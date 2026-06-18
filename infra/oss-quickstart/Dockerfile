@@ -16,7 +16,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1 — Rust build.
 # ---------------------------------------------------------------------------
-FROM rust:1.95-slim-bookworm AS rust-build
+FROM rust:1.95-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082 AS rust-build
 
 # sqlx + reqwest need pkg-config + libssl-dev for the rustls-native
 # bridge; the rest of the workspace is pure Rust.
@@ -76,7 +76,7 @@ RUN --mount=type=cache,target=/build/target \
 # ---------------------------------------------------------------------------
 # Stage 2 — SPA build.
 # ---------------------------------------------------------------------------
-FROM oven/bun:1.3-debian AS spa-build
+FROM oven/bun:1.3-debian@sha256:9dba1a1b43ce28c9d7931bfc4eb00feb63b0114720a0277a8f939ae4dfc9db6f AS spa-build
 
 # Skip puppeteer's Chrome download in this build stage — puppeteer
 # is a devDependency for browser-based smoke tests, not needed by
@@ -105,7 +105,7 @@ RUN bun run build
 # ---------------------------------------------------------------------------
 # Stage 3 — runtime.
 # ---------------------------------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716 AS runtime
 
 # Runtime deps: ca-certs for outbound HTTPS (the gateway), libssl
 # for rustls's native bridge, postgresql-client for the init

@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# Least-privilege token: CI only reads the repo (checkout + build).
+# No job needs write — release/attestation live in release.yml.
+permissions:
+  contents: read
+
 jobs:
   rust:
     runs-on: ubuntu-latest
