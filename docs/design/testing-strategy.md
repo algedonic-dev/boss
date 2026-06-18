@@ -62,7 +62,6 @@ in-memory, leaked credentials in release artifacts.
 | `infra/lint/seed-bypass-smell.sh` | Seed SQL that INSERTs into projection tables instead of routing through a JobKind. |
 | `infra/lint/tier-import-audit.sh` | Tier-1 library crates depending on Tier-2. 0 violations across 27 core crates today. |
 | `infra/check-binary-build-coverage.sh` | `*-api` binaries that would silently produce in-memory builds because their `postgres` (or `s3`) feature isn't activated by default, required-features, or workspace dep unification. Catches both the silent-skip class and the startup-guard-trap class. |
-| `infra/lint/release-scrub.sh` | Wordlist + binary-metadata scrub for prelaunch artifacts (no internal hostnames, no credentials). |
 
 **Where it runs:** CI on every push + on-demand locally.
 
@@ -218,7 +217,6 @@ answer "yes" stops the search:
 - Format: cargo fmt -- --check
 - Lint:   infra/lint/seed-bypass-smell.sh
 - Lint:   infra/lint/no-todo-citation.sh
-- Lint:   infra/lint/release-scrub.sh
 - Web:    bun install + bun run typecheck + bun run build
 ```
 
