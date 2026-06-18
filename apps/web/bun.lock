@@ -10,7 +10,7 @@
         "zod": "^4.4.3",
       },
       "devDependencies": {
-        "@playwright/test": "1.60.0",
+        "@playwright/test": "1.61.0",
         "bun-plugin-svelte": "^0.0.6",
         "bun-types": "^1.3.14",
         "svelte-check": "^4.4.8",
@@ -29,7 +29,7 @@
 
     "@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.31", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.1.0", "@jridgewell/sourcemap-codec": "^1.4.14" } }, "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw=="],
 
-    "@playwright/test": ["@playwright/test@1.60.0", "", { "dependencies": { "playwright": "1.60.0" }, "bin": { "playwright": "cli.js" } }, "sha512-O71yZIbAh/PxDMNGns37GHBIfrVkEVyn+AXyIa5dOTfb4/xNvRWV+Vv/NMbNCtODB/pO7vLlF2OTmMVLhmr7Ag=="],
+    "@playwright/test": ["@playwright/test@1.61.0", "", { "dependencies": { "playwright": "1.61.0" }, "bin": { "playwright": "cli.js" } }, "sha512-cKA5B6lpFEMyMGjxF54QihfYpB4FkEGH+qZhtArDEG+wezQAJY8Pq6C7T1SjWz+FFzt3TbyoXBQYk/0292TdJA=="],
 
     "@puppeteer/browsers": ["@puppeteer/browsers@3.0.4", "", { "dependencies": { "modern-tar": "^0.7.6", "yargs": "^17.7.2" }, "peerDependencies": { "proxy-agent": ">=8.0.1" }, "optionalPeers": ["proxy-agent"], "bin": { "browsers": "lib/main-cli.js" } }, "sha512-HGM8iAmGTf+Y7t0373szVbTmt3d7vPkYL/1bpOkOFO0YUYLgSeuYBCzESklogNPvOBnZ/MRD5f07OkpqH1trtA=="],
 
@@ -103,9 +103,9 @@
 
     "picocolors": ["picocolors@1.1.1", "", {}, "sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA=="],
 
-    "playwright": ["playwright@1.60.0", "", { "dependencies": { "playwright-core": "1.60.0" }, "optionalDependencies": { "fsevents": "2.3.2" }, "bin": { "playwright": "cli.js" } }, "sha512-hheHdokM8cdqCb0lcE3s+zT4t4W+vvjpGxsZlDnikarzx8tSzMebh3UiFtgqwFwnTnjYQcsyMF8ei2mCO/tpeA=="],
+    "playwright": ["playwright@1.61.0", "", { "dependencies": { "playwright-core": "1.61.0" }, "optionalDependencies": { "fsevents": "2.3.2" }, "bin": { "playwright": "cli.js" } }, "sha512-Z+7BeeqQPRRzklHsVFP4KTGIyMxKUmfeRA4WisM6G3/XW6nwGeX6fX9qYaDa+CiUqpOkb2f6X3nar05R3kSuJQ=="],
 
-    "playwright-core": ["playwright-core@1.60.0", "", { "bin": { "playwright-core": "cli.js" } }, "sha512-9bW6zvX/m0lEbgTKJ6YppOKx8H3VOPBMOCFh2irXFOT4BbHgrx5hPjwJYLT40Lu+4qtD36qKc/Hn56StUW57IA=="],
+    "playwright-core": ["playwright-core@1.61.0", "", { "bin": { "playwright-core": "cli.js" } }, "sha512-caX7TrY3Ml6egyDX0WUcTHDxodl/b51y5wJOdCEA36QviK/s2g081hvmGs8eaE3DWb6NYZQ6BjO/QkNRPenoPA=="],
 
     "puppeteer": ["puppeteer@25.1.0", "", { "dependencies": { "@puppeteer/browsers": "3.0.4", "chromium-bidi": "16.0.1", "devtools-protocol": "0.0.1624250", "lilconfig": "^3.1.3", "puppeteer-core": "25.1.0", "typed-query-selector": "^2.12.2" }, "bin": { "puppeteer": "lib/puppeteer/node/cli.js" } }, "sha512-7L6/0JM7XStK99lIL4xQySyNEXNfII6pk0BxkI5kKBTOhR7AsoQiv067YTsE/rIXxQiq9ajlO4WcqBjS/FWK1A=="],
 

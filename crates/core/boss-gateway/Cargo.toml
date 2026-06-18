@@ -18,8 +18,8 @@ rand = "0.10"
 chrono = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 base64 = "0.22"
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 subtle = "2"
 futures = { workspace = true }
 bytes = "1"
@@ -32,7 +32,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 hdrhistogram = "7"
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 # Argon2id password hashing for the file-backed local-auth path.
 # PHC string format so the on-disk credentials file stays
 # portable across versions.

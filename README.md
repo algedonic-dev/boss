@@ -1,5 +1,8 @@
 # BOSS
 
+[![CI](https://github.com/algedonic-dev/boss/actions/workflows/ci.yml/badge.svg)](https://github.com/algedonic-dev/boss/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/algedonic-dev/boss/badge)](https://scorecard.dev/viewer/?uri=github.com/algedonic-dev/boss)
+
 > ⚠ **Preliminary release.** An early, opinionated cut shared to
 > get reactions to the idea — direct-modeling, the four primitives
 > (Subjects, Jobs, Steps, Events), the human-plus-agents executor

@@ -6,7 +6,7 @@
  * six-state lifecycle. The shipped machine is FIVE states —
  * Pending -> Ready -> Active -> Completed, plus Skipped — with terminals
  * {Completed, Skipped} and no Blocked/Aborted/InProgress (see
- * crates/core/boss-core/src/job.rs and CHANGELOG v1.1.0). Its invariants
+ * crates/core/boss-core/src/job.rs). Its invariants
  * below prove properties of states that no longer exist; the spec needs
  * a rewrite to the 5-state machine (or deletion) before it can be
  * trusted again.

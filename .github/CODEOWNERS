@@ -9,16 +9,16 @@
 # Syntax: https://docs.github.com/en/repositories/managing-your-repositories-settings-and-customizations/customizing-your-repository/about-code-owners
 
 # Catch-all: every PR pings the maintainer for review.
-*  @algedonic-dev/maintainers
+*  @david-algedonic
 
 # Hot paths that especially benefit from a flag-down review:
 # audit_log + projection rebuilders + posting rules are the
 # correctness backbone; bypassing them is the most common way
 # to break the five-property contract.
-/crates/core/boss-events/        @algedonic-dev/maintainers
-/crates/core/boss-jobs/          @algedonic-dev/maintainers
-/crates/core/boss-policy/        @algedonic-dev/maintainers
-/crates/modules/boss-ledger/     @algedonic-dev/maintainers
-/infra/postgres/schema.sql       @algedonic-dev/maintainers
-/docs/adr/                       @algedonic-dev/maintainers
-/docs/design/correctness-protocol.md  @algedonic-dev/maintainers
+/crates/core/boss-events/        @david-algedonic
+/crates/core/boss-jobs/          @david-algedonic
+/crates/core/boss-policy/        @david-algedonic
+/crates/modules/boss-ledger/     @david-algedonic
+/infra/postgres/schema.sql       @david-algedonic
+/docs/architecture-decisions.md  @david-algedonic
+/docs/design/correctness-protocol.md  @david-algedonic

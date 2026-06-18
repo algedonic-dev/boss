@@ -18,7 +18,8 @@
 # Open http://localhost:4443 once the boss-services container
 # logs "all services up".
 #
-# ⚠  Not production-ready — see ../../docs/adr/0193-*.md.
+# ⚠  Not production-ready. See SECURITY.md (§Deployment trust
+#     model) before exposing this to anything but your laptop.
 
 name: boss
 

@@ -105,4 +105,4 @@ tower = "0.5"
 async-nats = "0.47"
 futures = "0.3"
 toml = "0.8"
-pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }

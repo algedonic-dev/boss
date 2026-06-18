@@ -59,6 +59,36 @@ Things I appreciate the report on but won't drop everything for:
   transactions — documented as suspicious-not-proof in the
   integrity-check output.
 
+## Deployment trust model — read this before you expose BOSS
+
+BOSS authenticates at a single trust boundary: **`boss-gateway`**.
+The gateway establishes identity (signed session cookie today) and
+forwards it to backend services as an `x-boss-user` header, which
+the services trust verbatim. Real per-service auth has not landed
+yet (see the *Integrated IAM* item in [`TODO.md`](TODO.md)).
+
+The load-bearing consequence: **the gateway must be the only thing
+that can reach the backend service ports.** A client that can talk
+to a backend port directly can set its own `x-boss-user` and assume
+any identity. So:
+
+- **Do not publish backend ports.** The Docker quickstart already
+  does this correctly — only the gateway port (`4443`) is published;
+  the backends are reachable only on the internal compose network.
+- **On bare-metal / systemd installs**, bind backends to
+  `127.0.0.1` (the gateway is co-located) or firewall their ports.
+  The sample configs bind `0.0.0.0` for flexibility — tighten this
+  before exposing the host to an untrusted network.
+- **Front the gateway with a proxy/IDP** (Cloudflare Access,
+  Authelia, etc.) for any internet-facing deployment, and make sure
+  it strips inbound `x-boss-*` headers from clients.
+
+This is a known, deliberate limitation of the preliminary release,
+not a defect — but mis-deploying around it is the most likely way
+to get a BOSS instance wrong. A path that lets an *external* client
+forge `x-boss-user` against a correctly-fronted gateway is in scope
+and I want to hear about it.
+
 ## Supported versions
 
 Only `main` is supported. There are no backports.

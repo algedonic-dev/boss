@@ -198,5 +198,7 @@ pub async fn compute_period_checksum(
         hasher.update(b"\n");
     }
     let digest = hasher.finalize();
-    Ok(format!("sha256:{:x}", digest))
+    // sha2 0.11's finalize() returns hybrid_array::Array, which (unlike
+    // the old GenericArray) doesn't implement LowerHex — encode explicitly.
+    Ok(format!("sha256:{}", hex::encode(digest)))
 }

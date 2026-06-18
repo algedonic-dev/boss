@@ -24,11 +24,13 @@ KINDS=$(grep '^kind = ' crates/core/boss-jobs/seeds/step_types.toml \
 PATTERN="kind[)]?[[:space:]]*(==|===|!=|!==)[[:space:]]*[\"'](${KINDS})[\"']|matches!\([^,]*kind[^,]*,[[:space:]]*\"(${KINDS})\"|WHERE[[:space:]]+s\.kind[[:space:]]*=[[:space:]]*'(${KINDS})'"
 
 # Allow-list: file => max permitted match count.
-#   - boss-jobs http.rs / DesignReviewPage: the two platform-pinned
-#     rows (job-kind-publish, review-design) — permanent pins.
+#   - boss-jobs http/steps.rs / DesignReviewPage: the two platform-
+#     pinned rows (job-kind-publish, review-design) — permanent pins.
+#     (steps.rs is where job-kind-publish landed after http.rs was
+#     split into the http/ module directory.)
 #   - apps/web/src/debug/: dev-only demo driver, not a core surface.
 declare -A ALLOW=(
-    ["crates/core/boss-jobs/src/http.rs"]=1
+    ["crates/core/boss-jobs/src/http/steps.rs"]=1
     ["apps/web/src/it/design/DesignReviewPage.svelte"]=1
 )
 
