@@ -32,7 +32,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 hdrhistogram = "7"
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 # Argon2id password hashing for the file-backed local-auth path.
 # PHC string format so the on-disk credentials file stays
 # portable across versions.
