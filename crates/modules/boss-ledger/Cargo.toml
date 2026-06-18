@@ -44,7 +44,7 @@ clap = { workspace = true }
 toml = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "rust_decimal", "uuid"], optional = true }
 rust_decimal = { version = "1", features = ["serde"] }
-sha2 = "0.10"
+sha2 = "0.11"
 boss-core = { path = "../../core/boss-core" }
 boss-clock-client = { path = "../../core/boss-clock-client" }
 boss-ports = { path = "../../core/boss-ports" }

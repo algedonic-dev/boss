@@ -16,7 +16,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 [dev-dependencies]
