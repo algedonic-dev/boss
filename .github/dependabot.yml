@@ -6,6 +6,8 @@
 #   - cargo:           the Rust workspace at /
 #   - bun (npm):       the Svelte SPA at /apps/web
 #   - github-actions:  the workflows under .github/workflows
+#   - docker:          the quickstart image base layers (digest-pinned,
+#                      so Dependabot keeps the pins fresh)
 #
 # Cadence: weekly on Monday so a contributor who's offline over a
 # weekend doesn't return to a wall of PRs. Group all minor + patch
@@ -46,5 +48,18 @@ updates:
     open-pull-requests-limit: 3
     groups:
       actions-all:
+        patterns:
+          - "*"
+
+  # Quickstart image base layers are digest-pinned in the Dockerfile;
+  # this keeps those pins current instead of letting them silently rot.
+  - package-ecosystem: "docker"
+    directory: "/infra/oss-quickstart"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    groups:
+      docker-all:
         patterns:
           - "*"
