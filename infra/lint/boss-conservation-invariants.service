@@ -1,0 +1,16 @@
+[Unit]
+Description=Boss — conservation-invariant sweep
+Documentation=https://github.com/algedonic-dev/boss/blob/main/docs/design/correctness-protocol.md
+After=postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=boss
+Environment=PGPASSWORD=boss
+ExecStart=/opt/boss/infra/lint/conservation-invariants.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

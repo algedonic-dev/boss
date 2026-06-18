@@ -1,0 +1,436 @@
+#!/usr/bin/env bash
+# Forbid chrono::Utc::now() outside the allowlist of crates that
+# legitimately need wall-clock access. Matches `Utc::now` on a word
+# boundary, so it catches the called forms `chrono::Utc::now()` /
+# bare `Utc::now()` AND the function-reference form
+# `unwrap_or_else(Utc::now)` — the latter leaks identically (it gets
+# invoked with no args later) and previously slipped past a
+# parens-requiring regex into a projection rebuilder.
+#
+# Why this exists: every other "now" in BOSS must route through
+# `state.clock.now().await.now` so the receiving service stamps
+# audit_log via clock-api (sim or wall depending on deploy mode).
+# A stray Utc::now() in a handler stamps audit_log with wallclock
+# regardless of clock-api mode — the silent-wallclock-leak class
+# that surfaced 116k mis-stamped rows in regen 18 (closed by
+# v1.0.5 #68). This lint keeps the leak class from recurring.
+#
+# Allowlist: only these paths may call Utc::now()
+#   * crates/core/boss-clock/         (the clock-api itself —
+#                                      wall-mode IS Utc::now())
+#   * crates/core/boss-clock-client/  (the WallClockClient fallback +
+#                                      ReqwestClockClient's transport-
+#                                      error fallback)
+#   * **/tests/                       (test files; no production
+#                                      runtime)
+#   * #[cfg(test)] mod tests          (inline test blocks — handled
+#                                      via tests/ path filter +
+#                                      explicit `mod tests` skipping)
+#   * cli boundary tools (e.g. boss-cli emit) — call with the path
+#     argument to the lint when extending
+#
+# Exit 0 = clean, 1 = violations.
+#
+# Usage:
+#   ./infra/lint/no-wallclock.sh
+#
+# Wire into CI by adding to the PR-time check matrix.
+
+set -euo pipefail
+
+cd "$(dirname "$0")/../.."
+
+# Path-prefix patterns that are allowed.
+#
+# Adding to this list: the bar is "this path's Utc::now() never
+# stamps an audit_log row." Authentication tokens, internal queue
+# claim timestamps, runtime dispatcher cost-window math,
+# diagnostic checkpoints — none of those route through the
+# Event::new + DomainPublisher pipeline that lands in audit_log,
+# so wallclock there is correct.
+#
+# When in doubt, leave it OUT and audit the callsite. The cost
+# of a false-positive flag is a 30-second look; the cost of a
+# silent wallclock leak is a regen 18 (116k mis-dated rows).
+ALLOWED_PREFIXES=(
+  # The clock-api itself, the wall-mode path that IS Utc::now()
+  "crates/core/boss-clock/"
+  # WallClockClient + ReqwestClockClient's transport-error fallback
+  "crates/core/boss-clock-client/"
+  # Auth tokens — wallclock IS the right semantic for token
+  # freshness checks (jwt-style "now > exp"). Doesn't emit
+  # audit_log; manages local in-process auth state only.
+  "crates/core/boss-gateway/src/local_auth.rs"
+  # Perf metrics — diagnostic only, never emitted as audit
+  "crates/core/boss-gateway/src/perf.rs"
+  # Cybernetics-layer queue + dispatcher + cost-ledger
+  # operational state. claim_at, started_at, finished_at,
+  # cost-window math, all internal runtime accounting that
+  # never lands in audit_log.
+  "crates/core/boss-events/src/queue.rs"
+  "crates/core/boss-events/src/dispatcher.rs"
+  "crates/core/boss-events/src/ledger.rs"
+  "crates/core/boss-events/src/claude_dispatcher.rs"
+  # Diagnostic CLI — checkpoint timestamps in operator output.
+  "crates/core/boss-events/src/bin/boss_audit_integrity_check.rs"
+  # Deprecated clock helpers, pre-Clock-as-service. The module
+  # itself still exists for backward compat but new code should
+  # use boss_clock_client::ClockClient.
+  "crates/core/boss-core/src/clock.rs"
+  # Policy rule-engine evaluator: rule expiry math is local
+  # decision logic, not audit-emitting. Post-#84 the engine
+  # itself lives in boss-policy-client; boss-policy is now just
+  # the HTTP + Postgres adapter (also allowed because the
+  # bootstrap binary uses chrono parse helpers).
+  "crates/core/boss-policy/"
+  "crates/core/boss-policy-client/src/engine.rs"
+  "crates/core/boss-policy-client/src/in_memory.rs"
+  "crates/core/boss-policy-client/src/seed_loader.rs"
+  # Calendar port.rs trait-default convenience overloads.
+  # The _at variants are what production code calls; the
+  # bare-arg defaults exist for legacy callers.
+  "crates/core/boss-calendar/src/port.rs"
+  # Same pattern for the other port.rs default-method overloads.
+  "crates/modules/boss-people/src/port.rs"
+  "crates/modules/boss-commerce/src/port.rs"
+  "crates/modules/boss-shipping/src/port.rs"
+  "crates/modules/boss-inventory/src/port.rs"
+  "crates/core/boss-content/src/port.rs"
+  # Classes client deprecated wallclock helper.
+  "crates/core/boss-classes-client/src/lib.rs"
+  # Boss-docs review system: in-memory + reindex are internal
+  # state for the design-doc review workflow. http.rs has tests
+  # inline (covered by tests/ filter where appropriate).
+  "crates/core/boss-docs/"
+  # Sim-side faker + bridge generators — sim-only; the audit
+  # trail comes from the LiveApiOutput emit path which IS
+  # clock-routed (see v1.0.6 #72 scheduler-driven anchors).
+  "crates/orchestrators/boss-sim/src/shape_driven/faker.rs"
+  "crates/modules/boss-assets/src/bridge.rs"
+  # Fleet system_parts uses Utc::now() for in-memory updated_at;
+  # the audit-emitting handler path is separate + clock-routed.
+  "crates/modules/boss-assets/src/system_parts.rs"
+  # In-memory + test fixture adapters; never deployed.
+  "crates/core/boss-content/src/in_memory.rs"
+  "crates/modules/boss-inventory/src/in_memory.rs"
+  "crates/core/boss-policy/src/in_memory.rs"
+  # ML inference + generators: predictions land in
+  # ml_predictions table, not audit_log. created_at /
+  # updated_at on those rows is wallclock by design.
+  "crates/core/boss-ml/"
+  "crates/modules/boss-ml-plugins/"
+  # CLI flag defaults (today = Utc::now().date_naive() unless
+  # --today is passed). Operators override at runtime.
+  "crates/modules/boss-ledger/src/bin/boss_ledger_recognize.rs"
+  # Demo synthetic agent loop — wallclock is the intended
+  # source; events feed the /ops live ticker, never audit_log.
+  "crates/core/boss-observability/src/demo_agents.rs"
+  # Sim output: shape_driven engine wires sim-time anchors via
+  # clock-api in the LiveApiOutput path (#72). The shape_driven
+  # / output.rs core uses Utc::now() in test/in-memory paths
+  # only; LiveApiOutput goes through advance_clock_to_instant.
+  "crates/orchestrators/boss-sim/src/output.rs"
+  # boss-jobs registry + step-plugin row creation timestamps
+  # (created_at on JobKindSpec, StepPluginSpec rows). These
+  # are reference-data rows in the platform registry — not
+  # audit-emitting sim/operations work.
+  "crates/core/boss-jobs/src/registry.rs"
+  "crates/core/boss-jobs/src/step_plugins.rs"
+  # Scheduling fallbacks: HTTP handlers use Utc::now() as the
+  # default when ?from query param is absent (operator viewing
+  # the calendar wants "now-ish"). Materialize daemon uses it
+  # for the next-week computation.
+  "crates/core/boss-jobs/src/scheduling/materialize.rs"
+  "crates/core/boss-jobs/src/scheduling/http.rs"
+  # Internal data struct default constructor — Message, etc.
+  "crates/core/boss-core/src/agent.rs"
+  # Rebuilders walk historic audit_log entries; the read_at
+  # backfill timestamp is wallclock by design (synthetic since
+  # the original event didn't carry it).
+  "crates/modules/boss-messages/src/rebuild.rs"
+  # Daily ledger recognition cron — operator-time tick.
+  "crates/modules/boss-ledger/src/recognize.rs"
+)
+
+# Files whose entire body is exempt (e.g. CLI boundary tools
+# where wallclock is the intent; the boss-cli emit subcommand
+# constructs an Event for stdout inspection — never published —
+# and the operator's wallclock IS the intended timestamp).
+ALLOWED_FILES=(
+  "crates/orchestrators/boss-cli/src/main.rs"
+  # docs_flush is a CLI snapshot tool, runs at operator request
+  "crates/orchestrators/boss-cli/src/docs_flush.rs"
+  # Operator-baseline seed: stamps via BOSS_EPOCH_START now
+  # (v1.0.5 fix), but the binary's own clock fallback is OK
+  "crates/modules/boss-people/src/bin/boss_operator_baseline_seed.rs"
+  # Brewery-engine seed + bootstrap: use BOSS_EPOCH_START
+  # explicitly now (#69); main.rs imports chrono just for type
+  # signatures, not Utc::now() calls.
+  "crates/tenants/boss-brewery-engine/src/bin/boss_brewery_data_seed.rs"
+  "crates/tenants/boss-brewery-engine/src/bin/boss_brewery_bootstrap.rs"
+  # File-references GC daemon: wallclock IS the right "now"
+  # for deciding whether soft-deleted bytes are past their
+  # retention window. Operator-time semantics.
+  "crates/core/boss-content/src/bin/boss_files_gc.rs"
+)
+
+is_allowed() {
+  local file="$1"
+  # Test files anywhere are fine.
+  if [[ "$file" == *"/tests/"* ]]; then
+    return 0
+  fi
+  # In-memory adapters are by convention test fixtures (the prod
+  # path uses the postgres adapter); the in_memory.rs naming
+  # convention is consistent across the workspace. Allow these
+  # crate-wide — if a non-test in-memory caller needs review,
+  # demote individually.
+  if [[ "$file" == *"/in_memory.rs" ]]; then
+    return 0
+  fi
+  # Trait port.rs defaults are convenience overloads that
+  # delegate to _at variants. New code should call _at directly;
+  # the bare overloads exist for legacy callers + tests.
+  if [[ "$file" == *"/port.rs" ]]; then
+    return 0
+  fi
+  # Doc-comment lines that reference Utc::now() in prose (not code)
+  # land in `///` blocks; we filter those out via the grep below
+  # so they never reach this gate.
+  for prefix in "${ALLOWED_PREFIXES[@]}"; do
+    if [[ "$file" == "$prefix"* ]]; then
+      return 0
+    fi
+  done
+  for allowed in "${ALLOWED_FILES[@]}"; do
+    if [[ "$file" == "$allowed" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# rg if available (much faster on large trees), grep -r as fallback.
+if command -v rg >/dev/null 2>&1; then
+  search() { rg -n --type rust 'Utc::now\b' crates/ "$@"; }
+else
+  search() {
+    grep -rn --include='*.rs' -E 'Utc::now\b' crates/ "$@" || true
+  }
+fi
+
+# Drop doc-comment lines (`///` or `//` with Utc::now in prose).
+# Match `Utc::now` on a word boundary: catches `chrono::Utc::now()`,
+# bare `Utc::now()` (after `use chrono::Utc;`), and the
+# function-reference form `unwrap_or_else(Utc::now)`. The `\b`
+# excludes identifiers like `now_from`. All leak the same way.
+raw_hits=$(search | grep -v '^[^:]*:\s*[0-9]*:\s*//' || true)
+
+# Filter out lines that fall inside an inline `mod tests` block.
+# The cheap heuristic: for each hit, find the nearest preceding
+# `#[cfg(test)] mod tests` or `#[test]` marker in the same file.
+# If the hit's line number > that marker's line number, the hit
+# is test code → drop. Awk does this in one pass per file.
+hits=""
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  file="${line%%:*}"
+  rest="${line#*:}"
+  lineno="${rest%%:*}"
+  # Find last marker line number at or before this hit's line.
+  marker_lineno=$(awk -v target="$lineno" '
+    /^#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(test\)\]/ { mark = NR }
+    /^[[:space:]]*mod tests/ && prev_cfg { mark = NR; prev_cfg = 0 }
+    /^#\[cfg\(test\)\]/ { prev_cfg = 1; next }
+    NR == target { print mark; exit }
+  ' "$file" 2>/dev/null || echo "")
+  if [ -n "$marker_lineno" ] && [ "$marker_lineno" -gt 0 ]; then
+    # Hit is after the test-mod marker → skip
+    continue
+  fi
+  hits+="$line"$'\n'
+done <<<"$raw_hits"
+
+violations=0
+violation_lines=()
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  # Lines look like: path/to/file.rs:LINE:code
+  file="${line%%:*}"
+  if ! is_allowed "$file"; then
+    violation_lines+=("$line")
+    violations=$((violations + 1))
+  fi
+done <<<"$hits"
+
+if [ "$violations" -eq 0 ]; then
+  echo "no-wallclock (Rust): clean"
+else
+  echo "no-wallclock (Rust): $violations violation(s) — these production callsites stamp wallclock instead of routing through state.clock.now():"
+  echo
+  for line in "${violation_lines[@]}"; do
+    echo "  $line"
+  done
+  echo
+  echo "Fix: replace with \`state.clock.now().await.now\` (in async handlers)"
+  echo "or pass a DateTime<Utc> argument from a clock-routed caller."
+  echo "See docs/design/clock-as-service.md (or v1.0.5 commit 1a862d9a for context)."
+fi
+
+# ============================================================
+# SQL wallclock pass (#78 — v1.0.8)
+# ============================================================
+#
+# The Rust pass above catches Utc::now() and friends. v1.0.7
+# fixed two production cases where the leak was inside a SQL
+# *string* — boss-commerce's AR aging used PostgreSQL's
+# CURRENT_DATE directly (wallclock at the DB layer), and the
+# boss-ml declarative rules + plugins did the same. The audit
+# found nine more sites of the same shape.
+#
+# This pass flags SQL `CURRENT_DATE` / `CURRENT_TIMESTAMP` /
+# `NOW()` inside Rust string literals where it's part of
+# business-domain date arithmetic. Legitimate operational
+# record-keeping (updated_at, created_at, deleted_at,
+# closed_at, settled_at, expires_at lifecycle columns) is
+# allowlisted on the line itself — these are wall-time
+# concerns by design (when did the row get touched), not
+# happened-on facts.
+#
+# Allowlist categories on the line:
+# - `<col>_at = NOW()` for the operational lifecycle columns
+# - `expires_at [<>=]* NOW()` for policy/auth expiry checks
+# - `COALESCE($N, NOW()|CURRENT_DATE)` — caller-supplied wins,
+#   wallclock is just the fallback at the API boundary
+sql_search() {
+  if command -v rg >/dev/null 2>&1; then
+    rg -n --type rust '(CURRENT_DATE|CURRENT_TIMESTAMP|\bNOW\s*\(\s*\))' crates/
+  else
+    grep -rn --include='*.rs' -E '(CURRENT_DATE|CURRENT_TIMESTAMP|\bNOW\s*\(\s*\))' crates/ || true
+  fi
+}
+
+# Patterns on the same line that make a wallclock SQL call OK.
+# Keep this list small and explicit. Any new column joins the
+# allowlist only if the audit log doesn't read from it.
+sql_allow_line() {
+  local line_content="$1"
+  # Operational lifecycle columns: when did the row get touched.
+  # Not business-domain dates; never read into audit_log payloads.
+  if echo "$line_content" | grep -qE '\b(updated_at|created_at|deleted_at|closed_at|settled_at|published|locked_at|paid_at|sent_at|read_at|expires_at|received_at|claimed_at|started_at|finished_at|completed_at|opened_at|seen_at)\s*=\s*NOW\s*\(\s*\)'; then
+    return 0
+  fi
+  # Expiry checks against wallclock (policy rules, tokens).
+  if echo "$line_content" | grep -qE 'expires_at\s*[<>!=]+\s*NOW\s*\(\s*\)'; then
+    return 0
+  fi
+  # COALESCE($N, NOW()|CURRENT_DATE) — caller supplies, fallback
+  # is wallclock at the API boundary. The inner $N is the
+  # clock-aware path.
+  if echo "$line_content" | grep -qE 'COALESCE\s*\(\s*\$[0-9]+,\s*(NOW\s*\(\s*\)|CURRENT_DATE)\s*\)'; then
+    return 0
+  fi
+  # Sequence + UUID generation columns appearing alongside NOW()
+  # on the same line (e.g. `gen_random_uuid(), NOW(), ...` in
+  # tests — covered by tests/ path filter above, but tolerate
+  # in case the same pattern surfaces in dev tools).
+  if echo "$line_content" | grep -qE 'gen_random_uuid|nextval'; then
+    return 0
+  fi
+  # INSERT/UPSERT VALUES tuple where NOW() is a positional column
+  # value (the column declaration is on the previous line).
+  # Pattern: `VALUES (...positional args..., NOW())`. The column
+  # name is in the INSERT column list above — these are always
+  # operational `_at` columns when NOW() appears in this position.
+  if echo "$line_content" | grep -qE 'VALUES\s*\([^)]*NOW\s*\(\s*\)\s*\)'; then
+    return 0
+  fi
+  return 1
+}
+
+# File-level allowlist for SQL wallclock — files whose entire
+# SQL surface is operational/record-keeping or pre-Clock-as-service
+# scaffolding the rest of the codebase doesn't depend on yet.
+sql_is_file_allowed() {
+  local file="$1"
+  # Same blanket allow as Rust pass for clock crates, in_memory,
+  # port.rs, tests, ml (predictions land in own table not audit_log).
+  if [[ "$file" == *"/tests/"* ]]; then return 0; fi
+  if [[ "$file" == *"/in_memory.rs" ]]; then return 0; fi
+  if [[ "$file" == *"/port.rs" ]]; then return 0; fi
+  case "$file" in
+    crates/core/boss-clock/*) return 0 ;;
+    crates/core/boss-clock-client/*) return 0 ;;
+    crates/core/boss-ml/*) return 0 ;;
+    # boss-ml-plugins removed (#86) — ClockClient is threaded
+    # through InferenceDispatcher's ctx.now; plugins source today
+    # from ctx.now and bind it as a SQL param. Any new wallclock
+    # here is a leak.
+    # boss-policy SQL is operational + rule-expiry; the audit
+    # confirmed nothing here writes to audit_log.
+    crates/core/boss-policy/*) return 0 ;;
+    # Post-#84 (P9 hexagonal split), the policy engine lives in
+    # boss-policy-client. Its `check` method needs wallclock to
+    # test whether user overrides are currently active per their
+    # `expires_at` field — operator-controlled expiry, not
+    # sim-time. Not audit-emitting.
+    crates/core/boss-policy-client/src/engine.rs) return 0 ;;
+    crates/core/boss-policy-client/src/in_memory.rs) return 0 ;;
+    crates/core/boss-policy-client/src/predicates.rs) return 0 ;;
+    crates/core/boss-policy-client/src/seed_loader.rs) return 0 ;;
+    crates/core/boss-policy-client/src/defaults.rs) return 0 ;;
+    # Internal scheduling lifecycle: claim/assignment status timestamps.
+    crates/core/boss-jobs/src/scheduling/rebuild.rs) return 0 ;;
+    crates/core/boss-jobs/src/scheduling/postgres.rs) return 0 ;;
+    # Registry row-creation timestamps (reference data, not audit).
+    crates/core/boss-jobs/src/registry.rs) return 0 ;;
+    # Messages-events purge daemon — operates on the mutable
+    # messages_events log, not audit_log.
+    crates/modules/boss-messages/src/bin/boss_messages_events_purge.rs) return 0 ;;
+    # Sim binary writes sim_clock metadata; the bus-side audit
+    # comes from elsewhere.
+    crates/tenants/boss-brewery-engine/src/bin/boss_brewery_sim.rs) return 0 ;;
+    # assets system_parts: in-memory updated_at on dev fixtures.
+    crates/modules/boss-assets/src/system_parts.rs) return 0 ;;
+  esac
+  return 1
+}
+
+raw_sql=$(sql_search | grep -v '^[^:]*:\s*[0-9]*:\s*//' || true)
+sql_violations=0
+sql_violation_lines=()
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  file="${line%%:*}"
+  if sql_is_file_allowed "$file"; then
+    continue
+  fi
+  # Strip the file:line: prefix to get the code content.
+  code="${line#*:}"
+  code="${code#*:}"
+  if sql_allow_line "$code"; then
+    continue
+  fi
+  sql_violation_lines+=("$line")
+  sql_violations=$((sql_violations + 1))
+done <<<"$raw_sql"
+
+if [ "$sql_violations" -eq 0 ]; then
+  echo "no-wallclock (SQL): clean"
+else
+  echo "no-wallclock (SQL): $sql_violations violation(s) — business-domain SQL reads wallclock instead of binding from ClockClient:"
+  echo
+  for line in "${sql_violation_lines[@]}"; do
+    echo "  $line"
+  done
+  echo
+  echo "Fix: bind \`today\` as a SQL parameter (\`\$1::date\`) sourced from"
+  echo "\`state.clock.now().await.now.date_naive()\`. Same pattern as"
+  echo "v1.0.7 commit c70455e5 (boss-commerce AR aging) and a39bec22 (boss-ml)."
+fi
+
+total=$((violations + sql_violations))
+if [ "$total" -gt 0 ]; then
+  exit 1
+fi
+exit 0

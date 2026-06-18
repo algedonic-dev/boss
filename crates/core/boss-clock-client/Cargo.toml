@@ -1,0 +1,23 @@
+[package]
+name = "boss-clock-client"
+description = "HTTP client + in-process fakes for boss-clock-api. Every BOSS service holds an `Arc<dyn ClockClient>` and calls `clock.now()` instead of `Utc::now()`. The reqwest impl caches the last response for a short TTL so per-handler latency stays sub-millisecond on warm cache."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+boss-clock = { path = "../boss-clock", default-features = false }
+boss-core = { path = "../boss-core" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+boss-clock = { path = "../boss-clock" }
+
+[lints]
+workspace = true

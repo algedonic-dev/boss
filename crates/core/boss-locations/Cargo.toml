@@ -1,0 +1,43 @@
+[package]
+name = "boss-locations"
+description = "Location primitive — places (storefronts, HQ, warehouse zones, field regions) with hierarchy + timezone + geo"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-locations-api"
+path = "src/bin/boss_locations_api.rs"
+required-features = ["postgres"]
+
+[features]
+# Same fix shape as boss-classes (2026-05-05): without postgres
+# in default the workspace build produces an in-memory binary that
+# crashes on the require_postgres_or_explicit_inmemory guard.
+default = ["postgres"]
+postgres = ["dep:sqlx"]
+
+[dependencies]
+boss-core = { path = "../boss-core" }
+boss-policy-client = { path = "../boss-policy-client" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"], optional = true }
+
+[dev-dependencies]
+boss-testing = { path = "../boss-testing", features = ["postgres"] }
+tower = { workspace = true }
+http-body-util = "0.1"
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
+
+[lints]
+workspace = true

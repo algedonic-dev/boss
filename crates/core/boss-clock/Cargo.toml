@@ -1,0 +1,43 @@
+[package]
+name = "boss-clock"
+description = "Authoritative clock service — single source of 'what time is it' across BOSS. Two runtime modes: wall (Utc::now per request) and sim (current_sim_date from sim_clock, advanced via POST). Services hold a ClockClient and never call Utc::now() directly; that's how sim + back-testing + production share one code path with zero per-service branching."
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-clock-api"
+path = "src/bin/boss_clock_api.rs"
+required-features = ["postgres"]
+
+[features]
+# `postgres` ships in default so `cargo build --release --workspace`
+# produces /target/release/boss-clock-api with the sim-mode adapter
+# wired (sim mode reads sim_clock; wall mode doesn't need
+# postgres but the binary supports both via runtime mode flag).
+default = ["postgres"]
+postgres = ["dep:sqlx"]
+
+[dependencies]
+boss-core = { path = "../boss-core" }
+boss-ports = { path = "../boss-ports" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+tokio-stream = "0.1"
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono"], optional = true }
+
+[dev-dependencies]
+tower = { workspace = true }
+http-body-util = "0.1"
+
+[lints]
+workspace = true

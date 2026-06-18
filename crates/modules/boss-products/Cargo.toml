@@ -1,0 +1,54 @@
+[package]
+name = "boss-products"
+description = "Finished-product catalog + per-location on-hand inventory. Sibling to boss-catalog (raw inputs) but tracks output the tenant produces and sells."
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-products-api"
+path = "src/bin/boss_products_api.rs"
+required-features = ["postgres"]
+
+[features]
+# `postgres` ships in default so `cargo build --release --workspace`
+# produces /target/release/boss-products-api with the postgres
+# adapter. No orchestrator activates the feature on boss-products,
+# so feature unification doesn't reach the bin → workspace build
+# silently produces an in-memory-only binary. Same fix as boss-docs
+# (postgres → default 2026-05-05).
+default = ["postgres"]
+postgres = ["dep:sqlx", "boss-events/postgres", "boss-ledger/postgres"]
+
+[dependencies]
+boss-core = { path = "../../core/boss-core" }
+boss-clock-client = { path = "../../core/boss-clock-client" }
+boss-ports = { path = "../../core/boss-ports" }
+boss-events = { path = "../../core/boss-events" }
+boss-ledger = { path = "../boss-ledger" }
+boss-nats = { path = "../../core/boss-nats" }
+boss-policy = { path = "../../core/boss-policy" }
+boss-policy-client = { path = "../../core/boss-policy-client" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { workspace = true }
+http-body-util = "0.1"
+boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"] }
+
+[lints]
+workspace = true

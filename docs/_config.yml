@@ -1,0 +1,73 @@
+# GitHub Pages config for the BOSS docs tree.
+#
+# Activate by setting Pages source = `docs/` folder on `main` in
+# the public repo (Settings → Pages → Source). With this config
+# in place, the `docs/` markdown tree renders as a browseable
+# site at `<org>.github.io/boss/` (or a custom domain — see
+# `cname` below).
+#
+# Lightweight intentionally: Jekyll's default `minima` theme +
+# kramdown markdown + GitHub-flavored quirks. No plugins beyond
+# `jekyll-relative-links` so internal `[text](other.md)` links
+# work without rewriting.
+
+title: BOSS — Beer Open Source Software for System Modeling
+description: >-
+  Event-sourced software for modeling systems as state machines.
+  A human-powered state machine OS where executors are humans
+  and agents.
+author: David
+
+# `baseurl` is the path the site is served under. For a
+# repository named `boss` published from the `docs/` folder on
+# `algedonic-dev/boss`, the canonical URL is
+# `algedonic-dev.github.io/boss/`. If a custom domain is
+# configured later (e.g. `docs.algedonic.dev`), set
+# `baseurl: ""` and add the CNAME file alongside.
+baseurl: ""
+url: ""
+
+# `algedonic.dev` (or wherever the BOSS landing site lives).
+# Update at migration time once the public URL is finalized.
+github_username: algedonic-dev
+
+theme: minima
+markdown: kramdown
+kramdown:
+  input: GFM
+  hard_wrap: false
+  syntax_highlighter: rouge
+
+plugins:
+  - jekyll-relative-links
+
+relative_links:
+  enabled: true
+  collections: true
+
+# Don't try to render Cargo / lockfiles / build artifacts the
+# tree happens to contain. Whitelist what Pages should include —
+# everything not in `include:` is treated as static-pass-through.
+include:
+  - design
+  - runbooks
+  - adr
+  - architecture
+  - formal
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor
+  - "*.mmd"
+  - "*.png"
+  - puppeteer-config.json
+
+# Top-of-page navigation. Mirrors the README's "Where to start"
+# table at a friendlier reading depth. Update as the doc tree
+# evolves.
+header_pages:
+  - design/extending-boss.md
+  - design/human-powered-state-machine.md
+  - design/correctness-protocol.md
+  - architecture-diagram.md

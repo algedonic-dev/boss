@@ -1,0 +1,53 @@
+[package]
+name = "boss-brewery-engine"
+description = "Brewery operating-engine binary. Loads the brewery seed bundle, registers every bridge crate's default SideEffectHandlers, and drives the day-loop via run_days_with_handlers — the production wire-up that flips the protocol-proofs from `tested` to `running`. See docs/design/correctness-protocol.md."
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-brewery-data-seed"
+path = "src/bin/boss_brewery_data_seed.rs"
+
+[[bin]]
+name = "boss-brewery-sim"
+path = "src/bin/boss_brewery_sim.rs"
+required-features = ["sim-daemon"]
+
+[features]
+default = []
+# Pulls in sqlx for the postgres-bound live-tick daemon. tokio is
+# now a hard dep (was here behind this flag pre-v1.0.6) because
+# the scheduler-shaped engine (#72) needs `tokio::time::sleep`
+# in the dispatch loop for sub-day timestamp distribution.
+sim-daemon = ["dep:sqlx"]
+
+[dependencies]
+boss-ports = { path = "../../core/boss-ports" }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+boss-accounts = { path = "../../modules/boss-accounts" }
+boss-inventory = { path = "../../modules/boss-inventory" }
+boss-jobs = { path = "../../core/boss-jobs" }
+# Policy-rule seeding for the converged prepare step reuses
+# boss_policy::bootstrap::publish_policy_rules (the same impl the
+# boss-policy-bootstrap binary drives). default-features=false keeps
+# the postgres adapter out — prepare is a pure public-API client.
+boss-policy = { path = "../../core/boss-policy", default-features = false }
+boss-sim = { path = "../../orchestrators/boss-sim" }
+
+# Optional — only the sim-daemon binary needs sqlx.
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio-rustls", "postgres", "chrono", "uuid"], optional = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

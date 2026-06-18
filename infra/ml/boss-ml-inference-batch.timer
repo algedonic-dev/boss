@@ -1,0 +1,12 @@
+[Unit]
+Description=Boss ML — daily infer-batch (02:30 UTC)
+
+[Timer]
+# Daily at 02:30 UTC — after midnight bank settlement and before
+# morning hours so the watchlist reflects yesterday's activity by
+# the time the day's first /me page renders.
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

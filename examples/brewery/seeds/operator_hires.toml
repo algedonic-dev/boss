@@ -1,0 +1,79 @@
+# Brewery tenant operator hires — the C-suite the brewery tenant
+# models in its org chart. Loaded by the brewery prepare step
+# (`boss-brewery-sim prepare`), which POSTs each hire to
+# /api/people before any seeding that references these ids
+# (account-manager attachments, operator-baseline conversations,
+# executive sign-off rows on JobKinds).
+#
+# These are TENANT identities, not
+# platform-baseline ones. They moved out of
+# `infra/operator-baseline/operator_hires.toml` so the platform
+# baseline carries only the bootstrap-admin slot + the system
+# audit account + the smoke-test fixture. Tenants own their own
+# org charts.
+#
+# Format mirrors the `boss-people::Employee` struct, same as the
+# platform-baseline file. The brewery prepare step
+# (`boss-brewery-sim prepare`) POSTs each hire to /api/people.
+
+[[hire]]
+id = "emp-cto"
+name = "cto"
+email = "cto@example.boss"
+role = "cto"
+department = "executive"
+hire_date = "2023-01-01"
+location = "loc-hq"
+employment_type = "full-time"
+status = "active"
+annual_salary_cents = 33000000
+skills = []
+certifications = []
+
+[[hire]]
+id = "emp-coo"
+name = "coo"
+email = "coo@example.boss"
+role = "coo"
+department = "executive"
+hire_date = "2023-01-01"
+location = "loc-hq"
+employment_type = "full-time"
+status = "active"
+annual_salary_cents = 31000000
+skills = []
+certifications = []
+
+[[hire]]
+id = "emp-ceo"
+name = "ceo"
+email = "ceo@example.boss"
+role = "ceo"
+department = "executive"
+hire_date = "2023-01-01"
+location = "loc-hq"
+employment_type = "full-time"
+status = "active"
+skills = []
+certifications = []
+# annual_salary_cents intentionally omitted (NULL in the projection).
+
+# emp-owner — the brewery owner-operator. Distinct from
+# emp-ceo (who's the salaried CEO running the company day-to-day).
+# Owner-operators are typically paid via owner draws / K-1, not
+# W-2 wages, so annual_salary_cents is intentionally NULL
+# (PayrollRule's salary path skips the row). Moved here from the
+# platform-baseline operator_hires.toml — the brewery owner is a
+# tenant identity, not a platform one.
+[[hire]]
+id = "emp-owner"
+name = "owner"
+email = "owner@example.boss"
+role = "owner"
+department = "executive"
+hire_date = "2023-01-01"
+location = "loc-hq"
+employment_type = "full-time"
+status = "active"
+skills = []
+certifications = []

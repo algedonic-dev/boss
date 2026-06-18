@@ -1,0 +1,39 @@
+# Cross-event soft-FK invariant rules.
+# Loaded once by `boss_events::integrity::foreign_ref_rules()` via
+# `include_str!` + `OnceLock`. Same data-as-data shape as D1
+# (step_types.toml), D2 (phase_two_models.toml), D3
+# (revenue_accounts.toml), D4 (tax_liability_accounts.toml).
+#
+# Adding a new cross-event reference (e.g. a `jobs.job.created.assigned_to`
+# → `employees.employee.created` invariant) is a TOML row append +
+# a restart of `boss-audit-integrity-check` — no Rust edit required.
+#
+# Per-tenant overrides via `BOSS_EVENTS_INVARIANT_RULES_TOML` env
+# var pointing at a sibling file (replaces — does not merge with —
+# the defaults so a tenant owns the full set explicitly).
+#
+# The bar for adding a rule: "this ref has burned us at least once
+# in a real rebuild, or a missing parent would silently 404 the
+# projection." Promiscuous addition slows the integrity check
+# linearly with rule count.
+
+[[rule]]
+child_kind  = "commerce.invoice.created"
+field       = "account_id"
+parent_kind = "accounts.account.created"
+
+[[rule]]
+child_kind  = "inventory.purchase_order.upserted"
+field       = "vendor_id"
+parent_kind = "inventory.vendor.created"
+
+# Vendor invoices carry the vendor id under `vendor` (not
+# `vendor_id` like POs) — the field name dates from the legacy
+# A/P generator. Same parent kind. Added 2026-04-30 after the
+# live brewery daemon surfaced 4 vendor_invoices referencing
+# vendor-00001 / vendor-00002 that had no matching vendor.created
+# event anywhere in the log.
+[[rule]]
+child_kind  = "inventory.vendor_invoice.upserted"
+field       = "vendor"
+parent_kind = "inventory.vendor.created"

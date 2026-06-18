@@ -1,0 +1,417 @@
+# BOSS — Coding Guidelines
+
+## Project Overview
+
+BOSS is event-sourced **software for modeling systems as state
+machines**. The acronym expands to **Beer Open Source Software —
+for System Modeling**, named after **Stafford Beer** — the
+British cybernetician whose life's work was modeling companies in
+software (the Viable System Model, Cyberstride / Project Cybersyn,
+*Algedonic* feedback signals). BOSS sits in that lineage: an
+event-sourced, state-machine-shaped OS for describing real-world
+organizations directly. Real-world systems get described as
+Subjects (identity-bearing things), Jobs (bounded units of
+coordinated work), Steps (typed transitions), and an immutable
+event log over the state changes those transitions produce.
+Executors are humans and agents — the "human-powered state machine
+OS" framing is the executor model on top of the abstraction.
+
+The public demo tenant **Algedonic Ales** (the brewery the repo
+ships with) is the worked example, not the namesake — its name
+is a tip of the hat to Beer's *algedonic* terminology, and the
+brewery context lands the "model what your company does directly"
+pitch through a literal beer-on-software pun.
+
+When writing prose for users (READMEs, design docs, runbooks, UI
+strings), use the all-caps form **BOSS** — it is the canonical
+brand spelling. Lowercase `boss-` survives only as the prefix on
+crate paths, binary names, env vars, and systemd units (`boss-core`,
+`boss-jobs-api`, `BOSS_POSTGRES_URL`, `boss-brewery-sim.service`)
+where uppercase would break tooling.
+
+The concrete use case this repo ships is **managing a company**:
+Jobs encode work-in-flight, Subjects identify what the work is
+about (an account, an asset, an employee), Steps gate transitions
+behind explicit ownership and sign-off, the event log gives
+operators a complete audit trail. Two worked-example tenants:
+
+- **BOSS Brewery** — public OSS demo tenant; an industrial-scale
+  brewer. Data-first seeds under `examples/brewery/`.
+- **Used-device-shop** — second worked example, a business that
+  sells, services, and resells used physical devices needing
+  sophisticated diagnostics and repair. Tenant-specific flows live
+  in the `boss-commerce`, `boss-inventory`, and `boss-shipping`
+  crates; this tenant builds on top of the platform-supplied
+  Equipment KB (`boss-catalog`, `boss-assets`) and people domain
+  (`boss-people`).
+
+Both tenants are instantiations of the company-management use case
+running on the underlying state-machine abstraction. BOSS itself
+is neither a brewery product nor a device-refurb product. Treat
+the example tenants as plugins built on top of the core, and the
+core itself as a generic state-machine modeling toolkit that
+happens to be tuned for human + agent executors.
+
+The four foundational primitives are **Subjects** (identity-bearing
+things the work is about — an asset, an account, an employee), **Jobs**
+(bounded units of coordinated work), **Steps** (typed transitions inside
+a Job), and **Events** (the immutable record of state changes — the
+system of record). The Class registry (reference data on Subjects),
+StepPlugins (UX extensions on Steps), and Policy (the privilege model)
+are supporting concepts that hang off the four. We start small, stay
+incremental, and optimize for adaptability over everything else.
+
+### Founding ideas — what every load-bearing decision is measured against
+
+Three intellectual lineages anchor the design. When you're choosing
+between alternatives, weigh the candidate against these:
+
+- **Stafford Beer — cybernetics as the operating model.** BOSS's
+  namesake. A company is a viable system describable in feedback loops,
+  *algedonic* signals, and recursive structure. Subjects, Jobs, and the
+  event log are the software-shaped form of that claim.
+- **Rich Hickey — "information is simple."** Data is primary; functions
+  of data are easy; hiding data behind a mutating object trades
+  simplicity for convenience and pays forever. The audit log is the
+  system of record; projections are pure functions of it; rebuilders
+  reproduce truth from the log.
+- **George Orwell — *Politics and the English Language*.** Communication
+  decays when language drifts from reality; vague, abstract, or
+  euphemistic prose lets sloppy thinking pass for rigor. The audit log
+  + the five-property correctness protocol (provenance, conservation,
+  closure, idempotence, determinism) are BOSS's defense: the system
+  holds what *did* happen, immutably, so the words operators use stay
+  anchored to the facts. This is why correctness is a first-class
+  invariant, not a quality bar.
+
+All three converge: the company *is* its event log + its current state
++ the rules connecting them. Design choices that respect that
+convergence land cleanly; ones that don't accumulate fragility.
+
+### Reading frame: BOSS is a human-powered state machine
+
+BOSS is the software layer of a state machine whose executors are humans
+(and, increasingly, agents). The software does not *run* the business;
+it *describes* it as a state machine and gives the executors
+instrumentation to run it safely. Concretely: the event log + projections
+are the machine's memory; the StepType registry is the alphabet of legal
+transitions; JobKind is the program written in that alphabet; a Step's
+`status` is the program counter; Messages + My Day are the work-routing
+surface (not to be confused with the `boss-dispatcher` core service,
+which runs step side-effect rules off `step.done.<kind>` topics);
+policy is the privilege model on CPUs. Agents are additional CPUs in
+the same machine, not a separate system. This framing is load-bearing
+for design review — if you're about to add a new workflow, a new page,
+or a new abstraction, read it against the invariants in
+[docs/design/human-powered-state-machine.md](docs/design/human-powered-state-machine.md)
+first.
+
+The five-property correctness protocol (provenance, conservation,
+closure, idempotence, determinism) named in §Founding ideas above is
+detailed at [docs/design/correctness-protocol.md](docs/design/correctness-protocol.md);
+the seed-side corollary ("if you're writing `INSERT INTO invoices` in
+a seed file, the answer is to fix the JobKind, not the seed") is at
+[docs/design/seed-vs-emergent-state.md](docs/design/seed-vs-emergent-state.md).
+
+For the example domain, see [examples/used-device-shop/DOMAIN.md](examples/used-device-shop/DOMAIN.md).
+For architecture and the full service map, see [README.md](README.md).
+
+**Stack:** Rust (backend/CLI/agents) · TypeScript/Svelte 5 (frontend)
+**Repo strategy:** Monorepo. BOSS core + example tenant share one tree
+for now; BOSS may extract to its own repo once interfaces stabilize.
+
+---
+
+## Core Design Principles
+
+### 1. Adaptability First
+Every design decision is evaluated by: "How easy is it to change this later?" Prefer small, replaceable modules over large, optimized-but-rigid ones. Delete code freely. Avoid sunk-cost reasoning.
+
+### 2. Simplicity & Maintainability
+If it's hard to explain, it's too complex. Fewer abstractions > more abstractions. No premature generalization. Build for what we need now, not what we might need.
+
+### 3. Hexagonal Architecture (Ports & Adapters)
+- **Ports** = traits (Rust) / interfaces (TypeScript) that define what the domain needs
+- **Adapters** = implementations that plug into ports (DB, API, messaging, etc.)
+- Domain logic NEVER imports infrastructure. Infrastructure implements domain traits.
+- This is how we stay adaptable: swap adapters, domain stays untouched.
+
+### 4. Immutable Data by Default
+- Rust: prefer owned types, `Clone` over `&mut`, `Arc<T>` over shared mutability
+- TypeScript: `readonly`, `Readonly<T>`, `as const`, spread-to-update. No mutation of function args.
+- State changes produce new values, not mutated old ones.
+
+### 5. Stateless Services
+- Services receive everything they need via arguments or events
+- No hidden state, no singletons, no module-level mutable globals
+- If something must persist, it goes through an explicit persistence port
+
+### 6. Functional Programming Paradigms
+- Pure functions as the default unit of work
+- Side effects pushed to the edges (adapters)
+- Favor `map`, `filter`, `fold` / `reduce` over imperative loops
+- Use `Result<T, E>` and `Option<T>` (Rust) — never panic in library code
+- TypeScript: discriminated unions over exceptions for expected failure cases
+
+### 7. Async by Default
+- Rust: `async fn` with `tokio` runtime. All I/O is async.
+- TypeScript: `async/await` everywhere. No sync I/O in server code.
+- Design for concurrency: if two things don't depend on each other, they run concurrently.
+
+### 8. Event-Driven Architecture
+- Services communicate through events, not direct calls
+- Events are immutable facts about things that happened
+- Every event has: `id`, `timestamp`, `source`, `kind`, `payload`
+- Commands (requests to do something) and Events (facts that happened) are distinct types
+
+### 9. Registries Over Hardcoded Paths
+New work types, new step UX, new posting rules — they land as **data in append-only versioned registries**, not as new branches in core code. This is how the system stays adaptable as operational needs evolve. If you find yourself adding a `match kind { "refurb-used" => ..., "sale" => ... }` in core code, there's a registry you should be using instead.
+
+The same principle applies one level down to **taxonomies**. Closed Rust enums for roles, departments, account types, asset models, etc. force every tenant to fork core to add a value. The BOSS answer is the **Class registry** ([docs/design/class-registry.md](docs/design/class-registry.md)) — one `classes` table keyed `(subject_kind, code)` with rows for every taxonomy in the system. Roles are Classes of `employee`-kind Subjects; AccountTypes are Classes of `account` Subjects; catalog asset models are Classes of `asset` Subjects. When you reach for a closed enum to model a tenant-extensible category, reach for the Class registry instead. Move things to data that can be data.
+
+### 10. Core vs. Example Tenant
+The core state-machine OS lives under `crates/core/` (27 crates —
+`boss-core`, `boss-events`, `boss-jobs`, `boss-policy`,
+`boss-gateway`, `boss-observability`, `boss-cybernetics`,
+`boss-docs`, `boss-ml`, `boss-content`, `boss-testing`,
+`boss-dispatcher`, `boss-clock`, `boss-expr`, `boss-locations`, the
+three taxonomy registries, `boss-calendar`, `boss-nats`, `boss-ports`,
+plus matching `*-client` crates). Company-modeling adds the
+`crates/modules/` tier (`boss-people`, `boss-messages`,
+`boss-ledger`, `boss-commerce`, `boss-inventory`, etc.). The
+`crates/tenants/` tier is where each tenant binary lives — today
+the brewery (`boss-brewery-engine`) and used-device-shop
+(`boss-used-device-shop-engine`). Don't push tenant-specific
+assumptions (device refurb, service-account specifics, regulator
+quirks) into the core; if a
+feature only makes sense for the example tenant, it lives in those
+crates.
+
+---
+
+## Primitives
+
+Four interlocking primitives model everything. Stay close to them — new work types and new UX ship as data in registries, not as new core code paths.
+
+### Subjects
+The identity-bearing things work is *about*. BOSS treats Subject as a trait: each kind (Asset, Account, Employee, PurchaseOrder, Campaign, Vendor, Custom) implements it with its own KB view. Adding a new Subject kind means a new crate (or a new module in the example tenant) that implements the trait — not a switch in core code.
+
+### Jobs
+A **Job** is a bounded unit of coordinated work — a sale, a service visit, a hiring pipeline, an onboarding, a vendor-payment chase. Jobs give every piece of work a stable identity, an owner, a subject, a status, and a structured list of Steps.
+
+The **JobKind registry** (`boss-jobs`, backed by the `job_kinds` table) is append-only and versioned. Each kind declares:
+- `subject_kinds` — what the Job can be about
+- `steps` — a flat set of Steps; the DAG is implicit in each step's `ready_when` predicate (an edge A → B exists iff B's `ready_when` references A), not an author-drawn graph
+- `metadata_schema` + `entitlements` — typed fields and policy hooks on the Job itself
+
+**Adding a new workflow means adding a JobKind row**, not touching core code. New versions supersede old ones; in-flight Jobs stay pinned to the version they were opened under. Authoring lives at `/admin/job-kinds`.
+
+### Steps
+A **Step** is the typed unit of work inside a Job. Each step has a `kind` (from the StepType registry), `status` (pending → ready → active → completed (+ skipped)), optional assignee, `blocked_by` (a predicate-derived denormalized edge list for DAG rendering — recovered from the step's `ready_when` references, not an author-specified gate), optional sign-off, and free-form `metadata`.
+
+The **StepType registry** (`boss-jobs/src/step_registry.rs`) is the alphabet of legal transitions — `scheduling`, `sign-off`, `handoff`, `outreach`, `checklist`, `acknowledgment`, and the rest. Each kind declares a `fields` schema describing its metadata shape.
+
+Two rules shape the contract:
+- **Required-at-done, not required-at-create.** A `scheduling` step can exist with no `scheduled_at`; that field is required only when the step flips to `status=completed`. Metadata validators run on completion, not on create.
+- **PATCH semantics on PUT.** `PUT /api/jobs/{id}/steps/{step_id}` fetches the current step, overlays the body, then saves. Callers can send `{"status":"completed"}` and keep every other field intact. Clients providing new `metadata` must merge with the existing keys — top-level fields are replaced wholesale, so partial metadata wipes unmentioned keys.
+
+### Events
+Every state change emits an immutable fact through NATS (`boss-nats`) and lands in `audit_log` (`boss-events`). **The log is the system of record.** Projections rebuild from it; rebuilders reproduce truth from it; the five-property correctness protocol (provenance, conservation, closure, idempotence, determinism) guarantees the system contributes zero error of its own. Every state-changing operation publishes an event; nothing else.
+
+## Supporting concepts
+
+These three hang off the four primitives. They are load-bearing infrastructure, not foundational vocabulary.
+
+- **Class registry** — typed reference data each Subject kind owns. One `classes` table keyed `(subject_kind, code)` carries every taxonomy in the system: roles (Classes of `employee` Subjects), AccountTypes (Classes of `account` Subjects), asset models, departments, account tiers. See [docs/design/class-registry.md](docs/design/class-registry.md).
+- **StepPlugins** — UX extensions on Steps. A plugin is a small JS bundle served by the gateway at `/plugins/<path>` that renders a custom surface for a step kind. Plugins ship as data (a row in `step_plugins`) + a static JS asset; authoring at `/admin/step-plugins`. **New step surfaces do not require a core code change in `apps/web`.** Decision record: [docs/architecture-decisions.md](docs/architecture-decisions.md) §Step UX & frontend.
+- **Policy** — every write passes through `boss-policy` (via the `PolicyClient` port). Rules are row-level: a rule grants an `(action, resource)` within a `scope`; user-specific overrides take precedence; `policy_rule_audit` tracks every decision.
+
+### How to add a new thing
+The shape of an "add a new thing" change follows the primitives:
+
+1. **New work type** → add a JobKind row (authoring at `/admin/job-kinds`), declaring its `steps` (the DAG implicit in their `ready_when` predicates). Usually no Rust code change.
+2. **New step behavior** → add a StepType entry (if the schema is new) + a StepPlugin row + a JS bundle. No core frontend change.
+3. **New domain entity** → a new crate following hexagonal structure: domain types + traits in `boss-core` or a `*-client` port crate, implementation in the service crate, HTTP surface in the service binary.
+4. **New cross-service contract** → extend `boss-core` events or add a `*-client` port shared between consumers.
+
+---
+
+## Rust Conventions
+
+### Structure
+Crate organization (the canonical roster lives in
+`Cargo.toml` workspace members; the visual map is at
+[docs/architecture-diagram.md](docs/architecture-diagram.md)):
+
+Crates live under `crates/<tier>/<name>/` so the tier is visible
+in the file tree.
+Four tier directories, each with a hard rule about what the tier
+can depend on. **Every PR is judged against the audit bar of
+the tier it touches.**
+
+- **`crates/core/` — Tier 1: Core state-machine OS** (27 crates).
+  The generic state-machine modeling toolkit. Every BOSS
+  deployment ships these regardless of what the tenant models.
+  A non-company tenant (research lab, robot fleet, city
+  government) exercises these the same way the brewery does.
+  **Tightest review bar: the five-property correctness protocol
+  is non-negotiable here.** Crates include `boss-core`,
+  `boss-events`, `boss-jobs`, `boss-policy`, `boss-gateway`,
+  `boss-dispatcher`, `boss-clock`, `boss-expr`, `boss-locations`,
+  the three taxonomy registries, `boss-calendar`,
+  `boss-content`, the ML stack, `boss-cybernetics`,
+  `boss-testing`, `boss-ports`, `boss-docs`, plus matching
+  `*-client` crates.
+
+- **`crates/modules/` — Tier 2: Company-modeling layer**
+  (16 crates). Useful for modeling a company on top of the
+  core. A non-company tenant can deploy without these. Same
+  hexagonal shape as Tier 1 (domain types + port + HTTP surface
+  + projection rebuilder) but the *concepts* are business-shaped,
+  not state-machine-shaped. Audit bar inherits the correctness
+  contracts of the core but domain-surface changes move at the
+  speed of the business. Crates: `boss-people`, `boss-accounts`,
+  `boss-commerce`, `boss-inventory`, `boss-shipping`,
+  `boss-ledger`, `boss-products`, `boss-messages`, `boss-catalog`,
+  `boss-assets`, plus matching `*-client` HTTP-contract crates and
+  `boss-ml-plugins`.
+
+- **`crates/orchestrators/` — Cross-tier orchestrators** (4).
+  Binaries that fan out across both tiers by design. The
+  Tier-1-must-not-depend-on-Tier-2 rule applies to **libraries**,
+  not orchestrators. An orchestrator's purpose IS to wire core
+  + module crates together. Same audit-bar status as Tier 1
+  (ships with every deployment) but inherently fan-out.
+  Crates: `boss-rebuild` (calls every domain rebuilder),
+  `boss-cli` (operator commands across domains),
+  `boss-sim` (synthetic event generator with tight domain-type
+  coupling), `boss-ml-api` (ML HTTP surface that loads
+  inference plugins from both tiers). Step side-effects are
+  owned by the core `boss-dispatcher` crate, which subscribes to
+  `step.done.<kind>` topics and runs data-driven rules.
+
+- **`crates/tenants/` — Tier 3: Tenants** (2). Tenant-specific
+  binaries. Crates: `boss-brewery-engine` (Algedonic Ales public
+  demo) and `boss-used-device-shop-engine` (used-device-shop).
+  Data-side seeds + JobKinds for the brewery tenant live under
+  `examples/brewery/`.
+
+The `infra/lint/tier-import-audit.sh` script enforces the
+Tier-1-can't-depend-on-Tier-2 rule (orchestrators excluded);
+runs cleanly today (0 violations across 27 core crates).
+
+Each domain crate has a matching `*-client` for cross-service
+HTTP calls + a `Pg*` adapter behind the `postgres` feature.
+
+### Style
+- `cargo fmt` — no exceptions
+- `cargo clippy -- -D warnings` — treat all warnings as errors
+- Edition 2024
+- Error handling: `thiserror` for library errors, `anyhow` for application/CLI errors
+- Serialization: `serde` + JSON for events and API boundaries
+- Async runtime: `tokio`
+- No `unwrap()` or `expect()` in library code — `Result` propagation only
+- `unwrap()` acceptable only in tests and CLI `main()`
+
+### Naming
+- Types: `PascalCase`
+- Functions/methods: `snake_case`
+- Constants: `SCREAMING_SNAKE_CASE`
+- Crate names: `boss-{name}` (kebab-case)
+- Module files: `snake_case.rs`
+
+### Patterns
+- Traits define ports: `trait EventStore`, `trait NotificationPort`
+- Adapters implement traits: `struct PostgresEventStore`
+- Constructor pattern: `Type::new(deps) -> Result<Self>`
+- Builder pattern for complex construction
+- Newtypes for domain IDs: `struct OrderId(Uuid)`
+
+---
+
+## TypeScript Conventions
+
+### Structure
+```
+apps/
+  web/            # Svelte 5 frontend (Bun + bun-plugin-svelte)
+```
+
+Type definitions that need to be shared between services live in
+the Rust crates and are translated to TypeScript at the HTTP
+boundary. There is no `libs/shared-types/` — every domain owns
+its own TS types under `apps/web/src/{domain}/types.ts`,
+and deserialization happens once at the fetch call site.
+
+### Style
+- Strict TypeScript — `strict: true`, no `any`
+- svelte-check on the client, `cargo fmt` + clippy on the Rust side
+- Svelte 5 with Runes (`$state`, `$derived`, `$effect`) — no stores
+- Prefer `type` over `interface` unless extending
+
+### Patterns
+- Discriminated unions for state: `type State = { kind: 'loading' } | { kind: 'ready', data: T }`
+- Props are `Readonly<{...}>`
+- No direct mutation — spread, `map`, `filter` to produce new state
+- Custom hooks extract logic from components
+- Co-locate: component + hook + types + test in same directory
+
+---
+
+## Testing — Test-Driven Development
+
+We practice TDD. Write the test first, watch it fail, then write the minimal code to make it pass.
+
+The full multi-layer strategy (compile-time → static lints → unit
+→ integration → replay-rebuild → continuous integrity in prod →
+formal proofs) is documented at
+[docs/design/testing-strategy.md](docs/design/testing-strategy.md).
+Read that to know which layer a new test belongs in.
+
+### TDD Workflow
+1. **Red** — Write a failing test that describes the behavior you want
+2. **Green** — Write the simplest code that makes the test pass
+3. **Refactor** — Clean up while keeping tests green
+
+### Rules
+- No production code without a failing test first
+- Tests are first-class code — they deserve the same care as production code
+- Unit tests live next to the code (`#[cfg(test)] mod tests` in Rust, `*.test.ts` co-located)
+- Integration tests in `tests/` directories
+- Test the domain through ports — never through adapters directly
+- No mocks unless unavoidable. Prefer in-memory adapter implementations.
+- Property-based testing for domain logic where applicable
+- Every bug fix starts with a test that reproduces the bug
+- If you can't write a test for it, reconsider the design
+
+---
+
+## Design docs
+
+When writing or editing a file under `docs/design/*.md`, follow the in-repo convention: open questions must be authored as `### Qn: <title>` subheadings (not numbered lists), so the in-app decision tracker parses stable anchors that survive reordering. If you skip this, the review workflow silently falls back to positional ids and the open questions you wrote don't show up in the UI.
+
+Resolutions flush into the source doc's Decision-history section via the tracker. Each release, settled material folds into [docs/architecture-decisions.md](docs/architecture-decisions.md) — the Baseline Architecture Decisions, the one current-truth decision record — and the flattened source doc is deleted. Docs that survive under `docs/design/` are living references (reading frames, contracts, governance rules), not decision archives.
+
+---
+
+## Git & Workflow
+
+- `main` is always deployable
+- Feature branches: `feat/{short-description}`
+- Fix branches: `fix/{short-description}`
+- Small PRs. If it's hard to review, it's too big.
+- Commit messages: imperative mood, concise. "Add order event schema" not "Added order event schema"
+
+---
+
+## What We Don't Do
+
+- No ORM magic — explicit queries, explicit mapping
+- No global mutable state
+- No inheritance hierarchies — composition via traits/interfaces
+- No "just in case" code — delete it; the working tree is the canonical record
+- No framework lock-in — frameworks are adapters, not architecture
+- No blocking I/O in async contexts
+- No bespoke workflow code paths — new work types are **JobKind rows**, not `match` branches in core code
+- No bespoke step UX in `apps/web` core — new surfaces ship as **StepPlugin rows + a JS bundle**
+- No tenant-specific assumptions in BOSS core — keep used-device-shop logic in the example crates

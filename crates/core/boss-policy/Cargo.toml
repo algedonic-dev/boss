@@ -1,0 +1,53 @@
+[package]
+name = "boss-policy"
+description = "Row-level authorization — rules, user overrides, scope predicates"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-policy-api"
+path = "src/bin/boss_policy_api.rs"
+required-features = ["postgres"]
+
+[[bin]]
+name = "boss-policy-bootstrap"
+path = "src/bin/boss_policy_bootstrap.rs"
+
+[features]
+# `postgres` ships in default so `cargo build --release --workspace`
+# produces /target/release/boss-policy-api with the postgres adapter.
+# No orchestrator depends on boss-policy with the postgres feature
+# enabled, so feature unification doesn't activate it → workspace
+# build silently produces an in-memory-only binary that fails on
+# startup. Same fix as boss-docs (postgres → default 2026-05-05).
+default = ["postgres"]
+postgres = ["dep:sqlx"]
+
+[dependencies]
+boss-core = { path = "../boss-core" }
+boss-ports = { path = "../boss-ports" }
+boss-policy-client = { path = "../boss-policy-client" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+axum = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+[dev-dependencies]
+boss-testing = { path = "../boss-testing", features = ["postgres"] }
+tower = { workspace = true }
+http-body-util = "0.1"
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
+
+[lints]
+workspace = true

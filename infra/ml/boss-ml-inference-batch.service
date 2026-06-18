@@ -1,0 +1,12 @@
+[Unit]
+Description=Boss ML — daily infer-batch trigger
+After=network-online.target boss-ml-api.service
+Requires=boss-ml-api.service
+
+[Service]
+Type=oneshot
+User=boss
+ExecStart=/opt/boss/infra/ml/run-inference-batch.sh
+Environment=BOSS_ML_API_URL=http://127.0.0.1:7070
+StandardOutput=journal
+StandardError=journal

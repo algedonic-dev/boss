@@ -1,0 +1,55 @@
+[package]
+name = "boss-gateway"
+description = "Boss gateway — reverse proxy, session auth, and file-backed credentials"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-gateway"
+path = "src/main.rs"
+
+[dependencies]
+boss-core = { path = "../boss-core" }
+boss-classes-client = { path = "../boss-classes-client" }
+boss-ports = { path = "../boss-ports" }
+anyhow = { workspace = true }
+axum = "0.8"
+rand = "0.10"
+chrono = { workspace = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
+futures = { workspace = true }
+bytes = "1"
+async-stream = "0.3"
+http-body-util = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hdrhistogram = "7"
+jsonwebtoken = "9"
+# Argon2id password hashing for the file-backed local-auth path.
+# PHC string format so the on-disk credentials file stays
+# portable across versions.
+argon2 = "0.5"
+# TOML for the credentials file format. workspace = true picks up
+# the same toml crate boss-jobs / boss-sim already use.
+toml = { workspace = true }
+
+[[bin]]
+# CLI for managing the local-auth credentials file. Used by the
+# OSS quickstart's bootstrap path + by operators onboarding new
+# users until the SPA admin UX lands.
+name = "boss-auth"
+path = "src/bin/boss_auth.rs"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

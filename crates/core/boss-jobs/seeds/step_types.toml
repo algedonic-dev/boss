@@ -1,0 +1,1788 @@
+# Step type catalog — the v1 alphabet of legal Step transitions.
+#
+# `boss_jobs::step_registry::StepRegistry::v1()` reads this file at
+# startup, deserializes the `[[step_type]]` blocks into StepType
+# rows, leaks the strings to `'static` (one-time, process-lifetime
+# leak), and caches them in a `OnceLock<Vec<StepType>>`.
+#
+# Adding a new step kind: append a `[[step_type]]` block here, then
+# rebuild + restart. No Rust changes required for the registry
+# itself — but new kinds whose completion should fire downstream
+# side effects need a matching dispatcher Handler registered in
+# `boss-dispatcher::rules::handlers::*` + a rule row in
+# `infra/dispatcher/rules.toml` listening on `step.done.<kind>`.
+#
+# Schema: see `crates/core/boss-jobs/src/step_registry.rs` —
+# `LoadedStepType` (the private serde mirror of `StepType`) and
+# `StepType` itself.
+#
+# Two contracts hold across every block:
+#
+#  - **Required-at-done, not required-at-create.** A field's
+#    `required = true` means the validator rejects the step
+#    flipping to `done` without it; the step can still exist on
+#    a Job with that field empty.
+#
+#  - **Pipe-shaped `field_type` strings must carry a `faker_hint`
+#    of the form `enum:a|b|c`.** Without it the sim's faker emits
+#    a generic string the validator rejects with 400. The lint
+#    `every_pipe_shaped_type_has_an_enum_faker_hint` enforces this.
+
+# =============================================================
+# Coordination
+# =============================================================
+
+[[step_type]]
+kind = "sign-off"
+surface = "approval"
+label = "Sign-off"
+category = "coordination"
+ux = "inline"
+version = 1
+description = "Authority agreement on a step in its current shape — approve/reject decisions and regulatory sign-offs. Stamps are collected via POST .../sign-offs; who must stamp is the step's sign_offs_required, policy decides who may."
+typical_duration_hours = 0.5
+typical_duration_jitter = 0.3
+required_roles = ["qa-supervisor", "service-mgr", "controller", "production-lead", "head-brewer"]
+
+  # The old per-metadata sign-off relics (authority_role / signed_by /
+  # signed_at) are gone: requirements live on the step
+  # (sign_offs_required) and attestations are stamps. The decision
+  # trio absorbed from the retired `approval` kind stays metadata —
+  # it is the CONTENT being agreed to, not the agreement itself.
+  [[step_type.fields]]
+  name = "decision"
+  field_type = "pending|approved|rejected|changes-requested"
+  required = false
+  description = "The decision this sign-off records"
+  faker_hint = "enum:pending|approved|rejected|changes-requested"
+
+  [[step_type.fields]]
+  name = "decided_at"
+  field_type = "date-time"
+  required = false
+  description = "When the decision was made"
+
+  [[step_type.fields]]
+  name = "comment"
+  field_type = "string"
+  required = false
+  description = "Reviewer comment"
+
+  [[step_type.fields]]
+  name = "threshold_cents"
+  field_type = "integer"
+  required = false
+  description = "Cents threshold triggering this approval"
+
+  [[step_type.fields]]
+  name = "currency"
+  field_type = "string"
+  required = false
+  description = "ISO-4217 currency for the threshold (default USD)"
+
+  [[step_type.fields]]
+  name = "certificate_id"
+  field_type = "string"
+  required = false
+  description = "Certificate or document reference"
+
+  [[step_type.fields]]
+  name = "regulatory_context"
+  field_type = "string"
+  required = false
+  description = "FDA, ISO, or other standard"
+
+[[step_type]]
+kind = "delegate-subjob"
+completion = "child-job"
+label = "Delegate Sub-job"
+category = "coordination"
+ux = "inline"
+version = 1
+description = """
+Delegation fork (JobKind v2 / D7): when this step becomes Ready it
+spawns a child Job of `subjob_kind` and pauses; when that child Job
+hits a terminal outcome the dispatcher writes the outcome back into
+`subjob_outcome` and flips this step to Completed. The structural
+parent-step → child-Job link rides on `Step.embedded_job`; the
+reverse link rides on the child Job's `metadata.parent_step_id`.
+Unlike the v1 `sub-job` step (a passive pointer an operator fills in),
+`delegate-subjob` is the active D6/D7 mechanism the dispatcher drives
+end-to-end — spawn on `step.ready.delegate-subjob`, resolve on the
+child's `jobs.job.closed`.
+"""
+typical_duration_jitter = 0.3
+required_roles = []
+
+  [[step_type.fields]]
+  name = "subjob_kind"
+  field_type = "string"
+  required = true
+  description = "Which child JobKind to spawn when this step becomes Ready"
+
+  [[step_type.fields]]
+  name = "subjob_outcome"
+  field_type = "string"
+  required = false
+  description = "Terminal outcome of the spawned child Job, written back by the dispatcher on close"
+
+[[step_type]]
+kind = "milestone"
+label = "Milestone"
+category = "coordination"
+ux = "inline"
+version = 1
+description = "Named checkpoint marking a phase complete."
+typical_duration_hours = 0.0
+typical_duration_jitter = 0.0
+required_roles = []
+
+[[step_type]]
+kind = "trigger"
+completion = "auto-on-materialize"
+label = "Job Trigger"
+category = "coordination"
+ux = "inline"
+version = 1
+description = """
+Opening signal — what caused this Job to exist. Periodic action,
+rate-based birth, counterparty re-emission, operator click. The
+trigger step auto-completes at Job-open time with metadata
+capturing the trigger source (e.g. trigger_kind=periodic,
+trigger_name=daily-ap-payment). Makes the "how did this Job
+start" question visible at the DAG instead of implicit in
+audit_log.
+"""
+typical_duration_hours = 0.0
+typical_duration_jitter = 0.0
+required_roles = []
+
+  [[step_type.fields]]
+  name = "trigger_kind"
+  field_type = "periodic|event|operator|counterparty"
+  required = false
+  description = "How the Job opened — automation, external event, human, or another Job"
+  faker_hint = "enum:periodic|event|operator|counterparty"
+
+  [[step_type.fields]]
+  name = "trigger_name"
+  field_type = "string"
+  required = false
+  description = "The specific trigger (periodic action name, event topic, operator id, source Job id)"
+
+[[step_type]]
+kind = "demand-gate"
+label = "Demand Gate"
+category = "operations"
+ux = "inline"
+version = 1
+description = """
+Decision gate: read finished-goods inventory and decide whether to
+run today's production batch. The `outcome` enum (brew | oversupply)
+is the fork discriminator the JobKind branches on — declaring it as
+an enum rather than free-text lets the viability lint prove the fork
+covers every outcome. Used by the brewery morning-brew family.
+"""
+typical_duration_hours = 0.25
+typical_duration_jitter = 0.3
+required_roles = ["head-brewer"]
+# Agent-executed: the dispatcher reads finished-goods stock and stamps the
+# brew/oversupply outcome at computer speed on step.ready, instead of the
+# gate waiting on a head-brewer to pull it (which throttled it at warp and
+# put a system decision inside the sim). See
+# docs/design/brewery-model-completeness.md. The role above is retained as
+# the human fallback / "who owns this" attribution.
+completion = "agent"
+
+  [[step_type.fields]]
+  name = "outcome"
+  field_type = "brew|oversupply"
+  required = true
+  description = "Brew-today decision — the outcome the JobKind forks on."
+  faker_hint = "enum:brew|oversupply"
+
+[[step_type]]
+kind = "availability-gate"
+label = "Availability Gate"
+category = "operations"
+ux = "inline"
+version = 1
+description = """
+Decision gate: read finished-goods inventory and decide whether an order
+can be fulfilled from stock now (fulfill) or must be backordered
+(backorder). The `outcome` enum is the fork discriminator the JobKind
+branches on. Agent-executed — the dispatcher reads real stock and stamps
+the outcome at computer speed on step.ready, no human in the loop. See
+docs/design/brewery-model-completeness.md.
+"""
+typical_duration_hours = 0.0
+typical_duration_jitter = 0.0
+required_roles = []
+completion = "agent"
+
+  [[step_type.fields]]
+  name = "outcome"
+  field_type = "fulfill|backorder"
+  required = true
+  description = "Fulfillment decision the JobKind forks on."
+  faker_hint = "enum:fulfill|backorder"
+
+  [[step_type.fields]]
+  name = "line_items"
+  field_type = "array"
+  required = false
+  description = "Order lines (sku + qty) checked against finished-goods stock."
+
+[[step_type]]
+kind = "outcome"
+label = "Job Outcome"
+category = "coordination"
+ux = "inline"
+version = 1
+description = """
+Terminal node — the JobKind's possible end states. Each `outcome`
+step represents one legal closure shape (completed, aborted,
+skipped, withdrawn). Exactly one outcome step lands Completed per
+Job; siblings are Aborted by the engine when the chosen outcome
+fires. Makes "how did this Job end" visible at the DAG instead
+of inferred from job.status alone.
+"""
+typical_duration_hours = 0.0
+typical_duration_jitter = 0.0
+required_roles = []
+
+  [[step_type.fields]]
+  name = "outcome_kind"
+  field_type = "completed|skipped|aborted|withdrawn"
+  required = false
+  description = "Which terminal state this outcome represents"
+  faker_hint = "enum:completed|skipped|aborted|withdrawn"
+
+  [[step_type.fields]]
+  name = "milestone_name"
+  field_type = "string"
+  required = false
+  description = "Name of the milestone"
+
+  [[step_type.fields]]
+  name = "criteria"
+  field_type = "string"
+  required = false
+  description = "Completion criteria"
+
+[[step_type]]
+kind = "checklist"
+label = "Checklist"
+category = "coordination"
+ux = "inline"
+version = 1
+description = "Set of sub-items to verify. All checked → auto-complete."
+typical_duration_hours = 1.0
+typical_duration_jitter = 0.4
+required_roles = ["shift-lead", "service-tech", "warehouse-lead"]
+
+  [[step_type.fields]]
+  name = "items"
+  field_type = "array"
+  required = true
+  description = "Checklist items [{label, checked, checked_by, checked_at}]"
+
+[[step_type]]
+kind = "handoff"
+surface = "handoff"
+label = "Handoff"
+category = "coordination"
+ux = "inline"
+version = 1
+description = "Transfer responsibility between teams or locations."
+typical_duration_hours = 0.5
+typical_duration_jitter = 0.3
+required_roles = ["shift-lead", "warehouse-lead", "packaging-lead", "service-tech"]
+
+  [[step_type.fields]]
+  name = "from_id"
+  field_type = "string"
+  required = true
+  description = "Person or team handing off"
+
+  [[step_type.fields]]
+  name = "to_id"
+  field_type = "string"
+  required = true
+  description = "Person or team receiving"
+
+  [[step_type.fields]]
+  name = "from_confirmed"
+  field_type = "boolean"
+  required = false
+  description = "Sender confirmed"
+
+  [[step_type.fields]]
+  name = "to_confirmed"
+  field_type = "boolean"
+  required = false
+  description = "Receiver confirmed"
+
+  [[step_type.fields]]
+  name = "items"
+  field_type = "array"
+  required = false
+  description = "Items being transferred"
+
+  [[step_type.fields]]
+  name = "location_from"
+  field_type = "string"
+  required = false
+  description = "Origin location"
+
+  [[step_type.fields]]
+  name = "location_to"
+  field_type = "string"
+  required = false
+  description = "Destination location"
+
+# =============================================================
+# Operations
+# =============================================================
+
+[[step_type]]
+kind = "repair"
+surface = "repair"
+label = "Repair"
+category = "operations"
+ux = "full-screen"
+version = 1
+description = "Physical repair, assembly, or calibration work."
+typical_duration_hours = 8.0
+typical_duration_jitter = 0.5
+required_roles = ["mechanic", "electrician", "service-tech"]
+
+  [[step_type.fields]]
+  name = "asset_id"
+  field_type = "string"
+  required = false
+  description = "System being repaired"
+
+  [[step_type.fields]]
+  name = "labor_hours"
+  field_type = "number"
+  required = false
+  description = "Hours of labor"
+
+  [[step_type.fields]]
+  name = "parts_consumed"
+  field_type = "array"
+  required = false
+  description = "Parts used [{sku, qty, from_bin}]"
+
+  [[step_type.fields]]
+  name = "failure_mode_code"
+  field_type = "string"
+  required = false
+  description = "KB failure mode code"
+
+  [[step_type.fields]]
+  name = "work_notes"
+  field_type = "string"
+  required = false
+  description = "Technician notes"
+
+  [[step_type.fields]]
+  name = "photos"
+  field_type = "array"
+  required = false
+  description = "Photo URLs"
+
+  [[step_type.fields]]
+  name = "bench_id"
+  field_type = "string"
+  required = false
+  description = "Work bench identifier"
+
+  # Repair steps drain service parts via the same handler that
+  # morning-brew uses for ingredients — the handler accepts the
+  # `parts_consumed` alias so both step kinds reuse one plugin.
+[[step_type]]
+kind = "inspection"
+surface = "inspection"
+label = "Inspection"
+category = "operations"
+ux = "full-screen"
+version = 1
+description = "QA check, triage, or preventive maintenance verification with measurements."
+typical_duration_hours = 1.5
+typical_duration_jitter = 0.4
+required_roles = ["qa-tech", "lab-tech", "qa-supervisor"]
+
+  [[step_type.fields]]
+  name = "asset_id"
+  field_type = "string"
+  required = false
+  description = "System being inspected"
+
+  [[step_type.fields]]
+  name = "measurements"
+  field_type = "array"
+  required = false
+  description = "Readings [{name, value, unit, tolerance_min, tolerance_max, pass}]"
+
+  [[step_type.fields]]
+  name = "overall_result"
+  field_type = "pass|fail|conditional"
+  required = false
+  description = "Overall inspection result"
+  faker_hint = "enum:pass|fail|conditional"
+
+  [[step_type.fields]]
+  name = "certificate_id"
+  field_type = "string"
+  required = false
+  description = "Certificate issued on pass"
+
+  [[step_type.fields]]
+  name = "inspector_notes"
+  field_type = "string"
+  required = false
+  description = "Inspector notes"
+
+  [[step_type.fields]]
+  name = "calibration_due"
+  field_type = "date"
+  required = false
+  description = "Next calibration due date"
+
+[[step_type]]
+kind = "receiving"
+surface = "receiving"
+label = "Receiving"
+category = "operations"
+ux = "expanded"
+version = 1
+description = "Goods receipt — confirm arrival against a PO."
+# Realistic vendor lead time: PO place → delivery is days, not
+# hours. Bumped from 0.5h so POs spend meaningful time in
+# `submitted` / `in-transit` status before flipping to `received`
+# (the open-PO visibility issue from #131).
+typical_duration_hours = 120.0
+typical_duration_jitter = 0.4
+required_roles = ["inventory-clerk", "shipping-clerk", "warehouse-lead"]
+
+  [[step_type.fields]]
+  name = "po_id"
+  field_type = "string"
+  required = false
+  description = "Purchase order reference"
+
+  [[step_type.fields]]
+  name = "expected_items"
+  field_type = "array"
+  required = false
+  description = "Expected items [{sku, expected_qty, received_qty}]"
+
+  [[step_type.fields]]
+  name = "received_date"
+  field_type = "date"
+  required = false
+  description = "Date goods received"
+
+  [[step_type.fields]]
+  name = "discrepancy_notes"
+  field_type = "string"
+  required = false
+  description = "Notes on discrepancies"
+
+  # Step.done refills inventory and flips the PO to received.
+[[step_type]]
+kind = "intake"
+surface = "intake"
+label = "Intake"
+category = "operations"
+ux = "expanded"
+version = 1
+description = "Physical-unit intake — log arrival of a system and open its refurb lineage."
+typical_duration_hours = 0.25
+typical_duration_jitter = 0.3
+required_roles = ["inventory-clerk", "service-tech", "shipping-clerk"]
+
+  [[step_type.fields]]
+  name = "asset_id"
+  field_type = "string"
+  required = true
+  description = "Boss system id assigned at intake"
+
+  [[step_type.fields]]
+  name = "oem_serial"
+  field_type = "string"
+  required = false
+  description = "OEM factory serial on the chassis"
+
+  [[step_type.fields]]
+  name = "source"
+  field_type = "used-trade-in|buyback|returned-lease|oem-new"
+  required = false
+  description = "How the unit arrived"
+  faker_hint = "enum:used-trade-in|buyback|returned-lease|oem-new"
+
+  [[step_type.fields]]
+  name = "condition_notes"
+  field_type = "string"
+  required = false
+  description = "Receiving-tech observations"
+
+  [[step_type.fields]]
+  name = "bin"
+  field_type = "string"
+  required = false
+  description = "Bin or rack the unit is staged in"
+
+# =============================================================
+# Commercial
+# =============================================================
+
+[[step_type]]
+kind = "outreach"
+label = "Outreach"
+category = "commercial"
+ux = "expanded"
+version = 1
+description = "Communication to a account, vendor, or contact."
+# Real outreach: compose, send, wait for response. Cold-touch
+# response cycles in B2B are 24-48h in a healthy pipeline.
+typical_duration_hours = 24.0
+typical_duration_jitter = 0.5
+required_roles = ["sales-rep", "account-manager", "sales-lead"]
+
+  [[step_type.fields]]
+  name = "channel"
+  field_type = "email|phone|meeting|demo|other"
+  required = true
+  description = "Communication channel"
+  faker_hint = "enum:email|phone|meeting|demo|other"
+
+  [[step_type.fields]]
+  name = "recipient_id"
+  field_type = "string"
+  required = true
+  description = "Recipient identifier"
+
+  [[step_type.fields]]
+  name = "recipient_type"
+  field_type = "account|vendor|contact"
+  required = false
+  description = "Recipient entity type"
+  faker_hint = "enum:account|vendor|contact"
+
+  [[step_type.fields]]
+  name = "subject"
+  field_type = "string"
+  required = false
+  description = "Subject or topic"
+
+  [[step_type.fields]]
+  name = "body"
+  field_type = "string"
+  required = false
+  description = "Message body"
+
+  [[step_type.fields]]
+  name = "sent_at"
+  field_type = "date-time"
+  required = false
+  description = "When sent"
+
+  [[step_type.fields]]
+  name = "response_received"
+  field_type = "boolean"
+  required = false
+  description = "Whether a response was received"
+
+  [[step_type.fields]]
+  name = "response_summary"
+  field_type = "string"
+  required = false
+  description = "Summary of response"
+
+  [[step_type.fields]]
+  name = "follow_up_date"
+  field_type = "date"
+  required = false
+  description = "Scheduled follow-up"
+
+[[step_type]]
+kind = "qualification"
+label = "Qualification"
+category = "commercial"
+ux = "expanded"
+version = 1
+description = "Evaluate a lead or opportunity against criteria."
+# Quals span a few days of discovery in a B2B context.
+typical_duration_hours = 48.0
+typical_duration_jitter = 0.5
+required_roles = ["sales-rep", "account-manager", "sales-lead"]
+
+  [[step_type.fields]]
+  name = "opportunity_id"
+  field_type = "string"
+  required = false
+  description = "Linked opportunity"
+
+  [[step_type.fields]]
+  name = "criteria"
+  field_type = "array"
+  required = false
+  description = "Criteria [{name, met, notes}]"
+
+  [[step_type.fields]]
+  name = "qualified"
+  field_type = "boolean"
+  required = false
+  description = "Overall qualification result"
+
+  [[step_type.fields]]
+  name = "disqualify_reason"
+  field_type = "string"
+  required = false
+  description = "Reason if disqualified"
+
+[[step_type]]
+kind = "quote"
+label = "Quote"
+category = "commercial"
+ux = "full-screen"
+version = 1
+description = "Prepare and deliver a pricing proposal."
+typical_duration_hours = 4.0
+typical_duration_jitter = 0.5
+required_roles = ["sales-rep", "account-manager", "sales-lead"]
+
+  [[step_type.fields]]
+  name = "account_id"
+  field_type = "string"
+  required = true
+  description = "Account receiving the quote"
+
+  [[step_type.fields]]
+  name = "line_items"
+  field_type = "array"
+  required = false
+  description = "Quote lines [{sku, description, qty, unit_price_cents, currency, discount_pct}]"
+
+  [[step_type.fields]]
+  name = "total_cents"
+  field_type = "integer"
+  required = false
+  description = "Total quote amount in cents"
+
+  [[step_type.fields]]
+  name = "currency"
+  field_type = "string"
+  required = false
+  description = "ISO-4217 currency for the total (default USD)"
+
+  [[step_type.fields]]
+  name = "valid_through"
+  field_type = "date"
+  required = false
+  description = "Quote expiry date"
+
+  [[step_type.fields]]
+  name = "sent_at"
+  field_type = "date-time"
+  required = false
+  description = "When sent to account"
+
+  [[step_type.fields]]
+  name = "accepted"
+  field_type = "boolean"
+  required = false
+  description = "Whether accepted"
+
+[[step_type]]
+kind = "billing"
+surface = "billing"
+label = "Billing"
+category = "commercial"
+ux = "expanded"
+version = 1
+description = "Issue an invoice or financial transaction."
+# Real billing: pull line items, reconcile, send. Typically a
+# few hours but not minutes.
+typical_duration_hours = 4.0
+typical_duration_jitter = 0.4
+required_roles = ["ar-clerk", "bookkeeper"]
+# Agent-executed: issuing an invoice is software, not human labor — the
+# dispatcher auto-completes it on step.ready (the JobKind defaults the
+# required account_id / amount_cents / currency / line_items) and the
+# invoice-issue side-effect fires on step.done.billing as before. See
+# docs/design/brewery-model-completeness.md.
+completion = "agent"
+
+  [[step_type.fields]]
+  name = "invoice_id"
+  field_type = "string"
+  required = false
+  description = "Linked invoice"
+  faker_hint = "id-ref:invoice"
+
+  [[step_type.fields]]
+  name = "account_id"
+  field_type = "string"
+  required = true
+  description = "Billed account"
+
+  [[step_type.fields]]
+  name = "amount_cents"
+  field_type = "integer"
+  required = true
+  description = "Invoice amount in cents"
+
+  [[step_type.fields]]
+  name = "currency"
+  field_type = "string"
+  required = true
+  description = "ISO-4217 currency for the amount (e.g. USD)"
+
+  [[step_type.fields]]
+  name = "category"
+  field_type = "new-sales|used-sales|service|parts|contracts"
+  required = false
+  description = "Revenue category"
+  faker_hint = "enum:new-sales|used-sales|service|parts|contracts"
+
+  [[step_type.fields]]
+  name = "reference_id"
+  field_type = "string"
+  required = false
+  description = "Reference (PO, ticket, agreement)"
+  faker_hint = "id-ref:ref"
+
+  [[step_type.fields]]
+  name = "issued_at"
+  field_type = "date-time"
+  required = false
+  description = "When issued"
+
+  [[step_type.fields]]
+  name = "line_items"
+  field_type = "array"
+  required = false
+  description = "Per-line breakdown [{amount_cents, revenue_category, description, ref_id}]; the commerce side-effect emits the invoice from this"
+
+  # Closes the GL gap: the billing step's done transition
+  # emits an Invoice through SimOutput::emit_invoice. The
+  # live API path POSTs to /api/commerce/invoices/create.
+[[step_type]]
+kind = "bill-approval"
+label = "Bill Approval"
+category = "commercial"
+ux = "expanded"
+version = 1
+description = "Approve a vendor bill for payment."
+# Real bill approval: 3-way match against PO + receipt, GL coding,
+# controller review. Half a day in normal operations.
+typical_duration_hours = 12.0
+typical_duration_jitter = 0.4
+required_roles = ["controller", "ap-clerk", "bookkeeper"]
+
+  [[step_type.fields]]
+  name = "vendor_id"
+  field_type = "string"
+  required = true
+  description = "Billing vendor"
+
+  [[step_type.fields]]
+  name = "po_id"
+  field_type = "string"
+  required = true
+  description = "Originating purchase order"
+
+  [[step_type.fields]]
+  name = "amount_cents"
+  field_type = "integer"
+  required = true
+  description = "Bill amount in cents"
+
+  [[step_type.fields]]
+  name = "currency"
+  field_type = "string"
+  required = false
+  description = "ISO-4217 currency (defaults to USD)"
+
+  [[step_type.fields]]
+  name = "vendor_invoice_no"
+  field_type = "string"
+  required = false
+  description = "Vendor's own invoice number (defaults to a step-derived id)"
+
+[[step_type]]
+kind = "bill-payment-batch"
+label = "Bill Payment Batch"
+category = "commercial"
+ux = "expanded"
+version = 1
+description = "Settle every approved vendor invoice on the run date — one HTTP batch."
+typical_duration_hours = 0.5
+typical_duration_jitter = 0.3
+required_roles = ["controller", "ap-clerk", "bookkeeper"]
+
+  [[step_type.fields]]
+  name = "paid_on"
+  field_type = "date"
+  required = false
+  description = "Settlement date (defaults to ctx.day)"
+
+  [[step_type.fields]]
+  name = "payment_method"
+  field_type = "string"
+  required = false
+  description = "ACH / check / wire — informational only"
+
+  [[step_type.fields]]
+  name = "check_run_id"
+  field_type = "string"
+  required = false
+  description = "Bank-side run identifier"
+
+  [[step_type.fields]]
+  name = "invoices_to_pay"
+  field_type = "array"
+  required = false
+  description = "Reserved for future per-invoice selection (unused today — the batch endpoint settles every approved invoice)"
+
+  # General operating bills (rent, utilities, insurance, services, …) owned
+  # by the ledger — NOT the inventory parts vendor-invoice. The free-text
+  # `bill_category` routes the GL debit via bill_accounts.toml; the credit is
+  # always 2100 A/P. Drives the `ledger.bill.approve` dispatcher handler
+  # (POST /api/ledger/bills). Adding a new kind of spend is a JobKind writing
+  # a `bill_category` + a bill_accounts.toml row — zero code.
+[[step_type]]
+kind = "expense-bill"
+label = "Expense Bill"
+category = "commercial"
+ux = "expanded"
+version = 1
+description = "Approve a general operating bill (rent, utilities, …) — routed to a GL expense account by its bill_category. Posts DR <category> / CR 2100 A/P."
+# An approval task: code the category, sanity-check the amount, sign off.
+# Lighter than bill-approval's 3-way PO match — there's no receipt to match.
+typical_duration_hours = 4.0
+typical_duration_jitter = 0.4
+required_roles = ["bookkeeper", "ap-clerk", "controller"]
+
+  [[step_type.fields]]
+  name = "bill_category"
+  field_type = "string"
+  required = true
+  description = "Spend category (rent, utilities, insurance, …) — routed to a GL debit account by bill_accounts.toml"
+
+  [[step_type.fields]]
+  name = "amount_cents"
+  field_type = "integer"
+  required = true
+  description = "Bill amount in cents"
+
+  [[step_type.fields]]
+  name = "vendor"
+  field_type = "string"
+  required = false
+  description = "Billing vendor (defaults to the Job's subject)"
+
+  [[step_type.fields]]
+  name = "currency"
+  field_type = "string"
+  required = false
+  description = "ISO-4217 currency (defaults to USD)"
+
+  # Settles every approved ledger bill on the run date — one HTTP batch.
+  # Drives `ledger.bill.payment_batch` (POST /api/ledger/bills/pay-run),
+  # posting DR 2100 A/P / CR 1000 Cash per bill.
+[[step_type]]
+kind = "expense-bill-payment"
+label = "Expense Bill Payment"
+category = "commercial"
+ux = "expanded"
+version = 1
+description = "Settle every approved ledger bill on the run date — one HTTP batch. Posts DR 2100 A/P / CR 1000 Cash per bill."
+typical_duration_hours = 0.5
+typical_duration_jitter = 0.3
+required_roles = ["bookkeeper", "ap-clerk", "controller"]
+
+  [[step_type.fields]]
+  name = "paid_on"
+  field_type = "date"
+  required = false
+  description = "Settlement date (defaults to the clock's now)"
+
+  [[step_type.fields]]
+  name = "payment_method"
+  field_type = "string"
+  required = false
+  description = "ACH / check / wire — informational only"
+
+[[step_type]]
+kind = "tax-remittance"
+label = "Tax Remittance"
+category = "commercial"
+ux = "expanded"
+version = 1
+description = "Submit and remit a tax filing for a closed period."
+typical_duration_hours = 1.0
+typical_duration_jitter = 0.4
+required_roles = ["bookkeeper"]
+
+  [[step_type.fields]]
+  name = "kind"
+  field_type = "sales|income|payroll_941|payroll_940|excise"
+  required = true
+  description = "Tax kind"
+  faker_hint = "enum:sales|income|payroll_941|payroll_940|excise"
+
+  [[step_type.fields]]
+  name = "jurisdiction"
+  field_type = "string"
+  required = true
+  description = "Filing jurisdiction (US-CA, US-FEDERAL, …)"
+
+  # period_start / period_end / amount_cents removed from the
+  # tax-remittance field schema: the ledger-sim-bridge fills
+  # period from `quarter_prior_to(ctx.day)` and `derive_basis`
+  # computes amount from the actual liability-account credit
+  # balance over the period. Synthesizing random dates here
+  # produced period_end < period_start failures every quarter
+  # (the faker is independent per field). JobKind authors that
+  # need a custom period override via metadata_defaults; the
+  # bridge respects whatever is set there.
+
+[[step_type]]
+kind = "payroll-release"
+label = "Payroll Release"
+category = "commercial"
+ux = "expanded"
+version = 1
+description = "Release a closed payroll period — server-side synthesis from the live employee roster, then post the compound journal entry."
+typical_duration_hours = 0.5
+typical_duration_jitter = 0.3
+required_roles = ["bookkeeper"]
+
+  [[step_type.fields]]
+  name = "period_start"
+  field_type = "date"
+  required = true
+  description = "Payroll period start"
+
+  [[step_type.fields]]
+  name = "period_end"
+  field_type = "date"
+  required = true
+  description = "Payroll period end"
+
+  [[step_type.fields]]
+  name = "run_date"
+  field_type = "date"
+  required = false
+  description = "Effective run date — defaults to the day the step ran"
+
+# =============================================================
+# Operations (production)
+# =============================================================
+
+[[step_type]]
+kind = "production-consume"
+surface = "production-consume"
+label = "Production Consumption"
+category = "operations"
+ux = "expanded"
+version = 1
+description = "Drain raw ingredients consumed by a production batch."
+typical_duration_hours = 0.1
+typical_duration_jitter = 0.2
+required_roles = ["production-tech", "production-lead", "brewer", "head-brewer"]
+
+  [[step_type.fields]]
+  name = "ingredients_consumed"
+  field_type = "array"
+  required = true
+  description = "Drawdowns [{part_sku, qty}]; the inventory side-effect decrements each"
+
+  [[step_type.fields]]
+  name = "batch_id"
+  field_type = "string"
+  required = false
+  description = "Brew batch identifier"
+
+[[step_type]]
+kind = "production-produce"
+label = "Production Output"
+category = "operations"
+ux = "expanded"
+version = 1
+description = "Mint finished product from a production batch — the brewing line's last step packages the brew into kegs / cans / bottles. The done-transition fires `products.produce` and the boss-products API increments finished_product_inventory at the producing location."
+typical_duration_hours = 0.1
+typical_duration_jitter = 0.2
+required_roles = ["production-tech", "production-lead", "packaging-tech", "brewer", "head-brewer"]
+
+  [[step_type.fields]]
+  name = "produces_products"
+  field_type = "array"
+  required = true
+  description = "Outputs [{sku, qty, location_id}]; the products side-effect increments each via POST /api/products/{sku}/inventory/produce"
+
+  [[step_type.fields]]
+  name = "batch_id"
+  field_type = "string"
+  required = false
+  description = "Brew batch identifier"
+
+  # Packaging consumables (CO2, keg fills) draw down when the brew
+  # is packaged. Shares the same parts.consume handler the
+  # production-consume step uses — it tolerates missing arrays
+  # so production-produce steps without packaging metadata
+  # silently no-op.
+# =============================================================
+# Operations (HR)
+# =============================================================
+
+[[step_type]]
+kind = "hr-hire"
+label = "HR — Hire"
+category = "operations"
+ux = "expanded"
+version = 1
+description = "Onboarding sign-off step. Done-transition fires `people.hire`, which POSTs the new-hire payload to /api/people. Hiring-manager approval is per-JobKind via authority_role metadata; required_roles here is the generic assignee pool."
+typical_duration_hours = 1.0
+typical_duration_jitter = 0.5
+required_roles = ["head-of-people", "hr-generalist"]
+
+  [[step_type.fields]]
+  name = "hire"
+  field_type = "object"
+  required = true
+  description = "{ id, name, role, department, location, email, hire_date, employment_type, annual_salary_cents, manager_id }"
+
+[[step_type]]
+kind = "hr-terminate"
+label = "HR — Terminate"
+category = "operations"
+ux = "expanded"
+version = 1
+description = "Offboarding sign-off step. Done-transition fires `people.terminate`, which PUTs status=terminated to /api/people/{id}/status. Used by brewery-terminate."
+typical_duration_hours = 0.5
+typical_duration_jitter = 0.3
+required_roles = ["head-of-people"]
+
+  [[step_type.fields]]
+  name = "terminate"
+  field_type = "object"
+  required = true
+  description = "{ id, reason, last_day }"
+
+# =============================================================
+# Logistics
+# =============================================================
+
+[[step_type]]
+kind = "procurement"
+surface = "procurement"
+label = "Procurement"
+category = "logistics"
+ux = "expanded"
+version = 1
+description = "Order parts, materials, or services from a vendor."
+# PO authoring + vendor approval takes hours, not minutes. Plus
+# real vendors don't ship same-day. The full "PO placed →
+# vendor acknowledged" lag is 4-8h in normal operations.
+typical_duration_hours = 6.0
+typical_duration_jitter = 0.4
+required_roles = ["inventory-clerk", "warehouse-lead", "controller"]
+
+  [[step_type.fields]]
+  name = "vendor_id"
+  field_type = "string"
+  required = false
+  description = "Vendor identifier"
+
+  [[step_type.fields]]
+  name = "items"
+  field_type = "array"
+  required = false
+  description = "Items to procure [{sku, qty, unit_cost_cents, currency}]"
+
+  [[step_type.fields]]
+  name = "po_id"
+  field_type = "string"
+  required = false
+  description = "Generated PO identifier"
+
+  [[step_type.fields]]
+  name = "expected_date"
+  field_type = "date"
+  required = false
+  description = "Expected delivery date"
+
+  [[step_type.fields]]
+  name = "received_date"
+  field_type = "date"
+  required = false
+  description = "Actual receipt date"
+
+  [[step_type.fields]]
+  name = "urgency"
+  field_type = "routine|expedite|emergency"
+  required = false
+  description = "Procurement urgency"
+  faker_hint = "enum:routine|expedite|emergency"
+
+[[step_type]]
+kind = "shipment"
+surface = "shipment"
+label = "Shipment"
+category = "logistics"
+ux = "expanded"
+version = 1
+description = "Move physical assets between locations."
+# Real wholesale shipment: pick → label → freight pickup → transit
+# → delivery is 24-48h. Bumped from 0.5h so the shipments view
+# carries enough "in-transit" volume to be informative.
+typical_duration_hours = 36.0
+typical_duration_jitter = 0.4
+required_roles = ["shipping-clerk", "warehouse-lead", "distribution-lead"]
+
+  [[step_type.fields]]
+  name = "direction"
+  field_type = "inbound|outbound"
+  required = true
+  description = "Shipment direction"
+  faker_hint = "enum:inbound|outbound"
+
+  [[step_type.fields]]
+  name = "origin"
+  field_type = "string"
+  required = true
+  description = "Origin location"
+
+  [[step_type.fields]]
+  name = "destination"
+  field_type = "string"
+  required = true
+  description = "Destination location"
+
+  # Carrier is a closed enum (mirrors boss_shipping::types::Carrier);
+  # the sim faker honours the `enum:` hint so it picks a valid
+  # value instead of a random string the API would 422.
+  [[step_type.fields]]
+  name = "carrier"
+  field_type = "fedex|ups|freight|local-pickup"
+  required = false
+  description = "Carrier"
+  faker_hint = "enum:fedex|ups|freight|local-pickup"
+
+  [[step_type.fields]]
+  name = "tracking_number"
+  field_type = "string"
+  required = false
+  description = "Tracking number"
+
+  [[step_type.fields]]
+  name = "items"
+  field_type = "array"
+  required = false
+  description = "Items being shipped [{id, type, description}]"
+
+  [[step_type.fields]]
+  name = "shipped_date"
+  field_type = "date"
+  required = false
+  description = "Ship date"
+
+  [[step_type.fields]]
+  name = "estimated_delivery"
+  field_type = "date"
+  required = false
+  description = "ETA"
+
+  [[step_type.fields]]
+  name = "delivered_date"
+  field_type = "date"
+  required = false
+  description = "Delivery confirmation date"
+
+  # Step.done creates the shipments row, decrements raw parts
+  # stock from `line_items` (or `parts_consumed`) when present,
+  # and decrements finished-product on-hand for
+  # `consumes_products` rows. Missing/empty arrays no-op.
+[[step_type]]
+kind = "scheduling"
+surface = "scheduling"
+label = "Scheduling"
+category = "logistics"
+ux = "full-screen"
+version = 1
+description = "Coordinate people, systems, and locations for a time."
+typical_duration_hours = 0.25
+typical_duration_jitter = 0.3
+required_roles = ["distribution-lead", "shift-lead", "service-mgr"]
+
+  [[step_type.fields]]
+  name = "location"
+  field_type = "string"
+  required = true
+  description = "Location"
+
+  [[step_type.fields]]
+  name = "scheduled_at"
+  field_type = "date-time"
+  required = true
+  description = "Scheduled date/time"
+
+  [[step_type.fields]]
+  name = "duration_minutes"
+  field_type = "integer"
+  required = false
+  description = "Duration in minutes"
+
+  [[step_type.fields]]
+  name = "attendees"
+  field_type = "array"
+  required = false
+  description = "Attendees [{id, role, confirmed}]"
+
+  [[step_type.fields]]
+  name = "resources"
+  field_type = "array"
+  required = false
+  description = "Resources [{id, type}]"
+
+  [[step_type.fields]]
+  name = "calendar_event_id"
+  field_type = "string"
+  required = false
+  description = "External calendar event ID"
+
+# =============================================================
+# Admin
+# =============================================================
+
+[[step_type]]
+kind = "task"
+label = "Task"
+category = "admin"
+ux = "inline"
+version = 1
+description = "Simple assigned task for HR, IT, admin."
+typical_duration_jitter = 0.3
+required_roles = []
+
+  [[step_type.fields]]
+  name = "category"
+  field_type = "string"
+  required = false
+  description = "Task category"
+
+  [[step_type.fields]]
+  name = "instructions"
+  field_type = "string"
+  required = false
+  description = "Instructions"
+
+  [[step_type.fields]]
+  name = "due_date"
+  field_type = "date"
+  required = false
+  description = "Due date"
+
+[[step_type]]
+kind = "acknowledgment"
+label = "Acknowledgment"
+category = "admin"
+ux = "inline"
+version = 1
+description = "Confirm receipt or understanding of a policy or document."
+typical_duration_hours = 0.25
+typical_duration_jitter = 0.5
+required_roles = ["sales-rep", "service-tech", "shift-lead"]
+
+  [[step_type.fields]]
+  name = "document_title"
+  field_type = "string"
+  required = true
+  description = "Document being acknowledged"
+
+  [[step_type.fields]]
+  name = "document_url"
+  field_type = "uri"
+  required = false
+  description = "Document URL"
+
+  [[step_type.fields]]
+  name = "acknowledged_at"
+  field_type = "date-time"
+  required = false
+  description = "When acknowledged"
+
+[[step_type]]
+kind = "marketing-brief"
+label = "Marketing Brief"
+category = "admin"
+ux = "expanded"
+version = 1
+description = "Cross-department alignment brief with a body, target audience, and per-employee acknowledgement tracker. Used early in marketing motions when a campaign or launch needs explicit sign-off from each adjacent function (sales, support, ops) before downstream work fans out."
+typical_duration_hours = 2.0
+typical_duration_jitter = 0.5
+required_roles = ["brand-manager", "head-of-marketing"]
+
+  [[step_type.fields]]
+  name = "brief_md"
+  field_type = "string"
+  required = false
+  description = "Markdown body of the brief"
+
+  [[step_type.fields]]
+  name = "audience"
+  field_type = "array"
+  required = false
+  description = "Employee IDs in scope"
+
+  [[step_type.fields]]
+  name = "circulated_at"
+  field_type = "date-time"
+  required = false
+  description = "When the brief was sent out"
+
+  [[step_type.fields]]
+  name = "acknowledgements"
+  field_type = "array"
+  required = false
+  description = "{employee_id, acknowledged_at} rows"
+
+[[step_type]]
+kind = "sr-triage"
+label = "SR Triage"
+category = "operations"
+ux = "expanded"
+version = 1
+description = "Service-request diagnostic triage — confirm failure mode and decide between dispatch, remote, or parts-only resolution. Used at the front of any field-service or break-fix workflow where a triage outcome shapes the rest of the step graph."
+typical_duration_hours = 0.5
+typical_duration_jitter = 0.5
+required_roles = ["service-mgr", "qa-supervisor"]
+
+  [[step_type.fields]]
+  name = "account_id"
+  field_type = "string"
+  required = true
+  description = "Requesting account"
+
+  [[step_type.fields]]
+  name = "device_serial"
+  field_type = "string"
+  required = true
+  description = "Device serial"
+
+  [[step_type.fields]]
+  name = "failure_description"
+  field_type = "string"
+  required = true
+  description = "Failure description"
+
+  [[step_type.fields]]
+  name = "priority"
+  field_type = "string"
+  required = true
+  description = "Priority tier"
+
+  [[step_type.fields]]
+  name = "intake_channel"
+  field_type = "phone|email|web|walk-in"
+  required = false
+  description = "Intake channel"
+  faker_hint = "enum:phone|email|web|walk-in"
+
+  [[step_type.fields]]
+  name = "requester_contact_id"
+  field_type = "string"
+  required = false
+  description = "Account contact who requested"
+
+  [[step_type.fields]]
+  name = "jira_issue_key"
+  field_type = "string"
+  required = false
+  description = "Ops # / Jira issue key (optional)"
+
+  [[step_type.fields]]
+  name = "triage_outcome"
+  field_type = "dispatch|remote|parts-only"
+  required = false
+  description = "Triage decision"
+  faker_hint = "enum:dispatch|remote|parts-only"
+
+[[step_type]]
+kind = "diagnostic-call"
+label = "Diagnostic Call"
+category = "operations"
+ux = "expanded"
+version = 1
+description = "Scheduled video/phone session with an account contact to diagnose a failure or walk through a fix. Carries the call's channel, join URL, attendees, and the technician's outcome notes so the parent Job inherits the diagnosis decision."
+typical_duration_hours = 0.5
+typical_duration_jitter = 0.3
+required_roles = ["service-tech", "service-mgr"]
+
+  [[step_type.fields]]
+  name = "scheduled_for"
+  field_type = "date-time"
+  required = false
+  description = "When the call is scheduled"
+
+  [[step_type.fields]]
+  name = "channel"
+  field_type = "zoom|teams|meet|phone|other"
+  required = false
+  description = "Call channel"
+  faker_hint = "enum:zoom|teams|meet|phone|other"
+
+  [[step_type.fields]]
+  name = "join_url"
+  field_type = "uri"
+  required = false
+  description = "Join URL"
+
+  [[step_type.fields]]
+  name = "attendees"
+  field_type = "array"
+  required = false
+  description = "Attendee list"
+
+  [[step_type.fields]]
+  name = "notes_md"
+  field_type = "string"
+  required = false
+  description = "Tech's notes during/after the call"
+
+  [[step_type.fields]]
+  name = "recording_url"
+  field_type = "uri"
+  required = false
+  description = "Recording URL (manually pasted for v1)"
+
+  [[step_type.fields]]
+  name = "transcript_url"
+  field_type = "uri"
+  required = false
+  description = "Transcript URL"
+
+  [[step_type.fields]]
+  name = "ended_at"
+  field_type = "date-time"
+  required = false
+  description = "Call end time"
+
+  [[step_type.fields]]
+  name = "outcome"
+  field_type = "string"
+  required = false
+  description = "Confirmed failure mode / decision from the call"
+
+[[step_type]]
+kind = "marketing-launch"
+label = "Marketing Launch"
+category = "admin"
+ux = "expanded"
+version = 1
+description = "Calendar-visible launch date for a marketing motion. Dedicated kind (separate from generic `scheduling`) so the launch-calendar projection can query by step kind and the launch-calendar UX plugin has a stable mount point."
+typical_duration_hours = 2.0
+typical_duration_jitter = 0.5
+required_roles = ["brand-manager", "events-coord", "head-of-marketing"]
+
+  [[step_type.fields]]
+  name = "launch_date"
+  field_type = "date"
+  required = false
+  description = "Calendar-visible launch date"
+
+  [[step_type.fields]]
+  name = "launch_channel"
+  field_type = "string"
+  required = false
+  description = "Channel (email/webinar/paid-social/event)"
+
+  [[step_type.fields]]
+  name = "notes"
+  field_type = "string"
+  required = false
+  description = "Launch-day notes"
+
+[[step_type]]
+kind = "marketing-attribution"
+label = "Marketing Attribution"
+category = "admin"
+ux = "expanded"
+version = 1
+description = "Open measurement window after a marketing launch — tracks the configured measurement period, what closed it, and the analyst's close-out notes. Dedicated kind so the attribution UX plugin has a stable mount point and the motion-attribution rollup can query by step kind."
+typical_duration_hours = 2.0
+typical_duration_jitter = 0.5
+required_roles = ["brand-manager", "head-of-marketing"]
+
+  [[step_type.fields]]
+  name = "measurement_days"
+  field_type = "number"
+  required = false
+  description = "Days the window stays open"
+
+  [[step_type.fields]]
+  name = "window_closes_at"
+  field_type = "date"
+  required = false
+  description = "Configured window end"
+
+  [[step_type.fields]]
+  name = "closing_notes"
+  field_type = "string"
+  required = false
+  description = "Analyst close-out notes"
+
+[[step_type]]
+kind = "training"
+label = "Training"
+category = "admin"
+ux = "expanded"
+version = 1
+description = "Complete a training module or certification."
+typical_duration_hours = 8.0
+typical_duration_jitter = 0.5
+required_roles = ["hr-generalist", "head-of-people"]
+
+  [[step_type.fields]]
+  name = "course_name"
+  field_type = "string"
+  required = true
+  description = "Course or module name"
+
+  [[step_type.fields]]
+  name = "provider"
+  field_type = "string"
+  required = false
+  description = "Training provider"
+
+  [[step_type.fields]]
+  name = "certification_id"
+  field_type = "string"
+  required = false
+  description = "Certification issued"
+
+  [[step_type.fields]]
+  name = "score"
+  field_type = "number"
+  required = false
+  description = "Score achieved"
+
+  [[step_type.fields]]
+  name = "passing_score"
+  field_type = "number"
+  required = false
+  description = "Minimum passing score"
+
+  [[step_type.fields]]
+  name = "completed_at"
+  field_type = "date-time"
+  required = false
+  description = "Completion timestamp"
+
+  [[step_type.fields]]
+  name = "expires_at"
+  field_type = "date"
+  required = false
+  description = "Certification expiry"
+
+[[step_type]]
+kind = "document"
+label = "Document"
+category = "admin"
+ux = "expanded"
+version = 1
+description = "Produce, collect, review, or approve a document."
+typical_duration_hours = 0.5
+typical_duration_jitter = 0.4
+required_roles = ["bookkeeper", "ar-clerk", "ap-clerk", "controller", "head-of-people", "platform-admin"]
+
+  [[step_type.fields]]
+  name = "doc_type"
+  field_type = "string"
+  required = true
+  description = "Document type"
+
+  [[step_type.fields]]
+  name = "title"
+  field_type = "string"
+  required = true
+  description = "Document title"
+
+  [[step_type.fields]]
+  name = "url"
+  field_type = "uri"
+  required = false
+  description = "Document URL"
+
+  [[step_type.fields]]
+  name = "version"
+  field_type = "string"
+  required = false
+  description = "Document version"
+
+  [[step_type.fields]]
+  name = "template_id"
+  field_type = "string"
+  required = false
+  description = "Template used"
+
+  [[step_type.fields]]
+  name = "produced_by"
+  field_type = "string"
+  required = false
+  description = "Author"
+
+  [[step_type.fields]]
+  name = "reviewed_by"
+  field_type = "string"
+  required = false
+  description = "Reviewer"
+
+# =============================================================
+# Commercial (procurement transparency / RFQ / negotiation)
+# =============================================================
+
+[[step_type]]
+kind = "crawl-config"
+label = "Crawl Target Config"
+category = "admin"
+ux = "expanded"
+version = 1
+description = "Scraper configuration for a vendor-catalog-refresh Job. Lets procurement tune selectors + rate limits without touching code."
+typical_duration_hours = 0.5
+typical_duration_jitter = 0.3
+required_roles = ["sysadmin", "it-director"]
+
+  [[step_type.fields]]
+  name = "vendor_crawl_target_id"
+  field_type = "string"
+  required = true
+  description = "Crawl target identifier"
+
+  [[step_type.fields]]
+  name = "scraper_kind"
+  field_type = "string"
+  required = false
+  description = "Scraper implementation tag (html, pdf, api, manual)"
+
+  [[step_type.fields]]
+  name = "config_blob"
+  field_type = "string"
+  required = false
+  description = "Opaque JSON blob for the scraper"
+
+  [[step_type.fields]]
+  name = "last_success_at"
+  field_type = "date-time"
+  required = false
+  description = "Last successful crawl"
+
+  [[step_type.fields]]
+  name = "last_failure_md"
+  field_type = "string"
+  required = false
+  description = "Most-recent failure diagnostic"
+
+[[step_type]]
+kind = "job-kind-publish"
+label = "Publish JobKind"
+category = "admin"
+ux = "inline"
+version = 1
+description = "Publish a JobKindSpec into the registry. Terminal step of `job-kind-design` Jobs."
+typical_duration_hours = 0.05
+typical_duration_jitter = 0.0
+required_roles = ["it-director", "platform-admin"]
+
+  [[step_type.fields]]
+  name = "job_kind_spec"
+  field_type = "object"
+  required = true
+  description = "Full JobKindSpec blob to publish"
+
+  [[step_type.fields]]
+  name = "previous_kind_version"
+  field_type = "integer"
+  required = false
+  description = "If set, supersedes this prior active version"
+
+[[step_type]]
+kind = "order-intake"
+label = "Order Intake"
+category = "coordination"
+ux = "expanded"
+version = 1
+description = "Open a sales-order Job and confirm its line items, delivery window, and customer-facing terms. The brewery + DTC-shop counterpart to the device-shop's physical-unit `intake` step — no `asset_id` because there's no physical asset being received, just an order being opened."
+typical_duration_hours = 0.5
+typical_duration_jitter = 0.4
+required_roles = ["sales-rep", "bookkeeper"]
+# Agent-executed: confirming an order from a feed/system is computer-speed
+# automation, not human labor. The dispatcher auto-completes it on
+# step.ready so high-volume order flow (wholesale 48/day) doesn't queue
+# behind the human workforce. See docs/design/brewery-model-completeness.md.
+completion = "agent"
+
+  [[step_type.fields]]
+  name = "line_items"
+  field_type = "array"
+  required = false
+  description = "Per-SKU lines: [{sku, qty, unit_price_cents, description}]"
+
+  [[step_type.fields]]
+  name = "delivery_window"
+  field_type = "string"
+  required = false
+  description = "Operator-supplied delivery window (e.g., 'Mon-Wed afternoon')"
+
+  [[step_type.fields]]
+  name = "po_number"
+  field_type = "string"
+  required = false
+  description = "Customer-supplied PO reference (optional)"
+
+  [[step_type.fields]]
+  name = "notes"
+  field_type = "string"
+  required = false
+  description = "Free-text intake notes"
+
+[[step_type]]
+kind = "review-design"
+label = "Review Design"
+category = "coordination"
+ux = "expanded"
+version = 1
+description = """
+Custom Step UX for the `design-doc-review` JobKind. The plugin
+fetches `/api/design/docs/{doc_path}`, lists every `### Qn:` open
+question parsed by boss-docs-api, and renders a per-question
+resolution textarea. Step completion is gated on every question
+having a non-empty resolution recorded. Resolutions are saved as
+pending-decisions via `/api/design/pending-decisions`; the
+follow-up `/api/design/flush-jobs` writes them into the source
+doc's Decision-history section (each release, settled material
+folds into `docs/architecture-decisions.md` and the source doc is
+deleted).
+"""
+typical_duration_hours = 4.0
+typical_duration_jitter = 0.5
+required_roles = ["platform-admin"]
+
+  [[step_type.fields]]
+  name = "doc_path"
+  field_type = "string"
+  required = true
+  description = "Path to the design doc, e.g. docs/design/scheduler-shaped-sim-engine.md"
+
+  [[step_type.fields]]
+  name = "resolutions"
+  field_type = "array"
+  required = false
+  description = "Per-question resolutions [{anchor, decision}]; plugin enforces all-filled before done"
+

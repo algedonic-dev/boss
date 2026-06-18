@@ -1,0 +1,31 @@
+# Keep the docker build context small. Anything below
+# infra/oss-quickstart/Dockerfile actually needs gets re-included
+# below.
+
+# Build artifacts — re-built inside the image.
+target/
+**/target/
+**/node_modules/
+apps/web/dist/
+apps/web/.svelte-kit/
+
+# Local-dev artifacts — never used by the image.
+.git/
+.github/
+.vscode/
+.idea/
+
+# Editor / OS noise.
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local-only config / secrets.
+*.local
+.env
+infra/oss-quickstart/.env
+
+# Large seed snapshots — only the canonical one is needed.
+infra/postgres/*.bak
+infra/postgres/seed-brewery-audit-log-*.sql.gz
+!infra/postgres/seed-brewery-audit-log.sql.gz

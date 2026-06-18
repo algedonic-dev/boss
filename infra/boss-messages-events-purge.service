@@ -1,0 +1,13 @@
+[Unit]
+Description=Boss messages_events retention sweep
+After=postgresql.service
+
+[Service]
+Type=oneshot
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/boss-messages-events-purge --config /etc/boss-messages-api.toml
+# Runs as root to match the rest of the boss-*-api units on
+# bare-metal Boss deployments. The DELETE itself authenticates to
+# Postgres via the `boss` role/password in postgres_url, not the
+# Linux user. Tighten to a dedicated service user once Boss adopts
+# per-service Linux UIDs system-wide.

@@ -1,0 +1,227 @@
+//! `boss-content-api` — HR content service. Bulletins today; manual in v1c.
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use axum::Router;
+use axum::http::StatusCode;
+use axum::routing::any;
+use boss_content::config::ContentApiConfig;
+use boss_content::http::{ContentApiState, router as content_router};
+use boss_content::{ContentRepository, PgContent};
+use clap::Parser;
+use tokio::net::TcpListener;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
+
+#[derive(Parser, Debug)]
+#[command(name = "boss-content-api", about = "Boss HR Content API", version)]
+struct Cli {
+    #[arg(short, long, default_value = "/etc/boss-content-api.toml")]
+    config: PathBuf,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .compact()
+        .init();
+
+    let cli = Cli::parse();
+    let cfg = ContentApiConfig::load(&cli.config)
+        .with_context(|| format!("loading config from {}", cli.config.display()))?;
+
+    info!(
+        postgres_url = %boss_core::startup::mask_password(&cfg.postgres_url),
+        http_bind = %cfg.http_bind,
+        "boss-content-api starting"
+    );
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&cfg.postgres_url)
+        .await
+        .with_context(|| "connecting to Postgres")?;
+
+    let repo: Arc<dyn ContentRepository> = Arc::new(PgContent::new(pool.clone()));
+
+    // Seed starter manual sections — idempotent, only inserts what's
+    // missing. Lets HR edit the outline on day one instead of an empty
+    // tree.
+    match boss_content::seed::seed_starter_sections(repo.as_ref()).await {
+        Ok(0) => info!("manual: no seeding needed"),
+        Ok(n) => info!(inserted = n, "manual: seeded starter sections"),
+        Err(e) => tracing::warn!(error = %e, "manual: seeding failed"),
+    }
+
+    let publisher = match &cfg.nats_url {
+        Some(url) => {
+            let bus = boss_nats::NatsEventBus::connect(url)
+                .await
+                .with_context(|| format!("connecting to NATS at {url}"))?;
+            let pub_ = boss_core::publisher::DomainPublisher::new(Arc::new(bus), "content")
+                .with_audit(Arc::new(boss_events::PgAuditWriter::new(pool.clone())));
+            info!(nats_url = %url, "domain event publishing + audit trail enabled");
+            Some(pub_)
+        }
+        None => {
+            info!("no nats_url configured — content events will not be published");
+            None
+        }
+    };
+
+    let clock_url = std::env::var("BOSS_CLOCK_URL").unwrap_or_else(|_| boss_ports::url("clock"));
+    let clock: Arc<dyn boss_clock_client::ClockClient> = Arc::new(
+        boss_clock_client::ReqwestClockClient::new(clock_url.clone()),
+    );
+    info!(%clock_url, "clock client wired");
+
+    // Wire the sim-mode probe into the publisher so every emit_at
+    // injects `_simulated: bool` into the audit_log payload without
+    // per-handler changes.
+    let publisher = publisher.map(|p| {
+        p.with_sim_probe(Arc::new(boss_clock_client::ClockSimProbe::new(
+            clock.clone(),
+        )))
+    });
+
+    let state = ContentApiState {
+        repo: repo.clone(),
+        publisher: publisher.clone(),
+        clock: clock.clone(),
+    };
+    let mut app = content_router(state);
+
+    // File-references surface — mounted only when the config wires
+    // a bucket. Keeps the binary boot path simple for deployments
+    // that haven't set up object storage yet. When unconfigured,
+    // mount a fallback that returns 503 with a clear body so the
+    // SPA can render an honest "not available in this deployment"
+    // message instead of a generic 404 (which reads as broken).
+    if let Some(files_cfg) = &cfg.files {
+        let files_app = build_files_router(
+            &cfg,
+            files_cfg,
+            pool.clone(),
+            publisher.clone(),
+            clock.clone(),
+        )
+        .await
+        .with_context(|| "wiring file-references HTTP surface")?;
+        app = app.merge(files_app);
+        info!(bucket = %files_cfg.bucket, "file-references surface enabled");
+    } else {
+        info!("file-references surface not configured (no [files] block); mounting 503 fallback");
+        app = app.merge(unconfigured_files_router());
+    }
+    // Sim-origin middleware: extract x-sim-origin header and set the
+    // per-request task-local so the publisher inherits the sim
+    // marker. Closes the gap where a sim chain could trigger a
+    // non-sim event on a service running with a wall clock.
+    let app = app.layer(axum::middleware::from_fn(
+        boss_policy_client::request_context_middleware,
+    ));
+
+    let http_addr: SocketAddr = cfg
+        .http_bind
+        .parse()
+        .with_context(|| format!("invalid http_bind `{}`", cfg.http_bind))?;
+    let listener = TcpListener::bind(http_addr)
+        .await
+        .with_context(|| format!("binding HTTP listener on {http_addr}"))?;
+    info!(addr = %http_addr, "boss-content-api listening");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Mounted when the `[files]` config block is absent. Returns 503
+/// on every `/api/files*` path so the SPA can render an honest
+/// "not available in this deployment" message — a 404 reads to
+/// operators like a broken endpoint, but the surface is just
+/// intentionally unconfigured.
+fn unconfigured_files_router() -> Router {
+    // Return 200 with an `{kind: "unconfigured"}` envelope rather than
+    // 503. The 503 was visible to auditor-role browsing sessions as a
+    // genuine error in the network tab, even though the surface is
+    // designed-off, not broken. SPA's `listFilesFor()` detects the
+    // envelope and renders the same "not available in this deployment"
+    // callout as before; the difference is the response is now a
+    // 200 OK from the auditor's vantage point.
+    let handler = any(|| async {
+        (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            r#"{"kind":"unconfigured","reason":"file-references surface not configured (no [files] block in boss-content-api config); see infra/deploy-services.sh"}"#,
+        )
+    });
+    Router::new()
+        .route("/api/files", handler.clone())
+        .route("/api/files/{*rest}", handler)
+}
+
+async fn build_files_router(
+    cfg: &ContentApiConfig,
+    files_cfg: &boss_content::config::FilesConfig,
+    pool: sqlx::PgPool,
+    publisher: Option<boss_core::publisher::DomainPublisher>,
+    clock: Arc<dyn boss_clock_client::ClockClient>,
+) -> Result<axum::Router> {
+    use boss_content::files::{
+        FileRepository, FileStorage, PgFileRepository, S3Storage,
+        http::{FilesApiState, router as files_router_fn},
+    };
+    use std::sync::Arc;
+
+    let repo: Arc<dyn FileRepository> = Arc::new(PgFileRepository::new(pool.clone()));
+    let storage: Arc<dyn FileStorage> = match (&files_cfg.access_key, &files_cfg.secret_key) {
+        (Some(ak), Some(sk)) => {
+            let endpoint = files_cfg
+                .endpoint
+                .as_deref()
+                .unwrap_or("https://storage.googleapis.com");
+            let region = files_cfg.region.as_deref().unwrap_or("us-east-1");
+            Arc::new(
+                S3Storage::with_credentials(&files_cfg.bucket, endpoint, region, ak, sk)
+                    .await
+                    .with_context(|| "S3Storage::with_credentials")?,
+            )
+        }
+        _ => Arc::new(
+            S3Storage::new(
+                &files_cfg.bucket,
+                files_cfg.endpoint.as_deref(),
+                files_cfg.region.as_deref(),
+            )
+            .await
+            .with_context(|| "S3Storage::new")?,
+        ),
+    };
+
+    let policy: Arc<dyn boss_policy_client::PolicyClient> = match &cfg.policy_api_url {
+        Some(url) => Arc::new(boss_policy_client::ReqwestPolicyClient::new(url.clone())),
+        None => {
+            tracing::warn!(
+                "no policy_api_url configured — file-references operate without policy enforcement \
+                 (gateway cookie auth only). Set policy_api_url in /etc/boss-content-api.toml \
+                 to gate uploads/downloads by role."
+            );
+            Arc::new(boss_policy_client::PermissivePolicyClient)
+        }
+    };
+
+    let state = FilesApiState {
+        repo,
+        storage,
+        publisher,
+        policy,
+        bucket: files_cfg.bucket.clone(),
+        pool: Some(pool),
+        clock,
+    };
+    Ok(files_router_fn(state))
+}

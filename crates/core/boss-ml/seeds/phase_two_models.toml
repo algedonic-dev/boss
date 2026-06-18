@@ -1,0 +1,311 @@
+# Phase 2 ML model seed catalog.
+#
+# `boss_ml::bootstrap::seed_phase_two_candidates()` reads this file at
+# startup, deserializes the `[[model]]` blocks into MlModelSeed rows,
+# stamps `created_at` / `updated_at` with the current UTC timestamp,
+# and upserts each into the ml_models table via the repository port.
+# Idempotent — the upsert is keyed on `id` so a restart is a no-op.
+#
+# Adding a new candidate model: append a `[[model]]` block here, then
+# restart the service. No code change required.
+#
+# Schema mirror: `MlModelSeed` (private, in `bootstrap.rs`) — same
+# fields as `MlModel` minus the runtime timestamps. The `inference_spec`
+# discriminator field is named `kind` (per `#[serde(tag = "kind")]` on
+# InferenceSpec). Both the outer `kind` (ModelKind) and the inner
+# `inference_spec.kind` (InferenceSpec variant) are kebab-case.
+
+# -----------------------------------------------------------------
+# Phase 2: composite churn signal via plugin-driven scoring.
+# -----------------------------------------------------------------
+
+[[model]]
+id = "mdl-account-churn-risk-v1"
+name = "account-churn-risk"
+kind = "heuristic-formula"
+version = "v1"
+status = "active"
+description = """
+Composite churn signal per account — order cadence, service ticket \
+frequency, contract status, satisfaction. Run nightly via \
+POST /api/ml/models/mdl-account-churn-risk-v1/infer-batch; \
+consumed by the territory-rep watchlist."""
+
+  [model.inference_spec]
+  kind = "heuristic-formula"
+  plugin_name = "account-churn-risk-composite-v1"
+  entity_type = "account"
+  entity_query = "SELECT id FROM accounts ORDER BY id"
+
+# -----------------------------------------------------------------
+# Phase 2: stub regression + classification models — kind set,
+# `inference_spec` deliberately absent. The dispatcher skips draft
+# models without an inference_spec; these slots reserve identity so
+# the CTO panel can render them in the catalog before they're built.
+# -----------------------------------------------------------------
+
+[[model]]
+id = "mdl-device-mtbf-v1"
+name = "device-mtbf"
+kind = "regression"
+version = "v1"
+status = "draft"
+accuracy_metric = "rmse_days"
+description = """
+Expected time-to-next-service per device based on usage + \
+failure history. Writes on ServiceJobClosed events; \
+consumed by the Service workbench and CTO ops view."""
+
+[[model]]
+id = "mdl-opportunity-win-probability-v1"
+name = "opportunity-win-probability"
+kind = "classification"
+version = "v1"
+status = "draft"
+accuracy_metric = "auc"
+description = """
+Win-probability score per pipeline opportunity. Writes on \
+stage transitions; consumed by the Sales workbench and \
+Exec dashboard pipeline quality view."""
+
+# -----------------------------------------------------------------
+# Phase 2: declarative-rule next-action models. One row per fact,
+# surfaced through /api/people/accounts/{id}/next-actions after the
+# step-10 cutover. Each model's SQL produces (entity_id = account_id)
+# + a payload carrying the legacy Action shape.
+# -----------------------------------------------------------------
+
+[[model]]
+id = "mdl-next-action-contract-expiring-v1"
+name = "next-action-contract-expiring"
+kind = "declarative-rule"
+version = "v1"
+status = "active"
+description = """
+Active service_agreement rows whose end_date is within 60 days. \
+Severity scales: critical ≤14d, warning ≤30d, info ≤60d."""
+
+  [model.inference_spec]
+  kind = "declarative-rule"
+  # Score 0.0..=1.0 — higher = more urgent. Days inverted so a
+  # 14-day-out contract scores ~0.77, a 60-day-out contract scores ~0.0.
+  query = """
+SELECT
+    account_id,
+    id AS agreement_id,
+    end_date,
+    annual_value_cents,
+    (end_date - $1::date)::int AS days_remaining,
+    CASE
+        WHEN end_date - $1::date <= 14 THEN 'critical'
+        WHEN end_date - $1::date <= 30 THEN 'warning'
+        ELSE 'info'
+    END AS severity,
+    ((60 - (end_date - $1::date))::float8 / 60.0) AS score
+FROM service_agreements
+WHERE status = 'active'
+  AND end_date >= $1::date
+  AND end_date - $1::date < 60"""
+  score_expr = "score"
+  entity_type = "account"
+  entity_id_column = "account_id"
+  row_key_column = "agreement_id"
+  payload_template = { rule = "contract-expiring", agreement_id = "{{agreement_id}}", severity = "{{severity}}", headline = "Contract {{agreement_id}} expires in {{days_remaining}} days", deep_link = "/sales/agreements/{{agreement_id}}", due_on = "{{end_date}}", annual_value_cents = "{{annual_value_cents}}", days_remaining = "{{days_remaining}}" }
+
+[[model]]
+id = "mdl-next-action-past-due-invoice-v1"
+name = "next-action-past-due-invoice"
+kind = "declarative-rule"
+version = "v1"
+status = "active"
+description = """
+Invoices in status='past-due'. Severity scales with days past due: \
+critical ≥60, warning ≥30, info <30."""
+
+  [model.inference_spec]
+  kind = "declarative-rule"
+  query = """
+SELECT
+    account_id,
+    id AS invoice_id,
+    due_on,
+    amount_cents,
+    ($1::date - due_on)::int AS days_late,
+    CASE
+        WHEN $1::date - due_on >= 60 THEN 'critical'
+        WHEN $1::date - due_on >= 30 THEN 'warning'
+        ELSE 'info'
+    END AS severity,
+    LEAST(1.0, (($1::date - due_on)::float8 / 60.0)) AS score
+FROM invoices
+WHERE status = 'past-due'"""
+  score_expr = "score"
+  entity_type = "account"
+  entity_id_column = "account_id"
+  row_key_column = "invoice_id"
+  payload_template = { rule = "past-due-invoice", invoice_id = "{{invoice_id}}", severity = "{{severity}}", headline = "Invoice {{invoice_id}} is {{days_late}} days past due", deep_link = "/finance/invoices/{{invoice_id}}", due_on = "{{due_on}}", amount_cents = "{{amount_cents}}", days_late = "{{days_late}}" }
+
+[[model]]
+id = "mdl-next-action-missing-primary-contact-v1"
+name = "next-action-missing-primary-contact"
+kind = "declarative-rule"
+version = "v1"
+status = "active"
+description = """
+Accounts with no account_contacts row marked is_primary=true. \
+Info severity — communication gap, not an active risk."""
+
+  [model.inference_spec]
+  kind = "declarative-rule"
+  # Single row per account (binary fact) — no row_key_column.
+  query = """
+SELECT a.id AS account_id, 0.10::float8 AS score
+FROM accounts a
+WHERE NOT EXISTS (
+    SELECT 1 FROM account_contacts c
+    WHERE c.account_id = a.id AND c.is_primary = true
+)"""
+  score_expr = "score"
+  entity_type = "account"
+  entity_id_column = "account_id"
+  payload_template = { rule = "missing-primary-contact", severity = "info", headline = "No primary contact set", deep_link = "/accounts/{{account_id}}" }
+
+# -----------------------------------------------------------------
+# Phase 2 step 9: composite next-action rules. The high-churn-risk
+# rule joins to ml_predictions populated by the
+# account-churn-risk-composite-v1 plugin. Inference-batch run order
+# (see run-inference-batch.sh) puts the churn model first so this
+# rule reads fresh data.
+# -----------------------------------------------------------------
+
+[[model]]
+id = "mdl-next-action-high-churn-risk-v1"
+name = "next-action-high-churn-risk"
+kind = "declarative-rule"
+version = "v1"
+status = "active"
+description = """
+Surfaces accounts whose latest churn-risk prediction is ≥30. \
+Severity: critical ≥70, warning ≥50, info ≥30. Joins to \
+ml_predictions populated by mdl-account-churn-risk-v1."""
+
+  [model.inference_spec]
+  kind = "declarative-rule"
+  query = """
+SELECT
+    a.id AS account_id,
+    (p.payload->>'score')::int AS churn_score,
+    p.payload->>'top_factor' AS top_factor,
+    CASE
+        WHEN (p.payload->>'score')::int >= 70 THEN 'critical'
+        WHEN (p.payload->>'score')::int >= 50 THEN 'warning'
+        ELSE 'info'
+    END AS severity,
+    (p.score)::float8 AS score
+FROM accounts a
+JOIN LATERAL (
+    SELECT score, payload FROM ml_predictions
+    WHERE model_id = 'mdl-account-churn-risk-v1'
+      AND entity_type = 'account'
+      AND entity_id = a.id
+    ORDER BY created_at DESC LIMIT 1
+) p ON true
+WHERE (p.payload->>'score')::int >= 30"""
+  score_expr = "score"
+  entity_type = "account"
+  entity_id_column = "account_id"
+  payload_template = { rule = "churn-risk", severity = "{{severity}}", headline = "Churn risk {{churn_score}}/100 — {{top_factor}}", deep_link = "/accounts/{{account_id}}", context = "Review the account and decide on a touch-point", churn_score = "{{churn_score}}", top_factor = "{{top_factor}}" }
+
+[[model]]
+id = "mdl-next-action-stalled-service-ticket-v1"
+name = "next-action-stalled-service-ticket"
+kind = "declarative-rule"
+version = "v1"
+status = "active"
+description = """
+Open / blocked service-side Jobs (field-service, service, repair, \
+depot-return) on a device at this account, untouched ≥3 days. \
+Severity: critical ≥14d, warning ≥7d, info ≥3d."""
+
+  [model.inference_spec]
+  kind = "declarative-rule"
+  query = """
+SELECT
+    s.account_id AS account_id,
+    j.id::text AS job_id,
+    j.title AS job_title,
+    j.subject_id AS asset_id,
+    (j.updated_at::date)::text AS updated_on,
+    ($1::date - j.updated_at::date)::int AS days_stalled,
+    CASE
+        WHEN $1::date - j.updated_at::date >= 14 THEN 'critical'
+        WHEN $1::date - j.updated_at::date >= 7 THEN 'warning'
+        ELSE 'info'
+    END AS severity,
+    LEAST(1.0, (($1::date - j.updated_at::date)::float8 / 14.0)) AS score
+FROM jobs j
+INNER JOIN systems s ON s.asset_id = j.subject_id
+WHERE j.kind IN ('field-service', 'service', 'repair', 'depot-return')
+  AND j.subject_kind = 'system'
+  AND j.status IN ('open', 'blocked')
+  AND $1::date - j.updated_at::date >= 3"""
+  score_expr = "score"
+  entity_type = "account"
+  entity_id_column = "account_id"
+  row_key_column = "job_id"
+  payload_template = { rule = "stalled-ticket", job_id = "{{job_id}}", asset_id = "{{asset_id}}", severity = "{{severity}}", headline = "{{job_title}} — stalled {{days_stalled}} days", context = "Device {{asset_id}}; no updates since {{updated_on}}", deep_link = "/jobs/{{job_id}}", days_stalled = "{{days_stalled}}" }
+
+[[model]]
+id = "mdl-next-action-preventive-maintenance-due-v1"
+name = "next-action-preventive-maintenance-due"
+kind = "declarative-rule"
+version = "v1"
+status = "active"
+description = """
+Installed / out-for-service systems whose last closed preventive-maintenance-visit Job \
+is older than the catalog's preventive_maintenance_interval_months window. Warning \
+once overdue by ≥1.5× the interval."""
+
+  [model.inference_spec]
+  kind = "declarative-rule"
+  query = """
+SELECT
+    s.account_id AS account_id,
+    s.asset_id AS asset_id,
+    sm.name AS model_name,
+    sm.preventive_maintenance_interval_months AS preventive_maintenance_interval_months,
+    COALESCE(last_pm.closed_on, s.first_seen) AS reference_date,
+    ($1::date - COALESCE(last_pm.closed_on, s.first_seen))::int AS days_since,
+    CASE
+        WHEN sm.preventive_maintenance_interval_months > 0
+         AND $1::date - COALESCE(last_pm.closed_on, s.first_seen) >
+             (sm.preventive_maintenance_interval_months * 30 * 3 / 2)
+        THEN 'warning'
+        ELSE 'info'
+    END AS severity,
+    LEAST(1.0,
+        (($1::date - COALESCE(last_pm.closed_on, s.first_seen))::float8 /
+         GREATEST(1, sm.preventive_maintenance_interval_months * 30)::float8 - 1.0)
+    ) AS score
+FROM systems s
+INNER JOIN asset_models sm ON sm.sku = s.sku
+LEFT JOIN LATERAL (
+    SELECT j.closed_on FROM jobs j
+    WHERE j.kind = 'preventive-maintenance-visit'
+      AND j.subject_kind = 'system'
+      AND j.subject_id = s.asset_id
+      AND j.status = 'closed'
+    ORDER BY j.closed_on DESC NULLS LAST LIMIT 1
+) AS last_pm ON true
+WHERE s.account_id IS NOT NULL
+  AND s.phase IN ('installed', 'out-for-service')
+  AND (
+      last_pm.closed_on IS NULL
+      OR last_pm.closed_on <
+          $1::date - (sm.preventive_maintenance_interval_months * interval '1 month')
+  )"""
+  score_expr = "score"
+  entity_type = "account"
+  entity_id_column = "account_id"
+  row_key_column = "asset_id"
+  payload_template = { rule = "preventive-maintenance-due", asset_id = "{{asset_id}}", model_name = "{{model_name}}", severity = "{{severity}}", headline = "{{model_name}} {{asset_id}} — preventive maintenance overdue", context = "Last preventive maintenance reference {{reference_date}} ({{days_since}} days ago); interval {{preventive_maintenance_interval_months}}mo", deep_link = "/fleet/{{asset_id}}", days_since = "{{days_since}}", preventive_maintenance_interval_months = "{{preventive_maintenance_interval_months}}" }

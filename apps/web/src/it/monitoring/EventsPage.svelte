@@ -1,0 +1,501 @@
+<script lang="ts">
+  // Audit-log tail — CTO surface.
+  //
+  // Two modes:
+  // - **Live (auto-refresh on)** subscribes to /api/events/stream
+  //   (SSE). Server pushes each new audit_log row as it lands;
+  //   no ordering loss vs. the prior poll-loop variant. Per the
+  //   SSE policy doc (docs/design/sse-policy.md) this is "every
+  //   event matters" → SSE-push.
+  // - **Snapshot (auto-refresh off)** falls back to the explicit
+  //   GET /api/events/tail with the current filters. Useful for
+  //   pinning a window to inspect / share.
+  //
+  // Filters (source, kind substring, limit) compose into query
+  // params for both modes. Single click on a row toggles the
+  // inline JSON payload. Requires operator tier; non-operators
+  // get a 403 from the backend which we render inline.
+
+  import PageHeader from '../../ui/PageHeader.svelte';
+  import Section from '../../ui/Section.svelte';
+  import FileAttachments from '../../content/FileAttachments.svelte';
+
+  type AuditEntry = {
+    event_id: string;
+    timestamp: string;
+    source: string;
+    kind: string;
+    payload: unknown;
+  };
+  type State =
+    | { kind: 'loading' }
+    | { kind: 'ready'; rows: ReadonlyArray<AuditEntry> }
+    | { kind: 'error'; message: string };
+
+  // Snapshot-mode poll; live mode uses SSE which arrives push-driven.
+  const SNAPSHOT_RELOAD_MS = 5000;
+  const LIMIT_CHOICES = [50, 100, 200, 500] as const;
+  // Cap how many rows we keep in memory in live mode. New ones
+  // arrive at the top; trim from the bottom past the cap.
+  const LIVE_BUFFER_CAP = 500;
+
+  let loadState: State = $state<State>({ kind: 'loading' });
+  let sourceFilter = $state('');
+  let kindFilter = $state('');
+  let limit = $state<(typeof LIMIT_CHOICES)[number]>(100);
+  let autoRefresh = $state(true);
+  let expanded = $state<string | null>(null);
+  let lastFetched = $state<Date | null>(null);
+
+  // Download-on-demand state. Defaults the from-date to 7 days
+  // back, to to now. Operator can override either before downloading.
+  // The export inherits the page's source + kind filters; the
+  // browser handles the file save via Content-Disposition.
+  function isoDate(d: Date): string {
+    return d.toISOString().slice(0, 10);
+  }
+  let downloadOpen = $state(false);
+  let downloadFrom = $state<string>(isoDate(new Date(Date.now() - 7 * 86400_000)));
+  let downloadTo = $state<string>(isoDate(new Date()));
+
+  function startDownload(): void {
+    const params = new URLSearchParams();
+    const src = sourceFilter.trim();
+    const knd = kindFilter.trim();
+    if (src) params.set('source', src);
+    if (knd) params.set('kind', knd);
+    // Convert dates to half-open RFC-3339 window. `until` is
+    // exclusive on the backend, so we pass to-date+1day to include
+    // the entire to-date.
+    if (downloadFrom) {
+      params.set('since', `${downloadFrom}T00:00:00Z`);
+    }
+    if (downloadTo) {
+      // until is exclusive; bump by 1 day to make the from..to
+      // range inclusive on the to side.
+      const t = new Date(`${downloadTo}T00:00:00Z`);
+      t.setUTCDate(t.getUTCDate() + 1);
+      params.set('until', t.toISOString());
+    }
+    // The export endpoint streams up to 50k rows; for large windows
+    // the operator narrows the range. Direct navigation triggers the
+    // browser download dialog via the response's Content-Disposition.
+    window.location.href = `/api/events/export?${params.toString()}`;
+    downloadOpen = false;
+  }
+
+  $effect(() => {
+    // Re-run whenever filters or live-mode flag change.
+    const src = sourceFilter.trim();
+    const knd = kindFilter.trim();
+    const lim = limit;
+    const auto = autoRefresh;
+
+    let cancelled = false;
+
+    async function fetchSnapshot(): Promise<void> {
+      const params = new URLSearchParams();
+      if (src) params.set('source', src);
+      if (knd) params.set('kind', knd);
+      params.set('limit', String(lim));
+      try {
+        const r = await fetch(`/api/events/tail?${params.toString()}`, {
+          credentials: 'same-origin',
+          headers: { accept: 'application/json' },
+        });
+        if (!r.ok) {
+          const msg = await r.text();
+          throw new Error(`HTTP ${r.status}${msg ? `: ${msg}` : ''}`);
+        }
+        const body = (await r.json()) as ReadonlyArray<AuditEntry>;
+        if (!cancelled) {
+          loadState = { kind: 'ready', rows: body };
+          lastFetched = new Date();
+        }
+      } catch (e) {
+        if (!cancelled) {
+          loadState = {
+            kind: 'error',
+            message: e instanceof Error ? e.message : String(e),
+          };
+        }
+      }
+    }
+
+    // Always start with one snapshot so the page renders the
+    // recent window immediately, regardless of mode.
+    void fetchSnapshot();
+
+    if (!auto) {
+      // Snapshot mode — explicit reload only via the user
+      // tapping the filter inputs (which retriggers this $effect).
+      // No interval timer.
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    // Live mode — SSE pushes new rows as they land. Browser's
+    // EventSource auto-reconnects on transient blips. On a hard
+    // failure (route 404 on older deploys) onerror fires with
+    // CLOSED state; fall back to a 5s snapshot poll.
+    const params = new URLSearchParams();
+    if (src) params.set('source', src);
+    if (knd) params.set('kind', knd);
+    let es: EventSource | null = null;
+    let pollFallbackId: number | null = null;
+    try {
+      es = new EventSource(`/api/events/stream?${params.toString()}`);
+      es.onmessage = (ev) => {
+        if (cancelled) return;
+        try {
+          const entry = JSON.parse(ev.data) as AuditEntry;
+          // Prepend new row, dedupe, cap.
+          if (loadState.kind === 'ready') {
+            const existing = loadState.rows;
+            if (!existing.some((r) => r.event_id === entry.event_id)) {
+              const next = [entry, ...existing].slice(0, LIVE_BUFFER_CAP);
+              loadState = { kind: 'ready', rows: next };
+            }
+          } else {
+            loadState = { kind: 'ready', rows: [entry] };
+          }
+          lastFetched = new Date();
+        } catch {
+          // Drop malformed frame.
+        }
+      };
+      es.onerror = () => {
+        if (es && es.readyState === EventSource.CLOSED) {
+          es.close();
+          es = null;
+          if (pollFallbackId === null) {
+            pollFallbackId = window.setInterval(fetchSnapshot, SNAPSHOT_RELOAD_MS);
+          }
+        }
+      };
+    } catch {
+      pollFallbackId = window.setInterval(fetchSnapshot, SNAPSHOT_RELOAD_MS);
+    }
+
+    return () => {
+      cancelled = true;
+      es?.close();
+      if (pollFallbackId !== null) window.clearInterval(pollFallbackId);
+    };
+  });
+
+  // Distinct sources present in the current batch — drives a quick
+  // dropdown without an extra API.
+  let knownSources = $derived.by(() => {
+    if (loadState.kind !== 'ready') return [] as string[];
+    const set = new Set<string>();
+    for (const r of loadState.rows) set.add(r.source);
+    return [...set].sort();
+  });
+
+  function formatTimestamp(iso: string): string {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    // HH:MM:SS.mmm on one row, full date hover via title
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    const ss = String(d.getSeconds()).padStart(2, '0');
+    const ms = String(d.getMilliseconds()).padStart(3, '0');
+    return `${hh}:${mm}:${ss}.${ms}`;
+  }
+
+  function formatFullTimestamp(iso: string): string {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    return d.toISOString();
+  }
+
+  function toggleRow(id: string): void {
+    expanded = expanded === id ? null : id;
+  }
+</script>
+
+<div class="events">
+  <PageHeader
+    eyebrow="IT · Event stream"
+    title="Audit Log"
+    subtitle="Live tail of every domain event. Operator tier only."
+  />
+
+  <Section title="Filters" wide>
+      <div class="events-filters">
+        <label class="events-filter">
+          <span>Source</span>
+          <input
+            list="events-sources"
+            bind:value={sourceFilter}
+            placeholder="e.g. jobs, assets"
+          />
+          <datalist id="events-sources">
+            {#each knownSources as s (s)}
+              <option value={s}></option>
+            {/each}
+          </datalist>
+        </label>
+        <label class="events-filter">
+          <span>Kind contains</span>
+          <input
+            bind:value={kindFilter}
+            placeholder="e.g. step, invoice"
+          />
+        </label>
+        <label class="events-filter">
+          <span>Limit</span>
+          <select bind:value={limit}>
+            {#each LIMIT_CHOICES as n (n)}
+              <option value={n}>{n}</option>
+            {/each}
+          </select>
+        </label>
+        <label class="events-filter events-auto">
+          <input type="checkbox" bind:checked={autoRefresh} />
+          <span>Live (SSE)</span>
+        </label>
+        <button
+          type="button"
+          class="events-download-btn"
+          onclick={() => (downloadOpen = !downloadOpen)}
+          title="Export matching events as a JSON Lines file"
+        >
+          Download ⤓
+        </button>
+        {#if lastFetched}
+          <span class="events-freshness">
+            Last: {formatTimestamp(lastFetched.toISOString())}
+          </span>
+        {/if}
+      </div>
+
+      {#if downloadOpen}
+        <div class="events-download-panel">
+          <div class="events-download-row">
+            <label class="events-filter">
+              <span>From</span>
+              <input type="date" bind:value={downloadFrom} max={downloadTo} />
+            </label>
+            <label class="events-filter">
+              <span>To</span>
+              <input type="date" bind:value={downloadTo} min={downloadFrom} />
+            </label>
+            <button type="button" class="events-download-go" onclick={startDownload}>
+              Save .jsonl
+            </button>
+            <button
+              type="button"
+              class="events-download-cancel"
+              onclick={() => (downloadOpen = false)}
+            >
+              Cancel
+            </button>
+          </div>
+          <p class="events-download-hint">
+            Exports up to 50,000 events matching the current source + kind filters
+            in the window above as JSON Lines (one event per line — parseable by
+            <code>jq</code>, log forwarders, and most analytics tools).
+            Narrow the window for large ranges.
+          </p>
+        </div>
+      {/if}
+  </Section>
+
+  <Section title="Stream" wide>
+      {#if loadState.kind === 'loading'}
+        <p class="empty">Loading…</p>
+      {:else if loadState.kind === 'error'}
+        <p class="empty">Failed to load: {loadState.message}</p>
+      {:else if loadState.rows.length === 0}
+        <p class="empty">No events match these filters.</p>
+      {:else}
+        <table class="data-table data-table-striped events-table">
+          <thead>
+            <tr>
+              <th style="width:10ch">Time</th>
+              <th style="width:12ch">Source</th>
+              <th>Kind</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each loadState.rows as row (row.event_id)}
+              {@const isOpen = expanded === row.event_id}
+              <tr
+                class="events-row{isOpen ? ' events-row-open' : ''}"
+                onclick={() => toggleRow(row.event_id)}
+              >
+                <td
+                  class="mono"
+                  title={formatFullTimestamp(row.timestamp)}
+                >{formatTimestamp(row.timestamp)}</td>
+                <td class="mono">{row.source}</td>
+                <td class="mono">{row.kind}</td>
+              </tr>
+              {#if isOpen}
+                <tr class="events-payload-row">
+                  <td colspan="3">
+                    <pre class="events-payload">{JSON.stringify(row.payload, null, 2)}</pre>
+                    <div class="events-event-id">event_id: <code>{row.event_id}</code></div>
+                    <!--
+                      Event-attached files render inline next to the
+                      event that produced them. Per design Q6 events
+                      get attachments — a vendor-invoice PDF tied to
+                      a `bill.received` event, a signed scan tied to
+                      an `acknowledgment` event. Empty by default
+                      until someone uploads.
+                    -->
+                    <div class="events-attachments">
+                      <FileAttachments targetKind="event" targetId={row.event_id} canEdit={false} />
+                    </div>
+                  </td>
+                </tr>
+              {/if}
+            {/each}
+          </tbody>
+        </table>
+      {/if}
+  </Section>
+</div>
+
+<style>
+  .events-filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    align-items: flex-end;
+  }
+  .events-filter {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+  }
+  .events-filter span {
+    color: var(--muted, #64748b);
+    font-weight: 500;
+  }
+  .events-filter input,
+  .events-filter select {
+    min-width: 160px;
+    padding: 4px 6px;
+    border: 1px solid var(--border, #d1d5db);
+    border-radius: 4px;
+    background: white;
+  }
+  .events-auto {
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+  }
+  .events-auto span {
+    font-size: 13px;
+    color: inherit;
+  }
+  .events-freshness {
+    font-size: 12px;
+    color: var(--muted, #64748b);
+    margin-left: auto;
+  }
+  .events-download-btn {
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    background: white;
+    color: inherit;
+    border: 1px solid var(--border, #d1d5db);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .events-download-btn:hover {
+    background: var(--accent-bg, #eff6ff);
+  }
+  .events-download-panel {
+    margin-top: 12px;
+    padding: 10px 12px;
+    background: var(--accent-bg, #eff6ff);
+    border: 1px solid var(--border, #d1d5db);
+    border-radius: 4px;
+  }
+  .events-download-row {
+    display: flex;
+    gap: 12px;
+    align-items: flex-end;
+    flex-wrap: wrap;
+  }
+  .events-download-go {
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    background: #1d4ed8;
+    color: white;
+    border: 1px solid #1e40af;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .events-download-go:hover {
+    background: #1e40af;
+  }
+  .events-download-cancel {
+    padding: 6px 10px;
+    font-size: 12px;
+    background: transparent;
+    color: var(--muted, #64748b);
+    border: none;
+    cursor: pointer;
+  }
+  .events-download-hint {
+    margin: 8px 0 0;
+    font-size: 11px;
+    color: var(--muted, #64748b);
+    line-height: 1.5;
+  }
+  .events-download-hint code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: rgba(15, 23, 42, 0.08);
+    padding: 1px 4px;
+    border-radius: 2px;
+  }
+  .events-table tbody tr.events-row {
+    cursor: pointer;
+  }
+  .events-table tbody tr.events-row:hover {
+    background: var(--accent-bg, #eff6ff);
+  }
+  .events-table tbody tr.events-row-open {
+    background: var(--accent-bg, #eff6ff);
+    font-weight: 500;
+  }
+  .events-table .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+  }
+  .events-payload-row td {
+    background: #0b1020;
+    color: #e2e8f0;
+    padding: 0;
+  }
+  .events-payload {
+    margin: 0;
+    padding: 12px 16px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 420px;
+    overflow: auto;
+  }
+  .events-attachments {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px dashed var(--border);
+  }
+  .events-event-id {
+    padding: 4px 16px 10px;
+    font-size: 11px;
+    color: #94a3b8;
+  }
+</style>

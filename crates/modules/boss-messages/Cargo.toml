@@ -1,0 +1,57 @@
+[package]
+name = "boss-messages"
+description = "Internal messaging — direct messages and system signals"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-messages-api"
+path = "src/bin/boss_messages_api.rs"
+required-features = ["postgres"]
+
+[[bin]]
+name = "boss-messages-rebuild"
+path = "src/bin/boss_messages_rebuild.rs"
+required-features = ["postgres"]
+
+[[bin]]
+name = "boss-messages-events-purge"
+path = "src/bin/boss_messages_events_purge.rs"
+required-features = ["postgres"]
+
+[features]
+default = []
+postgres = ["dep:sqlx", "boss-events/postgres"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"], optional = true }
+
+boss-core = { path = "../../core/boss-core" }
+boss-clock-client = { path = "../../core/boss-clock-client" }
+boss-ports = { path = "../../core/boss-ports" }
+boss-events = { path = "../../core/boss-events" }
+boss-nats = { path = "../../core/boss-nats" }
+boss-policy = { path = "../../core/boss-policy" }
+boss-policy-client = { path = "../../core/boss-policy-client" }
+boss-classes-client = { path = "../../core/boss-classes-client" }
+[dev-dependencies]
+tower = { workspace = true }
+http-body-util = "0.1"
+boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,2393 @@
+# JobKind rows for Boss Brewery.
+#
+# Each [[job_kind]] block authors one row of the `job_kinds` table.
+# Schema mirrors `JobKindSpec` in
+# crates/core/boss-jobs/src/registry.rs — the brewery prepare step
+# (`boss-brewery-sim prepare`) publishes these into the JobKind
+# registry.
+#
+# Step DAGs use existing StepTypes from
+# crates/core/boss-jobs/src/step_registry.rs (no new step kinds proposed
+# in this seed bundle — the brewery deliberately tries to land
+# without authoring new step kinds, to validate that the existing
+# catalog covers a different vertical). Where a step kind feels
+# like a stretch, the per-step `metadata_defaults` carries
+# brewery-shaped fields (mash_temp_f, boil_minutes, og_gravity,
+# ibu_target, ferm_temp_c, …).
+#
+# Authority roles reference the brewery Roles seeded in
+# `classes.toml`. The shipped JobKindSpec validation does not yet
+# cross-check authority_role against the Class registry; when it
+# does, these rows must resolve.
+
+# ---------------------------------------------------------------------------
+# Daily morning brew — the production heartbeat. One per brewing day
+# per brewhouse Location.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "morning-brew"
+label = "Morning Brew"
+category = "production"
+subject_kinds = ["location"]
+description = """
+Daily production cycle on the brewhouse. Runs every brewing morning
+on the brewhouse Subject. Step graph maps directly onto the
+mash → lauter → boil → whirlpool → fermentation-start lifecycle.
+Cellar handoff to the conditioning side closes the Job.
+
+Tier 0 is a demand-check gate: the engine reads FG on_hand for
+the target SKUs and aborts the entire Job (no mash, no consumption)
+when on_hand exceeds the configured demand_window_days × trailing
+daily demand. Prevents unbounded inventory growth during sim runs
+and demonstrates the Job abstractions support for decision-gated
+DAGs.
+"""
+# JobKind-level display/routing hints. `surfaces` lists the
+# operational pages this JobKind appears on.
+metadata = { surfaces = ["qa"] }
+
+# Trigger. Captures the opening signal (periodic action fires at
+# brewing-shift start) so operators see "how did this Job get here"
+# as a real DAG node instead of inferred from audit_log. Engine
+# auto-completes this step at Job-open (ready_when = "true").
+[[job_kind.step]]
+title = "trigger"
+kind = "trigger"
+ready_when = "true"
+title_template = "Periodic action — daily brewing schedule fires"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "morning-brew-shift" }
+
+# Demand gate — read FG inventory and decide whether to brew today.
+# This is the FORK POINT. On oversupply the demand-check completes
+# with metadata.outcome="oversupply" and the Job routes to the
+# `day-skipped` terminal WITHOUT consuming raw ingredients or
+# producing FG. On "brew" it routes through the mash → … → package
+# brew path. The decision is captured in audit_log so the operator
+# can read the no-brew-today rationale as a real event.
+#
+# REVIEW(v2 fork): the brew/skip fork discriminates on the free-text
+# `checklist.outcome` metadata field. The Phase-3 fork-coverage lint
+# treats `outcome` as a wildcard domain (the `checklist` StepType
+# declares no `outcome` enum) and would ask for a bare
+# `steps.demand-check.done` fallback successor. We deliberately keep
+# both branches mutually exclusive on `= "brew"` / `= "oversupply"`
+# (correct runtime semantics — exactly one fires, the sibling is
+# Skipped) rather than add a bare-done fallback that would double-fire
+# on the brew path. Lint-clean fork coverage wants `checklist.outcome`
+# promoted to a declared enum `brew|oversupply` on the StepType — a
+# StepType change out of scope for this data-only migration.
+[[job_kind.step]]
+title = "demand-check"
+kind = "demand-gate"
+ready_when = "steps.trigger.done"
+authority_role = "head-brewer"
+title_template = "Demand check — should we brew today?"
+# Gate the brew on the bottleneck SKU — for PALE that's the
+# half-BBL keg (wholesale-keg-order consumes 1 FP-PALE-1-2-BBL
+# per order at ~35/day baseline, peaking ~240/day with the
+# weekday × month multiplier stack). Sixtels (FP-PALE-1-6-BBL)
+# have no wholesale consumer in the current JobKinds and
+# would oversupply first if gated, blocking the brew the
+# half-BBL DOES need — see the prior attempt's
+# "1/2-BBL starvation" trace.
+#
+# Threshold math: 240 × 30d window × 1.5 multiplier = 10,800.
+# Opening balance 5,000 + net (353-240) = 113/day fills the
+# threshold in ~51 sim-days, at which point the gate trips
+# and brews route to the skipped-outcome until consumption
+# catches back up. Caps in-flight Jobs naturally instead of
+# forcing the morning-brew rate to be wrong.
+# `batch_yield` — finished units of each target SKU produced by ONE
+# brew of this kind (the package step's produces_products qty for that
+# SKU). The dispatcher's in-flight-aware gate credits brews already in
+# the pipeline against the threshold: effective_on_hand = real_on_hand
+# + in_flight_brews × batch_yield. Without it, a deterministic daily
+# review would re-brew every working day through the multi-day brew
+# lag before the first batch lands — the throttle-up the open-loop
+# gate lacked. PALE packages 210 FP-PALE-1-2-BBL per brew.
+metadata_defaults = { target_skus = ["FP-PALE-1-2-BBL"], expected_daily_demand = { FP-PALE-1-2-BBL = 240 }, batch_yield = { FP-PALE-1-2-BBL = 210 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+
+# Brew path — gated on the demand-check deciding "brew".
+[[job_kind.step]]
+title = "plan"
+kind = "scheduling"
+ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"brew\""
+authority_role = "senior-brewer"
+title_template = "Plan today's brew — {subject.id}"
+metadata_defaults = { recipes_planned = [], batch_size_bbl = 30 }
+
+[[job_kind.step]]
+title = "mash-in"
+kind = "production-consume"
+ready_when = "steps.plan.done"
+title_template = "Mash in (drain ingredients)"
+authority_role = "brewer"
+# Default ingredient drawdown for a 30-bbl brew. Recipe-level
+# derivation (per-style ingredient lists) is the faker hook in
+# #33; v1 ships the canonical pale-ale grain bill so the
+# inventory.parts.consume side effect drains real SKUs. Grain bill
+# sized to the 250-BBL batch this JobKind packages (~157 BBL of
+# finished beer across the produce step below): a pale ale at
+# ~2 lb grain/gal needs ~9,800 lb = ~196 fifty-lb bags of 2-row +
+# ~10% specialty munich, plus the hop + yeast charge. The
+# `inventory.parts.consume` side effect drains these raw SKUs at
+# their inventory cost, which is what the finished-goods cost basis
+# (and therefore COGS) is derived from — no hard-coded margin.
+metadata_defaults = { mash_temp_f = 152, mash_minutes = 60, ingredients_consumed = [
+    { part_sku = "ING-MALT-2ROW-50", qty = 196 },
+    { part_sku = "ING-MALT-MUNICH-50", qty = 20 },
+    { part_sku = "ING-HOPS-CASCADE-44", qty = 4 },
+    { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
+] }
+
+[[job_kind.step]]
+title = "lauter"
+kind = "task"
+ready_when = "steps.mash-in.done"
+authority_role = "brewer"
+title_template = "Lauter / sparge"
+metadata_defaults = { sparge_minutes = 90, runoff_gravity = "" }
+
+[[job_kind.step]]
+title = "boil"
+kind = "task"
+ready_when = "steps.lauter.done"
+authority_role = "brewer"
+title_template = "Boil"
+metadata_defaults = { boil_minutes = 60, ibu_target = 35, og_target = 1.052 }
+
+[[job_kind.step]]
+title = "whirlpool"
+kind = "task"
+ready_when = "steps.boil.done"
+authority_role = "brewer"
+title_template = "Whirlpool & knockout"
+metadata_defaults = { whirlpool_minutes = 20, knockout_temp_f = 68 }
+
+[[job_kind.step]]
+title = "fermentation-start"
+kind = "task"
+ready_when = "steps.whirlpool.done"
+authority_role = "brewer"
+title_template = "Fermentation start (pitch yeast)"
+metadata_defaults = { ferm_temp_c = 19, yeast_strain = "", vessel = "" }
+
+# QC checkpoint between fermentation and packaging. Kept as a normal
+# linear step for now. On anomaly the engine spawns a `batch-qc-hold`
+# sub-Job on the same brewhouse Subject and the parent waits for the
+# sub-Job's resolution before packaging fires.
+# REVIEW(v2 fork): QC-hold sub-Job — the anomaly-path delegation to
+# the `batch-qc-hold` sub-JobKind is handled separately (dispatcher /
+# delegate-subjob), NOT modeled in this predicate graph. This step
+# stays a plain checklist on the brew path.
+[[job_kind.step]]
+title = "qc-checkpoint"
+kind = "checklist"
+ready_when = "steps.fermentation-start.done"
+authority_role = "qa-tech"
+title_template = "QC checkpoint — pH, gravity, microbial"
+# `is_qc_checkpoint = true` marks this step as the QC anomaly
+# hook. Engine reads the flag (not the title prefix) when
+# deciding whether to spawn a batch-qc-hold sub-Job on
+# anomaly. Pre-fix the engine string-matched the title.
+metadata_defaults = { ph_target = 4.4, fg_target = 1.012, microbial_pass = true, batch_id = "", is_qc_checkpoint = true }
+
+[[job_kind.step]]
+title = "package"
+kind = "production-produce"
+ready_when = "steps.qc-checkpoint.done"
+title_template = "Package + cellar handoff"
+authority_role = "packaging-tech"
+# Default Pale Ale split for one daily brew run on a 250-BBL
+# industrial brewhouse. 250 BBL ≈ 500 half-BBLs of capacity; the
+# brewery splits ~210 half-BBLs + 315 sixtels (proportions tuned to
+# match wholesale-keg-order's daily consumption: rate=35/day ×
+# qty=4 half-BBLs/order = 140 half-BBLs/day, vs production
+# 0.7/day × 210 = 147/day → 5% surplus). Pre-2026-05-04 the yield
+# was 24+36 (a small craft 30-BBL brew), which made the sim drain
+# inventory in hours and the regen 400 once on PUT
+# /api/products/FP-PALE-1-2-BBL/inventory/consume.
+#
+# The products.produce side effect fires on this step's
+# done-transition and increments finished_product_inventory.on_hand
+# at loc-brewery-brewhouse via boss-products.
+metadata_defaults = { batch_id = "", excise_bbl = 158, produces_products = [
+    # FG cost basis is DERIVED at runtime by products.produce from this
+    # brew's real consumed inputs — the mash-in `ingredients_consumed`
+    # (196×$25 2-row + 20×$30 Munich + 4×$300 Cascade + 6×$15 yeast ≈
+    # $6,790) plus packaging `parts_consumed` — each at its real inventory
+    # avg_cost, allocated across these kegs by volume. COGS thus comes
+    # from real purchases, not a percentage-of-price plug. `unit_cost_cents`
+    # is only a fallback if the real cost can't be resolved; it matches the
+    # ~$25.5/half-BBL, ~$8.5/sixtel the BOM derives.
+    { sku = "FP-PALE-1-2-BBL", qty = 210, location_id = "loc-brewery-brewhouse", unit_cost_cents = 2550 },
+    { sku = "FP-PALE-1-6-BBL", qty = 315, location_id = "loc-brewery-brewhouse", unit_cost_cents = 850 },
+], parts_consumed = [
+    # Packaging draws — one keg-fill kit per keg packaged + CO2 for
+    # the whole batch (~1 lb CO2 per BBL, so 30 BBL ≈ ~0.6 of a
+    # 50-lb cylinder; round to 1 cylinder per brew for sim).
+    { part_sku = "PKG-KEG-FILL-HALF-BBL", qty = 210 },
+    { part_sku = "PKG-KEG-FILL-SIXTEL", qty = 315 },
+    { part_sku = "PKG-CO2-50LB", qty = 1 },
+] }
+
+# Terminal outcomes — two branches the engine selects between based
+# on the demand-check's outcome metadata. Exactly one lands
+# Completed per Job; the sibling is Skipped. Makes the branching
+# visible at the DAG instead of inferred from step status alone.
+[[job_kind.step]]
+title = "brew-completed"
+kind = "outcome"
+ready_when = "steps.package.done"
+title_template = "Brew completed — packaged + handed off"
+terminal = { outcome = "completed" }
+metadata_defaults = { outcome_kind = "completed" }
+
+[[job_kind.step]]
+title = "day-skipped"
+kind = "outcome"
+# Skipped outcome branches straight off the demand-check decision —
+# it doesn't wait for the brew path (which won't run on this path).
+ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"oversupply\""
+title_template = "Day skipped — sufficient stock on hand"
+terminal = { outcome = "skipped" }
+metadata_defaults = { outcome_kind = "skipped" }
+
+# ---------------------------------------------------------------------------
+# Sale — wholesale account acquisition. Models the new-account
+# funnel: a sales rep prospecting a bar / restaurant / distributor
+# from cold-outreach through first-order. Once the prospect
+# converts, the recurring relationship is captured by
+# wholesale-keg-order Jobs against the same Account. Subject is
+# the prospect Account (acc-prospect-* pool seeded by
+# boss-brewery-data-seed).
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "sale"
+label = "Wholesale Account — Sales Pipeline"
+category = "sales"
+subject_kinds = ["account"]
+description = """
+The new-account acquisition funnel for wholesale customers.
+Subject is the prospect Account. Tier 0 fires the first-touch
+outreach; tier 1 qualifies fit (geography, license, beer program);
+tier 2 books and runs the tasting visit; tier 3 sends the pricing
+proposal; tier 4 gets ops sign-off on adding the account to the
+weekly route; tier 5 marks the milestone — first-order placed.
+The recurring keg orders that follow are captured by separate
+wholesale-keg-order Jobs against the same Account.
+"""
+
+[[job_kind.step]]
+title = "trigger"
+kind = "trigger"
+ready_when = "true"
+title_template = "Sales rep opens a new prospect pursuit"
+metadata_defaults = { trigger_kind = "operator", trigger_name = "sales-rep-discretion" }
+
+[[job_kind.step]]
+title = "first-touch"
+kind = "outreach"
+ready_when = "steps.trigger.done"
+title_template = "First-touch outreach — {subject.id}"
+authority_role = "sales-rep"
+metadata_defaults = { channel = "email", purpose = "Introduce the brewery, share the wholesale price list, gauge interest" }
+
+[[job_kind.step]]
+title = "qualify"
+kind = "qualification"
+ready_when = "steps.first-touch.done"
+title_template = "Qualify the prospect"
+authority_role = "sales-rep"
+metadata_defaults = { criteria = ["geography within owned route", "on-premise license active", "dedicated craft taps"], outcome = "" }
+
+[[job_kind.step]]
+title = "book-tasting"
+kind = "scheduling"
+ready_when = "steps.qualify.done"
+title_template = "Book the tasting visit"
+authority_role = "sales-rep"
+
+[[job_kind.step]]
+title = "tasting-visit"
+kind = "outreach"
+ready_when = "steps.book-tasting.done"
+title_template = "Tasting visit"
+authority_role = "sales-rep"
+metadata_defaults = { channel = "demo", purpose = "Pour the core five + one seasonal; capture which SKUs the buyer wants on tap" }
+
+[[job_kind.step]]
+title = "pricing-proposal"
+kind = "quote"
+ready_when = "steps.tasting-visit.done"
+title_template = "Send pricing proposal — {subject.id}"
+authority_role = "sales-rep"
+metadata_defaults = { line_items = [
+    { sku = "FP-PALE-1-2-BBL", qty = 4, unit_price_cents = 30000, description = "Pale Ale 1/2 BBL keg" },
+    { sku = "FP-IPA-1-6-BBL", qty = 8, unit_price_cents = 15000, description = "IPA 1/6 BBL keg" },
+] }
+
+[[job_kind.step]]
+title = "ops-signoff"
+kind = "sign-off"
+ready_when = "steps.pricing-proposal.done"
+title_template = "Ops sign-off — add to weekly route"
+authority_role = "head-of-distribution"
+
+[[job_kind.step]]
+title = "onboarded"
+kind = "outcome"
+ready_when = "steps.ops-signoff.done"
+title_template = "Account onboarded — first order placed"
+terminal = { outcome = "completed" }
+metadata_defaults = { outcome_kind = "completed" }
+
+# ---------------------------------------------------------------------------
+# Wholesale keg order — recurring orders from distributors, bars,
+# restaurants, retail.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "wholesale-keg-order"
+label = "Wholesale Keg Order"
+category = "sales"
+subject_kinds = ["account"]
+description = """
+A recurring keg order from a wholesale customer (distributor, bar,
+restaurant, retail). Subject is the customer (Account). Order
+quantity + delivery date go in Job metadata; cellar techs work the
+production tier; distribution drivers pick up the delivery tier.
+"""
+
+[[job_kind.step]]
+title = "trigger"
+kind = "trigger"
+ready_when = "true"
+title_template = "Customer ordered — keg request from {subject.id}"
+metadata_defaults = { trigger_kind = "event", trigger_name = "wholesale-customer-order" }
+
+[[job_kind.step]]
+title = "confirm-order"
+kind = "order-intake"
+ready_when = "steps.trigger.done"
+title_template = "Confirm order — {subject.id}"
+# Default order shape — 4 half-BBL kegs of Pale Ale + 8 sixtels
+# of IPA, matching the shipment step's `consumes_products` and
+# the billing step's $2,400 invoice template. The 32+64 numbers
+# this used to carry pre-2026-05-04 came from the original demo
+# template, but the shipment side was rebalanced to 4+8 for sim-
+# economic balance (production 210/315 per brew × 0.7-1.0 rate vs
+# wholesale 35 orders/day × 4+8 = sustainable). Intake + billing
+# now match shipment so the customer is billed for what shipped.
+# Real-world wholesale-keg-order Jobs would override per-customer
+# at intake time, but the canonical shape is enough for the
+# demo's flea-circus visual: every spawned Job shows real SKUs +
+# quantities, not an empty placeholder.
+metadata_defaults = { delivery_window = "", line_items = [
+    { sku = "FP-PALE-1-2-BBL", qty = 4, unit_price_cents = 30000, description = "Pale Ale 1/2 BBL keg" },
+    { sku = "FP-IPA-1-6-BBL", qty = 8, unit_price_cents = 15000, description = "IPA 1/6 BBL keg" },
+    { sku = "FP-STOUT-1-6-BBL", qty = 1, unit_price_cents = 15000, description = "Stout 1/6 BBL keg" },
+    { sku = "FP-LAGER-1-6-BBL", qty = 1, unit_price_cents = 15000, description = "Lager 1/6 BBL keg" },
+    { sku = "FP-HAZY-1-6-BBL", qty = 1, unit_price_cents = 15000, description = "Hazy IPA 1/6 BBL keg" },
+] }
+
+# Stock-check gate — agent-executed (the dispatcher reads real finished-goods
+# stock for the order's line_items and decides fulfill | backorder, computer-
+# speed on step.ready). A release valve that costs no labor: an order the
+# cooler can't cover exits to the `backordered` outcome instead of marching
+# through pick → ship → bill against stock that isn't there. The old flow had
+# no inventory check at all. See docs/design/brewery-model-completeness.md.
+[[job_kind.step]]
+title = "stock-check"
+kind = "availability-gate"
+ready_when = "steps.confirm-order.done"
+title_template = "Stock check — fulfill from the cooler?"
+metadata_defaults = { line_items = [
+    { sku = "FP-PALE-1-2-BBL", qty = 4 },
+    { sku = "FP-IPA-1-6-BBL", qty = 8 },
+    { sku = "FP-STOUT-1-6-BBL", qty = 1 },
+    { sku = "FP-LAGER-1-6-BBL", qty = 1 },
+    { sku = "FP-HAZY-1-6-BBL", qty = 1 },
+] }
+
+# Pull + stage the kegs from the cooler — the physical pick a warehouse hand
+# performs (human labor), gated on the stock-check deciding "fulfill". This is
+# the fulfillment step the old flow was missing (it jumped straight from
+# acknowledge to ship). Finished goods are relieved here against the kegs
+# actually pulled — see the FG-drawdown-on-pick rule in rules.toml. Wholesale
+# ships from the stock morning-brew builds; there is no per-order brew.
+[[job_kind.step]]
+title = "pull-and-stage"
+kind = "handoff"
+ready_when = "steps.stock-check.done AND steps.stock-check.metadata.outcome = \"fulfill\""
+title_template = "Pull + stage kegs from the cooler"
+authority_role = "warehouse-lead"
+metadata_defaults = { from_id = "inventory-clerk", to_id = "shipping-clerk", line_items = [
+    { sku = "FP-PALE-1-2-BBL", qty = 4 },
+    { sku = "FP-IPA-1-6-BBL", qty = 8 },
+    { sku = "FP-STOUT-1-6-BBL", qty = 1 },
+    { sku = "FP-LAGER-1-6-BBL", qty = 1 },
+    { sku = "FP-HAZY-1-6-BBL", qty = 1 },
+] }
+[[job_kind.step]]
+title = "deliver"
+kind = "shipment"
+ready_when = "steps.pull-and-stage.done"
+title_template = "Deliver"
+# Logistics step — driver confirms delivery via the courier
+# counterparty's scan chain, not via exec sign-off. Real
+# brewery ops don't gate Job closure on a manager signing
+# off a delivered keg.
+#
+# `line_items` drives shipping_line_items (the shipment
+# projection's per-SKU rows) via the `shipping.create` side
+# effect. Pre-#105 a sibling `consumes_products` array drove
+# `products.consume` for the COGS draw. Post-#105 the billing
+# step's line_items carry sku + qty and the `invoice_issued`
+# posting rule emits the COGS pair in the same JE as revenue;
+# the shipment becomes purely physical (ship-out date + scan
+# chain), with no GL movement.
+metadata_defaults = { direction = "outbound", origin = "loc-brewery-brewhouse", destination = "{subject.id}", carrier = "local-pickup", line_items = [
+    { sku = "FP-PALE-1-2-BBL", qty = 4, unit_price_cents = 30000, description = "Pale Ale 1/2 BBL keg" },
+    { sku = "FP-IPA-1-6-BBL", qty = 8, unit_price_cents = 15000, description = "IPA 1/6 BBL keg" },
+] }
+
+[[job_kind.step]]
+title = "invoice"
+kind = "billing"
+ready_when = "steps.deliver.done"
+title_template = "Invoice"
+authority_role = "bookkeeper"
+# Default line items + StepType-required fields so
+# commerce.invoice.issue has something to emit AND the
+# layer-1 JobKind lint sees the contract satisfied. The
+# handler computes amount_cents from line_items, but the
+# StepType lists account_id / amount_cents / currency as
+# required for the UI/admin path. Per-Job derivation is the
+# faker hook (#33).
+# #105 — billing line_items now carry sku + qty so the
+# `invoice_issued` posting rule emits matching COGS lines in the
+# same JE. Commerce HTTP handler decrements FG on_hand + stamps
+# the cost basis in the same tx as the invoice insert. The
+# shipment step's `consumes_products` array is no longer
+# load-bearing for COGS — billing is the single source of truth.
+metadata_defaults = { account_id = "{subject.id}", amount_cents = 285000, currency = "USD", line_items = [
+    { sku = "FP-PALE-1-2-BBL", qty = 4, amount_cents = 120000, revenue_category = "wholesale", description = "Pale Ale 1/2 BBL × 4" },
+    { sku = "FP-IPA-1-6-BBL", qty = 8, amount_cents = 120000, revenue_category = "wholesale", description = "IPA 1/6 BBL × 8" },
+    { sku = "FP-STOUT-1-6-BBL", qty = 1, amount_cents = 15000, revenue_category = "wholesale", description = "Stout 1/6 BBL × 1" },
+    { sku = "FP-LAGER-1-6-BBL", qty = 1, amount_cents = 15000, revenue_category = "wholesale", description = "Lager 1/6 BBL × 1" },
+    { sku = "FP-HAZY-1-6-BBL", qty = 1, amount_cents = 15000, revenue_category = "wholesale", description = "Hazy IPA 1/6 BBL × 1" },
+] }
+
+[[job_kind.step]]
+title = "delivered-invoiced"
+kind = "outcome"
+ready_when = "steps.invoice.done"
+title_template = "Order delivered + invoiced"
+terminal = { outcome = "completed" }
+metadata_defaults = { outcome_kind = "completed" }
+
+# The backorder branch of the stock-check gate — the order couldn't be
+# covered from the cooler. Terminal (skipped) for now; a follow-up backorder
+# Job that fulfills once stock returns is the next enhancement (see Q3 in
+# docs/design/brewery-model-completeness.md). This is the release valve that
+# keeps unfulfillable orders from lingering as open WIP.
+[[job_kind.step]]
+title = "backordered"
+kind = "outcome"
+ready_when = "steps.stock-check.done AND steps.stock-check.metadata.outcome = \"backorder\""
+title_template = "Backordered — insufficient finished-goods stock"
+terminal = { outcome = "skipped" }
+metadata_defaults = { outcome_kind = "skipped" }
+
+# ---------------------------------------------------------------------------
+# Seasonal release — limited-run beer launch (collab, firkin, barrel
+# program, holiday seasonal).
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "seasonal-release"
+label = "Seasonal Release"
+category = "sales"
+subject_kinds = ["account"]
+description = """
+Limited-run beer launch — seasonal lineup, collab brews with another
+brewery, firkin launches, barrel-aged programs. Subject is the
+collab-account or campaign-anchor account. Recipe design + test
+batch happen before the full batch is firm; production runs short
+before the launch date.
+"""
+
+[[job_kind.step]]
+title = "trigger"
+kind = "trigger"
+ready_when = "true"
+title_template = "Head brewer proposes seasonal release"
+metadata_defaults = { trigger_kind = "operator", trigger_name = "head-brewer-discretion" }
+
+[[job_kind.step]]
+title = "concept-brief"
+kind = "order-intake"
+ready_when = "steps.trigger.done"
+title_template = "Concept brief — {subject.id}"
+# `linked_systems` is the array of barrel asset_ids reserved for
+# this release (e.g. ["SYS-BBL-BBN-003", "SYS-BBL-OAK-007"]).
+# Empty for non-barrel-aged seasonals; a barrel-aged release
+# fills it in at the concept-brief step so downstream tasting +
+# packaging tiers know which vessels are committed.
+metadata_defaults = { release_date = "", barrels_planned = 0, style = "", linked_systems = [] }
+
+[[job_kind.step]]
+title = "schedule-recipe"
+kind = "scheduling"
+ready_when = "steps.concept-brief.done"
+authority_role = "senior-brewer"
+title_template = "Schedule recipe session"
+
+[[job_kind.step]]
+title = "recipe-design"
+kind = "task"
+ready_when = "steps.schedule-recipe.done"
+title_template = "Recipe design"
+authority_role = "head-brewer"
+
+[[job_kind.step]]
+title = "test-batch"
+kind = "task"
+ready_when = "steps.recipe-design.done"
+title_template = "Test batch (pilot system)"
+authority_role = "lab-tech"
+
+[[job_kind.step]]
+title = "tasting-signoff"
+kind = "sign-off"
+ready_when = "steps.test-batch.done"
+title_template = "Tasting sign-off"
+authority_role = "head-brewer"
+sign_offs_required = ["head-brewer"]
+
+[[job_kind.step]]
+title = "brew-full-batch"
+kind = "production-consume"
+ready_when = "steps.tasting-signoff.done"
+authority_role = "brewer"
+title_template = "Brew full batch (mash in — drain ingredients)"
+# Raw drawdown for the seasonal full batch. Like morning-brew's
+# mash-in, this debits 1310 WIP at each SKU's real inventory
+# avg_cost via the `inventory.parts.consume` side effect, and the
+# package step's `products.produce` reads these same rows to derive
+# the FG cost basis — so WIP gets the raw materials it later
+# transfers to FG, and COGS stays BOM-driven (no hard-coded plug).
+# Pre-2026-06 this was a bare `task` with no consume: the package
+# step produced FG (CR 1310) with a hard-coded unit_cost_cents and
+# nothing ever debited 1310, so every seasonal release drained WIP
+# by the full FG value (a systematic negative-WIP imbalance).
+#
+# Sized for a ~4-BBL specialty bottled batch (50 cases × 24×12oz ≈
+# 3.6 BBL finished). Seasonals run higher-gravity + heavier-hopped
+# than the house kegged beers, so grain/hops per BBL skew up. Every
+# raw input lives in `ingredients_consumed` (the consume handler
+# drains exactly one array — keeping CO2 here, not in a sibling
+# `parts_consumed`, ensures it is both consumed AND counted into the
+# derived FG cost, preserving WIP symmetry):
+#   8×$25 2-row + 3×$30 Munich + 2×$300 Cascade (dry-hop) +
+#   1×$15 yeast + 1×$25 CO2 = $930 → $18.60/case derived FG cost
+#   (50 × 1860¢ = 93,000¢ = the BOM total exactly, so the WIP→FG
+#   credit equals the raw→WIP debit and 1310 nets to zero).
+metadata_defaults = { mash_temp_f = 150, mash_minutes = 75, ingredients_consumed = [
+    { part_sku = "ING-MALT-2ROW-50", qty = 8 },
+    { part_sku = "ING-MALT-MUNICH-50", qty = 3 },
+    { part_sku = "ING-HOPS-CASCADE-44", qty = 2 },
+    { part_sku = "ING-YEAST-CALI-1L", qty = 1 },
+    { part_sku = "PKG-CO2-50LB", qty = 1 },
+] }
+
+[[job_kind.step]]
+title = "package"
+kind = "production-produce"
+ready_when = "steps.brew-full-batch.done"
+title_template = "Package (kegs / cans / bottles)"
+authority_role = "packaging-tech"
+# Default seasonal-release output: 50 cases of 24×12oz bottles.
+# A typical seasonal run is ~4 BBL, packaged heavier into bottles
+# (vs kegs) for retail distribution. The products.produce side
+# effect fires on done and refills FP-SEASONAL-12OZ-CS at the
+# brewhouse.
+#
+# FG cost basis is DERIVED at runtime by products.produce from this
+# brew's real consumed inputs (the brew-full-batch
+# `ingredients_consumed` above, each at its real inventory avg_cost)
+# — matching the WIP that step debited, so 1310 nets to zero per
+# release instead of draining. COGS therefore comes from real
+# purchases, not a percentage-of-price plug. `unit_cost_cents` is
+# only a fallback if the real cost can't be resolved; it matches the
+# $18.60/case the BOM derives ($930 ÷ 50 cases).
+metadata_defaults = { batch_id = "", excise_bbl = 4, produces_products = [
+    { sku = "FP-SEASONAL-12OZ-CS", qty = 50, location_id = "loc-brewery-brewhouse", unit_cost_cents = 1860 },
+] }
+
+[[job_kind.step]]
+title = "launch-announcement"
+kind = "outreach"
+ready_when = "steps.package.done"
+title_template = "Launch announcement"
+
+[[job_kind.step]]
+title = "release-day"
+kind = "milestone"
+ready_when = "steps.launch-announcement.done"
+title_template = "Release day"
+
+# Allocation shipment — consumes the produced FP-SEASONAL cases so
+# Physical allocation shipment — tracks the ship-out date but
+# no longer drives COGS (#105 moved that to billing). Kept for
+# operational tracking + the existing scan/courier counterparty
+# chain.
+[[job_kind.step]]
+title = "allocate-cases"
+kind = "shipment"
+ready_when = "steps.release-day.done"
+title_template = "Allocate cases — {subject.id}"
+authority_role = "shipping-clerk"
+metadata_defaults = { direction = "outbound", origin = "loc-brewery-brewhouse", destination = "{subject.id}", carrier = "freight", line_items = [
+    { sku = "FP-SEASONAL-12OZ-CS", qty = 50, unit_price_cents = 17000, description = "Seasonal release allocation" },
+] }
+
+[[job_kind.step]]
+title = "final-invoice"
+kind = "billing"
+ready_when = "steps.allocate-cases.done"
+title_template = "Final invoice"
+authority_role = "bookkeeper"
+# Default line items so commerce.invoice.issue emits a real
+# Invoice on step.done. Billing line carries sku + qty so
+# the `invoice_issued` posting rule (post-#105) draws matching
+# COGS in the same JE — revenue + FG drawdown are siamese.
+metadata_defaults = { account_id = "{subject.id}", amount_cents = 850000, currency = "USD", line_items = [
+    { sku = "FP-SEASONAL-12OZ-CS", qty = 50, amount_cents = 850000, revenue_category = "event-package", description = "Seasonal release allocation" },
+] }
+
+[[job_kind.step]]
+title = "launched-shipped"
+kind = "outcome"
+ready_when = "steps.final-invoice.done"
+title_template = "Seasonal launched + shipped"
+terminal = { outcome = "completed" }
+metadata_defaults = { outcome_kind = "completed" }
+
+# ---------------------------------------------------------------------------
+# Ingredient restock — periodic supplier order. Subject is Vendor.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "ingredient-restock"
+label = "Ingredient Restock"
+category = "procurement"
+subject_kinds = ["vendor"]
+description = """
+Periodic order to a supplier (grain mill, hops yard, yeast bank,
+adjuncts, packaging). Subject is the Vendor; line items go in
+metadata. Receiving / put-away closes the loop.
+"""
+
+[[job_kind.step]]
+title = "trigger"
+kind = "trigger"
+ready_when = "true"
+title_template = "Stock fell below reorder point — restock signal"
+metadata_defaults = { trigger_kind = "event", trigger_name = "inventory-reorder-threshold" }
+
+# Second trigger — proactive planning. A periodic reorder check that
+# pre-buys against estimated demand (a forecast window + safety stock),
+# the way a real brewery plans ahead instead of only reacting to a
+# threshold breach. Both triggers converge on `audit-stock`: a restock
+# Job can be initiated reactively (the threshold trigger above) or
+# proactively (this forecast check), and either path runs the same
+# audit → order → receive → bill flow.
+[[job_kind.step]]
+title = "reorder-check"
+kind = "trigger"
+ready_when = "true"
+title_template = "Scheduled reorder check — pre-buy on {subject.id} demand forecast"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "demand-forecast-reorder", forecast_window_days = 30, safety_stock_days = 14 }
+
+[[job_kind.step]]
+title = "audit-stock"
+kind = "task"
+ready_when = "steps.trigger.done OR steps.reorder-check.done"
+title_template = "Audit on-hand stock"
+authority_role = "head-brewer"
+
+[[job_kind.step]]
+title = "place-order"
+kind = "procurement"
+ready_when = "steps.audit-stock.done"
+title_template = "Place order — {subject.id}"
+# po_id is shared with the bill-approval step so the vendor
+# invoice's po_id FK lines up with the PO this step creates.
+# `inventory.po.place` (StepType-level side effect) reads this
+# on step.done and POSTs the PurchaseOrder to inventory.
+# po_id stamped with {day} so every ingredient-restock Job mints
+# a unique PO id; pre-fix every Job for a given vendor reused
+# "PO-{subject.id}" and the upsert collapsed 541 events into 10
+# rows (#143 finding). bill-approval step picks up the
+# same template so the vendor_invoice.po_id FK still resolves.
+metadata_defaults = { po_id = "PO-{subject.id}-{day}", items = [
+    { part_sku = "{metadata.part_sku}" },
+] }
+
+[[job_kind.step]]
+title = "inbound-shipment"
+kind = "shipment"
+ready_when = "steps.place-order.done"
+title_template = "Inbound shipment from {subject.id}"
+# Vendor ASN → in-transit → arrived-at-dock. The shipment
+# StepType's side effect (`shipping.create`) drops a row into
+# `boss-shipping` so the dock has a tracker before pallets
+# arrive. Receiving (next tier) closes against the same PO.
+metadata_defaults = { direction = "inbound", origin = "{subject.id}", destination = "brewery-dock", carrier = "freight", tracking_number = "", items = [] }
+
+[[job_kind.step]]
+title = "receive-delivery"
+kind = "receiving"
+ready_when = "steps.inbound-shipment.done"
+title_template = "Receive delivery"
+# Receiving clerk confirms via the receiving step itself
+# (which fires inventory.receive on completion). No exec
+# sign-off required in real brewery ops — that gate was
+# wrong and was leaving every ingredient-restock job stuck
+# at pending-sign-off.
+# Step.done refills inventory via `inventory.receive`. v1 ships
+# uniform receipt qtys across all 5 brewery SKUs since the
+# brewery has no vendor-product catalog yet — every vendor's
+# delivery looks the same. Per-vendor catalog mapping is the
+# faker hook (#33).
+# unit_cost_cents on each line carries the receive cost into
+# inventory_items.avg_cost_cents (weighted moving average per
+# receive). The PartsConsumeEmitter reads avg_cost_cents at
+# consume time and the inventory adapter posts the matching
+# `finance.cogs.recognized` JE in the same tx — that's how
+# raw-ingredient COGS flows through the GL precisely.
+#
+# Receive qtys are sized to match consumption: at 1.2 brews/day
+# × 12 unit-receipts/brew = 14 unit-receipts/day consumed. One
+# restock delivers ~26 unit-receipts. At the brewery's restock
+# cadence (~3 restocks/day across 10 vendors with ~20% reaching
+# bill-approval), supply ≈ demand over the year — so 1300
+# Inventory hovers around its initial pre-seed value instead of
+# climbing or going negative.
+# #103 — restock qtys per line raised to match the parts.toml
+# reorder_qty values (was 40/10/5/5/5, now 40/10/15/5/5) so cascade
+# hops keeps up with the brewery's ~3 hops/day burn rate. Pre-#103
+# the seed delivered only 5 hops per restock while brews consumed
+# 2-3 per day — net deficit drained inventory to ~0 over weeks.
+# Per-SKU restock: receive only the triggering ingredient. The reorder
+# rule passes its part_sku in Job metadata; the inventory.receive handler
+# derives qty + unit_cost from the live inventory item (its current
+# reorder_qty + avg_cost), so each restock buys one ingredient — not the
+# whole catalog (which over-bought ~$44M of raw against ~$1M consumed).
+metadata_defaults = { po_id = "PO-{subject.id}-{day}", expected_items = [
+    { part_sku = "{metadata.part_sku}" },
+] }
+
+[[job_kind.step]]
+title = "put-away"
+kind = "task"
+ready_when = "steps.receive-delivery.done"
+title_template = "Put-away to grain bin / hop freezer / yeast cooler"
+# Warehouse owns put-away; without a role the step strands (the
+# dispatcher leaves no-role tasks for an operator the sim never plays),
+# which left restocks open forever and drained raw malt to dead-letters.
+authority_role = "warehouse-lead"
+
+[[job_kind.step]]
+title = "approve-bill"
+kind = "bill-approval"
+ready_when = "steps.put-away.done"
+title_template = "Approve vendor bill — {subject.id}"
+authority_role = "bookkeeper"
+# Default amount so inventory.bill.approve emits a vendor
+# invoice on step.done. Per-Job derivation (from the
+# procurement step's PO line totals) is the faker hook in #33;
+# v1 ships a deterministic single-line rollup so the dispatch
+# chain emits real bills.
+# `lines` is the source of truth — the `bill_approved` posting rule sums
+# qty×unit_cost over them. Per-SKU restock: bill only the triggering
+# ingredient. amount_cents is omitted; the inventory.bill.approve handler
+# derives qty + unit_cost from the live inventory item and sums the single
+# line, mirroring what the receive step actually received.
+metadata_defaults = { po_id = "PO-{subject.id}-{day}", currency = "USD", lines = [
+    { part_sku = "{metadata.part_sku}" },
+] }
+
+[[job_kind.step]]
+title = "restock-completed"
+kind = "outcome"
+ready_when = "steps.approve-bill.done"
+title_template = "Restock received + bill approved"
+terminal = { outcome = "completed" }
+metadata_defaults = { outcome_kind = "completed" }
+
+# ---------------------------------------------------------------------------
+# Equipment preventive maintenance — preventive maintenance on fermenters, mash tun,
+# pumps, glycol chiller, etc. Subject today is Location (gap:
+# equipment-as-Subject — see DOMAIN.md).
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "equipment-preventive-maintenance"
+label = "Equipment Preventive Maintenance"
+category = "operations"
+subject_kinds = ["location"]
+description = """
+Preventive maintenance pass on production equipment. v0 keys on
+Location (the brewhouse) because there's no equipment-Subject yet
+— the equipment_id (fermenter-04, glycol-pump-2, etc.) goes in Job
+metadata. SubjectKind registry would let this become
+subject_kinds=['equipment'].
+"""
+metadata = { surfaces = ["qa"] }
+
+[[job_kind.step]]
+title = "trigger"
+kind = "trigger"
+ready_when = "true"
+title_template = "Monthly preventive-maintenance cycle fires"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "equipment-preventive-maintenance" }
+
+[[job_kind.step]]
+title = "schedule-window"
+kind = "scheduling"
+ready_when = "steps.trigger.done"
+authority_role = "mechanic"
+title_template = "Schedule preventive maintenance window"
+
+[[job_kind.step]]
+title = "inspect-diagnose"
+kind = "inspection"
+ready_when = "steps.schedule-window.done"
+title_template = "Inspect & diagnose"
+authority_role = "head-brewer"
+
+[[job_kind.step]]
+title = "service-parts"
+kind = "repair"
+ready_when = "steps.inspect-diagnose.done"
+title_template = "Service / replace parts"
+# Default parts drawdown so inventory.parts.consume emits real
+# consumption rows on step.done. Per-Job derivation (from the
+# inspection step's failure_mode_code) is the faker hook in
+# #33; v1 ships a generic seal+filter rollup.
+metadata_defaults = { parts_consumed = [
+    { part_sku = "PKG-CO2-50LB", qty = 1 },
+] }
+
+[[job_kind.step]]
+title = "verify-back-in-service"
+kind = "sign-off"
+ready_when = "steps.service-parts.done"
+title_template = "Verify back in service"
+authority_role = "head-brewer"
+sign_offs_required = ["head-brewer"]
+
+[[job_kind.step]]
+title = "back-in-service"
+kind = "outcome"
+ready_when = "steps.verify-back-in-service.done"
+title_template = "Equipment back in service"
+terminal = { outcome = "completed" }
+metadata_defaults = { outcome_kind = "completed" }
+
+# ---------------------------------------------------------------------------
+# Facility overhead — the monthly operating-cost cycle for the brewery
+# facility (rent + utilities). Subject is the brewery Location. Each cycle
+# approves a rent bill (→ 6200 Operating Expense — Rent) and a utilities
+# bill (→ 6300 Operating Expense — General) through the ledger's GENERAL AP
+# subledger — routed by each bill's `bill_category` via bill_accounts.toml,
+# decoupled from the inventory parts vendor-invoice — then settles them
+# (DR 2100 A/P / CR 1000 Cash). This is the OpEx the brewery's P&L was
+# missing. Opened by `[periodic.monthly-facility-overhead]`. Adding another
+# expense (insurance, services, …) is one more `expense-bill` step with a
+# different `bill_category` — zero code.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "facility-overhead"
+label = "Facility Overhead"
+category = "operations"
+subject_kinds = ["location"]
+description = """
+Monthly operating-cost cycle for the brewery facility: approve the rent +
+utilities bills through the ledger AP subledger, then pay them. Opened by
+`[periodic.monthly-facility-overhead]` on loc-brewery-brewhouse. Each bill's
+`bill_category` routes its GL debit (bill_accounts.toml); the credit is
+always 2100 A/P, drained to 1000 Cash by the payment step.
+"""
+
+[[job_kind.step]]
+title = "trigger"
+kind = "trigger"
+ready_when = "true"
+title_template = "Monthly facility-overhead cycle fires"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "facility-overhead" }
+
+[[job_kind.step]]
+title = "approve-rent"
+kind = "expense-bill"
+ready_when = "steps.trigger.done"
+title_template = "Approve monthly facility rent"
+authority_role = "bookkeeper"
+# ~$125k/mo lease on the 250-BBL production house + taproom → ~$1.5M/yr.
+# Routed to 6200 Operating Expense — Rent by bill_category.
+metadata_defaults = { bill_category = "rent", amount_cents = 12500000, vendor = "Cascade Industrial Properties", currency = "USD" }
+
+[[job_kind.step]]
+title = "approve-utilities"
+kind = "expense-bill"
+ready_when = "steps.approve-rent.done"
+title_template = "Approve monthly utilities"
+authority_role = "bookkeeper"
+# ~$175k/mo power + water + gas + glycol refrigeration for a 250-BBL house
+# → ~$2.1M/yr. Routed to 6300 Operating Expense — General by bill_category.
+metadata_defaults = { bill_category = "utilities", amount_cents = 17500000, vendor = "Regional Power & Water", currency = "USD" }
+
+[[job_kind.step]]
+title = "pay-overhead"
+kind = "expense-bill-payment"
+ready_when = "steps.approve-utilities.done"
+title_template = "Settle approved facility bills"
+authority_role = "bookkeeper"
+
+[[job_kind.step]]
+title = "overhead-posted"
+kind = "outcome"
+ready_when = "steps.pay-overhead.done"
+title_template = "Facility overhead recognized + paid"
+terminal = { outcome = "completed" }
+metadata_defaults = { outcome_kind = "completed" }
+
+# ---------------------------------------------------------------------------
+# Tap launch — a new beer goes on tap at the taproom (or rotates
+# into a wholesale lineup). Subject is Campaign.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "tap-launch"
+label = "Tap Launch"
+category = "marketing"
+subject_kinds = ["campaign"]
+description = """
+A beer goes on tap at the taproom (or rolls into the wholesale
+lineup). Owner is the head brewer until the recipe is locked, then
+ownership shifts to the taproom for rollout. Today this rides on
+the Campaign Subject; once Recipe-as-Subject lands, the recipe id
+can be the primary subject and the campaign becomes secondary.
+"""
+
+[[job_kind.step]]
+title = "trigger"
+kind = "trigger"
+ready_when = "true"
+title_template = "Head brewer schedules a tap launch"
+metadata_defaults = { trigger_kind = "operator", trigger_name = "head-brewer-discretion" }
+
+[[job_kind.step]]
+title = "recipe-lock"
+kind = "task"
+ready_when = "steps.trigger.done"
+title_template = "Recipe lock"
+authority_role = "head-brewer"
+
+[[job_kind.step]]
+title = "test-batch"
+kind = "task"
+ready_when = "steps.recipe-lock.done"
+authority_role = "brewer"
+title_template = "Test batch on pilot system"
+
+[[job_kind.step]]
+title = "cost-price"
+kind = "task"
+ready_when = "steps.test-batch.done"
+title_template = "Cost & price"
+authority_role = "owner"
+
+[[job_kind.step]]
+title = "owner-approval"
+kind = "sign-off"
+ready_when = "steps.cost-price.done"
+title_template = "Owner approval"
+authority_role = "owner"
+sign_offs_required = ["owner"]
+
+[[job_kind.step]]
+title = "announce"
+kind = "outreach"
+ready_when = "steps.owner-approval.done"
+title_template = "Announce to taproom + accounts"
+
+[[job_kind.step]]
+title = "tap-day"
+kind = "outcome"
+ready_when = "steps.announce.done"
+title_template = "Tap day"
+terminal = { outcome = "completed" }
+metadata_defaults = { outcome_kind = "completed" }
+
+# ---------------------------------------------------------------------------
+# Brewery hire — recruit + onboard. Subject = Employee (the new
+# hire, created at offer-accept).
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "brewery-hire"
+label = "Brewery Hire"
+category = "hr"
+subject_kinds = ["employee"]
+description = """
+Recruit + onboard a new brewery staff member. Subject is the
+employee record once it's created. Pre-create the requisition tier
+doesn't yet have a subject_id — first step uses the Job metadata
+(role_target, department) instead, then later steps pick up the
+employee_id once offer is signed.
+"""
+metadata = { surfaces = ["hr"] }
+
+[[job_kind.step]]
+title = "trigger"
+kind = "trigger"
+ready_when = "true"
+title_template = "Manager requests new headcount"
+metadata_defaults = { trigger_kind = "operator", trigger_name = "headcount-request" }
+
+[[job_kind.step]]
+title = "open-requisition"
+kind = "task"
+ready_when = "steps.trigger.done"
+title_template = "Open requisition"
+metadata_defaults = { role_target = "", department = "" }
+
+[[job_kind.step]]
+title = "source-candidates"
+kind = "outreach"
+ready_when = "steps.open-requisition.done"
+title_template = "Source candidates"
+
+[[job_kind.step]]
+title = "interviews"
+kind = "task"
+ready_when = "steps.source-candidates.done"
+title_template = "Interviews"
+
+[[job_kind.step]]
+title = "make-offer"
+kind = "sign-off"
+ready_when = "steps.interviews.done"
+title_template = "Make offer"
+authority_role = "owner"
+sign_offs_required = ["owner"]
+
+[[job_kind.step]]
+title = "onboarding-day-1"
+kind = "task"
+ready_when = "steps.make-offer.done"
+title_template = "Onboarding day 1"
+
+[[job_kind.step]]
+title = "onboarding-week-1"
+kind = "hr-hire"
+ready_when = "steps.onboarding-day-1.done"
+title_template = "Onboarding week 1 sign-off"
+authority_role = "head-brewer"
+sign_offs_required = ["head-brewer"]
+# people.hire side-effect (bound on the hr-hire StepType) fires
+# on done — POSTs the new employee to /api/people (idempotent
+# on id). Step metadata `hire` carries the new-hire payload;
+# defaults below are placeholders the operator (or sim driver)
+# overlays at done time.
+metadata_defaults = { hire = { id = "emp-new-hire", name = "new hire", role = "cellar-tech", department = "production", location = "loc-brewery-brewhouse", employment_type = "full-time" } }
+
+[[job_kind.step]]
+title = "hire-onboarded"
+kind = "outcome"
+ready_when = "steps.onboarding-week-1.done"
+title_template = "New hire onboarded"
+terminal = { outcome = "completed" }
+metadata_defaults = { outcome_kind = "completed" }
+
+# ---------------------------------------------------------------------------
+# Brewery terminate — voluntary or for-cause separation. Subject is
+# the existing employee whose status flips to terminated.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "brewery-terminate"
+label = "Brewery Terminate"
+category = "hr"
+subject_kinds = ["employee"]
+description = """
+Walk an employee through the offboarding flow. Subject is the
+employee whose status flips on the final step. Reason +
+last-day captured in step metadata; the people.terminate
+side-effect fires the PUT /api/people/{id}/status call so the
+employees projection picks up the change.
+"""
+metadata = { surfaces = ["hr"] }
+
+[[job_kind.step]]
+title = "trigger"
+kind = "trigger"
+ready_when = "true"
+title_template = "Resignation notice or termination decision"
+metadata_defaults = { trigger_kind = "event", trigger_name = "employee-separation" }
+
+[[job_kind.step]]
+title = "notify-last-day"
+kind = "task"
+ready_when = "steps.trigger.done"
+title_template = "Notify + last-day plan"
+metadata_defaults = { reason = "voluntary", last_day = "" }
+
+[[job_kind.step]]
+title = "exit-interview"
+kind = "task"
+ready_when = "steps.notify-last-day.done"
+title_template = "Exit interview"
+
+[[job_kind.step]]
+title = "offboarding-checklist"
+kind = "checklist"
+ready_when = "steps.exit-interview.done"
+title_template = "Offboarding checklist"
+metadata_defaults = { items = [
+    { label = "return equipment", checked = false },
+    { label = "final paycheck calc", checked = false },
+    { label = "access revocation", checked = false },
+    { label = "knowledge handoff", checked = false },
+] }
+
+[[job_kind.step]]
+title = "status-flip-terminate"
+kind = "hr-terminate"
+ready_when = "steps.offboarding-checklist.done"
+title_template = "Status flip — terminate"
+authority_role = "head-of-people"
+sign_offs_required = ["head-of-people"]
+# people.terminate side-effect (bound on the hr-terminate
+# StepType) fires on done. Step metadata `terminate.id` defaults
+# to a placeholder; the operator (or sim driver) overlays the
+# real employee id at done time. The "{subject.id}" template
+# isn't auto-substituted into metadata defaults — operators
+# do the overlay manually for now.
+metadata_defaults = { terminate = { id = "emp-placeholder", reason = "sim-driven", last_day = "" } }
+
+[[job_kind.step]]
+title = "separation-completed"
+kind = "outcome"
+ready_when = "steps.status-flip-terminate.done"
+title_template = "Separation completed"
+terminal = { outcome = "completed" }
+metadata_defaults = { outcome_kind = "completed" }
+
+# ---------------------------------------------------------------------------
+# Periodic-driven aggregates — JobKinds the periodic + batch engines
+# OpenJob into when their cadence fires. Subject is the brewhouse
+# Location since these are tenant-scoped operations rather than
+# tied to a specific account / vendor / employee.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "payroll-run"
+label = "Payroll Run"
+category = "finance"
+subject_kinds = ["location"]
+description = """
+Biweekly payroll batch. Opened by `[periodic.biweekly-payroll]`
+on every other Thursday; one Job per cycle per legal entity.
+Steps walk the calculation → review → release sequence; the
+terminal `payroll-release` step's side-effect handler POSTs to
+/api/ledger/payroll-runs/synthesize, which queries active
+employees server-side, computes per-employee gross/withheld/net
++ aggregate employer_tax, and posts the compound journal entry
+(DR 6100 Payroll Expense + DR 6400 Payroll Taxes & Benefits /
+CR 2150 Payroll Liability + CR 1000 Cash). Replaces the legacy
+BatchEngine `[batch.payroll]` path (retired 2026-05-06; see
+TODO.md "Strip BatchEngine").
+"""
+
+[[job_kind.step]]
+title = "trigger"
+kind = "trigger"
+ready_when = "true"
+title_template = "Biweekly payroll cycle fires"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "biweekly-payroll" }
+
+[[job_kind.step]]
+title = "run-calculation"
+kind = "task"
+ready_when = "steps.trigger.done"
+authority_role = "payroll-mgr"
+title_template = "Run payroll calculation"
+
+[[job_kind.step]]
+title = "bookkeeper-review"
+kind = "sign-off"
+ready_when = "steps.run-calculation.done"
+title_template = "Bookkeeper review"
+authority_role = "bookkeeper"
+sign_offs_required = ["bookkeeper"]
+
+[[job_kind.step]]
+title = "release-funds"
+kind = "payroll-release"
+ready_when = "steps.bookkeeper-review.done"
+title_template = "Release funds + journal entry"
+authority_role = "bookkeeper"
+# Period bounds derive from the Job's open day so each biweekly
+# run lands inside the same fiscal year as the labor-absorption
+# JEs it offsets. `{day}` / `{day_minus_<N>}` expand at
+# materialize-time via `materialize_steps_at` (#54). Pre-fix,
+# hardcoded 2026-01-* literals pushed the payroll DR offset
+# outside FY2025 and left 6100 Payroll at -$1.1M — breaking
+# period close with `expense_lines[].balance_cents must be
+# non-negative`. A biweekly run on open-day D covers [D-13, D]
+# and the run is dated D (cash leaves the bank that day).
+metadata_defaults = { period_start = "{day_minus_13}", period_end = "{day}", run_date = "{day}" }
+
+[[job_kind.step]]
+title = "payroll-released"
+kind = "outcome"
+ready_when = "steps.release-funds.done"
+title_template = "Payroll released — funds sent + JE posted"
+terminal = { outcome = "completed" }
+metadata_defaults = { outcome_kind = "completed" }
+
+# ---------------------------------------------------------------------------
+# Quarterly sales-tax filing — opened by `[periodic.quarterly-sales-tax]`.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "sales-tax-filing"
+label = "Sales Tax Filing"
+category = "finance"
+subject_kinds = ["location"]
+description = """
+Quarterly sales-tax return. Opened by the PeriodicEngine on the
+filing-window anchor; the BatchEngine fanout fills the per-
+jurisdiction lines a few weeks later. Steps walk the prepare →
+review → file → confirm sequence.
+"""
+
+[[job_kind.step]]
+title = "prepare-filing"
+kind = "task"
+ready_when = "true"
+title_template = "Prepare filing data"
+authority_role = "bookkeeper"
+
+[[job_kind.step]]
+title = "review-sign"
+kind = "sign-off"
+ready_when = "steps.prepare-filing.done"
+title_template = "Review + sign filing"
+authority_role = "bookkeeper"
+sign_offs_required = ["bookkeeper"]
+
+[[job_kind.step]]
+title = "submit-remit"
+kind = "tax-remittance"
+ready_when = "steps.review-sign.done"
+title_template = "Submit + remit filing"
+authority_role = "bookkeeper"
+terminal = { outcome = "filed" }
+# Default Q1 2026 California sales-tax remittance so
+# ledger.tax.remit emits a real filing on step.done. The
+# bridge tags this filing with `derive_basis = "period-sales-tax"`,
+# so the ledger overrides `amount_cents` below with the actual
+# 2300 Sales Tax Payable credit balance accrued during the
+# period (invoice tax_lines post here at issue time). The
+# literal below is only the early-sim fallback for days with
+# no 2300 activity yet.
+# Period + amount derived at fire-time: the ledger-sim-bridge
+# defaults period to the calendar quarter PRIOR to ctx.day and
+# the ledger's derive_basis = "period-sales-tax" computes amount
+# from the 2300 credit balance over that period. Only kind +
+# jurisdiction live here.
+metadata_defaults = { kind = "sales", jurisdiction = "US-CA" }
+
+# ---------------------------------------------------------------------------
+# Quarterly federal payroll-tax filing (Form 941). Opened by
+# `[periodic.quarterly-payroll-941]`. Same three-step shape as
+# sales-tax-filing — the terminal `tax-remittance` step's
+# existing `ledger.tax.remit` side-effect handler reads metadata
+# (kind="payroll_941", liability_account="2150") and POSTs to
+# /api/ledger/tax-filings, which posts the
+# `finance.tax.remitted` fact + drains 2150 Payroll Liability
+# to 1000 Cash. Form 940 (annual FUTA) is rolled into this
+# quarterly filing for sim plausibility.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "payroll-941-filing"
+label = "Federal Payroll Tax Filing (941)"
+category = "finance"
+subject_kinds = ["location"]
+description = """
+Quarterly federal payroll tax (Form 941) filing — drains
+accumulated 2150 Payroll Liability for the closed quarter.
+Steps walk the prepare → review → file sequence; the terminal
+tax-remittance step's `ledger.tax.remit` side-effect emits the
+canonical TaxFilingSnapshot which the ledger-sim-bridge POSTs
+to /api/ledger/tax-filings.
+"""
+
+[[job_kind.step]]
+title = "aggregate-accruals"
+kind = "task"
+ready_when = "true"
+title_template = "Aggregate quarterly employer-tax accruals"
+authority_role = "bookkeeper"
+
+[[job_kind.step]]
+title = "bookkeeper-review"
+kind = "sign-off"
+ready_when = "steps.aggregate-accruals.done"
+title_template = "Bookkeeper review"
+authority_role = "bookkeeper"
+sign_offs_required = ["bookkeeper"]
+
+[[job_kind.step]]
+title = "file-941-remit"
+kind = "tax-remittance"
+ready_when = "steps.bookkeeper-review.done"
+title_template = "File 941 + remit"
+authority_role = "bookkeeper"
+terminal = { outcome = "filed" }
+# Period + amount derived at fire-time: the ledger-sim-bridge
+# defaults period to the calendar quarter PRIOR to ctx.day and
+# the ledger's derive_basis = "period-payroll-941" computes
+# amount from payroll_runs employer_tax_cents over that period.
+# Only kind + jurisdiction live here.
+metadata_defaults = { kind = "payroll_941", jurisdiction = "US-FEDERAL" }
+
+# ---------------------------------------------------------------------------
+# Quarterly estimated income-tax filing. Opened by
+# `[periodic.quarterly-income-tax]`. Same three-step shape as
+# the other tax filings; metadata kind="income" routes to the
+# 2310 Income Tax Payable liability account at posting time.
+# Real businesses estimate quarterly using prior-period revenue
+# × estimated_net_margin × tax_rate; v1 ships a deterministic
+# Q1 amount for the demo.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "income-tax-filing"
+label = "Estimated Income Tax Filing"
+category = "finance"
+subject_kinds = ["location"]
+description = """
+Quarterly estimated federal + state income-tax filing —
+drains accumulated 2310 Income Tax Payable. Steps walk
+prepare → review → file. Terminal tax-remittance step's
+`ledger.tax.remit` handler emits the canonical
+TaxFilingSnapshot for /api/ledger/tax-filings.
+"""
+
+[[job_kind.step]]
+title = "compute-estimate"
+kind = "task"
+ready_when = "true"
+title_template = "Compute quarterly estimated tax"
+authority_role = "bookkeeper"
+
+[[job_kind.step]]
+title = "cfo-review"
+kind = "sign-off"
+ready_when = "steps.compute-estimate.done"
+title_template = "CFO review"
+authority_role = "cfo"
+sign_offs_required = ["cfo"]
+
+[[job_kind.step]]
+title = "pay-estimate"
+kind = "tax-remittance"
+ready_when = "steps.cfo-review.done"
+title_template = "Pay quarterly estimate"
+authority_role = "bookkeeper"
+terminal = { outcome = "filed" }
+# Period + amount derived at fire-time: the ledger-sim-bridge
+# defaults `(period_start, period_end)` to the calendar quarter
+# PRIOR to ctx.day (filing mid-April settles the just-ended Q1)
+# and the ledger's `derive_basis = "prior-quarter-net-income"`
+# computes amount = 21% × prior-quarter net income from the GL.
+# Hardcoded period/amount caused #88 (every fire reused Q1 2026)
+# and the 2025-04-15-payment-before-2026-01-01-accrual ordering
+# bug — only `kind` + `jurisdiction` belong here.
+metadata_defaults = { kind = "income", jurisdiction = "US-FEDERAL" }
+
+# ---------------------------------------------------------------------------
+# Quarterly federal beer excise tax (TTB) filing. Opened by
+# `[periodic.quarterly-excise]`. Same three-step shape as the other
+# tax filings; metadata kind="excise" routes to the 2320 Excise Tax
+# Payable liability account at remit time. The liability is accrued
+# per brew batch (DR 6550 / CR 2320 = excise_bbl × $3.50/bbl) by the
+# `excise-accrue-on-production-produce-step-done` dispatcher rule, so
+# this filing's `period-excise` derive_basis sums the 2320 credit
+# balance for the quarter and the terminal step drains it to Cash.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "excise-tax-filing"
+label = "Federal Excise Tax Filing (TTB)"
+category = "finance"
+subject_kinds = ["location"]
+description = """
+Quarterly federal beer excise tax (TTB) filing — drains accumulated
+2320 Excise Tax Payable for the closed quarter. The liability accrues
+per brew batch at packaging time (DR 6550 Excise Tax Expense / CR 2320
+= excise_bbl × $3.50/bbl small-brewer rate). Steps walk the
+prepare → review → file sequence; the terminal tax-remittance step's
+`ledger.tax.remit` side-effect emits the canonical TaxFilingSnapshot
+which the ledger POSTs to /api/ledger/tax-filings.
+"""
+
+[[job_kind.step]]
+title = "aggregate-accruals"
+kind = "task"
+ready_when = "true"
+title_template = "Aggregate quarterly excise-tax accruals"
+authority_role = "bookkeeper"
+
+[[job_kind.step]]
+title = "bookkeeper-review"
+kind = "sign-off"
+ready_when = "steps.aggregate-accruals.done"
+title_template = "Bookkeeper review"
+authority_role = "bookkeeper"
+sign_offs_required = ["bookkeeper"]
+
+[[job_kind.step]]
+title = "file-excise-remit"
+kind = "tax-remittance"
+ready_when = "steps.bookkeeper-review.done"
+title_template = "File excise + remit"
+authority_role = "bookkeeper"
+terminal = { outcome = "filed" }
+# Period + amount derived at fire-time: the dispatcher defaults period
+# to the calendar quarter PRIOR to the completion day and the ledger's
+# derive_basis = "period-excise" computes amount from the 2320 credit
+# balance over that period. Only kind + jurisdiction live here.
+metadata_defaults = { kind = "excise", jurisdiction = "US-FEDERAL" }
+
+# ---------------------------------------------------------------------------
+# Direct-to-consumer order — the brewery /shop checkout flow.
+# A guest fills out the order form on /shop/{sku} and this Job is
+# the operational state. Step graph mirrors a wholesale-keg-order
+# scaled down to a single line item:
+#   intake (confirm + reserve) → handoff (pull from cooler)
+#   → shipment (pickup or local delivery) → billing (invoice the
+#   customer email).
+# Decrements finished-product inventory on shipment via the
+# existing `inventory.parts.consume` side effect; the line items
+# come from the order metadata. Subject is the catch-all
+# `acc-direct-shop` Account so direct orders aggregate cleanly
+# under one customer cluster instead of needing per-email
+# Account creation.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "direct-shop-order"
+label = "Direct Shop Order"
+category = "sales"
+subject_kinds = ["account"]
+description = """
+A guest order placed through the brewery's /shop storefront. The
+customer submits the order form; this Job opens with the line
+items, customer-contact metadata, and total in metadata. Same
+shape as wholesale-keg-order but scaled to a single-SKU
+single-customer cart. Decrements finished-product inventory on
+shipment via inventory.parts.consume; bills via
+commerce.invoice.issue on the closing billing step.
+"""
+
+[[job_kind.step]]
+title = "confirm-order"
+kind = "order-intake"
+ready_when = "true"
+title_template = "Confirm order — {subject.id}"
+authority_role = "shipping-clerk"
+# Order metadata copied from the SPA submit:
+# customer_email, customer_name, customer_phone, line_items,
+# total_cents, notes. The intake step's role is to confirm
+# stock + customer contact, then unblock the handoff step.
+#
+# `asset_id` is required by the intake StepType (designed for
+# the used-device-shop tenant's per-unit lineage). Beer orders
+# don't carry a per-unit asset_id; we satisfy the validator
+# with the order Job's own id pattern. The shipping-clerk
+# UX overlays nothing else — this default is enough.
+metadata_defaults = { asset_id = "direct-shop-order" }
+
+[[job_kind.step]]
+title = "pull-from-cooler"
+kind = "handoff"
+ready_when = "steps.confirm-order.done"
+title_template = "Pull from cooler — {subject.id}"
+authority_role = "inventory-clerk"
+# Pulls from the brewhouse cooler bin (FP-* SKUs are at C-NN-NN).
+# `from_id`/`to_id` required by the handoff StepType (designed
+# for cross-team transfers in the device-refurb tenant). Brewery
+# direct-shop fulfillment is a short warehouse→shipping flow, so
+# we satisfy the validator with the two staffed role names.
+metadata_defaults = { from_id = "inventory-clerk", to_id = "shipping-clerk" }
+
+[[job_kind.step]]
+title = "ship-to-customer"
+kind = "shipment"
+ready_when = "steps.pull-from-cooler.done"
+title_template = "Ship to customer — {subject.id}"
+authority_role = "shipping-clerk"
+# Shipment carrier defaults to local-pickup; can be flipped to
+# UPS / FedEx / freight in the step UX. The existing keg-courier
+# counterparty (tenant.toml) doesn't fire on direct-shop because
+# its match_payload gates on a wholesale-shaped trigger; direct
+# orders ship same-day or via local delivery, no scan chain.
+#
+# Physical pickup/ship step — tracks the moment goods leave the
+# brewery. Post-#105 the COGS draw moved to the billing step
+# (where revenue + cost are siamese in one JE), so the shipment
+# step is purely operational here.
+metadata_defaults = { direction = "outbound", origin = "loc-brewery-brewhouse", destination = "customer-pickup", line_items = [
+    { sku = "FP-PALE-1-6-BBL", qty = 1, unit_price_cents = 18000, description = "Direct shop order — Pale Ale sixtel ($180 retail)" },
+] }
+
+[[job_kind.step]]
+title = "invoice-customer"
+kind = "billing"
+ready_when = "steps.ship-to-customer.done"
+title_template = "Invoice customer — {subject.id}"
+authority_role = "ar-clerk"
+terminal = { outcome = "completed" }
+# Invoice goes to customer_email. The existing
+# commerce.invoice.issue side effect mints the invoice with
+# `issued_on = ctx.day` (sim-day) and the line items from the
+# order metadata.
+#
+# Pre-2026-05-04 these defaults were `line_items = []` with a
+# comment that per-Job line items would overlay at open time.
+# But the sim's create_job_with_steps path doesn't have a
+# per-Job overlay hook (#33 in the original comment) — it
+# uses metadata_defaults verbatim. The empty array then made
+# every direct-shop-order billing step fail
+# `commerce.invoice.issue` with BadArgs ("line_items is
+# empty"), surfaced cleanly by the side-effect-failures
+# instrumentation (commit 6fb8b62 + 5ede132).
+#
+# Real-Job overlay (when the /shop SPA submits an order)
+# replaces these defaults with the customer's actual order
+# items — that path still works. The defaults here are the
+# sim-only fallback so the engine produces a complete invoice
+# on step.done with at least a placeholder line.
+metadata_defaults = { account_id = "acc-direct-shop", amount_cents = 18000, currency = "USD", line_items = [
+    { sku = "FP-PALE-1-6-BBL", qty = 1, amount_cents = 18000, revenue_category = "retail", description = "Direct shop order — Pale Ale sixtel ($180 retail, vs $150 wholesale)" },
+] }
+
+# ---------------------------------------------------------------------------
+# Morning brew — IPA day. Same shape as `morning-brew` (the Pale
+# Ale heartbeat) but consumes IPA-recipe ingredients and produces
+# FP-IPA-* SKUs. The shape-driven engine picks between this and
+# the Pale Ale variant via the `[job_rates]` split in tenant.toml
+# (default 0.7 pale + 0.3 IPA = 1.0 brewing days/week). Adding
+# more recipes is a matter of authoring more JobKinds + adjusting
+# rates, not engine code.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "morning-brew-ipa"
+label = "Morning Brew — IPA"
+category = "production"
+subject_kinds = ["location"]
+description = """
+Daily IPA brewing cycle. Identical step graph to morning-brew
+(mash → lauter → boil → whirlpool → fermentation → package),
+but ingredients drain from the hop-forward IPA recipe (more
+Cascade + Centennial in the whirlpool) and packaged output
+goes to FP-IPA-* SKUs.
+"""
+
+# Trigger + brew/skip fork — see morning-brew (pale) for the full
+# pattern. Engine auto-completes the trigger at Job-open and the
+# demand-check forks between the brew path and the day-skipped
+# terminal.
+# REVIEW(v2 fork): brew/skip fork over the free-text
+# `checklist.outcome` field — same shape as morning-brew (pale).
+# Branches are mutually exclusive on `= "brew"` / `= "oversupply"`;
+# lint-clean Phase-3 coverage wants `checklist.outcome` promoted to a
+# declared enum on the StepType (out of scope for this data migration).
+[[job_kind.step]]
+title = "trigger"
+kind = "trigger"
+ready_when = "true"
+title_template = "Periodic action — daily IPA brewing schedule fires"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "morning-brew-shift" }
+
+[[job_kind.step]]
+title = "demand-check"
+kind = "demand-gate"
+ready_when = "steps.trigger.done"
+authority_role = "head-brewer"
+title_template = "Demand check — should we brew IPA today?"
+# batch_yield: IPA packages 320 FP-IPA-1-6-BBL sixtels per brew (see
+# morning-brew pale for the full rationale — pipeline credit so the
+# daily review doesn't double-brew through the brew lag).
+metadata_defaults = { target_skus = ["FP-IPA-1-6-BBL"], expected_daily_demand = { FP-IPA-1-6-BBL = 470 }, batch_yield = { FP-IPA-1-6-BBL = 320 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+
+[[job_kind.step]]
+title = "plan"
+kind = "scheduling"
+ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"brew\""
+authority_role = "senior-brewer"
+title_template = "Plan today's IPA — {subject.id}"
+metadata_defaults = { recipes_planned = ["West Coast IPA"], batch_size_bbl = 30 }
+
+[[job_kind.step]]
+title = "mash-in"
+kind = "production-consume"
+ready_when = "steps.plan.done"
+title_template = "Mash in (drain IPA ingredients)"
+authority_role = "brewer"
+# IPA grain bill: more 2-row, less Munich; aggressive Cascade
+# hops; California ale yeast like the Pale Ale.
+metadata_defaults = { mash_temp_f = 150, mash_minutes = 60, ingredients_consumed = [
+    { part_sku = "ING-MALT-2ROW-50", qty = 160 },
+    { part_sku = "ING-MALT-MUNICH-50", qty = 12 },
+    { part_sku = "ING-HOPS-CASCADE-44", qty = 6 },
+    { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
+] }
+
+[[job_kind.step]]
+title = "lauter"
+kind = "task"
+ready_when = "steps.mash-in.done"
+authority_role = "brewer"
+title_template = "Lauter / sparge"
+metadata_defaults = { sparge_minutes = 90, runoff_gravity = "" }
+
+[[job_kind.step]]
+title = "boil"
+kind = "task"
+ready_when = "steps.lauter.done"
+authority_role = "brewer"
+title_template = "Boil + late hop additions"
+metadata_defaults = { boil_minutes = 60, ibu_target = 65, og_target = 1.066 }
+
+[[job_kind.step]]
+title = "whirlpool"
+kind = "task"
+ready_when = "steps.boil.done"
+authority_role = "brewer"
+title_template = "Whirlpool & knockout"
+metadata_defaults = { whirlpool_minutes = 20, knockout_temp_f = 68 }
+
+[[job_kind.step]]
+title = "fermentation-start"
+kind = "task"
+ready_when = "steps.whirlpool.done"
+authority_role = "brewer"
+title_template = "Fermentation start (pitch yeast + dry hop schedule)"
+metadata_defaults = { ferm_temp_c = 19, yeast_strain = "California Ale", vessel = "" }
+
+[[job_kind.step]]
+title = "package"
+kind = "production-produce"
+ready_when = "steps.fermentation-start.done"
+title_template = "Package + cellar handoff (IPA)"
+authority_role = "packaging-tech"
+# IPA brews skew sixtel-heavy because tap rotations turn IPAs
+# faster than house pales — bars want fresh hops, smaller kegs
+# turn over before bitterness drops. 18 half-BBLs + 48 sixtels
+# of FP-IPA-* per 30-BBL brew.
+metadata_defaults = { batch_id = "", excise_bbl = 133, produces_products = [
+    { sku = "FP-IPA-1-2-BBL", qty = 160, location_id = "loc-brewery-brewhouse", unit_cost_cents = 2500 },
+    { sku = "FP-IPA-1-6-BBL", qty = 320, location_id = "loc-brewery-brewhouse", unit_cost_cents = 850 },
+], parts_consumed = [
+    { part_sku = "PKG-KEG-FILL-HALF-BBL", qty = 160 },
+    { part_sku = "PKG-KEG-FILL-SIXTEL", qty = 320 },
+    { part_sku = "PKG-CO2-50LB", qty = 1 },
+] }
+
+[[job_kind.step]]
+title = "brew-completed"
+kind = "outcome"
+ready_when = "steps.package.done"
+title_template = "Brew completed — packaged + handed off"
+terminal = { outcome = "completed" }
+metadata_defaults = { outcome_kind = "completed" }
+
+[[job_kind.step]]
+title = "day-skipped"
+kind = "outcome"
+ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"oversupply\""
+title_template = "Day skipped — sufficient IPA stock on hand"
+terminal = { outcome = "skipped" }
+metadata_defaults = { outcome_kind = "skipped" }
+
+# ---------------------------------------------------------------------------
+# Morning brew — Stout day. Roast-malt forward; English-style ale yeast.
+# Same step graph as morning-brew. Lower fan-out vs PALE/IPA — stouts
+# are a smaller share of taproom + wholesale volume in most US regional
+# breweries. Added 2026-05-05 as part of the 5-beer scalability lift
+# (TODO #48): exercises the simulator's per-JobKind fan-out and the
+# wholesale line-item mix at higher SKU count.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "morning-brew-stout"
+label = "Morning Brew — Stout"
+category = "production"
+subject_kinds = ["location"]
+description = """
+Daily Stout brewing cycle. Same step graph as morning-brew (mash →
+lauter → boil → whirlpool → fermentation → package), with a
+roast-malt grain bill and English ale yeast. Output is FP-STOUT-*.
+"""
+
+# Trigger + brew/skip fork — see morning-brew (pale) for the full
+# pattern.
+# REVIEW(v2 fork): brew/skip fork over the free-text
+# `checklist.outcome` field — same shape as morning-brew (pale).
+# Branches mutually exclusive on `= "brew"` / `= "oversupply"`;
+# lint-clean coverage wants `checklist.outcome` as a declared enum.
+[[job_kind.step]]
+title = "trigger"
+kind = "trigger"
+ready_when = "true"
+title_template = "Periodic action — daily stout brewing schedule fires"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "morning-brew-shift" }
+
+[[job_kind.step]]
+title = "demand-check"
+kind = "demand-gate"
+ready_when = "steps.trigger.done"
+authority_role = "head-brewer"
+title_template = "Demand check — should we brew Stout today?"
+# batch_yield: Stout packages 360 FP-STOUT-1-6-BBL sixtels per brew
+# (see morning-brew pale for the full rationale). This is the kind
+# whose cold-start drought aborted the 365-day regen ~day 58.
+metadata_defaults = { target_skus = ["FP-STOUT-1-6-BBL"], expected_daily_demand = { FP-STOUT-1-6-BBL = 64 }, batch_yield = { FP-STOUT-1-6-BBL = 360 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+
+[[job_kind.step]]
+title = "plan"
+kind = "scheduling"
+ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"brew\""
+authority_role = "senior-brewer"
+title_template = "Plan today's stout — {subject.id}"
+metadata_defaults = { recipes_planned = ["Dry Irish Stout"], batch_size_bbl = 30 }
+
+[[job_kind.step]]
+title = "mash-in"
+kind = "production-consume"
+ready_when = "steps.plan.done"
+title_template = "Mash in (drain stout ingredients)"
+authority_role = "brewer"
+# Stout grain bill: base 2-row + roasted barley + chocolate malt
+# (modeled as MUNICH for inventory purposes — the brewery's KB
+# doesn't yet split chocolate vs roast); modest hop bill.
+metadata_defaults = { mash_temp_f = 154, mash_minutes = 60, ingredients_consumed = [
+    { part_sku = "ING-MALT-2ROW-50", qty = 150 },
+    { part_sku = "ING-MALT-MUNICH-50", qty = 25 },
+    { part_sku = "ING-HOPS-CASCADE-44", qty = 4 },
+    { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
+] }
+
+[[job_kind.step]]
+title = "lauter"
+kind = "task"
+ready_when = "steps.mash-in.done"
+authority_role = "brewer"
+title_template = "Lauter / sparge"
+metadata_defaults = { sparge_minutes = 90, runoff_gravity = "" }
+
+[[job_kind.step]]
+title = "boil"
+kind = "task"
+ready_when = "steps.lauter.done"
+authority_role = "brewer"
+title_template = "Boil"
+metadata_defaults = { boil_minutes = 75, ibu_target = 30, og_target = 1.045 }
+
+[[job_kind.step]]
+title = "whirlpool"
+kind = "task"
+ready_when = "steps.boil.done"
+authority_role = "brewer"
+title_template = "Whirlpool & knockout"
+metadata_defaults = { whirlpool_minutes = 15, knockout_temp_f = 66 }
+
+[[job_kind.step]]
+title = "fermentation-start"
+kind = "task"
+ready_when = "steps.whirlpool.done"
+authority_role = "brewer"
+title_template = "Fermentation start (pitch yeast)"
+metadata_defaults = { ferm_temp_c = 18, yeast_strain = "English Ale", vessel = "" }
+
+[[job_kind.step]]
+title = "package"
+kind = "production-produce"
+ready_when = "steps.fermentation-start.done"
+title_template = "Package + cellar handoff (stout)"
+authority_role = "packaging-tech"
+# Stout split: heavier on sixtels because nitro pours run on smaller
+# kegs in most bars. 100 half-BBLs + 360 sixtels per 30-BBL brew.
+metadata_defaults = { batch_id = "", excise_bbl = 110, produces_products = [
+    { sku = "FP-STOUT-1-2-BBL", qty = 100, location_id = "loc-brewery-brewhouse", unit_cost_cents = 2500 },
+    { sku = "FP-STOUT-1-6-BBL", qty = 360, location_id = "loc-brewery-brewhouse", unit_cost_cents = 850 },
+], parts_consumed = [
+    { part_sku = "PKG-KEG-FILL-HALF-BBL", qty = 100 },
+    { part_sku = "PKG-KEG-FILL-SIXTEL", qty = 360 },
+    { part_sku = "PKG-CO2-50LB", qty = 1 },
+] }
+
+[[job_kind.step]]
+title = "brew-completed"
+kind = "outcome"
+ready_when = "steps.package.done"
+title_template = "Brew completed — packaged + handed off"
+terminal = { outcome = "completed" }
+metadata_defaults = { outcome_kind = "completed" }
+
+[[job_kind.step]]
+title = "day-skipped"
+kind = "outcome"
+ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"oversupply\""
+title_template = "Day skipped — sufficient stout stock on hand"
+terminal = { outcome = "skipped" }
+metadata_defaults = { outcome_kind = "skipped" }
+
+# ---------------------------------------------------------------------------
+# Morning brew — Lager day. Pilsner malt + noble hops + lager yeast.
+# Real lagers need 4-6 weeks of cold conditioning before packaging;
+# the sim collapses that to the same one-day cycle as ales for
+# brewhouse-scheduling parity. Tap-room Lagers move steady but slow.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "morning-brew-lager"
+label = "Morning Brew — Lager"
+category = "production"
+subject_kinds = ["location"]
+description = """
+Daily Lager brewing cycle. Same step graph as morning-brew. Pilsner
+malt grain bill, noble hops, lager yeast. Output is FP-LAGER-*.
+Note: real cold conditioning is collapsed for sim purposes.
+"""
+
+# Trigger + brew/skip fork — see morning-brew (pale) for the full
+# pattern.
+# REVIEW(v2 fork): brew/skip fork over the free-text
+# `checklist.outcome` field — same shape as morning-brew (pale).
+# Branches mutually exclusive on `= "brew"` / `= "oversupply"`;
+# lint-clean coverage wants `checklist.outcome` as a declared enum.
+[[job_kind.step]]
+title = "trigger"
+kind = "trigger"
+ready_when = "true"
+title_template = "Periodic action — daily lager brewing schedule fires"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "morning-brew-shift" }
+
+[[job_kind.step]]
+title = "demand-check"
+kind = "demand-gate"
+ready_when = "steps.trigger.done"
+authority_role = "head-brewer"
+title_template = "Demand check — should we brew Lager today?"
+# batch_yield: Lager packages 200 FP-LAGER-1-6-BBL sixtels per brew
+# (see morning-brew pale for the full rationale).
+metadata_defaults = { target_skus = ["FP-LAGER-1-6-BBL"], expected_daily_demand = { FP-LAGER-1-6-BBL = 50 }, batch_yield = { FP-LAGER-1-6-BBL = 200 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+
+[[job_kind.step]]
+title = "plan"
+kind = "scheduling"
+ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"brew\""
+authority_role = "senior-brewer"
+title_template = "Plan today's lager — {subject.id}"
+metadata_defaults = { recipes_planned = ["Czech Pilsner"], batch_size_bbl = 30 }
+
+[[job_kind.step]]
+title = "mash-in"
+kind = "production-consume"
+ready_when = "steps.plan.done"
+title_template = "Mash in (drain lager ingredients)"
+authority_role = "brewer"
+# Pilsner-style grain bill: 100% pilsner malt (modeled as 2-row,
+# the closest KB SKU); modest noble hop bill.
+metadata_defaults = { mash_temp_f = 148, mash_minutes = 90, ingredients_consumed = [
+    { part_sku = "ING-MALT-2ROW-50", qty = 160 },
+    { part_sku = "ING-HOPS-CASCADE-44", qty = 3 },
+    { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
+] }
+
+[[job_kind.step]]
+title = "lauter"
+kind = "task"
+ready_when = "steps.mash-in.done"
+authority_role = "brewer"
+title_template = "Lauter / sparge"
+metadata_defaults = { sparge_minutes = 105, runoff_gravity = "" }
+
+[[job_kind.step]]
+title = "boil"
+kind = "task"
+ready_when = "steps.lauter.done"
+authority_role = "brewer"
+title_template = "Boil"
+metadata_defaults = { boil_minutes = 90, ibu_target = 38, og_target = 1.048 }
+
+[[job_kind.step]]
+title = "whirlpool"
+kind = "task"
+ready_when = "steps.boil.done"
+authority_role = "brewer"
+title_template = "Whirlpool & knockout"
+metadata_defaults = { whirlpool_minutes = 20, knockout_temp_f = 50 }
+
+[[job_kind.step]]
+title = "fermentation-start"
+kind = "task"
+ready_when = "steps.whirlpool.done"
+authority_role = "brewer"
+title_template = "Fermentation start (pitch lager yeast)"
+metadata_defaults = { ferm_temp_c = 11, yeast_strain = "German Lager", vessel = "" }
+
+[[job_kind.step]]
+title = "package"
+kind = "production-produce"
+ready_when = "steps.fermentation-start.done"
+title_template = "Package + cellar handoff (lager)"
+authority_role = "packaging-tech"
+# Lager split: heavier on half-BBLs because lagers move steady at
+# higher-volume accounts (sports bars, large taprooms). 200 half-BBLs
+# + 200 sixtels per 30-BBL brew.
+metadata_defaults = { batch_id = "", excise_bbl = 133, produces_products = [
+    { sku = "FP-LAGER-1-2-BBL", qty = 200, location_id = "loc-brewery-brewhouse", unit_cost_cents = 2500 },
+    { sku = "FP-LAGER-1-6-BBL", qty = 200, location_id = "loc-brewery-brewhouse", unit_cost_cents = 850 },
+], parts_consumed = [
+    { part_sku = "PKG-KEG-FILL-HALF-BBL", qty = 200 },
+    { part_sku = "PKG-KEG-FILL-SIXTEL", qty = 200 },
+    { part_sku = "PKG-CO2-50LB", qty = 1 },
+] }
+
+[[job_kind.step]]
+title = "brew-completed"
+kind = "outcome"
+ready_when = "steps.package.done"
+title_template = "Brew completed — packaged + handed off"
+terminal = { outcome = "completed" }
+metadata_defaults = { outcome_kind = "completed" }
+
+[[job_kind.step]]
+title = "day-skipped"
+kind = "outcome"
+ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"oversupply\""
+title_template = "Day skipped — sufficient lager stock on hand"
+terminal = { outcome = "skipped" }
+metadata_defaults = { outcome_kind = "skipped" }
+
+# ---------------------------------------------------------------------------
+# Morning brew — Hazy IPA day. Flaked oats + soft water + Citra/Mosaic
+# in the whirlpool + dry hop. The "category-defining" beer for most
+# regional craft breweries today.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "morning-brew-hazy"
+label = "Morning Brew — Hazy IPA"
+category = "production"
+subject_kinds = ["location"]
+description = """
+Daily Hazy IPA brewing cycle. Same step graph as morning-brew. Heavy
+late hop schedule, biotransformation dry hop in active fermentation,
+English ale yeast for haze/mouthfeel. Output is FP-HAZY-*.
+"""
+
+# Trigger + brew/skip fork — see morning-brew (pale) for the full
+# pattern.
+# REVIEW(v2 fork): brew/skip fork over the free-text
+# `checklist.outcome` field — same shape as morning-brew (pale).
+# Branches mutually exclusive on `= "brew"` / `= "oversupply"`;
+# lint-clean coverage wants `checklist.outcome` as a declared enum.
+[[job_kind.step]]
+title = "trigger"
+kind = "trigger"
+ready_when = "true"
+title_template = "Periodic action — daily hazy brewing schedule fires"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "morning-brew-shift" }
+
+[[job_kind.step]]
+title = "demand-check"
+kind = "demand-gate"
+ready_when = "steps.trigger.done"
+authority_role = "head-brewer"
+title_template = "Demand check — should we brew Hazy IPA today?"
+# batch_yield: Hazy packages 400 FP-HAZY-1-6-BBL sixtels per brew
+# (see morning-brew pale for the full rationale).
+metadata_defaults = { target_skus = ["FP-HAZY-1-6-BBL"], expected_daily_demand = { FP-HAZY-1-6-BBL = 60 }, batch_yield = { FP-HAZY-1-6-BBL = 400 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+
+[[job_kind.step]]
+title = "plan"
+kind = "scheduling"
+ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"brew\""
+authority_role = "senior-brewer"
+title_template = "Plan today's hazy — {subject.id}"
+metadata_defaults = { recipes_planned = ["Hazy IPA"], batch_size_bbl = 30 }
+
+[[job_kind.step]]
+title = "mash-in"
+kind = "production-consume"
+ready_when = "steps.plan.done"
+title_template = "Mash in (drain hazy ingredients)"
+authority_role = "brewer"
+# Hazy grain bill: lots of 2-row + Munich for body, heavy hop charge.
+# Real recipes also use flaked oats + wheat — modeled as additional
+# 2-row for inventory purposes until the brewery's KB grows the SKU.
+metadata_defaults = { mash_temp_f = 156, mash_minutes = 60, ingredients_consumed = [
+    { part_sku = "ING-MALT-2ROW-50", qty = 130 },
+    { part_sku = "ING-MALT-MUNICH-50", qty = 15 },
+    { part_sku = "ING-HOPS-CASCADE-44", qty = 8 },
+    { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
+] }
+
+[[job_kind.step]]
+title = "lauter"
+kind = "task"
+ready_when = "steps.mash-in.done"
+authority_role = "brewer"
+title_template = "Lauter / sparge"
+metadata_defaults = { sparge_minutes = 90, runoff_gravity = "" }
+
+[[job_kind.step]]
+title = "boil"
+kind = "task"
+ready_when = "steps.lauter.done"
+authority_role = "brewer"
+title_template = "Boil + whirlpool hops"
+metadata_defaults = { boil_minutes = 60, ibu_target = 50, og_target = 1.064 }
+
+[[job_kind.step]]
+title = "whirlpool"
+kind = "task"
+ready_when = "steps.boil.done"
+authority_role = "brewer"
+title_template = "Whirlpool & knockout"
+metadata_defaults = { whirlpool_minutes = 30, knockout_temp_f = 70 }
+
+[[job_kind.step]]
+title = "fermentation-start"
+kind = "task"
+ready_when = "steps.whirlpool.done"
+authority_role = "brewer"
+title_template = "Fermentation start (pitch yeast + biotransformation dry hop)"
+metadata_defaults = { ferm_temp_c = 20, yeast_strain = "English Ale", vessel = "" }
+
+[[job_kind.step]]
+title = "package"
+kind = "production-produce"
+ready_when = "steps.fermentation-start.done"
+title_template = "Package + cellar handoff (hazy)"
+authority_role = "packaging-tech"
+# Hazy split: extreme sixtel skew. Hazies oxidize fast — bars want
+# small-format kegs that turn over in days, not weeks. 80 half-BBLs
+# + 400 sixtels per 30-BBL brew.
+metadata_defaults = { batch_id = "", excise_bbl = 107, produces_products = [
+    { sku = "FP-HAZY-1-2-BBL", qty = 80, location_id = "loc-brewery-brewhouse", unit_cost_cents = 2500 },
+    { sku = "FP-HAZY-1-6-BBL", qty = 400, location_id = "loc-brewery-brewhouse", unit_cost_cents = 850 },
+], parts_consumed = [
+    { part_sku = "PKG-KEG-FILL-HALF-BBL", qty = 80 },
+    { part_sku = "PKG-KEG-FILL-SIXTEL", qty = 400 },
+    { part_sku = "PKG-CO2-50LB", qty = 1 },
+] }
+
+[[job_kind.step]]
+title = "brew-completed"
+kind = "outcome"
+ready_when = "steps.package.done"
+title_template = "Brew completed — packaged + handed off"
+terminal = { outcome = "completed" }
+metadata_defaults = { outcome_kind = "completed" }
+
+[[job_kind.step]]
+title = "day-skipped"
+kind = "outcome"
+ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"oversupply\""
+title_template = "Day skipped — sufficient hazy stock on hand"
+terminal = { outcome = "skipped" }
+metadata_defaults = { outcome_kind = "skipped" }
+
+# ---------------------------------------------------------------------------
+# Ad-hoc — generic catchall for one-off work the SPA's "Create Ad Hoc
+# Job" button uses (#92). Accepts every platform Subject kind so any
+# entity (employee, account, vendor, location, system, purchase_order,
+# campaign) can anchor an ad-hoc piece of work. Single task step; the
+# operator fills in what the work is via the title + metadata.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "ad-hoc"
+label = "Ad Hoc"
+category = "operations"
+subject_kinds = ["employee", "account", "vendor", "location", "asset", "purchase_order", "campaign"]
+description = """
+Generic catchall for one-off work. Single task step; the operator
+fills in what the work is via the title + metadata.
+"""
+
+# Single step is both the trigger (fires at Job open) and the
+# terminal (its completion closes the Job).
+[[job_kind.step]]
+title = "do-the-thing"
+kind = "task"
+ready_when = "true"
+title_template = "Do the thing"
+terminal = { outcome = "completed" }
+metadata_defaults = { category = "ad-hoc" }
+
+
+# ---------------------------------------------------------------------------
+# Batch QC Hold — anomaly-path Sub-Job for morning-brew (and other
+# production JobKinds). When a QC checkpoint flags off-spec results
+# (microbial contamination, pH drift, gravity miss), the parent Job
+# spawns one of these on the same brewhouse Subject. This is the
+# canonical example of how the Job abstraction handles non-DAG
+# flows — the parent waits at the QC step while this sub-Job runs
+# its own decision tree, and the parent step transitions to
+# completed (resume packaging) or aborted (write-off + re-brew)
+# based on the triage outcome.
+#
+# Step graph branches by `tier 2` triage decision:
+#   - Tier 3a `re-test` runs another QC scan; if passing the parent
+#     QC step completes and packaging proceeds.
+#   - Tier 3b `re-blend` adjusts the batch via dilution / adjunct
+#     addition; parent QC step completes.
+#   - Tier 3c `discard` initiates batch-loss accounting; parent QC
+#     step aborts; a `batch-writeoff-recovery` Job opens for the
+#     financial side.
+#
+# The audit log reads as a real causal trace — each branch carries
+# its own actor (qa-tech for lab, qa-supervisor for triage,
+# packaging-tech for blend), and the cross-Job linkage via
+# `parent_job_id` in metadata makes the sub-Job query-able from
+# the parent and vice versa.
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "batch-qc-hold"
+label = "Batch QC Hold (anomaly branch)"
+category = "production"
+subject_kinds = ["location"]
+description = """
+Opened when a parent production Job (typically morning-brew) flags
+a QC anomaly. Lab analysis + triage decision; outcome determines
+whether the parent batch packages, re-blends, or gets written off.
+The parent JobKind waits on this sub-Job before completing its QC
+step.
+"""
+
+# Linear chain. The triage-decision branches (re-test / re-blend /
+# discard) described in the header are captured in the
+# `apply-triage` step's `branch` metadata + the `triage-decision`
+# sign-off's `decision`, not as separate predicate-graph branches —
+# the sub-Job resolves to one terminal (release hold) regardless of
+# branch, so a linear chain is the faithful v2 shape.
+[[job_kind.step]]
+title = "lab-analysis"
+kind = "task"
+ready_when = "true"
+authority_role = "qa-tech"
+title_template = "Lab analysis — collect + run extended panel"
+metadata_defaults = { panel = ["pH", "fg", "abv", "diacetyl", "microbial_plating"], parent_job_id = "", parent_step_id = "", batch_id = "" }
+
+[[job_kind.step]]
+title = "document-findings"
+kind = "task"
+ready_when = "steps.lab-analysis.done"
+authority_role = "qa-tech"
+title_template = "Document findings — extended results"
+metadata_defaults = { findings = "", anomaly_confirmed = false }
+
+[[job_kind.step]]
+title = "triage-decision"
+kind = "sign-off"
+ready_when = "steps.document-findings.done"
+authority_role = "qa-supervisor"
+title_template = "Triage decision — re-test, re-blend, or discard"
+sign_offs_required = ["qa-supervisor"]
+metadata_defaults = { decision = "pending", rationale = "" }
+
+[[job_kind.step]]
+title = "apply-triage"
+kind = "task"
+ready_when = "steps.triage-decision.done"
+authority_role = "qa-tech"
+title_template = "Apply triage decision — execute the branch"
+metadata_defaults = { branch = "", action_taken = "" }
+
+[[job_kind.step]]
+title = "release-hold"
+kind = "handoff"
+ready_when = "steps.apply-triage.done"
+authority_role = "qa-supervisor"
+title_template = "Resume parent Job — release hold"
+terminal = { outcome = "resolved" }
+metadata_defaults = { release_decision = "", parent_resumes = true }
+
+
+
+# ---------------------------------------------------------------------------
+# AP Payment Run — daily batch settlement of approved vendor bills.
+#
+# Procurement (ingredient-restock) ends at bill-approval (DR 1300 /
+# CR 2100). This Job picks up from there: every business day a
+# bookkeeper opens an ap-payment-run on the brewery location,
+# queries approved-but-unpaid vendor_invoices due within the window,
+# cuts a check / ACH for each, and marks them paid. The mark-paid
+# side effect fires inventory.vendor_invoice.paid which projects
+# to finance.bill.paid (DR 2100 / CR 1000 cash out, AP drains).
+#
+# Without this Job the direct-method cash flow shows AP credits
+# but zero debits — bills accrue forever, books drift from cash
+# reality. (#128 finding.)
+# ---------------------------------------------------------------------------
+
+[[job_kind]]
+kind = "ap-payment-run"
+label = "Daily AP Payment Run"
+category = "finance"
+subject_kinds = ["location"]
+description = """
+Daily batch settlement of approved vendor invoices. Subject is
+the brewery location (the entity issuing the checks / ACH).
+The bookkeeper queries approved-but-unpaid bills due within the
+window, batches them into a single payment run, and marks each
+paid via a side-effect that drains 2100 AP back into 1000 Cash.
+"""
+
+[[job_kind.step]]
+title = "pull-aging-report"
+kind = "task"
+ready_when = "true"
+authority_role = "bookkeeper"
+title_template = "Pull due-bills aging report"
+# At step.done the engine will populate `invoices_to_pay` with
+# the IDs of vendor_invoices where status=approved + due_on
+# within the window. v1 uses a max-30-day window so payments
+# track standard net-30 terms.
+metadata_defaults = { window_days = 30, invoices_to_pay = [] }
+
+[[job_kind.step]]
+title = "cut-checks"
+kind = "bill-payment-batch"
+ready_when = "steps.pull-aging-report.done"
+authority_role = "bookkeeper"
+title_template = "Cut checks + ACH for due bills"
+# This step's side-effect handler (inventory.bill.payment_batch)
+# emits a single inventory.bill.payment_batch topic. The route
+# table sends it to POST /api/inventory/vendor-invoices/batch-pay
+# which queries status=approved invoices, flips each to paid
+# (paid_on = step.day), and emits one inventory.vendor_invoice.paid
+# per invoice. Those project to finance.bill.paid → DR 2100 / CR 1000.
+metadata_defaults = { payment_method = "ach", check_run_id = "" }
+
+[[job_kind.step]]
+title = "record-provenance"
+kind = "task"
+ready_when = "steps.cut-checks.done"
+authority_role = "bookkeeper"
+title_template = "Record check-run provenance + file"
+terminal = { outcome = "completed" }
+# Audit-trail closer: log totals + match GL period.
+metadata_defaults = { total_paid_cents = 0, bill_count = 0, run_notes = "" }
+
+# ---------------------------------------------------------------------------
+# Taproom shift close — daily by-the-pour sales of the sixtels + co-product
+# half-BBLs the brewery over-produces. Wholesale buys PALE-1/2 + IPA-1/6, so
+# PALE-1/6 + IPA-1/2 accumulate; the taproom monetizes that surplus at retail
+# pour value and posts to Revenue — Taproom (4120). The billing line_items
+# drive both the FG decrement and the revenue+COGS JE (post-#105).
+# ---------------------------------------------------------------------------
+[[job_kind]]
+kind = "taproom-shift-close"
+label = "Taproom Shift Close"
+category = "sales"
+subject_kinds = ["account"]
+description = """
+End-of-day taproom reconciliation: ring up the shift's by-the-glass sales
+(poured from surplus sixtels + co-product half-BBLs) and post the day's
+taproom revenue. One per operating day; a shift-lead closes the register and
+a bookkeeper posts the revenue.
+"""
+
+[[job_kind.step]]
+title = "ring-sales"
+kind = "order-intake"
+ready_when = "true"
+title_template = "Ring up taproom shift sales"
+authority_role = "shift-lead"
+metadata_defaults = { asset_id = "taproom-shift" }
+
+[[job_kind.step]]
+title = "close-register"
+kind = "billing"
+ready_when = "steps.ring-sales.done"
+title_template = "Close register + post taproom revenue"
+authority_role = "bookkeeper"
+terminal = { outcome = "completed" }
+# By-the-pour retail value: a sixtel (~41 16oz pours) at ~$7 ≈ $287; a
+# half-BBL (~124 pours) ≈ $868. ~30 sixtels + 8 half-BBLs of the surplus
+# SKUs per shift ≈ $15.5k/day → ~$5.7M/yr taproom revenue. COGS draws on
+# the same real FG cost basis as wholesale, so taproom margin is honest.
+metadata_defaults = { account_id = "acc-direct-shop", amount_cents = 1555400, currency = "USD", line_items = [
+    { sku = "FP-PALE-1-6-BBL", qty = 30, amount_cents = 861000, revenue_category = "taproom", description = "Pale Ale sixtels — by-the-pour (30 × $287)" },
+    { sku = "FP-IPA-1-2-BBL", qty = 8, amount_cents = 694400, revenue_category = "taproom", description = "IPA half-BBLs — by-the-pour (8 × $868)" },
+] }
+
+# ---------------------------------------------------------------------------
+# Distribution contract — bulk sales of surplus co-product kegs to a regional
+# distributor at bulk (below-retail) pricing. Posts to Revenue — Distribution
+# Contracts (4140). Same sale shape; bigger quantities, lower per-unit price.
+# ---------------------------------------------------------------------------
+[[job_kind]]
+kind = "distribution-contract"
+label = "Distribution Contract"
+category = "sales"
+subject_kinds = ["account"]
+description = """
+A bulk pull against a standing distribution contract: a distributor takes a
+pallet of the surplus co-product kegs the wholesale flow doesn't move. Bulk
+pricing (below taproom/retail), high volume. Posts Revenue — Distribution.
+"""
+
+[[job_kind.step]]
+title = "pull-contract"
+kind = "order-intake"
+ready_when = "true"
+title_template = "Pull distribution contract — {subject.id}"
+authority_role = "sales-rep"
+metadata_defaults = { asset_id = "distribution-contract" }
+
+[[job_kind.step]]
+title = "invoice-distributor"
+kind = "billing"
+ready_when = "steps.pull-contract.done"
+title_template = "Invoice distributor — {subject.id}"
+authority_role = "ar-clerk"
+terminal = { outcome = "completed" }
+# Bulk pricing: a surplus sixtel at ~$150 (distributor), a co-product
+# half-BBL at ~$250. ~50 sixtels + 30 half-BBLs per contract ≈ $15k → at
+# ~1/day ≈ $5.5M/yr distribution revenue.
+metadata_defaults = { account_id = "acc-bigseed-0000", amount_cents = 1500000, currency = "USD", line_items = [
+    { sku = "FP-PALE-1-6-BBL", qty = 50, amount_cents = 750000, revenue_category = "distribution", description = "Pale Ale sixtels — bulk distribution (50 × $150)" },
+    { sku = "FP-LAGER-1-2-BBL", qty = 30, amount_cents = 750000, revenue_category = "distribution", description = "Lager half-BBLs — bulk distribution (30 × $250)" },
+] }

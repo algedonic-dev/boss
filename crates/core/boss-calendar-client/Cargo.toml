@@ -1,0 +1,21 @@
+[package]
+name = "boss-calendar-client"
+description = "HTTP client port for reaching boss-calendar from other services"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+boss-core = { path = "../boss-core" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

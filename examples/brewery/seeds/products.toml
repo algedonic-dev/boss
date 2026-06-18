@@ -1,0 +1,117 @@
+# Brewery finished-product catalog.
+#
+# Sibling to parts.toml (raw inputs); this file enumerates the
+# OUTPUT goods Algedonic Ales produces and sells. Loaded by the
+# brewery prepare step (`boss-brewery-sim prepare`) via POST
+# /api/products/batch, which lands these as state events; the
+# rebuilder reproduces the catalog deterministically from
+# products.product.upserted on replay.
+#
+# package_unit values are tenant-defined and validated against
+# the Class registry's (subject_kind='product', member_attribute=
+# 'package_unit') rows — the brewery currently uses
+# 1/2-bbl-keg, 1/6-bbl-keg, 12oz-case.
+#
+# Initial on-hand at the brewhouse cooler is wired separately
+# via finished_product_inventory POSTs so a fresh deploy renders
+# stock without waiting for the first morning-brew Job to
+# complete its packaging step.
+
+[[products]]
+sku = "FP-PALE-1-2-BBL"
+name = "Pale Ale 1/2-BBL Keg"
+product_kind = "beer"
+package_unit = "1/2-bbl-keg"
+description = "Flagship pale ale. 5.4% ABV, 38 IBU. American Pale Ale style."
+metadata = { abv_pct = 5.4, ibu = 38, style = "American Pale Ale", msrp_cents = 16500 }
+active = true
+
+[[products]]
+sku = "FP-PALE-1-6-BBL"
+name = "Pale Ale 1/6-BBL Keg (Sixtel)"
+product_kind = "beer"
+package_unit = "1/6-bbl-keg"
+description = "Sixtel keg of the flagship pale ale — fits taproom kegerators."
+metadata = { abv_pct = 5.4, ibu = 38, style = "American Pale Ale", msrp_cents = 6500 }
+active = true
+
+[[products]]
+sku = "FP-IPA-1-2-BBL"
+name = "Brewhouse IPA 1/2-BBL Keg"
+product_kind = "beer"
+package_unit = "1/2-bbl-keg"
+description = "Hazy IPA, 6.8% ABV. Citra + Mosaic dry-hop."
+metadata = { abv_pct = 6.8, ibu = 55, style = "Hazy IPA", msrp_cents = 19500 }
+active = true
+
+[[products]]
+sku = "FP-IPA-1-6-BBL"
+name = "Brewhouse IPA 1/6-BBL Keg (Sixtel)"
+product_kind = "beer"
+package_unit = "1/6-bbl-keg"
+description = "Sixtel keg of the brewhouse IPA."
+metadata = { abv_pct = 6.8, ibu = 55, style = "Hazy IPA", msrp_cents = 7500 }
+active = true
+
+[[products]]
+sku = "FP-STOUT-1-2-BBL"
+name = "Dry Irish Stout 1/2-BBL Keg"
+product_kind = "beer"
+package_unit = "1/2-bbl-keg"
+description = "Roast-malt forward, English ale yeast. 4.6% ABV, 30 IBU."
+metadata = { abv_pct = 4.6, ibu = 30, style = "Dry Irish Stout", msrp_cents = 15500 }
+active = true
+
+[[products]]
+sku = "FP-STOUT-1-6-BBL"
+name = "Dry Irish Stout 1/6-BBL Keg (Sixtel)"
+product_kind = "beer"
+package_unit = "1/6-bbl-keg"
+description = "Sixtel keg of the dry Irish stout — small-format for nitro pours."
+metadata = { abv_pct = 4.6, ibu = 30, style = "Dry Irish Stout", msrp_cents = 6000 }
+active = true
+
+[[products]]
+sku = "FP-LAGER-1-2-BBL"
+name = "Czech Pilsner 1/2-BBL Keg"
+product_kind = "beer"
+package_unit = "1/2-bbl-keg"
+description = "Pilsner malt, noble hops, lager yeast. 4.8% ABV, 38 IBU."
+metadata = { abv_pct = 4.8, ibu = 38, style = "Czech Pilsner", msrp_cents = 16500 }
+active = true
+
+[[products]]
+sku = "FP-LAGER-1-6-BBL"
+name = "Czech Pilsner 1/6-BBL Keg (Sixtel)"
+product_kind = "beer"
+package_unit = "1/6-bbl-keg"
+description = "Sixtel keg of the Czech Pilsner."
+metadata = { abv_pct = 4.8, ibu = 38, style = "Czech Pilsner", msrp_cents = 6500 }
+active = true
+
+[[products]]
+sku = "FP-HAZY-1-2-BBL"
+name = "Hazy IPA 1/2-BBL Keg"
+product_kind = "beer"
+package_unit = "1/2-bbl-keg"
+description = "Heavy late hops + biotransformation dry hop. 6.5% ABV, 50 IBU."
+metadata = { abv_pct = 6.5, ibu = 50, style = "Hazy IPA", msrp_cents = 19500 }
+active = true
+
+[[products]]
+sku = "FP-HAZY-1-6-BBL"
+name = "Hazy IPA 1/6-BBL Keg (Sixtel)"
+product_kind = "beer"
+package_unit = "1/6-bbl-keg"
+description = "Sixtel keg of the hazy IPA — turn over fast before oxidation."
+metadata = { abv_pct = 6.5, ibu = 50, style = "Hazy IPA", msrp_cents = 8000 }
+active = true
+
+[[products]]
+sku = "FP-SEASONAL-12OZ-CS"
+name = "Seasonal 12oz 24-Pack Case"
+product_kind = "beer"
+package_unit = "12oz-case"
+description = "Rotating seasonal release — currently Brown Ale, 5.8% ABV."
+metadata = { abv_pct = 5.8, ibu = 28, style = "Seasonal Rotation", msrp_cents = 4800 }
+active = true

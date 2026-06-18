@@ -1,0 +1,496 @@
+//! Axum HTTP surface for the inventory API. The router lives here;
+//! handlers are grouped by concern into the submodules below.
+
+use std::sync::Arc;
+
+use axum::routing::{get, post, put};
+use axum::{Json, Router};
+
+use boss_assets_client::AssetsClient;
+use boss_classes_client::ClassesClient;
+use boss_core::publisher::DomainPublisher;
+use boss_jobs_client::JobsClient;
+use boss_shipping_client::ShippingClient;
+
+use crate::port::InventoryRepository;
+
+mod items;
+mod orders;
+mod vendor_invoices;
+mod vendors;
+mod warehouse;
+
+use items::*;
+use orders::*;
+use vendor_invoices::*;
+use vendors::*;
+use warehouse::*;
+
+/// Cross-service clients needed by the warehouse-status projection.
+/// Bundled so the binary constructs once and passes a single Option —
+/// tests that don't exercise `/warehouse-status` leave `clients = None`.
+pub struct WarehouseClients {
+    pub jobs: Arc<dyn JobsClient>,
+    pub assets: Arc<dyn AssetsClient>,
+    pub shipping: Arc<dyn ShippingClient>,
+}
+
+pub struct InventoryApiState<R: InventoryRepository> {
+    pub inventory: Arc<R>,
+    pub publisher: Option<DomainPublisher>,
+    pub clients: Option<WarehouseClients>,
+    /// Optional Class registry for `DiscrepancyKind` validation. When
+    /// configured, every vendor-invoice upsert that carries a
+    /// `discrepancy_kind` checks that the code exists under
+    /// `(subject_kind='vendor-invoice')` in the Class registry. When
+    /// `None`, the API is permissive (matches the catalog
+    /// `check_category` gate). An absent discrepancy_kind is always
+    /// accepted — the field is optional on a clean match.
+    pub classes_client: Option<Arc<dyn ClassesClient>>,
+    /// Authoritative clock. See `boss-clock-client` for the
+    /// shape; every handler reads `now` via `state.clock.now()`.
+    pub clock: Arc<dyn boss_clock_client::ClockClient>,
+}
+
+pub fn router<R: InventoryRepository + 'static>(state: InventoryApiState<R>) -> Router {
+    let shared = Arc::new(state);
+    Router::new()
+        .route("/api/inventory/health", get(health))
+        .route("/api/inventory/items", get(list_items::<R>))
+        .route("/api/inventory/items/{part_sku}", get(get_item::<R>))
+        .route("/api/inventory/orders", get(list_orders::<R>))
+        .route("/api/inventory/orders/{id}", get(get_order::<R>))
+        .route(
+            "/api/inventory/items/{part_sku}/consume",
+            post(consume_part::<R>),
+        )
+        .route(
+            "/api/inventory/items/{part_sku}/open-po-exists",
+            get(open_po_exists_for_sku::<R>),
+        )
+        .route(
+            "/api/inventory/items/{part_sku}/primary-vendor",
+            get(primary_vendor_for_sku::<R>),
+        )
+        .route(
+            "/api/inventory/labor-absorbed",
+            post(labor_absorbed_handler::<R>),
+        )
+        .route(
+            "/api/inventory/items/{part_sku}/receive",
+            post(receive_part_handler::<R>),
+        )
+        .route("/api/inventory/items/batch", post(batch_upsert_items::<R>))
+        .route("/api/inventory/orders/create", post(create_order::<R>))
+        .route(
+            "/api/inventory/orders/batch",
+            post(batch_create_orders::<R>),
+        )
+        .route(
+            "/api/inventory/orders/{id}/status",
+            put(update_order_status::<R>),
+        )
+        .route("/api/inventory/vendors", get(list_vendors::<R>))
+        .route("/api/inventory/vendors", post(create_vendor::<R>))
+        .route(
+            "/api/inventory/vendors/{id}",
+            put(update_vendor::<R>).delete(delete_vendor::<R>),
+        )
+        .route(
+            "/api/inventory/vendor-invoices",
+            get(list_vendor_invoices::<R>).post(upsert_vendor_invoice::<R>),
+        )
+        .route(
+            "/api/inventory/vendor-invoices/batch-pay",
+            post(batch_pay_vendor_invoices::<R>),
+        )
+        .route("/api/inventory/ap-aging", get(ap_aging::<R>))
+        .route(
+            "/api/inventory/warehouse-status",
+            get(warehouse_status::<R>),
+        )
+        .with_state(shared)
+}
+
+#[cfg(feature = "postgres")]
+const STORAGE: &str = "postgres";
+#[cfg(not(feature = "postgres"))]
+const STORAGE: &str = "in-memory";
+
+async fn health() -> Json<boss_core::startup::HealthResponse> {
+    Json(boss_core::startup::health_response(
+        "boss-inventory-api",
+        env!("CARGO_PKG_VERSION"),
+        STORAGE,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    use crate::in_memory::InMemoryInventory;
+    use crate::types::*;
+
+    fn test_item(sku: &str) -> InventoryItem {
+        InventoryItem {
+            part_sku: sku.to_string(),
+            bin: "A-01".to_string(),
+            on_hand: 50,
+            allocated: 10,
+            reorder_point: 20,
+            reorder_qty: 100,
+            trailing_90d_usage: 30,
+            avg_cost_cents: 0,
+            vendor_price_cents: None,
+            vendor_category: None,
+        }
+    }
+
+    fn test_po(id: &str) -> PurchaseOrder {
+        PurchaseOrder {
+            id: id.to_string(),
+            vendor: Some("Acme Parts Co".to_string()),
+            status: PoStatus::Submitted,
+            placed_on: Some(chrono::NaiveDate::from_ymd_opt(2025, 3, 1).unwrap()),
+            expected_on: Some(chrono::NaiveDate::from_ymd_opt(2025, 3, 15).unwrap()),
+            received_on: None,
+            lines: vec![PurchaseOrderLine {
+                part_sku: "PART-001".to_string(),
+                qty: 25,
+                unit_cost_cents: 15_000,
+                currency: "USD".to_string(),
+            }],
+        }
+    }
+
+    fn test_app() -> Router {
+        let inventory = Arc::new(InMemoryInventory::new(
+            vec![test_item("PART-001"), test_item("PART-002")],
+            vec![test_po("PO-001"), test_po("PO-002")],
+        ));
+        router(InventoryApiState {
+            inventory,
+            publisher: None,
+            clients: None,
+            classes_client: None,
+            clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
+        })
+    }
+
+    #[tokio::test]
+    async fn health_ok() {
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/inventory/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn list_items_ok() {
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/inventory/items")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let items: Vec<InventoryItem> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_item_found() {
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/inventory/items/PART-001")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_item_not_found() {
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/inventory/items/PART-999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn list_orders_ok() {
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/inventory/orders")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let orders: Vec<PurchaseOrder> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(orders.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_order_found() {
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/inventory/orders/PO-001")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_order_not_found() {
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/inventory/orders/PO-999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------
+    // Vendor invoice three-way match endpoints
+    // -----------------------------------------------------------------
+
+    fn test_vendor_invoice(id: &str, po_id: &str) -> VendorInvoice {
+        VendorInvoice {
+            id: id.to_string(),
+            po_id: po_id.to_string(),
+            vendor: "Acme Parts Co".to_string(),
+            vendor_invoice_no: "INV-EXT-1".to_string(),
+            amount_cents: 375_000,
+            currency: "USD".to_string(),
+            received_on: chrono::NaiveDate::from_ymd_opt(2025, 3, 20).unwrap(),
+            matched_on: None,
+            approved_on: None,
+            paid_on: None,
+            status: VendorInvoiceStatus::Received,
+            discrepancy_cents: None,
+            discrepancy_kind: None,
+            lines: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_vendor_invoice_creates_and_lists() {
+        let app = test_app();
+        let invoice = test_vendor_invoice("VI-1", "PO-001");
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/inventory/vendor-invoices")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&invoice).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let list_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/inventory/vendor-invoices")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<VendorInvoice> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "VI-1");
+        assert_eq!(rows[0].status, VendorInvoiceStatus::Received);
+    }
+
+    // ----- DiscrepancyKind Class-registry gate -----------------------
+
+    fn app_with_classes_client(classes: Arc<dyn boss_classes_client::ClassesClient>) -> Router {
+        let inventory = Arc::new(InMemoryInventory::new(
+            vec![test_item("PART-001")],
+            vec![test_po("PO-001")],
+        ));
+        router(InventoryApiState {
+            inventory,
+            publisher: None,
+            clients: None,
+            classes_client: Some(classes),
+            clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
+        })
+    }
+
+    fn post_invoice_request(invoice: &VendorInvoice) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/api/inventory/vendor-invoices")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(invoice).unwrap()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn upsert_invoice_rejected_when_discrepancy_kind_unknown() {
+        use boss_classes_client::FakeClassesClient;
+        use boss_core::primitives::ClassRef;
+        // Registry only knows `overbilled`; the invoice claims `shorted`
+        // → 400 with the actionable error message.
+        let classes = Arc::new(FakeClassesClient::with(vec![ClassRef::new(
+            "vendor-invoice",
+            "overbilled",
+        )])) as Arc<dyn boss_classes_client::ClassesClient>;
+        let app = app_with_classes_client(classes);
+        let mut invoice = test_vendor_invoice("VI-D1", "PO-001");
+        invoice.discrepancy_cents = Some(500);
+        invoice.discrepancy_kind = Some(crate::types::DiscrepancyKind::new("shorted"));
+        let resp = app.oneshot(post_invoice_request(&invoice)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(
+            body.contains("shorted") && body.contains("subject_kind='vendor-invoice'"),
+            "error must name the rejected code and the registry shape, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_invoice_accepted_when_discrepancy_kind_registered() {
+        use boss_classes_client::FakeClassesClient;
+        let classes = Arc::new(FakeClassesClient::permissive())
+            as Arc<dyn boss_classes_client::ClassesClient>;
+        let app = app_with_classes_client(classes);
+        let mut invoice = test_vendor_invoice("VI-D2", "PO-001");
+        invoice.discrepancy_cents = Some(500);
+        invoice.discrepancy_kind = Some(crate::types::DiscrepancyKind::new("wrong-price"));
+        let resp = app.oneshot(post_invoice_request(&invoice)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn upsert_invoice_skips_gate_when_discrepancy_kind_absent() {
+        use boss_classes_client::FakeClassesClient;
+        use boss_core::primitives::ClassRef;
+        // Registry knows nothing about this code, but a clean match
+        // (discrepancy_kind = None) must pass straight through.
+        let classes = Arc::new(FakeClassesClient::with(vec![ClassRef::new(
+            "vendor-invoice",
+            "overbilled",
+        )])) as Arc<dyn boss_classes_client::ClassesClient>;
+        let app = app_with_classes_client(classes);
+        let invoice = test_vendor_invoice("VI-D3", "PO-001"); // discrepancy_kind: None
+        let resp = app.oneshot(post_invoice_request(&invoice)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn upsert_invoice_permissive_when_classes_client_unset() {
+        // No Class registry configured → permissive: even a junk
+        // discrepancy_kind lands (test_app sets classes_client: None).
+        let app = test_app();
+        let mut invoice = test_vendor_invoice("VI-D4", "PO-001");
+        invoice.discrepancy_cents = Some(500);
+        invoice.discrepancy_kind = Some(crate::types::DiscrepancyKind::new("definitely-not-real"));
+        let resp = app.oneshot(post_invoice_request(&invoice)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn post_vendor_invoice_upserts_status_transitions() {
+        let app = test_app();
+        let mut invoice = test_vendor_invoice("VI-2", "PO-002");
+        // First POST: received.
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/inventory/vendor-invoices")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&invoice).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Second POST: matched + approved, same id.
+        invoice.status = VendorInvoiceStatus::Approved;
+        invoice.matched_on = Some(chrono::NaiveDate::from_ymd_opt(2025, 3, 21).unwrap());
+        invoice.approved_on = Some(chrono::NaiveDate::from_ymd_opt(2025, 3, 22).unwrap());
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/inventory/vendor-invoices")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&invoice).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // List filtered by status=approved.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/inventory/vendor-invoices?status=approved")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rows: Vec<VendorInvoice> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "VI-2");
+        assert_eq!(rows[0].status, VendorInvoiceStatus::Approved);
+        assert!(rows[0].approved_on.is_some());
+    }
+}

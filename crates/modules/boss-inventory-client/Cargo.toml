@@ -1,0 +1,18 @@
+[package]
+name = "boss-inventory-client"
+description = "HTTP client port for reaching boss-inventory from other services"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+boss-core = { path = "../../core/boss-core" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

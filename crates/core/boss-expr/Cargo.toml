@@ -1,0 +1,12 @@
+[package]
+name = "boss-expr"
+description = "Tiny shared expression DSL used by both the dispatcher's rule registry and JobKind v2's ready_when predicates. Boolean expressions over field access, no arithmetic, no external state, no loops — the evaluator's correctness depends on expressions terminating, and they do because the language can't express anything that wouldn't."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

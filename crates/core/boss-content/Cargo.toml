@@ -1,0 +1,75 @@
+[package]
+name = "boss-content"
+description = "HR-authored content — bulletin board + company manual"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-content-api"
+path = "src/bin/boss_content_api.rs"
+required-features = ["postgres", "s3"]
+
+[[bin]]
+name = "boss-content-rebuild"
+path = "src/bin/boss_content_rebuild.rs"
+required-features = ["postgres"]
+
+[[bin]]
+name = "boss-files-gc"
+path = "src/bin/boss_files_gc.rs"
+required-features = ["postgres", "s3"]
+
+[features]
+# `postgres` + `s3` ship in default so `cargo build --release --workspace`
+# produces /target/release/boss-content-api + boss-files-gc. No
+# orchestrator activates either feature on boss-content, so feature
+# unification doesn't reach them → workspace build silently produces
+# in-memory-only binaries that fail on startup. Same fix as boss-docs
+# (postgres → default 2026-05-05). The `s3` build cost (~80 aws-sdk
+# transitive deps) is unavoidable in any deployment that ships the
+# content-api binary; non-content-api consumers can opt out via
+# `default-features = false` in their dep declaration.
+default = ["postgres", "s3"]
+postgres = ["dep:sqlx", "boss-events/postgres"]
+# `s3` pulls in aws-sdk-s3 + aws-config (~80 transitive deps). Required
+# by the boss-content-api binary; optional for the lib so other crates
+# that consume the file-references types don't pay the build-time tax.
+s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-credential-types", "dep:aws-types"]
+
+[dependencies]
+boss-clock-client = { path = "../boss-clock-client" }
+boss-ports = { path = "../boss-ports" }
+boss-core = { path = "../boss-core" }
+boss-events = { path = "../boss-events" }
+boss-nats = { path = "../boss-nats" }
+boss-policy-client = { path = "../boss-policy-client" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true, features = ["multipart"] }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+bytes = "1"
+clap = { workspace = true }
+toml = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"], optional = true }
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "rustls", "behavior-version-latest"], optional = true }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "rustls", "sigv4a", "behavior-version-latest"], optional = true }
+aws-credential-types = { version = "1", optional = true }
+aws-types = { version = "1", optional = true }
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+tower = { workspace = true }
+http-body-util = "0.1"
+boss-testing = { path = "../boss-testing", features = ["postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"] }
+
+[lints]
+workspace = true

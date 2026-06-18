@@ -1,0 +1,46 @@
+[package]
+name = "boss-classes"
+description = "Class registry — logical groupings of Subjects (roles, account types, system models)"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-classes-api"
+path = "src/bin/boss_classes_api.rs"
+required-features = ["postgres"]
+
+[features]
+# `postgres` ships in default so `cargo build --release --workspace`
+# produces /target/release/boss-classes-api with the postgres
+# adapter. Without postgres the binary boots into in-memory mode
+# and crashes on the require_postgres_or_explicit_inmemory startup
+# guard. Same fix shape as boss-docs / boss-policy / boss-products
+# / boss-content (2026-05-05).
+default = ["postgres"]
+postgres = ["dep:sqlx"]
+
+[dependencies]
+boss-core = { path = "../boss-core" }
+boss-policy-client = { path = "../boss-policy-client" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"], optional = true }
+
+[dev-dependencies]
+boss-testing = { path = "../boss-testing", features = ["postgres"] }
+tower = { workspace = true }
+http-body-util = "0.1"
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
+
+[lints]
+workspace = true

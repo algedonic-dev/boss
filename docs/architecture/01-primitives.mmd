@@ -1,0 +1,99 @@
+%%{init: {'theme':'base', 'themeVariables': { 'primaryColor':'#fafaf9', 'primaryBorderColor':'#57534e', 'primaryTextColor':'#1c1917', 'lineColor':'#78716c', 'fontFamily':'ui-sans-serif, system-ui, sans-serif', 'fontSize':'17px'}}}%%
+flowchart TB
+
+    subgraph Primitives ["Foundational primitives &mdash; the state-machine vocabulary (4)"]
+        direction LR
+        SUBJ["Subject<br/><code>boss-core::primitives</code> (trait)<br/><small>identity-bearing thing BOSS tracks<br/>kind() + id() pair; every concrete<br/>subject implements the trait</small>"]
+        JOB["Job<br/><code>boss-jobs</code><br/><small>bounded unit of coordinated work<br/>has subject, owner, status, Steps</small>"]
+        STEP["Step<br/><code>boss-jobs</code><br/><small>typed transition inside a Job<br/>kind + status + sign-off + metadata<br/>Step.embedded_job &rarr; nested Jobs</small>"]
+        EV["Event<br/><code>boss-core::event</code><br/><small>immutable fact about something<br/>that happened: id, ts, source,<br/>kind, payload. The audit-log atom.</small>"]
+    end
+
+    subgraph Supporting ["Supporting concepts &mdash; hang off the primitives"]
+        direction LR
+        CLASS["Class<br/><code>boss-core::primitives</code><br/><small>logical grouping of Subjects of one<br/>kind. Membership predicate +<br/>display metadata. Not a Subject.</small>"]
+        PART["Part<br/><code>boss-core::primitives</code><br/><small>composition role:<br/>SubjectPart (identity) +<br/>AttributePart (structured data)</small>"]
+        COMP["Composite<br/><code>boss-core::primitives</code> (trait)<br/><small>shared tree-walking interface<br/>Subjects &middot; Steps &middot; Classes<br/>same map/fold/render at any depth</small>"]
+        LOC["Location<br/><code>boss-core::primitives</code><br/><small>place: hierarchy, timezone, geo<br/>two grammatical roles &mdash; a Subject<br/>and an AttributePart on others</small>"]
+        RES["Reservation<br/><code>boss-core::calendar</code><br/><small>time-window claim on a resource<br/>(employee &middot; asset &middot; workstation).<br/>Job-level coordination atom.</small>"]
+    end
+
+    subgraph Classes ["Class registry &mdash; persistence form of Class"]
+        direction LR
+        CLS["<code>classes</code> table<br/><small>one row per (subject_kind, code).<br/>Replaces closed Rust enums for<br/>tenant-extensible taxonomies<br/>(roles, departments, account types,<br/>asset categories, vendor categories).<br/>Per docs/design/class-registry.md.</small>"]
+    end
+
+    subgraph KBPattern ["Knowledge Base &mdash; not a crate, a pattern"]
+        direction LR
+        KB["Every Subject has a KB view<br/><small>Facts &middot; Projections &middot; Parts &middot; active Jobs<br/>reference data (boss-catalog) is<br/>one Class-level instance of the pattern</small>"]
+    end
+
+    subgraph Registries ["Registries &mdash; new work ships as data, not code"]
+        direction LR
+        JK["JobKind registry<br/><code>job_kinds</code><br/><small>append-only, versioned<br/>declares step_graph + subject kinds</small>"]
+        SP["StepPlugin registry<br/><code>step_plugins</code><br/><small>custom step UX as JS bundles<br/>authored at /admin/step-plugins</small>"]
+        ST["StepType catalog<br/><code>boss-jobs/step_registry</code><br/><small>~39 step kinds with field schemas</small>"]
+        SK["SubjectKind registry<br/><code>subject_kinds</code><br/><small>tenant-defined subject kinds<br/>validated on Job creates</small>"]
+    end
+
+    JK -.->|"version-pinned per Job"| JOB
+    SP -.->|"bound to step kinds"| STEP
+    ST -.->|"types every Step"| STEP
+    SK -.->|"validates tenant subject kinds"| SUBJ
+    CLS -.->|"persists"| CLASS
+    CLASS -.->|"groups Subjects of one kind"| SUBJ
+    LOC -.->|"is-a / placed-at"| SUBJ
+    SUBJ -.->|"KB view renders"| KB
+    PART -.->|"attached to"| SUBJ
+    COMP -.->|"traverses"| SUBJ
+    COMP -.->|"traverses"| JOB
+    JOB -.->|"contains"| STEP
+
+    subgraph Ports ["Hexagonal &mdash; ports &amp; adapters"]
+        direction LR
+        PORT["Domain Ports (traits)<br/><small>AssetsRepository, JobsRepository,<br/>InventoryRepository, AccountsRepository,<br/>CalendarPort, &hellip;</small>"]
+        ADAPT["Adapters<br/><small>Postgres &middot; in-memory (tests)<br/>reqwest (cross-service clients)</small>"]
+    end
+
+    Primitives -.->|"domain defines"| PORT
+    PORT -.->|"implemented by"| ADAPT
+
+    subgraph Rails ["Cross-cutting rails &mdash; services that enforce the primitives"]
+        direction LR
+        POL["Policy<br/><code>boss-policy</code><br/><small>row-level auth<br/>every write gated via PolicyClient</small>"]
+        LDG["Ledger<br/><code>boss-ledger</code><br/><small>financial_facts &rarr; GL projection<br/>versioned posting rules</small>"]
+        MSG["Messages<br/><code>boss-messages</code><br/><small>unified inbox: DMs + system signals<br/>per-employee</small>"]
+        CAL["Calendar service<br/><code>boss-calendar</code><br/><small>enforces Reservation conflicts +<br/>strength rules across resources</small>"]
+    end
+
+    POL -.->|"guards writes"| Primitives
+    Primitives -->|"emit financial_facts"| LDG
+    Primitives -->|"emit system signals"| MSG
+    JOB -->|"book reservations"| CAL
+    RES -.->|"managed by"| CAL
+
+    subgraph Events ["Event backbone &mdash; persistence form of Event"]
+        direction LR
+        NATS["NATS<br/><code>boss-nats</code><br/><small>pub/sub event bus<br/>at-least-once delivery</small>"]
+        AUD["audit_log<br/><code>boss-events</code><br/><small>append-only Postgres table<br/>hash-chained, REVOKE-protected<br/>projections rebuild from the log</small>"]
+    end
+
+    EV ==>|"published on"| NATS
+    NATS ==>|"audit writer"| AUD
+
+    classDef primitive fill:#fef3c7,stroke:#a16207,stroke-width:2px
+    classDef class_ fill:#ede9fe,stroke:#6d28d9,stroke-width:1.5px
+    classDef kb fill:#dbeafe,stroke:#1d4ed8,stroke-width:1.5px
+    classDef registry fill:#e0e7ff,stroke:#4338ca,stroke-width:1.5px
+    classDef rail fill:#d1fae5,stroke:#047857,stroke-width:1.5px
+    classDef event fill:#fee2e2,stroke:#b91c1c,stroke-width:2px
+    classDef port fill:#f3f4f6,stroke:#374151,stroke-width:1.5px
+
+    class SUBJ,JOB,STEP,EV primitive
+    class PART,COMP,CLASS,LOC,RES class_
+    class CLS class_
+    class KB kb
+    class JK,SP,ST,SK registry
+    class POL,LDG,MSG,CAL rail
+    class NATS,AUD event
+    class PORT,ADAPT port

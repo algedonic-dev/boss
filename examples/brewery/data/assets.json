@@ -1,0 +1,538 @@
+[
+  {
+    "asset_id": "SYS-MT-001",
+    "sku": "BREW-MASH-250BBL",
+    "phase": "installed",
+    "oem_serial": "CAS-MT250-2019-A14",
+    "first_seen": "2019-09-12",
+    "warranty_through": "2029-09-12"
+  },
+  {
+    "asset_id": "SYS-LT-001",
+    "sku": "BREW-LAUTER-250BBL",
+    "phase": "installed",
+    "oem_serial": "CAS-LT250-2019-A14",
+    "first_seen": "2019-09-12",
+    "warranty_through": "2029-09-12"
+  },
+  {
+    "asset_id": "SYS-BK-001",
+    "sku": "BREW-KETTLE-250BBL",
+    "phase": "installed",
+    "oem_serial": "PSV-BK250-2019-K07",
+    "first_seen": "2019-09-12",
+    "warranty_through": "2029-09-12"
+  },
+  {
+    "asset_id": "SYS-HEX-001",
+    "sku": "BREW-HEX-PLATE",
+    "phase": "installed",
+    "oem_serial": "ALF-HEX60-2020-203",
+    "first_seen": "2020-04-08",
+    "warranty_through": "2025-04-08"
+  },
+  {
+    "asset_id": "SYS-FV-001",
+    "sku": "BREW-FV-30BBL",
+    "phase": "installed",
+    "oem_serial": "CAS-FV30-2020-F101",
+    "first_seen": "2020-05-22",
+    "warranty_through": "2025-05-22"
+  },
+  {
+    "asset_id": "SYS-FV-002",
+    "sku": "BREW-FV-30BBL",
+    "phase": "installed",
+    "oem_serial": "CAS-FV30-2020-F102",
+    "first_seen": "2020-05-22",
+    "warranty_through": "2025-05-22"
+  },
+  {
+    "asset_id": "SYS-FV-003",
+    "sku": "BREW-FV-30BBL",
+    "phase": "installed",
+    "oem_serial": "CAS-FV30-2020-F103",
+    "first_seen": "2020-05-22",
+    "warranty_through": "2025-05-22"
+  },
+  {
+    "asset_id": "SYS-FV-004",
+    "sku": "BREW-FV-30BBL",
+    "phase": "installed",
+    "oem_serial": "CAS-FV30-2020-F104",
+    "first_seen": "2020-05-22",
+    "warranty_through": "2025-05-22"
+  },
+  {
+    "asset_id": "SYS-FV-005",
+    "sku": "BREW-FV-30BBL",
+    "phase": "installed",
+    "oem_serial": "CAS-FV30-2021-F105",
+    "first_seen": "2021-03-14",
+    "warranty_through": "2026-03-14"
+  },
+  {
+    "asset_id": "SYS-FV-006",
+    "sku": "BREW-FV-30BBL",
+    "phase": "installed",
+    "oem_serial": "CAS-FV30-2021-F106",
+    "first_seen": "2021-03-14",
+    "warranty_through": "2026-03-14"
+  },
+  {
+    "asset_id": "SYS-FV-007",
+    "sku": "BREW-FV-30BBL",
+    "phase": "installed",
+    "oem_serial": "CAS-FV30-2023-F107",
+    "first_seen": "2023-08-02",
+    "warranty_through": "2028-08-02"
+  },
+  {
+    "asset_id": "SYS-FV-008",
+    "sku": "BREW-FV-30BBL",
+    "phase": "installed",
+    "oem_serial": "CAS-FV30-2023-F108",
+    "first_seen": "2023-08-02",
+    "warranty_through": "2028-08-02"
+  },
+  {
+    "asset_id": "SYS-BT-001",
+    "sku": "BREW-BRITE-30BBL",
+    "phase": "installed",
+    "oem_serial": "CAS-BT30-2020-B201",
+    "first_seen": "2020-06-04",
+    "warranty_through": "2025-06-04"
+  },
+  {
+    "asset_id": "SYS-BT-002",
+    "sku": "BREW-BRITE-30BBL",
+    "phase": "installed",
+    "oem_serial": "CAS-BT30-2020-B202",
+    "first_seen": "2020-06-04",
+    "warranty_through": "2025-06-04"
+  },
+  {
+    "asset_id": "SYS-BT-003",
+    "sku": "BREW-BRITE-30BBL",
+    "phase": "installed",
+    "oem_serial": "CAS-BT30-2021-B203",
+    "first_seen": "2021-04-19",
+    "warranty_through": "2026-04-19"
+  },
+  {
+    "asset_id": "SYS-BT-004",
+    "sku": "BREW-BRITE-30BBL",
+    "phase": "installed",
+    "oem_serial": "CAS-BT30-2023-B204",
+    "first_seen": "2023-09-11",
+    "warranty_through": "2028-09-11"
+  },
+  {
+    "asset_id": "SYS-GLY-001",
+    "sku": "BREW-GLYCOL-30T",
+    "phase": "installed",
+    "oem_serial": "PRO-GLY30T-2018-091",
+    "first_seen": "2018-12-05",
+    "warranty_through": "2023-12-05"
+  },
+  {
+    "asset_id": "SYS-GLY-002",
+    "sku": "BREW-GLYCOL-30T",
+    "phase": "installed",
+    "oem_serial": "PRO-GLY30T-2023-104",
+    "first_seen": "2023-07-19",
+    "warranty_through": "2028-07-19"
+  },
+  {
+    "asset_id": "SYS-BLR-001",
+    "sku": "BREW-BOILER-50HP",
+    "phase": "installed",
+    "oem_serial": "HRT-50HP-2018-7714",
+    "first_seen": "2018-10-30",
+    "warranty_through": "2023-10-30"
+  },
+  {
+    "asset_id": "SYS-KGF-001",
+    "sku": "BREW-KEG-WASHFILL-1",
+    "phase": "installed",
+    "oem_serial": "GWK-KWF1-2021-2208",
+    "first_seen": "2021-05-08",
+    "warranty_through": "2026-05-08"
+  },
+  {
+    "asset_id": "SYS-KGF-002",
+    "sku": "BREW-KEG-WASHFILL-1",
+    "phase": "installed",
+    "oem_serial": "GWK-KWF1-2023-2299",
+    "first_seen": "2023-11-22",
+    "warranty_through": "2028-11-22"
+  },
+  {
+    "asset_id": "SYS-CAN-001",
+    "sku": "BREW-CAN-LINE-MOBILE",
+    "phase": "installed",
+    "oem_serial": "WGF-MCL30-2022-188",
+    "first_seen": "2022-07-14",
+    "warranty_through": "2027-07-14"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-001",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2025-1001",
+    "first_seen": "2025-10-16",
+    "warranty_through": "2030-10-16"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-002",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2024-1002",
+    "first_seen": "2024-04-24",
+    "warranty_through": "2029-04-24"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-003",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2024-1003",
+    "first_seen": "2024-01-26",
+    "warranty_through": "2029-01-26"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-004",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2024-1004",
+    "first_seen": "2024-10-08",
+    "warranty_through": "2029-10-08"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-005",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2024-1005",
+    "first_seen": "2024-09-07",
+    "warranty_through": "2029-09-07"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-006",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2024-1006",
+    "first_seen": "2024-08-16",
+    "warranty_through": "2029-08-16"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-007",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2024-1007",
+    "first_seen": "2024-05-22",
+    "warranty_through": "2029-05-22"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-008",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2024-1008",
+    "first_seen": "2024-04-14",
+    "warranty_through": "2029-04-14"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-009",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2025-1009",
+    "first_seen": "2025-11-23",
+    "warranty_through": "2030-11-23"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-010",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2025-1010",
+    "first_seen": "2025-07-12",
+    "warranty_through": "2030-07-12"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-011",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2024-1011",
+    "first_seen": "2024-03-30",
+    "warranty_through": "2029-03-30"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-012",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2025-1012",
+    "first_seen": "2025-08-27",
+    "warranty_through": "2030-08-27"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-013",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2025-1013",
+    "first_seen": "2025-03-08",
+    "warranty_through": "2030-03-08"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-014",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2024-1014",
+    "first_seen": "2024-02-02",
+    "warranty_through": "2029-02-02"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-015",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2024-1015",
+    "first_seen": "2024-01-31",
+    "warranty_through": "2029-01-31"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-016",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2024-1016",
+    "first_seen": "2024-04-05",
+    "warranty_through": "2029-04-05"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-017",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2024-1017",
+    "first_seen": "2024-08-11",
+    "warranty_through": "2029-08-11"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-018",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2024-1018",
+    "first_seen": "2024-08-26",
+    "warranty_through": "2029-08-26"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-019",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2025-1019",
+    "first_seen": "2025-06-01",
+    "warranty_through": "2030-06-01"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-020",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2025-1020",
+    "first_seen": "2025-09-08",
+    "warranty_through": "2030-09-08"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-021",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2024-1021",
+    "first_seen": "2024-01-28",
+    "warranty_through": "2029-01-28"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-022",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2025-1022",
+    "first_seen": "2025-07-28",
+    "warranty_through": "2030-07-28"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-023",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2024-1023",
+    "first_seen": "2024-07-22",
+    "warranty_through": "2029-07-22"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-024",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2025-1024",
+    "first_seen": "2025-10-27",
+    "warranty_through": "2030-10-27"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-025",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2025-1025",
+    "first_seen": "2025-12-19",
+    "warranty_through": "2030-12-19"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-026",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2025-1026",
+    "first_seen": "2025-07-12",
+    "warranty_through": "2030-07-12"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-027",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2025-1027",
+    "first_seen": "2025-03-05",
+    "warranty_through": "2030-03-05"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-028",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2024-1028",
+    "first_seen": "2024-08-13",
+    "warranty_through": "2029-08-13"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-029",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2025-1029",
+    "first_seen": "2025-04-04",
+    "warranty_through": "2030-04-04"
+  },
+  {
+    "asset_id": "SYS-BBL-OAK-030",
+    "sku": "BREW-BARREL-OAK-NEW",
+    "phase": "installed",
+    "oem_serial": "ISC-OAK-N53-2025-1030",
+    "first_seen": "2025-08-26",
+    "warranty_through": "2030-08-26"
+  },
+  {
+    "asset_id": "SYS-BBL-BBN-001",
+    "sku": "BREW-BARREL-BOURBON-USED",
+    "phase": "installed",
+    "oem_serial": "KCO-BBN-U53-2024-2001",
+    "first_seen": "2024-07-23",
+    "warranty_through": "2027-07-23"
+  },
+  {
+    "asset_id": "SYS-BBL-BBN-002",
+    "sku": "BREW-BARREL-BOURBON-USED",
+    "phase": "installed",
+    "oem_serial": "KCO-BBN-U53-2023-2002",
+    "first_seen": "2023-01-14",
+    "warranty_through": "2026-01-14"
+  },
+  {
+    "asset_id": "SYS-BBL-BBN-003",
+    "sku": "BREW-BARREL-BOURBON-USED",
+    "phase": "installed",
+    "oem_serial": "KCO-BBN-U53-2023-2003",
+    "first_seen": "2023-11-23",
+    "warranty_through": "2026-11-23"
+  },
+  {
+    "asset_id": "SYS-BBL-BBN-004",
+    "sku": "BREW-BARREL-BOURBON-USED",
+    "phase": "installed",
+    "oem_serial": "KCO-BBN-U53-2025-2004",
+    "first_seen": "2025-05-15",
+    "warranty_through": "2028-05-15"
+  },
+  {
+    "asset_id": "SYS-BBL-BBN-005",
+    "sku": "BREW-BARREL-BOURBON-USED",
+    "phase": "installed",
+    "oem_serial": "KCO-BBN-U53-2024-2005",
+    "first_seen": "2024-11-27",
+    "warranty_through": "2027-11-27"
+  },
+  {
+    "asset_id": "SYS-BBL-BBN-006",
+    "sku": "BREW-BARREL-BOURBON-USED",
+    "phase": "installed",
+    "oem_serial": "KCO-BBN-U53-2024-2006",
+    "first_seen": "2024-07-23",
+    "warranty_through": "2027-07-23"
+  },
+  {
+    "asset_id": "SYS-BBL-BBN-007",
+    "sku": "BREW-BARREL-BOURBON-USED",
+    "phase": "installed",
+    "oem_serial": "KCO-BBN-U53-2023-2007",
+    "first_seen": "2023-11-15",
+    "warranty_through": "2026-11-15"
+  },
+  {
+    "asset_id": "SYS-BBL-BBN-008",
+    "sku": "BREW-BARREL-BOURBON-USED",
+    "phase": "installed",
+    "oem_serial": "KCO-BBN-U53-2024-2008",
+    "first_seen": "2024-03-16",
+    "warranty_through": "2027-03-16"
+  },
+  {
+    "asset_id": "SYS-BBL-BBN-009",
+    "sku": "BREW-BARREL-BOURBON-USED",
+    "phase": "installed",
+    "oem_serial": "KCO-BBN-U53-2024-2009",
+    "first_seen": "2024-11-20",
+    "warranty_through": "2027-11-20"
+  },
+  {
+    "asset_id": "SYS-BBL-BBN-010",
+    "sku": "BREW-BARREL-BOURBON-USED",
+    "phase": "installed",
+    "oem_serial": "KCO-BBN-U53-2023-2010",
+    "first_seen": "2023-07-29",
+    "warranty_through": "2026-07-29"
+  },
+  {
+    "asset_id": "SYS-BBL-WIN-001",
+    "sku": "BREW-BARREL-WINE-USED",
+    "phase": "installed",
+    "oem_serial": "TRX-WIN-U60-2022-3001",
+    "first_seen": "2022-07-09",
+    "warranty_through": "2028-07-09"
+  },
+  {
+    "asset_id": "SYS-BBL-WIN-002",
+    "sku": "BREW-BARREL-WINE-USED",
+    "phase": "installed",
+    "oem_serial": "TRX-WIN-U60-2024-3002",
+    "first_seen": "2024-02-18",
+    "warranty_through": "2030-02-18"
+  },
+  {
+    "asset_id": "SYS-BBL-WIN-003",
+    "sku": "BREW-BARREL-WINE-USED",
+    "phase": "installed",
+    "oem_serial": "TRX-WIN-U60-2022-3003",
+    "first_seen": "2022-07-18",
+    "warranty_through": "2028-07-18"
+  },
+  {
+    "asset_id": "SYS-BBL-WIN-004",
+    "sku": "BREW-BARREL-WINE-USED",
+    "phase": "installed",
+    "oem_serial": "TRX-WIN-U60-2024-3004",
+    "first_seen": "2024-01-06",
+    "warranty_through": "2030-01-06"
+  },
+  {
+    "asset_id": "SYS-BBL-WIN-005",
+    "sku": "BREW-BARREL-WINE-USED",
+    "phase": "installed",
+    "oem_serial": "TRX-WIN-U60-2023-3005",
+    "first_seen": "2023-12-06",
+    "warranty_through": "2029-12-06"
+  }
+]

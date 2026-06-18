@@ -1,0 +1,89 @@
+//! Live readiness of the dispatcher's two durable JetStream consumers — the
+//! signal a `/api/dispatcher/health` 200 cannot give you.
+//!
+//! `boss-dispatcher` spawns both consumer loops detached: if either's message
+//! stream ends — a NATS blip, or JetStream not ready at cold start under a
+//! launcher with NO per-service restart (the docker `services-launcher.sh`
+//! uses `wait -n`, unlike systemd which restarts a dead unit) — the loop just
+//! logs and ends while the PROCESS stays up and health-green. With the
+//! assignment consumer dead, ready Steps are never assigned, the workforce has
+//! nothing to pull, and every Job stalls `open`: the exact "thousands of jobs
+//! in flight, nothing reaching a terminal state" failure.
+//!
+//! This handle makes that visible at `/api/dispatcher/readyz` so an operator —
+//! and the brewery sim's pre-Go readiness gate — can confirm both consumers are
+//! actually bound and draining before trusting the stack with work.
+
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+
+/// Shared, lock-free liveness for the dispatcher's consumers. One instance is
+/// created in `main`, cloned into each consumer loop (which marks it), and
+/// cloned into the HTTP surface (which reads it for `/readyz`).
+#[derive(Default)]
+pub struct DispatcherLiveness {
+    /// `dispatcher.rs::run_loop`'s `dispatcher-steps` consumer is bound + draining.
+    assigning: AtomicBool,
+    /// Step events the assignment loop has handled since bind (monotonic).
+    assignment_events: AtomicU64,
+    /// The rules runner's `dispatcher-rules` consumer is bound + draining.
+    rules_running: AtomicBool,
+    /// Side-effect events the rules runner has handled since bind (monotonic).
+    rules_events: AtomicU64,
+    /// Wall-clock unix seconds of the most recently handled event (0 = none yet).
+    last_event_unix: AtomicI64,
+}
+
+impl DispatcherLiveness {
+    fn now_unix() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Called by `run_loop` once its durable consumer is bound.
+    pub fn mark_assigning(&self) {
+        self.assigning.store(true, Ordering::Relaxed);
+    }
+    /// Called by `run_loop` when its message stream ends (consumer dead).
+    pub fn mark_assign_stopped(&self) {
+        self.assigning.store(false, Ordering::Relaxed);
+    }
+    /// Called by `run_loop` per handled step event.
+    pub fn record_assignment(&self) {
+        self.assignment_events.fetch_add(1, Ordering::Relaxed);
+        self.last_event_unix
+            .store(Self::now_unix(), Ordering::Relaxed);
+    }
+
+    /// Called by the rules runner once its durable consumer is bound.
+    pub fn mark_rules_running(&self) {
+        self.rules_running.store(true, Ordering::Relaxed);
+    }
+    /// Called by the rules runner when its message stream ends.
+    pub fn mark_rules_stopped(&self) {
+        self.rules_running.store(false, Ordering::Relaxed);
+    }
+    /// Called by the rules runner per handled side-effect event.
+    pub fn record_rules(&self) {
+        self.rules_events.fetch_add(1, Ordering::Relaxed);
+        self.last_event_unix
+            .store(Self::now_unix(), Ordering::Relaxed);
+    }
+
+    /// JSON body for `/api/dispatcher/readyz`. `ready` is true only when BOTH
+    /// durable consumers are bound — the precondition for a Job to flow
+    /// step-ready → assigned → worked → side-effects → closed.
+    pub fn snapshot(&self) -> serde_json::Value {
+        let assigning = self.assigning.load(Ordering::Relaxed);
+        let rules_running = self.rules_running.load(Ordering::Relaxed);
+        serde_json::json!({
+            "ready": assigning && rules_running,
+            "assigning": assigning,
+            "assignment_events": self.assignment_events.load(Ordering::Relaxed),
+            "rules_running": rules_running,
+            "rules_events": self.rules_events.load(Ordering::Relaxed),
+            "last_event_unix": self.last_event_unix.load(Ordering::Relaxed),
+        })
+    }
+}

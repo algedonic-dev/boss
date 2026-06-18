@@ -1,0 +1,19 @@
+# boss-observability config.
+# Subscribes to NATS and serves the /ops dashboard.
+#
+# In a real multi-VM cybernetics deployment, populate `[[vms]]` with
+# the worker VMs that run boss-cybernetics. For the brewery
+# playground (and any tenant that hasn't wired real agents yet),
+# leave `[[vms]]` empty and set `[demo_agents]` instead — the
+# /ops surface then reads as a populated dashboard with synthetic
+# agent activity.
+#
+# /api/snapshot is reverse-proxied from the gateway and the SPA
+# dev-server at 127.0.0.1:7880, so this binary listens there.
+bind = "127.0.0.1:7880"
+nats_url = "nats://127.0.0.1:4222"
+
+# Synthetic-agent mode. Comment out (and add `[[vms]]` entries) to
+# attach real cybernetics workers instead.
+[demo_agents]
+tick_seconds = 8

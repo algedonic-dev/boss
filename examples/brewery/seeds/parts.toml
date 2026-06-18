@@ -1,0 +1,160 @@
+# Brewery parts catalog — initial inventory state.
+#
+# Every SKU referenced by a JobKind's consume_parts list lives
+# here. The brewery prepare step (`boss-brewery-sim prepare`)
+# POSTs these to
+# `/api/inventory/items/batch` before the day loop starts, so
+# step-effects-runner consume calls succeed against real rows
+# instead of 404'ing. Stock levels are sized for the 12-month
+# seed run: every SKU starts mid-cycle — reorder_point plus about
+# half a reorder_qty — so the first demand-driven restock fires
+# partway through the run (exercising the procurement→receive→bill
+# loop) without a cold-start stockout.
+#
+# Bin coordinates are illustrative — A/B/C cold-storage,
+# D/E ambient. Reorder point is ~73-78% of trailing-90-day usage
+# (≈ 66-70 sim-days of cover) and reorder qty is ~90 days' worth.
+# The deep buffer is deliberate: under a compressed regen the
+# demand-driven per-SKU restock is workforce-driven and takes
+# ~2-3 sim-weeks to flow procurement → receive → put-away, so the
+# reorder point must cover that lead time plus bursty packaging
+# draws. (Earlier ~20%-of-usage points sat right at the lead time
+# → production 409'd on insufficient stock under load.)
+#
+# Each reorder point carries an explicit ~2-week safety buffer on
+# top of lead-time cover, sized off the SKU's own demand signal as
+# `+ round(trailing_90d_usage × 14/90)` (14 sim-days out of the
+# 90-day usage window) — derived from real demand, not a literal.
+# Why 2 weeks: a prior 365-day regen ran a net raw-material deficit
+# of ~$162K (~1.7% of ~$9.86M consumed — under one week of total
+# raw burn), so the saw-tooth trough dipped just below zero for the
+# busiest SKUs around demand peaks and account 1300 / `on_hand`
+# went briefly negative. Two weeks of stock lifts the trough back
+# above zero with margin for the July surge without over-stocking:
+# `reorder_qty` (PO size) and `on_hand` (opening 1300 balance) are
+# untouched — restocks just fire ~2 weeks earlier, so this is
+# balance-neutral cash↔inventory, no COGS/margin change.
+
+# `avg_cost_cents` seeds the weighted moving-average that
+# `inventory_items` tracks per SKU. Values reflect ~industrial
+# craft-brewery procurement (USD wholesale, 2025):
+#   - 50-lb malt sack: $25-30
+#   - 44-lb hops pellet box: $300 (Cascade specialty)
+#   - 1L liquid yeast pitch: $15
+#   - 50-lb CO2 cylinder: $25
+# Recognize at consumption time via PartsConsumeEmitter →
+# finance.cogs.recognized → DR 5100 / CR 1300. Labor + overhead
+# stay in 6xxx OPEX; ingredient COGS is only ingredients.
+
+[[parts]]
+part_sku = "ING-MALT-2ROW-50"
+vendor_category = "grain-supplier"
+bin = "D-01-01"
+on_hand = 31000
+allocated = 0
+# 17000 lead-time cover + ~2wk safety (29000 × 14/90 ≈ 4500) = 21500.
+reorder_point = 21500
+reorder_qty = 29000
+trailing_90d_usage = 29000
+avg_cost_cents = 2500
+vendor_price_cents = 2500
+
+[[parts]]
+part_sku = "ING-MALT-MUNICH-50"
+vendor_category = "grain-supplier"
+bin = "D-01-02"
+on_hand = 3000
+allocated = 0
+# 1600 lead-time cover + ~2wk safety (2700 × 14/90 ≈ 420) = 2020 → 2000.
+reorder_point = 2000
+reorder_qty = 2700
+trailing_90d_usage = 2700
+avg_cost_cents = 3000
+vendor_price_cents = 3000
+
+[[parts]]
+part_sku = "ING-HOPS-CASCADE-44"
+vendor_category = "hops-supplier"
+bin = "B-02-01"
+on_hand = 1100
+allocated = 0
+# 600 lead-time cover + ~2wk safety (1000 × 14/90 ≈ 150) = 750.
+reorder_point = 750
+reorder_qty = 1000
+trailing_90d_usage = 1000
+avg_cost_cents = 30000
+vendor_price_cents = 30000
+
+[[parts]]
+part_sku = "ING-YEAST-CALI-1L"
+vendor_category = "yeast-bank"
+bin = "A-03-01"
+on_hand = 1100
+allocated = 0
+# 600 lead-time cover + ~2wk safety (1000 × 14/90 ≈ 150) = 750.
+reorder_point = 750
+reorder_qty = 1000
+trailing_90d_usage = 1000
+avg_cost_cents = 1500
+vendor_price_cents = 1500
+
+[[parts]]
+part_sku = "PKG-CO2-50LB"
+vendor_category = "packaging"
+bin = "E-01-01"
+on_hand = 1000
+allocated = 0
+# 550 lead-time cover + ~2wk safety (900 × 14/90 = 140) = 690 → 700.
+reorder_point = 700
+reorder_qty = 900
+trailing_90d_usage = 900
+avg_cost_cents = 2500
+vendor_price_cents = 2500
+
+# ---------------------------------------------------------------------------
+# Packaging materials. The kegs themselves are reused assets (CIP-
+# cleaned + refilled, not consumed each brew), so we model the
+# per-fill packaging cost as a bundle SKU: sanitizer + labels +
+# minor consumables per keg. Pricing is the per-fill cost a real
+# brewery sees:
+#   - PKG-KEG-FILL-HALF-BBL: ~$3/fill (labels $0.10, sanitizer
+#     $0.50, lubricant $0.05, dust cover $0.10, amortized keg
+#     wear $2.25 = roughly $3 cash + capital cost basis)
+#   - PKG-KEG-FILL-SIXTEL:   ~$1.20/fill (proportionally smaller)
+# Sized for daily brewing burn: 1.2 brews/day × 525 kegs/brew ≈
+# 630 keg-fills/day, split across half-BBL + sixtel by ratio
+# 210:315 ≈ 40%/60%. So daily burn ≈ 250 half-BBL fills + 380
+# sixtel fills; 90-day usage ≈ 22,500 / 34,200.
+# ---------------------------------------------------------------------------
+
+[[parts]]
+part_sku = "PKG-KEG-FILL-HALF-BBL"
+vendor_category = "packaging"
+bin = "E-02-01"
+on_hand = 25000
+allocated = 0
+# 13500 lead-time cover + ~2wk safety (22500 × 14/90 = 3500) = 17000.
+reorder_point = 17000
+reorder_qty = 22500
+trailing_90d_usage = 22500
+avg_cost_cents = 300
+vendor_price_cents = 300
+
+[[parts]]
+part_sku = "PKG-KEG-FILL-SIXTEL"
+vendor_category = "packaging"
+bin = "E-02-02"
+on_hand = 37000
+allocated = 0
+# 20000 lead-time cover + ~2wk safety (34200 × 14/90 ≈ 5300) = 25300 → 25000.
+reorder_point = 25000
+reorder_qty = 34200
+trailing_90d_usage = 34200
+avg_cost_cents = 120
+vendor_price_cents = 120
+
+# ---------------------------------------------------------------------------
+
+# Finished-product SKUs (FP-*) live in products.toml + the
+# products / finished_product_inventory tables; not in inventory_items.
+# See docs/architecture-decisions.md §Finance & ledger.

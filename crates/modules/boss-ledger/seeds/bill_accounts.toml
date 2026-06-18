@@ -1,0 +1,32 @@
+# Bill (vendor-invoice) category → GL debit account-code mapping.
+# Loaded once at first call by `boss_ledger::rules::bill_approved()`
+# via `include_str!` + `OnceLock<HashMap<String, &'static str>>`.
+# Same data-as-data shape as `revenue_accounts.toml` — adding a
+# bill category for a new kind of spend is a row here, not a new
+# match arm in the posting rule.
+#
+# A bill's `bill_category` selects what the approved bill debits;
+# the credit is always 2100 Accounts Payable. Asset categories
+# capitalize onto the balance sheet (inventory, equipment); expense
+# categories hit the P&L immediately (rent, utilities, …). When a
+# bill omits `bill_category` the rule defaults to "inventory" —
+# preserving the ingredient-restock pipeline shape.
+#
+# Per-tenant overrides land via `BOSS_LEDGER_BILL_ACCOUNTS_TOML`
+# (replaces — does not merge with — these defaults), and the map is
+# exhaustive at runtime: an unknown category trips a hard error
+# rather than silently mis-posting spend.
+
+# --- Asset purchases (capitalize onto the balance sheet) ---
+"inventory" = "1300"
+"equipment" = "1500"
+
+# --- Operating expenses (hit the P&L) ---
+# 6200 Operating Expense — Rent      ← facility lease
+# 6300 Operating Expense — General   ← utilities, insurance, repairs, supplies
+"rent"        = "6200"
+"utilities"   = "6300"
+"insurance"   = "6300"
+"maintenance" = "6300"
+"supplies"    = "6300"
+"services"    = "6300"

@@ -1,0 +1,23 @@
+[package]
+name = "boss-policy-client"
+description = "HTTP client + in-process fake for boss-policy"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+boss-core = { path = "../boss-core" }
+axum = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+futures = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

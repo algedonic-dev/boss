@@ -1,0 +1,87 @@
+# Location rows for Boss Brewery.
+#
+# Each [[location]] is one row of the `locations` table. Schema:
+#   id          — kebab-case, "loc-*" by convention
+#   name        — human label (shown in pickers, headers)
+#   kind        — Class registry code under
+#                 (subject_kind='location', member_attribute='kind').
+#                 Boss core already seeds the OSS-playground kinds:
+#                 'taproom' (Boss Brewery customer-facing locations),
+#                 'brewhouse' (Boss Brewery production locations),
+#                 'distribution-route' (Boss Brewery distribution
+#                 routes), plus the generic 'remote'. v0 reuses
+#                 these codes; renaming them to brewery-flavored
+#                 codes is a schema lift for a follow-up wave.
+#   parent_id   — optional self-FK for hierarchy
+#   timezone    — required (TZ database name)
+#   latitude    — optional, decimal degrees
+#   longitude   — optional, decimal degrees
+#   address     — optional free text
+#   account_id  — pending boss-accounts crate
+#   metadata    — optional jsonb
+#
+# Setup: one taproom on the customer-facing street, one brewhouse
+# in the production lane, three distribution routes covering the
+# wholesale territory.
+
+# ---------------------------------------------------------------------------
+# Taproom (customer-facing)
+# ---------------------------------------------------------------------------
+
+[[location]]
+id = "loc-brewery-taproom"
+name = "Algedonic Ales — Taproom"
+kind = "taproom"
+timezone = "America/Los_Angeles"
+latitude = 37.7749
+longitude = -122.4194
+address = "1218 Valencia St, San Francisco, CA 94110"
+metadata = { square_feet = 2200, opens = "15:00", closes = "23:00", taps = 24, seating = 80 }
+
+# ---------------------------------------------------------------------------
+# Brewhouse (production)
+# ---------------------------------------------------------------------------
+
+[[location]]
+id = "loc-brewery-brewhouse"
+name = "Algedonic Ales — Brewhouse"
+kind = "brewhouse"
+timezone = "America/Los_Angeles"
+latitude = 37.7600
+longitude = -122.4180
+address = "2104 Harrison St, San Francisco, CA 94110"
+# Industrial scale, coherent with the 250-BBL batches the morning-brew
+# JobKinds package and the ~400-person workforce: a 250-BBL brewhouse
+# running ~1.6 brews/day with ~40 fermenters (250-BBL, ~14-day turn →
+# ~27 batches in flight + headroom) yields ~110k BBL/yr. (The sim does
+# not yet hard-gate production on fermenter availability — see the
+# equipment-capacity follow-up; this metadata is the modeled capacity.)
+metadata = { square_feet = 80000, brewhouse_bbl = 250, fermenters = 40, brite_tanks = 20, glycol_loops = 6, annual_bbl_capacity = 110000 }
+
+# ---------------------------------------------------------------------------
+# Distribution routes (wholesale)
+# ---------------------------------------------------------------------------
+
+[[location]]
+id = "loc-brewery-route-mission"
+name = "Mission / SOMA distribution route"
+kind = "distribution-route"
+parent_id = "loc-brewery-brewhouse"
+timezone = "America/Los_Angeles"
+metadata = { typical_stops = 12, departure = "07:00" }
+
+[[location]]
+id = "loc-brewery-route-marina"
+name = "Marina / Pacific Heights distribution route"
+kind = "distribution-route"
+parent_id = "loc-brewery-brewhouse"
+timezone = "America/Los_Angeles"
+metadata = { typical_stops = 8, departure = "07:30" }
+
+[[location]]
+id = "loc-brewery-route-east-bay"
+name = "East Bay distribution route"
+kind = "distribution-route"
+parent_id = "loc-brewery-brewhouse"
+timezone = "America/Los_Angeles"
+metadata = { typical_stops = 10, departure = "06:30", crosses_bridge = true }

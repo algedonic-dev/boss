@@ -1,0 +1,877 @@
+[
+  {
+    "sku": "BREW-MASH-250BBL",
+    "name": "Industrial Mash Tun, 250-BBL",
+    "manufacturer": "Cascade Brewing Systems",
+    "model_year": 2019,
+    "category": "brewhouse-vessel",
+    "physical": {
+      "width_cm": 360,
+      "depth_cm": 360,
+      "height_cm": 380,
+      "weight_kg": 4200,
+      "power_requirements": "480V 3-phase, 50A \u2014 agitator + steam jacket"
+    },
+    "regulatory": {
+      "clearance_id": "ASME-PV-2019-MT-0048",
+      "clearance_date": "2019-04-15",
+      "regulator_device_class": 2
+    },
+    "commerce": {
+      "list_price_new_cents": 14500000,
+      "typical_refurb_price_cents": 9200000,
+      "currency": "USD",
+      "lead_time_days": 120,
+      "tagline": "250-BBL stainless mash tun with steam jacket + bottom-mounted agitator",
+      "description": "The Cascade 250-BBL Industrial Mash Tun is a stainless-steel infusion mash tun with a steam-jacketed bottom, false-bottom screen, and a variable-speed agitator. Sized for the canonical 250-BBL industrial brewhouse cycle (4-hour mash + lauter). Targets regional craft + production tenants brewing 5-10 daily turns.",
+      "hero_image": "/dashboard/catalog/brew-mash-250bbl.jpg",
+      "use_cases": [
+        "mashing-in",
+        "step-mash",
+        "decoction-mash"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 4.0,
+      "preventive_maintenance_interval_months": 6,
+      "calibration_interval_months": 12,
+      "required_skill_level": 4,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-MT-001",
+          "name": "Agitator gearbox seal leak",
+          "frequency": 0.06,
+          "typical_fix": "Drain mash, replace mechanical seal, refill grease, run dry-cycle test."
+        },
+        {
+          "code": "BREW-MT-002",
+          "name": "False-bottom blockage (stuck mash)",
+          "frequency": 0.12,
+          "typical_fix": "Underback rake-and-rinse; if persistent, pull and acid-wash the screen."
+        },
+        {
+          "code": "BREW-MT-003",
+          "name": "Steam jacket low-pressure",
+          "frequency": 0.04,
+          "typical_fix": "Inspect trap + bypass valve; pressure-test jacket once isolated."
+        }
+      ],
+      "pm_checklist": [
+        "Inspect agitator gearbox oil level",
+        "Check steam jacket pressure relief valve",
+        "Pressure-test false-bottom screen",
+        "Verify drain valve seals",
+        "Replace mash paddle wear bushings if >50% worn",
+        "CIP cycle the vessel + verify clean discharge"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-LAUTER-250BBL",
+    "name": "Industrial Lauter Tun, 250-BBL",
+    "manufacturer": "Cascade Brewing Systems",
+    "model_year": 2019,
+    "category": "brewhouse-vessel",
+    "physical": {
+      "width_cm": 380,
+      "depth_cm": 380,
+      "height_cm": 320,
+      "weight_kg": 3900,
+      "power_requirements": "480V 3-phase, 30A \u2014 rake drive"
+    },
+    "regulatory": {
+      "clearance_id": "ASME-PV-2019-LT-0049",
+      "clearance_date": "2019-04-15",
+      "regulator_device_class": 2
+    },
+    "commerce": {
+      "list_price_new_cents": 12800000,
+      "typical_refurb_price_cents": 8100000,
+      "currency": "USD",
+      "lead_time_days": 120,
+      "tagline": "250-BBL lauter tun with motorized rakes + grant collection",
+      "description": "Stainless lauter tun with a motorized rake assembly, false-bottom screen, and a grant for runoff collection. Sized for the 250-BBL brewhouse \u2014 supports 90-minute lauter cycles with vorlauf recirculation.",
+      "hero_image": "/dashboard/catalog/brew-lauter-250bbl.jpg",
+      "use_cases": [
+        "wort-separation",
+        "vorlauf-recirculation",
+        "sparging"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 3.0,
+      "preventive_maintenance_interval_months": 6,
+      "calibration_interval_months": 12,
+      "required_skill_level": 3,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-LT-001",
+          "name": "Rake motor amperage spike",
+          "frequency": 0.05,
+          "typical_fix": "Inspect for stuck rakes; reduce rake depth; if persistent, swap motor brushes."
+        },
+        {
+          "code": "BREW-LT-002",
+          "name": "Grant pump cavitation",
+          "frequency": 0.08,
+          "typical_fix": "Adjust runoff rate; verify suction line not air-locked."
+        }
+      ],
+      "pm_checklist": [
+        "Inspect rake motor brushes",
+        "Verify rake-depth setpoint accuracy",
+        "Pressure-test grant pump seals",
+        "CIP cycle + verify discharge clarity",
+        "Calibrate vorlauf turbidity meter"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-KETTLE-250BBL",
+    "name": "Direct-Fire Brew Kettle, 250-BBL",
+    "manufacturer": "Pacific Steel Vessels",
+    "model_year": 2019,
+    "category": "brewhouse-vessel",
+    "physical": {
+      "width_cm": 360,
+      "depth_cm": 360,
+      "height_cm": 420,
+      "weight_kg": 4800,
+      "power_requirements": "Natural gas burner, 6.5M BTU/hr \u2014 separate gas service"
+    },
+    "regulatory": {
+      "clearance_id": "ASME-PV-2019-BK-0050",
+      "clearance_date": "2019-05-10",
+      "regulator_device_class": 2
+    },
+    "commerce": {
+      "list_price_new_cents": 16500000,
+      "typical_refurb_price_cents": 10400000,
+      "currency": "USD",
+      "lead_time_days": 150,
+      "tagline": "250-BBL direct-fire kettle with internal whirlpool + hop addition port",
+      "description": "Stainless brew kettle with direct-fired natural-gas burner, internal whirlpool function, and a top-mounted hop addition port for late + whirlpool hopping. 60-90 minute boil cycle at 250 BBL working volume.",
+      "hero_image": "/dashboard/catalog/brew-kettle-250bbl.jpg",
+      "use_cases": [
+        "wort-boil",
+        "whirlpool",
+        "hop-addition"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 5.0,
+      "preventive_maintenance_interval_months": 6,
+      "calibration_interval_months": 6,
+      "required_skill_level": 4,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-BK-001",
+          "name": "Burner pilot dropout",
+          "frequency": 0.1,
+          "typical_fix": "Clean pilot orifice; verify gas pressure; replace thermocouple if fault recurs."
+        },
+        {
+          "code": "BREW-BK-002",
+          "name": "Whirlpool inlet clog",
+          "frequency": 0.07,
+          "typical_fix": "Pull inlet plate, clear hop debris, re-seal."
+        },
+        {
+          "code": "BREW-BK-003",
+          "name": "Sight-glass fouling",
+          "frequency": 0.2,
+          "typical_fix": "Caustic + acid CIP; replace gasket if leaking after re-tighten."
+        }
+      ],
+      "pm_checklist": [
+        "Inspect burner pilot + thermocouple",
+        "Run combustion analyzer + tune air/fuel ratio",
+        "Inspect whirlpool inlet for hop debris",
+        "Verify sight-glass seals",
+        "CIP cycle the kettle",
+        "Inspect hop-addition port seal"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-HEX-PLATE",
+    "name": "Plate Heat Exchanger (Wort Cooler)",
+    "manufacturer": "Alfa Brewery",
+    "model_year": 2020,
+    "category": "brewhouse-utility",
+    "physical": {
+      "width_cm": 80,
+      "depth_cm": 60,
+      "height_cm": 140,
+      "weight_kg": 320,
+      "power_requirements": "No electrical \u2014 gravity-fed wort + pumped glycol"
+    },
+    "regulatory": {
+      "clearance_id": "FDA-3A-CIP-0103",
+      "clearance_date": "2020-08-22",
+      "regulator_device_class": 1
+    },
+    "commerce": {
+      "list_price_new_cents": 4200000,
+      "typical_refurb_price_cents": 2300000,
+      "currency": "USD",
+      "lead_time_days": 45,
+      "tagline": "Two-stage wort heat exchanger (city water + glycol) for 60-bbl/hr knockout",
+      "description": "Plate-and-frame heat exchanger sized for 60 BBL/hr knockout. Two stages: city water pre-cools wort from boil temp to ~80F, glycol second stage drops wort to pitch temp (60-65F). Drop-out plate count tunable for seasonal water-temperature swings.",
+      "hero_image": "/dashboard/catalog/brew-hex-plate.jpg",
+      "use_cases": [
+        "wort-knockout",
+        "fermentation-cooling-stage-1"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 2.0,
+      "preventive_maintenance_interval_months": 3,
+      "calibration_interval_months": 12,
+      "required_skill_level": 2,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-HEX-001",
+          "name": "Gasket leak between plates",
+          "frequency": 0.15,
+          "typical_fix": "Disassemble plate stack; replace EPDM gaskets in affected channels."
+        },
+        {
+          "code": "BREW-HEX-002",
+          "name": "Plate fouling (reduced \u0394T)",
+          "frequency": 0.25,
+          "typical_fix": "Caustic CIP at higher concentration + extended dwell; if plates pitted, replace stack."
+        }
+      ],
+      "pm_checklist": [
+        "Disassemble + inspect EPDM gaskets",
+        "Caustic CIP at extended dwell",
+        "Pressure-test glycol side",
+        "Verify \u0394T vs design at standard flow rate"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-FV-30BBL",
+    "name": "Conical Fermentation Vessel, 30-BBL",
+    "manufacturer": "Cascade Brewing Systems",
+    "model_year": 2020,
+    "category": "fermentation-vessel",
+    "physical": {
+      "width_cm": 240,
+      "depth_cm": 240,
+      "height_cm": 480,
+      "weight_kg": 1850,
+      "power_requirements": "Glycol-jacketed (no direct power); 24V solenoid for valve actuation"
+    },
+    "regulatory": {
+      "clearance_id": "ASME-PV-2020-FV-0211",
+      "clearance_date": "2020-03-18",
+      "regulator_device_class": 2
+    },
+    "commerce": {
+      "list_price_new_cents": 5800000,
+      "typical_refurb_price_cents": 3200000,
+      "currency": "USD",
+      "lead_time_days": 90,
+      "tagline": "30-BBL conical fermenter with dual glycol zones + dump port",
+      "description": "Stainless cylindro-conical fermentation vessel, 30-BBL working volume (35-BBL gross). Two independently-controlled glycol zones (cone + body), bottom dump for yeast harvest, racking arm for clear-beer transfer. Standard pressure rating 15 PSI.",
+      "hero_image": "/dashboard/catalog/brew-fv-30bbl.jpg",
+      "use_cases": [
+        "primary-fermentation",
+        "secondary-conditioning",
+        "yeast-harvest"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 1.5,
+      "preventive_maintenance_interval_months": 12,
+      "calibration_interval_months": 6,
+      "required_skill_level": 3,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-FV-001",
+          "name": "Glycol jacket leak",
+          "frequency": 0.04,
+          "typical_fix": "Pressure-test jacket; if leak isolated to one zone, isolate that zone + run on backup."
+        },
+        {
+          "code": "BREW-FV-002",
+          "name": "Dump valve seal weep",
+          "frequency": 0.1,
+          "typical_fix": "Replace tri-clamp gasket; if valve seat damaged, swap valve assembly."
+        },
+        {
+          "code": "BREW-FV-003",
+          "name": "Pressure relief valve sticking",
+          "frequency": 0.06,
+          "typical_fix": "Pull PRV, clean spring + seat, re-test crack pressure on bench."
+        }
+      ],
+      "pm_checklist": [
+        "Pressure-test vessel to 18 PSI",
+        "Inspect dump-valve gasket",
+        "Verify glycol jacket leak-free",
+        "Crack-test pressure relief valve",
+        "CIP cycle + verify swab clean"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-BRITE-30BBL",
+    "name": "Brite Conditioning Tank, 30-BBL",
+    "manufacturer": "Cascade Brewing Systems",
+    "model_year": 2020,
+    "category": "conditioning-vessel",
+    "physical": {
+      "width_cm": 200,
+      "depth_cm": 200,
+      "height_cm": 380,
+      "weight_kg": 1400,
+      "power_requirements": "Glycol-jacketed (no direct power)"
+    },
+    "regulatory": {
+      "clearance_id": "ASME-PV-2020-BT-0212",
+      "clearance_date": "2020-03-18",
+      "regulator_device_class": 2
+    },
+    "commerce": {
+      "list_price_new_cents": 4400000,
+      "typical_refurb_price_cents": 2400000,
+      "currency": "USD",
+      "lead_time_days": 90,
+      "tagline": "30-BBL horizontal brite tank for carbonation + cold-conditioning",
+      "description": "Stainless horizontal brite/serving tank, 30-BBL working volume. Used for natural carbonation, cold-conditioning, and the bridging hold between fermentation and packaging. Lower height than FVs to fit cellar racks; gas-injection carbonation stone optional.",
+      "hero_image": "/dashboard/catalog/brew-brite-30bbl.jpg",
+      "use_cases": [
+        "carbonation",
+        "cold-conditioning",
+        "packaging-bridge"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 1.0,
+      "preventive_maintenance_interval_months": 12,
+      "calibration_interval_months": 12,
+      "required_skill_level": 2,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-BT-001",
+          "name": "Carb stone clogging",
+          "frequency": 0.18,
+          "typical_fix": "Remove stone, sonic-clean in citric acid bath; replace if dwell time hasn't recovered."
+        }
+      ],
+      "pm_checklist": [
+        "Sonic-clean carb stone",
+        "Pressure-test vessel to 18 PSI",
+        "CIP cycle + verify swab clean"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-GLYCOL-30T",
+    "name": "Glycol Chiller, 30-Ton",
+    "manufacturer": "Pro Refrigeration",
+    "model_year": 2018,
+    "category": "utility",
+    "physical": {
+      "width_cm": 300,
+      "depth_cm": 180,
+      "height_cm": 220,
+      "weight_kg": 2400,
+      "power_requirements": "480V 3-phase, 80A; R-449A refrigerant; 2 \u00d7 15HP scroll compressors"
+    },
+    "regulatory": {
+      "clearance_id": "UL-1995-2018-CHL-0142",
+      "clearance_date": "2018-11-04",
+      "regulator_device_class": 2
+    },
+    "commerce": {
+      "list_price_new_cents": 9800000,
+      "typical_refurb_price_cents": 5600000,
+      "currency": "USD",
+      "lead_time_days": 60,
+      "tagline": "30-ton dual-compressor glycol chiller \u2014 fermentation + brite cooling",
+      "description": "30-ton (105 kW) industrial glycol chiller with dual 15HP scroll compressors, 200-gal insulated reservoir, and twin pump trains. Provides chilled glycol to all fermentation + brite tanks plus the wort heat exchanger second stage. Lead-lag compressor staging.",
+      "hero_image": "/dashboard/catalog/brew-glycol-30t.jpg",
+      "use_cases": [
+        "fermentation-cooling",
+        "brite-cooling",
+        "wort-knockout"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 4.0,
+      "preventive_maintenance_interval_months": 3,
+      "calibration_interval_months": 6,
+      "required_skill_level": 5,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-GLY-001",
+          "name": "Compressor short-cycling",
+          "frequency": 0.08,
+          "typical_fix": "Check refrigerant charge; verify low-pressure cutout setpoint; inspect contactor for chatter."
+        },
+        {
+          "code": "BREW-GLY-002",
+          "name": "Glycol pump seal failure",
+          "frequency": 0.06,
+          "typical_fix": "Isolate pump, replace mechanical seal, refill loop, re-bleed."
+        },
+        {
+          "code": "BREW-GLY-003",
+          "name": "Reservoir glycol concentration drift",
+          "frequency": 0.2,
+          "typical_fix": "Test concentration with refractometer; top up with concentrate to maintain 35% propylene glycol."
+        }
+      ],
+      "pm_checklist": [
+        "Test glycol concentration with refractometer",
+        "Inspect pump seals for weep",
+        "Verify low-pressure cutout setpoint",
+        "Inspect contactors for chatter",
+        "Check refrigerant charge",
+        "Clean condenser coils",
+        "Verify lead-lag stagger logic"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-BOILER-50HP",
+    "name": "Steam Boiler, 50 HP",
+    "manufacturer": "Hurst Boiler",
+    "model_year": 2018,
+    "category": "utility",
+    "physical": {
+      "width_cm": 220,
+      "depth_cm": 280,
+      "height_cm": 240,
+      "weight_kg": 3200,
+      "power_requirements": "Natural gas, 1.7M BTU/hr; 480V 3-phase, 15A for blower + controls"
+    },
+    "regulatory": {
+      "clearance_id": "ASME-S-2018-BLR-0078",
+      "clearance_date": "2018-09-14",
+      "regulator_device_class": 3
+    },
+    "commerce": {
+      "list_price_new_cents": 7400000,
+      "typical_refurb_price_cents": 4100000,
+      "currency": "USD",
+      "lead_time_days": 90,
+      "tagline": "50-HP gas-fired packaged steam boiler \u2014 mash tun + kettle service",
+      "description": "Hurst 50-HP packaged steam boiler with 150-PSI design rating (operates ~30 PSI). Provides steam to the mash tun jacket, kettle (when retrofit with steam coil), and ancillary CIP heating. Annual ASME inspection required.",
+      "hero_image": "/dashboard/catalog/brew-boiler-50hp.jpg",
+      "use_cases": [
+        "mash-jacket-heat",
+        "cip-heating",
+        "kettle-steam"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 6.0,
+      "preventive_maintenance_interval_months": 6,
+      "calibration_interval_months": 12,
+      "required_skill_level": 5,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-BLR-001",
+          "name": "Low-water cutoff stuck",
+          "frequency": 0.05,
+          "typical_fix": "Drain LWCO chamber, manually verify float travel; if seized, swap LWCO assembly."
+        },
+        {
+          "code": "BREW-BLR-002",
+          "name": "Burner soot buildup",
+          "frequency": 0.3,
+          "typical_fix": "Vacuum tubes + firebox; verify air/fuel ratio with combustion analyzer; tune burner head."
+        }
+      ],
+      "pm_checklist": [
+        "Annual ASME inspection",
+        "Vacuum tubes + firebox",
+        "Test low-water cutoff drift",
+        "Calibrate combustion analyzer",
+        "Replace water-column gasket",
+        "Verify safety relief crack pressure"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-KEG-WASHFILL-1",
+    "name": "Single-Head Keg Wash + Fill Station",
+    "manufacturer": "GW Kent",
+    "model_year": 2021,
+    "category": "packaging",
+    "physical": {
+      "width_cm": 180,
+      "depth_cm": 110,
+      "height_cm": 180,
+      "weight_kg": 480,
+      "power_requirements": "208V 1-phase, 30A; compressed air 100 PSI; CIP chemical feeds"
+    },
+    "regulatory": {
+      "clearance_id": "FDA-3A-PKG-0044",
+      "clearance_date": "2021-02-19",
+      "regulator_device_class": 1
+    },
+    "commerce": {
+      "list_price_new_cents": 6200000,
+      "typical_refurb_price_cents": 3500000,
+      "currency": "USD",
+      "lead_time_days": 60,
+      "tagline": "Single-head keg wash + fill \u2014 25 kegs/hr at 1/2-BBL or 1/6-BBL",
+      "description": "Combination keg washer + filler. 5-stage wash cycle (water purge, caustic, intermediate rinse, acid sanitizer, sterile water + steam) followed by counter-pressure fill from a brite tank. Throughput ~25 kegs/hr at 1/2-BBL; ~40/hr at 1/6-BBL.",
+      "hero_image": "/dashboard/catalog/brew-keg-washfill-1.jpg",
+      "use_cases": [
+        "keg-washing",
+        "keg-filling",
+        "wholesale-packaging"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 3.0,
+      "preventive_maintenance_interval_months": 3,
+      "calibration_interval_months": 6,
+      "required_skill_level": 3,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-KGF-001",
+          "name": "Spear seal leak (keg coupler)",
+          "frequency": 0.12,
+          "typical_fix": "Replace coupler O-ring stack; verify keg spear isn't out-of-spec."
+        },
+        {
+          "code": "BREW-KGF-002",
+          "name": "Caustic dosing pump drift",
+          "frequency": 0.08,
+          "typical_fix": "Calibrate dosing pump against measured-volume test; replace diaphragm if worn."
+        }
+      ],
+      "pm_checklist": [
+        "Replace coupler O-ring stack",
+        "Calibrate caustic dosing pump",
+        "Verify steam sterilization temp at filler head",
+        "Inspect spear seal stack",
+        "Test counter-pressure setpoint accuracy"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-CAN-LINE-MOBILE",
+    "name": "Mobile Canning Line, 30 cans/min",
+    "manufacturer": "Wild Goose Filling",
+    "model_year": 2022,
+    "category": "packaging",
+    "physical": {
+      "width_cm": 480,
+      "depth_cm": 110,
+      "height_cm": 180,
+      "weight_kg": 1100,
+      "power_requirements": "208V 3-phase, 50A; CO2 + N2 service; compressed air 90 PSI"
+    },
+    "regulatory": {
+      "clearance_id": "FDA-3A-PKG-0091",
+      "clearance_date": "2022-04-30",
+      "regulator_device_class": 1
+    },
+    "commerce": {
+      "list_price_new_cents": 18500000,
+      "typical_refurb_price_cents": 11200000,
+      "currency": "USD",
+      "lead_time_days": 90,
+      "tagline": "4-head mobile canning line, 30 cans/min for 12oz aluminum",
+      "description": "4-head purge-fill-seam canning line on a mobile chassis. Pre-purges cans with CO2 to reduce dissolved-O2 pickup, fills under counter-pressure, seams the lid in line. Produces 30 cans/min sustained at 12oz format; 22 cans/min at 16oz.",
+      "hero_image": "/dashboard/catalog/brew-can-line-mobile.jpg",
+      "use_cases": [
+        "12oz-canning",
+        "16oz-canning",
+        "seasonal-release-packaging"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 8.0,
+      "preventive_maintenance_interval_months": 1,
+      "calibration_interval_months": 3,
+      "required_skill_level": 4,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-CAN-001",
+          "name": "Seamer roll wear (low-double-seam)",
+          "frequency": 0.2,
+          "typical_fix": "Tear-down seam check; replace 1st-op or 2nd-op seamer roll; recalibrate."
+        },
+        {
+          "code": "BREW-CAN-002",
+          "name": "Fill-head O-ring failure",
+          "frequency": 0.15,
+          "typical_fix": "Swap O-rings on affected head; verify no fill-tube damage."
+        },
+        {
+          "code": "BREW-CAN-003",
+          "name": "DO pickup spike (>50 ppb)",
+          "frequency": 0.1,
+          "typical_fix": "Re-tune CO2 purge pressure + dwell; check fill-tube seal."
+        }
+      ],
+      "pm_checklist": [
+        "Tear-down seam check (1st-op + 2nd-op)",
+        "Replace fill-head O-rings",
+        "Verify CO2 purge pressure + dwell",
+        "Test DO meter calibration",
+        "Inspect lid magazine feed"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-BARREL-OAK-NEW",
+    "name": "American Oak Barrel, 53-gal, new char-3",
+    "manufacturer": "Independent Stave Co.",
+    "model_year": 2024,
+    "category": "barrel",
+    "physical": {
+      "width_cm": 65,
+      "depth_cm": 65,
+      "height_cm": 89,
+      "weight_kg": 50,
+      "power_requirements": "none"
+    },
+    "regulatory": {
+      "clearance_id": "TTB-COLA-OAK-N53",
+      "clearance_date": "2024-01-15",
+      "regulator_device_class": 1
+    },
+    "commerce": {
+      "list_price_new_cents": 65000,
+      "typical_refurb_price_cents": 25000,
+      "currency": "USD",
+      "lead_time_days": 21,
+      "tagline": "53-gal new American oak, char level 3, for primary oak-aging",
+      "description": "Standard 53-gallon American oak barrel, char level 3 (medium-plus toast). Imparts vanilla + coconut + caramel notes; suitable for first-fill stout, barleywine, or sour-aging programs that want pronounced new-oak character. Single-use is the canonical lifecycle for new char-3; subsequent fills become 'refill oak' with diminished extraction.",
+      "hero_image": "/dashboard/catalog/brew-barrel-oak-new.jpg",
+      "use_cases": [
+        "stout-oak-aging",
+        "barleywine-aging",
+        "primary-sour-aging"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 0.5,
+      "preventive_maintenance_interval_months": 3,
+      "calibration_interval_months": 12,
+      "required_skill_level": 2,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-BBL-001",
+          "name": "Stave seepage (slow leak)",
+          "frequency": 0.12,
+          "typical_fix": "Re-soak barrel, drive bung tighter; if seepage persists at hoop line, retire to second-fill or compost."
+        },
+        {
+          "code": "BREW-BBL-002",
+          "name": "Brett contamination (unintended)",
+          "frequency": 0.05,
+          "typical_fix": "Quarantine barrel for sour program or destroy; cannot be reliably sanitized for clean fermentation."
+        },
+        {
+          "code": "BREW-BBL-003",
+          "name": "Excessive oxidation during aging",
+          "frequency": 0.08,
+          "typical_fix": "Top off with same-batch beer monthly; verify bung seal; reduce ullage."
+        }
+      ],
+      "pm_checklist": [
+        "Visual inspection for stave seepage at heads + bilge",
+        "Top-off check (replace headspace loss with same-batch beer)",
+        "Bung integrity + seal check",
+        "Sample for taste + DO every 90 days",
+        "Hoop tension check"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-BARREL-BOURBON-USED",
+    "name": "Ex-Bourbon Barrel, 53-gal, single-use",
+    "manufacturer": "Kentucky Cooperage (resold)",
+    "model_year": 2023,
+    "category": "barrel",
+    "physical": {
+      "width_cm": 65,
+      "depth_cm": 65,
+      "height_cm": 89,
+      "weight_kg": 52,
+      "power_requirements": "none"
+    },
+    "regulatory": {
+      "clearance_id": "TTB-COLA-BBN-U53",
+      "clearance_date": "2023-08-10",
+      "regulator_device_class": 1
+    },
+    "commerce": {
+      "list_price_new_cents": 28000,
+      "typical_refurb_price_cents": 12000,
+      "currency": "USD",
+      "lead_time_days": 14,
+      "tagline": "Used 53-gal ex-bourbon barrel, ~3yr fill, residual spirit ~2L",
+      "description": "Standard 53-gallon American oak barrel previously used for ~3 years of bourbon aging per federal regulation. Arrives wet with residual bourbon (~2L), which influences the first beer fill (typical pickup: 0.4-0.7% ABV bump + bourbon character). Canonical vessel for imperial stout barrel-aging programs; expected to deliver 2-3 useful beer fills before character drops below threshold.",
+      "hero_image": "/dashboard/catalog/brew-barrel-bourbon-used.jpg",
+      "use_cases": [
+        "imperial-stout-aging",
+        "barleywine-aging",
+        "scotch-ale-aging"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 0.5,
+      "preventive_maintenance_interval_months": 3,
+      "calibration_interval_months": 12,
+      "required_skill_level": 2,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-BBL-101",
+          "name": "Stave seepage at bilge",
+          "frequency": 0.18,
+          "typical_fix": "Re-soak with hot water; drive bung deeper; if persistent, retire after current fill."
+        },
+        {
+          "code": "BREW-BBL-102",
+          "name": "Bourbon character exhausted (3rd+ fill)",
+          "frequency": 0.25,
+          "typical_fix": "Reclassify barrel for refill-oak program or sell to sour-aging tenant; no longer suitable for marketed bourbon-barrel-aged claims."
+        },
+        {
+          "code": "BREW-BBL-103",
+          "name": "Brett or wild-yeast contamination",
+          "frequency": 0.07,
+          "typical_fix": "Quarantine for sour program; do not return to clean-fermentation pool."
+        }
+      ],
+      "pm_checklist": [
+        "Visual inspection for stave seepage",
+        "Top-off check + ullage measurement",
+        "Bung integrity check",
+        "Sample for taste + DO every 90 days",
+        "Track fill count (1/2/3) for character-budget reporting"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-BARREL-WINE-USED",
+    "name": "Ex-Wine Barrel, 60-gal, French oak, used",
+    "manufacturer": "Tonnellerie Radoux (resold)",
+    "model_year": 2022,
+    "category": "barrel",
+    "physical": {
+      "width_cm": 70,
+      "depth_cm": 70,
+      "height_cm": 95,
+      "weight_kg": 58,
+      "power_requirements": "none"
+    },
+    "regulatory": {
+      "clearance_id": "TTB-COLA-WIN-U60",
+      "clearance_date": "2022-11-04",
+      "regulator_device_class": 1
+    },
+    "commerce": {
+      "list_price_new_cents": 42000,
+      "typical_refurb_price_cents": 18000,
+      "currency": "USD",
+      "lead_time_days": 21,
+      "tagline": "Used 60-gal French oak ex-wine barrel, sour-program vessel",
+      "description": "60-gallon French oak barrel previously used for red-wine aging (typical: 2-3 vintages). Arrives with residual wine character + the indigenous microflora (Brettanomyces, Pediococcus, Lactobacillus) that resident wine programs cultivate. The canonical vessel for wild + sour aging in the brewery: tannins from French oak, fruit notes from wine, microbiome for slow secondary fermentation. Lifecycle is years, not months — expect 4-7 fills over 3-6 years before character flattens.",
+      "hero_image": "/dashboard/catalog/brew-barrel-wine-used.jpg",
+      "use_cases": [
+        "wild-ale-aging",
+        "sour-ale-aging",
+        "saison-aging"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 0.5,
+      "preventive_maintenance_interval_months": 6,
+      "calibration_interval_months": 12,
+      "required_skill_level": 3,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-BBL-201",
+          "name": "Hoop loosening (over years)",
+          "frequency": 0.15,
+          "typical_fix": "Drive hoop tighter with cooper's hammer; if iron is rusted-through, retire."
+        },
+        {
+          "code": "BREW-BBL-202",
+          "name": "Acetic spike (excess oxygen)",
+          "frequency": 0.1,
+          "typical_fix": "Top off aggressively, verify bung seal; if VA exceeds threshold, blend off or destroy."
+        },
+        {
+          "code": "BREW-BBL-203",
+          "name": "Microbial drift (off-character)",
+          "frequency": 0.08,
+          "typical_fix": "Sample + sensory panel; if irrecoverable, retire from sour program."
+        }
+      ],
+      "pm_checklist": [
+        "Visual inspection for stave + hoop integrity",
+        "Top-off check (more frequent for sours — ullage drives VA)",
+        "Bung integrity check",
+        "Sample for sensory + VA every 180 days",
+        "Track fill count + age for terroir-reporting"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  }
+]

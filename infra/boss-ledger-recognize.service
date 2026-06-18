@@ -1,0 +1,21 @@
+[Unit]
+Description=Boss revenue-recognition scheduler (ASC 606 step 3)
+After=postgresql.service
+
+[Service]
+Type=oneshot
+# The binary + config + env-var gate for RuleSet v2. Operators on
+# pre-switchover deployments leave BOSS_LEDGER_RULESET unset (default
+# is v1); no recognition facts fire because the schedule-populating
+# path also lives behind v2. Once flipped, every downstream service
+# that posts finance facts must carry the same env var or v1-tagged
+# entries will race v2-tagged ones.
+Environment=RUST_LOG=info
+Environment=BOSS_LEDGER_RULESET=2
+ExecStart=/usr/local/bin/boss-ledger-recognize --config /etc/boss-ledger-api.toml
+# Runs as root to match boss-ledger-api.service + the
+# boss-messages-events-purge / boss-audit-integrity-check
+# timer pattern. The recognize binary authenticates to
+# Postgres via the `boss` role in postgres_url, not via Linux
+# UID. Tighten to a dedicated service user once Boss adopts
+# per-service Linux UIDs system-wide.

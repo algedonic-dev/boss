@@ -1,0 +1,12 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security disclosure
+    url: https://github.com/algedonic-dev/boss/blob/main/SECURITY.md
+    about: |
+      Found a security issue? Please don't open a public issue.
+      SECURITY.md has the disclosure path.
+  - name: Question or design discussion
+    url: https://github.com/algedonic-dev/boss/discussions
+    about: |
+      For open-ended questions, design feedback, or "how should
+      I model X in BOSS", please use Discussions instead.

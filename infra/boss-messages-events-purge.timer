@@ -1,0 +1,19 @@
+[Unit]
+Description=Daily retention sweep for the messages_events trail
+
+[Timer]
+# Fires at 03:30 local daily — 30 minutes after the pg_dump backup
+# (see infra/boss-backup.timer) so the night's snapshot still
+# contains every row that was about to be expired. Operators who
+# need to recover a purged message can pull it out of the morning
+# backup; the sweep is otherwise destructive (no soft-delete column
+# on messages_events by design — that would re-introduce the leak
+# the trail-split was meant to fix).
+OnCalendar=*-*-* 03:30:00
+# Catch up if the host was down at fire time. A skipped night just
+# delays expiration by hours, never indefinitely.
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

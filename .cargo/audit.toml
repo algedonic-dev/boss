@@ -1,0 +1,39 @@
+# cargo-audit configuration — documents the 4 advisory IDs we
+# knowingly accept for v0.1.0. Every ignore needs a one-line
+# rationale + a check-back trigger ("revisit when X is true").
+#
+# `cargo audit` scans Cargo.lock entries; the lockfile records
+# every package the resolver considered (including OPTIONAL
+# dependencies that aren't actually compiled in any of our
+# binaries). The rsa entry below is exactly that case.
+
+[advisories]
+ignore = [
+    # rsa 0.9.10 carries the Marvin Attack timing sidechannel
+    # (RUSTSEC-2023-0071). Pulled by sqlx-mysql 0.8.6, which sqlx
+    # 0.8 lists as an OPTIONAL dependency. Every sqlx dep in this
+    # workspace declares `default-features = false` + an explicit
+    # feature list that includes only `postgres` — so sqlx-mysql
+    # (and therefore rsa) is never compiled into any binary.
+    # `cargo audit` walks the lockfile not the build graph, so
+    # it still flags rsa as present.
+    # Revisit when: sqlx releases a version that stops resolving
+    # sqlx-mysql in Cargo.lock under default-features = false.
+    "RUSTSEC-2023-0071",
+
+    # rustls-webpki 0.101.7 carries three name-constraint /
+    # CRL-parsing bugs (RUSTSEC-2026-0098 / -0099 / -0104).
+    # Pulled transitively by aws-sdk-s3 1.x → aws-smithy-http-
+    # client 1.1.12 → rustls 0.21.12. The AWS Rust SDK has not
+    # yet migrated to rustls 0.23 (which uses rustls-webpki
+    # 0.103+); BOSS already pulls rustls 0.23.40 via other
+    # transitive paths so we have two rustls versions co-existing
+    # at compile time. The three advisories are MITM-shaped
+    # (attacker forges intermediate certs against AWS endpoints)
+    # — out-of-scope for a single-VM OSS evaluator deployment.
+    # Revisit when: aws-smithy-http-client 1.x bumps to rustls
+    # 0.23+. Tracked at github.com/awslabs/smithy-rs.
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+]

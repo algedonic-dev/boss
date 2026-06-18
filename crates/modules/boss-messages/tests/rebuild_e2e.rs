@@ -1,0 +1,229 @@
+//! End-to-end: send messages via the API (which writes to both the
+//! `messages` projection AND the `audit_log` event log), snapshot the
+//! resulting projection, drop every row, run `rebuild_messages`,
+//! and assert the projection matches the snapshot.
+//!
+//! Pilot validation for the "events are canonical, projections are
+//! derived" architecture.
+
+#![cfg(feature = "postgres")]
+
+use std::sync::Arc;
+
+use axum::Router;
+use axum::http::StatusCode;
+use boss_core::publisher::DomainPublisher;
+use boss_events::PgAuditWriter;
+use boss_messages::PgMessages;
+use boss_messages::http::{MessageApiState, router};
+use boss_messages::rebuild_messages;
+use boss_testing::{RecordingEventBus, TestDb, TestRequest};
+use chrono::{DateTime, Utc};
+
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+struct MessageRow {
+    id: String,
+    sender_id: String,
+    recipient_id: String,
+    subject: String,
+    body: String,
+    entity_type: Option<String>,
+    entity_id: Option<String>,
+    kind: String,
+    sent_at: DateTime<Utc>,
+    read_at: Option<DateTime<Utc>>,
+    reply_to: Option<String>,
+}
+
+async fn snapshot_messages(pool: &sqlx::PgPool) -> Vec<MessageRow> {
+    sqlx::query_as::<_, MessageRow>(
+        "SELECT id, sender_id, recipient_id, subject, body, entity_type, entity_id, \
+                kind, sent_at, read_at, reply_to \
+         FROM messages ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+fn build_app(pool: sqlx::PgPool) -> Router {
+    let repo = Arc::new(PgMessages::new(pool.clone()));
+    let bus = RecordingEventBus::new();
+    let publisher = DomainPublisher::new(bus.clone(), "messages")
+        .with_audit(Arc::new(PgAuditWriter::new(pool)));
+    let state = MessageApiState {
+        messages: repo,
+        publisher: Some(publisher),
+        clock: Arc::new(boss_clock_client::WallClockClient),
+        classes_client: None,
+    };
+    router(state)
+}
+
+async fn send_message(router: &Router, sender: &str, recipient: &str, subject: &str) -> String {
+    let resp = TestRequest::post("/api/messages/send")
+        .json(&serde_json::json!({
+            "sender_id": sender,
+            "recipient_id": recipient,
+            "subject": subject,
+            "body": format!("body of {subject}"),
+            "kind": "direct",
+        }))
+        .send(router)
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+    let body: serde_json::Value = resp.assert_json();
+    body["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rebuild_reproduces_projection_after_drop() {
+    let db = TestDb::new().await;
+    let router = build_app(db.pool.clone());
+
+    // 1. Drive a realistic mix through the API: 4 messages sent, 2
+    //    read, 1 archived, 1 deleted. Each call lands a row in
+    //    messages AND an event in audit_log.
+    let m1 = send_message(&router, "emp-a", "emp-b", "first").await;
+    let m2 = send_message(&router, "emp-a", "emp-b", "second").await;
+    let m3 = send_message(&router, "emp-c", "emp-b", "third").await;
+    let m4 = send_message(&router, "emp-a", "emp-c", "fourth").await;
+
+    TestRequest::post(format!("/api/messages/{m1}/read"))
+        .send(&router)
+        .await
+        .assert_status(StatusCode::OK);
+    TestRequest::post(format!("/api/messages/{m3}/read"))
+        .send(&router)
+        .await
+        .assert_status(StatusCode::OK);
+    TestRequest::post(format!("/api/messages/{m2}/archive"))
+        .send(&router)
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    TestRequest::delete(format!("/api/messages/{m4}"))
+        .send(&router)
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    // 2. Snapshot the projection. m4 should be gone (deleted), m2's
+    //    kind should be 'archived', m1+m3 should have read_at set.
+    let before = snapshot_messages(&db.pool).await;
+    assert_eq!(before.len(), 3, "post-delete count");
+    let archived: Vec<_> = before.iter().filter(|r| r.kind == "archived").collect();
+    assert_eq!(archived.len(), 1, "exactly one archived");
+    assert_eq!(archived[0].id, m2);
+    let read: Vec<_> = before.iter().filter(|r| r.read_at.is_some()).collect();
+    assert_eq!(read.len(), 2, "two messages marked read");
+
+    // 3. Verify audit_log has the full event sequence — 4 sent + 2
+    //    read + 1 archived + 1 deleted = 8 events.
+    let event_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM audit_log WHERE kind LIKE 'messages.message.%'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(event_count.0, 8, "8 events emitted");
+
+    // 4. Blow away the projection. (We don't drop audit_log rows —
+    //    that's the point: events are canonical, projections derive.)
+    sqlx::query("DELETE FROM messages")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM messages")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 0, "messages projection wiped");
+
+    // 5. Rebuild from audit_log alone.
+    let report = rebuild_messages(&db.pool).await.expect("rebuild succeeds");
+
+    assert_eq!(report.events_processed, 8);
+    assert_eq!(report.rows_inserted, 4);
+    assert_eq!(report.rows_marked_read, 2);
+    assert_eq!(report.rows_archived, 1);
+    assert_eq!(report.rows_deleted, 1);
+
+    // 6. The reconstructed projection should match the original
+    //    bit-for-bit (same ids, same content, same read_at / kind).
+    let after = snapshot_messages(&db.pool).await;
+    assert_eq!(
+        before, after,
+        "rebuilt projection should match the pre-rebuild snapshot exactly"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rebuild_is_idempotent() {
+    let db = TestDb::new().await;
+    let router = build_app(db.pool.clone());
+
+    let _m1 = send_message(&router, "emp-a", "emp-b", "alpha").await;
+    let m2 = send_message(&router, "emp-a", "emp-b", "beta").await;
+    TestRequest::post(format!("/api/messages/{m2}/read"))
+        .send(&router)
+        .await
+        .assert_status(StatusCode::OK);
+
+    let baseline = snapshot_messages(&db.pool).await;
+
+    // Two consecutive rebuilds should both land on the same state.
+    rebuild_messages(&db.pool).await.unwrap();
+    let after_first = snapshot_messages(&db.pool).await;
+    assert_eq!(baseline, after_first);
+
+    rebuild_messages(&db.pool).await.unwrap();
+    let after_second = snapshot_messages(&db.pool).await;
+    assert_eq!(baseline, after_second);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rebuild_skips_pre_enrichment_sent_events() {
+    // Mimic an audit_log slice that pre-dates the payload enrichment —
+    // SENT events with only `{id}` should be skipped (and surface in
+    // events_skipped) rather than abort the rebuild.
+    let db = TestDb::new().await;
+
+    // Hand-write three audit_log rows: an unenriched SENT, a fully
+    // enriched SENT, and a READ that targets the enriched one.
+    sqlx::query(
+        "INSERT INTO audit_log (event_id, source, kind, payload) VALUES \
+         (gen_random_uuid(), 'messages', 'messages.message.sent', $1::jsonb), \
+         (gen_random_uuid(), 'messages', 'messages.message.sent', $2::jsonb), \
+         (gen_random_uuid(), 'messages', 'messages.message.read',  $3::jsonb)",
+    )
+    .bind(serde_json::json!({ "id": "msg-old" }))
+    .bind(serde_json::json!({
+        "id": "msg-new",
+        "sender_id": "emp-a",
+        "recipient_id": "emp-b",
+        "subject": "with full state",
+        "body": "ok",
+        "kind": "direct",
+        "sent_at": Utc::now(),
+        "read_at": null,
+        "reply_to": null,
+    }))
+    .bind(serde_json::json!({
+        "id": "msg-new",
+        "read_at": Utc::now(),
+    }))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let report = rebuild_messages(&db.pool).await.unwrap();
+
+    assert_eq!(report.events_processed, 3);
+    assert_eq!(report.events_skipped, 1, "the bare-id SENT was skipped");
+    assert_eq!(report.rows_inserted, 1);
+    assert_eq!(report.rows_marked_read, 1);
+
+    // Only the enriched message survives.
+    let rows = snapshot_messages(&db.pool).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "msg-new");
+    assert!(rows[0].read_at.is_some());
+}

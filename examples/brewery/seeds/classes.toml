@@ -1,0 +1,748 @@
+# Class registry seeds for Boss Brewery.
+#
+# Each [[class]] block is one row of the `classes` table. Schema:
+#   subject_kind     — which Subject the Class taxonomies (employee,
+#                      location, vendor, etc.)
+#   code             — kebab-case slug, unique within (subject_kind,
+#                      member_attribute)
+#   display_name     — human label
+#   member_attribute — which field on the Subject this taxonomy
+#                      governs (role / department / kind / etc.)
+#   metadata         — optional jsonb, used for cross-cutting flags
+#                      (e.g. is_management for roles)
+#   sort_order       — display order in admin pickers
+#
+# Brewery roles + departments deliberately collide with no
+# used-device-shop roles — every JobKind step authority_role on the
+# brewery side resolves only against brewery-shaped employees.
+# Adding a tenant_id column is the cleaner long-term fix; v0 lives
+# with the global namespace under the assumption that one DB hosts
+# one tenant.
+
+# ---------------------------------------------------------------------------
+# Employee — Departments
+# ---------------------------------------------------------------------------
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "department"
+code = "audit"
+display_name = "Audit"
+sort_order = 1
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "department"
+code = "executive"
+display_name = "Executive"
+sort_order = 5
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "department"
+code = "production"
+display_name = "Production"
+sort_order = 20
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "department"
+code = "sales"
+display_name = "Sales"
+sort_order = 25
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "department"
+code = "marketing"
+display_name = "Marketing"
+sort_order = 27
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "department"
+code = "taproom"
+display_name = "Taproom"
+sort_order = 30
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "department"
+code = "distribution"
+display_name = "Distribution"
+sort_order = 40
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "department"
+code = "admin"
+display_name = "Admin"
+sort_order = 50
+
+# ---------------------------------------------------------------------------
+# Employee — Roles (10)
+# ---------------------------------------------------------------------------
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "audit-readonly"
+display_name = "Audit (read-only)"
+metadata = { department = "audit", is_management = false, is_executive = false, is_system_role = true }
+sort_order = 0
+
+# Platform-admin is the role the operator-baseline CEO/COO/CTO
+# (`emp-ceo`/`emp-coo`/`emp-cto`) carry, distinct from any tenant
+# org chart's CEO/COO/CTO. Without this Class the API-boundary
+# DeviceCategory-style validator rejects role="platform-admin"
+# updates with 409. See infra/operator-baseline/operator_hires.toml.
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "platform-admin"
+display_name = "Platform admin"
+metadata = { department = "executive", is_management = true, is_executive = true, is_system_role = true }
+sort_order = 0
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "ceo"
+display_name = "CEO"
+metadata = { department = "executive", is_management = true, is_executive = true }
+sort_order = 1
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "coo"
+display_name = "COO"
+metadata = { department = "executive", is_management = true, is_executive = true }
+sort_order = 2
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "cfo"
+display_name = "CFO"
+metadata = { department = "executive", is_management = true, is_executive = true }
+sort_order = 3
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "cto"
+display_name = "CTO"
+metadata = { department = "executive", is_management = true, is_executive = true }
+sort_order = 4
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "head-of-sales"
+display_name = "Head of Sales"
+metadata = { department = "sales", is_management = true, is_executive = true }
+sort_order = 5
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "head-of-marketing"
+display_name = "Head of Marketing"
+metadata = { department = "marketing", is_management = true, is_executive = true }
+sort_order = 6
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "head-of-distribution"
+display_name = "Head of Distribution"
+metadata = { department = "distribution", is_management = true, is_executive = true }
+sort_order = 7
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "head-of-people"
+display_name = "Head of People"
+metadata = { department = "admin", is_management = true, is_executive = true }
+sort_order = 8
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "head-brewer"
+display_name = "Head Brewer"
+metadata = { department = "production", is_management = true }
+sort_order = 20
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "senior-brewer"
+display_name = "Senior Brewer"
+metadata = { department = "production", is_management = false }
+sort_order = 20.5
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "brewer"
+display_name = "Brewer"
+metadata = { department = "production", is_management = false }
+sort_order = 21
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "cellar-tech"
+display_name = "Cellar Tech"
+metadata = { department = "production", is_management = false }
+sort_order = 22
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "lab-tech"
+display_name = "Lab / QC Tech"
+metadata = { department = "production", is_management = false }
+sort_order = 23
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "shift-lead"
+display_name = "Shift Lead"
+metadata = { department = "production", is_management = true }
+sort_order = 30
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "taproom-server"
+display_name = "Taproom Server"
+metadata = { department = "taproom", is_management = false }
+sort_order = 31
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "bartender"
+display_name = "Bartender"
+metadata = { department = "taproom", is_management = false }
+sort_order = 32
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "distribution-driver"
+display_name = "Distribution Driver"
+metadata = { department = "distribution", is_management = false }
+sort_order = 40
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "bookkeeper"
+display_name = "Bookkeeper"
+metadata = { department = "admin", is_management = false }
+sort_order = 50
+
+# ---------------------------------------------------------------------------
+# Employee — employment_type, status (reuses Boss-core defaults; here
+# only as a reminder of what's seeded by core).
+# ---------------------------------------------------------------------------
+
+# (Boss core already seeds full-time / part-time / contractor for
+# employment_type and active / on-leave / terminated for status.
+# The brewery doesn't need to redefine those.)
+
+# ---------------------------------------------------------------------------
+# Beer-style categories — used as Job.metadata.recipe_category. Once
+# the SubjectKind registry lands and Recipe becomes a real Subject,
+# these shift to subject_kind = "recipe", member_attribute = "style".
+# Today they live as brewery-flavored decoration on existing Subjects.
+# ---------------------------------------------------------------------------
+
+[[class]]
+subject_kind = "campaign"
+member_attribute = "recipe-category"
+code = "lager"
+display_name = "Lager"
+sort_order = 10
+
+[[class]]
+subject_kind = "campaign"
+member_attribute = "recipe-category"
+code = "ale"
+display_name = "Ale"
+sort_order = 20
+
+[[class]]
+subject_kind = "campaign"
+member_attribute = "recipe-category"
+code = "ipa"
+display_name = "IPA"
+sort_order = 30
+
+[[class]]
+subject_kind = "campaign"
+member_attribute = "recipe-category"
+code = "stout"
+display_name = "Stout / Porter"
+sort_order = 40
+
+[[class]]
+subject_kind = "campaign"
+member_attribute = "recipe-category"
+code = "sour"
+display_name = "Sour / Wild"
+sort_order = 50
+
+[[class]]
+subject_kind = "campaign"
+member_attribute = "recipe-category"
+code = "barrel-aged"
+display_name = "Barrel-Aged"
+sort_order = 60
+
+# ---------------------------------------------------------------------------
+# Vendor categories — brewery-specific supplier kinds.
+# ---------------------------------------------------------------------------
+
+[[class]]
+subject_kind = "vendor"
+member_attribute = "category"
+code = "grain-supplier"
+display_name = "Grain / Malthouse"
+sort_order = 10
+
+[[class]]
+subject_kind = "vendor"
+member_attribute = "category"
+code = "hops-supplier"
+display_name = "Hops Yard / Broker"
+sort_order = 20
+
+[[class]]
+subject_kind = "vendor"
+member_attribute = "category"
+code = "yeast-bank"
+display_name = "Yeast Bank / Cultures"
+sort_order = 30
+
+[[class]]
+subject_kind = "vendor"
+member_attribute = "category"
+code = "specialty-ingredients"
+display_name = "Specialty Ingredients"
+sort_order = 40
+
+[[class]]
+subject_kind = "vendor"
+member_attribute = "category"
+code = "packaging"
+display_name = "Packaging (Kegs / Cans / Labels)"
+sort_order = 50
+
+[[class]]
+subject_kind = "vendor"
+member_attribute = "category"
+code = "equipment"
+display_name = "Equipment (Fermenters / Pumps)"
+sort_order = 60
+
+[[class]]
+subject_kind = "vendor"
+member_attribute = "category"
+code = "utilities"
+display_name = "Utilities / Water Treatment"
+sort_order = 70
+
+[[class]]
+subject_kind = "vendor"
+member_attribute = "category"
+code = "lab"
+display_name = "Analytical Lab / Testing"
+sort_order = 75
+
+[[class]]
+subject_kind = "vendor"
+member_attribute = "category"
+code = "logistics"
+display_name = "Logistics / Freight"
+sort_order = 80
+
+[[class]]
+subject_kind = "vendor"
+member_attribute = "category"
+code = "marketing"
+display_name = "Marketing / Printers"
+sort_order = 85
+
+[[class]]
+subject_kind = "vendor"
+member_attribute = "category"
+code = "professional-services"
+display_name = "Professional Services (Legal / Accounting)"
+sort_order = 90
+
+[[class]]
+subject_kind = "vendor"
+member_attribute = "category"
+code = "sanitation"
+display_name = "Sanitation / Cleaning"
+sort_order = 95
+
+[[class]]
+subject_kind = "vendor"
+member_attribute = "category"
+code = "uniforms"
+display_name = "Uniforms / Workwear"
+sort_order = 100
+
+# ---------------------------------------------------------------------------
+# Employee — industrial-brewery org expansion
+#
+# These departments + roles fill out Algedonic Ales as a realistic
+# regional industrial brewer (not a 12-person craft shop). The
+# generator at examples/brewery/scripts/gen_employees.py keys off
+# these codes when producing the seed roster.
+# ---------------------------------------------------------------------------
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "department"
+code = "finance"
+display_name = "Finance & Accounting"
+sort_order = 30
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "department"
+code = "people"
+display_name = "People (HR)"
+sort_order = 32
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "department"
+code = "it"
+display_name = "IT & Systems"
+sort_order = 35
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "department"
+code = "warehouse"
+display_name = "Warehouse & Logistics"
+sort_order = 40
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "department"
+code = "qa"
+display_name = "Quality Assurance"
+sort_order = 22
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "department"
+code = "packaging"
+display_name = "Packaging"
+sort_order = 21
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "department"
+code = "maintenance"
+display_name = "Maintenance & Facilities"
+sort_order = 23
+
+# Finance roles
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "controller"
+display_name = "Controller"
+sort_order = 110
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "ap-clerk"
+display_name = "Accounts Payable Clerk"
+sort_order = 111
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "ar-clerk"
+display_name = "Accounts Receivable Clerk"
+sort_order = 112
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "payroll-mgr"
+display_name = "Payroll Manager"
+sort_order = 113
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "fp-analyst"
+display_name = "FP&A Analyst"
+sort_order = 114
+
+# People (HR) roles
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "hr-generalist"
+display_name = "HR Generalist"
+sort_order = 120
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "recruiter"
+display_name = "Recruiter"
+sort_order = 121
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "benefits-coord"
+display_name = "Benefits Coordinator"
+sort_order = 122
+
+# IT roles
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "it-director"
+display_name = "IT Director"
+sort_order = 130
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "sysadmin"
+display_name = "Systems Administrator"
+sort_order = 131
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "helpdesk"
+display_name = "Helpdesk Tech"
+sort_order = 132
+
+# Warehouse / logistics roles
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "warehouse-mgr"
+display_name = "Warehouse Manager"
+sort_order = 140
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "forklift-operator"
+display_name = "Forklift Operator"
+sort_order = 141
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "inventory-clerk"
+display_name = "Inventory Clerk"
+sort_order = 142
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "shipping-clerk"
+display_name = "Shipping & Receiving Clerk"
+sort_order = 143
+
+# QA roles
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "qa-supervisor"
+display_name = "QA Supervisor"
+sort_order = 150
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "qa-tech"
+display_name = "QA Technician"
+sort_order = 151
+
+# Packaging roles
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "packaging-mgr"
+display_name = "Packaging Manager"
+sort_order = 160
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "packaging-tech"
+display_name = "Packaging Line Tech"
+sort_order = 161
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "palletizer"
+display_name = "Palletizer"
+sort_order = 162
+
+# Maintenance roles
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "maintenance-mgr"
+display_name = "Maintenance Manager"
+sort_order = 170
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "mechanic"
+display_name = "Mechanic"
+sort_order = 171
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "electrician"
+display_name = "Electrician"
+sort_order = 172
+
+# Sales / marketing IC roles (departments existed; roles missing)
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "sales-rep"
+display_name = "Sales Representative"
+sort_order = 180
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "account-manager"
+display_name = "Account Manager"
+sort_order = 181
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "brand-manager"
+display_name = "Brand Manager"
+sort_order = 190
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "social-media-coord"
+display_name = "Social Media Coordinator"
+sort_order = 191
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "events-coord"
+display_name = "Events Coordinator"
+sort_order = 192
+
+# Middle-management tiers. These roles sit between each
+# department head (head-brewer, packaging-mgr, warehouse-mgr) and
+# the individual contributors, so spans of control look like a
+# real org instead of 100+ direct reports per head.
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "packaging-lead"
+display_name = "Packaging Lead"
+sort_order = 162.5
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "warehouse-lead"
+display_name = "Warehouse Lead"
+sort_order = 173.5
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "distribution-lead"
+display_name = "Distribution Lead"
+sort_order = 175.5
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "sales-lead"
+display_name = "Sales Lead"
+sort_order = 179.5
+
+# Taproom-specific shift lead, distinct from the production
+# `shift-lead` row above (which applies to brewery-floor leads),
+# so the two reporting lines stay distinguishable.
+[[class]]
+subject_kind = "employee"
+member_attribute = "role"
+code = "taproom-shift-lead"
+display_name = "Taproom Shift Lead"
+sort_order = 220.5
+
+# ---------------------------------------------------------------------------
+# Account-team roles. The role an employee plays on a specific
+# account team — distinct from their primary `role` in the org
+# chart. New roles ship as additional Class rows here, no schema
+# migration needed.
+# ---------------------------------------------------------------------------
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "account_team_role"
+code = "territory-rep"
+display_name = "Territory Rep"
+sort_order = 300
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "account_team_role"
+code = "customer-success"
+display_name = "Customer Success"
+sort_order = 301
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "account_team_role"
+code = "service-manager"
+display_name = "Service Manager"
+sort_order = 302
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "account_team_role"
+code = "finance-contact"
+display_name = "Finance Contact"
+sort_order = 303
+
+[[class]]
+subject_kind = "employee"
+member_attribute = "account_team_role"
+code = "executive-sponsor"
+display_name = "Executive Sponsor"
+sort_order = 304

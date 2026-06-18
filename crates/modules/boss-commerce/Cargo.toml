@@ -1,0 +1,54 @@
+[package]
+name = "boss-commerce"
+description = "Opportunities, invoices, and revenue tracking"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-commerce-api"
+path = "src/bin/boss_commerce_api.rs"
+required-features = ["postgres"]
+
+[[bin]]
+name = "boss-commerce-rebuild"
+path = "src/bin/boss_commerce_rebuild.rs"
+required-features = ["postgres"]
+
+[features]
+default = []
+postgres = ["dep:sqlx", "boss-events/postgres", "boss-ledger/postgres"]
+
+[dependencies]
+boss-policy = { path = "../../core/boss-policy" }
+boss-policy-client = { path = "../../core/boss-policy-client" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"], optional = true }
+uuid = { workspace = true }
+
+boss-core = { path = "../../core/boss-core" }
+boss-clock-client = { path = "../../core/boss-clock-client" }
+boss-ports = { path = "../../core/boss-ports" }
+boss-events = { path = "../../core/boss-events" }
+boss-ledger = { path = "../boss-ledger" }
+boss-nats = { path = "../../core/boss-nats" }
+boss-people-client = { path = "../boss-people-client" }
+boss-classes-client = { path = "../../core/boss-classes-client" }
+[dev-dependencies]
+tower = { workspace = true }
+boss-clock-client = { path = "../../core/boss-clock-client" }
+boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
+
+[lints]
+workspace = true

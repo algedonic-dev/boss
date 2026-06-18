@@ -1,0 +1,108 @@
+%%{init: {'theme':'base', 'themeVariables': { 'primaryColor':'#fafaf9', 'primaryBorderColor':'#57534e', 'primaryTextColor':'#1c1917', 'lineColor':'#a8a29e', 'fontFamily':'ui-sans-serif, system-ui, sans-serif', 'fontSize':'17px'}}}%%
+flowchart TB
+
+    BROWSER["Browser / IDE<br/><small>apps/web-svelte SPA &middot; boss CLI &middot; Claude Code</small>"]
+
+    GW["<b>boss-gateway</b><br/><small>reverse proxy &middot; CF Access auth &middot; static SPA serving &middot; perf histograms</small>"]
+
+    BROWSER ==> GW
+
+    subgraph PrimitiveSvcs ["Primitive services &mdash; own a primitive from boss-core"]
+        direction LR
+        JOBS_S["<b>boss-jobs-api</b><br/><small>Job + Step primitives<br/>JobKind + StepPlugin + StepType registries</small>"]
+        ASSETS_S["<b>boss-assets-api</b><br/><small>Equipment assets &mdash; platform-supplied<br/>per-unit Asset Subjects + event logs<br/>(serial-tracked instances of catalog models)</small>"]
+        KB_S["<b>boss-catalog-api</b><br/><small>Equipment KB &mdash; platform-supplied<br/>asset-model Classes + parts + consumables</small>"]
+        PPL_S["<b>boss-people-api</b><br/><small>Employee + Account Subjects<br/>platform-supplied; org chart,<br/>certifications, account team</small>"]
+        CAL_S["<b>boss-calendar-api</b><br/><small>Reservation primitive<br/>strength rules + conflicts</small>"]
+        CLS_S["<b>boss-classes-api</b><br/><small>Class registry<br/>(roles, departments, categories)</small>"]
+        LOC_S["<b>boss-locations-api</b><br/><small>Location primitive<br/>hierarchy + timezone + geo</small>"]
+        SK_S["<b>boss-subject-kinds-api</b><br/><small>SubjectKind registry<br/>(tenant subject-kind validation)</small>"]
+    end
+
+    subgraph OperationalSvcs ["Operational services &mdash; workflows over the primitives"]
+        direction LR
+        COMM_S["boss-commerce-api<br/><small>opportunities, invoices,<br/>agreements</small>"]
+        INV_S["boss-inventory-api<br/><small>stock, POs, vendor CRM<br/>warehouse-status projection</small>"]
+        SHIP_S["boss-shipping-api<br/><small>inbound + outbound<br/>shipments + tracking scans</small>"]
+        PROD_S["boss-products-api<br/><small>finished-product catalog +<br/>per-location on-hand</small>"]
+    end
+
+    subgraph RailSvcs ["Rail services &mdash; cross-cutting enforcement"]
+        direction LR
+        POL_S["boss-policy-api<br/><small>row-level auth<br/>every write gated</small>"]
+        LDG_S["boss-ledger-api<br/><small>financial_facts &rarr; GL projection<br/>versioned posting rules</small>"]
+        MSG_S["boss-messages-api<br/><small>unified inbox<br/>DMs + system signals</small>"]
+        CONT_S["boss-content-api<br/><small>generic document/content store<br/>(bulletins, manual)</small>"]
+    end
+
+    subgraph PlatformSvcs ["Platform services &mdash; supporting tooling"]
+        direction LR
+        ML_S["boss-ml-api<br/><small>models + predictions<br/>declarative-rule + plugin inference</small>"]
+        DOCS_S["boss-docs-api<br/><small>design-doc reader,<br/>decision tracker</small>"]
+    end
+
+    subgraph TenantSvcs ["Tenant binaries &mdash; live only in example tenants"]
+        direction LR
+        BREW["boss-brewery-sim<br/><small>brewery sim tick daemon<br/>(+ prepare / run subcommands)</small>"]
+        UDS["boss-used-device-shop-engine<br/><small>used-device-shop sim tick</small>"]
+    end
+
+    subgraph Agents ["Runtime automation &mdash; NATS-subscribed daemons + timers"]
+        direction LR
+        CYB["boss-cybernetics<br/><small>event-driven agent runtime</small>"]
+        OBS["boss-observability<br/><small>NATS &rarr; SSE fan-out<br/>cybernetics aggregator</small>"]
+        SER["boss-dispatcher<br/><small>step.done.&lt;kind&gt; &rarr;<br/>data-driven rule registry</small>"]
+        INV_CHECK["boss-conservation-invariants<br/><small>periodic sweeps<br/>(timer)</small>"]
+    end
+
+    subgraph Clients ["Cross-service client crates &mdash; the narrow HTTP contract"]
+        direction LR
+        C_NOTE["<small>Each service calls other services only through typed client traits:<br/><code>boss-assets-client</code> &middot; <code>boss-people-client</code> &middot; <code>boss-jobs-client</code> &middot; <code>boss-catalog-client</code><br/><code>boss-inventory-client</code> &middot; <code>boss-shipping-client</code> &middot; <code>boss-policy-client</code> &middot; <code>boss-products-client</code><br/><code>boss-classes-client</code> &middot; <code>boss-locations-client</code> &middot; <code>boss-subject-kinds-client</code> &middot; <code>boss-calendar-client</code><br/><br/>In tests, these are swapped for in-memory fakes &mdash; no cross-service HTTP required.</small>"]
+    end
+
+    subgraph Infra ["Shared infrastructure"]
+        direction LR
+        PG[("Postgres<br/><small>boss &middot; boss_scratch<br/>audit_log (hash-chained)</small>")]
+        NATS[("NATS<br/><small>event bus</small>")]
+    end
+
+    %% Gateway fans out to HTTP services
+    GW ==> PrimitiveSvcs
+    GW ==> OperationalSvcs
+    GW ==> RailSvcs
+    GW ==> PlatformSvcs
+
+    %% Policy gate
+    PrimitiveSvcs -. "every write" .-> POL_S
+    OperationalSvcs -. "every write" .-> POL_S
+
+    %% Shared infra
+    PrimitiveSvcs ==> Infra
+    OperationalSvcs ==> Infra
+    RailSvcs ==> Infra
+    PlatformSvcs ==> Infra
+    TenantSvcs ==> Infra
+    Agents ==> Infra
+
+    classDef edge fill:#fef3c7,stroke:#a16207,stroke-width:2px
+    classDef primitive fill:#fef3c7,stroke:#a16207,stroke-width:2px
+    classDef operational fill:#dbeafe,stroke:#1d4ed8,stroke-width:1.5px
+    classDef rail fill:#d1fae5,stroke:#047857,stroke-width:1.5px
+    classDef platform fill:#fef9c3,stroke:#a16207,stroke-width:1.5px
+    classDef tenant fill:#fce7f3,stroke:#be185d,stroke-width:1.5px
+    classDef agent fill:#ede9fe,stroke:#6d28d9,stroke-width:1.5px
+    classDef extSystem fill:#fff,stroke:#be185d,stroke-width:1.5px,stroke-dasharray:4 3
+    classDef infra fill:#f3f4f6,stroke:#1f2937,stroke-width:2px
+    classDef user fill:#e0e7ff,stroke:#312e81,stroke-width:2px
+    classDef client fill:#fff,stroke:#374151,stroke-width:1.5px
+
+    class BROWSER user
+    class GW edge
+    class JOBS_S,ASSETS_S,KB_S,PPL_S,CAL_S,CLS_S,LOC_S,SK_S primitive
+    class COMM_S,INV_S,SHIP_S,PROD_S operational
+    class POL_S,LDG_S,MSG_S,CONT_S rail
+    class ML_S,DOCS_S platform
+    class BREW,UDS tenant
+    class CYB,OBS,SER,INV_CHECK agent
+    class PG,NATS infra
+    class C_NOTE client

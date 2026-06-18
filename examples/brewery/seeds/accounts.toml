@@ -1,0 +1,117 @@
+# Brewery account fixtures — names + cities + directors loaded by
+# the brewery prepare step (`boss-brewery-sim prepare`), POSTed
+# through the public API to populate the customer roster. Each
+# account row is drawn by zipping these arrays positionally with
+# small deterministic indexing (round-robin / hash mod), so order
+# matters: the same brewery deploys deterministically against the
+# same fixed sequence here.
+
+# 50 wholesale-account names. Most are bars / pubs / hotels /
+# distributors that resell craft beer. Order chosen to spread
+# regional flavor across the seed (no clustering by archetype).
+names = [
+    "Cascade Hop Distributors",
+    "Pacific Pour Co.",
+    "Northgate Beverages",
+    "Brick House Tap",
+    "Sundial Bar & Kitchen",
+    "Headwind Tavern",
+    "Ironhold Pub",
+    "Rivermark Wholesale",
+    "Two Rivers Saloon",
+    "Lighthouse Brewing Trade",
+    "Foxglen Brewhouse Sales",
+    "Granite Falls Distributing",
+    "Mainsail Bar Group",
+    "Salt & Sycamore",
+    "Birchwood Drinks",
+    "The Crooked Anvil",
+    "Glacier Pass Beverages",
+    "Wildflower Bottle Shop",
+    "Common Grain Bar",
+    "Stoneford Public House",
+    "High Tide Wholesale",
+    "Westwood Tavern Group",
+    "Marigold Tap & Pour",
+    "Ember Hollow Bar",
+    "Quayside Distributing",
+    "Foundry Cider & Beer",
+    "Larkspur Hospitality",
+    "Saltgrass Provisions",
+    "Quartz Mountain Bar",
+    "Northbrook Beverage Co.",
+    "Ridgepoint Tap House",
+    "Crescent Bay Drinks",
+    "Hilltop Hop Traders",
+    "Whitepine Wholesale",
+    "Garnet Quarry Pub",
+    "Open Field Bar Co.",
+    "Tidewater Beverages",
+    "Sage Run Distributing",
+    "Twin Peaks Tap",
+    "The Brass Lantern",
+    "Forge & Furrow Pub",
+    "Stillwater Provisions",
+    "Coppertop Pour House",
+    "Drift Bar Group",
+    "Goldrun Distributors",
+    "Maple Hollow Wholesale",
+    "Lantern Bay Bar",
+    "Stratford Tap Trade",
+    "Crosswind Beverages",
+    "Yarrow Hill Drinks",
+]
+
+# 15 primary-contact / "director" names — used for the account's
+# Primary Contact field. Order doesn't matter; seeder hashes the
+# account name into this slice. Top-level keys must precede the
+# `[[city]]` array-of-tables below — TOML scope rules apply.
+directors = [
+    "Robin Vasquez", "Casey Patel", "Jamie Holloway", "Morgan Quinn",
+    "Sam Trent", "Avery Cole", "Drew Singh", "Reese Atkins",
+    "Charlie Park", "Taylor Reyes", "Dana Vega", "Jordan Bell",
+    "Quinn Adair", "Riley Stone", "Sage Tan",
+]
+
+# (city, state) pairs the accounts cluster around. The seeder
+# picks from this list round-robin so the geographic spread looks
+# realistic. Keep states represented for sales-tax demo coverage.
+[[city]]
+name = "Portland"
+state = "OR"
+
+[[city]]
+name = "Seattle"
+state = "WA"
+
+[[city]]
+name = "Denver"
+state = "CO"
+
+[[city]]
+name = "Austin"
+state = "TX"
+
+[[city]]
+name = "Asheville"
+state = "NC"
+
+[[city]]
+name = "Burlington"
+state = "VT"
+
+[[city]]
+name = "Madison"
+state = "WI"
+
+[[city]]
+name = "San Diego"
+state = "CA"
+
+[[city]]
+name = "Boise"
+state = "ID"
+
+[[city]]
+name = "Bozeman"
+state = "MT"

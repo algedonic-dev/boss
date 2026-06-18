@@ -1,0 +1,37 @@
+# Subject Kind registry rows for Boss Brewery.
+#
+# Tenant-extension layer over the system-owned kinds Boss core seeds
+# (see infra/postgres/schema/01-registries.sql, the `subject_kinds` INSERT block).
+# Each [[subject_kind]] entry adds a tenant-defined Subject
+# discriminator the brewery uses but Boss core doesn't know about.
+#
+# These rows register Recipe and Equipment as first-class
+# Subject kinds the brewery uses, so they're carried in the
+# registry rather than as raw text on Jobs.
+
+[[subject_kind]]
+kind = "recipe"
+label = "Recipe"
+description = """
+A brewery recipe — Czech Pilsner, West Coast IPA, Imperial Stout,
+the barrel-aged sour spec. Carries identity + version history (every
+recipe has revisions across iterations), grain bills, hop schedules,
+yeast strain, mash + fermentation profiles, and required vessels.
+Subject of tap-launch JobKinds and the target of `morning-brew`
+step metadata's `recipe_id` field.
+"""
+owning_team = "brewery"
+sort_order = 100
+
+[[subject_kind]]
+kind = "equipment"
+label = "Equipment"
+description = """
+Production hardware — mash tun, lauter tun, fermenters, brite
+tanks, glycol chiller, kegging line, packaging machine. Carries
+identity + service history (preventive maintenance Jobs reference it). Subject of
+`equipment-preventive-maintenance` JobKinds, referenced as
+Subject { subject_kind = "equipment", id = "fermenter-04" }.
+"""
+owning_team = "brewery"
+sort_order = 110

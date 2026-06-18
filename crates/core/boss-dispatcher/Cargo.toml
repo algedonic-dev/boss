@@ -1,0 +1,37 @@
+[package]
+name = "boss-dispatcher"
+description = "Core dispatch service — auto-assigns ready Steps to role-matched Employees. Subscribes to jobs.step.* NATS events; for any step.created or step.updated transitioning to ready with no assignee, picks an active employee whose role matches the step's authority_role (or the StepType's required_roles) and PUTs the assignment. Drives the same flow whether the simulator OR a human operator opens the Job — the assignment is a SYSTEM concern, not a sim concern."
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-dispatcher"
+path = "src/bin/boss_dispatcher.rs"
+
+[dependencies]
+boss-core = { path = "../boss-core" }
+boss-ports = { path = "../boss-ports" }
+boss-nats = { path = "../boss-nats" }
+boss-jobs = { path = "../boss-jobs" }
+boss-expr = { path = "../boss-expr" }
+boss-clock-client = { path = "../boss-clock-client" }
+boss-events = { path = "../boss-events" }
+anyhow = { workspace = true }
+async-nats = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono"] }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

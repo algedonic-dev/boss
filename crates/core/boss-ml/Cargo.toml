@@ -1,0 +1,41 @@
+[package]
+name = "boss-ml"
+description = "ML platform — models + predictions infrastructure (Phase 1 scaffold)"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-ml-generate"
+path = "src/bin/boss_ml_generate.rs"
+required-features = ["postgres"]
+
+[features]
+default = []
+postgres = ["dep:sqlx"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"], optional = true }
+boss-core = { path = "../boss-core" }
+boss-clock-client = { path = "../boss-clock-client" }
+
+[dev-dependencies]
+tower = { workspace = true }
+http-body-util = "0.1"
+boss-testing = { path = "../boss-testing", features = ["postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,330 @@
+# Dispatcher rule registry.
+#
+# Per docs/architecture-decisions.md §Dispatcher — the event
+# router: rules are the
+# data-driven reactive layer. Each [[rule]] declares what to listen
+# for (`on_event`), an optional predicate against the payload and
+# system state (`when`), and an ordered list of side-effect handler
+# invocations to fire when the rule matches (`do`).
+#
+# Loaded by boss-dispatcher at startup via the BOSS_DISPATCHER_RULES
+# env var. Hot-reload is not yet implemented; restart the dispatcher
+# to pick up edits.
+
+# ---------------------------------------------------------------------------
+# Reorder-threshold spawn — the canonical example.
+#
+# When a part crosses its reorder point, spawn one restock Job — unless
+# one is already in flight. The idempotency check is the open-restock
+# predicate (`open_restock_exists`), which goes true the instant the Job
+# is spawned, so a duplicate restock never fires while a PO is pending.
+# ---------------------------------------------------------------------------
+
+[[rule]]
+name = "spawn-restock-on-low-inventory"
+on_event = "inventory.item.consumed"
+when = "on_hand <= reorder_point AND NOT open_restock_exists(part_sku)"
+[[rule.do]]
+handler = "jobs.spawn"
+# The restock Job's subject is the category-appropriate supplier for
+# the part that crossed its threshold: `vendor_for(part_sku)` resolves
+# it via inventory-api `primary_vendor_for_part`, which matches the
+# part's data-seeded `vendor_category` (parts.toml) against
+# `vendors.category`. Args are expr-evaluated against the event +
+# helpers (same as `when`), so `part_sku` binds from the
+# `inventory.item.consumed` payload.
+# The triggering part rides in Job metadata (`metadata.part_sku`) so the
+# per-SKU dedup (`open_restock_exists`) can match it — each restock buys
+# ONE ingredient, not the whole catalog.
+# `metadata.trigger_name` stamps which trigger fired: this rule reacts
+# to a threshold breach, so the spawned Job records the
+# `inventory-reorder-threshold` trigger. The materializer reads it to
+# complete that trigger step and Skip the alternative
+# (`demand-forecast-reorder`) — only the trigger that actually fired is
+# recorded Completed, never both.
+args = { kind = "\"ingredient-restock\"", subject_kind = "\"vendor\"", subject = "vendor_for(part_sku)", "metadata.part_sku" = "part_sku", "metadata.trigger_name" = "\"inventory-reorder-threshold\"" }
+
+# ---------------------------------------------------------------------------
+# Step-completion side effects.
+#
+# Each rule routes a `step.done.<kind>` event to the handler that runs the
+# step's side effect. Handler implementations live at
+# boss-dispatcher::rules::handlers::*.
+# ---------------------------------------------------------------------------
+
+[[rule]]
+name = "po-place-on-procurement-step-done"
+on_event = "step.done.procurement"
+[[rule.do]]
+handler = "inventory.po.place"
+
+[[rule]]
+name = "receive-on-receiving-step-done"
+on_event = "step.done.receiving"
+[[rule.do]]
+handler = "inventory.receive"
+
+[[rule]]
+name = "bill-approve-on-bill-approval-step-done"
+on_event = "step.done.bill-approval"
+[[rule.do]]
+handler = "inventory.bill.approve"
+
+[[rule]]
+name = "bill-payment-batch-on-bill-payment-batch-step-done"
+on_event = "step.done.bill-payment-batch"
+[[rule.do]]
+handler = "inventory.bill.payment_batch"
+
+# General operating bills (rent, utilities, …) owned by the ledger —
+# routed to a GL expense account by `bill_category` (bill_accounts.toml),
+# decoupled from the inventory parts vendor-invoice above.
+[[rule]]
+name = "ledger-bill-approve-on-expense-bill-step-done"
+on_event = "step.done.expense-bill"
+[[rule.do]]
+handler = "ledger.bill.approve"
+
+[[rule]]
+name = "ledger-bill-payment-batch-on-expense-bill-payment-step-done"
+on_event = "step.done.expense-bill-payment"
+[[rule.do]]
+handler = "ledger.bill.payment_batch"
+
+[[rule]]
+name = "invoice-issue-on-billing-step-done"
+on_event = "step.done.billing"
+[[rule.do]]
+handler = "commerce.invoice.issue"
+# Sales tax: retail + taproom + event-package lines are end-user sales and
+# carry CA state sales tax (725 bps / US-CA); wholesale + distribution are
+# resale-exempt (omitted from taxable_categories, so they accrue no 2300).
+# The handler taxes only the taxable-category line subtotal; commerce stamps
+# a tax_lines[account=2300] that the ledger accrues, and the quarterly
+# sales-tax-filing JobKind remits it back to Cash.
+args = { due_days = "30", default_revenue_category = "\"uncategorized\"", tax_rate_bps = "725", tax_jurisdiction = "\"US-CA\"", taxable_categories = "\"retail,taproom,event-package\"" }
+
+[[rule]]
+name = "tax-remit-on-tax-remittance-step-done"
+on_event = "step.done.tax-remittance"
+[[rule.do]]
+handler = "ledger.tax.remit"
+args = { remit = "true", provider = "\"in-house\"" }
+
+# Federal beer excise tax accrual. Each brew batch's package step
+# accrues `excise_bbl × $3.50/bbl` (TTB small-brewer rate) as
+# DR 6550 Excise Tax Expense / CR 2320 Excise Tax Payable, exactly
+# the way sales tax accrues per invoice line. The quarterly
+# excise-tax-filing JobKind drains 2320 → 1000 Cash. `excise_bbl`
+# rides in the package step's metadata (seeded per beer); a batch with
+# no taxable barrels is a no-op.
+[[rule]]
+name = "excise-accrue-on-production-produce-step-done"
+on_event = "step.done.production-produce"
+[[rule.do]]
+handler = "ledger.tax.accrue"
+args = { rate_cents_per_bbl = "350", liability_account = "\"2320\"", expense_account = "\"6550\"", jurisdiction = "\"US-FEDERAL\"" }
+
+[[rule]]
+name = "payroll-submit-on-payroll-release-step-done"
+on_event = "step.done.payroll-release"
+[[rule.do]]
+handler = "ledger.payroll.run.submit"
+args = { periods_per_year = "26", withholding_bps = "2200", employer_cost_bps = "1500", provider = "\"in-house\"" }
+
+[[rule]]
+name = "parts-consume-on-production-consume-step-done"
+on_event = "step.done.production-consume"
+[[rule.do]]
+handler = "inventory.parts.consume"
+args = { reason = "\"morning-brew\"" }
+
+[[rule]]
+name = "products-produce-on-production-produce-step-done"
+on_event = "step.done.production-produce"
+[[rule.do]]
+handler = "products.produce"
+[[rule.do]]
+handler = "inventory.parts.consume"
+args = { reason = "\"morning-brew-packaging\"" }
+
+[[rule]]
+name = "parts-consume-on-repair-step-done"
+on_event = "step.done.repair"
+[[rule.do]]
+handler = "inventory.parts.consume"
+args = { reason = "\"equipment-preventive-maintenance-repair\"" }
+
+[[rule]]
+name = "people-hire-on-hr-hire-step-done"
+on_event = "step.done.hr-hire"
+[[rule.do]]
+handler = "people.hire"
+
+[[rule]]
+name = "people-terminate-on-hr-terminate-step-done"
+on_event = "step.done.hr-terminate"
+[[rule.do]]
+handler = "people.terminate"
+
+[[rule]]
+name = "shipment-side-effects-on-shipment-step-done"
+on_event = "step.done.shipment"
+[[rule.do]]
+handler = "shipping.create"
+[[rule.do]]
+handler = "inventory.parts.consume"
+args = { reason = "\"sale\"" }
+[[rule.do]]
+handler = "products.consume"
+
+# ---------------------------------------------------------------------------
+# Delegate-subjob (JobKind v2, D7) — the spawn → link → resolve loop.
+#
+# A `delegate-subjob` step spawns a child Job of `metadata.subjob_kind`
+# when it becomes Ready, then pauses; when that child Job closes, the
+# child's terminal outcome is written back into the parent step's
+# `subjob_outcome` and the parent step flips to Completed.
+#
+# 1) SPAWN — on the D6 ready marker, jobs.spawn opens the child Job and
+#    sets the parent step's `embedded_job` (the forward link). The
+#    `step.ready.<kind>` payload mirrors `step.done.<kind>`: it carries
+#    `job_id` / `step_id` / `subject_kind` / `subject_id` / `metadata`,
+#    so the args read the child kind out of step metadata and pass the
+#    parent step id through for linkage.
+# 2) RESOLVE — on the child's close, jobs.subjob_resolve writes the
+#    outcome back and completes the parent step. The `when` gate keeps
+#    the rule from firing for ordinary (non-delegated) Job closes; the
+#    JOB_CLOSED marker carries `parent_step_id` (null when absent).
+# ---------------------------------------------------------------------------
+
+[[rule]]
+name = "spawn-subjob-on-delegate-subjob-step-ready"
+on_event = "step.ready.delegate-subjob"
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "metadata.subjob_kind", subject_kind = "subject_kind", subject = "subject_id", parent_step_id = "step_id" }
+
+# ---------------------------------------------------------------------------
+# Marker auto-completion (the SYSTEM half of work routing)
+# ---------------------------------------------------------------------------
+# Zero-duration, no-role structural markers — `trigger` (a periodic/event
+# signal), `outcome` (a terminal fork result), `milestone` (a checkpoint) —
+# are state the machine reaches on its own, not work an executor performs.
+# When one goes Ready the system completes it immediately so the downstream
+# `ready_when` predicates re-evaluate without waiting on a human/agent. The
+# `jobs.complete_step` handler classifies markers from the StepType registry
+# (no `required_roles` AND zero `typical_duration_hours`), so it no-ops for
+# role-bearing steps and for `task` (no role, but real HR/IT/admin work).
+# It rides the SAME `step.ready.*` subscription as the notifier below
+# rather than declaring per-kind topics (`step.ready.trigger`, ...) that
+# would overlap `step.ready.*` and make NATS deliver — and complete — every
+# marker event twice.
+[[rule]]
+name = "complete-marker-on-step-ready"
+on_event = "step.ready.*"
+[[rule.do]]
+handler = "jobs.complete_step"
+
+# Agent gate executor. Rides the SAME `step.ready.*` subscription as the
+# marker-completer + notifier (one NATS consumer, no double-delivery). The
+# handler self-filters to agent gates (executor = Agent + an `outcome`
+# field): it reads real finished-goods stock, decides the outcome
+# (brew/oversupply, fulfill/backorder), and completes the gate with it at
+# computer speed — so a release valve costs no labor and resolves the moment
+# it's ready instead of queuing behind the human workforce at warp. Agents
+# are CPUs in the same machine: the sim drives only labor, the gate decides
+# itself. See docs/design/brewery-model-completeness.md.
+[[rule]]
+name = "resolve-agent-gate-on-step-ready"
+on_event = "step.ready.*"
+[[rule.do]]
+handler = "gate.resolve"
+
+# ---------------------------------------------------------------------------
+# Push notifier (human-powered-state-machine awareness)
+# ---------------------------------------------------------------------------
+# When ANY step becomes Ready, message the responsible role's on-call
+# member so waiting work has a human-visible signal in their inbox. This
+# is the PUSH half; the PULL half (the `/api/jobs/assignments` My Day
+# query the sim workforce + SPA poll) is what actually drives the work.
+# `step.ready.*` is a NATS single-token wildcard — each step kind
+# (`bill-approval`, `production-consume`, ...) is one token. The handler
+# no-ops for steps with no `authority_role` (generic / outcome kinds an
+# operator picks off a queue), and sends one message per ready step
+# (no role-wide fan-out).
+[[rule]]
+name = "notify-assignee-on-step-ready"
+on_event = "step.ready.*"
+[[rule.do]]
+handler = "messages.notify"
+
+[[rule]]
+name = "resolve-subjob-on-child-job-closed"
+on_event = "jobs.job.closed"
+when = "parent_step_id != null"
+[[rule.do]]
+handler = "jobs.subjob_resolve"
+
+# ---------------------------------------------------------------------------
+# External-party callbacks. Forward the events the simulator's
+# CounterpartyEngine reacts to (banks, suppliers, the keg courier, the tax
+# authority, the operational broadcasts) to its callback receiver via
+# `webhook.notify`. The simulator never subscribes to the event stream — the
+# system pushes to a configured webhook, preserving the sim/system boundary.
+# No-op in any deployment without BOSS_EVENT_WEBHOOK_URL set.
+# ---------------------------------------------------------------------------
+
+[[rule]]
+name = "forward-billing-done-to-webhook"
+on_event = "step.done.billing"
+[[rule.do]]
+handler = "webhook.notify"
+
+[[rule]]
+name = "forward-procurement-done-to-webhook"
+on_event = "step.done.procurement"
+[[rule.do]]
+handler = "webhook.notify"
+
+[[rule]]
+name = "forward-shipment-done-to-webhook"
+on_event = "step.done.shipment"
+[[rule.do]]
+handler = "webhook.notify"
+
+[[rule]]
+name = "forward-handoff-done-to-webhook"
+on_event = "step.done.handoff"
+[[rule.do]]
+handler = "webhook.notify"
+
+[[rule]]
+name = "forward-receiving-done-to-webhook"
+on_event = "step.done.receiving"
+[[rule.do]]
+handler = "webhook.notify"
+
+[[rule]]
+name = "forward-invoice-paid-to-webhook"
+on_event = "commerce.invoice.paid"
+[[rule.do]]
+handler = "webhook.notify"
+
+[[rule]]
+name = "forward-invoice-past-due-to-webhook"
+on_event = "commerce.invoice.past_due"
+[[rule.do]]
+handler = "webhook.notify"
+
+[[rule]]
+name = "forward-vendor-invoice-to-webhook"
+on_event = "inventory.vendor_invoice_received"
+[[rule.do]]
+handler = "webhook.notify"
+
+[[rule]]
+name = "forward-tax-filing-to-webhook"
+on_event = "ledger.tax_filing_filed"
+[[rule.do]]
+handler = "webhook.notify"

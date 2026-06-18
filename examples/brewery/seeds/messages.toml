@@ -1,0 +1,47 @@
+# Seeded inbox messages between operator personas. Loaded by
+# the brewery prepare step (`boss-brewery-sim prepare`) via the
+# public API to populate the initial inbox view with realistic
+# exec-team chatter, so the /inbox page doesn't appear empty on
+# a fresh deployment.
+
+[[thread]]
+from = "emp-ceo"
+to = "emp-cto"
+subject = "Q3 platform priorities"
+body = "Pulling the next-quarter platform plan together. Want to align on the audit-log work + the brewery-engine accounts gap before Friday."
+
+[[thread]]
+from = "emp-cto"
+to = "emp-ceo"
+subject = "Re: Q3 platform priorities"
+body = "Sounds good. Audit-log layer 2 is shipped; layer 3 is auditor-handoff style. Brewery accounts/vendors are seeded now — see the latest dump."
+
+[[thread]]
+from = "emp-coo"
+to = "emp-ceo"
+subject = "Wholesale pipeline weekly"
+body = "Two new wholesale prospects in the pipeline this week: Glacier Pass + Lighthouse. Both Tier 2 candidates."
+
+[[thread]]
+from = "emp-ceo"
+to = "emp-coo"
+subject = "Re: Wholesale pipeline weekly"
+body = "Nice. Let's set up a tasting visit for Glacier Pass next week — I'll loop in the head brewer."
+
+[[thread]]
+from = "emp-cto"
+to = "emp-coo"
+subject = "Brewery dashboards green"
+body = "All projection rebuilders running clean post-seed. Accounts page now lists 108 rows; invoices link cleanly."
+
+[[thread]]
+from = "emp-coo"
+to = "emp-cto"
+subject = "Re: Brewery dashboards green"
+body = "Great. Any thoughts on the playwright coverage gap I saw flagged in the TODO?"
+
+[[thread]]
+from = "emp-ceo"
+to = "emp-cto"
+subject = "Authelia rollout target?"
+body = "When are you thinking we cut over to Authelia? Want to socialise it with operators before the switch lands."

@@ -1,0 +1,588 @@
+//! Postgres adapter for `ProductsRepository`.
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use sqlx::PgPool;
+
+use crate::port::{GlMove, InventoryDeltaResult, ProductsError, ProductsRepository};
+use crate::types::{Product, ProductInventory};
+
+pub struct PgProducts {
+    pool: PgPool,
+}
+
+impl PgProducts {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl ProductsRepository for PgProducts {
+    async fn list_products(&self, active_only: bool) -> Result<Vec<Product>, ProductsError> {
+        let rows: Vec<ProductRow> = if active_only {
+            sqlx::query_as(
+                "SELECT sku, name, product_kind, package_unit, description, metadata, active \
+                 FROM products WHERE active = TRUE ORDER BY sku",
+            )
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query_as(
+                "SELECT sku, name, product_kind, package_unit, description, metadata, active \
+                 FROM products ORDER BY sku",
+            )
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn get_product(&self, sku: &str) -> Result<Option<Product>, ProductsError> {
+        let row: Option<ProductRow> = sqlx::query_as(
+            "SELECT sku, name, product_kind, package_unit, description, metadata, active \
+             FROM products WHERE sku = $1",
+        )
+        .bind(sku)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        Ok(row.map(Into::into))
+    }
+
+    async fn upsert_product(&self, product: &Product) -> Result<(), ProductsError> {
+        sqlx::query(
+            "INSERT INTO products (sku, name, product_kind, package_unit, description, metadata, active) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (sku) DO UPDATE SET \
+                name = EXCLUDED.name, \
+                product_kind = EXCLUDED.product_kind, \
+                package_unit = EXCLUDED.package_unit, \
+                description = EXCLUDED.description, \
+                metadata = EXCLUDED.metadata, \
+                active = EXCLUDED.active, \
+                updated_at = NOW()",
+        )
+        .bind(&product.sku)
+        .bind(&product.name)
+        .bind(&product.product_kind)
+        .bind(&product.package_unit)
+        .bind(&product.description)
+        .bind(&product.metadata)
+        .bind(product.active)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn inventory_for(&self, sku: &str) -> Result<Vec<ProductInventory>, ProductsError> {
+        let rows: Vec<InventoryRow> = sqlx::query_as(
+            "SELECT product_sku, location_id, on_hand, reserved, \
+                    production_cost_cents, updated_at \
+             FROM finished_product_inventory WHERE product_sku = $1 \
+             ORDER BY location_id",
+        )
+        .bind(sku)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn upsert_inventory(&self, row: &ProductInventory) -> Result<(), ProductsError> {
+        sqlx::query(
+            "INSERT INTO finished_product_inventory \
+                (product_sku, location_id, on_hand, reserved, production_cost_cents) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (product_sku, location_id) DO UPDATE SET \
+                on_hand = EXCLUDED.on_hand, \
+                reserved = EXCLUDED.reserved, \
+                production_cost_cents = EXCLUDED.production_cost_cents, \
+                updated_at = NOW()",
+        )
+        .bind(&row.product_sku)
+        .bind(&row.location_id)
+        .bind(row.on_hand)
+        .bind(row.reserved)
+        .bind(row.production_cost_cents)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn record_inventory_je(
+        &self,
+        total_cost_cents: i64,
+        debit_account: &str,
+        credit_account: &str,
+        memo: &str,
+        source_table: &str,
+        source_id: &str,
+        happened_on: chrono::NaiveDate,
+    ) -> Result<uuid::Uuid, ProductsError> {
+        if total_cost_cents <= 0 {
+            return Err(ProductsError::Invalid(
+                "total_cost_cents must be positive".to_string(),
+            ));
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ProductsError::Storage(e.to_string()))?;
+
+        let payload = serde_json::json!({
+            "total_cost_cents": total_cost_cents,
+            "debit_account": debit_account,
+            "credit_account": credit_account,
+            "memo": memo,
+            "happened_on": happened_on.to_string(),
+            "source_id": source_id,
+        });
+
+        insert_fact(
+            &mut tx,
+            "finance.inventory.transferred",
+            happened_on,
+            &payload,
+            source_table,
+            source_id,
+        )
+        .await?;
+
+        // Read back the canonical fact_id so the journal entry posts
+        // against the right row even if the INSERT was a no-op on the
+        // ON CONFLICT path (rebuild replay / brewery_data_seed's
+        // external opening-FG-JE call colliding with this atomic
+        // post).
+        let (fact_id,): (uuid::Uuid,) = sqlx::query_as(
+            "SELECT id FROM financial_facts \
+             WHERE kind = $1 AND source_table = $2 AND source_id = $3",
+        )
+        .bind("finance.inventory.transferred")
+        .bind(source_table)
+        .bind(source_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| ProductsError::Storage(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        Ok(fact_id)
+    }
+
+    async fn produce(
+        &self,
+        sku: &str,
+        location_id: &str,
+        qty: i32,
+        unit_cost_cents: Option<i64>,
+        now: chrono::DateTime<chrono::Utc>,
+        source_id: String,
+    ) -> Result<InventoryDeltaResult, ProductsError> {
+        if qty <= 0 {
+            return Err(ProductsError::Invalid(format!(
+                "produce qty must be positive, got {qty}"
+            )));
+        }
+        // One tx wraps: (1) on_hand increment + weighted-avg
+        // production_cost_cents update, (2) the matching
+        // `finance.inventory.transferred` financial_fact insert
+        // sized at `qty × unit_cost_cents` (DR 1320 FG / CR 1310
+        // WIP) when the caller supplies a cost. Model B's WIP→FG
+        // half-step lands atomically with the physical move.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ProductsError::Storage(e.to_string()))?;
+
+        // Idempotency guard — `on_hand += qty` is relative, so a
+        // redelivered produce (at-least-once delivery) would double-count.
+        // The WIP→FG fact is the proof-of-application; if it already
+        // exists, return the current row unchanged. Sound for cost-bearing
+        // produces (the only ones that write a fact); the brewery always
+        // derives a cost, so this covers it.
+        if fact_exists(
+            &mut tx,
+            "finance.inventory.transferred",
+            "products_produce",
+            &source_id,
+        )
+        .await?
+            && let Some(row) = current_inventory_row(&mut tx, sku, location_id).await?
+        {
+            return Ok(InventoryDeltaResult {
+                inventory: row.into(),
+                gl_move: None,
+            });
+        }
+
+        let row: InventoryRow = match unit_cost_cents {
+            Some(unit_cost) if unit_cost > 0 => sqlx::query_as(
+                "INSERT INTO finished_product_inventory \
+                    (product_sku, location_id, on_hand, reserved, production_cost_cents) \
+                 VALUES ($1, $2, $3, 0, $4) \
+                 ON CONFLICT (product_sku, location_id) DO UPDATE SET \
+                    on_hand = finished_product_inventory.on_hand + EXCLUDED.on_hand, \
+                    production_cost_cents = CASE \
+                        WHEN finished_product_inventory.on_hand + EXCLUDED.on_hand = 0 THEN 0 \
+                        ELSE (finished_product_inventory.production_cost_cents \
+                              * finished_product_inventory.on_hand \
+                              + $4 * EXCLUDED.on_hand) \
+                             / (finished_product_inventory.on_hand + EXCLUDED.on_hand) \
+                    END, \
+                    updated_at = NOW() \
+                 RETURNING product_sku, location_id, on_hand, reserved, \
+                           production_cost_cents, updated_at",
+            )
+            .bind(sku)
+            .bind(location_id)
+            .bind(qty)
+            .bind(unit_cost),
+            _ => sqlx::query_as(
+                "INSERT INTO finished_product_inventory \
+                    (product_sku, location_id, on_hand, reserved) \
+                 VALUES ($1, $2, $3, 0) \
+                 ON CONFLICT (product_sku, location_id) DO UPDATE SET \
+                    on_hand = finished_product_inventory.on_hand + EXCLUDED.on_hand, \
+                    updated_at = NOW() \
+                 RETURNING product_sku, location_id, on_hand, reserved, \
+                           production_cost_cents, updated_at",
+            )
+            .bind(sku)
+            .bind(location_id)
+            .bind(qty),
+        }
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| ProductsError::Storage(e.to_string()))?;
+
+        // WIP→FG cost transfer, only when the caller knew the
+        // standard cost per unit. When unit_cost_cents is None, FG
+        // gets the units but the GL doesn't move — same shape as
+        // a manual on_hand correction without a cost basis.
+        let gl_move = if let Some(unit_cost) = unit_cost_cents
+            && unit_cost > 0
+        {
+            let happened_on = now.date_naive();
+            let total_cost = (qty as i64).saturating_mul(unit_cost);
+            // `source_id` + `happened_on` go INTO the payload so
+            // the projection rule's `/source_id` + `/happened_on`
+            // pointers find them on rebuild. Bundle export +
+            // re-import lands an identical `financial_facts` row.
+            let payload = serde_json::json!({
+                "total_cost_cents": total_cost,
+                "debit_account": "1320",
+                "credit_account": "1310",
+                "memo": format!(
+                    "Production — produced {qty} × {sku} @ {unit_cost}¢/unit (WIP → FG)"
+                ),
+                "sku": sku,
+                "location_id": location_id,
+                "qty": qty,
+                "unit_cost_cents": unit_cost,
+                "source_id": source_id,
+                "happened_on": happened_on.to_string(),
+            });
+            insert_fact(
+                &mut tx,
+                "finance.inventory.transferred",
+                happened_on,
+                &payload,
+                "products_produce",
+                &source_id,
+            )
+            .await?;
+            Some(GlMove {
+                source_id,
+                happened_on,
+                payload,
+            })
+        } else {
+            None
+        };
+
+        tx.commit()
+            .await
+            .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        Ok(InventoryDeltaResult {
+            inventory: row.into(),
+            gl_move,
+        })
+    }
+
+    async fn consume(
+        &self,
+        sku: &str,
+        location_id: &str,
+        qty: i32,
+        revenue_category: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+        source_id: String,
+    ) -> Result<InventoryDeltaResult, ProductsError> {
+        if qty <= 0 {
+            return Err(ProductsError::Invalid(format!(
+                "consume qty must be positive, got {qty}"
+            )));
+        }
+        // One tx wraps: (1) on_hand decrement, (2) the matching
+        // `finance.cogs.recognized` JE sized at
+        // `qty × production_cost_cents` (DR 5100 COGS / CR 1320
+        // FG). Every finished keg leaving inventory traces back
+        // to a real COGS recognition at the cost it was produced
+        // at — no shortcut, no decoupling.
+        // Tag the payload with `revenue_category` when supplied so
+        // the finance margin rollups can sum COGS by category
+        // directly instead of pro-rating against the period revenue
+        // mix.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ProductsError::Storage(e.to_string()))?;
+
+        // Idempotency guard — `on_hand -= qty` is relative, so a
+        // redelivered consume would double-decrement (and could spuriously
+        // fail the `on_hand >= qty` check once stock has fallen). The COGS
+        // fact is the proof-of-application; if it exists, return the
+        // current row unchanged. Sound for cost-bearing consumes (those
+        // that write a fact); a zero-production-cost FG row (early starter
+        // inventory with no basis) writes none and isn't guarded — no GL
+        // impact, and the seeded brewery costs its opening FG.
+        if fact_exists(
+            &mut tx,
+            "finance.cogs.recognized",
+            "products_consume",
+            &source_id,
+        )
+        .await?
+            && let Some(row) = current_inventory_row(&mut tx, sku, location_id).await?
+        {
+            return Ok(InventoryDeltaResult {
+                inventory: row.into(),
+                gl_move: None,
+            });
+        }
+
+        let updated: Option<InventoryRow> = sqlx::query_as(
+            "UPDATE finished_product_inventory \
+                SET on_hand = on_hand - $3, updated_at = NOW() \
+              WHERE product_sku = $1 AND location_id = $2 \
+                AND on_hand >= $3 \
+              RETURNING product_sku, location_id, on_hand, reserved, \
+                        production_cost_cents, updated_at",
+        )
+        .bind(sku)
+        .bind(location_id)
+        .bind(qty)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        match updated {
+            Some(row) => {
+                // COGS recognition. Skip when production_cost is
+                // zero — the FG row was seeded without a cost
+                // basis (the early-day starter inventory case).
+                // The on_hand still moved so the physical-side
+                // story is intact; books absorb the gap until
+                // the next produce lands a real cost basis.
+                let total_cost = (qty as i64).saturating_mul(row.production_cost_cents);
+                let gl_move = if total_cost > 0 {
+                    let happened_on = now.date_naive();
+                    let mut payload = serde_json::json!({
+                        "total_cost_cents": total_cost,
+                        "cogs_account": "5100",
+                        "inventory_account": "1320",
+                        "memo": format!(
+                            "COGS — sold {qty} × {sku} @ {}¢/unit",
+                            row.production_cost_cents
+                        ),
+                        "sku": sku,
+                        "location_id": location_id,
+                        "qty": qty,
+                        "unit_cost_cents": row.production_cost_cents,
+                        "source_id": source_id,
+                        "happened_on": happened_on.to_string(),
+                    });
+                    if let Some(cat) = revenue_category {
+                        payload["revenue_category"] = serde_json::Value::String(cat.to_string());
+                    }
+                    insert_fact(
+                        &mut tx,
+                        "finance.cogs.recognized",
+                        happened_on,
+                        &payload,
+                        "products_consume",
+                        &source_id,
+                    )
+                    .await?;
+                    Some(GlMove {
+                        source_id,
+                        happened_on,
+                        payload,
+                    })
+                } else {
+                    None
+                };
+                tx.commit()
+                    .await
+                    .map_err(|e| ProductsError::Storage(e.to_string()))?;
+                Ok(InventoryDeltaResult {
+                    inventory: row.into(),
+                    gl_move,
+                })
+            }
+            None => Err(ProductsError::Invalid(format!(
+                "consume failed: row missing or on_hand < {qty} for {sku} @ {location_id}"
+            ))),
+        }
+    }
+}
+
+/// Does a financial_fact with this natural key already exist? The
+/// produce/consume idempotency guard: the fact a mutation writes is its
+/// proof-of-application, so an existing fact means a redelivered
+/// step-effect already applied the relative `on_hand ± qty`.
+async fn fact_exists(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    kind: &str,
+    source_table: &str,
+    source_id: &str,
+) -> Result<bool, ProductsError> {
+    let row: Option<(uuid::Uuid,)> = sqlx::query_as(
+        "SELECT id FROM financial_facts \
+         WHERE kind = $1 AND source_table = $2 AND source_id = $3",
+    )
+    .bind(kind)
+    .bind(source_table)
+    .bind(source_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| ProductsError::Storage(e.to_string()))?;
+    Ok(row.is_some())
+}
+
+/// Current FG inventory row for `(sku, location_id)` within a tx — used to
+/// return an unchanged result when the idempotency guard skips a mutation.
+async fn current_inventory_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sku: &str,
+    location_id: &str,
+) -> Result<Option<InventoryRow>, ProductsError> {
+    sqlx::query_as(
+        "SELECT product_sku, location_id, on_hand, reserved, \
+                production_cost_cents, updated_at \
+         FROM finished_product_inventory \
+         WHERE product_sku = $1 AND location_id = $2",
+    )
+    .bind(sku)
+    .bind(location_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| ProductsError::Storage(e.to_string()))
+}
+
+/// Insert a `financial_facts` row in the given tx + project it
+/// via the ledger's posting rules. Mirrors
+/// `boss-inventory::postgres::insert_fact` — same idempotency
+/// shape (unique on `(kind, source_table, source_id)`), same
+/// post-fact-in-tx hand-off.
+async fn insert_fact(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    kind: &'static str,
+    happened_on: chrono::NaiveDate,
+    payload: &serde_json::Value,
+    source_table: &str,
+    source_id: &str,
+) -> Result<(), ProductsError> {
+    sqlx::query(
+        "INSERT INTO financial_facts \
+            (id, kind, happened_on, payload, source_table, source_id, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'products') \
+         ON CONFLICT (kind, source_table, source_id) DO NOTHING",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(kind)
+    .bind(happened_on)
+    .bind(payload)
+    .bind(source_table)
+    .bind(source_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| ProductsError::Storage(e.to_string()))?;
+
+    let (fact_id,): (uuid::Uuid,) = sqlx::query_as(
+        "SELECT id FROM financial_facts \
+         WHERE kind = $1 AND source_table = $2 AND source_id = $3",
+    )
+    .bind(kind)
+    .bind(source_table)
+    .bind(source_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| ProductsError::Storage(e.to_string()))?;
+
+    let fact_ref = boss_ledger::FactRef {
+        id: fact_id,
+        kind,
+        happened_on,
+        payload,
+    };
+    boss_ledger::post_fact_in_tx(tx, &fact_ref)
+        .await
+        .map_err(|e| ProductsError::Storage(format!("ledger post failed: {e}")))?;
+    Ok(())
+}
+
+#[derive(sqlx::FromRow)]
+struct ProductRow {
+    sku: String,
+    name: String,
+    product_kind: String,
+    package_unit: String,
+    description: Option<String>,
+    metadata: serde_json::Value,
+    active: bool,
+}
+
+impl From<ProductRow> for Product {
+    fn from(r: ProductRow) -> Self {
+        Self {
+            sku: r.sku,
+            name: r.name,
+            product_kind: r.product_kind,
+            package_unit: r.package_unit,
+            description: r.description,
+            metadata: r.metadata,
+            active: r.active,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct InventoryRow {
+    product_sku: String,
+    location_id: String,
+    on_hand: i32,
+    reserved: i32,
+    production_cost_cents: i64,
+    updated_at: DateTime<Utc>,
+}
+
+impl From<InventoryRow> for ProductInventory {
+    fn from(r: InventoryRow) -> Self {
+        Self {
+            product_sku: r.product_sku,
+            location_id: r.location_id,
+            on_hand: r.on_hand,
+            reserved: r.reserved,
+            production_cost_cents: r.production_cost_cents,
+            updated_at: Some(r.updated_at),
+        }
+    }
+}

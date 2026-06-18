@@ -1,0 +1,184 @@
+# Brewery vendor fixtures — 40 vendors covering the full
+# procurement footprint of an industrial-scale brewery, each
+# tagged with a category for inventory + finance reporting.
+# Loaded by the brewery prepare step (`boss-brewery-sim prepare`),
+# POSTed through the public API.
+#
+# Categories grouped:
+#   hops (4)        — multiple sourcing for redundancy + variety
+#   grain/malt (5)  — base malt + specialty + adjuncts
+#   yeast (3)       — production strains + lab cultures
+#   packaging (8)   — bottles, cans, kegs, crowns, labels, cartons,
+#                     stretch wrap, six-pack carriers
+#   sanitation (3)  — caustic + acid + lab chemicals
+#   logistics (4)   — freight, last-mile couriers, kegs-out
+#   equipment (4)   — process tanks, packaging line service,
+#                     fittings, pumps
+#   utilities (3)   — CO2, nitrogen, water treatment
+#   prof-services (4) — legal, accounting, IT integrations, lab
+#   misc (2)        — uniforms, marketing/print
+
+# Schema CHECK on vendors.payment_terms gates this list. Top-level
+# keys must precede the `[[vendor]]` array-of-tables below — TOML
+# scope rules apply.
+payment_terms = ["net-30", "net-45", "net-60", "prepaid"]
+
+[[vendor]]
+name = "Cascade Hop Yards"
+category = "hops-supplier"
+
+[[vendor]]
+name = "Yakima Valley Hop Co."
+category = "hops-supplier"
+
+[[vendor]]
+name = "Hopfield Cooperative"
+category = "hops-supplier"
+
+[[vendor]]
+name = "Northcoast Aroma Hops"
+category = "hops-supplier"
+
+[[vendor]]
+name = "Heritage Malt Co."
+category = "grain-supplier"
+
+[[vendor]]
+name = "Highland Grain Mill"
+category = "grain-supplier"
+
+[[vendor]]
+name = "Northwind Adjuncts"
+category = "specialty-ingredients"
+
+[[vendor]]
+name = "Riverbed Specialty Malts"
+category = "grain-supplier"
+
+[[vendor]]
+name = "Prairie Grain Bulk"
+category = "grain-supplier"
+
+[[vendor]]
+name = "Sunrise Yeast Bank"
+category = "yeast-bank"
+
+[[vendor]]
+name = "Ferment Labs Yeast"
+category = "yeast-bank"
+
+[[vendor]]
+name = "Cellar Strain Library"
+category = "yeast-bank"
+
+[[vendor]]
+name = "Stalwart Packaging"
+category = "packaging"
+
+[[vendor]]
+name = "Pacific Bottle Supply"
+category = "packaging"
+
+[[vendor]]
+name = "Coastal Cans & Crowns"
+category = "packaging"
+
+[[vendor]]
+name = "Keystone Keg Works"
+category = "packaging"
+
+[[vendor]]
+name = "Northbridge Labels"
+category = "packaging"
+
+[[vendor]]
+name = "Crown Cap & Capsule"
+category = "packaging"
+
+[[vendor]]
+name = "Western Cartons & Cases"
+category = "packaging"
+
+[[vendor]]
+name = "Vinewrap Stretch Films"
+category = "packaging"
+
+[[vendor]]
+name = "Brewchem Sanitation"
+category = "sanitation"
+
+[[vendor]]
+name = "Acid Line Supply Co."
+category = "sanitation"
+
+[[vendor]]
+name = "Helix Lab Reagents"
+category = "lab"
+
+[[vendor]]
+name = "Sundial Freight"
+category = "logistics"
+
+[[vendor]]
+name = "Headwind Couriers"
+category = "logistics"
+
+[[vendor]]
+name = "Tidewater Distribution"
+category = "logistics"
+
+[[vendor]]
+name = "Cross-Country Cold Chain"
+category = "logistics"
+
+[[vendor]]
+name = "Iron Range Equipment"
+category = "equipment"
+
+[[vendor]]
+name = "Brewhouse Process Service"
+category = "equipment"
+
+[[vendor]]
+name = "Foundry Pumps & Fittings"
+category = "equipment"
+
+[[vendor]]
+name = "Mainsail Tank Repair"
+category = "equipment"
+
+[[vendor]]
+name = "Argon Stream Gases"
+category = "utilities"
+
+[[vendor]]
+name = "Twin Rivers CO2"
+category = "utilities"
+
+[[vendor]]
+name = "Bluestone Water Treatment"
+category = "utilities"
+
+[[vendor]]
+name = "Whitepine Legal Group"
+category = "professional-services"
+
+[[vendor]]
+name = "Larkspur Accounting"
+category = "professional-services"
+
+[[vendor]]
+name = "Stratford IT Partners"
+category = "professional-services"
+
+[[vendor]]
+name = "Garnet Quarry Lab"
+category = "lab"
+
+[[vendor]]
+name = "Maple Hollow Uniforms"
+category = "uniforms"
+
+[[vendor]]
+name = "Quartz Print House"
+category = "marketing"

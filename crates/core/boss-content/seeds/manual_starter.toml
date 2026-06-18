@@ -1,0 +1,130 @@
+# Starter HR-manual skeleton — platform default. Loaded at boot
+# by `seed::seed_starter_sections`. Every row has a TBD placeholder
+# body so HR has obvious next-action targets instead of staring at
+# a blank tree. Tenants can override post-boot by editing the
+# rows through the /content admin surface; the seeder is idempotent
+# (skips slugs already present) so it never overwrites edited
+# content.
+#
+# Ordering rule: parents MUST come before children — the
+# `create_section` call resolves `parent_slug` via DB lookup, so a
+# child whose parent hasn't been inserted yet fails the FK check.
+# Keep the array ordered by slug-depth.
+#
+# `body` is markdown. The SPA renders it via the same renderer the
+# manual-edit surface uses. Owner annotations follow the same
+# `_TBD, owner: <role>._` convention so a future linter can grep
+# them.
+
+[[section]]
+slug = "welcome"
+title = "Welcome to BOSS"
+body = "_TBD, owner: HR._\n\nReplace with the mission statement, company history, and a note from the founder."
+sort = 0
+
+[[section]]
+slug = "benefits"
+title = "Benefits"
+body = "_TBD, owner: HR._\n\nOverview of benefits. Detailed sections live below."
+sort = 10
+
+[[section]]
+slug = "benefits/health"
+parent = "benefits"
+title = "Health insurance"
+body = "_TBD, owner: HR._\n\nPlan summary, enrollment windows, carrier contact, who to call for claims issues."
+sort = 0
+
+[[section]]
+slug = "benefits/time-off"
+parent = "benefits"
+title = "Time off"
+body = "_TBD, owner: HR._\n\nHow PTO accrues, holiday calendar, sick-leave policy."
+sort = 10
+
+[[section]]
+slug = "benefits/time-off/vacation"
+parent = "benefits/time-off"
+title = "Vacation"
+body = "_TBD, owner: HR._\n\nAccrual rate, request process, blackout periods."
+sort = 0
+
+[[section]]
+slug = "benefits/time-off/sick"
+parent = "benefits/time-off"
+title = "Sick leave"
+body = "_TBD, owner: HR._\n\nReporting process, doctor's-note threshold, long-term illness escalation."
+sort = 10
+
+[[section]]
+slug = "policies"
+title = "Policies"
+body = "_TBD, owner: HR._\n\nOverview of company policies."
+sort = 20
+
+[[section]]
+slug = "policies/code-of-conduct"
+parent = "policies"
+title = "Code of conduct"
+body = "_TBD, owner: HR._\n\nExpected behavior, harassment reporting, enforcement."
+sort = 0
+
+[[section]]
+slug = "policies/security"
+parent = "policies"
+title = "Security"
+body = "_TBD, owner: HR._\n\nPassword hygiene, device policy, incident reporting."
+sort = 10
+
+[[section]]
+slug = "policies/expenses"
+parent = "policies"
+title = "Expenses"
+body = "_TBD, owner: HR._\n\nWhat's reimbursable, receipt thresholds, submission deadlines."
+sort = 20
+
+[[section]]
+slug = "operations"
+title = "Operations"
+body = "_TBD, owner: Operations lead._\n\nDay-to-day how-we-work."
+sort = 30
+
+[[section]]
+slug = "operations/safety"
+parent = "operations"
+title = "Facility safety"
+body = "_TBD, owner: Operations._\n\nEmergency procedures, injury reporting, PPE expectations."
+sort = 0
+
+[[section]]
+slug = "operations/equipment-handling"
+parent = "operations"
+title = "Equipment handling"
+body = "_TBD, owner: Operations lead._\n\nSafe operation of tenant-specific equipment during routine work."
+sort = 10
+
+[[section]]
+slug = "org"
+title = "Organization"
+body = "_TBD, owner: HR._\n\nExec team, departments, and how they fit together."
+sort = 40
+
+[[section]]
+slug = "org/reporting-lines"
+parent = "org"
+title = "Reporting lines"
+body = "_TBD, owner: HR._\n\nOrg chart — link to the live exec roster."
+sort = 0
+
+[[section]]
+slug = "faq"
+title = "FAQ"
+body = "_TBD, owner: HR._\n\nQuick answers to the most common questions."
+sort = 50
+
+[[section]]
+slug = "faq/how-do-i"
+parent = "faq"
+title = "How do I…"
+body = "_TBD, owner: HR._\n\nAnchors by role: sales, service, ops, finance."
+sort = 0

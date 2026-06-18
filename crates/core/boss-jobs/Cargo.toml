@@ -1,0 +1,67 @@
+[package]
+name = "boss-jobs"
+description = "Job coordination primitive — universal cross-team work tracking"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-jobs-api"
+path = "src/bin/boss_jobs_api.rs"
+required-features = ["postgres"]
+
+# `boss-jobs-seed-kinds` retired 2026-05-03 (step 9a of the
+# HumanWorker generator retirement).
+# Platform JobKinds reconcile from `platform_kinds()` automatically
+# on `boss-jobs-api` startup; tenant JobKinds bootstrap via
+# per-tenant bins (boss-brewery-bootstrap, etc.) reading
+# examples/<tenant>/seeds/job_kinds.toml. See
+# docs/design/platform-vs-tenant-jobkinds.md.
+
+[[bin]]
+name = "boss-jobs-rebuild"
+path = "src/bin/boss_jobs_rebuild.rs"
+required-features = ["postgres"]
+
+[features]
+default = []
+postgres = ["dep:sqlx", "boss-events/postgres"]
+
+[dependencies]
+boss-clock-client = { path = "../boss-clock-client" }
+boss-ports = { path = "../boss-ports" }
+boss-core = { path = "../boss-core" }
+boss-expr = { path = "../boss-expr" }
+boss-classes-client = { path = "../boss-classes-client" }
+boss-events = { path = "../boss-events" }
+boss-nats = { path = "../boss-nats" }
+boss-policy-client = { path = "../boss-policy-client" }
+boss-calendar-client = { path = "../boss-calendar-client" }
+boss-subject-kinds-client = { path = "../boss-subject-kinds-client" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+axum = { workspace = true }
+async-stream = "0.3"
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+async-nats = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"], optional = true }
+
+[dev-dependencies]
+boss-testing = { path = "../boss-testing", features = ["postgres"] }
+tower = { workspace = true }
+http-body-util = "0.1"
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"] }
+proptest = "1"
+
+[lints]
+workspace = true

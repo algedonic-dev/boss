@@ -1,0 +1,53 @@
+[package]
+name = "boss-catalog"
+description = "Equipment Knowledge Base — authoritative domain types for system models, service profiles, parts, and consumables"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-catalog-api"
+path = "src/bin/boss_catalog_api.rs"
+required-features = ["postgres"]
+
+[[bin]]
+name = "boss-catalog-rebuild"
+path = "src/bin/boss_catalog_rebuild.rs"
+required-features = ["postgres"]
+
+[features]
+default = []
+postgres = ["dep:sqlx", "boss-events/postgres"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"], optional = true }
+uuid = { workspace = true }
+jsonschema = { version = "0.46", default-features = false }
+
+boss-core = { path = "../../core/boss-core" }
+boss-policy-client = { path = "../../core/boss-policy-client" }
+boss-classes-client = { path = "../../core/boss-classes-client" }
+boss-clock-client = { path = "../../core/boss-clock-client" }
+boss-events = { path = "../../core/boss-events" }
+boss-assets-client = { path = "../boss-assets-client" }
+boss-nats = { path = "../../core/boss-nats" }
+boss-ports = { path = "../../core/boss-ports" }
+[dev-dependencies]
+tower = { workspace = true }
+http-body-util = "0.1"
+boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
+
+[lints]
+workspace = true

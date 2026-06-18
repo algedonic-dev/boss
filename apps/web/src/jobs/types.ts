@@ -1,0 +1,148 @@
+// Job types — shape matches the JSON wire from /api/jobs.
+//
+// The Subject type is an open-kind shape, not a discriminated
+// union (docs/architecture-decisions.md §Primitives & information
+// architecture): kind-specific fields are optional on one shape
+// where kind-specific fields are optional. This matches the Rust
+// side (boss-core::primitives::Subject is a trait with kind() + id()
+// methods; any new kind is just a new string, not a type change).
+// New Subject kinds on the backend now land without a TS build
+// break.
+//
+// The trade-off: TS no longer catches a typo in `subject_kind ===
+// 'practise'`. SUBJECT_KINDS below is the runtime mirror of the
+// canonical list in boss-core; reference it from new code instead
+// of inlining string literals.
+
+/// Canonical Subject kind strings, mirrored from
+/// boss-core::primitives::SUBJECT_KINDS. Keep in sync when Wave 7
+/// introduces new per-kind Subject impls on the Rust side.
+export const SUBJECT_KINDS = [
+  'asset',
+  'account',
+  'purchase_order',
+  'campaign',
+  'employee',
+  'vendor',
+  'custom',
+] as const;
+
+export type SubjectKind = (typeof SUBJECT_KINDS)[number] | (string & {});
+
+/// A Subject is an identity-bearing thing a Job points at.
+///
+/// Wire shape mirrors Rust `boss_core::job::Subject`:
+/// `{ subject_kind, id }`. `subject_kind` stays an open string so a
+/// Subject kind the TS code has never heard of still renders.
+export type Subject = {
+  subject_kind: SubjectKind;
+  id: string;
+};
+
+export type JobStatus =
+  | 'draft' | 'open' | 'blocked' | 'pending-sign-off' | 'closed' | 'cancelled';
+
+/**
+ * Five-state predicate-driven lifecycle (mirrors `boss_core::job::StepStatus`).
+ * Use the `isPending` / `isTerminal` / `isInFlight` helpers
+ * to gate UI rather than comparing against literal strings.
+ */
+export type StepStatus =
+  // Stage 1 — pre-execution
+  | 'pending'
+  | 'ready'
+  // Stage 2 — in-flight
+  | 'active'
+  // Stage 3 — terminal
+  | 'completed'
+  | 'skipped';
+
+/** True if the step hasn't yet started (Stage 1). */
+export function isPending(status: StepStatus): boolean {
+  return status === 'pending'
+    || status === 'ready';
+}
+
+/** True if the step is terminal (Stage 3). */
+export function isTerminal(status: StepStatus): boolean {
+  return status === 'completed'
+    || status === 'skipped';
+}
+
+/** True if the step is in Stage 2 (in-flight). */
+export function isInFlight(status: StepStatus): boolean {
+  return status === 'active';
+}
+
+export type Step = {
+  id: string;
+  job_id: string;
+  kind: string;
+  title: string;
+  assignee_id: string | null;
+  status: StepStatus;
+  sort_order: number;
+  blocked_by: string[];
+  sign_offs_required?: string[];
+  sign_offs?: {
+    authority_id: string;
+    role: string;
+    stamped_at: string;
+    shape_hash: string;
+  }[];
+  completed_on: string | null;
+  metadata: Record<string, unknown>;
+  notes?: string | null;
+  /// Pointer to a child Job when this Step's work decomposes
+  /// further. Structural column on the `steps` table; traversal
+  /// code can discover embedded Jobs without parsing metadata.
+  embedded_job?: string | null;
+};
+
+export type Job = {
+  id: string;
+  kind: string;
+  subject: Subject;
+  title: string;
+  owner_id: string;
+  status: JobStatus;
+  priority: 'emergency' | 'urgent' | 'standard' | 'scheduled';
+  opened_on: string;
+  due_on: string | null;
+  closed_on: string | null;
+  metadata: Record<string, unknown>;
+  tags: string[];
+  steps?: Step[];
+};
+
+/// Pick the human-readable identifier for a Subject — the value
+/// most useful in a table row or a hero header.
+export function subjectLabel(s: Subject): string {
+  return s.id || '(unknown subject)';
+}
+
+/// Pick the canonical SPA path for a Subject — where clicking the
+/// subject in a list should navigate to.
+///
+/// Same dispatch shape as `subjectLabel`; unknown kinds return `'#'`
+/// so existing click handlers don't throw.
+export function subjectPath(s: Subject): string {
+  switch (s.subject_kind) {
+    case 'asset':
+      return `/assets/${encodeURIComponent(s.id)}`;
+    case 'account':
+      return `/accounts/${s.id ?? ''}`;
+    case 'purchase_order':
+      return `/purchase-orders/${s.id ?? ''}`;
+    case 'campaign':
+      return `/jobs?kind=marketing-motion`;
+    case 'employee':
+      return `/people/${s.id ?? ''}`;
+    case 'vendor':
+      return `/vendors/${s.id ?? ''}`;
+    case 'custom':
+      return '#';
+    default:
+      return '#';
+  }
+}

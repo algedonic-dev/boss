@@ -1,0 +1,24 @@
+[package]
+name = "boss-testing"
+description = "Shared test utilities for Boss service testing"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+postgres = ["dep:sqlx", "dep:uuid"]
+
+[dependencies]
+boss-core = { path = "../boss-core" }
+axum = { workspace = true }
+tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+tower = { workspace = true }
+http-body-util = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres"], optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+
+[lints]
+workspace = true

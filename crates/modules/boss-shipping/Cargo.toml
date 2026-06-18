@@ -1,0 +1,50 @@
+[package]
+name = "boss-shipping"
+description = "Shipment tracking for inbound and outbound logistics"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-shipping-api"
+path = "src/bin/boss_shipping_api.rs"
+required-features = ["postgres"]
+
+[[bin]]
+name = "boss-shipping-rebuild"
+path = "src/bin/boss_shipping_rebuild.rs"
+required-features = ["postgres"]
+
+[features]
+default = []
+postgres = ["dep:sqlx", "boss-events/postgres"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"], optional = true }
+
+boss-core = { path = "../../core/boss-core" }
+boss-classes-client = { path = "../../core/boss-classes-client" }
+boss-clock-client = { path = "../../core/boss-clock-client" }
+boss-ports = { path = "../../core/boss-ports" }
+boss-events = { path = "../../core/boss-events" }
+boss-nats = { path = "../../core/boss-nats" }
+boss-policy-client = { path = "../../core/boss-policy-client" }
+boss-shipping-client = { path = "../boss-shipping-client" }
+[dev-dependencies]
+tower = { workspace = true }
+boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
+
+[lints]
+workspace = true

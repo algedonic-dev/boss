@@ -1,0 +1,12 @@
+[Unit]
+Description=Boss file_refs garbage-collection sweep
+After=postgresql.service
+
+[Service]
+Type=oneshot
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/boss-files-gc --config /etc/boss-content-api.toml
+# Inherits the same elevated-on-bare-metal posture as the other
+# Boss timer-driven binaries. The Postgres connection authenticates
+# via the `boss` role baked into postgres_url; the S3-side credentials
+# come from /etc/boss-content-api.toml's [files] block.

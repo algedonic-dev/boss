@@ -1,0 +1,34 @@
+[Unit]
+Description=Boss — brewery 1yr=1hr live tick daemon
+Documentation=https://github.com/algedonic-dev/boss/blob/main/docs/design/projection-rebuilders.md
+After=postgresql.service nats-server.service network-online.target boss-jobs-api.service boss-dispatcher.service
+Wants=network-online.target
+PartOf=boss-jobs-api.service
+
+[Service]
+Type=simple
+Environment=RUST_LOG=info
+Environment=BOSS_POSTGRES_URL=postgres://boss:boss@127.0.0.1/boss
+Environment=BOSS_SIM_API_BASE=direct://127.0.0.1
+Environment=BOSS_SIM_SEEDS_DIR=/opt/boss/examples/brewery/seeds
+# Receive the dispatcher's pushed step.done.<kind> events on :7099 so the
+# counterparty engine drives the collections loop (AR-aging payments, courier
+# scans). Must match the dispatcher's BOSS_EVENT_WEBHOOK_URL host:port; unset →
+# zero collections fire and AR balloons.
+Environment=BOSS_SIM_CALLBACK_BIND=127.0.0.1:7099
+# BOSS_DEMO_MODE gates whether the brewery simulator runs. A real
+# tenant (BOSS_DEMO_MODE=0 or unset) has real activity flowing
+# through Jobs; running the synthetic sim alongside that would
+# double-book everything. ExecStartPre exits 0 to skip the unit
+# silently when demo mode is off — the unit shows as activating
+# briefly then deactivates without producing an error in journal.
+ExecStartPre=/bin/sh -c '[ "${BOSS_DEMO_MODE:-0}" = "1" ] || { echo "BOSS_DEMO_MODE not set; sim will not start." >&2; exit 0; }'
+ExecStartPre=/bin/sh -c '[ "${BOSS_DEMO_MODE:-0}" = "1" ] || exit 1'
+ExecStart=/usr/local/bin/boss-brewery-sim
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

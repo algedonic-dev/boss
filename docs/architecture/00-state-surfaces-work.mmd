@@ -1,0 +1,44 @@
+%%{init: {'theme':'base', 'themeVariables': { 'primaryColor':'#fafaf9', 'primaryBorderColor':'#57534e', 'primaryTextColor':'#1c1917', 'lineColor':'#78716c', 'fontFamily':'ui-sans-serif, system-ui, sans-serif', 'fontSize':'17px'}}}%%
+flowchart LR
+
+    subgraph State ["&nbsp;&nbsp;State &mdash; what is true&nbsp;&nbsp;"]
+        direction TB
+        SUBJ["<b>Subjects</b><br/>identity-bearing things<br/><small><code>boss-core::primitives::Subject</code><br/>trait + per-kind impls + Parts<br/>concrete kinds are tenant-defined</small>"]
+        CLS["<b>Classes</b><br/>taxonomies of Subjects<br/><small><code>boss-core::primitives::Class</code><br/>roles, departments, asset categories<br/>(rows, not closed Rust enums)</small>"]
+        LOC["<b>Locations</b><br/>places<br/><small><code>boss-core::primitives::Location</code><br/>hierarchy + timezone + geo;<br/>also attaches as AttributePart</small>"]
+        RES["<b>Reservations</b><br/>time-window claims<br/><small><code>boss-core::calendar</code><br/>employees / assets / workstations</small>"]
+        KB["<b>Knowledge Base pattern</b><br/>Subject-oriented data<br/><small>every Subject has a KB view:<br/>Facts &middot; Projections &middot; Parts<br/>catalog is one Class-level instance</small>"]
+        EV["<b>Event log</b><br/>source of truth<br/><small><code>boss-core::event::Event</code><br/>immutable fact; projections rebuild;<br/>hash-chained, REVOKE-protected</small>"]
+        LDG["<b>Ledger projection</b><br/>financial state<br/><small>financial_facts &rarr; GL<br/>via versioned posting rules</small>"]
+    end
+
+    subgraph Surfaces ["&nbsp;&nbsp;Surfaces &mdash; how humans see + act&nbsp;&nbsp;"]
+        direction TB
+        WEB["<b>Web SPA</b><br/><code>apps/web-svelte</code><br/><small>Svelte 5 + Runes<br/>pages per Subject + Job<br/>dashboards, forms, lists</small>"]
+        PLUG["<b>Step plugins</b><br/>per-step custom UX<br/><small>JS bundles authored as data<br/>at <code>/admin/step-plugins</code></small>"]
+        MSG["<b>Messages inbox</b><br/>per-employee unified inbox<br/><small>DMs + system signals<br/>one place to look</small>"]
+        CLI["<b>boss CLI + APIs</b><br/>operator + automation surface<br/><small>deploy, backup, status,<br/>agents via HTTP</small>"]
+    end
+
+    subgraph Work ["&nbsp;&nbsp;Work &mdash; how state changes&nbsp;&nbsp;"]
+        direction TB
+        JOBS["<b>Jobs + Steps</b><br/>coordination primitive<br/><small>every workflow is a Job;<br/>Steps are the typed unit of work.<br/><code>Step.embedded_job</code> &rarr; recursion<br/>(a Step can be a Job)</small>"]
+        REG["<b>Registries</b><br/>workflows as data<br/><small>JobKind + StepPlugin + StepType +<br/>SubjectKind &mdash; new work lands<br/>as rows, not code</small>"]
+        AUTO["<b>Automation runners</b><br/>event &rarr; work<br/><small>boss-cybernetics (agents)<br/>boss-dispatcher (step side-effects)<br/>tenant tick engines (e.g. brewery)</small>"]
+    end
+
+    %% The cycle reads left-to-right: State feeds Surfaces (reads),
+    %% Surfaces kick Work (user actions or scheduled triggers), Work
+    %% mutates State (events). Policy gates the Work&rarr;State edge:
+    %% every write must pass row-level auth.
+    State ==>|"projections, live events"| Surfaces
+    Surfaces ==>|"user action,<br/>scheduled trigger"| Work
+    Work ==>|"immutable events<br/>(gated by Policy)"| State
+
+    classDef state fill:#fef3c7,stroke:#a16207,stroke-width:2px
+    classDef surface fill:#dbeafe,stroke:#1d4ed8,stroke-width:2px
+    classDef work fill:#d1fae5,stroke:#047857,stroke-width:2px
+
+    class SUBJ,CLS,LOC,RES,KB,EV,LDG state
+    class WEB,PLUG,MSG,CLI surface
+    class JOBS,REG,AUTO work

@@ -1,0 +1,58 @@
+# Rust
+target/
+target
+/target
+**/*.rs.bk
+# Cargo.lock is committed (Rust convention for binary-shipping
+# workspaces: guarantees reproducible builds + the Docker install
+# path's `COPY Cargo.toml Cargo.lock ./` requires it in the build
+# context).
+
+# Node
+node_modules/
+dist/
+.next/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+
+# Build artifacts
+*.log
+
+# Playwright artifacts
+test-results/
+playwright-report/
+
+# TLA+ tooling — downloaded on demand by infra/tla/run-tlc.sh
+infra/tla/tla2tools.jar
+# TLC writes states/ alongside the spec when checking; .toolbox/
+# is the IDE state from the official TLA+ Toolbox.
+docs/formal/states/
+docs/formal/*.toolbox/
+**/__pycache__/
+
+# Generated seed bundles — `infra/postgres/regenerate-brewery-seed.sh`
+# rebuilds them from source (JobKinds + tenant.toml + the live sim).
+# Don't commit; runtime consumers (bootstrap-local.sh,
+# reset-to-baseline.sh, oss-quickstart/init.sh) fetch or regenerate
+# as needed. Keeps git history slim and forces every deployment to
+# start from a known-fresh artifact rather than a stale snapshot.
+infra/postgres/seed-brewery-audit-log.sql.gz
+infra/postgres/seed-brewery-audit-log.meta.json

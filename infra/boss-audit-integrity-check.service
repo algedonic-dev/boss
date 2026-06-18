@@ -1,0 +1,18 @@
+[Unit]
+Description=Boss audit_log integrity scan (Layer 1 of immutable-audit-log)
+After=postgresql.service
+
+[Service]
+Type=oneshot
+# Surfaces id gaps and created_at regressions in audit_log. Schema-level
+# triggers reject UPDATE / DELETE / TRUNCATE; this scan catches operators
+# who bypass the trigger (DROP TRIGGER, ALTER TABLE DISABLE TRIGGER,
+# restore-from-backup) and leave evidence behind. Exit code 2 → anomalies
+# found → systemctl is-failed → OnFailure hook fires the alert.
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/boss-audit-integrity-check --config /etc/boss-audit-integrity-check.toml
+# Runs as root to match the boss-messages-events-purge timer
+# pattern. The scan itself is read-only and authenticates to
+# Postgres via the `boss` role/password in postgres_url, not
+# the Linux user. Tighten to a dedicated service user once
+# Boss adopts per-service Linux UIDs system-wide.

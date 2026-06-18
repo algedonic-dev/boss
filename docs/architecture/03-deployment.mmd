@@ -1,0 +1,90 @@
+%%{init: {'theme':'base', 'themeVariables': { 'primaryColor':'#fafaf9', 'primaryBorderColor':'#57534e', 'primaryTextColor':'#1c1917', 'lineColor':'#78716c', 'fontFamily':'ui-sans-serif, system-ui, sans-serif', 'fontSize':'17px'}}}%%
+flowchart TB
+
+    subgraph Clients ["Clients"]
+        direction LR
+        WEB["Web browser<br/><small>apps/web-svelte SPA<br/>served from gateway</small>"]
+        CLI["<code>boss</code> CLI<br/><small>operator + developer<br/>SSH-based where needed</small>"]
+        AUTO["Automation / CI<br/><small>GitHub Actions<br/>Claude Code</small>"]
+    end
+
+    subgraph Edge ["Edge &mdash; Cloudflare"]
+        direction LR
+        CFA["<b>Cloudflare Access</b><br/><small>JWT identity (Email OTP / WebAuthn)<br/>DDoS / WAF / origin hidden</small>"]
+        CFT["<b>Cloudflare Tunnel</b><br/><small>cloudflared bridge<br/>no public ingress on the VM</small>"]
+    end
+
+    subgraph Manager ["Primary VM"]
+        direction TB
+        GATEWAY["<b>boss-gateway</b><br/><small>HTTP-only &middot; CF Access JWT verify &middot; static SPA &middot; reverse proxy</small>"]
+
+        subgraph ProdStack ["Prod services"]
+            direction LR
+            P_PRIM["Primitive services<br/><small>jobs :7900<br/>assets :7600<br/>catalog :7750<br/>people :7500<br/>calendar :7860<br/>classes :7800<br/>locations :7820<br/>subject-kinds :7830</small>"]
+            P_OPS["Operational<br/><small>shipping :7100<br/>inventory :7300<br/>commerce :7400<br/>products :7840</small>"]
+            P_RAIL["Rails<br/><small>messages :7200<br/>policy :7250<br/>ledger :7080<br/>content :7090</small>"]
+            P_PLAT["Platform<br/><small>docs :7050<br/>ml :7070</small>"]
+            P_OBS["Observability<br/><small>obs / snapshot / SSE :7880</small>"]
+        end
+
+        subgraph ScratchStack ["Scratch stack (+1000 offset)"]
+            direction LR
+            SCR["paired services<br/><small>:8050&ndash;:8900<br/>isolated DB: boss_scratch</small>"]
+        end
+
+        subgraph Daemons ["Local daemons + timers"]
+            direction LR
+            D1["boss-cybernetics<br/><small>event-driven agents</small>"]
+            D2["boss-dispatcher<br/><small>step.done rule dispatch</small>"]
+            D3["boss-brewery-sim<br/><small>tenant sim tick (timer)</small>"]
+            D4["Periodic sweeps (timers)<br/><small>audit-integrity-check &middot; conservation-invariants<br/>files-gc &middot; ledger-recognize<br/>messages-events-purge &middot; ml-inference-batch</small>"]
+        end
+
+        subgraph DataLocal ["Local data"]
+            direction LR
+            PG[("Postgres 16<br/><small>boss &middot; boss_scratch<br/>audit_log hash-chained</small>")]
+            NATS_N[("NATS<br/>:4222")]
+        end
+    end
+
+    %% Client traffic
+    WEB ==>|"HTTPS"| CFT
+    CLI -.->|"HTTPS + SSH"| CFT
+    AUTO -.->|"HTTPS"| CFT
+    CFT ==> CFA
+    CFA ==>|"Cf-Access-Jwt-Assertion"| GATEWAY
+
+    %% Gateway routing
+    GATEWAY ==>|"/api/*"| ProdStack
+    GATEWAY -->|"scratch traffic"| ScratchStack
+
+    %% Service deps
+    ProdStack ==> PG
+    ProdStack ==> NATS_N
+    ScratchStack --> PG
+    ScratchStack --> NATS_N
+    Daemons --> NATS_N
+    Daemons --> PG
+
+    classDef client fill:#e0e7ff,stroke:#312e81,stroke-width:2px
+    classDef edge fill:#ffedd5,stroke:#c2410c,stroke-width:2px
+    classDef gw fill:#fef3c7,stroke:#a16207,stroke-width:2px
+    classDef prim fill:#fef3c7,stroke:#a16207,stroke-width:1.5px
+    classDef ops fill:#dbeafe,stroke:#1d4ed8,stroke-width:1.5px
+    classDef rail fill:#d1fae5,stroke:#047857,stroke-width:1.5px
+    classDef platform fill:#fef9c3,stroke:#a16207,stroke-width:1.5px
+    classDef obsbox fill:#fee2e2,stroke:#b91c1c,stroke-width:1.5px
+    classDef scratch fill:#fef9c3,stroke:#a16207,stroke-width:1px,stroke-dasharray:4 3
+    classDef daemon fill:#ede9fe,stroke:#6d28d9,stroke-width:1.5px
+    classDef store fill:#f3f4f6,stroke:#1f2937,stroke-width:2px
+    class WEB,CLI,AUTO client
+    class CFA,CFT edge
+    class GATEWAY gw
+    class P_PRIM prim
+    class P_OPS ops
+    class P_RAIL rail
+    class P_PLAT platform
+    class P_OBS obsbox
+    class SCR scratch
+    class D1,D2,D3,D4 daemon
+    class PG,NATS_N store

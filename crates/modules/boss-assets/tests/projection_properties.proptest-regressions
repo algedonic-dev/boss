@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 532cdabaafd7f02b252d6a9d3f091f0a3e8ad9eff3108927b8934537631b6104 # shrinks to events = [DeviceEvent { id: DeviceEventId("evt-000"), device_serial: DeviceSerial("SN-PROP"), ts: 2026-01-01, actor_id: None, kind: ServiceTicketClosed { ticket_id: "tkt-000", turnaround_days: 1 } }, DeviceEvent { id: DeviceEventId("evt-001"), device_serial: DeviceSerial("SN-PROP"), ts: 2026-01-02, actor_id: None, kind: ServiceTicketOpened { ticket_id: "tkt-000", summary: "issue" } }]
+cc 1669cf1d0bf37c3f01f4a8350073ee69aedab8a4c7ad1c4bb87b232a36543ce5 # shrinks to events = [DeviceEvent { id: DeviceEventId("evt-000"), device_serial: DeviceSerial("SN-PROP"), ts: 2026-01-01, actor_id: None, kind: ServiceTicketOpened { ticket_id: "tkt-000", summary: "issue" } }, DeviceEvent { id: DeviceEventId("evt-001"), device_serial: DeviceSerial("SN-PROP"), ts: 2026-01-02, actor_id: None, kind: ServiceTicketClosed { ticket_id: "tkt-000", turnaround_days: 1 } }]
+cc abb42969de8814d726928ad310e60c244bf405ec1843cffa3510f4bc0fe796b0 # shrinks to events = [DeviceEvent { id: DeviceEventId("evt-000"), device_serial: DeviceSerial("SN-PROP"), ts: 2026-01-01, actor_id: None, kind: ServiceTicketOpened { ticket_id: "tkt-000", summary: "issue" } }, DeviceEvent { id: DeviceEventId("evt-001"), device_serial: DeviceSerial("SN-PROP"), ts: 2026-01-02, actor_id: None, kind: Decommissioned { reason: "aaa" } }]

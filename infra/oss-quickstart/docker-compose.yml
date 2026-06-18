@@ -1,0 +1,197 @@
+# OSS quickstart — single-stack BOSS in Docker.
+#
+# Brings up Postgres, NATS, every boss-* service in one container
+# (the gateway in that container also serves the SPA static files,
+# so no separate Caddy / nginx is needed). Total: 3 long-running
+# containers + 1 one-shot init. ~5 minutes to first SPA load.
+#
+# Setup:
+#   1. cp .env.example .env
+#   2. Edit .env — at minimum set BOSS_BOOTSTRAP_ADMIN_EMAIL.
+#   3. docker compose up
+#
+# First run runs the init container, which loads the brewery
+# 12-month seed bundle (~5 min) and seeds the bootstrap-admin
+# Employee. Subsequent runs skip init (the marker file in the
+# postgres volume tells it the DB is already bootstrapped).
+#
+# Open http://localhost:4443 once the boss-services container
+# logs "all services up".
+#
+# ⚠  Not production-ready — see ../../docs/adr/0193-*.md.
+
+name: boss
+
+services:
+  # -------------------------------------------------------------------
+  # State plane — Postgres + NATS. Both pin major versions so the
+  # quickstart is reproducible across runs.
+  # -------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    # ~24 API services each run an sqlx pool (default max 10 connections), so
+    # the stack needs well above PG's default max_connections=100 — otherwise
+    # the pools saturate the cluster ("FATAL: sorry, too many clients already")
+    # and services fail-closed mid-startup (the brewery prepare then sees
+    # "stack not ready" and the sim idles). 400 matches the documented
+    # playground setting (see infra/deploy-services.sh).
+    command: ["postgres", "-c", "max_connections=400"]
+    environment:
+      POSTGRES_USER: boss
+      POSTGRES_PASSWORD: boss
+      POSTGRES_DB: boss
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "boss"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    # Local-dev port for `psql` + the bootstrap CLI hitting the DB
+    # directly. Comment out for an isolated stack.
+    ports:
+      - "5432:5432"
+
+  nats:
+    # alpine variant carries busybox (wget) so the healthcheck below
+    # has a tool to call. The default `nats:2.10` is scratch-based
+    # and ships only the nats-server binary.
+    image: nats:2.10-alpine
+    # -js: JetStream on so audit-log replay works.
+    # -m 8222: enable monitoring port for the healthcheck.
+    command: ["-js", "-m", "8222"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+
+  # -------------------------------------------------------------------
+  # Init — runs once per fresh DB. Applies schema, loads the brewery
+  # 12-month seed, seeds the bootstrap-admin Employee. Exits 0 on
+  # success. The boss-services container waits on it via depends_on.
+  # -------------------------------------------------------------------
+  boss-init:
+    build:
+      context: ../..
+      dockerfile: infra/oss-quickstart/Dockerfile
+    image: boss:latest
+    entrypoint: ["/usr/bin/tini", "--"]
+    command: ["/usr/local/bin/boss-init"]
+    environment:
+      # DATABASE_URL: sqlx-style env var that boss-rebuild-all and
+      # boss-operator-baseline-seed read from when --database-url
+      # isn't passed explicitly. BOSS_POSTGRES_URL is the BOSS-side
+      # name; both point at the same place.
+      DATABASE_URL: postgres://boss:boss@postgres:5432/boss
+      BOSS_POSTGRES_URL: postgres://boss:boss@postgres:5432/boss
+      BOSS_BOOTSTRAP_ADMIN_EMAIL: ${BOSS_BOOTSTRAP_ADMIN_EMAIL:?set BOSS_BOOTSTRAP_ADMIN_EMAIL in .env}
+      BOSS_BOOTSTRAP_ADMIN_PASSWORD: ${BOSS_BOOTSTRAP_ADMIN_PASSWORD:-change-me}
+      BOSS_AUTH_FILE: /var/lib/boss/auth/credentials.toml
+      PGHOST: postgres
+      PGUSER: boss
+      PGPASSWORD: boss
+      PGDATABASE: boss
+    volumes:
+      - boss-auth:/var/lib/boss/auth
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------
+  # BOSS services — every API binary + the brewery sim daemon, in
+  # one container, supervised by a tiny launcher script. The gateway
+  # in this container also serves the SPA static files at /, so the
+  # operator opens http://localhost:4443 to reach the UI.
+  # -------------------------------------------------------------------
+  boss-services:
+    image: boss:latest
+    environment:
+      DATABASE_URL: postgres://boss:boss@postgres:5432/boss
+      BOSS_POSTGRES_URL: postgres://boss:boss@postgres:5432/boss
+      BOSS_NATS_URL: nats://nats:4222
+      # Run boss-clock-api as the sim (formula) clock rather than wall
+      # time: it reads the sim_clock row boss-init seeds (epoch = the
+      # seed's last day, 8640x warp), so the brewery-sim advances
+      # ~1 sim-day per 10 wall-seconds and the playground is live, not
+      # frozen at today's date.
+      BOSS_CLOCK_MODE: sim
+      BOSS_DEFAULT_USER_EMAIL: ${BOSS_BOOTSTRAP_ADMIN_EMAIL:?}
+      # services-launcher.sh seeds the operator-baseline + bootstrap-admin
+      # via the public API once the stack is up (boss-init can't — it runs
+      # pre-API); boss-operator-baseline-seed reads this to inject the
+      # platform-admin login row.
+      BOSS_BOOTSTRAP_ADMIN_EMAIL: ${BOSS_BOOTSTRAP_ADMIN_EMAIL:?}
+      BOSS_STATIC_DIR: /opt/boss/spa
+      BOSS_AUTH_FILE: /var/lib/boss/auth/credentials.toml
+      BOSS_AUTH_PROVIDER: local-auth
+      # Demo Mode: anonymous visitors (no `boss_session` cookie)
+      # get a synthetic `audit-readonly` session — read every
+      # projection, write nothing — so the SPA renders the brewery
+      # immediately without forcing a login. Local-auth login is
+      # still available at /login: bootstrap-admin email + password
+      # upgrades the session to platform-admin (full write access).
+      # Real-tenant deployments should remove this line.
+      BOSS_DEMO_MODE: "1"
+      # Tenant manifest the gateway loads for /api/finance/revenue-categories
+      # and other tenant-scoped lookups. The docker image carries the
+      # brewery seeds at /opt/boss/examples/brewery/seeds/; production
+      # tenants override this path or copy their own manifest to
+      # /etc/boss-gateway/tenant.toml (the default if unset).
+      BOSS_TENANT_MANIFEST_TOML: /opt/boss/examples/brewery/seeds/tenant.toml
+      BOSS_SESSION_KEY: ${BOSS_SESSION_KEY:-please-rotate-me-in-prod-do-not-leak}
+      # Collections loop. boss-dispatcher and boss-brewery-sim share this
+      # container, so the dispatcher PUSHES step.done.<kind> events to its
+      # webhook and the sim RECEIVES them on the same loopback host:port,
+      # driving the counterparty engine (AR-aging payments, courier scans).
+      # The two vars MUST point at the same host:port; unset → zero
+      # collections fire and AR balloons. Real-tenant deployments drop both.
+      BOSS_EVENT_WEBHOOK_URL: http://127.0.0.1:7099/callback
+      BOSS_SIM_CALLBACK_BIND: 127.0.0.1:7099
+      # Step-assignment distribution strategy named as data (default spread:
+      # hash-spread each ready step across its role's active holders;
+      # deterministic). `lowest-id` is the legacy single-holder behavior.
+      # Unknown value → dispatcher warns + falls back to spread.
+      BOSS_DISPATCH_STRATEGY: spread
+      # Rule registry the dispatcher's side-effect runner consumes — the
+      # consumer that system-completes markers + fires produce / invoice-issue
+      # / gate-resolve so multi-step Jobs advance to close. The dispatcher
+      # reads this PATH from the env (NOT the generated /etc toml); unset → the
+      # rules runner never starts → Jobs get assigned + worked but never reach
+      # a terminal state (they pile up `open` unbounded). Shipped into the
+      # image via `COPY infra/dispatcher` in the Dockerfile.
+      BOSS_DISPATCHER_RULES: /opt/boss/infra/dispatcher/rules.toml
+      # Bind on 0.0.0.0 so the docker port-forward (4443:4443)
+      # actually reaches the gateway. The default in
+      # boss-gateway/main.rs is 127.0.0.1, which is right for
+      # systemd-deploy + Caddy-on-host but wrong inside a container.
+      BOSS_LISTEN: 0.0.0.0:4443
+      RUST_LOG: ${BOSS_LOG_LEVEL:-info}
+    volumes:
+      - boss-auth:/var/lib/boss/auth:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      boss-init:
+        condition: service_completed_successfully
+    healthcheck:
+      # Hit `/` (the SPA index) rather than `/healthz`; the gateway
+      # requires auth on the latter by design (file-backed local-auth
+      # session cookie). `/` is unauthenticated since that's where
+      # operators land before logging in.
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:4443/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports:
+      # Gateway exposed on the host. The gateway serves the SPA at
+      # / and proxies /api/* internally to the per-service binaries.
+      - "4443:4443"
+
+volumes:
+  postgres-data:
+  # Credentials file lives in its own volume so a `docker compose
+  # down` (without -v) preserves it across stack restarts.
+  boss-auth:

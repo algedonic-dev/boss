@@ -1,0 +1,201 @@
+//! In-memory adapter for `CommerceRepository`.
+
+use async_trait::async_trait;
+
+use crate::port::{CommerceError, CommerceRepository};
+use crate::types::{Invoice, InvoiceSummary, RevenueLine};
+
+pub struct InMemoryCommerce {
+    invoices: Vec<Invoice>,
+    revenue: Vec<RevenueLine>,
+}
+
+impl InMemoryCommerce {
+    pub fn new(invoices: Vec<Invoice>) -> Self {
+        Self {
+            invoices,
+            revenue: Vec::new(),
+        }
+    }
+
+    pub fn with_revenue(mut self, revenue: Vec<RevenueLine>) -> Self {
+        self.revenue = revenue;
+        self
+    }
+}
+
+#[async_trait]
+impl CommerceRepository for InMemoryCommerce {
+    async fn all_revenue(&self) -> Result<Vec<RevenueLine>, CommerceError> {
+        Ok(self.revenue.clone())
+    }
+
+    async fn all_invoices(&self) -> Result<Vec<Invoice>, CommerceError> {
+        Ok(self.invoices.clone())
+    }
+
+    async fn list_invoices(
+        &self,
+        limit: i64,
+        offset: i64,
+        account_id: Option<&str>,
+    ) -> Result<(Vec<Invoice>, i64), CommerceError> {
+        let filtered: Vec<&Invoice> = match account_id {
+            Some(cid) => self
+                .invoices
+                .iter()
+                .filter(|i| i.account_id == cid)
+                .collect(),
+            None => self.invoices.iter().collect(),
+        };
+        let total = filtered.len() as i64;
+        let start = (offset as usize).min(filtered.len());
+        let end = (start + limit as usize).min(filtered.len());
+        Ok((
+            filtered[start..end].iter().map(|&i| i.clone()).collect(),
+            total,
+        ))
+    }
+
+    async fn invoice_by_id(&self, id: &str) -> Result<Option<Invoice>, CommerceError> {
+        Ok(self.invoices.iter().find(|i| i.id == id).cloned())
+    }
+
+    async fn create_invoice_at(
+        &self,
+        invoice: &Invoice,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Invoice, CommerceError> {
+        if invoice.line_items.is_empty() {
+            return Err(CommerceError::Storage(format!(
+                "invoice {} has no line items",
+                invoice.id
+            )));
+        }
+        let sum: i64 = invoice.line_items.iter().map(|l| l.amount_cents).sum();
+        if sum != invoice.amount_cents {
+            return Err(CommerceError::Storage(format!(
+                "invoice {} amount_cents={} but line items sum to {}",
+                invoice.id, invoice.amount_cents, sum
+            )));
+        }
+        if invoice
+            .line_items
+            .iter()
+            .any(|l| l.currency != invoice.currency)
+        {
+            return Err(CommerceError::Storage(format!(
+                "invoice {} line items disagree on currency with header {}",
+                invoice.id, invoice.currency
+            )));
+        }
+        // In-memory impl has no FG inventory to draw down — return
+        // the invoice unchanged. Tests that depend on enrichment
+        // use the postgres impl.
+        Ok(invoice.clone())
+    }
+
+    async fn mark_invoice_paid_at(
+        &self,
+        id: &str,
+        _paid_on: chrono::NaiveDate,
+    ) -> Result<(), CommerceError> {
+        if !self.invoices.iter().any(|i| i.id == id) {
+            return Err(CommerceError::NotFound(format!("invoice {id}")));
+        }
+        Ok(())
+    }
+
+    async fn mark_invoice_past_due(&self, id: &str) -> Result<(), CommerceError> {
+        if !self.invoices.iter().any(|i| i.id == id) {
+            return Err(CommerceError::NotFound(format!("invoice {id}")));
+        }
+        Ok(())
+    }
+
+    async fn mark_invoice_written_off(&self, id: &str) -> Result<(), CommerceError> {
+        if !self.invoices.iter().any(|i| i.id == id) {
+            return Err(CommerceError::NotFound(format!("invoice {id}")));
+        }
+        Ok(())
+    }
+
+    async fn invoice_summary(
+        &self,
+        _today: chrono::NaiveDate,
+    ) -> Result<InvoiceSummary, CommerceError> {
+        Ok(InvoiceSummary {
+            revenue_ttm: Vec::new(),
+            total_revenue_ttm_cents: 0,
+            total_cogs_ttm_cents: 0,
+            total_gross_margin_ttm_cents: 0,
+            ar_aging: Vec::new(),
+            total_outstanding_cents: 0,
+            total_invoice_count: self.invoices.len() as i64,
+            revenue_by_month: Vec::new(),
+            currency: "USD".to_string(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::*;
+
+    fn test_invoice(id: &str) -> Invoice {
+        Invoice {
+            id: id.to_string(),
+            account_id: "account-001".to_string(),
+            issued_on: chrono::NaiveDate::from_ymd_opt(2025, 3, 15).unwrap(),
+            due_on: chrono::NaiveDate::from_ymd_opt(2025, 4, 15).unwrap(),
+            paid_on: None,
+            status: InvoiceStatus::OUTSTANDING.into(),
+            amount_cents: 1_200_000,
+            currency: "USD".to_string(),
+            tax_cents: 0,
+            tax_jurisdiction: None,
+            payment_method: None,
+            line_items: vec![InvoiceLineItem {
+                id: format!("{id}-l1"),
+                invoice_id: id.to_string(),
+                revenue_category: RevenueCategory::from("new-sales"),
+                amount_cents: 1_200_000,
+                currency: "USD".to_string(),
+                description: "Test line".to_string(),
+                ref_id: None,
+                sku: None,
+                qty: None,
+                cost_basis_cents: None,
+            }],
+        }
+    }
+
+    fn test_repo() -> InMemoryCommerce {
+        InMemoryCommerce::new(vec![
+            test_invoice("inv-001"),
+            test_invoice("inv-002"),
+            test_invoice("inv-003"),
+        ])
+    }
+
+    #[tokio::test]
+    async fn all_invoices_returns_all() {
+        let repo = test_repo();
+        assert_eq!(repo.all_invoices().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn invoice_by_id_found() {
+        let repo = test_repo();
+        let inv = repo.invoice_by_id("inv-002").await.unwrap();
+        assert!(inv.is_some());
+        assert_eq!(inv.unwrap().id, "inv-002");
+    }
+
+    #[tokio::test]
+    async fn invoice_by_id_not_found() {
+        let repo = test_repo();
+        assert!(repo.invoice_by_id("inv-999").await.unwrap().is_none());
+    }
+}

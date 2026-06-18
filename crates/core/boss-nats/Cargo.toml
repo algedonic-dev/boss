@@ -1,0 +1,22 @@
+[package]
+name = "boss-nats"
+description = "NATS adapter for the Boss EventBus port"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+boss-core = { path = "../boss-core" }
+async-nats = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,47 @@
+# Operator-baseline employee hires for BOSS.
+#
+# Per the "tighten the model" correction: the ONLY default
+# platform-level identity this file
+# carries is the system-audit account. Everything else — tenant
+# org-chart figures (CEO/CTO/COO), the deployment owner-operator,
+# integration-test fixtures — belongs in its proper home (tenant
+# seed bundles, test infrastructure).
+#
+# Two platform-level Employees exist in every BOSS deployment:
+#
+#   1. `emp-bootstrap-admin` — INJECTED DYNAMICALLY at the head of
+#      this list by `boss-operator-baseline-seed` when
+#      BOSS_BOOTSTRAP_ADMIN_EMAIL (or the first email in
+#      BOSS_AUTH_FILE) resolves. role=platform-admin. The single
+#      direct write the system needs to bootstrap itself (F2
+#      keystone).
+#
+#   2. `emp-audit` (below) — system audit account. Read on every
+#      projection. Also serves as the demo-mode fallback identity
+#      when a deployment has no other auth wired.
+#
+# Everything else is somebody else's seed:
+#   - Tenant exec teams → `examples/<tenant>/seeds/operator_hires.toml`,
+#     loaded via the API by the tenant's data-seed binary as the
+#     bootstrap-admin actor.
+#   - emp-smoke (boss-testing::SmokeUser) → moved to test fixtures.
+#
+# Loaded by `boss-operator-baseline-seed` during
+# `infra/postgres/bootstrap-db.sh` (BEFORE `boss-rebuild-all`).
+# Idempotent on re-run via per-id existence check.
+
+# emp-audit — system audit account. External auditors / CPAs /
+# SOC-2 reviewers + demo-mode fallback identity. Read on every
+# projection via boss-policy::defaults.
+[[hire]]
+id = "emp-audit"
+name = "System Audit Account"
+email = "audit@boss.example"
+role = "audit-readonly"
+department = "platform"
+hire_date = "2023-01-01"
+location = "loc-hq"
+employment_type = "contractor"
+status = "active"
+skills = []
+certifications = []

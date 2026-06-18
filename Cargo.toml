@@ -1,0 +1,108 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core/boss-clock",
+    "crates/core/boss-clock-client",
+    "crates/core/boss-core",
+    "crates/core/boss-dispatcher",
+    "crates/core/boss-events",
+    "crates/core/boss-expr",
+    "crates/core/boss-gateway",
+    "crates/orchestrators/boss-cli",
+    "crates/core/boss-cybernetics",
+    "crates/core/boss-nats",
+    "crates/core/boss-observability",
+    "crates/modules/boss-catalog",
+    "crates/modules/boss-assets",
+    "crates/modules/boss-assets-client",
+    "crates/tenants/boss-brewery-engine",
+    "crates/tenants/boss-used-device-shop-engine",
+    "crates/modules/boss-accounts",
+    "crates/modules/boss-people",
+    "crates/modules/boss-people-client",
+    "crates/modules/boss-commerce",
+    "crates/modules/boss-inventory",
+    "crates/modules/boss-inventory-client",
+    "crates/modules/boss-catalog-client",
+    "crates/modules/boss-messages",
+    "crates/core/boss-jobs",
+    "crates/core/boss-jobs-client",
+    "crates/modules/boss-shipping",
+    "crates/modules/boss-shipping-client",
+    "crates/orchestrators/boss-sim",
+    "crates/core/boss-docs",
+    "crates/core/boss-ml",
+    "crates/orchestrators/boss-ml-api",
+    "crates/modules/boss-ml-plugins",
+    "crates/core/boss-classes",
+    "crates/core/boss-classes-client",
+    "crates/core/boss-calendar",
+    "crates/core/boss-calendar-client",
+    "crates/core/boss-locations",
+    "crates/core/boss-locations-client",
+    "crates/core/boss-subject-kinds",
+    "crates/core/boss-subject-kinds-client",
+    "crates/core/boss-policy",
+    "crates/core/boss-policy-client",
+    "crates/modules/boss-products",
+    "crates/modules/boss-ledger",
+    "crates/core/boss-content",
+    "crates/core/boss-testing",
+    "crates/orchestrators/boss-rebuild",
+    "crates/core/boss-ports",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Algedonic, LLC"]
+
+# Workspace-wide lint floor — opt-in via `[lints] workspace = true`
+# in each crate's Cargo.toml. As of 2026-05-05 every crate is at 0
+# clippy warnings under `cargo clippy --workspace --all-features`.
+# CI gates regressions via the clippy step in .github/workflows/ci.yml
+# (`cargo clippy --workspace --all-features --tests -- -D warnings`);
+# this section is reserved as the single config point for future
+# ratchets without forcing local-dev shells to deny mid-refactor
+# state. Today it intentionally re-states the cargo defaults so the
+# `[lints] workspace = true` lines in member Cargo.tomls compile
+# without complaint and the structure is in place when we tighten.
+[workspace.lints.rust]
+# `cfg(kani)` is set by cargo-kani during proof runs (boss-ledger
+# carries the `#[kani::proof]` functions today). Register it as a
+# known cfg so regular `cargo build` / `cargo clippy` doesn't warn
+# about an "unexpected" cfg name.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[workspace.lints.clippy]
+# Groups at lower priority so the individual allows below override within them.
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+# Pedantic style/complexity lints a newer clippy started flagging. They are
+# noise, not defects: doc-list continuation formatting, argument-count and
+# type-complexity heuristics the domain signatures legitimately exceed.
+# Allowed so `-D warnings` stays a correctness gate, not a style ratchet.
+doc_lazy_continuation = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+inconsistent_digit_grouping = "allow"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+axum = "0.8"
+tower = "0.5"
+async-nats = "0.47"
+futures = "0.3"
+toml = "0.8"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }

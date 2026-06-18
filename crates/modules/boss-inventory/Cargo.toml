@@ -1,0 +1,56 @@
+[package]
+name = "boss-inventory"
+description = "Parts inventory, stock levels, and purchase orders"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-inventory-api"
+path = "src/bin/boss_inventory_api.rs"
+required-features = ["postgres"]
+
+[[bin]]
+name = "boss-inventory-rebuild"
+path = "src/bin/boss_inventory_rebuild.rs"
+required-features = ["postgres"]
+
+[features]
+default = []
+postgres = ["dep:sqlx", "boss-events/postgres", "boss-ledger/postgres"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"], optional = true }
+
+boss-core = { path = "../../core/boss-core" }
+boss-clock-client = { path = "../../core/boss-clock-client" }
+boss-ports = { path = "../../core/boss-ports" }
+boss-events = { path = "../../core/boss-events" }
+boss-ledger = { path = "../boss-ledger" }
+boss-nats = { path = "../../core/boss-nats" }
+boss-assets-client = { path = "../boss-assets-client" }
+boss-classes-client = { path = "../../core/boss-classes-client" }
+boss-jobs-client = { path = "../../core/boss-jobs-client" }
+boss-policy-client = { path = "../../core/boss-policy-client" }
+boss-shipping-client = { path = "../boss-shipping-client" }
+[dev-dependencies]
+tower = { workspace = true }
+boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
+proptest = "1"
+
+[lints]
+workspace = true

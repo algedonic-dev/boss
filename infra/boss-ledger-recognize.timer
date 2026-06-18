@@ -1,0 +1,22 @@
+[Unit]
+Description=Daily ASC 606 revenue-recognition sweep
+
+[Timer]
+# Fires at 02:00 local daily. Late enough that the previous day's
+# invoices have all posted (fact writes are synchronous with the
+# write tx, so they land with the business action); early enough
+# that any recognition posted for "today" still shows up on the same
+# calendar day's monthly projections.
+OnCalendar=*-*-* 02:00:00
+# If the host was down at fire time (reboot window, planned
+# maintenance), Persistent=true means the sweep runs once on next
+# boot — a missed night only delays recognition by hours, not a
+# whole day.
+Persistent=true
+# Avoid the thundering-herd pattern when the same timer fires on
+# multiple hosts — irrelevant for a single-VM deployment but
+# harmless and forward-compatible.
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

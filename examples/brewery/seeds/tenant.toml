@@ -1,0 +1,1182 @@
+# Tenant config for Algedonic Ales — the public Boss brewery sim.
+#
+# Drives the shape-driven simulator. Sections:
+#
+#   1. [meta]            — tenant identity + sim window
+#   2. [job_rates]       — JobKind creation rates (rows mirror
+#                          job_kinds.toml entries; rate is jobs/day,
+#                          Poisson-sampled)
+#   3. [subject_rates]   — Subject birth rates for the Subject kinds
+#                          the brewery uses
+#   4. [anomalies]       — per-JobKind anomaly probabilities
+#                          (delays, blocks, cancels, batch losses)
+#   5. [counterparty.*]  — external actors (banks, suppliers,
+#                          distributor courier, tax authority)
+#   6. [periodic.*]      — calendar-driven cycles
+#   7. [batch.*]         — population aggregations (payroll +
+#                          tax filings)
+#
+# When the shape-driven sim ships, it loads this file + the
+# job_kinds.toml + classes.toml + locations.toml + employees.json
+# from the same `seeds/` directory and runs end-to-end without
+# brewery-specific Rust code.
+#
+# # Gaps
+# This file also serves as the running list of places the brewery
+# stretched Boss core. Each `# GAP:` comment marks a tenant-driven
+# request for core to grow.
+
+[meta]
+tenant_id = "brewery"
+display_name = "Algedonic Ales"
+seed = 0xdeadbeef
+start_date = "2024-01-02"
+end_date = "2026-04-25"
+# Brewhouse runs Mon-Sat; the taproom is open Wed-Sun. Daily
+# morning-brew fires Mon-Sat. Wholesale keg orders are weekday-heavy;
+# seasonal releases punctuate the calendar.
+operating_days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+# Sub-day-tick — Phase B-1 of the rollout (see
+# crates/orchestrators/boss-sim/src/shape_driven/tenant.rs:295).
+# At "1h" the daemon ticks 24× per sim-day instead of 1×, with the
+# wall-clock budget split evenly (10s/sim-day = ~0.42s/sim-hour).
+# Same per-day expected Job volume — the Poisson sampler scales
+# lambda by tick.day_fraction() so 24 hourly ticks fire roughly the
+# same Job count as 1 daily tick. Visual: events spread across the
+# wall-clock window instead of bursting at midnight, so the
+# flea-circus on the landing page reads as a continuous beat.
+#
+# Phase B-2 mechanisms (operating_hours window-aware ticking,
+# subject_cadence.time_of_day, sub-day periodic cadences like
+# Hourly / EveryNMinutes) are deferred — until they land,
+# cadence rows + Periodic + Batch + Counterparty drains still
+# gate on `is_first_in_day` (fire once per sim-day at tick 0).
+# That's enough to spread Poisson Job creation + step
+# completion + subject birth, which is the visible win.
+tick_duration = "1h"
+
+# ---------------------------------------------------------------------------
+# Modules — which platform surfaces this tenant uses.
+#
+# `true` means the SPA shows the sidebar entry + the tenant is
+# expected to populate the data. `false` means the platform service
+# still runs (it's stateless until written to) but the sidebar entry
+# is hidden + sim generators skip it.
+#
+# Platform crates are NEVER unloaded by this manifest; they're always
+# available. The flag gates *visibility* and *sim population*, not
+# service lifecycle.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Messages — retention horizon for the messages_events trail.
+# ---------------------------------------------------------------------------
+#
+# Messages carry user content (PII, business detail someone might
+# want forgotten), so they ride their own immutable trail
+# (`messages_events`) instead of the compliance-grade `audit_log`.
+# The daily `boss-messages-events-purge.timer` deletes rows older
+# than `events_retention_days` from that trail. `audit_log` itself
+# is never purged.
+#
+# 90 days is conservative for the brewery playground — long enough
+# that an operator can audit a quarter-end without scrambling, short
+# enough that a forgotten DM doesn't linger forever. Tenants with
+# stricter privacy postures can dial this down; tenants in
+# regulated industries should leave the audit_log alone and lengthen
+# this number instead of building a parallel retention story.
+
+[messages]
+events_retention_days = 90
+
+[labels]
+# Brewery-specific terminology overrides for SPA presentation.
+# Keys follow `<page>.<element>` shape. Defaults (what every other
+# tenant sees) are baked into the SPA via `getLabel(key, fallback)`;
+# this block only declares the overrides where the generic device-
+# shop vocabulary lies for this tenant.
+#
+# Add an entry here when (and only when) you find a label that
+# misrepresents what the brewery is. Don't reach for this to
+# tweak adjacent terminology that's merely awkward.
+
+# Sidebar nav label for /assets. Without this override the
+# brewery would see the device-shop-shaped "Fleet" label in the
+# left rail; "Brewing Equipment" reflects what's actually
+# tracked (mash tuns, fermenters, brite tanks, barrels).
+"nav.assets_label"           = "Brewing Equipment"
+
+# /assets — the brewery tracks kegs/barrels (45 BREW-BARREL-*
+# units seeded). "Devices" / "OEM serial" / "Warranty" / "Open SRs"
+# all read as device-shop language; relabel to brewery terms.
+"assets.page_title"          = "tracked vessels"
+"assets.entity_singular"     = "vessel"
+"assets.entity_plural"       = "vessels"
+"assets.serial_label"        = "Vessel ID"
+"assets.tickets_label"       = "Open jobs"
+"assets.empty_state"         = "No vessels match those filters."
+
+# /catalog — brewery catalog is finished products (beer SKUs) +
+# equipment models, not "systems."
+"catalog.page_title"         = "catalog items"
+"catalog.entity_singular"    = "item"
+"catalog.empty_state"        = "No items match those filters."
+
+# /parts — brewery uses parts for ingredients (malt, hops, yeast)
+# + packaging (kegs, cans, bottles). "Parts" technically works
+# but "Ingredients & packaging" reads more honestly.
+"parts.page_title"           = "ingredients & packaging items"
+
+# /support — brewery has a wholesale-account support flow, not
+# field-service to deployed devices. The module gate already
+# hides /support from the sidebar (see [modules].support = false);
+# the label override is defensive in case a deep link surfaces it.
+"support.subtitle"           = "Wholesale account support"
+
+# Revenue categories — the brewery's finance + exec views render
+# wholesale / retail / taproom / etc. The canonical lookup key is
+# `finance.revenue_category.<code>` (used by both /finance and
+# /exec). Without these overrides the SPA falls back to a
+# humanized version of the code ("wholesale" → "Wholesale"),
+# which is fine; these overrides flavor the language for the
+# brewery's specific terminology.
+"finance.revenue_category.wholesale"     = "Wholesale beer"
+"finance.revenue_category.retail"        = "Retail (DTC)"
+"finance.revenue_category.taproom"       = "Taproom pours"
+"finance.revenue_category.event-package" = "Event packages"
+"finance.revenue_category.distribution"  = "Distribution"
+"finance.revenue_category.merchandise"   = "Merchandise"
+"finance.revenue_category.uncategorized" = "Uncategorized"
+
+[modules]
+# Always-on for every tenant — fundamental to running a business.
+jobs        = true   # Jobs + Steps; the coordination primitive
+people      = true   # Employees + Accounts + Vendors
+finance     = true   # GL + invoices + A/R + payroll
+messages    = true   # Inbox: DMs + system signals
+calendar    = false  # The "Release calendar" sidebar entry shows
+                     # forward-scheduled marketing-launch / tap-launch /
+                     # seasonal-release Jobs with explicit release_date
+                     # metadata. The brewery operates event-driven —
+                     # JobKinds fire on Poisson schedules, no
+                     # forward-dated launch calendar. The reservations
+                     # primitive (used by /me/calendar for assignee
+                     # scheduling) is a separate surface and stays on.
+qa          = true   # QA & Compliance hub — already brewery-themed
+                     # (Batch QC + Compliance + Equipment PM tabs).
+                     # Used-device-shop variant of /qa stops existing
+                     # once that page is brewery-shaped; that's fine,
+                     # the device-shop is an example tenant, not a real
+                     # one whose namespace we share.
+
+# Brewery-relevant.
+exec        = true
+hr          = true
+parts       = true   # Brewery uses parts as ingredients + packaging
+warehouse   = true   # Inventory tracking
+shop        = true   # Direct-to-consumer brewery storefront at /shop
+
+equipment   = true   # Brewhouse + cellar + packaging + utility
+                     # equipment seeded under examples/brewery/data/
+                     # {catalog,assets}.json — 10 models, 22 units.
+shipping    = true   # Wholesale keg orders ship via the brewery's
+                     # owned distribution routes; the sim emits
+                     # ~1500 shipments per 365 sim-days (each
+                     # wholesale-keg-order's tier-5 `shipment` step
+                     # fires shipping.create + the keg-courier
+                     # counterparty drops 3 tracking scans). The
+                     # /shipping page renders against the live data.
+support     = false  # Field-service ticketing — device-shop
+                     # concept (a customer's installed system needs
+                     # a tech visit). A brewery does not have field-
+                     # deployed customer equipment to service.
+                     # Customer issues with a delivered keg flow
+                     # through wholesale-keg-order Jobs, not a
+                     # separate field-service queue.
+marketing-assets = true  # Marketing-asset library seeded under
+                     # examples/brewery/data/marketing-assets.json —
+                     # 44 assets covering brand foundation, per-beer
+                     # label artwork (12oz cans + 1/2-BBL + sixtel
+                     # keg stickers across 5 SKUs), tap handles,
+                     # wholesale sales sheets, social-post templates,
+                     # distributor pricing, seasonal release artwork.
+                     # Image files are placeholder URLs — wire a real
+                     # image-gen pipeline post-launch.
+sim         = true   # Simulator surface (admin-gated)
+it          = true   # IT integrations panel (Chase / Stripe / ADP / DOR)
+
+# ---------------------------------------------------------------------------
+# JobKind creation rates (jobs/day at steady state).
+#
+# Sim Poisson-samples each rate per day. Ramps (rate increases over
+# time as the brewery grows) are captured per-kind with [[ramp]]
+# tables; absent ramp = constant rate.
+# ---------------------------------------------------------------------------
+
+[job_rates.morning-brew]
+rate = 2.0
+# Pale Ale brewing days. The 250-BBL brewhouse runs Pale Ale
+# weekdays. Subject is loc-brewery-brewhouse (the only brewhouse
+# Location in `locations.toml`).
+#
+# CLOSED-LOOP PRODUCTION REVIEW (2026-06-14). This kind switched
+# from an open-loop Poisson rate to a `deterministic = true` daily
+# review: exactly one brew is *reviewed* every working day, and the
+# in-flight-aware demand gate (demand-check step) decides whether
+# that review brews or skips. The prior Poisson rate created a
+# cold-start drought — a low-λ kind draws 0 with probability e^−λ,
+# so morning-brew-stout went ~28 days without a single brew at the
+# top of the 365-day regen and Stout finished-goods hit 0 ~day 58.
+# A deterministic daily review makes that drought structurally
+# impossible. See docs/design/brewery-model-completeness.md.
+#
+# The `rate` is the brewhouse's brew-SLOT capacity for this beer per
+# working day — the number of batches the brewmaster can schedule,
+# not how many run. Each weekday the in-flight-aware gate fills each
+# slot from real stock: brew when the cooler (plus brews already in
+# flight) is under the demand-window threshold, skip when it isn't.
+# The gate demand-matches DOWN within the capacity, so the rate only
+# has to clear peak. Pale is high-volume — wholesale pulls ~192
+# FP-PALE-1-2-BBL/day, ~1.3 batches per weekday-equivalent, and one
+# 210-keg batch can't cover a working day — so it runs 2 slots; a
+# 1-slot cap bleeds the cooler dry over weeks. The low-volume kinds
+# (stout/lager/hazy) run 1 slot: one 200-400-keg batch covers many
+# days and the gate skips the surplus. weekday_multiplier 1.0 /
+# weekend_multiplier 0.0 squashes Sat/Sun + every federal holiday
+# (the holiday rule reads weekend_multiplier) so brewers don't brew
+# on days off.
+deterministic = true
+weekday_multiplier = 1.0
+weekend_multiplier = 0.0
+subject_distribution = { "loc-brewery-brewhouse" = 1.0 }
+
+[job_rates.morning-brew-stout]
+rate = 1.0
+# Stout brewing days. Daily deterministic production review (see
+# morning-brew above) — one review per working day, gate decides
+# brew-vs-skip. This kind was the proximate cause of the day-58
+# regen abort: at the old Poisson rate 0.4 it drew zero brews for
+# the first ~28 sim-days (e^−0.4 ≈ 0.67 chance of a zero-draw each
+# day), so Stout finished-goods drained to 0 before the first batch
+# ever landed. A daily review with the in-flight gate behind it
+# pulls production up immediately on cold start and throttles it
+# down once the cooler fills. Production per brew: 100 STOUT-1-2 +
+# 360 STOUT-1-6 (sixtel-heavy because nitro-stout pours run on
+# smaller kegs); the gate's batch_yield reflects the 360 sixtels.
+deterministic = true
+weekday_multiplier = 1.0
+weekend_multiplier = 0.0
+subject_distribution = { "loc-brewery-brewhouse" = 1.0 }
+
+[job_rates.morning-brew-lager]
+rate = 1.0
+# Lager brewing days. Daily deterministic production review (see
+# morning-brew above). Production split is more even (200 LAGER-1-2
+# + 200 LAGER-1-6) because lagers move steady at higher-volume
+# accounts (sports bars, large taprooms). Wholesale consumes 1
+# LAGER-1-6/order today; the 1-2-BBL co-product accumulates in
+# inventory until a future tap-launch / direct-shop variant pulls
+# from it (same trade-off as PALE-1-6 over-accumulation today).
+deterministic = true
+weekday_multiplier = 1.0
+weekend_multiplier = 0.0
+subject_distribution = { "loc-brewery-brewhouse" = 1.0 }
+
+[job_rates.morning-brew-hazy]
+rate = 1.0
+# Hazy IPA brewing days. Daily deterministic production review (see
+# morning-brew above). Extreme sixtel skew (80 HAZY-1-2 + 400
+# HAZY-1-6) because hazies oxidize fast and bars want kegs that turn
+# over in days; the gate's batch_yield reflects the 400 sixtels.
+deterministic = true
+weekday_multiplier = 1.0
+weekend_multiplier = 0.0
+subject_distribution = { "loc-brewery-brewhouse" = 1.0 }
+
+[job_rates.morning-brew-ipa]
+rate = 4.0
+# IPA brewing days. Daily deterministic production review (see
+# morning-brew above). The package step produces FP-IPA-* SKUs (160
+# half-BBLs + 320 sixtels per 250-BBL industrial brew); the gate's
+# batch_yield reflects the 320 sixtels (the bottleneck SKU
+# wholesale consumes).
+#
+# IPA is the flagship — by far the highest-volume beer. Measured demand
+# over the first 121 sim-days was 456 FP-IPA-1-6-BBL/day (8 per wholesale
+# order, ~57 orders/day), 8× every other beer (~57/day each). That is
+# ~2 batches per weekday-equivalent on AVERAGE, and the gate's own peak
+# estimate is 470/day. So 2 slots sat right at the average — no buffer —
+# and the July peak (month ×1.30 atop the weekday surge) drained IPA to
+# zero ~day 99, skipping its sales and 404-ing the A/R collection. The
+# brewhouse therefore dedicates 4 slots to the flagship (vs 2 pale, 1
+# each for the minor beers): that clears peak with margin and builds the
+# buffer that absorbs order bursts. The in-flight-aware gate fills only
+# the slots real stock needs and skips the rest, so 4 is a ceiling, not
+# a commitment — demand-matching still lives in the gate, the rate just
+# has to clear peak, which 2 did not.
+deterministic = true
+weekday_multiplier = 1.0
+weekend_multiplier = 0.0
+subject_distribution = { "loc-brewery-brewhouse" = 1.0 }
+
+# Wholesale account acquisition — the sales-rep funnel from cold
+# outreach through first-order. Subject is a prospect Account
+# (acc-prospect-* pool of 30, seeded by boss-brewery-data-seed).
+# At rate=0.4/day weekday × ~5 weekdays = ~2/week of net-new sale
+# Jobs opening, the /sales pipeline page lights up with active
+# prospecting work without depleting the prospect pool faster than
+# turnover (a real brewery's sales team carries ~10-15 active
+# prospects at any time per rep, with ~30% close rate over 8-12
+# weeks). Q1/Q2 weighted because beer demand peaks summer; reps
+# push hard to get accounts onboarded ahead of the surge.
+[job_rates.sale]
+rate = 0.4
+weekday_multiplier = 1.4
+weekend_multiplier = 0.0
+month_multipliers = { 1 = 1.30, 2 = 1.30, 3 = 1.40, 4 = 1.20, 5 = 0.90, 6 = 0.70, 7 = 0.60, 8 = 0.70, 9 = 1.00, 10 = 1.10, 11 = 1.00, 12 = 0.80 }
+subject_distribution = { "acc-prospect-000" = 0.034, "acc-prospect-001" = 0.034, "acc-prospect-002" = 0.034, "acc-prospect-003" = 0.034, "acc-prospect-004" = 0.034, "acc-prospect-005" = 0.034, "acc-prospect-006" = 0.034, "acc-prospect-007" = 0.034, "acc-prospect-008" = 0.034, "acc-prospect-009" = 0.034, "acc-prospect-010" = 0.034, "acc-prospect-011" = 0.034, "acc-prospect-012" = 0.034, "acc-prospect-013" = 0.034, "acc-prospect-014" = 0.034, "acc-prospect-015" = 0.034, "acc-prospect-016" = 0.034, "acc-prospect-017" = 0.034, "acc-prospect-018" = 0.034, "acc-prospect-019" = 0.034, "acc-prospect-020" = 0.034, "acc-prospect-021" = 0.034, "acc-prospect-022" = 0.034, "acc-prospect-023" = 0.034, "acc-prospect-024" = 0.034, "acc-prospect-025" = 0.034, "acc-prospect-026" = 0.034, "acc-prospect-027" = 0.034, "acc-prospect-028" = 0.034, "acc-prospect-029" = 0.014 }
+
+[job_rates.wholesale-keg-order]
+# Steady state targets the ~$30M/yr playground revenue line. With
+# wholesale-keg-order metadata_defaults at $2,400/invoice (4 1/2-BBL
+# Pale + 8 IPA sixtels — see job_kinds.toml comment for the rebalance
+# rationale), 35 orders/day × 365 days ≈ $30.6M, with seasonal-release
+# + restock rounding the rest. Pre-2025-04 rates ramp from launch
+# through growth so the historical chart shows arc, not a step.
+rate = 48.0  # ~48 orders/day at steady state (scaled from 35 for a
+             # profitable revenue line: 48 × $2,850 × 365 ≈ $50M wholesale,
+             # which covers the ~$29M payroll + COGS + OpEx with margin.
+             # Production (morning-brew 1.5 / -ipa 1.9) scaled in lockstep
+             # so peak demand stays under brewhouse capacity.
+# Distributors order Mon-Fri. Some weekend trickle from
+# direct-shop-order accounts that route to wholesale-keg
+# fulfillment. (5×1.3 + 2×0.25 = 7.0 → preserves weekly mean.)
+weekday_multiplier = 1.3
+weekend_multiplier = 0.25
+# Beer demand has a strong seasonal curve. Summer + holiday
+# surges, late-winter trough. Yearly mean stays at the rate
+# above by construction (sum of monthly multipliers / 12 ≈ 1.0).
+month_multipliers = { 1 = 0.75, 2 = 0.80, 3 = 0.95, 4 = 1.05, 5 = 1.15, 6 = 1.25, 7 = 1.30, 8 = 1.20, 9 = 1.05, 10 = 0.95, 11 = 1.05, 12 = 1.20 }
+[[job_rates.wholesale-keg-order.ramp]]
+date = "2024-01-02"
+rate = 8.0  # eight distributors at launch
+[[job_rates.wholesale-keg-order.ramp]]
+date = "2024-07-01"
+rate = 18.0
+[[job_rates.wholesale-keg-order.ramp]]
+date = "2025-01-01"
+rate = 28.0
+[[job_rates.wholesale-keg-order.ramp]]
+date = "2025-04-01"
+rate = 48.0
+# Per-Account ordering cadence — twelve regulars who fire
+# deterministically on a fixed weekday, on top of the Poisson
+# noise. Models real distributor behavior: dock-day truck routes
+# pin most accounts to one weekday. Stacks with the Poisson rate;
+# the rate above stays the steady-state average across all
+# accounts so the cadence rows produce visible weekday clustering
+# without inflating yearly volume materially.
+[[job_rates.wholesale-keg-order.subject_cadence]]
+subject_id = "acc-bigseed-0000"
+weekday = "Mon"
+[[job_rates.wholesale-keg-order.subject_cadence]]
+subject_id = "acc-bigseed-0001"
+weekday = "Tue"
+[[job_rates.wholesale-keg-order.subject_cadence]]
+subject_id = "acc-bigseed-0002"
+weekday = "Wed"
+[[job_rates.wholesale-keg-order.subject_cadence]]
+subject_id = "acc-bigseed-0003"
+weekday = "Thu"
+[[job_rates.wholesale-keg-order.subject_cadence]]
+subject_id = "acc-bigseed-0004"
+weekday = "Fri"
+[[job_rates.wholesale-keg-order.subject_cadence]]
+subject_id = "acc-bigseed-0005"
+weekday = "Mon"
+[[job_rates.wholesale-keg-order.subject_cadence]]
+subject_id = "acc-bigseed-0006"
+weekday = "Tue"
+[[job_rates.wholesale-keg-order.subject_cadence]]
+subject_id = "acc-bigseed-0007"
+weekday = "Thu"
+# Two biweekly regulars — alternate-week rotation simulates the
+# bars that get a dock truck only every other Mon/Fri.
+[[job_rates.wholesale-keg-order.subject_cadence]]
+subject_id = "acc-bigseed-0008"
+weekday = "Mon"
+biweekly_offset = 0
+[[job_rates.wholesale-keg-order.subject_cadence]]
+subject_id = "acc-bigseed-0009"
+weekday = "Mon"
+biweekly_offset = 1
+[[job_rates.wholesale-keg-order.subject_cadence]]
+subject_id = "acc-bigseed-0010"
+weekday = "Fri"
+biweekly_offset = 0
+[[job_rates.wholesale-keg-order.subject_cadence]]
+subject_id = "acc-bigseed-0011"
+weekday = "Fri"
+biweekly_offset = 1
+
+[job_rates.seasonal-release]
+# A seasonal/limited release is a real production+launch program, not a
+# weekly event: recipe design, a pilot batch, a tasting sign-off, then a
+# short full batch before the launch date. A craft brewery runs on the
+# order of a couple dozen of these a year — a monthly seasonal core plus
+# occasional collabs, firkin launches, and barrel-program drops — NOT one
+# every few days. The prior 0.3/day (≈ 0.3 × 365 × 1.083 month-avg ≈
+# 119/yr) over-spawned the pipeline ~4× past a believable program and far
+# past what the launch chain can carry, so releases piled up unworked at
+# the front of the pipeline instead of flowing through to a launch.
+# 0.075/day × 365 × 1.083 month-avg ≈ 30/yr — ~2-3 releases a month, a
+# strong-but-realistic limited-release calendar that actually completes.
+rate = 0.075  # ~30/yr — monthly seasonal core + occasional collabs/firkins/barrel drops
+# Releases skew toward the end of the week so they hit Friday
+# crowds. (5×1.0 + 2×1.0 = 7 → neutral.)
+weekday_multiplier = 1.0
+weekend_multiplier = 1.0
+# Most releases land at season inflection points: spring saison,
+# summer fest beers, fall pumpkin/Oktoberfest, winter strong ales.
+# Light dip in the deepest winter / midsummer lulls.
+month_multipliers = { 1 = 0.5, 2 = 0.7, 3 = 1.3, 4 = 1.2, 5 = 1.0, 6 = 0.9, 7 = 0.7, 8 = 1.0, 9 = 1.5, 10 = 1.5, 11 = 1.3, 12 = 1.4 }
+
+[job_rates.ingredient-restock]
+# Demand-driven only — NO periodic baseline. Ingredient restock is
+# fired purely by the dispatcher's `spawn-restock-on-low-inventory`
+# rule (`on_hand <= reorder_point AND NOT open_po_exists`), which
+# delivers ~a month of consumption per order (see the restock
+# JobKind's expected_items). A periodic baseline here is actively
+# harmful: its open PO trips the open-PO dedup and *caps* the
+# demand-driven reorder at the periodic rate — which starves the
+# realistic 250-BBL grain bill and drains raw inventory to zero
+# (the day-~80 stall). Threshold + dedup self-paces supply to demand.
+rate = 0.0  # demand-driven via auto-reorder rule; no baseline cadence
+# Subject distribution drawn across all active Vendors in the
+# vendor_categories Class taxonomy. Sim picks proportionally to
+# subject_distribution; if absent, uniform over actives.
+# Suppliers ship Mon-Fri; weekend orders queue for Monday.
+weekday_multiplier = 1.4
+weekend_multiplier = 0.0
+
+[job_rates.equipment-preventive-maintenance]
+rate = 0.07  # ~1 every 2 weeks
+# Maintenance techs work weekdays.
+weekday_multiplier = 1.4
+weekend_multiplier = 0.0
+subject_distribution = { "loc-brewery-brewhouse" = 1.0 }
+
+[job_rates.tap-launch]
+# Bumped 0.04 → 0.12 (#99 follow-up): the original rate was
+# realistic for a brewery's actual launch cadence (~3/quarter) but
+# made the demo feel like tap-launches never fired. 0.12 ≈ 1/week
+# keeps the marketing surface visibly active in the playground.
+rate = 0.12  # ~1/week
+# Tap launches skew Thu-Sat to land on the bar's busy nights.
+# (5×0.7 + 2×1.75 = 7.0 → preserves weekly mean.)
+weekday_multiplier = 0.7
+weekend_multiplier = 1.75
+# Bars launch new taps to align with seasonal beer cycles.
+month_multipliers = { 1 = 0.6, 2 = 0.8, 3 = 1.2, 4 = 1.1, 5 = 1.1, 6 = 1.0, 7 = 0.9, 8 = 1.0, 9 = 1.4, 10 = 1.4, 11 = 1.2, 12 = 1.3 }
+
+# Direct-shop e-commerce traffic — the brewery's DTC storefront
+# (apps/web/src/shop) creates one Job per checkout via POST
+# /api/jobs. This rate models the autonomous half: simulated
+# customer arrivals open direct-shop-order Jobs as the sim-clock
+# ticks, so the demo's flea-circus visual gets public traffic
+# instead of only operator-clicked orders.
+#
+# The e-commerce customer is a first-class actor.
+# v1 ships subject_kind=account against the catch-all
+# `acc-direct-shop` Account (seeded by boss-brewery-data-seed); a
+# `customer` SubjectKind + per-customer pool comes in a follow-up
+# once tenants need per-customer purchase history. The demo
+# value of "watch orders land" doesn't require per-customer
+# identity yet.
+#
+# Rate: ~3-5 orders/day weekday. /shop traffic skews evenings
+# + weekends in real life, so weekend_multiplier is non-zero
+# (unlike production / wholesale flows). Seasonal modulation
+# tracks consumer beer demand: summer + holiday peaks, late-
+# winter trough.
+[job_rates.direct-shop-order]
+rate = 8.0  # scaled from 3.5 — monetizes the surplus PALE-1-6 sixtels
+            # the brewery over-produces (wholesale buys PALE-1-2, not -1-6)
+weekday_multiplier = 1.0
+weekend_multiplier = 1.4   # weekend bumps demand
+month_multipliers = { 1 = 0.7, 2 = 0.7, 3 = 0.9, 4 = 1.0, 5 = 1.2, 6 = 1.4, 7 = 1.5, 8 = 1.3, 9 = 1.0, 10 = 0.9, 11 = 1.1, 12 = 1.3 }
+subject_distribution = { "acc-direct-shop" = 1.0 }
+
+# Taproom by-the-pour shift close — monetizes surplus sixtels/half-BBLs at
+# retail. ~1/operating day, busiest Fri-Sun. ~$5.7M/yr → Revenue-Taproom.
+[job_rates.taproom-shift-close]
+rate = 1.0
+weekday_multiplier = 0.8
+weekend_multiplier = 1.5  # taproom traffic peaks Fri-Sun
+subject_distribution = { "acc-direct-shop" = 1.0 }
+
+# Bulk distribution pulls of surplus co-product kegs. Weekday-heavy (dock
+# days). ~$5.5M/yr → Revenue-Distribution. Together with taproom this lifts
+# the revenue mix off ~98% wholesale toward a diversified book.
+[job_rates.distribution-contract]
+rate = 1.0
+weekday_multiplier = 1.3
+weekend_multiplier = 0.25
+subject_distribution = { "acc-bigseed-0000" = 1.0 }
+
+# brewery-hire + brewery-terminate are RATE = 0 today.
+#
+# The JobKind has `subject_kinds = ["employee"]`, which means the
+# engine picks an EXISTING employee as the Job subject. That's the
+# wrong shape for a hire — a hire job should target a candidate
+# (no employee yet) and bind to a new id at the offer step. With
+# the existing wiring, brewery-hire fires against random existing
+# employees with empty `role_target` metadata and produces no real
+# hire — it's noise that clutters the audit_log + occasionally
+# creates duplicate jobs against the same subject (e.g. two
+# brewery-hire Jobs both targeting emp-aa-557 in the current
+# bundle; observed 2026-05-05).
+#
+# Same shape problem for brewery-terminate. The 750-employee
+# roster from `examples/brewery/seeds/employees.json` already
+# delivers the demo's "real-brewery headcount" feel; sim-driven
+# turnover doesn't add visible value until the hire JobKind is
+# rewritten to target candidates instead of existing employees
+# (filed as TODO under "Fix duplicate executive hires").
+#
+# Rates set to 0 keeps the JobKinds in the registry (so an
+# operator can still walk one through the SPA manually) while
+# stopping the sim from emitting them.
+[job_rates.brewery-hire]
+rate = 0.0
+weekday_multiplier = 0.0
+weekend_multiplier = 0.0
+
+[job_rates.brewery-terminate]
+rate = 0.0
+weekday_multiplier = 0.0
+weekend_multiplier = 0.0
+
+# ---------------------------------------------------------------------------
+# Subject birth rates — how often new instances of each Subject
+# appear, independent of any Job creating them.
+# ---------------------------------------------------------------------------
+
+[subject_rates.account]
+# Wholesale-keg + taproom-event customers. Each Job that opens
+# against an account that doesn't yet exist gets one created on the
+# fly; this rate covers explicit "new distributor signed" events too.
+rate = 0.15
+# Audit_log topic emitted when a synthesized account is born.
+# Without this the pool grows silently and downstream
+# `commerce.invoice.created` events reference accounts that never
+# entered audit_log → projection rebuild silently drops the
+# invoice. The integrity check at /usr/local/bin/boss-audit-integrity-check
+# also runs `commerce.invoice.created.account_id →
+# accounts.account.created.id` as a soft-FK rule.
+created_event_kind = "accounts.account.created"
+
+[subject_rates.vendor]
+# New supplier added when an existing one stops carrying a SKU
+# (e.g. hops contract reassigned, yeast bank dropped a strain).
+rate = 0.02
+# Audit_log topic for synthesized vendor births. Pairs with the
+# `inventory.purchase_order.upserted.vendor_id →
+# inventory.vendor.created.id` and `inventory.vendor_invoice.upserted.vendor →
+# inventory.vendor.created.id` soft-FK rules.
+created_event_kind = "inventory.vendor.created"
+
+[subject_rates.employee]
+# Sim-driven hiring is owned by the brewery-hire JobKind; this rate
+# is for non-Job employee creation (e.g., backfilling the seeded
+# roster). Set to zero — employees come from `employees.json` +
+# brewery-hire Jobs. No `created_event_kind` because rate=0 means
+# no births fire; if/when that flips, set it to
+# `people.employee.created`.
+rate = 0.0
+
+[subject_rates.campaign]
+# Tap launches + seasonal promos.
+rate = 0.04
+# Audit_log topic for synthesized campaign births. No soft-FK
+# rule yet — campaigns are referenced by `tap-launch` Jobs as
+# Subject, not as a foreign id field — but emitting the event
+# preserves replay parity for any future references.
+created_event_kind = "commerce.campaign.created"
+
+# ---------------------------------------------------------------------------
+# Anomaly probabilities — likelihood that a Step on a given JobKind
+# experiences a given anomaly during its execution. Sim rolls these
+# at step in-progress → done time.
+# ---------------------------------------------------------------------------
+
+[anomalies.morning-brew]
+delay_probability = 0.05      # stuck mash, slow lauter, reset
+batch_loss_probability = 0.01 # contamination / dump-the-batch
+
+[anomalies.wholesale-keg-order]
+delivery_late_probability = 0.04
+short_count_probability = 0.02
+
+[anomalies.seasonal-release]
+recipe_revision_probability = 0.20  # two iterations is normal
+cancel_probability = 0.05
+
+[anomalies.ingredient-restock]
+short_ship_probability = 0.07
+quality_reject_probability = 0.02
+
+[anomalies.equipment-preventive-maintenance]
+extends_to_repair_probability = 0.10  # preventive maintenance finds something real
+
+[anomalies.tap-launch]
+test_batch_revision_probability = 0.40
+
+[anomalies.brewery-hire]
+candidate_dropoff_probability = 0.15
+post_offer_decline_probability = 0.10
+
+# ---------------------------------------------------------------------------
+# # Gaps — places the brewery had to stretch a Boss-core primitive.
+# Each entry is a unblockable for Boss-core simplification work.
+# ---------------------------------------------------------------------------
+
+# GAP 1 + 2: Recipe and Equipment are not Subjects.
+#   RESOLVED (Phase A) — `subject_kinds` table + the
+#   boss-subject-kinds crate (port + in-memory + Postgres + HTTP API)
+#   + the boss-subject-kinds-client crate ship the data layer for
+#   the SubjectKind registry. Schema seeds 8 system-owned rows
+#   matching the prior `boss-core::SUBJECT_KINDS` const exactly;
+#   the brewery's `seeds/subject_kinds.toml` adds two tenant-owned
+#   rows (recipe, equipment) so future Subject::Custom values with
+#   custom_kind='recipe' or 'equipment' are recognized kinds.
+#
+#   Phase B (deferred) — boss-jobs and boss-people validate
+#   Subject::Custom { custom_kind } against the registry on writes
+#   (same shape as Class / Location validators that landed in the
+#   employees.role / employees.location lifts).
+#
+#   Phase C (deferred) — `boss-core::is_known_subject_kind` flips
+#   from constant lookup to registry lookup, the SUBJECT_KINDS
+#   const retires, and template expansion in
+#   `boss-jobs::registry::subject_fields` treats registered
+#   tenant kinds the same as system kinds.
+#
+# GAP 3: Practice → Account rename.
+#   RESOLVED — `Subject::Practice` is now `Subject::Account` in
+#   boss-core; `practices` table → `accounts`; `practice_id`
+#   columns → `account_id`; `practice_account_team` table →
+#   `account_team_members`; SPA route `/practices` → `/accounts`;
+#   28+ Rust crates and the SPA had `practice` → `account` /
+#   `Practice` → `Account` rewritten in one mechanical pass. The
+#   brewery's wholesale-keg-order + seasonal-release JobKinds now
+#   target `subject_kinds = ["account"]` directly, no more
+#   "Account is close-but-not-quite" framing.
+#
+#   What remains (deferred): an `account_type` Class registry
+#   under (subject_kind='account', member_attribute='type') so
+#   tenants distinguish their Account flavors — the
+#   used-device-shop tenant gets account_type='service-account',
+#   brewery gets account_type='wholesale-customer'. That lift comes
+#   when the AccountType + boss-accounts crate work lands per
+#   TODO.md.
+#
+# GAP 4: StepType registry doesn't carry sim-affordance fields.
+#   RESOLVED — `crates/core/boss-jobs/src/step_registry.rs` StepType
+#   gained `typical_duration_hours`, `typical_duration_jitter`,
+#   `required_roles`; FieldSpec gained `faker_hint`. All 31 step
+#   types in the v1() registry carry per-kind durations + jitter
+#   tuned to wall-clock work shape (e.g. repair 8h, approval 4h,
+#   milestone 0h-instant). The shape-driven sim reads these
+#   directly off `StepRegistry::get(kind)` instead of carrying
+#   per-domain Rust generators.
+#
+# GAP 5: JobKind doesn't declare cross-Job triggers.
+#   RESOLVED (data shape) — `JobKindSpec` gained
+#   `on_complete_create: Vec<JobTrigger>` and the `job_kinds` table
+#   gained an `on_complete_create JSONB` column with `[]` default.
+#   Each `JobTrigger` carries a kind + subject_source +
+#   metadata_seed; round-trips through JSON cleanly.
+#
+#   The runtime that actually fires triggers when a Job closes is
+#   shipped separately — likely a NATS subscriber inside
+#   boss-jobs-api that reads the closing Job's JobKind, walks
+#   on_complete_create, and spawns child Jobs. Brewery doesn't yet
+#   need it (billing tier closes the loop in-Job); the data shape
+#   is here so a follow-up tenant or the used-device-shop migration
+#   off-Rust can declare triggers without further schema changes.
+
+# ---------------------------------------------------------------------------
+# Random shocks — quarterly probabilistic events that bump a
+# JobKind's rate (or one Subject's draws) for a fixed window.
+# Models real-world disruption that a steady Poisson rate misses.
+# Empty `target.subject_id` + empty `subject_id_pattern` =
+# kind-wide multiplier. With `subject_id_pattern` the engine picks
+# one matching subject at activation and locks it in for the
+# window.
+# ---------------------------------------------------------------------------
+
+# Supply-chain shock: malt or hops shortage dampens every brew run
+# for ~3 weeks. ~5%/qtr ≈ once every five quarters on average.
+[[shock]]
+name = "supply-shortage"
+probability_per_quarter = 0.05
+rate_multiplier = 0.5
+duration_weeks = 3
+target = { kind = "morning-brew" }
+
+# Viral-bar surge: one wholesale account doubles its order rate
+# for ~6 weeks. ~10%/qtr → roughly twice a year. Engine picks one
+# acc-bigseed-* account at random when the shock activates.
+[[shock]]
+name = "viral-bar"
+probability_per_quarter = 0.10
+rate_multiplier = 2.0
+duration_weeks = 6
+target = { kind = "wholesale-keg-order", subject_id_pattern = "acc-bigseed-*" }
+
+# Counterparty-delay shocks — `target = { counterparty = "<spec name>" }`
+# multiplies the SAMPLED DELAY of every emission from that counterparty.
+# rate_multiplier > 1.0 = slower, < 1.0 = faster. Stacks multiplicatively
+# with other counterparty shocks targeting the same name. Disabled by
+# default so steady-state observation isn't disrupted; uncomment to
+# exercise the path.
+#
+# [[shock]]
+# name = "ach-clearing-degraded"
+# probability_per_quarter = 0.05
+# rate_multiplier = 3.0   # bank-ach takes ~3x as long to settle
+# duration_weeks = 2
+# target = { counterparty = "bank-ach" }
+
+# Counterparties — external actors that listen for BOSS events and
+# emit a deferred response after a delay, with optional
+# probability-of-loss (docs/architecture-decisions.md §Simulator).
+#
+# v1 has one pilot: bank-ach. When the brewery's HumanWorker engine
+# closes a Job, the bank settles ~1 business day later, with a small
+# loss rate covering NSF + other failures. The settlement event
+# lands on the bus + on the SimOutput as `ledger.payment_settled`,
+# routed by LiveApiOutput's topic→endpoint map (Phase 4 work).
+# ---------------------------------------------------------------------------
+
+[counterparty.bank-ach]
+listens_to = "commerce.invoice.paid"
+emits = "ledger.payment_settled"
+emit_probability = 0.985
+
+  [counterparty.bank-ach.delay]
+  mean_days = 1.0
+  spread_days = 0.5
+  business_calendar = "us-banking"
+
+  [counterparty.bank-ach.payload]
+  channel = "ach"
+  bank = "chase"
+
+# A/R aging — every billing step.done schedules either a
+# paid or past-due emit ~30 business days later. `emit_else`
+# splits the same probability roll into mutually exclusive
+# branches: 97% Paid, 3% PastDue, 0% both, 0% neither.
+# (Without emit_else, two parallel specs would roll
+# independently and produce both/neither leaks.)
+#
+# Listens on `step.done.billing`. In live-api the CounterpartyEngine
+# can't subscribe to the system's event stream (that would cross the
+# sim/system boundary), so the dispatcher's `webhook.notify` forwards
+# this event to the engine's callback receiver, which feeds it onto
+# the bus. The spec keeps deriving the invoice id from the step
+# (`inv-step-{step_id}`), so the emit/route templates are unchanged.
+# The old +30d 404 risk (invoice not yet created) is closed by
+# JetStream redelivery landing the InvoiceIssueEmitter side-effect
+# before collection.
+#
+# Routed in `register_default_event_routes`:
+#   commerce.invoice.paid     → PUT .../paid
+#   commerce.invoice.past_due → PUT .../past-due
+[counterparty.ar-aging]
+listens_to = "step.done.billing"
+emits = "commerce.invoice.paid"
+emit_else = "commerce.invoice.past_due"
+emit_probability = 0.97
+
+  [counterparty.ar-aging.delay]
+  mean_days = 30.0
+  spread_days = 7.0
+  business_calendar = "us-banking"
+
+# Past-due → write-off. The small past-due bucket (~3%, see ar-aging
+# above) is bad debt: an industrial brewer sells to licensed, vetted
+# distributors, so ~97% pay on net-30 and the ~3% that go past-due are
+# written off after 60 business days — a realistic ~3%-of-sales B2B
+# bad-debt rate. (v1 paired this 100% write-off with an 85/15 ar-aging
+# split → a ruinous 15% bad-debt rate; the fix lifted the on-time rate to
+# 97%, leaving the write-off behavior intact.) The richer reality — most
+# past-due COLLECTS late (net-60) rather than defaulting, a true A/R aging
+# — needs a past-due→paid transition + a depth-aware bank-settlement chain
+# the system lacks today; tracked as a POST-RELEASE model-polish feature.
+#
+# Routed in `register_default_event_routes`:
+#   commerce.invoice.written_off → PUT .../write-off (DR 6700 Bad Debt / CR 1100 A/R)
+[counterparty.bad-debt-writeoff]
+listens_to = "commerce.invoice.past_due"
+emits = "commerce.invoice.written_off"
+emit_probability = 1.0
+
+  [counterparty.bad-debt-writeoff.delay]
+  mean_days = 60.0
+  spread_days = 14.0
+  business_calendar = "us-banking"
+
+# Grain supplier — three-hop A/P chain. PO sent → vendor invoice
+# arrives ~3 days later → AP cuts a check ~5 days after match. The
+# loss rate stays at 1.0 here; vendor disputes are anomaly-layer
+# concerns (Q4 in sim-engines.md). Listens to
+# `step.done.procurement` — the shape-driven engine emits one of
+# those per-completed `procurement` step (e.g. the
+# `ingredient-restock` JobKind's "Place order" step). The
+# `match_payload` predicate gates the counterparty on the parent
+# Job's Subject so this hop only fires for grain-vendor procurement
+# events; hops, yeast, and other categories route to their own
+# counterparties below.
+# Success-gated (step.completed.procurement) — same reason as
+# ar-aging: the procurement step's side-effects materialize the
+# PO row the vendor invoice will reference. If they failed,
+# emitting the vendor invoice would dangle.
+[counterparty.grain-supplier]
+listens_to = "step.done.procurement"
+emits = "inventory.vendor_invoice_received"
+emit_probability = 1.0
+match_payload = { "subject_id" = "vnd-riverside-malt" }
+
+  [counterparty.grain-supplier.delay]
+  mean_days = 3.0
+  spread_days = 1.5
+  business_calendar = "us-banking"
+
+  [counterparty.grain-supplier.payload]
+  vendor = "riverside-malting"
+
+  [[counterparty.grain-supplier.followups]]
+  name = "ap-pay"
+  listens_to = "inventory.vendor_invoice_received"
+  emits = "ap.payment_acknowledged"
+  emit_probability = 0.97
+
+    [counterparty.grain-supplier.followups.delay]
+    mean_days = 5.0
+    spread_days = 2.0
+    business_calendar = "us-banking"
+
+    [counterparty.grain-supplier.followups.payload]
+    method = "ach"
+
+# Hops supplier — second per-vendor procurement counterparty
+# demonstrating the `match_payload` predicate. Same shape as
+# grain-supplier, different subject_id, slightly tighter delays
+# (yard-direct hops ship next-day during harvest). Without
+# `match_payload` both counterparties would fire on every
+# procurement event regardless of which vendor the Job was about —
+# see `engines::CounterpartyEngine::match_payload` for the
+# semantics.
+[counterparty.hops-supplier]
+listens_to = "step.done.procurement"
+emits = "inventory.vendor_invoice_received"
+emit_probability = 1.0
+match_payload = { "subject_id" = "vnd-cascade-hops" }
+
+  [counterparty.hops-supplier.delay]
+  mean_days = 1.5
+  spread_days = 0.5
+  business_calendar = "us-banking"
+
+  [counterparty.hops-supplier.payload]
+  vendor = "cascade-hop-yard"
+
+# Keg-courier — multi-stage chain via the `scans` sugar. Each scan
+# emits `delivery.tracking_<status>` with the status field +
+# stage_index. ~3% loss rate covers driver no-shows, refused
+# deliveries, dropped kegs, etc. The scan chain stops on the first
+# failed probability roll (a real lost shipment never gets a
+# "delivered" scan), which is the honest behavior. Trigger is the
+# per-step-kind topic the shape-driven engine emits when a
+# `shipment` step transitions to done — the wholesale-keg-order
+# JobKind's tier-5 "Deliver" step lands the courier on the bus
+# naturally.
+# Success-gated (step.completed.shipment) — the shipment step's
+# `shipping.create` side-effect creates the row that tracking
+# scans target via `ship-step-{step_id}`. If shipping.create
+# failed, the scans would PUT against a phantom shipment id.
+[counterparty.keg-courier]
+listens_to = "step.done.shipment"
+emits = "delivery.tracking"
+emit_probability = 0.97
+
+  [counterparty.keg-courier.delay]
+  # Unused by the scans path — each scan carries its own delay.
+  # Kept so the loader's required-field check passes.
+  mean_days = 0.0
+  spread_days = 0.0
+
+  [counterparty.keg-courier.payload]
+  carrier = "in-house-route"
+
+  [[counterparty.keg-courier.scans]]
+  status = "in-transit"
+  delay = { mean_days = 0.5, spread_days = 0.25 }
+
+  [[counterparty.keg-courier.scans]]
+  status = "out-for-delivery"
+  delay = { mean_days = 0.5, spread_days = 0.25 }
+
+  [[counterparty.keg-courier.scans]]
+  status = "delivered"
+  delay = { mean_days = 0.25, spread_days = 0.1 }
+
+# ---------------------------------------------------------------------------
+# Periodic — calendar-driven cycles independent of any Boss event.
+# Pilots: daily bank-clearing sweep, monthly equipment preventive maintenance,
+# quarterly sales-tax filing. Each fires at its cadence + anchor;
+# the LiveApiOutput topic→endpoint map (Phase 4) routes them to the
+# right service. Payroll moved to [batch.payroll] below — periodic
+# can fire-and-forget events but it can't honestly aggregate over a
+# population (docs/architecture-decisions.md §Simulator).
+# ---------------------------------------------------------------------------
+
+[periodic.daily-bank-sweep]
+cadence = "daily"
+anchor_date = "2024-01-02"
+business_calendar = "us-banking"
+action.kind = "emit_event"
+action.topic = "ledger.bank_sweep_request"
+
+# Daily AP payment run. Opens an ap-payment-run Job on the
+# brewery location every business day. The Job's side-effect
+# handler queries vendor_invoices status=approved + due_on
+# within metadata.window_days, batches them, marks paid. Drains
+# the 2100 AP credits into 1000 Cash via finance.bill.paid
+# facts so books reflect actual cash positions. #128.
+#
+# Anchored on the sim's second day (2025-04-02), not the first:
+# opening a role-bearing Job on the regen's very first sim-day races
+# the dispatcher's people-roster cache before it warms (the tier-0
+# `bookkeeper` step would find no eligible employee). The dispatcher
+# now NAKs + redelivers a missed assignment until the roster warms,
+# so this is belt-and-suspenders rather than the primary fix — but
+# keeping the first AP run off the cold-roster window is cheap, and
+# the brewery has nothing due on its opening day anyway. (Daily
+# cadence fires every business day on/after the anchor; the epoch is
+# fixed at 2025-04-01, so a 2nd-day anchor is the daily-cadence
+# analogue of the monthly-facility-overhead day-5 anchor below.)
+[periodic.daily-ap-payment]
+cadence = "daily"
+anchor_date = "2025-04-02"
+business_calendar = "us-banking"
+action.kind = "open_job"
+action.job_kind = "ap-payment-run"
+action.subject_kind = "location"
+action.subject_id = "loc-brewery-brewhouse"
+
+[periodic.equipment-preventive-maintenance]
+cadence = "monthly"
+anchor_date = "2024-01-15"
+action.kind = "open_job"
+action.job_kind = "equipment-preventive-maintenance"
+action.subject_kind = "location"
+action.subject_id = "loc-brewery-brewhouse"
+
+# Monthly facility overhead — rent + utilities for the brewery facility.
+# Anchored on the 5th (bills due mid-month, not midnight-of-day-1): firing
+# on a regen's very first sim-day races the dispatcher's people-roster cache
+# (the single monthly approval step would 404 "no eligible employee" before
+# the roster warms, and the dispatcher doesn't retry a missed assignment —
+# tracked as a follow-up). Day-5 fires once the roster is loaded and still
+# leaves ample runway to close inside a 14-day window. Opens
+# facility-overhead on the brewery location; the JobKind approves rent
+# (→6200) + utilities (→6300) through the ledger AP subledger, then pays
+# them. ~$3.6M/yr of OpEx the brewery's P&L was previously missing.
+[periodic.monthly-facility-overhead]
+cadence = "monthly"
+anchor_date = "2024-01-05"
+action.kind = "open_job"
+action.job_kind = "facility-overhead"
+action.subject_kind = "location"
+action.subject_id = "loc-brewery-brewhouse"
+
+# Each `[periodic.*]` open_job spec MUST set subject_kind +
+# subject_id — `open_job_from_request` silently drops the
+# request when either is missing (the brewery's prior
+# sales-tax-filing periodic never fired for months because of
+# this; caught 2026-05-06 during Stage 4 of the BatchEngine
+# rip). The four finance-cadence specs below all anchor on
+# `loc-brewery-brewhouse` (the brewery's primary location
+# subject, also used by equipment-preventive-maintenance), since their JobKinds
+# declare `subject_kinds = ["location"]`.
+# Quarterly sales-tax filing. Re-enabled 2026-06-13: the billing
+# dispatcher rule (invoice-issue-on-billing-step-done) now threads CA
+# sales tax (725 bps / US-CA) onto retail + taproom + event-package
+# invoice lines — wholesale + distribution stay resale-exempt — so
+# 2300 Sales Tax Payable accrues a real balance via the invoice
+# tax_lines. The quarterly `tax-remittance` step's ledger.tax.remit
+# handler drains that balance back into 1000 Cash, and the remit's
+# conservation guard keeps 2300 from going negative. (Previously
+# disabled because invoices carried no tax_lines, so the remit drove
+# 2300 into a negative-liability state every quarter.)
+[periodic.quarterly-sales-tax]
+cadence = "quarterly"
+anchor_date = "2024-01-31"
+business_calendar = "us-tax"
+action.kind = "open_job"
+action.job_kind = "sales-tax-filing"
+action.subject_kind = "location"
+action.subject_id = "loc-brewery-brewhouse"
+
+# Biweekly payroll-run. Opens the payroll-run JobKind on
+# Thursdays starting 2024-01-04. Steps walk calculate → review
+# → release; the terminal `payroll-release` step's
+# `ledger.payroll.run.submit` side-effect (rules.toml) posts the
+# payroll JE — DR 6100 Payroll + DR 6400 Payroll Taxes & Benefits,
+# CR 2150 Payroll Liability + CR 1000 Cash — accruing the 2150
+# liability that the quarterly payroll-941 filing later drains.
+[periodic.biweekly-payroll]
+cadence = "biweekly"
+anchor_date = "2024-01-04"
+business_calendar = "us-banking"
+action.kind = "open_job"
+action.job_kind = "payroll-run"
+action.subject_kind = "location"
+action.subject_id = "loc-brewery-brewhouse"
+
+# Quarterly federal payroll tax filing (Form 941). One filing
+# per closed quarter. Opens the payroll-941-filing JobKind whose
+# terminal tax-remittance step's existing ledger.tax.remit
+# handler emits the canonical TaxFilingSnapshot.
+[periodic.quarterly-payroll-941]
+cadence = "quarterly"
+anchor_date = "2024-01-15"
+business_calendar = "us-banking"
+action.kind = "open_job"
+action.job_kind = "payroll-941-filing"
+action.subject_kind = "location"
+action.subject_id = "loc-brewery-brewhouse"
+
+# Quarterly estimated income tax. Same shape as payroll-941;
+# routes through the income-tax-filing JobKind's tax-remittance
+# step.
+[periodic.quarterly-income-tax]
+cadence = "quarterly"
+anchor_date = "2024-01-15"
+business_calendar = "us-banking"
+action.kind = "open_job"
+action.job_kind = "income-tax-filing"
+action.subject_kind = "location"
+action.subject_id = "loc-brewery-brewhouse"
+
+# Quarterly federal beer excise tax (TTB). Same shape as payroll-941;
+# routes through the excise-tax-filing JobKind's tax-remittance step,
+# draining the 2320 Excise Tax Payable balance accrued per brew batch.
+[periodic.quarterly-excise]
+cadence = "quarterly"
+anchor_date = "2024-01-15"
+business_calendar = "us-banking"
+action.kind = "open_job"
+action.job_kind = "excise-tax-filing"
+action.subject_kind = "location"
+action.subject_id = "loc-brewery-brewhouse"
+
+# ---------------------------------------------------------------------------
+# Batch [batch.*] specs retired 2026-05-06 — see TODO.md
+# "Strip BatchEngine" for the why. The four batch rows that lived
+# here (payroll, sales-tax, payroll-941, income-tax) bypassed the
+# JobKind / Step / audit-trail by emitting canonical events
+# directly — a developer-convenience back door that produced
+# financial entries no operator could review. Replaced by
+# `[periodic.*]` specs (above) that open honest JobKinds whose
+# terminal step's side-effect handler POSTs to the canonical
+# `/api/ledger/*` endpoints. All five tax/payroll filings
+# (payroll-run, payroll-941-filing, income-tax-filing,
+# sales-tax-filing, excise-tax-filing) now run through that
+# periodic + JobKind + ledger path.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Operational chatter — one message-broadcast counterparty per
+# significant step kind so /inbox lights up with realistic
+# brewery activity instead of just the hand-seeded operator
+# threads. Each emits `messages.broadcast` (registered in
+# replay.rs) which routes to POST /api/messages/send. The static
+# payload carries sender_id / recipient_id / subject / body / kind
+# directly — the trigger payload is folded under `trigger` and
+# ignored by the send endpoint. emp-cto is the consistent
+# recipient because most operational signals route to the CTO
+# operations dashboard; tenants can fan to other operators by
+# duplicating the spec with a different recipient_id.
+#
+# Delays are sub-day so the message lands the same day as the
+# triggering step — operational signals are real-time, not
+# multi-day chains. emit_probability of 1.0 for cellar handoff
+# (every brew handoff produces a status post); lower for the
+# others where ops typically batches into a daily digest.
+[counterparty.brewhouse-broadcast]
+listens_to = "step.done.handoff"
+emits = "messages.broadcast"
+emit_probability = 1.0
+
+  [counterparty.brewhouse-broadcast.delay]
+  mean_days = 0.0
+  spread_days = 0.0
+
+  [counterparty.brewhouse-broadcast.payload]
+  sender_id = "system-sim"
+  recipient_id = "emp-cto"
+  subject = "Cellar handoff complete"
+  body = "Brewhouse handed off to cellar. Beer transferred to brite tank, CO2 set, tap-ready in 4 days."
+  kind = "signal"
+
+[counterparty.dispatch-broadcast]
+listens_to = "step.done.shipment"
+emits = "messages.broadcast"
+emit_probability = 0.6
+
+  [counterparty.dispatch-broadcast.delay]
+  mean_days = 0.0
+  spread_days = 0.0
+
+  [counterparty.dispatch-broadcast.payload]
+  sender_id = "system-sim"
+  recipient_id = "emp-cto"
+  subject = "Wholesale dispatch — kegs out the door"
+  body = "Driver loaded the route and rolled. Tracking scans should land within the day."
+  kind = "signal"
+
+[counterparty.billing-broadcast]
+listens_to = "step.done.billing"
+emits = "messages.broadcast"
+emit_probability = 0.4
+
+  [counterparty.billing-broadcast.delay]
+  mean_days = 0.0
+  spread_days = 0.0
+
+  [counterparty.billing-broadcast.payload]
+  sender_id = "system-sim"
+  recipient_id = "emp-cto"
+  subject = "Invoice issued"
+  body = "Wholesale invoice issued. A/R aging counterparty will fire payment ack ~30 days out."
+  kind = "signal"
+
+[counterparty.receiving-broadcast]
+listens_to = "step.done.receiving"
+emits = "messages.broadcast"
+emit_probability = 0.8
+
+  [counterparty.receiving-broadcast.delay]
+  mean_days = 0.0
+  spread_days = 0.0
+
+  [counterparty.receiving-broadcast.payload]
+  sender_id = "system-sim"
+  recipient_id = "emp-cto"
+  subject = "Vendor delivery received"
+  body = "Pallet landed at receiving dock. Inventory levels refreshed; PO marked received."
+  kind = "signal"

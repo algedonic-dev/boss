@@ -1,0 +1,19 @@
+[package]
+name = "boss-used-device-shop-engine"
+description = "Used-device-shop operating-engine library. Sister crate to boss-brewery-engine — loads the used-device-shop seed bundle (tenant.toml + job_kinds.toml + employees.json), registers every bridge crate's default SideEffectHandlers, and drives the day-loop via run_days_with_handlers."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+boss-jobs = { path = "../../core/boss-jobs" }
+boss-sim = { path = "../../orchestrators/boss-sim" }
+
+[lints]
+workspace = true

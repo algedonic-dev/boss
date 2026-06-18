@@ -1,0 +1,546 @@
+# Algedonic Ales — tenant policy seed.
+#
+# Tenant role grants for the brewery. Core ships only platform
+# rules (platform-admin / audit-readonly / smoke-tester / guest);
+# this file restores the rest of the brewery's org chart's
+# row-level access matrix.
+#
+# Seeded at first boot by `boss-policy-bootstrap --seeds
+# examples/brewery/seeds/policy_rules.toml`. Re-runs are no-ops
+# unless `--force` is passed.
+#
+# Scope vocabulary (from `crate::types::Scope`):
+#   - "all"                     no restriction
+#   - "self"                    rows the caller owns directly
+#   - "team"                    caller + their direct reports
+#   - "territory"               accounts on the caller's account team
+#   - "department:<name>"       rows scoped to a named department
+#
+# Department names follow the brewery's `classes.toml` department
+# slugs: executive / brewhouse / packaging / cellar / lab /
+# warehouse / distribution / taproom / sales / marketing / hr /
+# finance / it / maintenance.
+
+# ------------------------------------------------------------------
+# Executives — broad Read across every resource.
+# ------------------------------------------------------------------
+
+[[grants]]
+roles = ["ceo", "coo", "cfo", "cto"]
+resources = [
+    "job", "step", "account", "employee", "invoice", "agreement",
+    "shipment", "part", "purchase-order", "policy-rule",
+    "job-kind", "step-plugin",
+]
+action = "read"
+scope = "all"
+
+# CEO + COO can tune policy.
+[[grants]]
+roles = ["ceo", "coo"]
+resource = "policy-rule"
+actions = ["create", "update", "delete"]
+scope = "all"
+
+# CEO + COO + CTO get override authority on Jobs + Steps.
+[[grants]]
+roles = ["ceo", "coo", "cto"]
+resources = ["job"]
+actions = ["update", "close"]
+scope = "all"
+
+[[grants]]
+roles = ["ceo", "coo", "cto"]
+resources = ["step"]
+actions = ["update", "sign-off"]
+scope = "all"
+
+# CEO + COO + CFO can create + update accounts / invoices / agreements.
+[[grants]]
+roles = ["ceo", "coo", "cfo"]
+resources = ["account", "invoice", "agreement"]
+actions = ["create", "update"]
+scope = "all"
+
+# CEO + COO can onboard + restructure employees. No delete —
+# terminations flip status, never remove rows.
+[[grants]]
+roles = ["ceo", "coo"]
+resource = "employee"
+actions = ["create", "update"]
+scope = "all"
+
+# CEO + CTO can publish + retire JobKinds and StepPlugins.
+[[grants]]
+roles = ["ceo", "cto"]
+resources = ["job-kind", "step-plugin"]
+actions = ["create", "update", "publish", "retire"]
+scope = "all"
+
+# ------------------------------------------------------------------
+# Brewing operations — brewhouse + cellar.
+# ------------------------------------------------------------------
+
+[[grants]]
+role = "head-brewer"
+resources = ["job", "step"]
+actions = ["read", "update", "close"]
+scope = "department:brewhouse"
+
+[[grants]]
+role = "head-brewer"
+resource = "step"
+action = "sign-off"
+scope = "department:brewhouse"
+
+[[grants]]
+role = "head-brewer"
+resources = ["part", "purchase-order", "employee"]
+action = "read"
+scope = "all"
+
+[[grants]]
+roles = ["senior-brewer", "brewer"]
+resources = ["job", "step"]
+actions = ["read", "update"]
+scope = "self"
+
+[[grants]]
+roles = ["senior-brewer", "brewer", "cellar-tech"]
+resources = ["part"]
+action = "read"
+scope = "all"
+
+[[grants]]
+role = "cellar-tech"
+resources = ["job", "step"]
+actions = ["read", "update"]
+scope = "self"
+
+[[grants]]
+role = "lab-tech"
+resources = ["step"]
+actions = ["read", "update"]
+scope = "self"
+
+[[grants]]
+role = "lab-tech"
+resource = "step"
+action = "sign-off"
+scope = "department:lab"
+
+[[grants]]
+role = "qa-supervisor"
+resources = ["step", "job"]
+action = "read"
+scope = "all"
+
+[[grants]]
+role = "qa-supervisor"
+resource = "step"
+action = "sign-off"
+scope = "department:lab"
+
+[[grants]]
+role = "qa-tech"
+resources = ["step", "job"]
+actions = ["read", "update"]
+scope = "self"
+
+# ------------------------------------------------------------------
+# Packaging.
+# ------------------------------------------------------------------
+
+[[grants]]
+role = "packaging-mgr"
+resources = ["job", "step"]
+actions = ["read", "update", "close"]
+scope = "department:packaging"
+
+[[grants]]
+role = "packaging-mgr"
+resource = "step"
+action = "sign-off"
+scope = "department:packaging"
+
+[[grants]]
+role = "packaging-mgr"
+resources = ["part", "shipment", "employee"]
+action = "read"
+scope = "all"
+
+[[grants]]
+roles = ["packaging-tech", "palletizer"]
+resources = ["job", "step"]
+actions = ["read", "update"]
+scope = "self"
+
+# ------------------------------------------------------------------
+# Warehouse + distribution.
+# ------------------------------------------------------------------
+
+[[grants]]
+role = "warehouse-mgr"
+resources = ["shipment", "part", "purchase-order"]
+actions = ["read", "update"]
+scope = "all"
+
+[[grants]]
+role = "warehouse-mgr"
+resource = "employee"
+action = "read"
+scope = "team"
+
+[[grants]]
+roles = ["forklift-operator", "inventory-clerk", "shipping-clerk"]
+resource = "shipment"
+action = "read"
+scope = "all"
+
+[[grants]]
+role = "shipping-clerk"
+resource = "shipment"
+action = "update"
+scope = "self"
+
+[[grants]]
+role = "inventory-clerk"
+resource = "part"
+action = "read"
+scope = "all"
+
+[[grants]]
+role = "head-of-distribution"
+resources = ["shipment", "job", "step"]
+action = "read"
+scope = "all"
+
+[[grants]]
+role = "head-of-distribution"
+resources = ["shipment", "job"]
+action = "update"
+scope = "department:distribution"
+
+[[grants]]
+role = "distribution-driver"
+resources = ["job", "step", "shipment"]
+actions = ["read", "update"]
+scope = "self"
+
+# ------------------------------------------------------------------
+# Sales (wholesale + on-prem keg).
+# ------------------------------------------------------------------
+
+[[grants]]
+role = "head-of-sales"
+resources = ["job", "step", "account", "invoice", "agreement"]
+action = "read"
+scope = "all"
+
+[[grants]]
+role = "head-of-sales"
+resources = ["job", "account"]
+action = "update"
+scope = "department:sales"
+
+[[grants]]
+role = "sales-rep"
+resources = ["job", "account", "agreement"]
+actions = ["read", "update"]
+scope = "territory"
+
+[[grants]]
+role = "sales-rep"
+resources = ["job", "step"]
+action = "create"
+scope = "territory"
+
+[[grants]]
+role = "sales-rep"
+resource = "invoice"
+action = "read"
+scope = "territory"
+
+[[grants]]
+role = "sales-rep"
+resource = "step"
+action = "update"
+scope = "self"
+
+[[grants]]
+role = "account-manager"
+resources = ["account", "agreement", "job"]
+action = "read"
+scope = "territory"
+
+# ------------------------------------------------------------------
+# Taproom (on-premise sales).
+# ------------------------------------------------------------------
+
+[[grants]]
+role = "events-coord"
+resources = ["job", "step"]
+actions = ["read", "update", "create"]
+scope = "department:taproom"
+
+[[grants]]
+roles = ["bartender", "taproom-server"]
+resources = ["job", "step"]
+actions = ["read", "update"]
+scope = "self"
+
+[[grants]]
+role = "shift-lead"
+resources = ["job", "step"]
+action = "update"
+scope = "self"
+
+[[grants]]
+role = "shift-lead"
+resources = ["job", "step"]
+action = "read"
+scope = "department:taproom"
+
+# ------------------------------------------------------------------
+# Marketing.
+# ------------------------------------------------------------------
+
+[[grants]]
+role = "head-of-marketing"
+resources = ["job", "step"]
+actions = ["read", "update"]
+scope = "department:marketing"
+
+[[grants]]
+role = "head-of-marketing"
+resource = "step"
+action = "sign-off"
+scope = "department:marketing"
+
+[[grants]]
+roles = ["brand-manager", "social-media-coord"]
+resources = ["job", "step"]
+actions = ["read", "update"]
+scope = "self"
+
+# ------------------------------------------------------------------
+# Finance.
+# ------------------------------------------------------------------
+
+[[grants]]
+role = "controller"
+resources = ["invoice", "agreement", "purchase-order", "account"]
+action = "read"
+scope = "all"
+
+[[grants]]
+role = "controller"
+resource = "invoice"
+actions = ["create", "update"]
+scope = "all"
+
+[[grants]]
+role = "bookkeeper"
+resources = ["invoice", "purchase-order"]
+action = "read"
+scope = "all"
+
+[[grants]]
+role = "ar-clerk"
+resources = ["invoice"]
+actions = ["read", "update"]
+scope = "all"
+
+[[grants]]
+role = "ap-clerk"
+resources = ["invoice", "purchase-order"]
+actions = ["read", "update"]
+scope = "all"
+
+[[grants]]
+role = "fp-analyst"
+resources = ["invoice", "agreement", "purchase-order", "account", "employee"]
+action = "read"
+scope = "all"
+
+[[grants]]
+role = "payroll-mgr"
+resource = "employee"
+actions = ["read", "update"]
+scope = "all"
+
+# ------------------------------------------------------------------
+# HR / People.
+# ------------------------------------------------------------------
+
+[[grants]]
+role = "head-of-people"
+resource = "employee"
+actions = ["read", "create", "update"]
+scope = "all"
+
+[[grants]]
+role = "hr-generalist"
+resource = "employee"
+actions = ["read", "update", "create"]
+scope = "all"
+
+[[grants]]
+role = "recruiter"
+resource = "employee"
+actions = ["read", "create"]
+scope = "department:hr"
+
+[[grants]]
+role = "benefits-coord"
+resource = "employee"
+action = "read"
+scope = "all"
+
+# ------------------------------------------------------------------
+# IT + maintenance.
+# ------------------------------------------------------------------
+
+[[grants]]
+role = "it-director"
+resources = ["employee", "policy-rule"]
+action = "read"
+scope = "all"
+
+[[grants]]
+roles = ["sysadmin", "helpdesk"]
+resources = ["employee"]
+action = "read"
+scope = "all"
+
+[[grants]]
+role = "maintenance-mgr"
+resources = ["job", "step", "part"]
+action = "read"
+scope = "all"
+
+[[grants]]
+role = "maintenance-mgr"
+resources = ["job", "step"]
+action = "update"
+scope = "department:maintenance"
+
+[[grants]]
+roles = ["mechanic", "electrician"]
+resources = ["job", "step", "part"]
+actions = ["read", "update"]
+scope = "self"
+
+# ------------------------------------------------------------------
+# Step sign-off authority (step-signoff:<role>).
+#
+# A sign-off step's required role (`authority_role`) is enforced
+# through policy by authorizing against a role-scoped resource —
+# `step-signoff:<role>` — rather than a bare `step` (see
+# `boss-jobs::http::update_step`). Each role here is granted SignOff
+# only on ITS OWN `step-signoff:<role>` resource, so a caller can
+# sign a step iff their role matches the step's required authority.
+# The required role is read from the step's immutable persisted
+# metadata, so a PUT body cannot lower the bar.
+#
+# One grant per distinct `authority_role` used by the brewery's
+# JobKinds (examples/brewery/seeds/job_kinds.toml). Without these,
+# every sign-off step becomes unsignable. Scope is `all`: the role
+# match (the resource match) IS the authority gate; row-level scope
+# is not layered on top of the sign-off authority check.
+#
+# The simulator does not appear here: it drives sign-offs as the
+# trusted, `_simulated`-marked actor and is authorized by the
+# sim-origin policy bypass (see SimBypassPolicyClient), not by any
+# seeded grant. Real employees sign their own steps via the per-role
+# grants below.
+
+[[grants]]
+role = "head-brewer"
+resource = "step-signoff:head-brewer"
+action = "sign-off"
+scope = "all"
+
+[[grants]]
+role = "brewer"
+resource = "step-signoff:brewer"
+action = "sign-off"
+scope = "all"
+
+[[grants]]
+role = "lab-tech"
+resource = "step-signoff:lab-tech"
+action = "sign-off"
+scope = "all"
+
+[[grants]]
+role = "qa-tech"
+resource = "step-signoff:qa-tech"
+action = "sign-off"
+scope = "all"
+
+[[grants]]
+role = "qa-supervisor"
+resource = "step-signoff:qa-supervisor"
+action = "sign-off"
+scope = "all"
+
+[[grants]]
+role = "packaging-tech"
+resource = "step-signoff:packaging-tech"
+action = "sign-off"
+scope = "all"
+
+[[grants]]
+role = "shipping-clerk"
+resource = "step-signoff:shipping-clerk"
+action = "sign-off"
+scope = "all"
+
+[[grants]]
+role = "warehouse-clerk"
+resource = "step-signoff:warehouse-clerk"
+action = "sign-off"
+scope = "all"
+
+[[grants]]
+role = "head-of-distribution"
+resource = "step-signoff:head-of-distribution"
+action = "sign-off"
+scope = "all"
+
+[[grants]]
+role = "sales-rep"
+resource = "step-signoff:sales-rep"
+action = "sign-off"
+scope = "all"
+
+[[grants]]
+role = "bookkeeper"
+resource = "step-signoff:bookkeeper"
+action = "sign-off"
+scope = "all"
+
+[[grants]]
+role = "ar-clerk"
+resource = "step-signoff:ar-clerk"
+action = "sign-off"
+scope = "all"
+
+[[grants]]
+role = "cfo"
+resource = "step-signoff:cfo"
+action = "sign-off"
+scope = "all"
+
+[[grants]]
+role = "head-of-people"
+resource = "step-signoff:head-of-people"
+action = "sign-off"
+scope = "all"
+
+[[grants]]
+role = "owner"
+resource = "step-signoff:owner"
+action = "sign-off"
+scope = "all"

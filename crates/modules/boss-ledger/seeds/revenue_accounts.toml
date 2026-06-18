@@ -1,0 +1,40 @@
+# Revenue category → GL account-code mapping. Loaded once at first
+# call by `boss_ledger::rules::revenue_account_for()` via
+# `include_str!` + `OnceLock<HashMap<String, &'static str>>`. Same
+# data-as-data shape as `boss-jobs/seeds/step_types.toml` (D1) and
+# `boss-ml/seeds/phase_two_models.toml` (D2).
+#
+# Adding a new category for a tenant whose chart-of-accounts diverges:
+#   1. Append a row to this file.
+#   2. Rebuild + restart boss-ledger-api.
+#
+# Per-tenant overrides land via `BOSS_LEDGER_REVENUE_ACCOUNTS_TOML`
+# env var pointing at a sibling file — the env-supplied file
+# replaces (not merges with) the embedded defaults so the tenant
+# owns the full mapping.
+#
+# The mapping has to be exhaustive at runtime: an unknown category
+# in `finance.invoice.issued` payload trips a hard error rather
+# than silently mis-classifying revenue. See the
+# `unknown revenue category` branch in `rules::revenue_account_for`.
+
+# --- Device-shop tenant (used-device-shop) ---
+"new-sales"  = "4100"
+"used-sales" = "4110"
+"service"    = "4120"
+"parts"      = "4130"
+"contracts"  = "4140"
+
+# --- Brewery tenant (Algedonic Ales) ---
+# 4100 Wholesale Beer Sales       ← wholesale
+# 4110 Direct-to-Consumer         ← retail / merchandise
+# 4120 Taproom                    ← taproom
+# 4130 Seasonal & Specialty       ← event-package
+# 4140 Distribution Contracts     ← distribution / contracts / uncategorized
+"wholesale"     = "4100"
+"retail"        = "4110"
+"merchandise"   = "4110"
+"taproom"       = "4120"
+"event-package" = "4130"
+"distribution"  = "4140"
+"uncategorized" = "4140"

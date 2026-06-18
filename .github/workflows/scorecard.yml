@@ -1,0 +1,62 @@
+# OpenSSF Scorecard — daily security-posture audit.
+#
+# What it checks (https://github.com/ossf/scorecard#scorecard-checks):
+#   - Branch-Protection         — main is gated by required PR review + checks.
+#   - Code-Review               — every change has at least one reviewer.
+#   - Dangerous-Workflow        — no untrusted-input → script-injection paths.
+#   - Dependency-Update-Tool    — dependabot.yml present (we ship one).
+#   - Pinned-Dependencies       — every action pinned to a SHA (we ship pins).
+#   - Token-Permissions         — workflows use least-privilege GITHUB_TOKEN.
+#   - SAST                      — clippy + svelte-check + cargo deny coverage.
+#   - Security-Policy           — SECURITY.md present (we ship one).
+#   - Maintained                — recent commit + issue activity.
+#   - License                   — Apache-2.0, advertised in repo metadata.
+#   - Vulnerabilities           — open known CVEs in deps.
+#   - Signed-Releases           — release artifacts have provenance + signing.
+#   - Fuzzing                   — fuzz target present.
+#
+# A few of the above are aspirational at the preliminary-release
+# stage (Signed-Releases, Fuzzing). The score is published as a
+# badge in the README so visitors can see the trajectory; today's
+# baseline is "what an honest preliminary release looks like."
+#
+# The workflow needs id-token: write to publish to the public OpenSSF
+# results API + the optional private security-advisories token. Both
+# are documented in the scorecard-action README.
+
+name: OpenSSF Scorecard
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: "37 4 * * 1"  # Mondays 04:37 UTC
+  push:
+    branches: [main]
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write     # publish SARIF to GitHub Security tab
+      id-token: write             # publish to OpenSSF results API
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        with:
+          persist-credentials: false
+
+      - name: Run Scorecard
+        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a # v2.4.3
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        with:
+          sarif_file: results.sarif

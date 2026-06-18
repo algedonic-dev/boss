@@ -1,0 +1,36 @@
+[package]
+name = "boss-rebuild"
+description = "Top-level orchestrator that rebuilds every projection from audit_log in dependency order. Wraps the per-service rebuilders shipped under docs/design/projection-rebuilders.md."
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-rebuild-all"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Every per-service rebuilder lives under its owning crate's
+# `rebuild` module. We pull each one in with the postgres feature
+# enabled so the Pg-backed rebuild functions are exposed.
+boss-messages = { path = "../../modules/boss-messages", features = ["postgres"] }
+boss-jobs = { path = "../../core/boss-jobs", features = ["postgres"] }
+boss-inventory = { path = "../../modules/boss-inventory", features = ["postgres"] }
+boss-products = { path = "../../modules/boss-products", features = ["postgres"] }
+boss-accounts = { path = "../../modules/boss-accounts", features = ["postgres"] }
+boss-shipping = { path = "../../modules/boss-shipping", features = ["postgres"] }
+boss-people = { path = "../../modules/boss-people", features = ["postgres"] }
+boss-catalog = { path = "../../modules/boss-catalog", features = ["postgres"] }
+boss-calendar = { path = "../../core/boss-calendar", features = ["postgres"] }
+boss-commerce = { path = "../../modules/boss-commerce", features = ["postgres"] }
+boss-content = { path = "../../core/boss-content", features = ["postgres"] }
+boss-ledger = { path = "../../modules/boss-ledger", features = ["postgres"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,62 @@
+[package]
+name = "boss-people"
+description = "Employee roster, org chart, certifications, and requisitions"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-people-api"
+path = "src/bin/boss_people_api.rs"
+required-features = ["postgres"]
+
+[[bin]]
+name = "boss-people-rebuild"
+path = "src/bin/boss_people_rebuild.rs"
+required-features = ["postgres"]
+
+[[bin]]
+name = "boss-operator-baseline-seed"
+path = "src/bin/boss_operator_baseline_seed.rs"
+required-features = ["postgres"]
+
+[features]
+default = []
+postgres = ["dep:sqlx", "boss-events/postgres"]
+
+[dependencies]
+boss-policy = { path = "../../core/boss-policy" }
+boss-policy-client = { path = "../../core/boss-policy-client" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"], optional = true }
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+boss-clock-client = { path = "../../core/boss-clock-client" }
+boss-ports = { path = "../../core/boss-ports" }
+boss-core = { path = "../../core/boss-core" }
+boss-classes-client = { path = "../../core/boss-classes-client" }
+boss-locations-client = { path = "../../core/boss-locations-client" }
+boss-subject-kinds-client = { path = "../../core/boss-subject-kinds-client" }
+boss-calendar-client = { path = "../../core/boss-calendar-client" }
+boss-events = { path = "../../core/boss-events" }
+boss-assets-client = { path = "../boss-assets-client" }
+boss-nats = { path = "../../core/boss-nats" }
+[dev-dependencies]
+tower = { workspace = true }
+boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
+proptest = "1"
+
+[lints]
+workspace = true

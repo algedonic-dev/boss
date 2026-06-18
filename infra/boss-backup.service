@@ -1,0 +1,8 @@
+[Unit]
+Description=Boss backup (pg_dump + configs)
+After=postgresql.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/boss/infra/backup.sh
+User=root

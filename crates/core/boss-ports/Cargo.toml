@@ -1,0 +1,14 @@
+[package]
+name = "boss-ports"
+description = "Single source of truth for BOSS service port assignments"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-ports-list"
+path = "src/bin/list.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

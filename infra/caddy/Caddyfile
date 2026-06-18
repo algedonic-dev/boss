@@ -1,0 +1,33 @@
+# Caddy front door for Boss.
+#
+# Single virtual host driven by the `BOSS_HOSTNAME` env var.
+# Caddy terminates HTTPS via Let's Encrypt (HTTP-01 by default —
+# the host must resolve directly to your VM's IP, no proxy in
+# front). Reverse-proxies to boss-gateway on 127.0.0.1:4443.
+#
+# Usage: set BOSS_HOSTNAME and run `caddy run --config Caddyfile`
+# (or use the unit installed by infra/caddy/setup.sh, which
+# reads /etc/boss/caddy.env). For local dev without a public
+# hostname, point BOSS_HOSTNAME at `localhost` and Caddy will
+# serve over HTTP.
+#
+# Cloud-provider-specific recipes (Cloudflare Tunnel + Origin
+# Certificate, AWS ALB termination, GCP HTTPS LB) used to live
+# here as a second virtual host pinned to the project's old
+# playground deployment. The 2026-05-06 cloud-provisioning rip
+# moved those recipes to a future "Cloud provider blueprints"
+# Post-release item — see TODO.md.
+
+{$BOSS_HOSTNAME} {
+    encode gzip
+
+    reverse_proxy 127.0.0.1:4443 {
+        # Needed for Server-Sent Events to stream without buffering.
+        flush_interval -1
+    }
+
+    log {
+        output stdout
+        format console
+    }
+}

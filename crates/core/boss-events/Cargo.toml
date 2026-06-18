@@ -1,0 +1,59 @@
+[package]
+name = "boss-events"
+description = "Event bus, sourcing, and serialization infrastructure"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# `bin` ships in default so `cargo build --release --workspace` produces
+# /target/release/boss-audit-integrity-check. Pre-2026-05-05 the binary
+# was opt-in, which left the regen script's step-9 integrity check
+# silently dead (script falls back to "informational only" when the
+# binary is missing). The audit-chain has to actually be checked, not
+# silently skipped.
+default = ["bin"]
+postgres = ["dep:sqlx", "dep:axum", "dep:async-stream", "dep:futures", "dep:tokio-stream"]
+bin = ["postgres", "dep:anyhow", "dep:clap", "dep:tracing-subscriber", "dep:hex"]
+events-api = ["bin"]
+
+[dependencies]
+boss-core = { path = "../boss-core" }
+boss-policy-client = { path = "../boss-policy-client" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"], optional = true }
+axum = { workspace = true, optional = true }
+async-stream = { version = "0.3", optional = true }
+futures = { version = "0.3", optional = true }
+tokio-stream = { version = "0.1", optional = true }
+anyhow = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+toml = { version = "0.8" }
+hex = { version = "0.4", optional = true }
+
+[[bin]]
+name = "boss-audit-integrity-check"
+path = "src/bin/boss_audit_integrity_check.rs"
+required-features = ["bin"]
+
+[[bin]]
+name = "boss-events-api"
+path = "src/bin/boss_events_api.rs"
+required-features = ["events-api"]
+
+[dev-dependencies]
+boss-testing = { path = "../boss-testing", features = ["postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true

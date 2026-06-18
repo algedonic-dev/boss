@@ -1,0 +1,17 @@
+[Unit]
+Description=Daily audit_log integrity scan
+
+[Timer]
+# Fires at 03:30 local daily. Slot chosen between the 02:00 ledger
+# recognition sweep and the 04:00 backup window so a clean signal
+# is captured before any further mutation, and so a hot anomaly
+# alert pages oncall before morning standup.
+OnCalendar=*-*-* 03:30:00
+# Cover host-down windows: if the box was off at 03:30, fire once on
+# next boot. A missed night just delays detection, not detection
+# itself.
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

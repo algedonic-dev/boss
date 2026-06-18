@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 135f0e759df7e2e92e640f59ba1042e5b47fc11b28a9ad5bf610a742468d01f0 # shrinks to spec = ForestSpec { jobs: [[("aaa", Some(1)), ("aaa", Some(1))], [("aaa", None)]], root: 0 }

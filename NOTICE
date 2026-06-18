@@ -1,0 +1,18 @@
+BOSS — Beer Open Source Software for System Modeling
+
+Copyright 2026 Algedonic, LLC
+
+This product includes software developed at Algedonic, LLC and
+distributed under the Apache License, Version 2.0 (see LICENSE).
+
+The "BOSS" name and the all-caps brand spelling are used as the
+canonical project identifier; the lowercase `boss-` prefix appears
+on crate paths, binary names, env vars, and systemd units where
+uppercase would break tooling.
+
+The acronym expands to "Beer Open Source Software — for System
+Modeling," named in tribute to Stafford Beer (1926-2002), the
+British cybernetician whose Viable System Model + Cyberstride /
+Project Cybersyn work is the intellectual lineage this project
+sits in. Algedonic, LLC has no affiliation with the Stafford Beer
+estate; the project name is a tribute, not an endorsement.

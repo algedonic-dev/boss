@@ -1,0 +1,22 @@
+[package]
+name = "boss-ml-plugins"
+description = "Inference plugins for boss-ml — sibling crate hosting the canonical heuristic-formula plugins (Phase 2)."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"] }
+tracing = { workspace = true }
+
+boss-ml = { path = "../../core/boss-ml", features = ["postgres"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
+
+[lints]
+workspace = true

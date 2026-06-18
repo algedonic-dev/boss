@@ -1,0 +1,54 @@
+[package]
+name = "boss-accounts"
+description = "Account-side CRM domain — accounts, contacts, team assignments, notes, support cases, next actions, risk scores. Carve-out from boss-people; boss-people now owns employee-side data only."
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+postgres = ["dep:sqlx", "boss-events/postgres"]
+accounts-api = ["postgres", "dep:clap", "dep:tracing-subscriber"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"], optional = true }
+uuid = { version = "1", features = ["v4"] }
+
+boss-clock-client = { path = "../../core/boss-clock-client" }
+boss-ports = { path = "../../core/boss-ports" }
+boss-core = { path = "../../core/boss-core" }
+boss-policy = { path = "../../core/boss-policy" }
+boss-policy-client = { path = "../../core/boss-policy-client" }
+boss-classes-client = { path = "../../core/boss-classes-client" }
+boss-assets-client = { path = "../boss-assets-client" }
+boss-subject-kinds-client = { path = "../../core/boss-subject-kinds-client" }
+boss-events = { path = "../../core/boss-events" }
+boss-nats = { path = "../../core/boss-nats" }
+# Optional bin-only deps. boss-people is needed for ReqwestAssetsClient
+# which we reuse rather than re-implementing. clap + tracing-subscriber
+# are bin convenience. Gated under accounts-api so the library build
+# stays lean.
+clap = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+toml = { version = "0.8" }
+
+[[bin]]
+name = "boss-accounts-api"
+path = "src/bin/boss_accounts_api.rs"
+required-features = ["accounts-api"]
+
+[dev-dependencies]
+tower = { workspace = true }
+boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
+
+[lints]
+workspace = true

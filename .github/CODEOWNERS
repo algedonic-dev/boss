@@ -1,0 +1,24 @@
+# Code owners — GitHub auto-requests review from the listed
+# handles when a PR touches a matching path.
+#
+# Single maintainer today. As the project grows, this file gets
+# split per tier — Tier-1 (`crates/core/`) needs the tightest
+# review bar per CLAUDE.md and would carry a separate owner team
+# once one exists.
+#
+# Syntax: https://docs.github.com/en/repositories/managing-your-repositories-settings-and-customizations/customizing-your-repository/about-code-owners
+
+# Catch-all: every PR pings the maintainer for review.
+*  @algedonic-dev/maintainers
+
+# Hot paths that especially benefit from a flag-down review:
+# audit_log + projection rebuilders + posting rules are the
+# correctness backbone; bypassing them is the most common way
+# to break the five-property contract.
+/crates/core/boss-events/        @algedonic-dev/maintainers
+/crates/core/boss-jobs/          @algedonic-dev/maintainers
+/crates/core/boss-policy/        @algedonic-dev/maintainers
+/crates/modules/boss-ledger/     @algedonic-dev/maintainers
+/infra/postgres/schema.sql       @algedonic-dev/maintainers
+/docs/adr/                       @algedonic-dev/maintainers
+/docs/design/correctness-protocol.md  @algedonic-dev/maintainers
