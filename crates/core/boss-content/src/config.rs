@@ -1,6 +1,6 @@
 //! Configuration for `boss-content-api`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use boss_core::config::{ConfigError, Validate, load_toml};
 use serde::Deserialize;
@@ -13,8 +13,8 @@ pub struct ContentApiConfig {
     /// always sets it so bulletin events land in `audit_log`.
     #[serde(default)]
     pub nats_url: Option<String>,
-    /// boss-policy-api URL. Required when `BOSS_FILE_STORAGE_BUCKET`
-    /// is set (i.e. file uploads are wired); optional otherwise.
+    /// boss-policy-api URL. Required when a `[files]` block is set
+    /// (i.e. file uploads are wired); optional otherwise.
     #[serde(default)]
     pub policy_api_url: Option<String>,
     /// File storage configuration. Optional — when absent, the file
@@ -26,25 +26,11 @@ pub struct ContentApiConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FilesConfig {
-    /// Object-storage bucket. One bucket per deployment per Q1.
-    pub bucket: String,
-    /// S3 endpoint URL. Defaults to AWS regional endpoint when unset.
-    /// For GCS interop, set `https://storage.googleapis.com`.
-    /// For MinIO, set `http://127.0.0.1:9000`.
-    #[serde(default)]
-    pub endpoint: Option<String>,
-    /// AWS-style region. Defaults to `us-east-1` when unset (GCS +
-    /// MinIO accept this as a placeholder).
-    #[serde(default)]
-    pub region: Option<String>,
-    /// Explicit access key. Optional — when both this and secret_key
-    /// are set, they're passed directly to S3Storage::with_credentials
-    /// (the GCS-interop path). When unset, the AWS SDK reads from
-    /// environment / instance metadata.
-    #[serde(default)]
-    pub access_key: Option<String>,
-    #[serde(default)]
-    pub secret_key: Option<String>,
+    /// Root directory for file-attachment bytes. One tree per
+    /// deployment; created on startup if absent. Objects land at
+    /// `<root>/sha256/<hex>`. Back this with durable storage (and
+    /// include it in backups) — it holds every uploaded attachment.
+    pub root: PathBuf,
 }
 
 impl ContentApiConfig {

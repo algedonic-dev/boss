@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| "wiring file-references HTTP surface")?;
         app = app.merge(files_app);
-        info!(bucket = %files_cfg.bucket, "file-references surface enabled");
+        info!(root = %files_cfg.root.display(), "file-references surface enabled");
     } else {
         info!("file-references surface not configured (no [files] block); mounting 503 fallback");
         app = app.merge(unconfigured_files_router());
@@ -172,35 +172,17 @@ async fn build_files_router(
     clock: Arc<dyn boss_clock_client::ClockClient>,
 ) -> Result<axum::Router> {
     use boss_content::files::{
-        FileRepository, FileStorage, PgFileRepository, S3Storage,
+        FileRepository, FileStorage, LocalDiskStorage, PgFileRepository,
         http::{FilesApiState, router as files_router_fn},
     };
     use std::sync::Arc;
 
     let repo: Arc<dyn FileRepository> = Arc::new(PgFileRepository::new(pool.clone()));
-    let storage: Arc<dyn FileStorage> = match (&files_cfg.access_key, &files_cfg.secret_key) {
-        (Some(ak), Some(sk)) => {
-            let endpoint = files_cfg
-                .endpoint
-                .as_deref()
-                .unwrap_or("https://storage.googleapis.com");
-            let region = files_cfg.region.as_deref().unwrap_or("us-east-1");
-            Arc::new(
-                S3Storage::with_credentials(&files_cfg.bucket, endpoint, region, ak, sk)
-                    .await
-                    .with_context(|| "S3Storage::with_credentials")?,
-            )
-        }
-        _ => Arc::new(
-            S3Storage::new(
-                &files_cfg.bucket,
-                files_cfg.endpoint.as_deref(),
-                files_cfg.region.as_deref(),
-            )
+    let storage: Arc<dyn FileStorage> = Arc::new(
+        LocalDiskStorage::new(&files_cfg.root)
             .await
-            .with_context(|| "S3Storage::new")?,
-        ),
-    };
+            .with_context(|| format!("opening file storage root {}", files_cfg.root.display()))?,
+    );
 
     let policy: Arc<dyn boss_policy_client::PolicyClient> = match &cfg.policy_api_url {
         Some(url) => Arc::new(boss_policy_client::ReqwestPolicyClient::new(url.clone())),
@@ -219,7 +201,7 @@ async fn build_files_router(
         storage,
         publisher,
         policy,
-        bucket: files_cfg.bucket.clone(),
+        bucket: files_cfg.root.display().to_string(),
         pool: Some(pool),
         clock,
     };

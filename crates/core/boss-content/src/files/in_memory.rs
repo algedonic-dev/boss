@@ -1,9 +1,9 @@
 //! In-memory adapters for `FileRepository` + `FileStorage`. Used by
 //! the crate's own tests + by downstream-crate integration tests
 //! (e.g. boss-jobs Job-page tests that don't want to spin up Postgres
-//! and an S3-compatible bucket).
+//! and a file-storage root on disk).
 //!
-//! Production paths use `PgFileRepository` + `S3Storage`. These
+//! Production paths use `PgFileRepository` + `LocalDiskStorage`. These
 //! adapters preserve the port contract exactly (dedup check, soft-
 //! delete idempotence, etc) so swapping for tests doesn't hide bugs
 //! that would surface against the real adapters.

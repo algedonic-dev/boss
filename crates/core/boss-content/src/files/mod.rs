@@ -23,11 +23,11 @@ pub mod postgres;
 #[cfg(feature = "postgres")]
 pub mod rebuild;
 
-#[cfg(feature = "s3")]
-pub mod s3;
+pub mod local_disk;
 
 pub use error::FileError;
 pub use in_memory::{InMemoryFileRepository, InMemoryFileStorage};
+pub use local_disk::LocalDiskStorage;
 pub use port::{FileRepository, FileStorage};
 pub use types::{FileRef, FileRefDraft, ResourceKind, ResourceRef};
 
@@ -39,6 +39,3 @@ pub use rebuild::{
     AuditMismatch, AuditMismatchKind, AuditReport, DEFAULT_GC_GRACE_DAYS, GcReport, RebuildError,
     RebuildReport, audit_sample, gc_orphan_objects, rebuild_file_refs,
 };
-
-#[cfg(feature = "s3")]
-pub use s3::S3Storage;

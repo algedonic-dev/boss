@@ -57,10 +57,11 @@ pub trait FileRepository: Send + Sync {
 
 /// Object-storage interface — the bytes layer behind a trait.
 ///
-/// Implementations: `S3Storage` (production — speaks the AWS S3 wire,
-/// works against GCS/MinIO/R2/B2/AWS), `InMemoryFileStorage` (tests).
-/// A `LocalDiskStorage` could land for dev later but isn't part of
-/// session 1 — `S3Storage` against MinIO covers the dev case.
+/// Implementations: `LocalDiskStorage` (production — bytes under a
+/// configured root directory; large files stream through the app),
+/// `InMemoryFileStorage` (tests). Backends without a native presigned
+/// path return `FileError::Unsupported` from `sign_*_url`; callers
+/// fall back to streaming.
 #[async_trait]
 pub trait FileStorage: Send + Sync {
     /// Write bytes at `key`. Idempotent — re-PUTting the same key
