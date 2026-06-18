@@ -195,11 +195,10 @@ secondary, scratch + prod stacks isolated by port offset + database.
   its own `boss_scratch` database. Driven by the simulator; safe to
   drop and recreate without touching production data.
 - **External integrations** — GitHub (source repo; hosts the `boss`
-  CLI releases for `boss upgrade`),
-  S3-compatible object storage (deferred until asset files land
-  — the `S3Storage` adapter speaks the AWS S3 wire so any
-  provider that supports it works), banks/payroll (designed
-  under `external-financial-actors.md`, not deployed).
+  CLI releases for `boss upgrade`), banks/payroll (designed
+  under `external-financial-actors.md`, not deployed). File
+  attachments use local-disk storage (`LocalDiskStorage`), not a
+  cloud object store.
 
 ---
 

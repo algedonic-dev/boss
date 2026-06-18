@@ -141,6 +141,7 @@ fn err(e: FileError) -> Response {
         FileError::DuplicateObject(s) => (StatusCode::CONFLICT, s).into_response(),
         FileError::Repository(s) => (StatusCode::INTERNAL_SERVER_ERROR, s).into_response(),
         FileError::Storage(s) => (StatusCode::INTERNAL_SERVER_ERROR, s).into_response(),
+        FileError::Unsupported(s) => (StatusCode::NOT_IMPLEMENTED, s).into_response(),
     }
 }
 
@@ -319,26 +320,31 @@ async fn download(
         return resp;
     }
 
-    // Large files: 302 to a presigned URL so the bytes flow client
-    // → bucket directly instead of through the gateway. v1 does not
-    // bind the URL to the requesting user via a query-param HMAC
-    // (the design line 112 enhancement); the short TTL is the
-    // primary safeguard. Per-user binding is a follow-up if a real
-    // link-sharing concern surfaces.
+    // Large files: if the storage backend can mint a presigned URL,
+    // 302 to it so the bytes flow client → store directly. The
+    // local-disk backend can't presign (returns Unsupported), so we
+    // fall through to streaming the bytes through the content-api —
+    // fine for a single-VM deployment with no separate object store.
     if row.size_bytes > LARGE_DOWNLOAD_THRESHOLD_BYTES {
-        return match state
+        match state
             .storage
             .sign_get_url(&row.object_key, SIGNED_GET_TTL)
             .await
         {
-            Ok(url) => Redirect::temporary(&url).into_response(),
-            Err(FileError::NotFound(_)) => (
-                StatusCode::GONE,
-                "bytes_missing — row exists but bytes were GC'd",
-            )
-                .into_response(),
-            Err(e) => err(e),
-        };
+            Ok(url) => return Redirect::temporary(&url).into_response(),
+            // Backends without presigned URLs (local disk) stream the
+            // bytes through the content-api instead — fall through to
+            // the streaming path below.
+            Err(FileError::Unsupported(_)) => {}
+            Err(FileError::NotFound(_)) => {
+                return (
+                    StatusCode::GONE,
+                    "bytes_missing — row exists but bytes were GC'd",
+                )
+                    .into_response();
+            }
+            Err(e) => return err(e),
+        }
     }
 
     match state.storage.get(&row.object_key).await {

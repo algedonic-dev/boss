@@ -24,7 +24,14 @@ pub enum FileError {
     #[error("repository failure: {0}")]
     Repository(String),
 
-    /// Bytes-layer failure (S3 PUT/GET, local-disk I/O, signing).
+    /// Bytes-layer failure (local-disk I/O, etc.).
     #[error("storage failure: {0}")]
     Storage(String),
+
+    /// Operation the active storage backend doesn't support — e.g.
+    /// presigned URLs on the local-disk adapter, which streams bytes
+    /// through the content-api instead. Callers degrade gracefully
+    /// (download falls back to streaming; upload uses multipart).
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
 }

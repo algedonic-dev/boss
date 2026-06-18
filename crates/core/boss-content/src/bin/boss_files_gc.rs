@@ -7,21 +7,23 @@
 //! lets operators recover within the window from a mistaken Detach.
 //!
 //! Invoked by a systemd timer (see `infra/boss-files-gc.timer`).
-//! Reads bucket / S3 endpoint / credentials from the same
+//! Reads the file-storage root from the same
 //! `/etc/boss-content-api.toml` that the API binary consumes — no
 //! split-config to keep in sync.
 //!
 //! Exit codes:
 //! - `0` — sweep ran (including "0 candidates" runs)
 //! - non-zero — operational error (config missing, DB unreachable,
-//!   S3 endpoint unreachable, …)
+//!   storage root unreadable, …)
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use boss_content::config::ContentApiConfig;
-use boss_content::files::{DEFAULT_GC_GRACE_DAYS, FileStorage, S3Storage, gc_orphan_objects};
+use boss_content::files::{
+    DEFAULT_GC_GRACE_DAYS, FileStorage, LocalDiskStorage, gc_orphan_objects,
+};
 use chrono::Utc;
 use clap::Parser;
 use sqlx::postgres::PgPoolOptions;
@@ -69,29 +71,11 @@ async fn main() -> Result<()> {
         .await
         .context("connecting to postgres")?;
 
-    let storage: Arc<dyn FileStorage> = match (&files_cfg.access_key, &files_cfg.secret_key) {
-        (Some(ak), Some(sk)) => {
-            let endpoint = files_cfg
-                .endpoint
-                .as_deref()
-                .unwrap_or("https://storage.googleapis.com");
-            let region = files_cfg.region.as_deref().unwrap_or("us-east-1");
-            Arc::new(
-                S3Storage::with_credentials(&files_cfg.bucket, endpoint, region, ak, sk)
-                    .await
-                    .context("S3Storage::with_credentials")?,
-            )
-        }
-        _ => Arc::new(
-            S3Storage::new(
-                &files_cfg.bucket,
-                files_cfg.endpoint.as_deref(),
-                files_cfg.region.as_deref(),
-            )
+    let storage: Arc<dyn FileStorage> = Arc::new(
+        LocalDiskStorage::new(&files_cfg.root)
             .await
-            .context("S3Storage::new")?,
-        ),
-    };
+            .with_context(|| format!("opening file storage root {}", files_cfg.root.display()))?,
+    );
 
     let grace_days = cli.grace_days.unwrap_or(DEFAULT_GC_GRACE_DAYS);
     let grace = chrono::Duration::days(grace_days);
