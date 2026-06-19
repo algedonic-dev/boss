@@ -143,6 +143,7 @@ fn fixture_job(id: &str, title: &str) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
         kind: "service-visit".into(),
+        job_kind_version: 1,
         subject: Subject::new("account", "acc-001"),
         title: title.into(),
         owner_id: "emp-100".into(),

@@ -77,6 +77,7 @@ mod tests {
         Job {
             id: JobId::new(),
             kind: "field-service".into(),
+            job_kind_version: 1,
             subject,
             title: "Test".into(),
             owner_id: owner_id.to_string(),

@@ -40,6 +40,7 @@ impl PgJobs {
 struct JobRow {
     id: uuid::Uuid,
     kind: String,
+    job_kind_version: i32,
     subject_kind: String,
     subject_id: String,
     title: String,
@@ -95,6 +96,7 @@ fn row_to_job(r: JobRow) -> Job {
     Job {
         id: JobId::from_uuid(r.id),
         kind: r.kind,
+        job_kind_version: r.job_kind_version,
         subject: parse_subject(&r.subject_kind, &r.subject_id),
         title: r.title,
         owner_id: r.owner_id,
@@ -257,8 +259,8 @@ impl JobsRepository for PgJobs {
             r#"
             INSERT INTO jobs (id, kind, subject_kind, subject_id, title, owner_id,
                               status, priority, opened_on, due_on, closed_on, metadata, tags,
-                              created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)
+                              job_kind_version, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)
             ON CONFLICT (id) DO NOTHING
             "#,
         )
@@ -275,6 +277,7 @@ impl JobsRepository for PgJobs {
         .bind(job.closed_on)
         .bind(&job.metadata)
         .bind(&job.tags)
+        .bind(job.job_kind_version)
         .bind(now)
         .execute(&self.pool)
         .await
@@ -284,7 +287,7 @@ impl JobsRepository for PgJobs {
 
     async fn get_job(&self, id: &JobId) -> Result<Option<Job>, JobsError> {
         let row = sqlx::query_as::<_, JobRow>(
-            "SELECT id, kind, subject_kind, subject_id, title, owner_id, status, priority, opened_on, due_on, closed_on, metadata, tags FROM jobs WHERE id = $1",
+            "SELECT id, kind, job_kind_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, due_on, closed_on, metadata, tags FROM jobs WHERE id = $1",
         )
         .bind(*id.inner().as_uuid())
         .fetch_optional(&self.pool)
@@ -373,7 +376,7 @@ impl JobsRepository for PgJobs {
         // and returned the full policy-scoped set — which is why
         // /api/jobs?account_id=foo looked empty on every detail page.
         let list_sql = r#"
-            SELECT id, kind, subject_kind, subject_id, title, owner_id, status,
+            SELECT id, kind, job_kind_version, subject_kind, subject_id, title, owner_id, status,
                    priority, opened_on, due_on, closed_on, metadata, tags
             FROM jobs
             WHERE ($1::text IS NULL OR kind = $1)

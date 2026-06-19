@@ -129,6 +129,7 @@ fn job_with_subject(subject: Subject) -> Job {
     Job {
         id: boss_core::job::JobId::from_uuid(Uuid::new_v4()),
         kind: "ad-hoc".into(),
+        job_kind_version: 1,
         subject,
         title: "Smoke".into(),
         owner_id: "emp-cto".into(),
