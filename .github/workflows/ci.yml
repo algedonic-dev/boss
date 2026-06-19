@@ -86,6 +86,21 @@ jobs:
       - name: API-path bypass-smell (no direct-DB data writes)
         run: infra/lint/api-path-bypass-smell.sh
 
+      # Linchpin for seed-event realism: the sim may only reach the
+      # system through *-client crates (the public API), so event
+      # ordering is forced by the live write-time guards. If the sim
+      # could bulk-write domain state, ordering realism would be lost.
+      - name: Sim-boundary audit (sim goes through the API only)
+        run: infra/lint/sim-boundary-audit.sh
+
+      - name: Tier-import audit (Tier-1 must not depend on Tier-2)
+        run: infra/lint/tier-import-audit.sh
+
+      # Temporal realism: every timestamp routes through clock-api, so
+      # sim-epoch events aren't stamped with wallclock.
+      - name: No-wallclock (timestamps route through clock-api)
+        run: infra/lint/no-wallclock.sh
+
   web:
     runs-on: ubuntu-latest
     steps:

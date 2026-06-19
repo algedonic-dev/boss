@@ -1,0 +1,103 @@
+name: Install smoke
+
+# Boots the actual OSS quickstart Docker stack, lets the live sim seed
+# emergent data, and asserts the install works AND the seeded events are
+# causally ordered. This is the gate that makes "install green on main"
+# mean something — plain CI (cargo + bun) never boots the stack.
+#
+# Heavy by design: it compiles the whole workspace + SPA into the image,
+# boots Postgres/NATS/all services, and runs the sim. ~25-35 min.
+#
+# NOTE: this is not yet a required status check — once it's proven
+# stable, add "smoke" to main's branch-protection required checks so a
+# broken install can't merge.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: install-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: infra/oss-quickstart
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4 (pinned per OpenSSF Scorecard)
+
+      - name: Free up runner disk space
+        # The image build compiles the full workspace; reclaim ~25 GB of
+        # unused preinstalled toolchains so it doesn't run out of disk.
+        working-directory: .
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Build the quickstart image
+        run: |
+          cp .env.example .env
+          docker compose build
+
+      - name: Boot the stack
+        run: docker compose up -d
+
+      - name: Wait for the sim to seed emergent data
+        # The live sim runs on boot; poll until it has both closed Jobs
+        # and issued invoices — proof the install booted AND the seed
+        # path produced emergent state (not just empty tables).
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            counts=$(docker compose exec -T postgres psql -U boss -d boss -At -F' ' -c \
+              "select (select count(*) from jobs where closed_on is not null),
+                      (select count(*) from invoices);" 2>/dev/null || echo "0 0")
+            closed=$(echo "$counts" | awk '{print $1}')
+            invoices=$(echo "$counts" | awk '{print $2}')
+            echo "t=${i} closed_jobs=${closed:-0} invoices=${invoices:-0}"
+            if [ "${closed:-0}" -gt 0 ] && [ "${invoices:-0}" -gt 0 ]; then
+              echo "✓ emergent data present"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::sim did not produce emergent data within timeout"
+          docker compose ps
+          docker compose logs --tail=120 boss-services
+          exit 1
+
+      - name: Assert seeded events are causally ordered
+        # The regression net for unrealistic event ordering. Runs the
+        # always-valid ordering invariants (lifecycle dates ascend;
+        # facts land within a gl_period) inside the postgres container.
+        run: |
+          set -euo pipefail
+          docker cp ../lint/audit-ordering.sh "$(docker compose ps -q postgres)":/tmp/ord.sh
+          docker compose exec -T \
+            -e PGHOST=127.0.0.1 -e PGUSER=boss -e PGPASSWORD=boss -e PGDATABASE=boss \
+            postgres bash /tmp/ord.sh
+
+      - name: Report dispatcher dead-letters (informational)
+        if: always()
+        # Informational, not a gate: a short window can show transient
+        # dead-letters (e.g. an invoice billed before production catches
+        # up on FG stock) that a full regen clears. Surfaced so a
+        # regression in the count is visible in the log.
+        run: |
+          n=$(docker compose logs boss-services 2>&1 | grep -c 'DEAD-LETTER' || true)
+          echo "dispatcher dead-letters observed: ${n}"
+          docker compose logs boss-services 2>&1 | grep 'DEAD-LETTER' | tail -5 || true
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v || true
