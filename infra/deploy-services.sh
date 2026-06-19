@@ -871,4 +871,34 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
     done
 fi
 
+# Front door. deploy-services manages the API services but NOT the
+# gateway (nor the sim) — so a `systemctl stop boss-*` + deploy-services
+# reset would leave the gateway down and caddy would serve the "demo
+# regenerating" splash even though every API above is healthy (this bit
+# us 2026-06-19). Ensure + verify the gateway here so the bring-up can't
+# silently leave the public face down.
+if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]] \
+    && systemctl list-unit-files boss-gateway.service >/dev/null 2>&1; then
+    if ! systemctl is-active --quiet boss-gateway.service; then
+        echo "==> gateway not running — starting it (front door; not in the managed list)"
+        systemctl enable --now boss-gateway.service >/dev/null 2>&1 || true
+        systemctl start boss-gateway.service || true
+        sleep 2
+    fi
+    gw_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1:4443/ || echo "000")
+    if [[ "$gw_code" =~ ^(200|302|401|403)$ ]]; then
+        printf '  %-20s  GET %-45s  %s\n' "gateway(front-door)" "http://127.0.0.1:4443/" "$gw_code"
+    else
+        echo "  !! GATEWAY NOT RESPONDING ($gw_code) — the public face will show the" >&2
+        echo "     'demo regenerating' splash until :4443 is up. Investigate boss-gateway." >&2
+    fi
+    # The sim (also unmanaged here) gates on BOSS_DEMO_MODE; flag it if a
+    # demo host left it down, but don't force-start (non-demo deploys
+    # intentionally leave it off).
+    if systemctl is-enabled --quiet boss-brewery-sim.service 2>/dev/null \
+        && ! systemctl is-active --quiet boss-brewery-sim.service; then
+        echo "  note: boss-brewery-sim is enabled but not active — start it if this is a demo host."
+    fi
+fi
+
 echo "done."
