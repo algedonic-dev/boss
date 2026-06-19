@@ -74,37 +74,55 @@
     { name: 'PostgreSQL', port: 5432, healthSlug: null, description: 'Primary data store, audit_log hash-chained' },
   ];
 
-  // Live status, fetched on mount. Defaults to `unknown`; the
-  // probe flips to `healthy` / `degraded` / `down` as each
-  // /health response lands. Probes run in parallel via
-  // Promise.allSettled so one slow service doesn't block the row.
+  // Live status, polled on an interval. Defaults to `unknown`; each
+  // probe resolves to healthy / degraded / down / unknown and the row
+  // updates as responses land. Re-polling (not a one-shot on mount) is
+  // the fix for services that were cold or slow at first paint sticking
+  // red forever — a transient now recovers to green on the next tick.
   let serviceStatus = $state<Record<string, ServiceStatus>>({});
 
+  // Classify one /health response. Only a real JSON health body counts
+  // as healthy/degraded. A 200 that isn't JSON is the SPA index served
+  // by the gateway's static fall-through — i.e. there's no health route
+  // for this slug (e.g. boss-dispatcher is a NATS consumer with no HTTP
+  // API; some services aren't proxied at /api/<slug>/health) — that's
+  // `unknown`, NOT a degraded service. A 4xx (no route / not probeable)
+  // is likewise `unknown`. Only a 5xx or a network/timeout failure — a
+  // genuinely unreachable upstream — is `down`. This stops live, healthy
+  // deployments painting half their rows red/yellow.
+  async function probeHealth(slug: string): Promise<ServiceStatus> {
+    try {
+      const r = await fetch(`/api/${slug}/health`, {
+        // Health routes are auth-bypass at the gateway; keep a modest
+        // timeout so a flap doesn't hang the row (the interval retries).
+        signal: AbortSignal.timeout(5000),
+      });
+      if (r.status >= 500) return 'down';
+      if (!r.ok) return 'unknown';
+      const body = (await r.json().catch(() => null)) as { status?: string } | null;
+      if (!body || typeof body.status !== 'string') return 'unknown';
+      return body.status === 'ok' ? 'healthy' : 'degraded';
+    } catch {
+      return 'down';
+    }
+  }
+
   $effect(() => {
-    const probes = SERVICES.filter((s) => s.healthSlug !== null).map(
-      async (s) => {
-        try {
-          const r = await fetch(`/api/${s.healthSlug}/health`, {
-            // Health routes are auth-bypass at the gateway; the
-            // SPA can hit them without a session. Keep tight
-            // timeout so a flap doesn't hang the page.
-            signal: AbortSignal.timeout(3000),
-          });
-          if (!r.ok) {
-            serviceStatus = { ...serviceStatus, [s.name]: 'down' };
-            return;
-          }
-          const body = (await r.json()) as { status?: string };
-          serviceStatus = {
-            ...serviceStatus,
-            [s.name]: body.status === 'ok' ? 'healthy' : 'degraded',
-          };
-        } catch {
-          serviceStatus = { ...serviceStatus, [s.name]: 'down' };
-        }
-      },
-    );
-    Promise.allSettled(probes);
+    let cancelled = false;
+    const probeable = SERVICES.filter((s) => s.healthSlug !== null);
+    const pollAll = () => {
+      for (const s of probeable) {
+        probeHealth(s.healthSlug as string).then((status) => {
+          if (!cancelled) serviceStatus = { ...serviceStatus, [s.name]: status };
+        });
+      }
+    };
+    pollAll();
+    const id = setInterval(pollAll, 10_000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
   });
 
   function statusFor(s: ServiceInfo): ServiceStatus {
