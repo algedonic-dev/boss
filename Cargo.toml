@@ -104,5 +104,5 @@ axum = "0.8"
 tower = "0.5"
 async-nats = "0.47"
 futures = "0.3"
-toml = "0.8"
+toml = "1.1"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
