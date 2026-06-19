@@ -320,6 +320,13 @@ sql_allow_line() {
   if echo "$line_content" | grep -qE '\b(updated_at|created_at|deleted_at|closed_at|settled_at|published|locked_at|paid_at|sent_at|read_at|expires_at|received_at|claimed_at|started_at|finished_at|completed_at|opened_at|seen_at)\s*=\s*NOW\s*\(\s*\)'; then
     return 0
   fi
+  # The sim-clock epoch anchor: `wall_anchor` records the real-world
+  # instant the sim epoch was primed. Wallclock is correct here by
+  # definition — it's the fixed reference sim-time is measured *from*,
+  # not a business date stamped onto any event.
+  if echo "$line_content" | grep -qE 'wall_anchor\s*=\s*NOW\s*\(\s*\)'; then
+    return 0
+  fi
   # Expiry checks against wallclock (policy rules, tokens).
   if echo "$line_content" | grep -qE 'expires_at\s*[<>!=]+\s*NOW\s*\(\s*\)'; then
     return 0
