@@ -49,7 +49,7 @@ it and it'll stay consistent with the code. Full vocabulary in
 
 In BOSS-primitive terms, every noun below is a Subject (identity-bearing)
 or a Class (taxonomy of Subjects). See
-[/DOMAIN.md](../../DOMAIN.md) and
+[CLAUDE.md](../../CLAUDE.md) and
 [docs/architecture/01-primitives.mmd](../../docs/architecture/01-primitives.mmd)
 for the platform-level definitions.
 

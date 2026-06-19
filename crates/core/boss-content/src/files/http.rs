@@ -376,12 +376,15 @@ fn download_response(row: &FileRef, bytes: Bytes) -> Response {
     (StatusCode::OK, headers, bytes).into_response()
 }
 
-// ---- Large-file upload path (Session 4) ----------------------------------
+// ---- Large-file upload path (presigned, optional backend) ----------------
 //
-// Two-phase: client first asks for a presigned PUT URL, uploads bytes
-// directly to the bucket, then asks the service to finalize (insert
-// row + emit event). Used by the SPA when file.size > 50 MiB; the
-// multipart `upload` handler still serves smaller files.
+// Two-phase: client asks for a presigned PUT URL, uploads bytes
+// directly to the object store, then asks the service to finalize
+// (insert row + emit event). This requires a storage backend that can
+// mint presigned URLs. The default `LocalDiskStorage` cannot, so
+// `sign_put_url` returns `Unsupported` and these endpoints are unused —
+// the SPA uploads every size via the multipart `upload` handler. The
+// endpoints are retained for a future object-store backend.
 //
 // State between phases is carried by the client — every metadata field
 // the row needs gets sent on _both_ requests, and the finalize handler

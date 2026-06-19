@@ -5,8 +5,8 @@ Description=Daily bytes-GC sweep for soft-deleted file_refs
 # Fires at 04:15 local daily — staggered after the messages-events
 # purge (03:30) and the audit-integrity check (04:00) so the night's
 # maintenance load doesn't pile onto one minute. Bytes-side delete
-# may hit the S3 endpoint hundreds of times per sweep, so giving it
-# a quieter window keeps the API services responsive.
+# may issue hundreds of local-disk byte removals per sweep, so giving
+# it a quieter window keeps the API services responsive.
 OnCalendar=*-*-* 04:15:00
 # Catch up if the host was down at fire time. A skipped night just
 # delays orphan eviction by hours; the 30-day grace window absorbs

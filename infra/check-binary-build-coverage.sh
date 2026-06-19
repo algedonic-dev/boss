@@ -183,7 +183,6 @@ done < "$TMP/bins.tsv"
 #   2. The bin's `required-features`.
 #   3. A workspace member that depends on the crate with
 #      features = ["postgres"].
-# The s3 feature gets the same treatment (boss-content uses both).
 
 # Collect every bin (regardless of required-features) for the
 # service-binary-name check — re-walk the Cargo.tomls.
@@ -209,7 +208,7 @@ while IFS=$'\t' read -r pkg_name cargo_file _defaults; do
 done < "$TMP/crates.tsv" > "$TMP/all_bins.tsv"
 
 # Service-bin name patterns. Adjust if a new naming convention lands.
-declare -a HEAVY_FEATURES=("postgres" "s3")
+declare -a HEAVY_FEATURES=("postgres")
 declare -a SERVICE_BIN_PATTERNS=("-api$" "-rebuild$" "-files-gc$" "-events-purge$" "-recognize$" "-replay-check$" "-facts-rebuild$" "-baseline-seed$")
 
 is_service_bin() {

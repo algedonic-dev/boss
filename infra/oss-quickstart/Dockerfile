@@ -16,7 +16,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1 — Rust build.
 # ---------------------------------------------------------------------------
-FROM rust:1.95-slim-bookworm@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082 AS rust-build
+FROM rust:1.96-slim-bookworm@sha256:c8a94a78f67ec8c4d474ec7f71e0720f21eb7e584e158daec0874cafa7c30e4d AS rust-build
 
 # sqlx + reqwest need pkg-config + libssl-dev for the rustls-native
 # bridge; the rest of the workspace is pure Rust.

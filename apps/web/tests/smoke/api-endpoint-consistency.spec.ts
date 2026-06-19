@@ -30,9 +30,9 @@ const SRC_DIR = join(import.meta.dir, '..', '..', 'src');
 // reading the reason and deciding the skip is still warranted.
 const SKIP_LIST: ReadonlyArray<{ url: string; reason: string }> = [
   // file-attachments returns 200 + `{kind: "unconfigured"}` envelope
-  // when no [files] config block is set — handled, but the SPA's
-  // POST path (`/api/files/_finalize`, `/api/files/_upload-url`)
-  // will 4xx if probed via GET. Skip those.
+  // when no [files] config block is set. The presigned-upload routes
+  // below are server-only (no current SPA caller on the local-disk
+  // backend) and POST-only, so a GET probe 4xx's. Skip them.
   { url: '/api/files/_finalize', reason: 'POST-only; GET probe always 405/404' },
   { url: '/api/files/_upload-url', reason: 'POST-only; GET probe always 405/404' },
   // `/api/auth/*` are POST endpoints; GET probe returns 405.

@@ -142,7 +142,7 @@ The workspace splits into four tiers (see CLAUDE.md):
 - **Core state-machine OS** — `crates/core/`. The generic primitives every deployment uses:
   Subjects, Jobs, Steps, the audit log + projection rebuilders,
   the JobKind / StepType / StepPlugin registries, policy,
-  gateway/auth/NATS, calendar, and the three taxonomy registries.
+  gateway/auth/NATS, calendar, and the two taxonomy registries.
   Tenant-neutral.
 - **Company-modeling layer** — `crates/modules/`. Useful for modeling a company on top of the core:
   people, accounts, commerce, inventory, ledger, products,
