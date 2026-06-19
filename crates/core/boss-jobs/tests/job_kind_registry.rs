@@ -10,7 +10,7 @@ use axum::http::{Request, StatusCode};
 use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
 use boss_jobs::http::{JobsApiState, router};
-use boss_jobs::registry::{JobKindRegistry, JobKindSpec, JobKindStatus};
+use boss_jobs::registry::{JobKindRegistry, JobKindSpec, JobKindStatus, StepSpec, Terminal};
 use boss_jobs::step_registry::StepRegistry;
 use boss_jobs::{InMemoryJobKinds, InMemoryJobs};
 use boss_policy_client::{AccessTier, Action, Resource, Scope, User};
@@ -105,6 +105,86 @@ async fn send_json(
         None => Body::empty(),
     };
     app.oneshot(builder.body(body).unwrap()).await.unwrap()
+}
+
+// --- author-time dry-run lint (POST /api/jobs/kinds/_validate) ---
+
+fn trigger_step() -> StepSpec {
+    StepSpec {
+        title: "start".into(),
+        kind: "task".into(),
+        ready_when: "true".into(),
+        ..Default::default()
+    }
+}
+
+fn terminal_step() -> StepSpec {
+    StepSpec {
+        title: "finish".into(),
+        kind: "task".into(),
+        ready_when: "steps.start.done".into(),
+        terminal: Some(Terminal {
+            outcome: "done".into(),
+        }),
+        ..Default::default()
+    }
+}
+
+async fn dry_run(app: Router, spec: &JobKindSpec) -> serde_json::Value {
+    let resp = send_json(
+        app,
+        "POST",
+        "/api/jobs/kinds/_validate",
+        &cto(),
+        Some(serde_json::to_value(spec).unwrap()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn dry_run_validate_passes_a_viable_spec() {
+    let registry: Arc<dyn JobKindRegistry> = Arc::new(InMemoryJobKinds::new());
+    let app = build_app(registry);
+    let mut spec = draft_spec("viable");
+    spec.steps = vec![trigger_step(), terminal_step()];
+
+    let body = dry_run(app, &spec).await;
+    assert_eq!(
+        body["ok"].as_bool(),
+        Some(true),
+        "viable spec should pass: {body}"
+    );
+    assert_eq!(body["problems"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn dry_run_validate_flags_missing_terminal_without_persisting() {
+    let registry: Arc<dyn JobKindRegistry> = Arc::new(InMemoryJobKinds::new());
+    let app = build_app(registry.clone());
+    let mut spec = draft_spec("no-terminal");
+    spec.steps = vec![trigger_step()]; // trigger only — no terminal
+
+    let body = dry_run(app, &spec).await;
+    assert_eq!(body["ok"].as_bool(), Some(false));
+    let problems = body["problems"].as_array().unwrap();
+    let joined: String = problems
+        .iter()
+        .filter_map(|p| p["message"].as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        joined.contains("no terminal"),
+        "expected a 'no terminal' problem, got: {joined}"
+    );
+
+    // The dry run must not persist: the kind is not in the registry.
+    assert!(
+        registry.get_active("no-terminal").await.is_err(),
+        "dry-run must not create the kind"
+    );
 }
 
 #[tokio::test]
