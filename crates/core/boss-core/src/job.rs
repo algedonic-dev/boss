@@ -146,6 +146,14 @@ pub struct Job {
     #[serde(default)]
     pub id: JobId,
     pub kind: String,
+    /// JobKind version this Job opened under. Server-assigned at
+    /// creation to the kind's active version — creation is blocked
+    /// against draft/retired kinds, so this is the latest version at
+    /// open time. In-flight Jobs stay pinned to it across later
+    /// publishes. Default 1 keeps pre-versioning events replaying
+    /// clean. Per docs/architecture-decisions.md §Jobs, JobKinds, Steps.
+    #[serde(default = "default_job_kind_version")]
+    pub job_kind_version: i32,
     pub subject: Subject,
     pub title: String,
     pub owner_id: String,
@@ -170,6 +178,7 @@ impl Job {
         Self {
             id: JobId::new(),
             kind: kind.into(),
+            job_kind_version: default_job_kind_version(),
             subject,
             title: title.into(),
             owner_id: owner_id.into(),
@@ -196,6 +205,15 @@ impl Job {
     /// stay on the `Job::new` default.
     pub fn with_id(mut self, id: JobId) -> Self {
         self.id = id;
+        self
+    }
+
+    /// Set the JobKind version this Job opened under. Production goes
+    /// through the create handler, which stamps the kind's active
+    /// version; this builder is for sim/replay/test paths that
+    /// construct a Job directly.
+    pub fn with_job_kind_version(mut self, version: i32) -> Self {
+        self.job_kind_version = version;
         self
     }
 
@@ -340,6 +358,10 @@ pub struct Step {
     /// `None` for ordinary steps.
     #[serde(default)]
     pub embedded_job: Option<JobId>,
+}
+
+fn default_job_kind_version() -> i32 {
+    1
 }
 
 fn default_step_kind() -> String {

@@ -69,14 +69,35 @@ UNION ALL SELECT 'shipment.delivered_on<shipped_on ' || id::text FROM shipments 
 SQL
 )"
 
-# ---- 2. Temporal skeleton — every financial_fact lands in a period ----
+# ---- 2. JobKind version pin — Jobs open under the active version ----
+# docs/architecture-decisions.md §Jobs, JobKinds, Steps: creation is
+# blocked against draft/retired kinds, and in-flight Jobs pin to the
+# version they opened under. So every Job's (kind, job_kind_version)
+# must resolve to a real job_kinds row, and that row must NOT be a
+# `draft` — a Job can never open under a draft. It MAY be `retired`:
+# an in-flight Job whose version was superseded by a later publish.
+# (Catches the regression where job_kind_version silently defaulted to
+# 1 instead of being stamped with the kind's active version on create.)
+run_invariant "2. JobKind version pin — every Job opened under a non-draft version" "$(cat <<'SQL'
+SELECT 'job ' || j.id::text || ' kind=' || j.kind || ' v=' || j.job_kind_version ||
+       CASE WHEN k.kind IS NULL THEN ' — no such job_kinds row'
+            ELSE ' — opened under a draft version' END
+  FROM jobs j
+  LEFT JOIN job_kinds k
+    ON k.kind = j.kind AND k.version = j.job_kind_version
+ WHERE k.kind IS NULL
+    OR k.status = 'draft'
+SQL
+)"
+
+# ---- 3. Temporal skeleton — every financial_fact lands in a period ----
 # A financial_fact dated outside every defined gl_period means an event
 # landed before the books opened (or beyond the period skeleton) — a
 # temporal-realism violation period-lock can't catch on its own (it only
 # blocks back-dating into *closed* periods). The opening-snapshot facts
 # (the day before sim day-1) are fine: they sit inside the opening month
 # period (e.g. gl_periods starts 2025-03-01 for a 2025-04-01 epoch).
-run_invariant "2. Temporal skeleton — financial_facts fall within a gl_period" "$(cat <<'SQL'
+run_invariant "3. Temporal skeleton — financial_facts fall within a gl_period" "$(cat <<'SQL'
 SELECT 'financial_fact ' || ff.id::text || ' happened_on=' || ff.happened_on
   FROM financial_facts ff
  WHERE NOT EXISTS (

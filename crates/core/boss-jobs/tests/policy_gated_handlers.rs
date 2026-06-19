@@ -37,6 +37,7 @@ fn job_owned_by(id: &str, owner: &str) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
         kind: "field-service".into(),
+        job_kind_version: 1,
         subject: Subject::new("asset", "SYS-1"),
         title: "Repair".into(),
         owner_id: owner.to_string(),

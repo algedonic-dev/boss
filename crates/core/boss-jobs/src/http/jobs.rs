@@ -415,7 +415,7 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
     {
         obj.insert("opened_on".to_string(), serde_json::json!(now.date_naive()));
     }
-    let job: Job = match serde_json::from_value(raw) {
+    let mut job: Job = match serde_json::from_value(raw) {
         Ok(j) => j,
         Err(e) => {
             return (
@@ -447,6 +447,16 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
     } else {
         None
     };
+
+    // Pin the Job to the kind's active version — the version it opens
+    // under. Per docs/architecture-decisions.md §Jobs, JobKinds, Steps:
+    // in-flight Jobs pin to the version they opened under, and creation
+    // is blocked against draft/retired kinds (enforced by get_active
+    // above, which 400s on an inactive kind). Server-assigned —
+    // overrides any value a client put on the wire.
+    if let Some(ref spec) = kind_spec {
+        job.job_kind_version = spec.version;
+    }
 
     // When `subject = Subject::Custom`, validate `custom_kind` against
     // the SubjectKind registry. Closed-variant subjects (System,
