@@ -7,8 +7,8 @@ model checker exhaustively confirm them on a bounded model.
 
 This is the TLA+ track of BOSS's formal-methods work. The other
 tracks are independent and live in the Rust tree: proptest property
-tests (e.g. `crates/core/boss-core/tests/composite_properties.rs`)
-and Kani bounded proofs (`crates/modules/boss-ledger/src/kani_proofs.rs`).
+tests across the Rust crates and Kani bounded proofs
+(`crates/modules/boss-ledger/src/kani_proofs.rs`).
 
 ## Specs
 

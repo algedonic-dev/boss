@@ -390,8 +390,6 @@ sql_is_file_allowed() {
     # Sim binary writes sim_clock metadata; the bus-side audit
     # comes from elsewhere.
     crates/tenants/boss-brewery-engine/src/bin/boss_brewery_sim.rs) return 0 ;;
-    # assets system_parts: in-memory updated_at on dev fixtures.
-    crates/modules/boss-assets/src/system_parts.rs) return 0 ;;
   esac
   return 1
 }

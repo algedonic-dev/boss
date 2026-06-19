@@ -4,13 +4,14 @@
 //!
 //! Two ports (`FileStorage` for bytes, `FileRepository` for rows)
 //! sit behind the same HTTP service as bulletins/manual. Bytes live
-//! in object storage; sha256 chains them into `audit_log`.
+//! under a configured local-disk `root` (see `LocalDiskStorage`),
+//! keyed by sha256; sha256 chains them into `audit_log`.
 //!
-//! Session 1 ships the ports + schema + Pg adapter + in-memory
-//! adapters (test-only). The S3-compatible bytes adapter lands with
-//! the HTTP service in Session 2 — that's the first consumer that
-//! actually needs to write bytes; pulling `aws-sdk-s3` into the
-//! workspace before then would be a build-time tax for no consumer.
+//! `PgFileRepository` persists the metadata rows; `LocalDiskStorage`
+//! is the default bytes backend (no cloud object store / SDK).
+//! In-memory adapters back the tests. The `FileStorage` port keeps
+//! the bytes backend swappable — a cloud object-store adapter could
+//! slot in later behind the same trait.
 
 pub mod error;
 pub mod http;

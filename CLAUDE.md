@@ -175,7 +175,8 @@ The core state-machine OS lives under `crates/core/` (27 crates —
 `boss-gateway`, `boss-observability`, `boss-cybernetics`,
 `boss-docs`, `boss-ml`, `boss-content`, `boss-testing`,
 `boss-dispatcher`, `boss-clock`, `boss-expr`, `boss-locations`, the
-three taxonomy registries, `boss-calendar`, `boss-nats`, `boss-ports`,
+two taxonomy registries (`boss-classes`, `boss-subject-kinds`),
+`boss-calendar`, `boss-nats`, `boss-ports`,
 plus matching `*-client` crates). Company-modeling adds the
 `crates/modules/` tier (`boss-people`, `boss-messages`,
 `boss-ledger`, `boss-commerce`, `boss-inventory`, etc.). The
@@ -258,7 +259,8 @@ the tier it touches.**
   is non-negotiable here.** Crates include `boss-core`,
   `boss-events`, `boss-jobs`, `boss-policy`, `boss-gateway`,
   `boss-dispatcher`, `boss-clock`, `boss-expr`, `boss-locations`,
-  the three taxonomy registries, `boss-calendar`,
+  the two taxonomy registries (`boss-classes`, `boss-subject-kinds`),
+  `boss-calendar`,
   `boss-content`, the ML stack, `boss-cybernetics`,
   `boss-testing`, `boss-ports`, `boss-docs`, plus matching
   `*-client` crates.
