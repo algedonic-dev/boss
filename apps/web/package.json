@@ -10,6 +10,8 @@
     "typecheck": "svelte-check --tsconfig ./tsconfig.json"
   },
   "dependencies": {
+    "@dagrejs/dagre": "^3.0.0",
+    "@xyflow/svelte": "^1.6.0",
     "puppeteer": "^25.1.0",
     "svelte": "^5.55.9",
     "zod": "^4.4.3"

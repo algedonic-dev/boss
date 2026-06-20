@@ -136,7 +136,7 @@ async fn dry_run(app: Router, spec: &JobKindSpec) -> serde_json::Value {
         "POST",
         "/api/jobs/kinds/_validate",
         &cto(),
-        Some(serde_json::to_value(spec).unwrap()),
+        Some(serde_json::json!({ "kind": spec.kind, "steps": spec.steps })),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
