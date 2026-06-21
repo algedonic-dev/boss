@@ -27,19 +27,21 @@ test.describe('Admin Job kinds list', () => {
 });
 
 test.describe('Admin Job kind detail — controls', () => {
-  test('Publish + Retire buttons render with correct disabled state', async ({
+  test('Edit + Retire buttons render with correct enabled state', async ({
     page,
   }) => {
     await mountPage(page, '/admin/job-kinds/ad-hoc');
     await expect(page.locator('h1')).toBeVisible({ timeout: 10_000 });
 
-    const publish = page.getByRole('button', { name: /publish/i });
+    // D6 removed the direct "Publish draft" control — authoring/publish
+    // now runs through a job-kind-design Job (opened via Edit…).
+    const edit = page.getByRole('button', { name: /edit/i });
     const retire = page.getByRole('button', { name: /^retire$/i });
-    await expect(publish).toBeVisible({ timeout: 5_000 });
+    await expect(edit).toBeVisible({ timeout: 5_000 });
     await expect(retire).toBeVisible();
 
-    // Active kind, no draft → publish disabled, retire enabled.
-    await expect(publish).toBeDisabled();
+    // Active kind → Edit (new version) + Retire both enabled.
+    await expect(edit).toBeEnabled();
     await expect(retire).toBeEnabled();
   });
 

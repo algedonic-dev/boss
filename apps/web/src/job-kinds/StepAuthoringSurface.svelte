@@ -119,13 +119,17 @@
 
   <div class="jk-surface-body">
     <div class="jk-canvas">
-      {#await graphModule then { default: GraphEditor }}
+      {#await graphModule}
+        <div class="jk-canvas-msg">Loading graph…</div>
+      {:then { default: GraphEditor }}
         <GraphEditor
           {steps}
           problems={lintProblems}
           {selected}
           onselect={(s) => (selected = s)}
         />
+      {:catch err}
+        <div class="jk-canvas-msg jk-canvas-err">Graph editor failed to load: {err}</div>
       {/await}
     </div>
     {#if selectedStep}
@@ -166,6 +170,14 @@
   .jk-canvas {
     flex: 1 1 auto;
     min-width: 0;
+  }
+  .jk-canvas-msg {
+    padding: 24px;
+    color: #94a3b8;
+    font-size: 0.9rem;
+  }
+  .jk-canvas-err {
+    color: #dc2626;
   }
   .jk-list-details {
     border: 1px solid #e2e8f0;

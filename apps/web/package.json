@@ -7,7 +7,9 @@
   "scripts": {
     "dev": "bun --hot src/dev-server.ts",
     "build": "bun run src/build.ts",
-    "typecheck": "svelte-check --tsconfig ./tsconfig.json"
+    "typecheck": "svelte-check --tsconfig ./tsconfig.json",
+    "test:unit": "bun test src/",
+    "test:mocked": "playwright test -c playwright.mocked.config.ts"
   },
   "dependencies": {
     "@dagrejs/dagre": "^3.0.0",
@@ -22,5 +24,8 @@
     "bun-types": "^1.3.14",
     "svelte-check": "^4.4.8",
     "typescript": "^6.0.3"
+  },
+  "patchedDependencies": {
+    "@xyflow/svelte@1.6.0": "patches/@xyflow%2Fsvelte@1.6.0.patch"
   }
 }

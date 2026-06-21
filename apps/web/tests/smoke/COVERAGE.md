@@ -6,6 +6,22 @@ passing assertion in `tests/smoke/*.spec.ts`. Pages get checked
 off (`[x]`) once their spec covers every `<button>`, `onclick`
 handler, form submission, and significant input affordance.
 
+**Two layers.**
+
+- **`tests/smoke/*.spec.ts` — live-stack** (this suite). Runs
+  against the dev-server proxying to the real backend
+  (`playwright.config.ts`, scratch-isolated). High fidelity but
+  needs the stack up; **not yet a CI gate** (Phase-2 work) — so
+  treat a stale spec here as a real bug, not noise.
+- **`tests/mocked/*.spec.ts` — mocked-backend** (CI-gated). Every
+  `/api/**` call is intercepted in-browser
+  (`tests/mocked/_mockApi.ts`), so it needs only the SPA shell —
+  fast, deterministic, and run in the `web` CI job
+  (`bun run test:mocked`, `playwright.mocked.config.ts`). This is
+  where interactive behavior we want to *maintain* (e.g. the
+  JobKind authoring graph/inspector/workflow rail) is guarded
+  against regression.
+
 **Conventions.**
 
 - Test file naming: `<area>-<kind>.spec.ts`. One file per page is
