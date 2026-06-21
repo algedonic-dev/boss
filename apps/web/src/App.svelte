@@ -46,6 +46,7 @@
   import PolicyPage from './policy/PolicyPage.svelte';
   import JobKindsPage from './job-kinds/JobKindsPage.svelte';
   import JobKindNewPage from './job-kinds/JobKindNewPage.svelte';
+  import JobKindEditPage from './job-kinds/JobKindEditPage.svelte';
   import JobKindDetailPage from './job-kinds/JobKindDetailPage.svelte';
   import StepPluginsPage from './it/step-plugins/StepPluginsPage.svelte';
   import StepPluginDetailPage from './it/step-plugins/StepPluginDetailPage.svelte';
@@ -183,7 +184,7 @@
       : route.kind === 'marketingAssets' || route.kind === 'marketingAsset' ? 'marketing-assets'
       : route.kind === 'manual' || route.kind === 'manualSection' ? 'manual'
       : route.kind === 'policy' ? 'policy'
-      : route.kind === 'jobKinds' || route.kind === 'jobKindNew' || route.kind === 'jobKindDetail' ? 'jobKinds'
+      : route.kind === 'jobKinds' || route.kind === 'jobKindNew' || route.kind === 'jobKindEdit' || route.kind === 'jobKindDetail' ? 'jobKinds'
       : route.kind === 'itStepPlugins' || route.kind === 'itStepPluginDetail' ? 'itStepPlugins'
       : route.kind === 'workflows' ? 'workflows'
       : 'me',
@@ -289,6 +290,8 @@
       <JobKindsPage />
     {:else if route.kind === 'jobKindNew'}
       <JobKindNewPage />
+    {:else if route.kind === 'jobKindEdit'}
+      <JobKindEditPage kindSlug={route.kindSlug} />
     {:else if route.kind === 'jobKindDetail'}
       <JobKindDetailPage kindSlug={route.kindSlug} />
     {:else if route.kind === 'itStepPlugins'}

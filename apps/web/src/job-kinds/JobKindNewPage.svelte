@@ -5,10 +5,9 @@
   import Breadcrumb from '../ui/Breadcrumb.svelte';
   import PageHeader from '../ui/PageHeader.svelte';
   import Section from '../ui/Section.svelte';
-  import StepDagEditor from './StepDagEditor.svelte';
+  import StepAuthoringSurface from './StepAuthoringSurface.svelte';
   import type { JobKindSpec, StepSpec } from './jobKindTypes';
   import { lintSteps } from './stepValidation';
-  import { validateDraft, problemsByStep, type LintProblem } from './liveLint';
   import { appNow } from '../shell/sim-clock.svelte';
   import { href, navigate } from '../router';
 
@@ -133,29 +132,9 @@
   }
 
   // Advisory lint surfaced next to the Create button. Non-blocking:
-  // the authoritative viability check runs server-side at publish.
+  // the authoritative viability check runs server-side at publish (and
+  // live, on the graph, via StepAuthoringSurface's dry-run lint).
   let stepWarningCount = $derived(lintSteps(steps).length);
-
-  // Live, on-graph validation — the SAME validate_all the publish path
-  // enforces, dry-run against the server (Slice 1's /_validate endpoint).
-  // Debounced so it doesn't fire on every keystroke; a transient failure
-  // leaves the prior result in place.
-  let lintProblems = $state<Map<string, LintProblem[]>>(new Map());
-  let selectedStep = $state<string | null>(null);
-  $effect(() => {
-    const k = kindSlug;
-    const s = steps;
-    const t = setTimeout(() => {
-      void (async () => {
-        try {
-          lintProblems = problemsByStep(await validateDraft(k || 'draft', s));
-        } catch {
-          // keep the prior result on a transient failure
-        }
-      })();
-    }, 400);
-    return () => clearTimeout(t);
-  });
 
   async function submit(): Promise<void> {
     error = null;
@@ -294,17 +273,11 @@
   </Section>
 
   <Section title="Steps" wide>
-      <!-- Lazy-load the graph editor (Svelte Flow + dagre) into its own
-           chunk so the main bundle isn't hit (decision D2). -->
-      {#await import('./JobKindGraphEditor.svelte') then { default: GraphEditor }}
-        <GraphEditor
-          {steps}
-          problems={lintProblems}
-          selected={selectedStep}
-          onselect={(slug) => (selectedStep = slug)}
-        />
-      {/await}
-      <StepDagEditor value={steps} onChange={(s) => (steps = s)} />
+      <StepAuthoringSurface
+        {steps}
+        kindSlug={kindSlug}
+        onChange={(s) => (steps = s)}
+      />
   </Section>
 
   <div style="padding:0 24px 24px; display:flex; gap:12px; align-items:center">

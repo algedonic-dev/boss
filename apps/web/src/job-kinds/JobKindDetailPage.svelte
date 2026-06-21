@@ -205,6 +205,14 @@
       <button
         type="button"
         class="wb-btn"
+        onclick={() => navigate(href(`/admin/job-kinds/${encodeURIComponent(spec.kind)}/edit`))}
+        title="Open the graphical editor — saving records a new draft version; the active version and in-flight Jobs are untouched"
+      >
+        Edit…
+      </button>
+      <button
+        type="button"
+        class="wb-btn"
         onclick={() => navigate(href(`/admin/job-kinds/new?fork=${encodeURIComponent(spec.kind)}`))}
         title="Create a new kind pre-populated from this one"
       >

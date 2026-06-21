@@ -167,7 +167,27 @@ All five open questions resolved 2026-06-19.
 
 ## Build status
 
-- **Slice 1 (in progress):** `POST /api/jobs/kinds/_validate` dry-run
-  (reuse `validate_all`, no persist) — the keystone the live lint reads.
-  The edit-draft `PUT` already exists server-side; the SPA wiring lands
-  with the editor (Slice 2).
+- **Slice 1 (done):** `POST /api/jobs/kinds/_validate` dry-run (reuse
+  `validate_all`, no persist) — the keystone the live lint reads. Lean
+  `{kind, steps}` body so a per-keystroke call never 422s on the
+  heavyweight registry fields. Tests in `job_kind_registry.rs`.
+- **Slice 2 (done):** the graphical authoring surface.
+  - `JobKindGraphEditor.svelte` — interactive Svelte Flow canvas (nodes
+    classified trigger/outcome/fork/work; edges derived from `ready_when`
+    references; dagre LR layout; live-lint problems badge the nodes),
+    lazy-loaded into its own ~216 KB chunk (D2).
+  - `StepPalette.svelte` — add a step by picking a StepType (the
+    `/api/jobs/step-types` registry vocabulary).
+  - `StepInspector.svelte` — edit the selected node; slug renames route
+    through `renameSlug`, rewriting every `ready_when` reference (D1).
+  - `StepAuthoringSurface.svelte` — composes palette + canvas + inspector
+    + the full list editor; owns the one step-types fetch and the
+    debounced dry-run lint. Shared by the New and Edit pages.
+  - `JobKindEditPage.svelte` + `/admin/job-kinds/:slug/edit` route — wires
+    the `PUT`; editing always lands a fresh DRAFT (D4), never the active
+    row. Reachable via an **Edit…** button on the detail page.
+  - Pure, unit-tested step transforms in `stepEdits.ts`
+    (`makeStep`/`freshSlug`/`patchStep`/`removeStep`/`renameSlug`).
+- **Slices 3–5:** not started (structured predicate/edge builder;
+  metadata/entitlements/fields editors + publish-gated-on-lint; version
+  diff by stable step id + live new-Job preview).

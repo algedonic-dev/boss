@@ -63,6 +63,7 @@ export type Route =
   | { kind: 'policy' }
   | { kind: 'jobKinds' }
   | { kind: 'jobKindNew' }
+  | { kind: 'jobKindEdit'; kindSlug: string }
   | { kind: 'jobKindDetail'; kindSlug: string }
   | { kind: 'itStepPlugins' }
   | { kind: 'itStepPluginDetail'; pluginSlug: string }
@@ -174,6 +175,12 @@ export function parseRoute(pathname: string): Route {
   // prefix is an alias kept stable for the public-facing docs.
   if (p === '/job-kinds' || p === '/admin/job-kinds') return { kind: 'jobKinds' };
   if (p === '/job-kinds/new' || p === '/admin/job-kinds/new') return { kind: 'jobKindNew' };
+  // The `/edit` route must be matched before the catch-all detail
+  // pattern below, which would otherwise swallow `<slug>/edit` as a
+  // slug. Slugs are kebab-case (no slashes), so the `/edit` suffix is
+  // unambiguous.
+  const jkEditM = p.match(/^\/(?:admin\/)?job-kinds\/(.+)\/edit$/);
+  if (jkEditM) return { kind: 'jobKindEdit', kindSlug: decodeURIComponent(jkEditM[1]!) };
   const jkM = p.match(/^\/(?:admin\/)?job-kinds\/(.+)$/);
   if (jkM) return { kind: 'jobKindDetail', kindSlug: decodeURIComponent(jkM[1]!) };
   if (p === '/it/step-plugins') return { kind: 'itStepPlugins' };
