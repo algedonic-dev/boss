@@ -83,16 +83,16 @@ describe('parseRoute — every specific path matches its specific case', () => {
     ['/qa', { kind: 'qa' }],
     ['/ops', { kind: 'ops' }],
     ['/ops/anything', { kind: 'ops' }],
-    // Policy + admin authoring. The job-kinds `/edit` suffix is the
-    // wildcard-precedence trap: it MUST resolve before the catch-all
-    // `/job-kinds/(.+)` detail route.
+    // Policy + admin authoring. The job-kinds `/authoring/<jobId>` route
+    // is the wildcard-precedence trap: it MUST resolve before the
+    // catch-all `/job-kinds/(.+)` detail route.
     ['/policy', { kind: 'policy' }],
     ['/job-kinds', { kind: 'jobKinds' }],
     ['/admin/job-kinds', { kind: 'jobKinds' }],
     ['/job-kinds/new', { kind: 'jobKindNew' }],
     ['/admin/job-kinds/new', { kind: 'jobKindNew' }],
-    ['/job-kinds/seasonal-release/edit', { kind: 'jobKindEdit', kindSlug: 'seasonal-release' }],
-    ['/admin/job-kinds/seasonal-release/edit', { kind: 'jobKindEdit', kindSlug: 'seasonal-release' }],
+    ['/job-kinds/authoring/job-abc-123', { kind: 'jobKindDesign', jobId: 'job-abc-123' }],
+    ['/admin/job-kinds/authoring/job-abc-123', { kind: 'jobKindDesign', jobId: 'job-abc-123' }],
     ['/job-kinds/seasonal-release', { kind: 'jobKindDetail', kindSlug: 'seasonal-release' }],
   ];
 
@@ -120,8 +120,8 @@ describe('parseRoute — wildcard does not shadow specific cases', () => {
     const r = parseRoute('/finance/journal-entries/new');
     expect(r.kind).toBe('newJournalEntry');
   });
-  test('/job-kinds/X/edit → jobKindEdit, NOT jobKindDetail', () => {
-    const r = parseRoute('/job-kinds/seasonal-release/edit');
-    expect(r.kind).toBe('jobKindEdit');
+  test('/job-kinds/authoring/X → jobKindDesign, NOT jobKindDetail', () => {
+    const r = parseRoute('/job-kinds/authoring/job-abc-123');
+    expect(r.kind).toBe('jobKindDesign');
   });
 });

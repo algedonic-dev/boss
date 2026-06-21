@@ -165,6 +165,41 @@ All five open questions resolved 2026-06-19.
   only that registry. The dry-run endpoint runs in-process, so
   editor-green == publishes by construction.
 
+- **D6 — authoring host (was "can drafts be local state for the authoring
+  step?", resolved 2026-06-21): a JobKind is authored *through* a
+  `job-kind-design` Job; the working spec lives in that Job's publish-step
+  `metadata.job_kind_spec`, and the registry write + `jobs.kind.published`
+  audit fact happen exactly once, when the terminal `job-kind-publish` step
+  completes.** The Slice-1/2 SPA took the direct `POST/PUT /api/jobs/kinds`
+  path, which writes a throwaway `job_kinds` draft row per Save *and* — via
+  the direct `POST /kinds/{kind}/publish` — emits **no** `jobs.kind.published`,
+  so SPA-published kinds were never recorded as published facts (a provenance
+  gap vs the five-property protocol). The Job-based machinery already exists
+  (`job_kind_design_spec`; the `job-kind-publish` StepType +
+  `dispatch_job_kind_publish` → `publish_authored`) but nothing ever drove it.
+  Realization, **zero backend change** (the runtime contract was verified end
+  to end against the stack):
+  - **New** collects the slug + spec fields and POSTs a `job-kind-design` Job
+    with `subject = {custom, <slug>}`. The slug is the Job's immutable subject
+    id — which *is* D1's slug-as-identity. (`custom` is a seeded subject kind;
+    custom subject ids bypass existence checks, so a brand-new slug is
+    accepted.) Steps materialize on create.
+  - The graph surface edits the full spec and persists it by **debounced PATCH
+    onto the publish step's `job_kind_spec`** (legal: step metadata is
+    required-at-done, not at-create). These are normal `STEP_UPDATED` events on
+    the design Job — durable, resumable authoring history, **no `job_kinds`
+    rows**. (Metadata PATCH replaces the field wholesale, so the SPA always
+    sends the publish step's complete metadata.)
+  - author → validate → approve (platform-admin sign-off: POST `/sign-offs`
+    then complete) → publish are the gates; the SPA gates "advance past
+    validate" on the live dry-run being clean. Completing the terminal publish
+    step fires the single registry write + event (returns 204; the SPA then
+    routes to the published kind).
+  - **Editing** a published kind opens a fresh design Job seeded from the
+    active spec (optionally stamping `previous_kind_version`).
+  - The direct `/api/jobs/kinds` create/update/publish handlers stay for
+    bootstrap + tests; the **SPA stops calling them**.
+
 ## Build status
 
 - **Slice 1 (done):** `POST /api/jobs/kinds/_validate` dry-run (reuse
@@ -182,12 +217,23 @@ All five open questions resolved 2026-06-19.
     through `renameSlug`, rewriting every `ready_when` reference (D1).
   - `StepAuthoringSurface.svelte` — composes palette + canvas + inspector
     + the full list editor; owns the one step-types fetch and the
-    debounced dry-run lint. Shared by the New and Edit pages.
-  - `JobKindEditPage.svelte` + `/admin/job-kinds/:slug/edit` route — wires
-    the `PUT`; editing always lands a fresh DRAFT (D4), never the active
-    row. Reachable via an **Edit…** button on the detail page.
+    debounced dry-run lint. Reused by every authoring host.
   - Pure, unit-tested step transforms in `stepEdits.ts`
     (`makeStep`/`freshSlug`/`patchStep`/`removeStep`/`renameSlug`).
+- **Authoring-as-a-Job (D6, done):** the persistence + publish flow re-based
+  on a `job-kind-design` Job (the graph surface above is reused unchanged).
+  - `designJob.ts` — the design-Job client (create / load / find-step /
+    persist-spec-to-publish-step / complete-step / sign-off) + the pure
+    `initialSpec` seed (unit-tested).
+  - `JobKindDesignWorkspace.svelte` + `/admin/job-kinds/authoring/:jobId` —
+    loads the design Job, binds the surface to the publish step's
+    `job_kind_spec` (debounced PATCH), drives author → validate (gated on the
+    live dry-run being clean) → approve (sign-off) → publish.
+  - `JobKindNewPage` reduced to a name-it entry that creates the design Job;
+    detail-page **Edit…**/**Fork…** open a design Job seeded from the active
+    spec. The direct-API `JobKindEditPage` + `:slug/edit` route and the
+    detail-page **Publish draft** button were removed — the SPA no longer
+    touches `POST/PUT /api/jobs/kinds` (D6).
 - **Slices 3–5:** not started (structured predicate/edge builder;
-  metadata/entitlements/fields editors + publish-gated-on-lint; version
-  diff by stable step id + live new-Job preview).
+  metadata/entitlements/fields editors; version diff by stable step id +
+  live new-Job preview).
