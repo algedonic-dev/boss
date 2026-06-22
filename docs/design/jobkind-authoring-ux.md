@@ -190,7 +190,7 @@ All five open questions resolved 2026-06-19.
     the design Job — durable, resumable authoring history, **no `job_kinds`
     rows**. (Metadata PATCH replaces the field wholesale, so the SPA always
     sends the publish step's complete metadata.)
-  - author → validate → approve (platform-admin sign-off: POST `/sign-offs`
+  - author → validate → approve (`job-kind-approver` sign-off: POST `/sign-offs`
     then complete) → publish are the gates; the SPA gates "advance past
     validate" on the live dry-run being clean. Completing the terminal publish
     step fires the single registry write + event (returns 204; the SPA then
@@ -199,6 +199,20 @@ All five open questions resolved 2026-06-19.
     active spec (optionally stamping `previous_kind_version`).
   - The direct `/api/jobs/kinds` create/update/publish handlers stay for
     bootstrap + tests; the **SPA stops calling them**.
+
+- **D7 — approval authority (post-D6, resolved 2026-06-22): the
+  `job-kind-design` approve step requires a `job-kind-approver` capability,
+  not `platform-admin` alone.** Authoring a work-type is operational
+  leadership's job — the C-suite/COO/dept-heads who own the `job-kinds`
+  surface — not solely the deploy operator's. The approve step now declares
+  `authority_role = job-kind-approver`; the core policy defaults grant
+  `step-signoff:job-kind-approver` to `platform-admin` (so the deploy
+  operator and the seed-time bootstrap stamp retain the authority regardless
+  of tenant seed order), and tenants grant it to their operational leaders
+  (brewery: ceo/coo/cto/owner). The separate `design-doc-review` approval
+  stays on `platform-admin` — reviewing BOSS's own design docs *is* the
+  platform operator's call. used-device-shop parity is deferred to a
+  follow-up.
 
 ## Build status
 

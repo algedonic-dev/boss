@@ -14,8 +14,11 @@ import type { Job, Step } from '../jobs/types';
 
 export const DESIGN_KIND = 'job-kind-design';
 export const PUBLISH_STEP_KIND = 'job-kind-publish';
-/// The role the `approve` sign-off step requires.
-export const APPROVE_ROLE = 'platform-admin';
+/// The authority the `approve` sign-off step requires. Granted (via
+/// policy) to the C-suite/COO/dept-heads who own the job-kinds surface,
+/// plus platform-admin — see boss-jobs job_kind_design_spec + the tenant
+/// policy seeds.
+export const APPROVE_ROLE = 'job-kind-approver';
 
 /// A complete, viable seed spec for a brand-new kind: a single trigger
 /// step (`ready_when = "true"`) that is also terminal — the minimal

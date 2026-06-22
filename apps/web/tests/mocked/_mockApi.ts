@@ -53,7 +53,7 @@ export async function installAuthoringMocks(page: Page): Promise<void> {
   const steps = [
     { id: 's-author', job_id: JOB_ID, kind: 'task', title: 'author', assignee_id: null, status: 'ready', sort_order: 0, blocked_by: [], completed_on: null, metadata: {} },
     { id: 's-validate', job_id: JOB_ID, kind: 'task', title: 'validate', assignee_id: null, status: 'pending', sort_order: 1, blocked_by: [], completed_on: null, metadata: {} },
-    { id: 's-approve', job_id: JOB_ID, kind: 'sign-off', title: 'approve', assignee_id: null, status: 'pending', sort_order: 2, blocked_by: [], sign_offs_required: ['platform-admin'], sign_offs: [], completed_on: null, metadata: { authority_role: 'platform-admin' } },
+    { id: 's-approve', job_id: JOB_ID, kind: 'sign-off', title: 'approve', assignee_id: null, status: 'pending', sort_order: 2, blocked_by: [], sign_offs_required: ['job-kind-approver'], sign_offs: [], completed_on: null, metadata: { authority_role: 'job-kind-approver' } },
     { id: 's-publish', job_id: JOB_ID, kind: 'job-kind-publish', title: 'publish', assignee_id: null, status: 'pending', sort_order: 3, blocked_by: [], completed_on: null, metadata: { job_kind_spec: seedSpec() } },
   ];
   const job = {

@@ -7,7 +7,7 @@
   // registry write + `jobs.kind.published` audit fact.
   //
   // Workflow: author → validate (gated on the live dry-run being clean)
-  // → approve (platform-admin sign-off) → publish.
+  // → approve (job-kind-approver sign-off) → publish.
 
   import Breadcrumb from '../ui/Breadcrumb.svelte';
   import PageHeader from '../ui/PageHeader.svelte';
@@ -288,9 +288,9 @@
           class="wb-btn"
           onclick={approve}
           disabled={!actionable(approveStep) || acting !== null}
-          title="Stamp the platform-admin sign-off and advance"
+          title={`Stamp the ${APPROVE_ROLE} sign-off and advance`}
         >
-          {acting === 'approve' ? 'Approving…' : '3 · Approve (platform-admin)'}
+          {acting === 'approve' ? 'Approving…' : `3 · Approve (${APPROVE_ROLE})`}
         </button>
         <button
           type="button"
