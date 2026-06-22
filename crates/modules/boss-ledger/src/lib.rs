@@ -46,6 +46,8 @@ pub mod rebuild;
 #[cfg(feature = "postgres")]
 pub mod rebuild_facts;
 #[cfg(feature = "postgres")]
+pub mod rebuild_payroll;
+#[cfg(feature = "postgres")]
 pub mod replay_check;
 #[cfg(feature = "postgres")]
 pub mod supersede;
@@ -69,6 +71,9 @@ pub use rebuild_facts::{
     ProjectedFact, ProjectionError, ProjectionRule, RebuildFactsReport, project_event,
     rebuild_facts, rebuild_facts_in_tx,
 };
+
+#[cfg(feature = "postgres")]
+pub use rebuild_payroll::{RebuildPayrollReport, rebuild_payroll, rebuild_payroll_in_tx};
 
 #[cfg(feature = "postgres")]
 pub use replay_check::{
