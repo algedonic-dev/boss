@@ -294,13 +294,22 @@ fn walk_step(
             }
             // Sign-off contract: metadata lands first, the stamp attests the
             // final shape, then the status flip below completes it.
+            //
+            // The `job-kind-design` approve step requires the
+            // `job-kind-approver` authority (boss-jobs registry), so the
+            // stamp's `role` must equal that — the sign-off endpoint
+            // rejects any role not in `sign_offs_required`. We stamp as the
+            // `platform-admin` automation identity, which holds
+            // `step-signoff:job-kind-approver` via the core policy defaults;
+            // seed-time provisioning therefore never depends on the tenant's
+            // approver grants having loaded first.
             let md_url = jobs_url(api_base, &format!("/api/jobs/{job_id}/steps/{step_id}"));
             let md_resp = client
                 .put(&md_url)
                 .headers(headers.clone())
                 .json(&json!({
                     "metadata": {
-                        "authority_role": "platform-admin",
+                        "authority_role": "job-kind-approver",
                         "signed_by": "emp-cto",
                     },
                 }))
@@ -331,7 +340,7 @@ fn walk_step(
                     "x-boss-user",
                     reqwest::header::HeaderValue::from_str(&stamper).context("stamper header")?,
                 )
-                .json(&json!({ "role": "platform-admin" }))
+                .json(&json!({ "role": "job-kind-approver" }))
                 .send()
                 .with_context(|| format!("POST {stamp_url}"))?;
             if !resp.status().is_success() {

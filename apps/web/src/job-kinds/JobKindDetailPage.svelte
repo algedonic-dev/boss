@@ -10,6 +10,9 @@
   import { href, navigate } from '../router';
   import StepDag from '../jobs/StepDag.svelte';
   import { jobKindToDag } from '../jobs/jobKindToDag';
+  import { startDesignJob } from './designJob';
+  import { session } from '../session/session.svelte';
+  import { appToday } from '../shell/sim-clock.svelte';
 
   type LoadState =
     | { kind: 'loading' }
@@ -23,6 +26,32 @@
   let action = $state<string | null>(null);
   let actionError = $state<string | null>(null);
   let compareVersion = $state<number | null>(null);
+  let ownerId = $derived(
+    session.value.kind === 'ready' ? session.value.user.id : '',
+  );
+
+  // Edit / new version (D6): author the next version *through* a fresh
+  // `job-kind-design` Job seeded from the active spec — never a direct
+  // registry write. The active row + in-flight Jobs are untouched until
+  // the new design Job reaches its publish step.
+  async function editNewVersion(): Promise<void> {
+    if (loadState.kind !== 'ready') return;
+    const spec = loadState.spec;
+    action = 'edit';
+    actionError = null;
+    try {
+      const jobId = await startDesignJob(
+        { ...spec, status: 'draft' },
+        ownerId,
+        appToday(),
+        { title: `Edit ${spec.kind}`, previousVersion: spec.version },
+      );
+      navigate(href(`/admin/job-kinds/authoring/${encodeURIComponent(jobId)}`));
+    } catch (e) {
+      actionError = e instanceof Error ? e.message : String(e);
+      action = null;
+    }
+  }
 
   async function load(): Promise<void> {
     try {
@@ -55,7 +84,7 @@
     void load();
   });
 
-  async function runAction(verb: 'publish' | 'retire'): Promise<void> {
+  async function runAction(verb: 'retire'): Promise<void> {
     action = verb;
     actionError = null;
     try {
@@ -168,7 +197,6 @@
 {:else}
   {@const spec = loadState.spec}
   {@const versions = loadState.versions}
-  {@const hasDraft = versions.some((v) => v.status === 'draft')}
   {@const compareSpec = compareVersion != null
     ? versions.find((v) => v.version === compareVersion) ?? null
     : null}
@@ -186,12 +214,12 @@
     <div style="padding:0 24px 16px; display:flex; gap:12px; align-items:center">
       <button
         type="button"
-        class="wb-btn"
-        onclick={() => runAction('publish')}
-        disabled={!hasDraft || action !== null}
-        title={hasDraft ? 'Promote the latest draft to active' : 'No draft to publish'}
+        class="wb-btn wb-btn-primary"
+        onclick={editNewVersion}
+        disabled={action !== null}
+        title="Author the next version in the graphical workspace (opens a fresh design Job; the active version + in-flight Jobs are untouched)"
       >
-        {action === 'publish' ? 'Publishing…' : 'Publish draft'}
+        {action === 'edit' ? 'Opening…' : 'Edit…'}
       </button>
       <button
         type="button"

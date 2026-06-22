@@ -141,6 +141,57 @@ pub(super) async fn create_kind<R: JobsRepository + 'static, B: EventBus + 'stat
     }
 }
 
+/// Body for the author-time dry run. Only the kind slug (for error
+/// labels) and the step list are needed — the lint validates the graph,
+/// not the heavyweight registry-row fields — so the editor doesn't have
+/// to assemble a full `JobKindSpec` on every keystroke.
+#[derive(serde::Deserialize)]
+pub(super) struct DraftLintRequest {
+    #[serde(default)]
+    pub kind: String,
+    pub steps: Vec<crate::registry::StepSpec>,
+}
+
+/// Author-time dry run — lint a draft's steps WITHOUT persisting.
+/// Runs the same `validate_job_kind` the publish path enforces, against
+/// the same process-resident StepType registry, so an editor showing
+/// "no problems" will publish cleanly (D5). Always returns 200 with a
+/// structured result; lint failures are data, not an HTTP error — the
+/// editor renders them on the graph. See docs/design/jobkind-authoring-ux.md.
+pub(super) async fn validate_kind<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+    Json(req): Json<DraftLintRequest>,
+) -> Response {
+    // Gated like create — the dry run is an authoring affordance.
+    if let Err(r) = policy_check(&state, &user, Action::Create).await {
+        return r;
+    }
+    let kind = if req.kind.is_empty() {
+        "draft"
+    } else {
+        req.kind.as_str()
+    };
+    let spec = JobKindSpec::platform_seed(kind, "draft", "draft", Vec::new(), req.steps);
+    let registry = crate::step_registry::StepRegistry::v1();
+    let errs = crate::job_kind_lint::validate_job_kind(&spec, &registry);
+    let problems: Vec<serde_json::Value> = errs
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "step": e.step,
+                "reason": e.reason,
+                "message": e.to_string(),
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": errs.is_empty(), "problems": problems })),
+    )
+        .into_response()
+}
+
 pub(super) async fn update_kind<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,

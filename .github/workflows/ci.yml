@@ -120,3 +120,16 @@ jobs:
       - name: Build
         working-directory: apps/web
         run: bun run build
+
+      # Mocked-backend Playwright smoke — guards the SPA's interactive
+      # behavior (the JobKind authoring graph/inspector/workflow rail,
+      # routing) against regression. Every /api call is intercepted
+      # in-browser, so no backend is needed; the live-stack suite is the
+      # separate Phase-2 gate. See apps/web/playwright.mocked.config.ts.
+      - name: Install Playwright browser
+        working-directory: apps/web
+        run: bunx playwright install --with-deps chromium
+
+      - name: Frontend smoke (mocked backend)
+        working-directory: apps/web
+        run: bun run test:mocked

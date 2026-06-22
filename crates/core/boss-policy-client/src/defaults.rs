@@ -85,20 +85,23 @@ pub fn default_rules() -> Vec<Rule> {
 
     // Step sign-off authority is enforced through policy against a
     // role-scoped `step-signoff:<role>` resource (see
-    // `boss-jobs::http::update_step`). The platform JobKinds
-    // (`job-kind-design`, `design-doc-review`) declare
-    // `authority_role = "platform-admin"` on their approval steps, so
-    // platform-admin needs SignOff on its own role-scoped resource —
-    // the bare `step` grant above does NOT cover it, because the gate
-    // authorizes against `step-signoff:platform-admin` when the step
-    // carries that required role. Tenant roles get the equivalent
-    // grant in `examples/<tenant>/seeds/policy_rules.toml`.
-    rules.push(Rule::new(
-        "platform-admin",
-        Resource::new("step-signoff:platform-admin"),
-        SignOff,
-        Scope::All,
-    ));
+    // `boss-jobs::http::update_step`). The deploy superuser keeps SignOff
+    // on `step-signoff:platform-admin` (the `design-doc-review` approval
+    // step still requires it) AND on `step-signoff:job-kind-approver` —
+    // the operational-leadership capability the `job-kind-design` approval
+    // step now requires. Tenants grant `job-kind-approver` to their
+    // C-suite/COO/dept-heads in `examples/<tenant>/seeds/policy_rules.toml`
+    // so authoring a work-type isn't gated solely on the deploy operator;
+    // the bare `step` grant above does NOT cover these role-scoped
+    // resources.
+    for authority in ["platform-admin", "job-kind-approver"] {
+        rules.push(Rule::new(
+            "platform-admin",
+            Resource::new(format!("step-signoff:{authority}")),
+            SignOff,
+            Scope::All,
+        ));
+    }
 
     // ------------------------------------------------------------------
     // Audit-readonly — external auditors / OSS anonymous visitors /
