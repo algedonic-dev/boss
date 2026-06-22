@@ -1,0 +1,64 @@
+diff --git a/dist/lib/components/KeyHandler/KeyHandler.svelte b/dist/lib/components/KeyHandler/KeyHandler.svelte
+index d5c286a89f9f8cf3543207c8ee96c04ec6bcfbcf..5ec5c7e4429737a31f929828ae743d563d63ba1e 100644
+--- a/dist/lib/components/KeyHandler/KeyHandler.svelte
++++ b/dist/lib/components/KeyHandler/KeyHandler.svelte
+@@ -75,58 +75,4 @@
+   }
+ </script>
+ 
+-<svelte:window
+-  on:blur={resetKeysAndSelection}
+-  on:contextmenu={resetKeysAndSelection}
+-  use:shortcut={{
+-    trigger: getShortcutTrigger(selectionKey, () => (store.selectionKeyPressed = true)),
+-    type: 'keydown'
+-  }}
+-  use:shortcut={{
+-    trigger: getShortcutTrigger(selectionKey, () => (store.selectionKeyPressed = false)),
+-    type: 'keyup'
+-  }}
+-  use:shortcut={{
+-    trigger: getShortcutTrigger(multiSelectionKey, () => {
+-      store.multiselectionKeyPressed = true;
+-    }),
+-    type: 'keydown'
+-  }}
+-  use:shortcut={{
+-    trigger: getShortcutTrigger(multiSelectionKey, () => (store.multiselectionKeyPressed = false)),
+-    type: 'keyup'
+-  }}
+-  use:shortcut={{
+-    trigger: getShortcutTrigger(deleteKey, (detail) => {
+-      const isModifierKey =
+-        detail.originalEvent.ctrlKey ||
+-        detail.originalEvent.metaKey ||
+-        detail.originalEvent.shiftKey;
+-      if (!isModifierKey && !isInputDOMNode(detail.originalEvent)) {
+-        store.deleteKeyPressed = true;
+-        handleDelete();
+-      }
+-    }),
+-    type: 'keydown'
+-  }}
+-  use:shortcut={{
+-    trigger: getShortcutTrigger(deleteKey, () => (store.deleteKeyPressed = false)),
+-    type: 'keyup'
+-  }}
+-  use:shortcut={{
+-    trigger: getShortcutTrigger(panActivationKey, () => (store.panActivationKeyPressed = true)),
+-    type: 'keydown'
+-  }}
+-  use:shortcut={{
+-    trigger: getShortcutTrigger(panActivationKey, () => (store.panActivationKeyPressed = false)),
+-    type: 'keyup'
+-  }}
+-  use:shortcut={{
+-    trigger: getShortcutTrigger(zoomActivationKey, () => (store.zoomActivationKeyPressed = true)),
+-    type: 'keydown'
+-  }}
+-  use:shortcut={{
+-    trigger: getShortcutTrigger(zoomActivationKey, () => (store.zoomActivationKeyPressed = false)),
+-    type: 'keyup'
+-  }}
+-/>
++<!-- xyflow KeyHandler window listeners removed: works around the bun-plugin-svelte <svelte:window> $.window-undefined crash (see patches/). Keyboard shortcuts (delete/multiselect/pan/zoom keys) are disabled; pointer drag/click/fit still work. -->

@@ -503,6 +503,38 @@ resource = "step-signoff:warehouse-clerk"
 action = "sign-off"
 scope = "all"
 
+# JobKind-authoring approval (step-signoff:job-kind-approver).
+#
+# The `job-kind-design` meta-Job's approve step requires the
+# `job-kind-approver` authority (boss-jobs registry), NOT platform-admin.
+# Grant it to the operational leaders who own the `job-kinds` authoring
+# surface — the C-suite + COO — so they can approve a new/edited work
+# type without the platform operator. (platform-admin also holds this via
+# the core policy defaults; design-doc-review still uses platform-admin.)
+[[grants]]
+role = "ceo"
+resource = "step-signoff:job-kind-approver"
+action = "sign-off"
+scope = "all"
+
+[[grants]]
+role = "coo"
+resource = "step-signoff:job-kind-approver"
+action = "sign-off"
+scope = "all"
+
+[[grants]]
+role = "cto"
+resource = "step-signoff:job-kind-approver"
+action = "sign-off"
+scope = "all"
+
+[[grants]]
+role = "owner"
+resource = "step-signoff:job-kind-approver"
+action = "sign-off"
+scope = "all"
+
 [[grants]]
 role = "head-of-distribution"
 resource = "step-signoff:head-of-distribution"
