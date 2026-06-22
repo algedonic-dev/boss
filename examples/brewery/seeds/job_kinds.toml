@@ -83,30 +83,27 @@ kind = "demand-gate"
 ready_when = "steps.trigger.done"
 authority_role = "head-brewer"
 title_template = "Demand check — should we brew today?"
-# Gate the brew on the bottleneck SKU — for PALE that's the
-# half-BBL keg (wholesale-keg-order consumes 1 FP-PALE-1-2-BBL
-# per order at ~35/day baseline, peaking ~240/day with the
-# weekday × month multiplier stack). Sixtels (FP-PALE-1-6-BBL)
-# have no wholesale consumer in the current JobKinds and
-# would oversupply first if gated, blocking the brew the
-# half-BBL DOES need — see the prior attempt's
-# "1/2-BBL starvation" trace.
+# TOP GATE — fire the mash if EITHER package format is below its
+# reorder threshold. target_skus lists both formats;
+# decide_demand_outcome returns "oversupply" only when ALL listed
+# SKUs are over threshold, so this brews whenever any one is short.
 #
-# Threshold math: 240 × 30d window × 1.5 multiplier = 10,800.
-# Opening balance 5,000 + net (353-240) = 113/day fills the
-# threshold in ~51 sim-days, at which point the gate trips
-# and brews route to the skipped-outcome until consumption
-# catches back up. Caps in-flight Jobs naturally instead of
-# forcing the morning-brew rate to be wrong.
-# `batch_yield` — finished units of each target SKU produced by ONE
-# brew of this kind (the package step's produces_products qty for that
-# SKU). The dispatcher's in-flight-aware gate credits brews already in
-# the pipeline against the threshold: effective_on_hand = real_on_hand
-# + in_flight_brews × batch_yield. Without it, a deterministic daily
-# review would re-brew every working day through the multi-day brew
-# lag before the first batch lands — the throttle-up the open-loop
-# gate lacked. PALE packages 210 FP-PALE-1-2-BBL per brew.
-metadata_defaults = { target_skus = ["FP-PALE-1-2-BBL"], expected_daily_demand = { FP-PALE-1-2-BBL = 240 }, batch_yield = { FP-PALE-1-2-BBL = 210 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+# This replaces the old "gate on the half-BBL only" workaround: when
+# sixtels had no wholesale consumer, gating them starved the half-BBL
+# brew (the "1/2-BBL starvation" trace). Now that wholesale demand
+# spans both formats, each format is packaged conditionally downstream
+# (demand-check-half / demand-check-sixtel → package-half /
+# package-sixtel), so the brew makes only the format(s) actually short
+# — the feedback that prevents co-product glut. One mash, split
+# packaging.
+#
+# Per-format threshold = expected_daily_demand × window × multiplier;
+# batch_yield credits in-flight brews against it (effective_on_hand =
+# real + in_flight × batch_yield). PALE packages 210 half-BBL + 315
+# sixtels per brew. (expected_daily_demand values are reorder targets,
+# tunable like raw-material reorder_point — they set the buffer level,
+# not whether the glut is prevented.)
+metadata_defaults = { target_skus = ["FP-PALE-1-2-BBL", "FP-PALE-1-6-BBL"], expected_daily_demand = { FP-PALE-1-2-BBL = 240, FP-PALE-1-6-BBL = 240 }, batch_yield = { FP-PALE-1-2-BBL = 210, FP-PALE-1-6-BBL = 315 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
 
 # Brew path — gated on the demand-check deciding "brew".
 [[job_kind.step]]
@@ -193,44 +190,81 @@ title_template = "QC checkpoint — pH, gravity, microbial"
 # anomaly. Pre-fix the engine string-matched the title.
 metadata_defaults = { ph_target = 4.4, fg_target = 1.012, microbial_pass = true, batch_id = "", is_qc_checkpoint = true }
 
+# PER-FORMAT PACKAGING GATES — after fermentation, decide EACH keg
+# format independently against its OWN current stock. This is the
+# feedback that prevents co-product glut: if sixtels are already
+# stocked, demand-check-sixtel returns "oversupply" and package-sixtel
+# never fires, while package-half still runs if half-BBLs are short
+# (and vice-versa). One mash (raw consumed once at mash-in) → split,
+# stock-gated packaging. Reuses the same demand-gate handler as the
+# top gate, pointed at a single format.
 [[job_kind.step]]
-title = "package"
-kind = "production-produce"
+title = "demand-check-half"
+kind = "demand-gate"
 ready_when = "steps.qc-checkpoint.done"
-title_template = "Package + cellar handoff"
+title_template = "Package half-BBLs? — stock check"
+metadata_defaults = { target_skus = ["FP-PALE-1-2-BBL"], expected_daily_demand = { FP-PALE-1-2-BBL = 240 }, batch_yield = { FP-PALE-1-2-BBL = 210 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+
+[[job_kind.step]]
+title = "demand-check-sixtel"
+kind = "demand-gate"
+ready_when = "steps.qc-checkpoint.done"
+title_template = "Package sixtels? — stock check"
+metadata_defaults = { target_skus = ["FP-PALE-1-6-BBL"], expected_daily_demand = { FP-PALE-1-6-BBL = 240 }, batch_yield = { FP-PALE-1-6-BBL = 315 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+
+[[job_kind.step]]
+title = "package-half"
+kind = "production-produce"
+ready_when = "steps.demand-check-half.done AND steps.demand-check-half.metadata.outcome = \"brew\""
+title_template = "Package half-BBLs + cellar handoff"
 authority_role = "packaging-tech"
-# Default Pale Ale split for one daily brew run on a 250-BBL
-# industrial brewhouse. 250 BBL ≈ 500 half-BBLs of capacity; the
-# brewery splits ~210 half-BBLs + 315 sixtels (proportions tuned to
-# match wholesale-keg-order's daily consumption: rate=35/day ×
-# qty=4 half-BBLs/order = 140 half-BBLs/day, vs production
-# 0.7/day × 210 = 147/day → 5% surplus). Pre-2026-05-04 the yield
-# was 24+36 (a small craft 30-BBL brew), which made the sim drain
-# inventory in hours and the regen 400 once on PUT
-# /api/products/FP-PALE-1-2-BBL/inventory/consume.
-#
-# The products.produce side effect fires on this step's
-# done-transition and increments finished_product_inventory.on_hand
-# at loc-brewery-brewhouse via boss-products.
-metadata_defaults = { batch_id = "", excise_bbl = 158, produces_products = [
-    # FG cost basis is DERIVED at runtime by products.produce from this
-    # brew's real consumed inputs — the mash-in `ingredients_consumed`
-    # (196×$25 2-row + 20×$30 Munich + 4×$300 Cascade + 6×$15 yeast ≈
-    # $6,790) plus packaging `parts_consumed` — each at its real inventory
-    # avg_cost, allocated across these kegs by volume. COGS thus comes
-    # from real purchases, not a percentage-of-price plug. `unit_cost_cents`
-    # is only a fallback if the real cost can't be resolved; it matches the
-    # ~$25.5/half-BBL, ~$8.5/sixtel the BOM derives.
+# Excise is charged per BBL REMOVED (packaged), so it splits across the
+# two package steps: 210 half-BBL × 0.5 = 105 BBL here. If sixtels skip,
+# only this BBL is excised — correct, you only pay on what you remove;
+# when both run the ~158-BBL batch total is conserved (105 + 53).
+# FG cost basis is DERIVED at runtime by products.produce from the
+# mash-in's consumed inputs allocated across these kegs by volume (COGS
+# from real purchases, not a percentage-of-price plug); unit_cost_cents
+# is only the fallback. CO2 (batch-level) is drawn here with the
+# half-BBL fills.
+metadata_defaults = { batch_id = "", excise_bbl = 105, produces_products = [
     { sku = "FP-PALE-1-2-BBL", qty = 210, location_id = "loc-brewery-brewhouse", unit_cost_cents = 2550 },
-    { sku = "FP-PALE-1-6-BBL", qty = 315, location_id = "loc-brewery-brewhouse", unit_cost_cents = 850 },
 ], parts_consumed = [
-    # Packaging draws — one keg-fill kit per keg packaged + CO2 for
-    # the whole batch (~1 lb CO2 per BBL, so 30 BBL ≈ ~0.6 of a
-    # 50-lb cylinder; round to 1 cylinder per brew for sim).
     { part_sku = "PKG-KEG-FILL-HALF-BBL", qty = 210 },
-    { part_sku = "PKG-KEG-FILL-SIXTEL", qty = 315 },
     { part_sku = "PKG-CO2-50LB", qty = 1 },
 ] }
+
+[[job_kind.step]]
+title = "package-sixtel"
+kind = "production-produce"
+ready_when = "steps.demand-check-sixtel.done AND steps.demand-check-sixtel.metadata.outcome = \"brew\""
+title_template = "Package sixtels + cellar handoff"
+authority_role = "packaging-tech"
+# 315 sixtels × 0.1667 ≈ 53 BBL of excise — the other half of the
+# ~158-BBL batch. Same per-package split rationale as package-half.
+metadata_defaults = { batch_id = "", excise_bbl = 53, produces_products = [
+    { sku = "FP-PALE-1-6-BBL", qty = 315, location_id = "loc-brewery-brewhouse", unit_cost_cents = 850 },
+], parts_consumed = [
+    { part_sku = "PKG-KEG-FILL-SIXTEL", qty = 315 },
+] }
+
+# Skip branches — the "oversupply" outcome of each per-format gate.
+# No packaging; they exist so the demand-gate fork routes every outcome
+# to a successor (layer-1 requires it) and so brew-completed can join on
+# "packaged OR skipped" per format. A packaging hand logs the hold.
+[[job_kind.step]]
+title = "skip-half"
+kind = "task"
+ready_when = "steps.demand-check-half.metadata.outcome = \"oversupply\""
+title_template = "Hold half-BBLs — sufficient stock on hand"
+authority_role = "packaging-tech"
+
+[[job_kind.step]]
+title = "skip-sixtel"
+kind = "task"
+ready_when = "steps.demand-check-sixtel.metadata.outcome = \"oversupply\""
+title_template = "Hold sixtels — sufficient stock on hand"
+authority_role = "packaging-tech"
 
 # Terminal outcomes — two branches the engine selects between based
 # on the demand-check's outcome metadata. Exactly one lands
@@ -239,7 +273,10 @@ metadata_defaults = { batch_id = "", excise_bbl = 158, produces_products = [
 [[job_kind.step]]
 title = "brew-completed"
 kind = "outcome"
-ready_when = "steps.package.done"
+# Fires once BOTH formats are resolved — each either packaged or
+# stock-skipped. The top gate guarantees ≥1 format was short, so at
+# least one package-* ran. (boss-expr supports OR + parens.)
+ready_when = "(steps.package-half.done OR steps.skip-half.done) AND (steps.package-sixtel.done OR steps.skip-sixtel.done)"
 title_template = "Brew completed — packaged + handed off"
 terminal = { outcome = "completed" }
 metadata_defaults = { outcome_kind = "completed" }
@@ -386,10 +423,15 @@ title_template = "Confirm order — {subject.id}"
 # demo's flea-circus visual: every spawned Job shows real SKUs +
 # quantities, not an empty placeholder.
 metadata_defaults = { delivery_window = "", line_items = [
-    { sku = "FP-PALE-1-2-BBL", qty = 4, unit_price_cents = 30000, description = "Pale Ale 1/2 BBL keg" },
-    { sku = "FP-IPA-1-6-BBL", qty = 8, unit_price_cents = 15000, description = "IPA 1/6 BBL keg" },
-    { sku = "FP-STOUT-1-6-BBL", qty = 1, unit_price_cents = 15000, description = "Stout 1/6 BBL keg" },
+    { sku = "FP-IPA-1-2-BBL", qty = 2, unit_price_cents = 30000, description = "IPA 1/2 BBL keg" },
+    { sku = "FP-IPA-1-6-BBL", qty = 3, unit_price_cents = 15000, description = "IPA 1/6 BBL keg" },
+    { sku = "FP-PALE-1-2-BBL", qty = 2, unit_price_cents = 30000, description = "Pale Ale 1/2 BBL keg" },
+    { sku = "FP-PALE-1-6-BBL", qty = 2, unit_price_cents = 15000, description = "Pale Ale 1/6 BBL keg" },
+    { sku = "FP-LAGER-1-2-BBL", qty = 1, unit_price_cents = 30000, description = "Lager 1/2 BBL keg" },
     { sku = "FP-LAGER-1-6-BBL", qty = 1, unit_price_cents = 15000, description = "Lager 1/6 BBL keg" },
+    { sku = "FP-STOUT-1-2-BBL", qty = 1, unit_price_cents = 30000, description = "Stout 1/2 BBL keg" },
+    { sku = "FP-STOUT-1-6-BBL", qty = 1, unit_price_cents = 15000, description = "Stout 1/6 BBL keg" },
+    { sku = "FP-HAZY-1-2-BBL", qty = 1, unit_price_cents = 30000, description = "Hazy IPA 1/2 BBL keg" },
     { sku = "FP-HAZY-1-6-BBL", qty = 1, unit_price_cents = 15000, description = "Hazy IPA 1/6 BBL keg" },
 ] }
 
@@ -405,10 +447,15 @@ kind = "availability-gate"
 ready_when = "steps.confirm-order.done"
 title_template = "Stock check — fulfill from the cooler?"
 metadata_defaults = { line_items = [
-    { sku = "FP-PALE-1-2-BBL", qty = 4 },
-    { sku = "FP-IPA-1-6-BBL", qty = 8 },
-    { sku = "FP-STOUT-1-6-BBL", qty = 1 },
+    { sku = "FP-IPA-1-2-BBL", qty = 2 },
+    { sku = "FP-IPA-1-6-BBL", qty = 3 },
+    { sku = "FP-PALE-1-2-BBL", qty = 2 },
+    { sku = "FP-PALE-1-6-BBL", qty = 2 },
+    { sku = "FP-LAGER-1-2-BBL", qty = 1 },
     { sku = "FP-LAGER-1-6-BBL", qty = 1 },
+    { sku = "FP-STOUT-1-2-BBL", qty = 1 },
+    { sku = "FP-STOUT-1-6-BBL", qty = 1 },
+    { sku = "FP-HAZY-1-2-BBL", qty = 1 },
     { sku = "FP-HAZY-1-6-BBL", qty = 1 },
 ] }
 
@@ -425,10 +472,15 @@ ready_when = "steps.stock-check.done AND steps.stock-check.metadata.outcome = \"
 title_template = "Pull + stage kegs from the cooler"
 authority_role = "warehouse-lead"
 metadata_defaults = { from_id = "inventory-clerk", to_id = "shipping-clerk", line_items = [
-    { sku = "FP-PALE-1-2-BBL", qty = 4 },
-    { sku = "FP-IPA-1-6-BBL", qty = 8 },
-    { sku = "FP-STOUT-1-6-BBL", qty = 1 },
+    { sku = "FP-IPA-1-2-BBL", qty = 2 },
+    { sku = "FP-IPA-1-6-BBL", qty = 3 },
+    { sku = "FP-PALE-1-2-BBL", qty = 2 },
+    { sku = "FP-PALE-1-6-BBL", qty = 2 },
+    { sku = "FP-LAGER-1-2-BBL", qty = 1 },
     { sku = "FP-LAGER-1-6-BBL", qty = 1 },
+    { sku = "FP-STOUT-1-2-BBL", qty = 1 },
+    { sku = "FP-STOUT-1-6-BBL", qty = 1 },
+    { sku = "FP-HAZY-1-2-BBL", qty = 1 },
     { sku = "FP-HAZY-1-6-BBL", qty = 1 },
 ] }
 [[job_kind.step]]
@@ -450,8 +502,16 @@ title_template = "Deliver"
 # the shipment becomes purely physical (ship-out date + scan
 # chain), with no GL movement.
 metadata_defaults = { direction = "outbound", origin = "loc-brewery-brewhouse", destination = "{subject.id}", carrier = "local-pickup", line_items = [
-    { sku = "FP-PALE-1-2-BBL", qty = 4, unit_price_cents = 30000, description = "Pale Ale 1/2 BBL keg" },
-    { sku = "FP-IPA-1-6-BBL", qty = 8, unit_price_cents = 15000, description = "IPA 1/6 BBL keg" },
+    { sku = "FP-IPA-1-2-BBL", qty = 2, unit_price_cents = 30000, description = "IPA 1/2 BBL keg" },
+    { sku = "FP-IPA-1-6-BBL", qty = 3, unit_price_cents = 15000, description = "IPA 1/6 BBL keg" },
+    { sku = "FP-PALE-1-2-BBL", qty = 2, unit_price_cents = 30000, description = "Pale Ale 1/2 BBL keg" },
+    { sku = "FP-PALE-1-6-BBL", qty = 2, unit_price_cents = 15000, description = "Pale Ale 1/6 BBL keg" },
+    { sku = "FP-LAGER-1-2-BBL", qty = 1, unit_price_cents = 30000, description = "Lager 1/2 BBL keg" },
+    { sku = "FP-LAGER-1-6-BBL", qty = 1, unit_price_cents = 15000, description = "Lager 1/6 BBL keg" },
+    { sku = "FP-STOUT-1-2-BBL", qty = 1, unit_price_cents = 30000, description = "Stout 1/2 BBL keg" },
+    { sku = "FP-STOUT-1-6-BBL", qty = 1, unit_price_cents = 15000, description = "Stout 1/6 BBL keg" },
+    { sku = "FP-HAZY-1-2-BBL", qty = 1, unit_price_cents = 30000, description = "Hazy IPA 1/2 BBL keg" },
+    { sku = "FP-HAZY-1-6-BBL", qty = 1, unit_price_cents = 15000, description = "Hazy IPA 1/6 BBL keg" },
 ] }
 
 [[job_kind.step]]
@@ -473,11 +533,16 @@ authority_role = "bookkeeper"
 # the cost basis in the same tx as the invoice insert. The
 # shipment step's `consumes_products` array is no longer
 # load-bearing for COGS — billing is the single source of truth.
-metadata_defaults = { account_id = "{subject.id}", amount_cents = 285000, currency = "USD", line_items = [
-    { sku = "FP-PALE-1-2-BBL", qty = 4, amount_cents = 120000, revenue_category = "wholesale", description = "Pale Ale 1/2 BBL × 4" },
-    { sku = "FP-IPA-1-6-BBL", qty = 8, amount_cents = 120000, revenue_category = "wholesale", description = "IPA 1/6 BBL × 8" },
-    { sku = "FP-STOUT-1-6-BBL", qty = 1, amount_cents = 15000, revenue_category = "wholesale", description = "Stout 1/6 BBL × 1" },
+metadata_defaults = { account_id = "{subject.id}", amount_cents = 330000, currency = "USD", line_items = [
+    { sku = "FP-IPA-1-2-BBL", qty = 2, amount_cents = 60000, revenue_category = "wholesale", description = "IPA 1/2 BBL × 2" },
+    { sku = "FP-IPA-1-6-BBL", qty = 3, amount_cents = 45000, revenue_category = "wholesale", description = "IPA 1/6 BBL × 3" },
+    { sku = "FP-PALE-1-2-BBL", qty = 2, amount_cents = 60000, revenue_category = "wholesale", description = "Pale Ale 1/2 BBL × 2" },
+    { sku = "FP-PALE-1-6-BBL", qty = 2, amount_cents = 30000, revenue_category = "wholesale", description = "Pale Ale 1/6 BBL × 2" },
+    { sku = "FP-LAGER-1-2-BBL", qty = 1, amount_cents = 30000, revenue_category = "wholesale", description = "Lager 1/2 BBL × 1" },
     { sku = "FP-LAGER-1-6-BBL", qty = 1, amount_cents = 15000, revenue_category = "wholesale", description = "Lager 1/6 BBL × 1" },
+    { sku = "FP-STOUT-1-2-BBL", qty = 1, amount_cents = 30000, revenue_category = "wholesale", description = "Stout 1/2 BBL × 1" },
+    { sku = "FP-STOUT-1-6-BBL", qty = 1, amount_cents = 15000, revenue_category = "wholesale", description = "Stout 1/6 BBL × 1" },
+    { sku = "FP-HAZY-1-2-BBL", qty = 1, amount_cents = 30000, revenue_category = "wholesale", description = "Hazy IPA 1/2 BBL × 1" },
     { sku = "FP-HAZY-1-6-BBL", qty = 1, amount_cents = 15000, revenue_category = "wholesale", description = "Hazy IPA 1/6 BBL × 1" },
 ] }
 
@@ -1639,10 +1704,13 @@ kind = "demand-gate"
 ready_when = "steps.trigger.done"
 authority_role = "head-brewer"
 title_template = "Demand check — should we brew IPA today?"
-# batch_yield: IPA packages 320 FP-IPA-1-6-BBL sixtels per brew (see
-# morning-brew pale for the full rationale — pipeline credit so the
-# daily review doesn't double-brew through the brew lag).
-metadata_defaults = { target_skus = ["FP-IPA-1-6-BBL"], expected_daily_demand = { FP-IPA-1-6-BBL = 470 }, batch_yield = { FP-IPA-1-6-BBL = 320 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+# TOP GATE — fire the mash if EITHER package format is below its
+# reorder threshold. target_skus lists both formats; the brew makes
+# only the format(s) actually short downstream (demand-check-half /
+# demand-check-sixtel → package-half / package-sixtel). One mash,
+# split packaging. See morning-brew (pale) for the full rationale.
+# batch_yield: IPA packages 160 half-BBL + 320 sixtels per brew.
+metadata_defaults = { target_skus = ["FP-IPA-1-2-BBL", "FP-IPA-1-6-BBL"], expected_daily_demand = { FP-IPA-1-2-BBL = 470, FP-IPA-1-6-BBL = 470 }, batch_yield = { FP-IPA-1-2-BBL = 160, FP-IPA-1-6-BBL = 320 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
 
 [[job_kind.step]]
 title = "plan"
@@ -1699,29 +1767,83 @@ authority_role = "brewer"
 title_template = "Fermentation start (pitch yeast + dry hop schedule)"
 metadata_defaults = { ferm_temp_c = 19, yeast_strain = "California Ale", vessel = "" }
 
+# PER-FORMAT PACKAGING GATES — after fermentation, decide EACH keg
+# format independently against its OWN current stock. If sixtels are
+# already stocked, demand-check-sixtel returns "oversupply" and
+# package-sixtel never fires, while package-half still runs if
+# half-BBLs are short (and vice-versa). One mash (raw consumed once at
+# mash-in) → split, stock-gated packaging. See morning-brew (pale).
 [[job_kind.step]]
-title = "package"
-kind = "production-produce"
+title = "demand-check-half"
+kind = "demand-gate"
 ready_when = "steps.fermentation-start.done"
-title_template = "Package + cellar handoff (IPA)"
+title_template = "Package half-BBLs? — stock check"
+metadata_defaults = { target_skus = ["FP-IPA-1-2-BBL"], expected_daily_demand = { FP-IPA-1-2-BBL = 470 }, batch_yield = { FP-IPA-1-2-BBL = 160 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+
+[[job_kind.step]]
+title = "demand-check-sixtel"
+kind = "demand-gate"
+ready_when = "steps.fermentation-start.done"
+title_template = "Package sixtels? — stock check"
+metadata_defaults = { target_skus = ["FP-IPA-1-6-BBL"], expected_daily_demand = { FP-IPA-1-6-BBL = 470 }, batch_yield = { FP-IPA-1-6-BBL = 320 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+
+[[job_kind.step]]
+title = "package-half"
+kind = "production-produce"
+ready_when = "steps.demand-check-half.done AND steps.demand-check-half.metadata.outcome = \"brew\""
+title_template = "Package half-BBLs + cellar handoff (IPA)"
 authority_role = "packaging-tech"
-# IPA brews skew sixtel-heavy because tap rotations turn IPAs
-# faster than house pales — bars want fresh hops, smaller kegs
-# turn over before bitterness drops. 18 half-BBLs + 48 sixtels
-# of FP-IPA-* per 30-BBL brew.
-metadata_defaults = { batch_id = "", excise_bbl = 133, produces_products = [
-    { sku = "FP-IPA-1-2-BBL", qty = 160, location_id = "loc-brewery-brewhouse", unit_cost_cents = 2500 },
-    { sku = "FP-IPA-1-6-BBL", qty = 320, location_id = "loc-brewery-brewhouse", unit_cost_cents = 850 },
+# IPA brews skew sixtel-heavy because tap rotations turn IPAs faster
+# than house pales. 160 half-BBLs per 30-BBL brew. Excise splits per
+# package step (charged per BBL removed): 160 × 0.5 = 80 BBL here. FG
+# cost basis is DERIVED at runtime by products.produce from mash-in's
+# consumed inputs; unit_cost_cents is only the fallback. CO2
+# (batch-level) is drawn here with the half-BBL fills.
+metadata_defaults = { batch_id = "", excise_bbl = 80, produces_products = [
+    { sku = "FP-IPA-1-2-BBL", qty = 160, location_id = "loc-brewery-brewhouse", unit_cost_cents = 2550 },
 ], parts_consumed = [
     { part_sku = "PKG-KEG-FILL-HALF-BBL", qty = 160 },
-    { part_sku = "PKG-KEG-FILL-SIXTEL", qty = 320 },
     { part_sku = "PKG-CO2-50LB", qty = 1 },
 ] }
 
 [[job_kind.step]]
+title = "package-sixtel"
+kind = "production-produce"
+ready_when = "steps.demand-check-sixtel.done AND steps.demand-check-sixtel.metadata.outcome = \"brew\""
+title_template = "Package sixtels + cellar handoff (IPA)"
+authority_role = "packaging-tech"
+# 320 sixtels × 0.1667 ≈ 53 BBL of excise — the other share of the
+# batch. Same per-package split rationale as package-half.
+metadata_defaults = { batch_id = "", excise_bbl = 53, produces_products = [
+    { sku = "FP-IPA-1-6-BBL", qty = 320, location_id = "loc-brewery-brewhouse", unit_cost_cents = 850 },
+], parts_consumed = [
+    { part_sku = "PKG-KEG-FILL-SIXTEL", qty = 320 },
+] }
+
+# Skip branches — the "oversupply" outcome of each per-format gate.
+# No packaging; they exist so the demand-gate fork routes every outcome
+# to a successor and so brew-completed can join on "packaged OR
+# skipped" per format. A packaging hand logs the hold.
+[[job_kind.step]]
+title = "skip-half"
+kind = "task"
+ready_when = "steps.demand-check-half.metadata.outcome = \"oversupply\""
+title_template = "Hold half-BBLs — sufficient stock on hand"
+authority_role = "packaging-tech"
+
+[[job_kind.step]]
+title = "skip-sixtel"
+kind = "task"
+ready_when = "steps.demand-check-sixtel.metadata.outcome = \"oversupply\""
+title_template = "Hold sixtels — sufficient stock on hand"
+authority_role = "packaging-tech"
+
+[[job_kind.step]]
 title = "brew-completed"
 kind = "outcome"
-ready_when = "steps.package.done"
+# Fires once BOTH formats are resolved — each either packaged or
+# stock-skipped. The top gate guarantees ≥1 format was short.
+ready_when = "(steps.package-half.done OR steps.skip-half.done) AND (steps.package-sixtel.done OR steps.skip-sixtel.done)"
 title_template = "Brew completed — packaged + handed off"
 terminal = { outcome = "completed" }
 metadata_defaults = { outcome_kind = "completed" }
@@ -1773,10 +1895,13 @@ kind = "demand-gate"
 ready_when = "steps.trigger.done"
 authority_role = "head-brewer"
 title_template = "Demand check — should we brew Stout today?"
-# batch_yield: Stout packages 360 FP-STOUT-1-6-BBL sixtels per brew
-# (see morning-brew pale for the full rationale). This is the kind
-# whose cold-start drought aborted the 365-day regen ~day 58.
-metadata_defaults = { target_skus = ["FP-STOUT-1-6-BBL"], expected_daily_demand = { FP-STOUT-1-6-BBL = 64 }, batch_yield = { FP-STOUT-1-6-BBL = 360 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+# TOP GATE — fire the mash if EITHER package format is below its
+# reorder threshold. target_skus lists both formats; the brew makes
+# only the format(s) actually short downstream (demand-check-half /
+# demand-check-sixtel → package-half / package-sixtel). One mash,
+# split packaging. See morning-brew (pale) for the full rationale.
+# batch_yield: Stout packages 100 half-BBL + 360 sixtels per brew.
+metadata_defaults = { target_skus = ["FP-STOUT-1-2-BBL", "FP-STOUT-1-6-BBL"], expected_daily_demand = { FP-STOUT-1-2-BBL = 64, FP-STOUT-1-6-BBL = 64 }, batch_yield = { FP-STOUT-1-2-BBL = 100, FP-STOUT-1-6-BBL = 360 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
 
 [[job_kind.step]]
 title = "plan"
@@ -1834,27 +1959,83 @@ authority_role = "brewer"
 title_template = "Fermentation start (pitch yeast)"
 metadata_defaults = { ferm_temp_c = 18, yeast_strain = "English Ale", vessel = "" }
 
+# PER-FORMAT PACKAGING GATES — after fermentation, decide EACH keg
+# format independently against its OWN current stock. If sixtels are
+# already stocked, demand-check-sixtel returns "oversupply" and
+# package-sixtel never fires, while package-half still runs if
+# half-BBLs are short (and vice-versa). One mash (raw consumed once at
+# mash-in) → split, stock-gated packaging. See morning-brew (pale).
 [[job_kind.step]]
-title = "package"
-kind = "production-produce"
+title = "demand-check-half"
+kind = "demand-gate"
 ready_when = "steps.fermentation-start.done"
-title_template = "Package + cellar handoff (stout)"
+title_template = "Package half-BBLs? — stock check"
+metadata_defaults = { target_skus = ["FP-STOUT-1-2-BBL"], expected_daily_demand = { FP-STOUT-1-2-BBL = 64 }, batch_yield = { FP-STOUT-1-2-BBL = 100 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+
+[[job_kind.step]]
+title = "demand-check-sixtel"
+kind = "demand-gate"
+ready_when = "steps.fermentation-start.done"
+title_template = "Package sixtels? — stock check"
+metadata_defaults = { target_skus = ["FP-STOUT-1-6-BBL"], expected_daily_demand = { FP-STOUT-1-6-BBL = 64 }, batch_yield = { FP-STOUT-1-6-BBL = 360 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+
+[[job_kind.step]]
+title = "package-half"
+kind = "production-produce"
+ready_when = "steps.demand-check-half.done AND steps.demand-check-half.metadata.outcome = \"brew\""
+title_template = "Package half-BBLs + cellar handoff (stout)"
 authority_role = "packaging-tech"
 # Stout split: heavier on sixtels because nitro pours run on smaller
-# kegs in most bars. 100 half-BBLs + 360 sixtels per 30-BBL brew.
-metadata_defaults = { batch_id = "", excise_bbl = 110, produces_products = [
-    { sku = "FP-STOUT-1-2-BBL", qty = 100, location_id = "loc-brewery-brewhouse", unit_cost_cents = 2500 },
-    { sku = "FP-STOUT-1-6-BBL", qty = 360, location_id = "loc-brewery-brewhouse", unit_cost_cents = 850 },
+# kegs in most bars. 100 half-BBLs per 30-BBL brew. Excise splits per
+# package step (charged per BBL removed): 100 × 0.5 = 50 BBL here. FG
+# cost basis is DERIVED at runtime by products.produce from mash-in's
+# consumed inputs; unit_cost_cents is only the fallback. CO2
+# (batch-level) is drawn here with the half-BBL fills.
+metadata_defaults = { batch_id = "", excise_bbl = 50, produces_products = [
+    { sku = "FP-STOUT-1-2-BBL", qty = 100, location_id = "loc-brewery-brewhouse", unit_cost_cents = 2550 },
 ], parts_consumed = [
     { part_sku = "PKG-KEG-FILL-HALF-BBL", qty = 100 },
-    { part_sku = "PKG-KEG-FILL-SIXTEL", qty = 360 },
     { part_sku = "PKG-CO2-50LB", qty = 1 },
 ] }
 
 [[job_kind.step]]
+title = "package-sixtel"
+kind = "production-produce"
+ready_when = "steps.demand-check-sixtel.done AND steps.demand-check-sixtel.metadata.outcome = \"brew\""
+title_template = "Package sixtels + cellar handoff (stout)"
+authority_role = "packaging-tech"
+# 360 sixtels × 0.1667 ≈ 60 BBL of excise — the other share of the
+# batch. Same per-package split rationale as package-half.
+metadata_defaults = { batch_id = "", excise_bbl = 60, produces_products = [
+    { sku = "FP-STOUT-1-6-BBL", qty = 360, location_id = "loc-brewery-brewhouse", unit_cost_cents = 850 },
+], parts_consumed = [
+    { part_sku = "PKG-KEG-FILL-SIXTEL", qty = 360 },
+] }
+
+# Skip branches — the "oversupply" outcome of each per-format gate.
+# No packaging; they exist so the demand-gate fork routes every outcome
+# to a successor and so brew-completed can join on "packaged OR
+# skipped" per format. A packaging hand logs the hold.
+[[job_kind.step]]
+title = "skip-half"
+kind = "task"
+ready_when = "steps.demand-check-half.metadata.outcome = \"oversupply\""
+title_template = "Hold half-BBLs — sufficient stock on hand"
+authority_role = "packaging-tech"
+
+[[job_kind.step]]
+title = "skip-sixtel"
+kind = "task"
+ready_when = "steps.demand-check-sixtel.metadata.outcome = \"oversupply\""
+title_template = "Hold sixtels — sufficient stock on hand"
+authority_role = "packaging-tech"
+
+[[job_kind.step]]
 title = "brew-completed"
 kind = "outcome"
-ready_when = "steps.package.done"
+# Fires once BOTH formats are resolved — each either packaged or
+# stock-skipped. The top gate guarantees ≥1 format was short.
+ready_when = "(steps.package-half.done OR steps.skip-half.done) AND (steps.package-sixtel.done OR steps.skip-sixtel.done)"
 title_template = "Brew completed — packaged + handed off"
 terminal = { outcome = "completed" }
 metadata_defaults = { outcome_kind = "completed" }
@@ -1904,9 +2085,13 @@ kind = "demand-gate"
 ready_when = "steps.trigger.done"
 authority_role = "head-brewer"
 title_template = "Demand check — should we brew Lager today?"
-# batch_yield: Lager packages 200 FP-LAGER-1-6-BBL sixtels per brew
-# (see morning-brew pale for the full rationale).
-metadata_defaults = { target_skus = ["FP-LAGER-1-6-BBL"], expected_daily_demand = { FP-LAGER-1-6-BBL = 50 }, batch_yield = { FP-LAGER-1-6-BBL = 200 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+# TOP GATE — fire the mash if EITHER package format is below its
+# reorder threshold. target_skus lists both formats; the brew makes
+# only the format(s) actually short downstream (demand-check-half /
+# demand-check-sixtel → package-half / package-sixtel). One mash,
+# split packaging. See morning-brew (pale) for the full rationale.
+# batch_yield: Lager packages 200 half-BBL + 200 sixtels per brew.
+metadata_defaults = { target_skus = ["FP-LAGER-1-2-BBL", "FP-LAGER-1-6-BBL"], expected_daily_demand = { FP-LAGER-1-2-BBL = 50, FP-LAGER-1-6-BBL = 50 }, batch_yield = { FP-LAGER-1-2-BBL = 200, FP-LAGER-1-6-BBL = 200 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
 
 [[job_kind.step]]
 title = "plan"
@@ -1962,28 +2147,84 @@ authority_role = "brewer"
 title_template = "Fermentation start (pitch lager yeast)"
 metadata_defaults = { ferm_temp_c = 11, yeast_strain = "German Lager", vessel = "" }
 
+# PER-FORMAT PACKAGING GATES — after fermentation, decide EACH keg
+# format independently against its OWN current stock. If sixtels are
+# already stocked, demand-check-sixtel returns "oversupply" and
+# package-sixtel never fires, while package-half still runs if
+# half-BBLs are short (and vice-versa). One mash (raw consumed once at
+# mash-in) → split, stock-gated packaging. See morning-brew (pale).
 [[job_kind.step]]
-title = "package"
-kind = "production-produce"
+title = "demand-check-half"
+kind = "demand-gate"
 ready_when = "steps.fermentation-start.done"
-title_template = "Package + cellar handoff (lager)"
+title_template = "Package half-BBLs? — stock check"
+metadata_defaults = { target_skus = ["FP-LAGER-1-2-BBL"], expected_daily_demand = { FP-LAGER-1-2-BBL = 50 }, batch_yield = { FP-LAGER-1-2-BBL = 200 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+
+[[job_kind.step]]
+title = "demand-check-sixtel"
+kind = "demand-gate"
+ready_when = "steps.fermentation-start.done"
+title_template = "Package sixtels? — stock check"
+metadata_defaults = { target_skus = ["FP-LAGER-1-6-BBL"], expected_daily_demand = { FP-LAGER-1-6-BBL = 50 }, batch_yield = { FP-LAGER-1-6-BBL = 200 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+
+[[job_kind.step]]
+title = "package-half"
+kind = "production-produce"
+ready_when = "steps.demand-check-half.done AND steps.demand-check-half.metadata.outcome = \"brew\""
+title_template = "Package half-BBLs + cellar handoff (lager)"
 authority_role = "packaging-tech"
 # Lager split: heavier on half-BBLs because lagers move steady at
 # higher-volume accounts (sports bars, large taprooms). 200 half-BBLs
-# + 200 sixtels per 30-BBL brew.
-metadata_defaults = { batch_id = "", excise_bbl = 133, produces_products = [
-    { sku = "FP-LAGER-1-2-BBL", qty = 200, location_id = "loc-brewery-brewhouse", unit_cost_cents = 2500 },
-    { sku = "FP-LAGER-1-6-BBL", qty = 200, location_id = "loc-brewery-brewhouse", unit_cost_cents = 850 },
+# per 30-BBL brew. Excise splits per package step (charged per BBL
+# removed): 200 × 0.5 = 100 BBL here. FG cost basis is DERIVED at
+# runtime by products.produce from mash-in's consumed inputs;
+# unit_cost_cents is only the fallback. CO2 (batch-level) is drawn
+# here with the half-BBL fills.
+metadata_defaults = { batch_id = "", excise_bbl = 100, produces_products = [
+    { sku = "FP-LAGER-1-2-BBL", qty = 200, location_id = "loc-brewery-brewhouse", unit_cost_cents = 2550 },
 ], parts_consumed = [
     { part_sku = "PKG-KEG-FILL-HALF-BBL", qty = 200 },
-    { part_sku = "PKG-KEG-FILL-SIXTEL", qty = 200 },
     { part_sku = "PKG-CO2-50LB", qty = 1 },
 ] }
 
 [[job_kind.step]]
+title = "package-sixtel"
+kind = "production-produce"
+ready_when = "steps.demand-check-sixtel.done AND steps.demand-check-sixtel.metadata.outcome = \"brew\""
+title_template = "Package sixtels + cellar handoff (lager)"
+authority_role = "packaging-tech"
+# 200 sixtels × 0.1667 ≈ 33 BBL of excise — the other share of the
+# batch. Same per-package split rationale as package-half.
+metadata_defaults = { batch_id = "", excise_bbl = 33, produces_products = [
+    { sku = "FP-LAGER-1-6-BBL", qty = 200, location_id = "loc-brewery-brewhouse", unit_cost_cents = 850 },
+], parts_consumed = [
+    { part_sku = "PKG-KEG-FILL-SIXTEL", qty = 200 },
+] }
+
+# Skip branches — the "oversupply" outcome of each per-format gate.
+# No packaging; they exist so the demand-gate fork routes every outcome
+# to a successor and so brew-completed can join on "packaged OR
+# skipped" per format. A packaging hand logs the hold.
+[[job_kind.step]]
+title = "skip-half"
+kind = "task"
+ready_when = "steps.demand-check-half.metadata.outcome = \"oversupply\""
+title_template = "Hold half-BBLs — sufficient stock on hand"
+authority_role = "packaging-tech"
+
+[[job_kind.step]]
+title = "skip-sixtel"
+kind = "task"
+ready_when = "steps.demand-check-sixtel.metadata.outcome = \"oversupply\""
+title_template = "Hold sixtels — sufficient stock on hand"
+authority_role = "packaging-tech"
+
+[[job_kind.step]]
 title = "brew-completed"
 kind = "outcome"
-ready_when = "steps.package.done"
+# Fires once BOTH formats are resolved — each either packaged or
+# stock-skipped. The top gate guarantees ≥1 format was short.
+ready_when = "(steps.package-half.done OR steps.skip-half.done) AND (steps.package-sixtel.done OR steps.skip-sixtel.done)"
 title_template = "Brew completed — packaged + handed off"
 terminal = { outcome = "completed" }
 metadata_defaults = { outcome_kind = "completed" }
@@ -2032,9 +2273,13 @@ kind = "demand-gate"
 ready_when = "steps.trigger.done"
 authority_role = "head-brewer"
 title_template = "Demand check — should we brew Hazy IPA today?"
-# batch_yield: Hazy packages 400 FP-HAZY-1-6-BBL sixtels per brew
-# (see morning-brew pale for the full rationale).
-metadata_defaults = { target_skus = ["FP-HAZY-1-6-BBL"], expected_daily_demand = { FP-HAZY-1-6-BBL = 60 }, batch_yield = { FP-HAZY-1-6-BBL = 400 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+# TOP GATE — fire the mash if EITHER package format is below its
+# reorder threshold. target_skus lists both formats; the brew makes
+# only the format(s) actually short downstream (demand-check-half /
+# demand-check-sixtel → package-half / package-sixtel). One mash,
+# split packaging. See morning-brew (pale) for the full rationale.
+# batch_yield: Hazy packages 80 half-BBL + 400 sixtels per brew.
+metadata_defaults = { target_skus = ["FP-HAZY-1-2-BBL", "FP-HAZY-1-6-BBL"], expected_daily_demand = { FP-HAZY-1-2-BBL = 60, FP-HAZY-1-6-BBL = 60 }, batch_yield = { FP-HAZY-1-2-BBL = 80, FP-HAZY-1-6-BBL = 400 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
 
 [[job_kind.step]]
 title = "plan"
@@ -2092,28 +2337,84 @@ authority_role = "brewer"
 title_template = "Fermentation start (pitch yeast + biotransformation dry hop)"
 metadata_defaults = { ferm_temp_c = 20, yeast_strain = "English Ale", vessel = "" }
 
+# PER-FORMAT PACKAGING GATES — after fermentation, decide EACH keg
+# format independently against its OWN current stock. If sixtels are
+# already stocked, demand-check-sixtel returns "oversupply" and
+# package-sixtel never fires, while package-half still runs if
+# half-BBLs are short (and vice-versa). One mash (raw consumed once at
+# mash-in) → split, stock-gated packaging. See morning-brew (pale).
 [[job_kind.step]]
-title = "package"
-kind = "production-produce"
+title = "demand-check-half"
+kind = "demand-gate"
 ready_when = "steps.fermentation-start.done"
-title_template = "Package + cellar handoff (hazy)"
+title_template = "Package half-BBLs? — stock check"
+metadata_defaults = { target_skus = ["FP-HAZY-1-2-BBL"], expected_daily_demand = { FP-HAZY-1-2-BBL = 60 }, batch_yield = { FP-HAZY-1-2-BBL = 80 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+
+[[job_kind.step]]
+title = "demand-check-sixtel"
+kind = "demand-gate"
+ready_when = "steps.fermentation-start.done"
+title_template = "Package sixtels? — stock check"
+metadata_defaults = { target_skus = ["FP-HAZY-1-6-BBL"], expected_daily_demand = { FP-HAZY-1-6-BBL = 60 }, batch_yield = { FP-HAZY-1-6-BBL = 400 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+
+[[job_kind.step]]
+title = "package-half"
+kind = "production-produce"
+ready_when = "steps.demand-check-half.done AND steps.demand-check-half.metadata.outcome = \"brew\""
+title_template = "Package half-BBLs + cellar handoff (hazy)"
 authority_role = "packaging-tech"
 # Hazy split: extreme sixtel skew. Hazies oxidize fast — bars want
 # small-format kegs that turn over in days, not weeks. 80 half-BBLs
-# + 400 sixtels per 30-BBL brew.
-metadata_defaults = { batch_id = "", excise_bbl = 107, produces_products = [
-    { sku = "FP-HAZY-1-2-BBL", qty = 80, location_id = "loc-brewery-brewhouse", unit_cost_cents = 2500 },
-    { sku = "FP-HAZY-1-6-BBL", qty = 400, location_id = "loc-brewery-brewhouse", unit_cost_cents = 850 },
+# per 30-BBL brew. Excise splits per package step (charged per BBL
+# removed): 80 × 0.5 = 40 BBL here. FG cost basis is DERIVED at
+# runtime by products.produce from mash-in's consumed inputs;
+# unit_cost_cents is only the fallback. CO2 (batch-level) is drawn
+# here with the half-BBL fills.
+metadata_defaults = { batch_id = "", excise_bbl = 40, produces_products = [
+    { sku = "FP-HAZY-1-2-BBL", qty = 80, location_id = "loc-brewery-brewhouse", unit_cost_cents = 2550 },
 ], parts_consumed = [
     { part_sku = "PKG-KEG-FILL-HALF-BBL", qty = 80 },
-    { part_sku = "PKG-KEG-FILL-SIXTEL", qty = 400 },
     { part_sku = "PKG-CO2-50LB", qty = 1 },
 ] }
 
 [[job_kind.step]]
+title = "package-sixtel"
+kind = "production-produce"
+ready_when = "steps.demand-check-sixtel.done AND steps.demand-check-sixtel.metadata.outcome = \"brew\""
+title_template = "Package sixtels + cellar handoff (hazy)"
+authority_role = "packaging-tech"
+# 400 sixtels × 0.1667 ≈ 67 BBL of excise — the other share of the
+# batch. Same per-package split rationale as package-half.
+metadata_defaults = { batch_id = "", excise_bbl = 67, produces_products = [
+    { sku = "FP-HAZY-1-6-BBL", qty = 400, location_id = "loc-brewery-brewhouse", unit_cost_cents = 850 },
+], parts_consumed = [
+    { part_sku = "PKG-KEG-FILL-SIXTEL", qty = 400 },
+] }
+
+# Skip branches — the "oversupply" outcome of each per-format gate.
+# No packaging; they exist so the demand-gate fork routes every outcome
+# to a successor and so brew-completed can join on "packaged OR
+# skipped" per format. A packaging hand logs the hold.
+[[job_kind.step]]
+title = "skip-half"
+kind = "task"
+ready_when = "steps.demand-check-half.metadata.outcome = \"oversupply\""
+title_template = "Hold half-BBLs — sufficient stock on hand"
+authority_role = "packaging-tech"
+
+[[job_kind.step]]
+title = "skip-sixtel"
+kind = "task"
+ready_when = "steps.demand-check-sixtel.metadata.outcome = \"oversupply\""
+title_template = "Hold sixtels — sufficient stock on hand"
+authority_role = "packaging-tech"
+
+[[job_kind.step]]
 title = "brew-completed"
 kind = "outcome"
-ready_when = "steps.package.done"
+# Fires once BOTH formats are resolved — each either packaged or
+# stock-skipped. The top gate guarantees ≥1 format was short.
+ready_when = "(steps.package-half.done OR steps.skip-half.done) AND (steps.package-sixtel.done OR steps.skip-sixtel.done)"
 title_template = "Brew completed — packaged + handed off"
 terminal = { outcome = "completed" }
 metadata_defaults = { outcome_kind = "completed" }

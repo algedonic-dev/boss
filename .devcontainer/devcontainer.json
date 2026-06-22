@@ -1,0 +1,52 @@
+// BOSS dev container — Rust (edition 2024) + Bun + Postgres 16 + NATS
+// (JetStream), wired so `cargo build`, `cargo test --all-features`, and
+// the web build work out of the box. Open via the Codespaces "Code ▾"
+// button or VS Code "Dev Containers: Reopen in Container".
+// See ./README.md for details.
+{
+  "name": "BOSS",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspaces/boss",
+
+  // The ~60-crate workspace's debug/test build is large; the default
+  // 2-core / 8 GB / 32 GB Codespaces machine runs out of disk partway
+  // through `cargo test`. Ask for headroom (Codespaces honors this;
+  // local Docker ignores it).
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "16gb",
+    "storage": "64gb"
+  },
+
+  "forwardPorts": [4443, 3000, 5432, 4222],
+  "portsAttributes": {
+    "4443": { "label": "BOSS gateway + SPA", "onAutoForward": "notify" },
+    "3000": { "label": "web dev server (bun run dev)", "onAutoForward": "silent" },
+    "5432": { "label": "Postgres", "onAutoForward": "silent" },
+    "4222": { "label": "NATS", "onAutoForward": "silent" }
+  },
+
+  // First-run setup: toolchain components, dep fetch, schema apply,
+  // web deps. Idempotent. See post-create.sh.
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "svelte.svelte-vscode",
+        "vadimcn.vscode-lldb",
+        "ms-azuretools.vscode-docker"
+      ],
+      "settings": {
+        "rust-analyzer.cargo.features": "all",
+        "rust-analyzer.check.command": "clippy",
+        "[svelte]": { "editor.defaultFormatter": "svelte.svelte-vscode" }
+      }
+    }
+  },
+
+  "remoteUser": "vscode"
+}
