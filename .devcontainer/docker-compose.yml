@@ -1,0 +1,72 @@
+# Dev-container stack: the toolchain container ("app") plus the two
+# state-plane services the workspace needs (Postgres + NATS). The app
+# reaches them by service DNS via the env below — the same wiring the
+# OSS quickstart uses (DATABASE_URL / BOSS_NATS_URL).
+name: boss-dev
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # The repo root is the .devcontainer/ parent; mount it where
+    # devcontainer.json's workspaceFolder points.
+    volumes:
+      - ..:/workspaces/boss:cached
+    command: sleep infinity
+    environment:
+      # Workspace → companion services. Binaries + tests read these
+      # (see infra/oss-quickstart/generate-configs.sh + boss_testing).
+      DATABASE_URL: postgres://boss:boss@postgres:5432/boss
+      BOSS_POSTGRES_URL: postgres://boss:boss@postgres:5432/boss
+      BOSS_TEST_POSTGRES_ADMIN_URL: postgres://boss:boss@postgres:5432/postgres
+      NATS_URL: nats://nats:4222
+      BOSS_NATS_URL: nats://nats:4222
+      # Let bare `psql` + apply-schema.sh hit the postgres service with
+      # no -h/-U flags.
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: boss
+      PGPASSWORD: boss
+      PGDATABASE: boss
+      # Trim debuginfo — the big workspace test build otherwise fills
+      # the container disk (matches CI).
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16
+    # ~24 services each run an sqlx pool; PG's default max_connections=100
+    # saturates. 400 matches the quickstart + playground settings.
+    command: ["postgres", "-c", "max_connections=400"]
+    environment:
+      POSTGRES_USER: boss
+      POSTGRES_PASSWORD: boss
+      POSTGRES_DB: boss
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "boss"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  nats:
+    # alpine carries busybox wget for the healthcheck; plain nats:2.10
+    # is scratch-based (binary only).
+    image: nats:2.10-alpine
+    # -js: JetStream (audit-log replay needs it). -m 8222: monitoring
+    # endpoint the healthcheck calls.
+    command: ["-js", "-m", "8222"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+
+volumes:
+  postgres-data:
