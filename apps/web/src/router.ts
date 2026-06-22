@@ -63,6 +63,7 @@ export type Route =
   | { kind: 'policy' }
   | { kind: 'jobKinds' }
   | { kind: 'jobKindNew' }
+  | { kind: 'jobKindDesign'; jobId: string }
   | { kind: 'jobKindDetail'; kindSlug: string }
   | { kind: 'itStepPlugins' }
   | { kind: 'itStepPluginDetail'; pluginSlug: string }
@@ -174,6 +175,11 @@ export function parseRoute(pathname: string): Route {
   // prefix is an alias kept stable for the public-facing docs.
   if (p === '/job-kinds' || p === '/admin/job-kinds') return { kind: 'jobKinds' };
   if (p === '/job-kinds/new' || p === '/admin/job-kinds/new') return { kind: 'jobKindNew' };
+  // The authoring-workspace route is keyed by the design Job's id and
+  // must match before the catch-all detail pattern, which would
+  // otherwise swallow `authoring/<jobId>` as a slug.
+  const jkDesignM = p.match(/^\/(?:admin\/)?job-kinds\/authoring\/(.+)$/);
+  if (jkDesignM) return { kind: 'jobKindDesign', jobId: decodeURIComponent(jkDesignM[1]!) };
   const jkM = p.match(/^\/(?:admin\/)?job-kinds\/(.+)$/);
   if (jkM) return { kind: 'jobKindDetail', kindSlug: decodeURIComponent(jkM[1]!) };
   if (p === '/it/step-plugins') return { kind: 'itStepPlugins' };

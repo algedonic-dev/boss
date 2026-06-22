@@ -232,7 +232,7 @@ impl JobKindSpec {
 /// Step graph (tier-major, default edges between adjacent tiers):
 /// 0. `task`              — Author spec
 /// 1. `task`              — Validate (lint via `validate_all`)
-/// 2. `sign-off`          — Approve (authority_role = `platform-admin`)
+/// 2. `sign-off`          — Approve (authority_role = `job-kind-approver`)
 /// 3. `job-kind-publish`  — Publish (writes to registry, emits
 ///    `jobs.kind.published`)
 ///
@@ -261,9 +261,15 @@ fn job_kind_design_spec() -> JobKindSpec {
             kind: "sign-off".into(),
             ready_when: "steps.validate.done".into(),
             title_template: "Approve spec".into(),
-            sign_offs_required: vec!["platform-admin".into()],
-            authority_role: Some("platform-admin".into()),
-            metadata_defaults: serde_json::json!({ "authority_role": "platform-admin" }),
+            // Approval authority is `job-kind-approver` — an operational-
+            // leadership capability granted (via tenant policy) to the
+            // C-suite/COO/dept-heads who own the `job-kinds` authoring
+            // surface, plus platform-admin (core policy default). NOT
+            // platform-admin alone: authoring a work-type is the
+            // operational leaders' job, not solely the deploy operator's.
+            sign_offs_required: vec!["job-kind-approver".into()],
+            authority_role: Some("job-kind-approver".into()),
+            metadata_defaults: serde_json::json!({ "authority_role": "job-kind-approver" }),
             ..Default::default()
         },
         StepSpec {
@@ -2702,12 +2708,13 @@ mod tests {
         assert_eq!(steps[2].kind, "sign-off"); // approve
         assert_eq!(
             steps[2].sign_offs_required,
-            vec!["platform-admin".to_string()]
+            vec!["job-kind-approver".to_string()]
         );
         assert_eq!(
             steps[2].authority_role.as_deref(),
-            Some("platform-admin"),
-            "sign-off authority is platform-admin (`cto` is a tenant role)"
+            Some("job-kind-approver"),
+            "approval is the operational-leader `job-kind-approver` authority, \
+             not platform-admin alone"
         );
         assert_eq!(steps[3].kind, "job-kind-publish"); // publish
         assert!(steps[3].terminal.is_some(), "publish is the terminal step");

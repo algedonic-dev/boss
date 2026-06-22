@@ -87,6 +87,11 @@ ENV PUPPETEER_SKIP_DOWNLOAD=true
 
 WORKDIR /spa
 COPY apps/web/package.json apps/web/bun.lock* ./
+# `patchedDependencies` in package.json references patch files under
+# patches/; bun install needs them present, so copy that dir ahead of
+# the install (and ahead of the full-source COPY) to keep the
+# dependency layer cacheable.
+COPY apps/web/patches ./patches
 RUN bun install --frozen-lockfile
 
 COPY apps/web/. ./

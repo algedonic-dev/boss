@@ -44,6 +44,13 @@ export const ROUTE_ACCESS: Record<Role, ReadonlyArray<RouteName>> = {
   ceo: ALL,
   cto: ALL,
   coo: ALL,
+  // Platform super-admin. The policy layer grants `platform-admin`
+  // Scope::All on every resource (boss-policy-client defaults), so the
+  // sidebar should surface every section — same rationale as
+  // `audit-readonly` below; server-side enforces the real grants. This
+  // is also the role the `job-kind-design` approve step requires, so the
+  // operator authoring a JobKind lands here and needs the full surface.
+  'platform-admin': ALL,
   cfo: ['exec', 'accounts', 'assets', 'sales', 'finance', 'people', 'parts', 'products', 'vendors'],
   'vp-sales': ['exec', 'catalog', 'accounts', 'assets', 'sales', 'people'],
   'sales-mgr': ['catalog', 'accounts', 'assets', 'sales', 'people'],
