@@ -1070,6 +1070,12 @@ async fn run_restart_epoch_background(
         "restart_epoch: audit_log trimmed past seed baseline"
     );
 
+    // Clear directly-written per-epoch ledger state that no audit-log
+    // rebuilder owns (see clear_epoch_payroll_state), so the new cycle
+    // starts from an empty payroll ledger instead of deduping against
+    // last cycle's calendar-dated runs.
+    clear_epoch_payroll_state(pool).await?;
+
     // Spawn boss-rebuild-all WITHOUT --audit-log-seed: the
     // surviving audit_log is the source of truth; we just need
     // to re-derive projections from it.
@@ -1105,6 +1111,31 @@ async fn run_restart_epoch_background(
     .execute(pool)
     .await
     .map_err(|e| JobsError::Storage(e.to_string()))?;
+    Ok(())
+}
+
+/// Clear the directly-written per-epoch payroll projection tables on a
+/// demo-loop reset.
+///
+/// `payroll_runs` (+ its `payroll_run_lines`, FK `ON DELETE CASCADE`) is
+/// written straight by the ledger payroll-synthesize endpoint and is NOT
+/// owned by any audit-log rebuilder — so the per-service replay above
+/// (which wipes + re-derives `gl_journal_lines`, `financial_facts`, …)
+/// leaves it untouched. Across epoch loops it accumulates prior-cycle
+/// rows, and synthesize's calendar-dated idempotency key
+/// (`payroll-YYYYMMDD`) then collides with last cycle's row → the new
+/// cycle's payroll is deduped away and never reaches the GL. The reset
+/// must clear it so each epoch starts from an empty payroll ledger.
+///
+/// Reset-path only (NOT the general `boss-rebuild-all` rebuilder), so an
+/// ordinary projection repair never drops payroll history.
+pub async fn clear_epoch_payroll_state(pool: &PgPool) -> Result<(), JobsError> {
+    // Both tables in one TRUNCATE so the FK (lines → runs) is satisfied
+    // without CASCADE.
+    sqlx::query("TRUNCATE payroll_run_lines, payroll_runs")
+        .execute(pool)
+        .await
+        .map_err(|e| JobsError::Storage(format!("clear epoch payroll state: {e}")))?;
     Ok(())
 }
 
