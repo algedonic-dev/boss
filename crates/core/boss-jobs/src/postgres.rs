@@ -905,11 +905,19 @@ impl JobsRepository for PgJobs {
     }
 
     async fn set_sim_clock_paused(&self, paused: bool) -> Result<(), JobsError> {
-        sqlx::query("UPDATE sim_clock SET paused = $1 WHERE id = 1")
-            .bind(paused)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // Move paused_at in lockstep with paused: boss-clock's now() only
+        // freezes when (paused, paused_at) = (true, Some). Setting paused
+        // alone leaves the clock advancing, so the Pause button wouldn't
+        // actually stop sim-time. On resume, clear it.
+        sqlx::query(
+            "UPDATE sim_clock \
+             SET paused = $1, paused_at = CASE WHEN $1 THEN NOW() ELSE NULL END \
+             WHERE id = 1",
+        )
+        .bind(paused)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -979,9 +987,18 @@ impl JobsRepository for PgJobs {
         // + rebuild-all + clock-rewind) runs in a tokio::spawn
         // task. The SPA polls /api/jobs/live to see when
         // restart_in_progress flips back to false.
+        // paused_at = NOW() is load-bearing, not cosmetic: boss-clock's
+        // now() only freezes sim-time when (paused, paused_at) = (true,
+        // Some) — with paused_at NULL it falls through to Utc::now() and
+        // the clock keeps advancing, so the sim daemon never quiesces.
+        // Without it the tick-wait below is a no-op and the audit_log
+        // trim races live writes (trimming a job's create event while a
+        // later-committed step event survives → orphaned steps → the
+        // jobs rebuild aborts on the FK).
         sqlx::query(
             "UPDATE sim_clock \
-             SET paused = true, restart_in_progress = true, updated_at = NOW() \
+             SET paused = true, paused_at = NOW(), \
+                 restart_in_progress = true, updated_at = NOW() \
              WHERE id = 1",
         )
         .execute(&self.pool)
@@ -1103,7 +1120,7 @@ async fn run_restart_epoch_background(
     sqlx::query(
         "UPDATE sim_clock \
          SET epoch_start_date = $1, wall_anchor = NOW(), \
-             paused_offset_seconds = 0, paused = false, \
+             paused_offset_seconds = 0, paused = false, paused_at = NULL, \
              restart_in_progress = false, updated_at = NOW() \
          WHERE id = 1",
     )
