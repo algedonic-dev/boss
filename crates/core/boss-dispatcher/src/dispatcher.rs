@@ -305,7 +305,9 @@ async fn handle_event(ctx: &DispatcherCtx, subject: &str, payload: &Value) -> Re
         );
     };
     assign(ctx, job_id, step_id, &emp_id).await?;
-    info!(
+    // Per-assignment log at DEBUG, not INFO: at warp the loop assigns
+    // many steps/sec; an INFO line each contributed to the syslog flood.
+    debug!(
         job_id, step_id, emp_id,
         role = role_used,
         candidates = ?role_candidates,
