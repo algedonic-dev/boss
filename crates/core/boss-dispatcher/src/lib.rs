@@ -40,6 +40,7 @@
 //!   A future tick will re-emit the step.updated event if the dispatch
 //!   never landed (or an admin can manually re-run /api/dispatcher/sweep).
 
+pub mod cascade;
 pub mod config;
 pub mod dispatcher;
 pub mod http;

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use boss_dispatcher::config::DispatcherConfig;
 use boss_dispatcher::dispatcher::{DispatcherCtx, run_loop};
-use boss_dispatcher::http::router;
+use boss_dispatcher::http::{HttpState, router};
 use boss_dispatcher::liveness::DispatcherLiveness;
 use boss_dispatcher::rules::handler::HandlerRegistry;
 use boss_dispatcher::rules::handlers::{
@@ -209,7 +209,10 @@ async fn main() -> Result<()> {
         info!("BOSS_DISPATCHER_RULES not set; rules runner not started");
     }
 
-    let app = router(live);
+    let app = router(HttpState {
+        live,
+        rules_path: cfg.rules_path.clone(),
+    });
     let bind: SocketAddr = cfg
         .http_bind
         .parse()
