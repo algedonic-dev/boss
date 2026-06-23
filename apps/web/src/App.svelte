@@ -187,6 +187,7 @@
       : route.kind === 'policy' ? 'policy'
       : route.kind === 'jobKinds' || route.kind === 'jobKindNew' || route.kind === 'jobKindDesign' || route.kind === 'jobKindDetail' ? 'jobKinds'
       : route.kind === 'itStepPlugins' || route.kind === 'itStepPluginDetail' ? 'itStepPlugins'
+      : route.kind === 'dispatcherRules' ? 'it-dispatcher'
       : route.kind === 'workflows' ? 'workflows'
       : 'me',
   );
