@@ -95,11 +95,10 @@ pub(super) async fn trial_balance(
     // accounts (for name + normal_side).
     let rows_result: Result<Vec<TrialBalanceRowTuple>, _> = sqlx::query_as(
         "SELECT a.code, a.name, a.kind, a.normal_side, \
-                    COALESCE(SUM(l.debit_cents), 0)::bigint, COALESCE(SUM(l.credit_cents), 0)::bigint \
+                    COALESCE(SUM(d.debit_cents), 0)::bigint, COALESCE(SUM(d.credit_cents), 0)::bigint \
              FROM gl_accounts a \
-             LEFT JOIN gl_journal_lines l ON l.account_id = a.id \
-             LEFT JOIN gl_journal_entries e ON e.id = l.journal_entry_id \
-             WHERE ($1::date IS NULL OR e.posted_on <= $1) \
+             LEFT JOIN gl_account_daily d ON d.account_id = a.id \
+             WHERE ($1::date IS NULL OR d.posted_on <= $1) \
              GROUP BY a.code, a.name, a.kind, a.normal_side \
              ORDER BY a.code",
     )
@@ -211,14 +210,13 @@ pub(super) async fn income_statement(
     // we compute the signed amount per-row in Rust below.
     let rows_result: Result<Vec<StatementRowTuple>, _> = sqlx::query_as(
         "SELECT a.code, a.name, a.kind, \
-                COALESCE(SUM(l.debit_cents), 0)::bigint, \
-                COALESCE(SUM(l.credit_cents), 0)::bigint \
+                COALESCE(SUM(d.debit_cents), 0)::bigint, \
+                COALESCE(SUM(d.credit_cents), 0)::bigint \
          FROM gl_accounts a \
-         LEFT JOIN gl_journal_lines l ON l.account_id = a.id \
-         LEFT JOIN gl_journal_entries e ON e.id = l.journal_entry_id \
+         LEFT JOIN gl_account_daily d ON d.account_id = a.id \
          WHERE a.kind IN ('revenue', 'expense') \
-           AND ($1::date IS NULL OR e.posted_on >= $1) \
-           AND ($2::date IS NULL OR e.posted_on <= $2) \
+           AND ($1::date IS NULL OR d.posted_on >= $1) \
+           AND ($2::date IS NULL OR d.posted_on <= $2) \
          GROUP BY a.code, a.name, a.kind \
          ORDER BY a.code",
     )
@@ -339,12 +337,11 @@ pub(super) async fn balance_sheet(
     // calls see only post-close activity.
     let rows: Result<Vec<StatementRowTuple>, _> = sqlx::query_as(
         "SELECT a.code, a.name, a.kind, \
-                COALESCE(SUM(l.debit_cents), 0)::bigint, \
-                COALESCE(SUM(l.credit_cents), 0)::bigint \
+                COALESCE(SUM(d.debit_cents), 0)::bigint, \
+                COALESCE(SUM(d.credit_cents), 0)::bigint \
          FROM gl_accounts a \
-         LEFT JOIN gl_journal_lines l ON l.account_id = a.id \
-         LEFT JOIN gl_journal_entries e ON e.id = l.journal_entry_id \
-         WHERE ($1::date IS NULL OR e.posted_on <= $1) \
+         LEFT JOIN gl_account_daily d ON d.account_id = a.id \
+         WHERE ($1::date IS NULL OR d.posted_on <= $1) \
          GROUP BY a.code, a.name, a.kind \
          ORDER BY a.code",
     )
@@ -569,43 +566,22 @@ pub(super) async fn cash_flow_statement(
     // net cash POOL change per JE and attribute to non-pool offsets.
     let cash_pool: &[&str] = &["1000", "1010"];
     let cash_movements: Result<Vec<(String, String, String, i64)>, _> = sqlx::query_as(
-        "WITH pool_jes AS ( \
-             SELECT e.id, e.posted_on, \
-                    SUM(l.debit_cents) - SUM(l.credit_cents) AS net_cash \
-             FROM gl_journal_entries e \
-             JOIN gl_journal_lines l ON l.journal_entry_id = e.id \
-             JOIN gl_accounts a ON a.id = l.account_id AND a.code = ANY($3) \
-             WHERE e.posted_on BETWEEN $1 AND $2 \
-             GROUP BY e.id, e.posted_on \
-             HAVING SUM(l.debit_cents) - SUM(l.credit_cents) != 0 \
-         ), \
-         offset_per_je AS ( \
-             SELECT je.id AS je_id, je.net_cash, \
-                    a.code, a.kind, a.name, \
-                    SUM(l.credit_cents - l.debit_cents) AS offset_cr_net \
-             FROM pool_jes je \
-             JOIN gl_journal_lines l ON l.journal_entry_id = je.id \
-             JOIN gl_accounts a ON a.id = l.account_id AND a.code != ALL($3) \
-             GROUP BY je.id, je.net_cash, a.code, a.kind, a.name \
-         ), \
-         offset_totals AS ( \
-             SELECT je_id, SUM(offset_cr_net) AS offset_total_cr \
-             FROM offset_per_je GROUP BY je_id \
-         ) \
-         SELECT o.code, o.kind, o.name, \
-                SUM(CASE WHEN ot.offset_total_cr != 0 \
-                         THEN (o.net_cash::numeric * \
-                               o.offset_cr_net::numeric / \
-                               ot.offset_total_cr::numeric)::bigint \
-                         ELSE 0 END)::bigint AS attributed_cash \
-         FROM offset_per_je o \
-         JOIN offset_totals ot ON ot.je_id = o.je_id \
-         GROUP BY o.code, o.kind, o.name \
-         ORDER BY o.code",
+        // Reads the pre-attributed gl_account_daily.cash_flow_cents rollup
+        // (net cash attributed per offset account per day) instead of
+        // re-running the per-entry pool->offset attribution over the whole
+        // journal on every request. The pool accounts carry 0 here, so
+        // they fall out; the per-entry proportional split + truncating
+        // rounding happened when the rollup was built (live + rebuild).
+        "SELECT a.code, a.kind, a.name, \
+                COALESCE(SUM(d.cash_flow_cents), 0)::bigint AS attributed_cash \
+         FROM gl_accounts a \
+         JOIN gl_account_daily d ON d.account_id = a.id \
+         WHERE d.posted_on BETWEEN $1 AND $2 \
+         GROUP BY a.code, a.kind, a.name \
+         ORDER BY a.code",
     )
     .bind(from)
     .bind(to)
-    .bind(cash_pool)
     .fetch_all(&state.pool)
     .await;
     let cash_movements = match cash_movements {
@@ -685,15 +661,14 @@ pub(super) async fn cash_flow_statement(
     let net_income_cents: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM( \
              CASE \
-                 WHEN a.code LIKE '4%' THEN l.credit_cents - l.debit_cents \
-                 WHEN a.code LIKE '5%' OR a.code LIKE '6%' THEN -(l.debit_cents - l.credit_cents) \
+                 WHEN a.code LIKE '4%' THEN d.credit_cents - d.debit_cents \
+                 WHEN a.code LIKE '5%' OR a.code LIKE '6%' THEN -(d.debit_cents - d.credit_cents) \
                  ELSE 0 \
              END \
          ), 0)::BIGINT \
-         FROM gl_journal_lines l \
-         JOIN gl_journal_entries e ON e.id = l.journal_entry_id \
-         JOIN gl_accounts a ON a.id = l.account_id \
-         WHERE e.posted_on BETWEEN $1 AND $2 \
+         FROM gl_account_daily d \
+         JOIN gl_accounts a ON a.id = d.account_id \
+         WHERE d.posted_on BETWEEN $1 AND $2 \
            AND (a.code LIKE '4%' OR a.code LIKE '5%' OR a.code LIKE '6%')",
     )
     .bind(from)
@@ -918,13 +893,12 @@ async fn account_balances_as_of(
 ) -> Result<AccountBalances, sqlx::Error> {
     let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
         "SELECT a.code, a.kind, \
-                COALESCE(SUM(l.debit_cents), 0)::bigint, \
-                COALESCE(SUM(l.credit_cents), 0)::bigint \
+                COALESCE(SUM(d.debit_cents), 0)::bigint, \
+                COALESCE(SUM(d.credit_cents), 0)::bigint \
          FROM gl_accounts a \
-         LEFT JOIN gl_journal_lines l ON l.account_id = a.id \
-         LEFT JOIN gl_journal_entries e ON e.id = l.journal_entry_id \
+         LEFT JOIN gl_account_daily d ON d.account_id = a.id \
          WHERE a.kind IN ('asset', 'liability', 'equity') \
-           AND ($1::date IS NULL OR e.posted_on <= $1) \
+           AND ($1::date IS NULL OR d.posted_on <= $1) \
          GROUP BY a.code, a.kind",
     )
     .bind(as_of)

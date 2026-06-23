@@ -207,6 +207,45 @@ CREATE INDEX IF NOT EXISTS gl_journal_lines_entry ON gl_journal_lines (journal_e
 CREATE INDEX IF NOT EXISTS gl_journal_lines_account ON gl_journal_lines (account_id);
 
 
+-- -----------------------------------------------------------------------------
+-- GL daily rollup — convenience projection over the journal.
+-- A second-level projection (the journal is itself a projection of
+-- financial_facts): pre-aggregates each account's debit + credit totals
+-- per posted_on date, plus the cash attributed to the account that day.
+-- The financial statements (trial balance, balance sheet, income
+-- statement, cash flow) read THIS table instead of GROUP-BY-ing the full
+-- gl_journal_lines × gl_journal_entries join on every request — turning a
+-- ~400k-line scan into a ~few-thousand-row sum. Maintained two ways that
+-- must agree (the principle behind replay-check):
+--   * live    — incremented per journal entry inside post_fact_in_tx's
+--               insert_entry (same tx as the line write)
+--   * rebuild — TRUNCATE + full re-aggregate at the end of the ledger
+--               rebuild (boss-ledger::rebuild)
+-- `cash_flow_cents` is the net cash attributed to this account on this
+-- day: for every journal entry that moves the cash pool (1000 + 1010),
+-- the pool's net change is split across the entry's non-pool offset
+-- accounts in proportion to their credit-net share, with truncating
+-- division (matching the rebuild SQL's trunc()::bigint). It is 0 for the
+-- pool accounts themselves and for accounts on non-cash entries — so the
+-- cash-flow statement sums this column over a window instead of
+-- re-attributing the whole ledger per request.
+-- -----------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS gl_account_daily (
+    account_id      UUID NOT NULL REFERENCES gl_accounts(id),
+    posted_on       DATE NOT NULL,
+    debit_cents     BIGINT NOT NULL DEFAULT 0,
+    credit_cents    BIGINT NOT NULL DEFAULT 0,
+    cash_flow_cents BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (account_id, posted_on)
+);
+
+
+-- Statement queries filter by posted_on (as_of / from..to) then group by
+-- account; the date index keeps the range scan tight.
+CREATE INDEX IF NOT EXISTS gl_account_daily_posted ON gl_account_daily (posted_on);
+
+
 -- ASC 606 revenue recognition — one row per ratable obligation, driven
 -- by the `boss-ledger-recognize` scheduler
 -- (docs/architecture-decisions.md §Finance & ledger).
