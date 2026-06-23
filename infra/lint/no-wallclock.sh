@@ -327,6 +327,15 @@ sql_allow_line() {
   if echo "$line_content" | grep -qE 'wall_anchor\s*=\s*NOW\s*\(\s*\)'; then
     return 0
   fi
+  # The sim-clock pause anchor: `paused_at` records the real-world
+  # instant the current pause started — the wall reference boss-clock
+  # uses to freeze sim-time (same class as wall_anchor). Matches both
+  # the direct `= NOW()` (restart-epoch pause-claim) and the
+  # `= CASE WHEN $1 THEN NOW() ELSE NULL END` pause/resume form. Never
+  # a business date stamped onto any event.
+  if echo "$line_content" | grep -qE 'paused_at\s*=\s*(NOW\s*\(\s*\)|CASE)'; then
+    return 0
+  fi
   # Expiry checks against wallclock (policy rules, tokens).
   if echo "$line_content" | grep -qE 'expires_at\s*[<>!=]+\s*NOW\s*\(\s*\)'; then
     return 0
