@@ -24,7 +24,7 @@ use boss_dispatcher::rules::handlers::{
 };
 use boss_dispatcher::rules::helpers_inventory::InventoryHelpers;
 use boss_dispatcher::rules::jobs_spawn::JobsSpawn;
-use boss_dispatcher::rules::registry::Registry as RuleRegistry;
+use boss_dispatcher::rules::registry::{Registry as RuleRegistry, load_active_rules};
 use boss_dispatcher::rules::runner::RulesRunner;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -45,7 +45,6 @@ async fn main() -> Result<()> {
         jobs_api_url = %cfg.jobs_api_url,
         people_api_url = %cfg.people_api_url,
         inventory_api_url = %cfg.inventory_api_url,
-        rules_path = ?cfg.rules_path,
         assignment_strategy = ?cfg.assignment_strategy,
         "boss-dispatcher starting"
     );
@@ -89,130 +88,128 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Load the rules registry (if configured) and start the
-    // rules runner alongside the legacy role-assignment loop. Both
-    // share the same NATS connection but subscribe to disjoint topic
-    // sets — the legacy loop owns jobs.step.>, the runner owns
-    // whatever the registry declares.
-    if let Some(path) = cfg.rules_path.as_deref() {
-        match std::fs::read_to_string(path) {
-            Ok(src) => match RuleRegistry::from_toml(&src) {
-                Ok(registry) => {
-                    info!(
-                        path = %path,
-                        rule_count = registry.rules().len(),
-                        "rules registry loaded"
-                    );
-                    let mut handlers = HandlerRegistry::new();
-                    handlers.register(JobsSpawn::new(cfg.jobs_api_url.clone()));
-                    // D7 delegate-subjob write-back: on a child Job's
-                    // close, resolve the parent delegate-subjob step.
-                    handlers.register(JobsSubjobResolve::new(cfg.jobs_api_url.clone()));
-                    // System-completes zero-duration, no-role markers
-                    // (trigger / outcome / milestone) the moment they go
-                    // Ready, so a Job flows past its structural checkpoints
-                    // without an executor. Shares the dispatcher's StepType
-                    // registry to classify markers (vs. real no-role work
-                    // like `task`).
-                    handlers.register(JobsCompleteStep::new(
-                        cfg.jobs_api_url.clone(),
-                        ctx.registry.clone(),
-                    ));
-                    // Agent gate executor: on step.ready for a gate kind
-                    // (demand-gate / availability-gate), read real
-                    // finished-goods stock, decide the outcome, and complete
-                    // the gate with it — computer-speed, no workforce slot.
-                    // Shares the StepType registry to classify gates.
-                    handlers.register(GateResolve::new(
-                        cfg.jobs_api_url.clone(),
-                        cfg.products_api_url.clone(),
-                        ctx.registry.clone(),
-                    ));
-                    // Step-completion handlers — F15 migration. Each
-                    // is a pure HTTP client to the relevant public API.
-                    handlers.register(InventoryPoPlace::new(cfg.inventory_api_url.clone()));
-                    handlers.register(InventoryReceive::new(cfg.inventory_api_url.clone()));
-                    handlers.register(InventoryBillApprove::new(cfg.inventory_api_url.clone()));
-                    handlers.register(BillPaymentBatch::new(
-                        "inventory.bill.payment_batch",
-                        cfg.inventory_api_url.clone(),
-                        "/api/inventory/vendor-invoices/batch-pay",
-                    ));
-                    handlers.register(InventoryPartsConsume::new(cfg.inventory_api_url.clone()));
-                    handlers.register(InventoryPartsProduce::new(cfg.inventory_api_url.clone()));
-                    // FG cost basis is derived from the brew's real
-                    // consumed-input cost (Job + inventory avg_cost), not a
-                    // plug — so the handler needs the jobs + inventory APIs.
-                    handlers.register(ProductsProduce::new(
-                        cfg.products_api_url.clone(),
-                        cfg.jobs_api_url.clone(),
-                        cfg.inventory_api_url.clone(),
-                    ));
-                    handlers.register(ProductsConsume::new(cfg.products_api_url.clone()));
-                    handlers.register(CommerceInvoiceIssue::new(cfg.commerce_api_url.clone()));
-                    handlers.register(ShippingCreate::new(cfg.shipping_api_url.clone()));
-                    // Outbound integration edge: forward matched events to a
-                    // configured external webhook (e.g. a regen's simulator
-                    // playing external counterparties). No-op when
-                    // BOSS_EVENT_WEBHOOK_URL is unset; the system stays
-                    // unaware of who, if anyone, is on the other end.
-                    handlers.register(WebhookNotify::new(cfg.webhook_url.clone()));
-                    handlers.register(LedgerTaxRemit::new(cfg.ledger_api_url.clone()));
-                    // Per-production excise-tax accrual (DR 6550 / CR 2320),
-                    // fired on `step.done.production-produce` — the brewery's
-                    // federal beer excise liability accrues at packaging time,
-                    // drained quarterly by the excise-tax-filing JobKind.
-                    handlers.register(LedgerTaxAccrue::new(cfg.ledger_api_url.clone()));
-                    handlers.register(LedgerPayrollRunSubmit::new(cfg.ledger_api_url.clone()));
-                    // General AP bills (rent/utilities/…) → ledger subledger.
-                    handlers.register(LedgerBillApprove::new(cfg.ledger_api_url.clone()));
-                    handlers.register(BillPaymentBatch::new(
-                        "ledger.bill.payment_batch",
-                        cfg.ledger_api_url.clone(),
-                        "/api/ledger/bills/pay-run",
-                    ));
-                    handlers.register(PeopleHire::new(cfg.people_api_url.clone()));
-                    handlers.register(PeopleTerminate::new(cfg.people_api_url.clone()));
-                    // Push notifier: step.ready.* -> message the role's
-                    // on-call member (the pull-side assignments query is
-                    // the actual work driver; this is awareness).
-                    handlers.register(MessagesNotify::new(
-                        cfg.people_api_url.clone(),
-                        cfg.messages_api_url.clone(),
-                    ));
-                    let helpers = Arc::new(InventoryHelpers::new(
-                        cfg.inventory_api_url.clone(),
-                        cfg.jobs_api_url.clone(),
-                    ));
-                    let runner = Arc::new(RulesRunner {
-                        registry,
-                        handlers,
-                        helpers,
-                    });
-                    let js_for_runner = jetstream.clone();
-                    let live_for_runner = live.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = runner.run(js_for_runner, live_for_runner).await {
-                            tracing::error!(error = %e, "rules runner exited with error");
-                        }
-                    });
+    // Postgres pool — the dispatcher loads its rule registry from the
+    // append-only versioned `dispatcher_rules` table (replacing the legacy
+    // rules.toml file) and serves it at /api/dispatcher/rules.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&cfg.postgres_url)
+        .await
+        .with_context(|| "connecting to Postgres for the dispatcher rule registry")?;
+
+    // Load the rule registry from `dispatcher_rules` and start the rules
+    // runner alongside the legacy role-assignment loop. They share the NATS
+    // connection but subscribe to disjoint topics — the legacy loop owns
+    // jobs.step.>, the runner owns whatever the registry declares.
+    match load_active_rules(&pool)
+        .await
+        .and_then(RuleRegistry::from_raw)
+    {
+        Ok(registry) => {
+            info!(
+                rule_count = registry.rules().len(),
+                "rules registry loaded from dispatcher_rules"
+            );
+            let mut handlers = HandlerRegistry::new();
+            handlers.register(JobsSpawn::new(cfg.jobs_api_url.clone()));
+            // D7 delegate-subjob write-back: on a child Job's
+            // close, resolve the parent delegate-subjob step.
+            handlers.register(JobsSubjobResolve::new(cfg.jobs_api_url.clone()));
+            // System-completes zero-duration, no-role markers
+            // (trigger / outcome / milestone) the moment they go
+            // Ready, so a Job flows past its structural checkpoints
+            // without an executor. Shares the dispatcher's StepType
+            // registry to classify markers (vs. real no-role work
+            // like `task`).
+            handlers.register(JobsCompleteStep::new(
+                cfg.jobs_api_url.clone(),
+                ctx.registry.clone(),
+            ));
+            // Agent gate executor: on step.ready for a gate kind
+            // (demand-gate / availability-gate), read real
+            // finished-goods stock, decide the outcome, and complete
+            // the gate with it — computer-speed, no workforce slot.
+            // Shares the StepType registry to classify gates.
+            handlers.register(GateResolve::new(
+                cfg.jobs_api_url.clone(),
+                cfg.products_api_url.clone(),
+                ctx.registry.clone(),
+            ));
+            // Step-completion handlers — F15 migration. Each
+            // is a pure HTTP client to the relevant public API.
+            handlers.register(InventoryPoPlace::new(cfg.inventory_api_url.clone()));
+            handlers.register(InventoryReceive::new(cfg.inventory_api_url.clone()));
+            handlers.register(InventoryBillApprove::new(cfg.inventory_api_url.clone()));
+            handlers.register(BillPaymentBatch::new(
+                "inventory.bill.payment_batch",
+                cfg.inventory_api_url.clone(),
+                "/api/inventory/vendor-invoices/batch-pay",
+            ));
+            handlers.register(InventoryPartsConsume::new(cfg.inventory_api_url.clone()));
+            handlers.register(InventoryPartsProduce::new(cfg.inventory_api_url.clone()));
+            // FG cost basis is derived from the brew's real
+            // consumed-input cost (Job + inventory avg_cost), not a
+            // plug — so the handler needs the jobs + inventory APIs.
+            handlers.register(ProductsProduce::new(
+                cfg.products_api_url.clone(),
+                cfg.jobs_api_url.clone(),
+                cfg.inventory_api_url.clone(),
+            ));
+            handlers.register(ProductsConsume::new(cfg.products_api_url.clone()));
+            handlers.register(CommerceInvoiceIssue::new(cfg.commerce_api_url.clone()));
+            handlers.register(ShippingCreate::new(cfg.shipping_api_url.clone()));
+            // Outbound integration edge: forward matched events to a
+            // configured external webhook (e.g. a regen's simulator
+            // playing external counterparties). No-op when
+            // BOSS_EVENT_WEBHOOK_URL is unset; the system stays
+            // unaware of who, if anyone, is on the other end.
+            handlers.register(WebhookNotify::new(cfg.webhook_url.clone()));
+            handlers.register(LedgerTaxRemit::new(cfg.ledger_api_url.clone()));
+            // Per-production excise-tax accrual (DR 6550 / CR 2320),
+            // fired on `step.done.production-produce` — the brewery's
+            // federal beer excise liability accrues at packaging time,
+            // drained quarterly by the excise-tax-filing JobKind.
+            handlers.register(LedgerTaxAccrue::new(cfg.ledger_api_url.clone()));
+            handlers.register(LedgerPayrollRunSubmit::new(cfg.ledger_api_url.clone()));
+            // General AP bills (rent/utilities/…) → ledger subledger.
+            handlers.register(LedgerBillApprove::new(cfg.ledger_api_url.clone()));
+            handlers.register(BillPaymentBatch::new(
+                "ledger.bill.payment_batch",
+                cfg.ledger_api_url.clone(),
+                "/api/ledger/bills/pay-run",
+            ));
+            handlers.register(PeopleHire::new(cfg.people_api_url.clone()));
+            handlers.register(PeopleTerminate::new(cfg.people_api_url.clone()));
+            // Push notifier: step.ready.* -> message the role's
+            // on-call member (the pull-side assignments query is
+            // the actual work driver; this is awareness).
+            handlers.register(MessagesNotify::new(
+                cfg.people_api_url.clone(),
+                cfg.messages_api_url.clone(),
+            ));
+            let helpers = Arc::new(InventoryHelpers::new(
+                cfg.inventory_api_url.clone(),
+                cfg.jobs_api_url.clone(),
+            ));
+            let runner = Arc::new(RulesRunner {
+                registry,
+                handlers,
+                helpers,
+            });
+            let js_for_runner = jetstream.clone();
+            let live_for_runner = live.clone();
+            tokio::spawn(async move {
+                if let Err(e) = runner.run(js_for_runner, live_for_runner).await {
+                    tracing::error!(error = %e, "rules runner exited with error");
                 }
-                Err(e) => {
-                    warn!(error = %e, path = %path, "failed to load rules registry; runner not started");
-                }
-            },
-            Err(e) => {
-                warn!(error = %e, path = %path, "could not read rules file; runner not started");
-            }
+            });
         }
-    } else {
-        info!("BOSS_DISPATCHER_RULES not set; rules runner not started");
+        Err(e) => {
+            warn!(error = %e, "failed to load dispatcher_rules registry; runner not started");
+        }
     }
 
-    let app = router(HttpState {
-        live,
-        rules_path: cfg.rules_path.clone(),
-    });
+    let app = router(HttpState { live, pool });
     let bind: SocketAddr = cfg
         .http_bind
         .parse()
