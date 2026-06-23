@@ -16,15 +16,15 @@ use axum::{Json, Router};
 
 use crate::cascade;
 use crate::liveness::DispatcherLiveness;
-use crate::rules::registry::parse_raw;
+use crate::rules::registry::load_active_rules;
 
-/// HTTP state: the consumer-liveness handle + the rules-file path, so the
-/// read-only `/api/dispatcher/rules` surface can serve the registry for
-/// the cascade visualization.
+/// HTTP state: the consumer-liveness handle + the Postgres pool, so the
+/// read-only `/api/dispatcher/rules` surface can serve the rule registry
+/// (the `dispatcher_rules` table) for the cascade visualization.
 #[derive(Clone)]
 pub struct HttpState {
     pub live: Arc<DispatcherLiveness>,
-    pub rules_path: Option<String>,
+    pub pool: sqlx::PgPool,
 }
 
 pub fn router(state: HttpState) -> Router {
@@ -52,34 +52,20 @@ async fn readyz(State(state): State<HttpState>) -> Json<serde_json::Value> {
 }
 
 /// Read-only rule-registry surface for the cascade visualization. Serves
-/// the parsed `rules.toml` verbatim (name, on_event, when, do/args) plus
-/// the static cascade metadata: per-handler emitted events + the
-/// jobs-api/external "system edges" that close the feedback loops.
-/// Re-reads the file per request — a low-traffic admin view, and reading
-/// on demand keeps it honest if the rules file changes under a running
-/// dispatcher.
+/// the ACTIVE rows of the `dispatcher_rules` registry table (name,
+/// on_event, when, do/args) plus the static cascade metadata: per-handler
+/// emitted events + the jobs-api/external "system edges" that close the
+/// feedback loops. Queries the table per request — a low-traffic admin
+/// view, and reading live reflects any rule edits without a restart.
 async fn rules(State(state): State<HttpState>) -> Json<serde_json::Value> {
-    let rules_value = match &state.rules_path {
-        Some(path) => match std::fs::read_to_string(path) {
-            Ok(src) => match parse_raw(&src) {
-                Ok(raw) => {
-                    serde_json::to_value(&raw.rules).unwrap_or_else(|_| serde_json::json!([]))
-                }
-                Err(e) => {
-                    return Json(serde_json::json!({
-                        "error": format!("parse {path}: {e}"),
-                        "rules": [], "handler_emits": {}, "system_edges": [],
-                    }));
-                }
-            },
-            Err(e) => {
-                return Json(serde_json::json!({
-                    "error": format!("read {path}: {e}"),
-                    "rules": [], "handler_emits": {}, "system_edges": [],
-                }));
-            }
-        },
-        None => serde_json::json!([]),
+    let rules_value = match load_active_rules(&state.pool).await {
+        Ok(raw) => serde_json::to_value(&raw.rules).unwrap_or_else(|_| serde_json::json!([])),
+        Err(e) => {
+            return Json(serde_json::json!({
+                "error": format!("load dispatcher_rules: {e}"),
+                "rules": [], "handler_emits": {}, "system_edges": [],
+            }));
+        }
     };
     let mut out = serde_json::Map::new();
     out.insert("rules".into(), rules_value);
