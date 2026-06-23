@@ -165,7 +165,11 @@ impl RulesRunner {
         for r in results {
             match &r.outcome {
                 Ok(()) => {
-                    info!(
+                    // Per-fire log at DEBUG, not INFO: at warp the runner
+                    // fires tens of rules/sec, and an INFO line each
+                    // flooded syslog (26G incident, 2026-06-23). Failures
+                    // still surface via the `bail!` below.
+                    debug!(
                         rule = %r.rule_name,
                         handler = %r.handler,
                         triggering_event = %event_id,
