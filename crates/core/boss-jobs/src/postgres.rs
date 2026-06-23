@@ -1054,6 +1054,51 @@ async fn run_restart_epoch_background(
     let pause_wait = std::time::Duration::from_secs((tick_interval.max(1) + 2) as u64);
     tokio::time::sleep(pause_wait).await;
 
+    // Wait for write-quiescence before trimming. Pausing the sim (the
+    // paused_at freeze above) stops NEW work, but the dispatcher keeps
+    // draining its in-flight step.done backlog — writing jobs/steps
+    // (and their commerce/shipping side-effects) stamped at the frozen
+    // instant. Trimming while those commit races them: the DELETE
+    // removes a job's create event while a later-committed step event
+    // survives → orphaned steps → the jobs rebuild aborts on
+    // steps_job_id_fkey. Poll MAX(audit_log.id) until it stops growing
+    // (backlog drained), then trim a settled log. The sim is paused so
+    // no new step.done events arrive — the backlog is finite + drains.
+    {
+        let mut last_max: i64 = -1;
+        let mut stable: u32 = 0;
+        let mut quiesced = false;
+        for _ in 0..60 {
+            let cur: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM audit_log")
+                .fetch_one(pool)
+                .await
+                .map_err(|e| JobsError::Storage(format!("quiesce poll: {e}")))?;
+            if cur == last_max {
+                stable += 1;
+                if stable >= 4 {
+                    quiesced = true;
+                    break;
+                }
+            } else {
+                stable = 0;
+                last_max = cur;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        if quiesced {
+            tracing::info!(
+                last_audit_id = last_max,
+                "restart_epoch: writers quiesced; trimming"
+            );
+        } else {
+            tracing::warn!(
+                last_audit_id = last_max,
+                "restart_epoch: audit_log still changing after ~60s; trimming anyway \
+                 (a writer isn't honoring the pause — investigate)"
+            );
+        }
+    }
+
     // Trim audit_log past the seed baseline. The append-only
     // trigger (DELETE rejection per the correctness-protocol
     // invariant) has to be disabled briefly — this is the one
