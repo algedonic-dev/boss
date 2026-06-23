@@ -823,6 +823,7 @@ dependencies = [
  "boss-jobs",
  "boss-nats",
  "boss-ports",
+ "boss-testing",
  "chrono",
  "clap",
  "futures",

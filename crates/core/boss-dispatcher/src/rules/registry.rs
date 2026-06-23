@@ -63,6 +63,44 @@ pub fn parse_raw(src: &str) -> Result<RawRegistry, RegistryError> {
     toml::from_str(src).map_err(|e| RegistryError::Toml(e.to_string()))
 }
 
+/// Load the ACTIVE dispatcher rules from the `dispatcher_rules` registry
+/// table into the raw shape. The dispatcher reads this at startup
+/// (replacing the legacy rules.toml file read) and `/api/dispatcher/rules`
+/// serves it. `do_steps` is stored as JSONB matching `RawDoStep`.
+pub async fn load_active_rules(pool: &sqlx::PgPool) -> Result<RawRegistry, RegistryError> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        name: String,
+        on_event: String,
+        when_expr: Option<String>,
+        do_steps: serde_json::Value,
+        delay: Option<String>,
+        version: i32,
+    }
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT name, on_event, when_expr, do_steps, delay, version \
+         FROM dispatcher_rules WHERE status = 'active' ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| RegistryError::Storage(e.to_string()))?;
+
+    let mut rules = Vec::with_capacity(rows.len());
+    for r in rows {
+        let do_steps: Vec<RawDoStep> = serde_json::from_value(r.do_steps)
+            .map_err(|e| RegistryError::Storage(format!("do_steps parse: {e}")))?;
+        rules.push(RawRule {
+            name: r.name,
+            on_event: r.on_event,
+            when: r.when_expr,
+            do_steps,
+            delay: r.delay,
+            version: r.version as u32,
+        });
+    }
+    Ok(RawRegistry { rules })
+}
+
 // ---------------------------------------------------------------------------
 // Parsed shape — what the matcher walks at runtime
 // ---------------------------------------------------------------------------
@@ -280,6 +318,8 @@ impl Rule {
 pub enum RegistryError {
     #[error("toml parse: {0}")]
     Toml(String),
+    #[error("registry storage: {0}")]
+    Storage(String),
     #[error("invalid topic {topic:?}: {reason}")]
     InvalidTopic { topic: String, reason: String },
     #[error("rule {rule:?} {location} could not parse {src:?}: {err}")]

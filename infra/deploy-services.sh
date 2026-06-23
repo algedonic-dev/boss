@@ -511,10 +511,10 @@ emit_unit() {
         # 1-day-per-10-wall-sec demo cadence.
         extra_env=$'Environment=BOSS_CLOCK_MODE=wall\nEnvironment=BOSS_SIM_TICK_SIZE_SECONDS=86400\nEnvironment=BOSS_SIM_TICK_INTERVAL_MS=0\nEnvironment=BOSS_POSTGRES_URL='"$PROD_DB_URL"
     elif [[ "$name" == "dispatcher" ]]; then
-        # boss-dispatcher reads everything from env vars. v1.0.10
-        # rule registry needs URLs for every downstream API its
-        # handlers may post into (commerce/products/shipping/
-        # ledger/inventory/people/jobs), plus the rules.toml path.
+        # boss-dispatcher reads everything from env vars: URLs for every
+        # downstream API its handlers post into (commerce/products/
+        # shipping/ledger/inventory/people/jobs), plus the Postgres URL —
+        # it loads its rule registry from the `dispatcher_rules` table.
         extra_env=$'Environment=BOSS_NATS_URL='"$NATS_URL"
         extra_env=$"${extra_env}"$'\nEnvironment=BOSS_JOBS_URL=http://127.0.0.1:'"$(port_of jobs prod)"
         extra_env=$"${extra_env}"$'\nEnvironment=BOSS_PEOPLE_URL=http://127.0.0.1:'"$(port_of people prod)"
@@ -523,7 +523,7 @@ emit_unit() {
         extra_env=$"${extra_env}"$'\nEnvironment=BOSS_PRODUCTS_URL=http://127.0.0.1:'"$(port_of products prod)"
         extra_env=$"${extra_env}"$'\nEnvironment=BOSS_SHIPPING_URL=http://127.0.0.1:'"$(port_of shipping prod)"
         extra_env=$"${extra_env}"$'\nEnvironment=BOSS_LEDGER_URL=http://127.0.0.1:'"$(port_of ledger prod)"
-        extra_env=$"${extra_env}"$'\nEnvironment=BOSS_DISPATCHER_RULES=/etc/boss-dispatcher-rules.toml'
+        extra_env=$"${extra_env}"$'\nEnvironment=BOSS_POSTGRES_URL='"$PROD_DB_URL"
         # Step-assignment distribution strategy, named as explicit data
         # rather than left to the binary's default. `spread` fans each
         # ready step across its role's active holders by a stable hash of
@@ -648,13 +648,10 @@ fi
 echo "==> systemctl daemon-reload"
 systemctl daemon-reload
 
-# v1.0.10: boss-dispatcher reads its rule registry from this path.
-# Sync it from the canonical source on every deploy so adds/edits
-# to rules.toml land without a manual sudo cp.
-if [[ -f "$REPO_ROOT/infra/dispatcher/rules.toml" ]]; then
-    install -m 644 "$REPO_ROOT/infra/dispatcher/rules.toml" /etc/boss-dispatcher-rules.toml
-    echo "  wrote /etc/boss-dispatcher-rules.toml"
-fi
+# boss-dispatcher's rule registry now lives in the `dispatcher_rules`
+# table (seeded by 41-dispatcher.sql, authored from infra/dispatcher/
+# rules.toml via gen-seed.py) and is loaded at startup — no rules.toml
+# file deploy.
 
 # Resolve target dir — may be a symlink (`/opt/boss/target` →
 # `/var/lib/boss-build/target` per `infra/dev-bootstrap`) or a real
