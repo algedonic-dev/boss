@@ -36,6 +36,13 @@ fn evaluate_active(fact: &FactRef<'_>) -> Result<(JournalEntryDraft, Uuid), Ledg
 /// Project a fact to journal entries in the given transaction. Called by
 /// domain crates after writing the fact row. Idempotent — re-posting the
 /// same fact is a no-op thanks to `UNIQUE (fact_id, rule_version_id)`.
+/// The cash pool: 1000 Cash + 1010 Cash in Transit. Movements between
+/// these two are internal transfers; the cash-flow rollup attributes the
+/// pool's net change per entry to the non-pool offset accounts. Shared by
+/// the `gl_account_daily` live increment ([`upsert_daily_rollup`]) and the
+/// rebuild re-aggregate in `rebuild.rs` so both classify cash identically.
+pub(crate) const CASH_POOL: [&str; 2] = ["1000", "1010"];
+
 pub async fn post_fact_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     fact: &FactRef<'_>,
@@ -283,6 +290,80 @@ async fn insert_entry(
         .bind("USD")
         .bind(&line.memo)
         .bind(line.sort_order)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| LedgerError::Storage(e.to_string()))?;
+    }
+
+    // Maintain the gl_account_daily rollup in the same tx as the lines.
+    upsert_daily_rollup(tx, draft, account_ids).await?;
+    Ok(())
+}
+
+/// Increment the `gl_account_daily` rollup for one journal entry, in the
+/// same tx as the line writes. Per-account debit/credit deltas, plus —
+/// for entries that move the cash pool — the net pool change split across
+/// the non-pool offset accounts by credit-net share (i128 integer
+/// division, truncating toward zero to match the rebuild's `trunc()`).
+async fn upsert_daily_rollup(
+    tx: &mut Transaction<'_, Postgres>,
+    draft: &JournalEntryDraft,
+    account_ids: &std::collections::HashMap<String, Uuid>,
+) -> Result<(), LedgerError> {
+    use std::collections::HashMap;
+
+    // (debit, credit, cash_flow) delta per account for this entry.
+    let mut deltas: HashMap<Uuid, (i64, i64, i64)> = HashMap::new();
+    for line in &draft.lines {
+        let aid = account_ids[line.account_code.as_ref()];
+        let e = deltas.entry(aid).or_insert((0, 0, 0));
+        e.0 += line.debit_cents;
+        e.1 += line.credit_cents;
+    }
+
+    // Cash attribution: if this entry moves the cash pool, split the net
+    // pool change across the non-pool offsets by credit-net share.
+    let net_cash: i64 = draft
+        .lines
+        .iter()
+        .filter(|l| CASH_POOL.contains(&l.account_code.as_ref()))
+        .map(|l| l.debit_cents - l.credit_cents)
+        .sum();
+    if net_cash != 0 {
+        let mut offsets: HashMap<Uuid, i64> = HashMap::new();
+        for line in draft
+            .lines
+            .iter()
+            .filter(|l| !CASH_POOL.contains(&l.account_code.as_ref()))
+        {
+            let aid = account_ids[line.account_code.as_ref()];
+            *offsets.entry(aid).or_insert(0) += line.credit_cents - line.debit_cents;
+        }
+        let offset_total_cr: i64 = offsets.values().copied().sum();
+        if offset_total_cr != 0 {
+            for (aid, cr_net) in &offsets {
+                let attributed =
+                    (net_cash as i128 * *cr_net as i128 / offset_total_cr as i128) as i64;
+                deltas.entry(*aid).or_insert((0, 0, 0)).2 += attributed;
+            }
+        }
+    }
+
+    for (aid, (debit, credit, cash_flow)) in deltas {
+        sqlx::query(
+            "INSERT INTO gl_account_daily \
+                (account_id, posted_on, debit_cents, credit_cents, cash_flow_cents) \
+             VALUES ($1, $2, $3, $4, $5) \
+             ON CONFLICT (account_id, posted_on) DO UPDATE SET \
+                debit_cents     = gl_account_daily.debit_cents     + EXCLUDED.debit_cents, \
+                credit_cents    = gl_account_daily.credit_cents    + EXCLUDED.credit_cents, \
+                cash_flow_cents = gl_account_daily.cash_flow_cents + EXCLUDED.cash_flow_cents",
+        )
+        .bind(aid)
+        .bind(draft.posted_on)
+        .bind(debit)
+        .bind(credit)
+        .bind(cash_flow)
         .execute(&mut **tx)
         .await
         .map_err(|e| LedgerError::Storage(e.to_string()))?;

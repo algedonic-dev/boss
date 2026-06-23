@@ -226,6 +226,17 @@ pub async fn rebuild_facts_in_tx(
         .await
         .map_err(|e| LedgerError::Storage(e.to_string()))?;
 
+    // The gl_account_daily rollup is NOT reachable by the CASCADE above
+    // (it FKs gl_accounts, not the journal), but the journal it summarizes
+    // was just wiped. Clear it too so the full journal re-post below
+    // (post_fact_in_tx increments it per entry) rebuilds it from a clean
+    // slate — keeping rebuild_facts self-consistent even when run without
+    // a following `rebuild()` (which would also re-aggregate it).
+    sqlx::query("TRUNCATE gl_account_daily")
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| LedgerError::Storage(e.to_string()))?;
+
     let event_rows = sqlx::query(
         "SELECT event_id, timestamp, source, kind, payload \
          FROM audit_log \
