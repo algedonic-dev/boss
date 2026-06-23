@@ -57,10 +57,11 @@ pub struct DispatcherConfig {
     pub ledger_api_url: String,
     pub messages_api_url: String,
     pub http_bind: String,
-    /// Path to the rule registry TOML file. Optional — when
-    /// absent, the dispatcher only runs its legacy role-assignment
-    /// loop, leaving the rules runner inert.
-    pub rules_path: Option<String>,
+    /// Postgres URL — the dispatcher loads its rule registry (the
+    /// append-only versioned `dispatcher_rules` table) from here at
+    /// startup and serves it at `/api/dispatcher/rules`. Replaces the
+    /// legacy `BOSS_DISPATCHER_RULES` rules.toml file path.
+    pub postgres_url: String,
     /// External webhook URL for the `webhook.notify` handler to forward
     /// matched events to. `None` (the normal deployment) makes
     /// `webhook.notify` a no-op; a regen sets it to the brewery-engine's
@@ -99,7 +100,8 @@ impl Default for DispatcherConfig {
             messages_api_url: std::env::var("BOSS_MESSAGES_URL")
                 .unwrap_or_else(|_| boss_ports::url("messages")),
             http_bind: format!("0.0.0.0:{}", boss_ports::prod("dispatcher")),
-            rules_path: std::env::var("BOSS_DISPATCHER_RULES").ok(),
+            postgres_url: std::env::var("BOSS_POSTGRES_URL")
+                .unwrap_or_else(|_| "postgres://boss:boss@127.0.0.1/boss".to_string()),
             webhook_url: std::env::var("BOSS_EVENT_WEBHOOK_URL").ok(),
             assignment_strategy: AssignmentStrategy::parse(
                 &std::env::var("BOSS_DISPATCH_STRATEGY").unwrap_or_default(),

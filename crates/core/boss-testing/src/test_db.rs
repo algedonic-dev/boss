@@ -130,6 +130,10 @@ const SCHEMA_FILES: &[(&str, &str)] = &[
         include_str!("../../../../infra/postgres/schema/40-ledger.sql"),
     ),
     (
+        "41-dispatcher",
+        include_str!("../../../../infra/postgres/schema/41-dispatcher.sql"),
+    ),
+    (
         "99-search",
         include_str!("../../../../infra/postgres/schema/99-search.sql"),
     ),
