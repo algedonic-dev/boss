@@ -118,6 +118,18 @@ pub(super) async fn create_payroll_run(
         Err(e) => return storage_err(e),
     };
 
+    // Carry the per-employee lines in the fact payload so payroll_runs
+    // AND payroll_run_lines are both pure projections of the log
+    // (rebuilt by crate::rebuild_payroll). The aggregate JE rule reads
+    // only the totals, so the GL is unaffected.
+    let lines_json = match serde_json::to_value(&body.lines) {
+        Ok(v) => v,
+        Err(e) => {
+            return ledger_err(crate::error::LedgerError::Storage(format!(
+                "serialize payroll lines: {e}"
+            )));
+        }
+    };
     let payload = serde_json::json!({
         "run_id": run.id,
         "run_date": run.run_date,
@@ -129,6 +141,7 @@ pub(super) async fn create_payroll_run(
         "net_cents": run.net_cents,
         "employee_count": run.employee_count,
         "provider": run.provider,
+        "lines": lines_json,
     });
     let live_fact_id = match crate::events::record_fact_in_tx(
         &mut tx,
@@ -323,6 +336,18 @@ pub(super) async fn synthesize_payroll_run(
         Err(e) => return storage_err(e),
     };
 
+    // Carry the per-employee lines in the fact payload so payroll_runs
+    // AND payroll_run_lines are both pure projections of the log
+    // (rebuilt by crate::rebuild_payroll). The aggregate JE rule reads
+    // only the totals, so the GL is unaffected.
+    let lines_json = match serde_json::to_value(&lines) {
+        Ok(v) => v,
+        Err(e) => {
+            return ledger_err(crate::error::LedgerError::Storage(format!(
+                "serialize payroll lines: {e}"
+            )));
+        }
+    };
     let payload = serde_json::json!({
         "run_id": run.id,
         "run_date": run.run_date,
@@ -334,6 +359,7 @@ pub(super) async fn synthesize_payroll_run(
         "net_cents": run.net_cents,
         "employee_count": run.employee_count,
         "provider": run.provider,
+        "lines": lines_json,
     });
     let live_fact_id = match crate::events::record_fact_in_tx(
         &mut tx,

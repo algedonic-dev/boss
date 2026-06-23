@@ -173,6 +173,15 @@ async fn main() -> Result<()> {
     // out-of-sync with financial_facts.
     step!("ledger-journal", boss_ledger::rebuild(&pool));
 
+    // Ledger payroll: project the finance.payroll.run facts back into
+    // payroll_runs + payroll_run_lines. Both are pure read-models of
+    // the fact (header totals + per-employee lines ride in the
+    // payload), so this keeps them from going stale across an audit_log
+    // trim — the demo epoch reset runs rebuild-all, which now reproduces
+    // payroll exactly from the log instead of leaving prior-cycle rows
+    // that collide with the synthesize idempotency key.
+    step!("ledger-payroll", boss_ledger::rebuild_payroll(&pool));
+
     let total_elapsed_ms = started_at.elapsed().as_millis();
     info!(
         elapsed_ms = total_elapsed_ms,
