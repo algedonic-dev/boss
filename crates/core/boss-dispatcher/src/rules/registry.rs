@@ -12,7 +12,7 @@
 //! dispatch — those live in the next pass.
 
 use super::expr::{self, Expr, HelperResolver, Value};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -21,7 +21,7 @@ use thiserror::Error;
 // ---------------------------------------------------------------------------
 
 /// Top-level TOML document: `[[rule]] ...` blocks.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RawRegistry {
     #[serde(default, rename = "rule")]
     pub rules: Vec<RawRule>,
@@ -29,7 +29,7 @@ pub struct RawRegistry {
 
 /// One rule as written in TOML. Strings get parsed into Expr at
 /// registry-load time so authoring errors surface up front.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RawRule {
     pub name: String,
     pub on_event: String,
@@ -47,11 +47,20 @@ fn default_version() -> u32 {
     1
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RawDoStep {
     pub handler: String,
     #[serde(default)]
     pub args: HashMap<String, String>,
+}
+
+/// Parse the raw TOML rule registry WITHOUT building the runtime Expr
+/// trees — the read-only `/api/dispatcher/rules` surface serves the
+/// rules verbatim (name, on_event, when, do/args) for the cascade
+/// visualization. The runtime dispatch path uses `Registry::from_toml`,
+/// which additionally compiles the predicates.
+pub fn parse_raw(src: &str) -> Result<RawRegistry, RegistryError> {
+    toml::from_str(src).map_err(|e| RegistryError::Toml(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------

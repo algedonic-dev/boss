@@ -71,6 +71,7 @@ const SIDEBAR_PATHS: ReadonlyArray<string> = [
   '/policy',
   '/job-kinds',
   '/it/step-plugins',
+  '/it/dispatcher',
   '/it/kb',
   '/auth-admin',
   '/workflows',

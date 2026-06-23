@@ -68,6 +68,7 @@ export type Route =
   | { kind: 'itStepPlugins' }
   | { kind: 'itStepPluginDetail'; pluginSlug: string }
   | { kind: 'itDesign' }
+  | { kind: 'dispatcherRules' }
   | { kind: 'inbox' }
   | { kind: 'calendar' }
   | { kind: 'myCalendar' }
@@ -186,6 +187,10 @@ export function parseRoute(pathname: string): Route {
   const spM = p.match(/^\/it\/step-plugins\/(.+)$/);
   if (spM) return { kind: 'itStepPluginDetail', pluginSlug: decodeURIComponent(spM[1]!) };
   if (p === '/it/design') return { kind: 'itDesign' };
+  // The dispatcher rule-cascade visualization. `/admin/dispatcher` is the
+  // README-style admin alias (like /admin/job-kinds); `/it/dispatcher` is
+  // the platform-internals nav home (beside step-plugins + monitoring).
+  if (p === '/it/dispatcher' || p === '/admin/dispatcher') return { kind: 'dispatcherRules' };
 
   if (p === '/service') return { kind: 'service' };
   const tm = p.match(/^\/service\/(.+)$/);

@@ -169,6 +169,12 @@ async fn main() -> Result<()> {
             "/api/assets/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::ASSETS)),
         )
+        // Dispatcher rule-registry surface (read-only) — backs the
+        // /admin/dispatcher cascade visualization.
+        .route(
+            "/api/dispatcher/{*rest}",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::DISPATCHER)),
+        )
         // Public read surface for the unauth landing page (`/`) —
         // live fetch from /api/jobs/kinds/{kind}, no session
         // required. Strict path matchers win over `/api/jobs/{*rest}`

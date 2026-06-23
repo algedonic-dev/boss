@@ -66,6 +66,7 @@
     policy:               { id: 'policy',               label: 'Policy',              path: '/policy',         permKey: 'policy' },
     'job-kinds':          { id: 'job-kinds',            label: 'Job kinds',           path: '/job-kinds',      permKey: 'job-kinds' },
     'it-step-plugins':    { id: 'it-step-plugins',      label: 'Step plugins',        path: '/it/step-plugins', permKey: 'it-step-plugins' },
+    'it-dispatcher':      { id: 'it-dispatcher',        label: 'Dispatcher rules',    path: '/it/dispatcher',  permKey: 'it-dispatcher' },
     'it-design':          { id: 'it-design',            label: 'Design review',       path: '/it/design',      permKey: 'it-design' },
     'it-kb':              { id: 'it-kb',                label: 'IT Knowledge Base',   path: '/it/kb',          permKey: 'it-kb' },
     'auth-admin':         { id: 'auth-admin',           label: 'Auth admin',          path: '/auth-admin',     permKey: 'auth-admin' },
@@ -91,6 +92,7 @@
     'finance',    // finance department
     'it-monitoring', // IT department live state — service map, perf, events, atlas
     'it-step-plugins', // IT — custom step UX bundles
+    'it-dispatcher', // IT — dispatcher rule cascade (read-only)
     // 'it-sim' retired 2026-05-03 with boss-sim-api (HumanWorker step 9b).
     'ops',        // operations
     'policy',     // dept heads + COO — author role/scope policy

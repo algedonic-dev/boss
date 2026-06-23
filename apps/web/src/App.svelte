@@ -50,6 +50,7 @@
   import JobKindDetailPage from './job-kinds/JobKindDetailPage.svelte';
   import StepPluginsPage from './it/step-plugins/StepPluginsPage.svelte';
   import StepPluginDetailPage from './it/step-plugins/StepPluginDetailPage.svelte';
+  import DispatcherCascadePage from './dispatcher/DispatcherCascadePage.svelte';
   import DesignReviewPage from './it/design/DesignReviewPage.svelte';
   import InboxPage from './inbox/InboxPage.svelte';
   import CalendarPage from './calendar/CalendarPage.svelte';
@@ -186,6 +187,7 @@
       : route.kind === 'policy' ? 'policy'
       : route.kind === 'jobKinds' || route.kind === 'jobKindNew' || route.kind === 'jobKindDesign' || route.kind === 'jobKindDetail' ? 'jobKinds'
       : route.kind === 'itStepPlugins' || route.kind === 'itStepPluginDetail' ? 'itStepPlugins'
+      : route.kind === 'dispatcherRules' ? 'it-dispatcher'
       : route.kind === 'workflows' ? 'workflows'
       : 'me',
   );
@@ -300,6 +302,8 @@
       <StepPluginDetailPage pluginSlug={route.pluginSlug} />
     {:else if route.kind === 'itDesign'}
       <DesignReviewPage />
+    {:else if route.kind === 'dispatcherRules'}
+      <DispatcherCascadePage />
     {:else if route.kind === 'inbox'}
       <InboxPage />
     {:else if route.kind === 'calendar'}
