@@ -172,7 +172,8 @@ to level 3. Two pieces ship together:
    parses once at first registry call. The
    StepType row is pure schema; any side effect a step fires on
    completion lives in a dispatcher rule keyed `step.done.<kind>`
-   (`infra/dispatcher/rules.toml`), not on the StepType itself.
+   (a row in the `dispatcher_rules` registry, seeded from
+   `infra/dispatcher/rules.toml`), not on the StepType itself.
 
 2. **The Step UX plugin.** A plain JS bundle (IIFE) that calls
    `window.__boss_register_step_plugin(kind, mount)` on load.
@@ -200,7 +201,7 @@ Commercial, Logistics, Admin). The TOML rows are pure schema —
 which kinds need a module-tier service is no longer baked into the
 registry. A kind counts as "company-modeling" when a dispatcher
 rule's `on_event` matches `step.done.<kind>`
-(`infra/dispatcher/rules.toml`); deploy it without that service
+(a row in the `dispatcher_rules` registry); deploy it without that service
 running and the step still completes, but the downstream
 projection is missing. The other kinds (generic transitions,
 coordination gates, acknowledgment-style data templates) fire no
