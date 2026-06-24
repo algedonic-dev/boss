@@ -16,6 +16,7 @@
   import dagre from '@dagrejs/dagre';
   import { buildCascade, type Cascade } from './cascadeToGraph';
   import type { DispatcherRules } from './types';
+  import { href, navigate } from '../router';
 
   let data = $state<DispatcherRules | null>(null);
   let error = $state<string | null>(null);
@@ -141,13 +142,26 @@
         events that re-trigger more rules. Red = a feedback cycle.
       </p>
     </div>
-    {#if data && !error}
-      <div class="dx-stats">
-        <span>{counts.rules} rules</span>
-        <span>{counts.handlers} handlers</span>
-        <span class="dx-stat-cycle">{counts.cycleNodes} in cycles</span>
-      </div>
-    {/if}
+    <div class="dx-head-right">
+      {#if data && !error}
+        <div class="dx-stats">
+          <span>{counts.rules} rules</span>
+          <span>{counts.handlers} handlers</span>
+          <span class="dx-stat-cycle">{counts.cycleNodes} in cycles</span>
+        </div>
+      {/if}
+      <a
+        class="dx-edit-link"
+        href={href('/it/dispatcher/rules')}
+        onclick={(e) => {
+          if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+          e.preventDefault();
+          navigate(href('/it/dispatcher/rules'));
+        }}
+      >
+        Edit rules →
+      </a>
+    </div>
   </header>
 
   <div class="dx-legend">
@@ -267,12 +281,27 @@
     color: #475569;
     font-size: 0.85rem;
   }
+  .dx-head-right {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 6px;
+  }
   .dx-stats {
     display: flex;
     gap: 12px;
     white-space: nowrap;
     font-size: 0.8rem;
     color: #475569;
+  }
+  .dx-edit-link {
+    font-size: 0.8rem;
+    color: #2563eb;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .dx-edit-link:hover {
+    text-decoration: underline;
   }
   .dx-stat-cycle {
     color: #dc2626;

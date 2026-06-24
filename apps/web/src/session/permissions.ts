@@ -28,6 +28,10 @@ export type RouteName =
   // surfaces can land in role-keyed Work lists per the
   // three-axis IA simplifier ("administering is someone's job").
   | 'policy' | 'job-kinds' | 'it-step-plugins' | 'it-dispatcher' | 'it-design'
+  // Dispatcher rule-authoring surfaces — same `it-dispatcher` audience as
+  // the cascade viz they hang off (reached via links from it, not their
+  // own sidebar entries).
+  | 'it-dispatcher-rules' | 'it-dispatcher-rule'
   | 'it-kb' | 'auth-admin'
   | 'workflows';
 
@@ -36,7 +40,8 @@ const ALL: ReadonlyArray<RouteName> = [
   'parts', 'products', 'finance', 'people', 'qa', 'warehouse', 'support', 'ops', 'it-monitoring',
   'shipping', 'vendors', 'marketing-assets', 'calendar',
   'schedule', 'jobs',
-  'policy', 'job-kinds', 'it-step-plugins', 'it-dispatcher', 'it-design', 'it-kb', 'auth-admin',
+  'policy', 'job-kinds', 'it-step-plugins', 'it-dispatcher',
+  'it-dispatcher-rules', 'it-dispatcher-rule', 'it-design', 'it-kb', 'auth-admin',
   'workflows',
 ];
 
@@ -76,7 +81,8 @@ export const ROUTE_ACCESS: Record<Role, ReadonlyArray<RouteName>> = {
   // model what their dept's work looks like (per the
   // "modeling-not-building" frame).
   'it-manager': ['exec', 'it-monitoring', 'it-kb',
-    'it-step-plugins', 'it-dispatcher', 'it-design', 'jobs'],
+    'it-step-plugins', 'it-dispatcher', 'it-dispatcher-rules', 'it-dispatcher-rule',
+    'it-design', 'jobs'],
   auditor: ['finance', 'accounts', 'assets'],
   // Audit-readonly is the system audit account — Read on every
   // resource via the policy gate, so the sidebar surfaces every
@@ -153,9 +159,11 @@ export const ROUTE_ACCESS: Record<Role, ReadonlyArray<RouteName>> = {
   // + COO (the people whose work the JobKind models) per the
   // "engineers are operators like anyone else" framing.
   'it-director': ['exec', 'it-monitoring', 'it-kb',
-    'it-step-plugins', 'it-dispatcher', 'it-design', 'jobs'],
+    'it-step-plugins', 'it-dispatcher', 'it-dispatcher-rules', 'it-dispatcher-rule',
+    'it-design', 'jobs'],
   sysadmin:      ['it-monitoring', 'it-kb',
-    'it-step-plugins', 'it-dispatcher', 'it-design', 'jobs'],
+    'it-step-plugins', 'it-dispatcher', 'it-dispatcher-rules', 'it-dispatcher-rule',
+    'it-design', 'jobs'],
   helpdesk:      ['it-monitoring', 'it-kb', 'jobs'],
 
   // Heads of department.
