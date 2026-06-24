@@ -68,6 +68,7 @@ export type Route =
   | { kind: 'itStepPlugins' }
   | { kind: 'itStepPluginDetail'; pluginSlug: string }
   | { kind: 'itDesign' }
+  | { kind: 'itSubjects' }
   | { kind: 'dispatcherRules' }
   | { kind: 'dispatcherRulesList' }
   | { kind: 'dispatcherRuleEdit'; ruleName: string }
@@ -189,6 +190,7 @@ export function parseRoute(pathname: string): Route {
   const spM = p.match(/^\/it\/step-plugins\/(.+)$/);
   if (spM) return { kind: 'itStepPluginDetail', pluginSlug: decodeURIComponent(spM[1]!) };
   if (p === '/it/design') return { kind: 'itDesign' };
+  if (p === '/it/subjects' || p === '/admin/subjects') return { kind: 'itSubjects' };
   // Dispatcher rule authoring. The list + editor patterns MUST precede the
   // `/it/dispatcher` exact match below, which would otherwise be eclipsed —
   // and the editor's `/rules/{name}` catch-all MUST come after the bare

@@ -67,6 +67,7 @@
     'job-kinds':          { id: 'job-kinds',            label: 'Job kinds',           path: '/job-kinds',      permKey: 'job-kinds' },
     'it-step-plugins':    { id: 'it-step-plugins',      label: 'Step plugins',        path: '/it/step-plugins', permKey: 'it-step-plugins' },
     'it-dispatcher':      { id: 'it-dispatcher',        label: 'Dispatcher rules',    path: '/it/dispatcher',  permKey: 'it-dispatcher' },
+    'it-subjects':        { id: 'it-subjects',          label: 'Subjects & Classes',  path: '/it/subjects',    permKey: 'it-subjects' },
     // The rule-authoring list + editor are reached via a link FROM the
     // cascade viz (the it-dispatcher Surface entry), not their own sidebar
     // rows — so these catalog entries exist to satisfy the
@@ -100,6 +101,7 @@
     'it-monitoring', // IT department live state — service map, perf, events, atlas
     'it-step-plugins', // IT — custom step UX bundles
     'it-dispatcher', // IT — dispatcher rule cascade (read-only)
+    'it-subjects', // IT — SubjectKind taxonomy + Class registry (read-only)
     // 'it-sim' retired 2026-05-03 with boss-sim-api (HumanWorker step 9b).
     'ops',        // operations
     'policy',     // dept heads + COO — author role/scope policy

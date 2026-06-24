@@ -53,6 +53,7 @@
   import DispatcherCascadePage from './dispatcher/DispatcherCascadePage.svelte';
   import DispatcherRulesPage from './dispatcher/DispatcherRulesPage.svelte';
   import DispatcherRuleEditPage from './dispatcher/DispatcherRuleEditPage.svelte';
+  import SubjectsClassesPage from './it/subjects/SubjectsClassesPage.svelte';
   import DesignReviewPage from './it/design/DesignReviewPage.svelte';
   import InboxPage from './inbox/InboxPage.svelte';
   import CalendarPage from './calendar/CalendarPage.svelte';
@@ -190,6 +191,7 @@
       : route.kind === 'jobKinds' || route.kind === 'jobKindNew' || route.kind === 'jobKindDesign' || route.kind === 'jobKindDetail' ? 'jobKinds'
       : route.kind === 'itStepPlugins' || route.kind === 'itStepPluginDetail' ? 'itStepPlugins'
       : route.kind === 'dispatcherRules' || route.kind === 'dispatcherRulesList' || route.kind === 'dispatcherRuleEdit' ? 'it-dispatcher'
+      : route.kind === 'itSubjects' ? 'it-subjects'
       : route.kind === 'workflows' ? 'workflows'
       : 'me',
   );
@@ -310,6 +312,8 @@
       <DispatcherRulesPage />
     {:else if route.kind === 'dispatcherRuleEdit'}
       <DispatcherRuleEditPage ruleName={route.ruleName} />
+    {:else if route.kind === 'itSubjects'}
+      <SubjectsClassesPage />
     {:else if route.kind === 'inbox'}
       <InboxPage />
     {:else if route.kind === 'calendar'}
