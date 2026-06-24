@@ -74,7 +74,7 @@
     }
   }
 
-  const isTerminal = $derived(step.terminal !== null);
+  const isTerminal = $derived(step.terminal != null);
 </script>
 
 <aside class="jk-inspector">

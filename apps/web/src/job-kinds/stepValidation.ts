@@ -94,7 +94,7 @@ export function lintSteps(steps: ReadonlyArray<StepSpec>): ReadonlyArray<StepWar
   }
 
   // --- At least one terminal ---
-  const terminals = steps.filter((s) => s.terminal !== null);
+  const terminals = steps.filter((s) => s.terminal != null);
   if (steps.length > 0 && terminals.length === 0) {
     warnings.push({
       stepIndex: null,
