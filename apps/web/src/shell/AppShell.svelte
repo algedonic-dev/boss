@@ -67,6 +67,7 @@
     'job-kinds':          { id: 'job-kinds',            label: 'Job kinds',           path: '/job-kinds',      permKey: 'job-kinds' },
     'it-step-plugins':    { id: 'it-step-plugins',      label: 'Step plugins',        path: '/it/step-plugins', permKey: 'it-step-plugins' },
     'it-dispatcher':      { id: 'it-dispatcher',        label: 'Dispatcher rules',    path: '/it/dispatcher',  permKey: 'it-dispatcher' },
+    'it-system':          { id: 'it-system',            label: 'System Model',        path: '/it',             permKey: 'it-system' },
     'it-subjects':        { id: 'it-subjects',          label: 'Subjects & Classes',  path: '/it/subjects',    permKey: 'it-subjects' },
     // The rule-authoring list + editor are reached via a link FROM the
     // cascade viz (the it-dispatcher Surface entry), not their own sidebar
@@ -98,6 +99,7 @@
     'shipping',   // shipping department
     'support',    // support department
     'finance',    // finance department
+    'it-system', // IT — System Model hub (the IT landing, leads the cluster)
     'it-monitoring', // IT department live state — service map, perf, events, atlas
     'it-step-plugins', // IT — custom step UX bundles
     'it-dispatcher', // IT — dispatcher rule cascade (read-only)

@@ -31,6 +31,8 @@ export type RouteName =
   // The model-vocabulary surface — SubjectKind taxonomy + Class registry
   // (read-only). Same `it-*` audience as the dispatcher cascade it sits beside.
   | 'it-subjects'
+  // The IT landing — a live-stats hub linking the model-reading surfaces.
+  | 'it-system'
   // Dispatcher rule-authoring surfaces — same `it-dispatcher` audience as
   // the cascade viz they hang off (reached via links from it, not their
   // own sidebar entries).
@@ -44,7 +46,7 @@ const ALL: ReadonlyArray<RouteName> = [
   'shipping', 'vendors', 'marketing-assets', 'calendar',
   'schedule', 'jobs',
   'policy', 'job-kinds', 'it-step-plugins', 'it-dispatcher',
-  'it-dispatcher-rules', 'it-dispatcher-rule', 'it-design', 'it-subjects', 'it-kb', 'auth-admin',
+  'it-dispatcher-rules', 'it-dispatcher-rule', 'it-design', 'it-subjects', 'it-system', 'it-kb', 'auth-admin',
   'workflows',
 ];
 
@@ -84,7 +86,7 @@ export const ROUTE_ACCESS: Record<Role, ReadonlyArray<RouteName>> = {
   // model what their dept's work looks like (per the
   // "modeling-not-building" frame).
   'it-manager': ['exec', 'it-monitoring', 'it-kb',
-    'it-step-plugins', 'it-dispatcher', 'it-dispatcher-rules', 'it-dispatcher-rule', 'it-subjects',
+    'it-step-plugins', 'it-dispatcher', 'it-dispatcher-rules', 'it-dispatcher-rule', 'it-subjects', 'it-system',
     'it-design', 'jobs'],
   auditor: ['finance', 'accounts', 'assets'],
   // Audit-readonly is the system audit account — Read on every
@@ -162,10 +164,10 @@ export const ROUTE_ACCESS: Record<Role, ReadonlyArray<RouteName>> = {
   // + COO (the people whose work the JobKind models) per the
   // "engineers are operators like anyone else" framing.
   'it-director': ['exec', 'it-monitoring', 'it-kb',
-    'it-step-plugins', 'it-dispatcher', 'it-dispatcher-rules', 'it-dispatcher-rule', 'it-subjects',
+    'it-step-plugins', 'it-dispatcher', 'it-dispatcher-rules', 'it-dispatcher-rule', 'it-subjects', 'it-system',
     'it-design', 'jobs'],
   sysadmin:      ['it-monitoring', 'it-kb',
-    'it-step-plugins', 'it-dispatcher', 'it-dispatcher-rules', 'it-dispatcher-rule', 'it-subjects',
+    'it-step-plugins', 'it-dispatcher', 'it-dispatcher-rules', 'it-dispatcher-rule', 'it-subjects', 'it-system',
     'it-design', 'jobs'],
   helpdesk:      ['it-monitoring', 'it-kb', 'jobs'],
 
