@@ -69,6 +69,8 @@ export type Route =
   | { kind: 'itStepPluginDetail'; pluginSlug: string }
   | { kind: 'itDesign' }
   | { kind: 'dispatcherRules' }
+  | { kind: 'dispatcherRulesList' }
+  | { kind: 'dispatcherRuleEdit'; ruleName: string }
   | { kind: 'inbox' }
   | { kind: 'calendar' }
   | { kind: 'myCalendar' }
@@ -187,6 +189,14 @@ export function parseRoute(pathname: string): Route {
   const spM = p.match(/^\/it\/step-plugins\/(.+)$/);
   if (spM) return { kind: 'itStepPluginDetail', pluginSlug: decodeURIComponent(spM[1]!) };
   if (p === '/it/design') return { kind: 'itDesign' };
+  // Dispatcher rule authoring. The list + editor patterns MUST precede the
+  // `/it/dispatcher` exact match below, which would otherwise be eclipsed —
+  // and the editor's `/rules/{name}` catch-all MUST come after the bare
+  // `/rules` list so the list doesn't get parsed as a rule named "".
+  if (p === '/it/dispatcher/rules' || p === '/admin/dispatcher/rules')
+    return { kind: 'dispatcherRulesList' };
+  const drM = p.match(/^\/(?:admin|it)\/dispatcher\/rules\/(.+)$/);
+  if (drM) return { kind: 'dispatcherRuleEdit', ruleName: decodeURIComponent(drM[1]!) };
   // The dispatcher rule-cascade visualization. `/admin/dispatcher` is the
   // README-style admin alias (like /admin/job-kinds); `/it/dispatcher` is
   // the platform-internals nav home (beside step-plugins + monitoring).

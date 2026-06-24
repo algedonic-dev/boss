@@ -67,6 +67,13 @@
     'job-kinds':          { id: 'job-kinds',            label: 'Job kinds',           path: '/job-kinds',      permKey: 'job-kinds' },
     'it-step-plugins':    { id: 'it-step-plugins',      label: 'Step plugins',        path: '/it/step-plugins', permKey: 'it-step-plugins' },
     'it-dispatcher':      { id: 'it-dispatcher',        label: 'Dispatcher rules',    path: '/it/dispatcher',  permKey: 'it-dispatcher' },
+    // The rule-authoring list + editor are reached via a link FROM the
+    // cascade viz (the it-dispatcher Surface entry), not their own sidebar
+    // rows — so these catalog entries exist to satisfy the
+    // Record<RouteName,…> type but are intentionally absent from
+    // SURFACE_ORDER (no sidebar item ⇒ no sidebar-consistency entry).
+    'it-dispatcher-rules': { id: 'it-dispatcher-rules', label: 'Dispatcher rules — authoring', path: '/it/dispatcher/rules', permKey: 'it-dispatcher-rules' },
+    'it-dispatcher-rule':  { id: 'it-dispatcher-rule',  label: 'Dispatcher rule — editor',    path: '/it/dispatcher/rules', permKey: 'it-dispatcher-rule' },
     'it-design':          { id: 'it-design',            label: 'Design review',       path: '/it/design',      permKey: 'it-design' },
     'it-kb':              { id: 'it-kb',                label: 'IT Knowledge Base',   path: '/it/kb',          permKey: 'it-kb' },
     'auth-admin':         { id: 'auth-admin',           label: 'Auth admin',          path: '/auth-admin',     permKey: 'auth-admin' },
