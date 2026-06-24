@@ -152,6 +152,44 @@ export function buildCascade(data: DispatcherRules): Cascade {
   };
 }
 
+/** Narrow a cascade to the forward-reachable subgraph from one or more
+ *  trigger events (by event `ref` — the on_event topic). Follows edges in
+ *  direction (trigger → rule → handler → emit → event → match/system → …),
+ *  so you see exactly what firing those events cascades into. Cycle flags
+ *  are preserved from the full graph. An empty selection returns the
+ *  cascade unchanged (the full view). */
+export function filterCascadeFromEvents(
+  cascade: Cascade,
+  eventRefs: ReadonlyArray<string>,
+): Cascade {
+  if (eventRefs.length === 0) return cascade;
+  const refs = new Set(eventRefs);
+  const starts = cascade.nodes
+    .filter((n) => n.kind === 'event' && refs.has(n.ref))
+    .map((n) => n.id);
+  const adj = new Map<string, string[]>();
+  for (const e of cascade.edges) {
+    const out = adj.get(e.source);
+    if (out) out.push(e.target);
+    else adj.set(e.source, [e.target]);
+  }
+  const reachable = new Set<string>(starts);
+  const queue = [...starts];
+  while (queue.length > 0) {
+    const v = queue.shift()!;
+    for (const w of adj.get(v) ?? []) {
+      if (!reachable.has(w)) {
+        reachable.add(w);
+        queue.push(w);
+      }
+    }
+  }
+  return {
+    nodes: cascade.nodes.filter((n) => reachable.has(n.id)),
+    edges: cascade.edges.filter((e) => reachable.has(e.source) && reachable.has(e.target)),
+  };
+}
+
 /** Tarjan SCC. Returns the nodes that sit in a non-trivial strongly-connected
  *  component (or a self-loop) — i.e. are part of a feedback cycle — plus each
  *  node's component id so edge highlighting can stay intra-component. */

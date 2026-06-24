@@ -14,7 +14,7 @@
   import type { Node, Edge } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
   import dagre from '@dagrejs/dagre';
-  import { buildCascade, type Cascade } from './cascadeToGraph';
+  import { buildCascade, filterCascadeFromEvents, type Cascade } from './cascadeToGraph';
   import type { DispatcherRules } from './types';
   import { href, navigate } from '../router';
 
@@ -23,6 +23,9 @@
   let loading = $state(true);
   /** selected node id (`evt:` / `rule:` / `hdl:`), for the detail panel. */
   let selected = $state<string | null>(null);
+  /** Selected trigger events (on_event topics) to narrow the diagram to
+   *  their forward cascade. Empty = the full view. */
+  let selectedTriggers = $state<string[]>([]);
 
   const NODE_W = 240;
   const NODE_H = 54;
@@ -46,9 +49,26 @@
     })();
   });
 
-  const cascade = $derived<Cascade>(
+  const fullCascade = $derived<Cascade>(
     data && !data.error ? buildCascade(data) : { nodes: [], edges: [] },
   );
+  // Narrow to the selected triggers' forward cascade; empty = the full view.
+  const cascade = $derived<Cascade>(filterCascadeFromEvents(fullCascade, selectedTriggers));
+
+  /** Distinct trigger events (topics rules listen for), sorted — the filter
+   *  selector's options. */
+  const allTriggers = $derived([...new Set((data?.rules ?? []).map((r) => r.on_event))].sort());
+  const availableTriggers = $derived(allTriggers.filter((t) => !selectedTriggers.includes(t)));
+
+  function addTrigger(e: Event): void {
+    const sel = e.currentTarget as HTMLSelectElement;
+    const t = sel.value;
+    if (t && !selectedTriggers.includes(t)) selectedTriggers = [...selectedTriggers, t];
+    sel.value = '';
+  }
+  function removeTrigger(t: string): void {
+    selectedTriggers = selectedTriggers.filter((x) => x !== t);
+  }
 
   const EDGE_STYLE: Record<string, string> = {
     trigger: 'stroke:#64748b;stroke-width:1.5',
@@ -128,7 +148,7 @@
   const counts = $derived({
     rules: data?.rules.length ?? 0,
     handlers: Object.keys(data?.handler_emits ?? {}).length,
-    cycleNodes: cascade.nodes.filter((n) => n.inCycle).length,
+    cycleNodes: fullCascade.nodes.filter((n) => n.inCycle).length,
   });
 </script>
 
@@ -173,6 +193,33 @@
     <span class="dx-edgekey"><i style="background:#dc2626"></i>feedback cycle</span>
   </div>
 
+  {#if data && !error && allTriggers.length}
+    <div class="dx-filter">
+      <label class="dx-filter-label">
+        Trigger
+        <select class="dx-filter-select" onchange={addTrigger}>
+          <option value="">filter cascade by trigger event…</option>
+          {#each availableTriggers as t (t)}
+            <option value={t}>{t}</option>
+          {/each}
+        </select>
+      </label>
+      {#each selectedTriggers as t (t)}
+        <span class="dx-chip">
+          {t}
+          <button type="button" class="dx-chip-x" title="remove" onclick={() => removeTrigger(t)}>×</button>
+        </span>
+      {/each}
+      {#if selectedTriggers.length}
+        <button type="button" class="dx-clear" onclick={() => (selectedTriggers = [])}>show all</button>
+        <span class="dx-filter-note">
+          cascade from {selectedTriggers.length} trigger{selectedTriggers.length === 1 ? '' : 's'} ·
+          {cascade.nodes.length}/{fullCascade.nodes.length} nodes
+        </span>
+      {/if}
+    </div>
+  {/if}
+
   <div class="dx-body">
     <div class="dx-flow">
       {#if loading}
@@ -182,19 +229,23 @@
       {:else if cascade.nodes.length === 0}
         <div class="dx-msg">No dispatcher rules are loaded.</div>
       {:else}
-        <SvelteFlow
-          bind:nodes
-          bind:edges
-          fitView
-          nodesDraggable
-          elementsSelectable
-          onnodeclick={({ node }) => (selected = node.id)}
-          onpaneclick={() => (selected = null)}
-        >
-          <Background />
-          <Controls showLock={false} />
-          <MiniMap pannable zoomable />
-        </SvelteFlow>
+        <!-- key on the filter so a selection re-mounts the flow and
+             fitView re-frames the narrowed subgraph. -->
+        {#key selectedTriggers.join('|')}
+          <SvelteFlow
+            bind:nodes
+            bind:edges
+            fitView
+            nodesDraggable
+            elementsSelectable
+            onnodeclick={({ node }) => (selected = node.id)}
+            onpaneclick={() => (selected = null)}
+          >
+            <Background />
+            <Controls showLock={false} />
+            <MiniMap pannable zoomable />
+          </SvelteFlow>
+        {/key}
       {/if}
     </div>
 
@@ -315,6 +366,66 @@
     margin: 10px 0;
     font-size: 0.75rem;
     color: #475569;
+  }
+  .dx-filter {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 10px;
+    font-size: 0.78rem;
+    color: #475569;
+  }
+  .dx-filter-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .dx-filter-select {
+    font-size: 0.78rem;
+    padding: 3px 6px;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    max-width: 340px;
+  }
+  .dx-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    border-radius: 999px;
+    padding: 2px 4px 2px 10px;
+    color: #1e3a8a;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.72rem;
+  }
+  .dx-chip-x {
+    border: none;
+    background: none;
+    cursor: pointer;
+    color: #1e3a8a;
+    font-size: 0.95rem;
+    line-height: 1;
+    padding: 0 3px;
+  }
+  .dx-chip-x:hover {
+    color: #dc2626;
+  }
+  .dx-clear {
+    border: 1px solid #cbd5e1;
+    background: #fff;
+    border-radius: 6px;
+    padding: 2px 8px;
+    cursor: pointer;
+    font-size: 0.74rem;
+    color: #475569;
+  }
+  .dx-clear:hover {
+    background: #f1f5f9;
+  }
+  .dx-filter-note {
+    color: #94a3b8;
   }
   .dx-key {
     padding: 2px 8px;

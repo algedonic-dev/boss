@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { buildCascade, topicMatch } from './cascadeToGraph';
+import { buildCascade, filterCascadeFromEvents, topicMatch } from './cascadeToGraph';
 import type { DispatcherRules } from './types';
 
 describe('topicMatch', () => {
@@ -66,5 +66,37 @@ describe('buildCascade', () => {
     // emit_cpu emits the concrete metric.cpu, which the metric.* trigger
     // covers — a `match` edge must bridge them.
     expect(g.edges.some((e) => e.kind === 'match' && e.source === 'evt:metric.cpu' && e.target === 'evt:metric.*')).toBe(true);
+  });
+});
+
+describe('filterCascadeFromEvents', () => {
+  // a → r1 → h1 → (emit) b → r2 → h2(sink)
+  const data: DispatcherRules = {
+    rules: [
+      { name: 'r1', on_event: 'a', when: null, do: [{ handler: 'h1', args: {} }], version: 1 },
+      { name: 'r2', on_event: 'b', when: null, do: [{ handler: 'h2', args: {} }], version: 1 },
+    ],
+    handler_emits: { h1: ['b'], h2: [] },
+    system_edges: [],
+  };
+
+  test('empty selection returns the full cascade unchanged', () => {
+    const full = buildCascade(data);
+    expect(filterCascadeFromEvents(full, [])).toBe(full);
+  });
+
+  test('forward cascade from a trigger keeps its whole downstream chain', () => {
+    const f = filterCascadeFromEvents(buildCascade(data), ['a']);
+    const ids = new Set(f.nodes.map((n) => n.id));
+    expect(ids).toEqual(new Set(['evt:a', 'rule:r1', 'hdl:h1', 'evt:b', 'rule:r2', 'hdl:h2']));
+    expect(f.edges.every((e) => ids.has(e.source) && ids.has(e.target))).toBe(true);
+  });
+
+  test('a downstream trigger excludes upstream-only nodes', () => {
+    const f = filterCascadeFromEvents(buildCascade(data), ['b']);
+    const ids = new Set(f.nodes.map((n) => n.id));
+    expect(ids).toEqual(new Set(['evt:b', 'rule:r2', 'hdl:h2']));
+    expect(ids.has('evt:a')).toBe(false);
+    expect(ids.has('rule:r1')).toBe(false);
   });
 });
