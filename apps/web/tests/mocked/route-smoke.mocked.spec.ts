@@ -22,6 +22,7 @@ import { installAuthoringMocks, JOB_ID } from './_mockApi';
 const ROUTES: ReadonlyArray<string> = [
   '/', '/me', '/inbox', '/jobs', '/accounts', '/vendors', '/people', '/parts',
   '/products', '/shipping', '/assets', '/catalog',
+  '/marketing-assets', '/marketing-assets/ma-1',
   '/support', '/service', '/refurb', '/qa', '/hr', '/sales',
   '/shop', '/manual', '/workflows',
   // The IT "read the running model" surfaces — the set the stale
@@ -43,10 +44,12 @@ const ROUTES: ReadonlyArray<string> = [
 //
 // DEFERRED, group 2 — REAL failures this harness surfaced, to be fixed
 // (not hidden behind a fixture), then folded back into ROUTES:
-//   /marketing-assets + /marketing-assets/ma-1 → consistent no-shell (the
-//     SPA never paints — likely the reported marketing-assets crash).
 //   /calendar/me → pageerror on render.
 //   /calendar → effect_update_depth_exceeded (an infinite $effect loop).
+// (The marketing-assets no-shell this harness first caught was a real
+// effect_update_depth_exceeded loop in loadClasses() called from a tracked
+// $effect — fixed in session/classes.svelte.ts, so both routes are back in
+// ROUTES above and gated.)
 
 type Issue = { route: string; kind: string; text: string };
 
