@@ -22,7 +22,7 @@ import { installAuthoringMocks, JOB_ID } from './_mockApi';
 const ROUTES: ReadonlyArray<string> = [
   '/', '/me', '/inbox', '/jobs', '/accounts', '/vendors', '/people', '/parts',
   '/products', '/shipping', '/assets', '/catalog',
-  '/marketing-assets', '/marketing-assets/ma-1',
+  '/marketing-assets', '/marketing-assets/ma-1', '/calendar', '/calendar/me',
   '/support', '/service', '/refurb', '/qa', '/hr', '/sales',
   '/shop', '/manual', '/workflows',
   // The IT "read the running model" surfaces — the set the stale
@@ -42,14 +42,12 @@ const ROUTES: ReadonlyArray<string> = [
 //   /finance (statements .reduce) · /warehouse (summary.below_reorder_count)
 //   /exec (.find/.length) · /watchlist (.length) · /it/monitoring (snapshot .length)
 //
-// DEFERRED, group 2 — REAL failures this harness surfaced, to be fixed
-// (not hidden behind a fixture), then folded back into ROUTES:
-//   /calendar/me → pageerror on render.
-//   /calendar → effect_update_depth_exceeded (an infinite $effect loop).
-// (The marketing-assets no-shell this harness first caught was a real
-// effect_update_depth_exceeded loop in loadClasses() called from a tracked
-// $effect — fixed in session/classes.svelte.ts, so both routes are back in
-// ROUTES above and gated.)
+// Resolved: the marketing-assets no-shell this harness first caught was a
+// real effect_update_depth_exceeded loop in loadClasses() called from a
+// tracked $effect — fixed in session/classes.svelte.ts. The /calendar +
+// /calendar/me failures seen alongside it were that loop bleeding across a
+// shared page (pre-fix); both render cleanly in isolation and are gated
+// above. All four routes are now in ROUTES.
 
 type Issue = { route: string; kind: string; text: string };
 
