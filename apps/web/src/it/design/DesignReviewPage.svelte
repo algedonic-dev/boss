@@ -97,7 +97,7 @@
       },
       title: `Review: ${doc.title}`,
       owner_id: 'system',
-      priority: 'normal',
+      priority: 'standard',
       status: 'open',
       metadata: {
         doc_path: doc.path,
