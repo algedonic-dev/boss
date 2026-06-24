@@ -29,7 +29,7 @@ pub struct RawRegistry {
 
 /// One rule as written in TOML. Strings get parsed into Expr at
 /// registry-load time so authoring errors surface up front.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawRule {
     pub name: String,
     pub on_event: String,
@@ -47,7 +47,7 @@ fn default_version() -> u32 {
     1
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawDoStep {
     pub handler: String,
     #[serde(default)]

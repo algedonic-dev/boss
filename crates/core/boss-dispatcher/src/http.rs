@@ -1,5 +1,9 @@
-//! Minimal HTTP surface: a health + readiness probe pair. No write surface;
-//! the dispatcher's only outputs are PUTs to jobs-api.
+//! HTTP surface: health + readiness probes, the read-only cascade-viz
+//! `rules` feed, and the rule-authoring write endpoints (create-draft /
+//! validate / publish / retire) that back the SPA authoring UI. The
+//! authoring writes go through `crate::rules::authoring`; the running
+//! RulesRunner picks up a published change on its next restart (live
+//! hot-reload is a planned follow-up).
 //!
 //! `/api/dispatcher/health` answers 200 while the PROCESS is up — necessary
 //! but NOT sufficient: the consumer loops run detached and can die while the
@@ -10,13 +14,16 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::routing::get;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use crate::cascade;
 use crate::liveness::DispatcherLiveness;
-use crate::rules::registry::load_active_rules;
+use crate::rules::authoring::{self, AuthoringError};
+use crate::rules::registry::{RawRule, load_active_rules};
 
 /// HTTP state: the consumer-liveness handle + the Postgres pool, so the
 /// read-only `/api/dispatcher/rules` surface can serve the rule registry
@@ -31,7 +38,19 @@ pub fn router(state: HttpState) -> Router {
     Router::new()
         .route("/api/dispatcher/health", get(health))
         .route("/api/dispatcher/readyz", get(readyz))
-        .route("/api/dispatcher/rules", get(rules))
+        // GET serves the cascade-viz feed; POST creates a new rule draft.
+        .route("/api/dispatcher/rules", get(rules).post(create_rule_draft))
+        .route("/api/dispatcher/rules/_validate", post(validate_rule))
+        .route(
+            "/api/dispatcher/rules/{name}/versions",
+            get(list_rule_versions),
+        )
+        .route(
+            "/api/dispatcher/rules/{name}/versions/{version}",
+            get(get_rule_version),
+        )
+        .route("/api/dispatcher/rules/{name}/publish", post(publish_rule))
+        .route("/api/dispatcher/rules/{name}/retire", post(retire_rule))
         .with_state(state)
 }
 
@@ -78,4 +97,75 @@ async fn rules(State(state): State<HttpState>) -> Json<serde_json::Value> {
         serde_json::to_value(cascade::system_edges()).unwrap_or_default(),
     );
     Json(serde_json::Value::Object(out))
+}
+
+// ---------------------------------------------------------------------------
+// Rule authoring (control-plane writes) — see crate::rules::authoring.
+// ---------------------------------------------------------------------------
+
+fn authoring_err(e: AuthoringError) -> Response {
+    let code = match &e {
+        AuthoringError::NotFound(_) => StatusCode::NOT_FOUND,
+        AuthoringError::Invalid(_) => StatusCode::BAD_REQUEST,
+        AuthoringError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (code, e.to_string()).into_response()
+}
+
+/// `POST /api/dispatcher/rules` — append a new draft version of a rule.
+/// Body is the rule spec (name, on_event, when?, do[], delay?). The draft is
+/// validated (must load via `Rule::from_raw`) before it persists; `201` on
+/// success returns the stored draft.
+async fn create_rule_draft(State(state): State<HttpState>, Json(raw): Json<RawRule>) -> Response {
+    match authoring::create_draft(&state.pool, &raw).await {
+        Ok(v) => (StatusCode::CREATED, Json(v)).into_response(),
+        Err(e) => authoring_err(e),
+    }
+}
+
+/// `POST /api/dispatcher/rules/_validate` — dry-run a draft without
+/// persisting. Returns `{ ok, error }` so the authoring UI can surface
+/// topic/predicate/arg parse errors live, before publish.
+async fn validate_rule(Json(raw): Json<RawRule>) -> Json<serde_json::Value> {
+    match authoring::validate(&raw) {
+        Ok(()) => Json(serde_json::json!({ "ok": true, "error": null })),
+        Err(e) => Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+    }
+}
+
+/// `GET /api/dispatcher/rules/{name}/versions` — all versions, oldest first
+/// (draft + active + retired).
+async fn list_rule_versions(State(state): State<HttpState>, Path(name): Path<String>) -> Response {
+    match authoring::list_versions(&state.pool, &name).await {
+        Ok(vs) => Json(vs).into_response(),
+        Err(e) => authoring_err(e),
+    }
+}
+
+/// `GET /api/dispatcher/rules/{name}/versions/{version}` — one version.
+async fn get_rule_version(
+    State(state): State<HttpState>,
+    Path((name, version)): Path<(String, i32)>,
+) -> Response {
+    match authoring::get_version(&state.pool, &name, version).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => authoring_err(e),
+    }
+}
+
+/// `POST /api/dispatcher/rules/{name}/publish` — activate the latest draft,
+/// retiring the prior active version.
+async fn publish_rule(State(state): State<HttpState>, Path(name): Path<String>) -> Response {
+    match authoring::publish(&state.pool, &name).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => authoring_err(e),
+    }
+}
+
+/// `POST /api/dispatcher/rules/{name}/retire` — retire the active version.
+async fn retire_rule(State(state): State<HttpState>, Path(name): Path<String>) -> Response {
+    match authoring::retire(&state.pool, &name).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => authoring_err(e),
+    }
 }
