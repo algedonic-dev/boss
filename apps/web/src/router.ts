@@ -132,6 +132,10 @@ export function parseRoute(pathname: string): Route {
   // ===== User Experiences perspective — /ux/* (canonical); bare / is the public alias for the UX home.
   // Unprefixed legacy paths still resolve here (defensive). =====
   const p = raw === '/' || raw === '/ux' ? '/' : raw.startsWith('/ux/') ? raw.slice('/ux'.length) : raw;
+  // User Experiences lands on My Day by default — the actor's personal
+  // work view, not a marketing landing. (The landing page stays the
+  // catch-all fallback for unknown paths, at the bottom of this fn.)
+  if (p === '/') return { kind: 'me' };
   if (p === '/me') return { kind: 'me' };
   if (p === '/inbox') return { kind: 'inbox' };
   if (p === '/accounts') return { kind: 'accounts' };

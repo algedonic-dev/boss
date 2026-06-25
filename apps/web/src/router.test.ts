@@ -27,10 +27,10 @@ describe('parseRoute — every specific path matches its specific case', () => {
   // that the discriminator `kind` is right + any positional param
   // is captured.
   const cases: Array<[string, Record<string, unknown>]> = [
-    // Landing — bare / is the public alias for the UX home; /ux is its
-    // canonical perspective root and resolves to the same home view.
-    ['/', { kind: 'home' }],
-    ['/ux', { kind: 'home' }],
+    // User Experiences home — bare / and the canonical /ux both land on
+    // My Day (the actor's personal work view) by default.
+    ['/', { kind: 'me' }],
+    ['/ux', { kind: 'me' }],
     // Browse / domain dashboards — User Experiences perspective (/ux/*).
     ['/ux/jobs', { kind: 'jobs' }],
     ['/ux/jobs/abc-123', { kind: 'jobDetail', jobId: 'abc-123' }],
