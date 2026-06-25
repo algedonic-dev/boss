@@ -1,0 +1,59 @@
+# CodeQL — static application security testing (SAST).
+#
+# Scorecard's SAST check only credits a recognized SAST engine (CodeQL,
+# Sonar, Snyk, …); clippy/svelte-check don't count, which is why the
+# check scored 0 despite our lint gates. This workflow runs CodeQL over
+# both halves of the tree:
+#   - javascript-typescript — apps/web (Svelte 5 SPA)
+#   - rust                  — the crates/ workspace
+#
+# Both languages use build-mode: none — CodeQL builds its database from
+# source without compiling, so this stays fast and never has to
+# reproduce the workspace build. Actions are pinned to a SHA (matching
+# scorecard.yml) so this doesn't reopen a Pinned-Dependencies alert.
+
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "23 5 * * 1"  # Mondays 05:23 UTC
+
+permissions: read-all
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # upload CodeQL SARIF to the Security tab
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: javascript-typescript
+            build-mode: none
+          - language: rust
+            build-mode: none
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
+        with:
+          category: "/language:${{ matrix.language }}"
