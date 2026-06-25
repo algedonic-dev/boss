@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use chrono::NaiveDate;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TenantConfigError {
@@ -25,7 +25,7 @@ pub enum TenantConfigError {
 
 /// Top-level tenant config. Section ordering mirrors the TOML's
 /// authored layout so the file is the doc.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TenantConfig {
     pub meta: TenantMeta,
     /// Per-JobKind creation rates. Key is the JobKind slug
@@ -76,7 +76,7 @@ pub struct TenantConfig {
 
 /// TOML side of `PeriodicSpec`. See
 /// `crates/boss-sim/src/engines/periodic.rs`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PeriodicToml {
     pub cadence: crate::engines::Cadence,
     pub anchor_date: NaiveDate,
@@ -85,7 +85,7 @@ pub struct PeriodicToml {
     pub action: PeriodicActionToml,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PeriodicActionToml {
     OpenJob {
@@ -105,7 +105,7 @@ pub enum PeriodicActionToml {
 /// TOML side of `CounterpartySpec`. Carries the same fields plus
 /// `name` is implicit (the section key). Keeps the engine spec types
 /// independent of the TOML loader.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CounterpartyToml {
     pub listens_to: String,
     pub delay: DelayToml,
@@ -131,7 +131,7 @@ pub struct CounterpartyToml {
     pub match_payload: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ScanToml {
     pub status: String,
     pub delay: DelayToml,
@@ -143,7 +143,7 @@ fn default_one() -> f64 {
 
 /// A followup hop. Same as `CounterpartyToml` but with an explicit
 /// `name` since followups live inside an array, not a map.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NamedCounterpartyToml {
     pub name: String,
     pub listens_to: String,
@@ -167,7 +167,7 @@ pub struct NamedCounterpartyToml {
     pub match_payload: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DelayToml {
     pub mean_days: f64,
     #[serde(default)]
@@ -206,7 +206,7 @@ fn scan_toml_to_spec(s: &ScanToml) -> crate::engines::ScanSpec {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TenantMeta {
     pub tenant_id: String,
     pub display_name: String,
@@ -259,6 +259,13 @@ pub struct TenantMeta {
     /// a weekday means closed that day.
     #[serde(default)]
     pub operating_hours: HashMap<String, String>,
+    /// Workforce execution speed — a multiplier on every step's typical
+    /// duration. `<1` makes the workforce complete assigned steps faster
+    /// (shorter durations), `>1` slower. `None`/absent = 1.0 (registry
+    /// durations as-authored). A control-plane knob (the "Workforce
+    /// execution" category); applied in `build_workforce`.
+    #[serde(default)]
+    pub step_speed_multiplier: Option<f64>,
     /// Sim-clock granularity — how much sim-time each tick advances.
     /// Accepted forms: `"1d"` (default; legacy day-tick behavior),
     /// `"1h"` (24 ticks/day), `"30m"` (48 ticks/day), `"15m"`
@@ -442,7 +449,7 @@ pub fn parse_tick_duration(s: &str) -> Result<u32, String> {
 /// Per-JobKind rate spec. The base `rate` is jobs/day; ramps
 /// override that rate from a given date onward; weekday/weekend
 /// multipliers tilt the curve.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JobRate {
     /// Steady-state Jobs/day at the latest ramp point (or, if no
     /// ramps, throughout the sim).
@@ -528,7 +535,7 @@ pub struct JobRate {
 /// `ActiveShock` onto `ShapeDrivenState.active_shocks` with an end
 /// date `duration_weeks * 7` days out, and applies the multiplier
 /// to the matching rate until the window closes.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ShockSpec {
     /// Authoring name; surfaces in logs + per-shock counters.
     pub name: String,
@@ -567,7 +574,7 @@ pub struct ShockSpec {
 ///   Models "supplier is slow this quarter", "carrier is slammed",
 ///   "ACH settling is degraded". Mutually exclusive with `kind`.
 ///   `rate_multiplier > 1.0` = longer delays, `< 1.0` = faster.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ShockTarget {
     /// JobKind slug to apply against. Mutually exclusive with
     /// `counterparty`; exactly one must be set.
@@ -631,7 +638,7 @@ impl ShockTarget {
 /// orders Mon, Crown Pub orders Thu, etc. The Poisson sampler
 /// above gives ad-hoc orders; this gives the deterministic
 /// regulars.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SubjectCadence {
     /// Subject id this cadence applies to. Matched against the
     /// SubjectKind declared in the JobKind's `subject_kinds[0]`
@@ -714,7 +721,7 @@ impl SubjectCadence {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RampPoint {
     pub date: NaiveDate,
     pub rate: f64,
@@ -727,7 +734,7 @@ pub struct RampPoint {
 /// replay. Without it the pool grows silently — fine for tenants
 /// who don't replay, but dangling-FK integrity scans will flag
 /// any downstream events that reference the silent ids.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SubjectRate {
     pub rate: f64,
     /// Optional ramps, same shape as `JobRate.ramp`.
@@ -745,7 +752,7 @@ pub struct SubjectRate {
 /// anomaly *names* defined by the StepType or JobKind authors;
 /// values are probabilities in `[0, 1]`. The sim enumerates the
 /// keys it understands and rolls each per Step transition.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct AnomalyRates {
     pub probs: HashMap<String, f64>,
@@ -830,7 +837,7 @@ impl TenantConfig {
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<(), TenantConfigError> {
+    pub fn validate(&self) -> Result<(), TenantConfigError> {
         if self.meta.tenant_id.is_empty() {
             return Err(TenantConfigError::Validation(
                 "meta.tenant_id must not be empty".into(),
@@ -1175,6 +1182,7 @@ mod tests {
             operating_days: vec![],
             operating_hours: hours,
             tick_duration: "1d".into(),
+            step_speed_multiplier: None,
         };
         let mon = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
         let wed = NaiveDate::from_ymd_opt(2026, 1, 7).unwrap();
@@ -1215,6 +1223,7 @@ mod tests {
             operating_days: vec![],
             operating_hours: HashMap::new(),
             tick_duration: "1h".into(),
+            step_speed_multiplier: None,
         };
         let any_day = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
         for h in 0..24 {
@@ -1236,6 +1245,7 @@ mod tests {
             operating_days: vec![],
             operating_hours: hours,
             tick_duration: "30m".into(),
+            step_speed_multiplier: None,
         };
         let mon = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
         // 30-min tick at 07:30 covers [7.5, 8.0). Window starts
@@ -1286,6 +1296,7 @@ mod tests {
                 "fri".into(),
             ],
             tick_duration: "1d".into(),
+            step_speed_multiplier: None,
             operating_hours: std::collections::HashMap::new(),
         };
         // Monday 2026-01-05
@@ -1304,6 +1315,7 @@ mod tests {
             end_date: NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
             operating_days: vec![],
             tick_duration: "1d".into(),
+            step_speed_multiplier: None,
             operating_hours: std::collections::HashMap::new(),
         };
         assert!(meta.is_operating_day(NaiveDate::from_ymd_opt(2026, 1, 3).unwrap()));

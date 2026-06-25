@@ -381,7 +381,14 @@ async fn main() -> Result<()> {
     let engine = Arc::new(Mutex::new(
         tokio::task::spawn_blocking({
             let seeds = seeds_path.clone();
-            move || BreweryEngineState::load(&seeds, calendars)
+            // Boot from the control-plane config override if an operator
+            // has set one (else the seed tenant.toml) — the "edit +
+            // restart" config model — feeding in the calendars fetched
+            // above so every engine shares one source of truth.
+            move || -> anyhow::Result<BreweryEngineState> {
+                let tenant = sim_control::effective_tenant(&seeds)?;
+                BreweryEngineState::load_with_tenant(&seeds, tenant, calendars)
+            }
         })
         .await
         .context("spawn_blocking engine load")??,
@@ -491,11 +498,12 @@ async fn main() -> Result<()> {
         api_base.clone(),
     )));
     {
-        let control_bind = std::env::var("BOSS_SIM_CONTROL_BIND")
-            .unwrap_or_else(|_| "127.0.0.1:7011".to_string());
+        let control_bind =
+            std::env::var("BOSS_SIM_CONTROL_BIND").unwrap_or_else(|_| "127.0.0.1:7011".to_string());
         let telemetry = telemetry.clone();
+        let seeds = seeds_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = sim_control::serve(control_bind, telemetry).await {
+            if let Err(e) = sim_control::serve(control_bind, telemetry, seeds).await {
                 warn!(error = %e, "sim control + telemetry server exited");
             }
         });
@@ -679,7 +687,10 @@ async fn main() -> Result<()> {
             // writes) + cadence. Cheap post-tick snapshot copy.
             global_tick += 1;
             {
-                let wf = workforce.lock().map(|w| w.stats.clone()).unwrap_or_default();
+                let wf = workforce
+                    .lock()
+                    .map(|w| w.stats.clone())
+                    .unwrap_or_default();
                 let api = output.lock().map(|o| o.stats.clone()).unwrap_or_default();
                 if let Ok(mut t) = telemetry.lock() {
                     t.record_tick(global_tick, cadence_of(&clock, Some(day)), &wf, &api);
@@ -809,7 +820,9 @@ fn cadence_of(clock: &Clock, day: Option<NaiveDate>) -> sim_control::Cadence {
         epoch_start: clock
             .epoch_start_date
             .map(|x| x.format("%Y-%m-%d").to_string()),
-        epoch_end: clock.epoch_end_date.map(|x| x.format("%Y-%m-%d").to_string()),
+        epoch_end: clock
+            .epoch_end_date
+            .map(|x| x.format("%Y-%m-%d").to_string()),
         warp_factor: clock.warp_factor,
         days_per_tick: Some(clock.days_per_tick),
         tick_interval_seconds: Some(clock.tick_interval_seconds),

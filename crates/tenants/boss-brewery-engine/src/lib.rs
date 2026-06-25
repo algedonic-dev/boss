@@ -210,9 +210,22 @@ impl BreweryEngineState {
         calendars: Vec<boss_core::calendar::BusinessCalendar>,
     ) -> Result<Self> {
         let tenant_path = seeds.join("tenant.toml");
-        let kinds_path = seeds.join("job_kinds.toml");
         let tenant = TenantConfig::load(&tenant_path)
             .with_context(|| format!("loading tenant config from {}", tenant_path.display()))?;
+        Self::load_with_tenant(seeds, tenant, calendars)
+    }
+
+    /// Same as [`load`], but with a caller-supplied [`TenantConfig`]
+    /// instead of the seed `tenant.toml` — used by the control plane to
+    /// boot the daemon from an operator-edited config override. Job
+    /// kinds + subjects still come from the seed bundle; `calendars` are
+    /// threaded through exactly as in [`load`].
+    pub fn load_with_tenant(
+        seeds: &Path,
+        tenant: TenantConfig,
+        calendars: Vec<boss_core::calendar::BusinessCalendar>,
+    ) -> Result<Self> {
+        let kinds_path = seeds.join("job_kinds.toml");
         let kinds = load_job_kinds_with_owning_team(&kinds_path, &tenant.meta.tenant_id)
             .with_context(|| format!("loading job kinds from {}", kinds_path.display()))?;
         let registry = StepRegistry::v1();
@@ -564,11 +577,22 @@ pub fn build_workforce(
 ) -> boss_sim::workforce::Workforce {
     use boss_sim::workforce::{RequiredField, Workforce};
     // kind → typical duration hours (drives duration-gated completion).
+    // Scaled by the tenant's workforce speed multiplier (control-plane
+    // knob): <1 = faster completion, >1 = slower. Absent/<=0 → 1.0.
+    let speed = engine
+        .tenant
+        .meta
+        .step_speed_multiplier
+        .filter(|m| *m > 0.0)
+        .unwrap_or(1.0);
     let step_durations: std::collections::HashMap<String, f64> = engine
         .registry
         .all()
         .into_iter()
-        .filter_map(|t| t.typical_duration_hours.map(|h| (t.kind.to_string(), h)))
+        .filter_map(|t| {
+            t.typical_duration_hours
+                .map(|h| (t.kind.to_string(), h * speed))
+        })
         .collect();
     // kind → required-at-done fields, so the worker supplies any the
     // JobKind didn't default — the executor filling the step's form.

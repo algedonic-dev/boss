@@ -104,3 +104,42 @@ export type SimTelemetry = Readonly<{
   api_writes: ApiWrites;
   recent: ReadonlyArray<TickActivity>;
 }>;
+
+// --- Simulator behavior config (GET/POST /simulator/api/config). The
+// editable subset of the daemon's effective config; every other field
+// is preserved verbatim through the round-trip via the `[k: string]:
+// unknown` passthrough on each level. The POST body must be a
+// structurally-complete config (all fields from the GET, with edits
+// applied) so the daemon's validation passes. NOT Readonly — the
+// Controls editor binds inputs directly to the nested objects. ---
+
+export type SimBehaviorConfig = {
+  meta: { step_speed_multiplier?: number | null; [k: string]: unknown };
+  job_rates: Record<
+    string,
+    {
+      rate: number;
+      weekday_multiplier?: number | null;
+      weekend_multiplier?: number | null;
+      [k: string]: unknown;
+    }
+  >;
+  subject_rates: Record<string, { rate: number; [k: string]: unknown }>;
+  counterparty: Record<
+    string,
+    {
+      emit_probability: number;
+      delay: { mean_days: number; spread_days?: number; [k: string]: unknown };
+      [k: string]: unknown;
+    }
+  >;
+  // AnomalyRates is #[serde(transparent)] on the daemon — each entry is
+  // the flat prob-name → probability map directly (NOT wrapped in
+  // `probs`). Round-trips transparently.
+  anomalies: Record<string, Record<string, number>>;
+  periodic: Record<
+    string,
+    { cadence: string; anchor_date: string; [k: string]: unknown }
+  >;
+  [k: string]: unknown;
+};

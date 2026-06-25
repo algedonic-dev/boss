@@ -26,8 +26,12 @@ Environment=BOSS_SIM_CALLBACK_BIND=127.0.0.1:7099
 ExecStartPre=/bin/sh -c '[ "${BOSS_DEMO_MODE:-0}" = "1" ] || { echo "BOSS_DEMO_MODE not set; sim will not start." >&2; exit 0; }'
 ExecStartPre=/bin/sh -c '[ "${BOSS_DEMO_MODE:-0}" = "1" ] || exit 1'
 ExecStart=/usr/local/bin/boss-brewery-sim
+# on-failure also restarts on the daemon's deliberate exit(75) after a
+# config Apply (POST /simulator/api/config) — that's how the "edit +
+# restart" behavior-config model lands the new config. RestartSec kept
+# low for a snappy apply.
 Restart=on-failure
-RestartSec=10
+RestartSec=3
 StandardOutput=journal
 StandardError=journal
 

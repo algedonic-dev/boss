@@ -132,6 +132,33 @@ async fn get_telemetry(State(s): State<Arc<AppState>>) -> Response {
     forward_get(&s, format!("{}/telemetry", s.sim_control_url)).await
 }
 
+/// GET /simulator/api/config — the daemon's effective behavior config
+/// (the Controls editor loads this). Open read.
+async fn get_config(State(s): State<Arc<AppState>>) -> Response {
+    forward_get(&s, format!("{}/config", s.sim_control_url)).await
+}
+
+/// POST /simulator/api/config — operator-gated. Persists an operator-
+/// edited behavior config to the daemon, which validates it, writes the
+/// override, and restarts to apply it (the "edit + restart" model).
+async fn post_config(
+    State(s): State<Arc<AppState>>,
+    user: CurrentUser,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(r) = operator_guard(&user) {
+        return r;
+    }
+    forward_post(
+        &s,
+        format!("{}/config", s.sim_control_url),
+        &headers,
+        Some(body),
+    )
+    .await
+}
+
 async fn control_pause(
     State(s): State<Arc<AppState>>,
     user: CurrentUser,
@@ -239,6 +266,7 @@ async fn main() -> Result<()> {
     let api = Router::new()
         .route("/api/health", get(health))
         .route("/api/telemetry", get(get_telemetry))
+        .route("/api/config", get(get_config).post(post_config))
         .route("/api/control/pause", post(control_pause))
         .route("/api/control/resume", post(control_resume))
         .route("/api/control/restart-epoch", post(control_restart_epoch))

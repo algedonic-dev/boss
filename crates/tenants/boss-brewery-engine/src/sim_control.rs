@@ -8,14 +8,61 @@
 //! (NOT gateway-proxied). Inert unless the daemon runs (demo mode).
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::get,
+};
 use serde::Serialize;
 
 use boss_sim::output::live::LiveApiStats;
+use boss_sim::shape_driven::TenantConfig;
 use boss_sim::workforce::WorkforceStats;
+
+/// Path of the control-plane config override the daemon writes + reads.
+/// Lives in the daemon's own state dir (NOT the seed bundle), so the
+/// authored seed `tenant.toml` stays pristine. JSON for clean typed
+/// round-trips with the Controls UI.
+pub fn override_path() -> PathBuf {
+    let dir =
+        std::env::var("BOSS_SIM_STATE_DIR").unwrap_or_else(|_| "/var/lib/boss-sim".to_string());
+    Path::new(&dir).join("tenant-override.json")
+}
+
+fn load_override(path: &Path) -> anyhow::Result<TenantConfig> {
+    let text = std::fs::read_to_string(path)?;
+    let cfg: TenantConfig = serde_json::from_str(&text)?;
+    cfg.validate().map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(cfg)
+}
+
+/// Resolve the effective tenant config: the control-plane override if it
+/// exists + parses + validates, else the seed `tenant.toml`. A bad
+/// override falls back to the seed (logged) so a corrupt override can't
+/// brick the daemon. Used at daemon startup AND by `GET /config`.
+pub fn effective_tenant(seeds: &Path) -> anyhow::Result<TenantConfig> {
+    let op = override_path();
+    if op.exists() {
+        match load_override(&op) {
+            Ok(cfg) => {
+                tracing::info!(path = %op.display(), "loaded tenant config override");
+                return Ok(cfg);
+            }
+            Err(e) => tracing::warn!(
+                path = %op.display(), error = %e,
+                "config override invalid — using seed tenant.toml"
+            ),
+        }
+    }
+    let seed = seeds.join("tenant.toml");
+    TenantConfig::load(&seed).map_err(|e| anyhow::anyhow!("loading seed tenant.toml: {e}"))
+}
 
 /// How many recent per-tick activity rows to retain in the ring buffer.
 const RECENT_TICKS: usize = 60;
@@ -141,11 +188,68 @@ pub type SharedTelemetry = Arc<Mutex<SimTelemetry>>;
 #[derive(Clone)]
 struct ControlState {
     telemetry: SharedTelemetry,
+    seeds: PathBuf,
 }
 
 async fn get_telemetry(State(st): State<ControlState>) -> Json<SimTelemetry> {
     let snapshot = st.telemetry.lock().map(|t| t.clone()).unwrap_or_default();
     Json(snapshot)
+}
+
+/// GET /config — the effective tenant config (override if set, else the
+/// seed) as typed JSON. The Controls UI edits this and POSTs it back.
+async fn get_config(State(st): State<ControlState>) -> Response {
+    match effective_tenant(&st.seeds) {
+        Ok(cfg) => Json(cfg).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("config load failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /config — validate an operator-edited config, persist it as the
+/// override, then exit non-zero so systemd (Restart=on-failure) restarts
+/// the daemon with it (the "edit + restart" model). boss-simulator
+/// operator-gates this; the daemon control server is localhost-only.
+async fn post_config(State(_st): State<ControlState>, Json(cfg): Json<TenantConfig>) -> Response {
+    if let Err(e) = cfg.validate() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("invalid config: {e}"),
+        )
+            .into_response();
+    }
+    let path = override_path();
+    let json = match serde_json::to_string_pretty(&cfg) {
+        Ok(j) => j,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("serialize: {e}")).into_response();
+        }
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&path, json) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write override: {e}"),
+        )
+            .into_response();
+    }
+    tracing::warn!(path = %path.display(), "config override written; exiting to restart with new config");
+    // Respond first, then exit non-zero so systemd restarts us with the
+    // new config. The brief delay lets the HTTP response flush.
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        std::process::exit(75);
+    });
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "status": "applied", "restarting": true })),
+    )
+        .into_response()
 }
 
 async fn health() -> &'static str {
@@ -155,10 +259,11 @@ async fn health() -> &'static str {
 /// Run the control + telemetry server. Binds `bind` (e.g.
 /// `127.0.0.1:7011`); localhost-only. Spawned by the daemon as a
 /// background task — returns only on listener error.
-pub async fn serve(bind: String, telemetry: SharedTelemetry) -> anyhow::Result<()> {
-    let state = ControlState { telemetry };
+pub async fn serve(bind: String, telemetry: SharedTelemetry, seeds: PathBuf) -> anyhow::Result<()> {
+    let state = ControlState { telemetry, seeds };
     let app = Router::new()
         .route("/telemetry", get(get_telemetry))
+        .route("/config", get(get_config).post(post_config))
         .route("/health", get(health))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
