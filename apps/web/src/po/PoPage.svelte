@@ -55,7 +55,7 @@
   </div>
 {:else if !po}
   <div class="catalog theme-exec">
-    <Breadcrumb to={href('/warehouse')}>
+    <Breadcrumb to={href('/ux/warehouse')}>
       ← Warehouse
     </Breadcrumb>
     <div class="exec-header"><h1 class="exec-title">Purchase order not found</h1></div>
@@ -74,7 +74,7 @@
   {@const billedCents = bills.reduce((s, vi) => s + vi.amount_cents, 0)}
 
   <div class="detail-page theme-exec">
-    <Breadcrumb to={href('/warehouse')}>
+    <Breadcrumb to={href('/ux/warehouse')}>
       ← Warehouse
     </Breadcrumb>
 

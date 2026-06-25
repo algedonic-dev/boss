@@ -28,8 +28,8 @@
 
   const TABS: ReadonlyArray<{ id: Perspective; label: string; href: string }> = [
     { id: 'simulator', label: 'Simulator', href: '/simulator' },
-    { id: 'model', label: 'System Model', href: '/it' },
-    { id: 'user', label: 'User Experiences', href: '/' },
+    { id: 'model', label: 'System Model', href: '/system' },
+    { id: 'user', label: 'User Experiences', href: '/ux' },
   ];
 </script>
 

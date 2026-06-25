@@ -56,7 +56,7 @@
 </script>
 
 <div class="detail-page theme-exec">
-  <Breadcrumb to={href('/warehouse')}>
+  <Breadcrumb to={href('/ux/warehouse')}>
     ← Warehouse
   </Breadcrumb>
 

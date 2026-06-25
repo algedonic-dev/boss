@@ -3,7 +3,7 @@
   //
   // In the three-axis IA, Workflows is the *what* —
   // every active JobKind in the registry, browseable like a
-  // catalog. Editing JobKinds happens at /admin/job-kinds (the
+  // catalog. Editing JobKinds happens at /system/job-kinds (the
   // Surface for the platform-eng role). This page is the
   // read-only KB view non-admin operators land on when they
   // want to understand "what kinds of work does this brewery
@@ -131,7 +131,7 @@
             {#each rows as k (k.kind)}
               <li class="kb-workflow-row">
                 <div class="kb-workflow-header">
-                  <Link to={href(`/admin/job-kinds/${encodeURIComponent(k.kind)}`)}>
+                  <Link to={href(`/system/job-kinds/${encodeURIComponent(k.kind)}`)}>
                     <span class="kb-workflow-kind mono">{k.kind}</span>
                   </Link>
                   <span class="kb-workflow-label">{k.label}</span>

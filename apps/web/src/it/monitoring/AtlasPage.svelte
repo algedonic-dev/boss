@@ -62,7 +62,7 @@
 
 <div class="atlas">
   <PageHeader
-    eyebrow="IT · System atlas"
+    eyebrow="System Model · System atlas"
     title="Operating model flows"
     subtitle="Every JobKind this tenant publishes, grouped by category. Data-driven from /api/jobs/kinds."
   />
@@ -75,7 +75,7 @@
     {:else if state.specs.length === 0}
       <p class="empty">
         This tenant has no published JobKinds. Author one at
-        <a href={href('/job-kinds')}>/admin/job-kinds</a>
+        <a href={href('/system/job-kinds')}>/system/job-kinds</a>
         to populate the atlas.
       </p>
     {:else if layoutResult}
@@ -97,8 +97,8 @@
             {#each row.nodes as n (n.kind)}
               {@const c = atlasColorFor(n.category)}
               <a
-                href={href(`/workflows`)}
-                onclick={(e) => go(e, `/workflows`)}
+                href={href(`/system/workflows`)}
+                onclick={(e) => go(e, `/system/workflows`)}
                 class="node-link"
               >
                 <g class="node-v2" transform={`translate(${n.x}, ${n.y})`}>
@@ -137,7 +137,7 @@
         registered in <code>job_kinds</code>. Rows group by
         <code>category</code>; the count below each label is the
         number of Steps in the JobKind's graph. Click any node to
-        jump to the <a href={href('/workflows')}>Workflows</a> KB
+        jump to the <a href={href('/system/workflows')}>Workflows</a> KB
         for full step-graph + metadata.
       </p>
       <p class="atlas-note">

@@ -82,7 +82,7 @@
 
   <section class="shop-grid">
     {#each BREWERY_PRODUCTS as p (p.sku)}
-      {@const to = href(`/shop/${encodeURIComponent(p.sku)}`)}
+      {@const to = href(`/ux/shop/${encodeURIComponent(p.sku)}`)}
       {@const avail = availability(p.sku)}
       {@const isLimited = p.available_until !== null}
       <article class="shop-card brewery-card">

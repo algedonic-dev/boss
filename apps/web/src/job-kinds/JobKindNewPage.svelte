@@ -1,5 +1,5 @@
 <script lang="ts">
-  // /admin/job-kinds/new — name a new kind, then open the authoring
+  // /system/job-kinds/new — name a new kind, then open the authoring
   // workspace. Under D6 a JobKind is authored *through* a
   // `job-kind-design` Job: this page collects the identity + headline
   // fields, creates the design Job (the slug becomes its immutable
@@ -132,7 +132,7 @@
       const jobId = await startDesignJob(seed, ownerId, appToday(), {
         title: forkSource ? `Fork ${forkSource} → ${kindSlug}` : `Design ${kindSlug}`,
       });
-      navigate(href(`/admin/job-kinds/authoring/${encodeURIComponent(jobId)}`));
+      navigate(href(`/system/job-kinds/authoring/${encodeURIComponent(jobId)}`));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       starting = false;
@@ -141,7 +141,7 @@
 </script>
 
 <div class="catalog theme-exec">
-  <Breadcrumb to={href('/job-kinds')}>← All job kinds</Breadcrumb>
+  <Breadcrumb to={href('/system/job-kinds')}>← All job kinds</Breadcrumb>
   <PageHeader
     eyebrow="Platform · Job kind"
     title={forkSource ? `New job kind (forked from ${forkSource})` : 'New job kind'}

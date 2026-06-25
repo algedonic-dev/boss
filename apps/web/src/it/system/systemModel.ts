@@ -1,4 +1,4 @@
-// System Model hub (/it) — the IT landing surface. A live-stats launchpad
+// System Model hub (/system) — the model-definition landing surface. A live-stats launchpad
 // into the surfaces that describe the running state machine: Subjects,
 // Jobs, Steps, Events, and the registries layered over them. Read-only;
 // the cards link out to the existing surfaces.
@@ -27,16 +27,16 @@ export type SurfaceCard = Readonly<{
  *  (Dispatcher) → the vocabulary (Subjects & Classes) → step UX → the
  *  event log, then the supporting read surfaces. */
 export const SURFACE_CARDS: ReadonlyArray<SurfaceCard> = [
-  { id: 'workflows', title: 'Workflows', blurb: 'JobKinds — the programs the machine runs.', path: '/workflows', stat: 'jobKinds' },
-  { id: 'jobs', title: 'Live jobs', blurb: 'Work in flight across every kind right now.', path: '/jobs', stat: 'openJobs' },
-  { id: 'dispatcher', title: 'Dispatcher', blurb: 'Reactive rules + the step-side-effect cascade.', path: '/it/dispatcher', stat: 'rules' },
-  { id: 'subjects', title: 'Subjects & Classes', blurb: "The model's vocabulary — kinds + reference data.", path: '/it/subjects', stat: 'subjectsClasses' },
-  { id: 'step-plugins', title: 'Step plugins', blurb: 'Custom step-UX bundles served to the SPA.', path: '/it/step-plugins', stat: 'stepPlugins' },
-  { id: 'audit', title: 'Audit Log', blurb: 'The immutable event log — system of record.', path: '/it/monitoring/events', stat: 'lastEvent' },
-  { id: 'monitoring', title: 'Monitoring', blurb: 'Service health, latency, live operational counts.', path: '/it/monitoring', stat: null },
-  { id: 'atlas', title: 'Atlas', blurb: 'A map of every published JobKind, by category.', path: '/it/monitoring/atlas', stat: null },
-  { id: 'kb', title: 'IT Knowledge Base', blurb: 'ADRs, architecture diagrams, platform reference.', path: '/it/kb', stat: null },
-  { id: 'design', title: 'Design review', blurb: 'Open design questions across docs/design.', path: '/it/design', stat: null },
+  { id: 'workflows', title: 'Workflows', blurb: 'JobKinds — the programs the machine runs.', path: '/system/workflows', stat: 'jobKinds' },
+  { id: 'jobs', title: 'Live jobs', blurb: 'Work in flight across every kind right now.', path: '/ux/jobs', stat: 'openJobs' },
+  { id: 'dispatcher', title: 'Dispatcher', blurb: 'Reactive rules + the step-side-effect cascade.', path: '/system/dispatcher', stat: 'rules' },
+  { id: 'subjects', title: 'Subjects & Classes', blurb: "The model's vocabulary — kinds + reference data.", path: '/system/subjects', stat: 'subjectsClasses' },
+  { id: 'step-plugins', title: 'Step plugins', blurb: 'Custom step-UX bundles served to the SPA.', path: '/system/step-plugins', stat: 'stepPlugins' },
+  { id: 'audit', title: 'Audit Log', blurb: 'The immutable event log — system of record.', path: '/system/monitoring/events', stat: 'lastEvent' },
+  { id: 'monitoring', title: 'Monitoring', blurb: 'Service health, latency, live operational counts.', path: '/system/monitoring', stat: null },
+  { id: 'atlas', title: 'Atlas', blurb: 'A map of every published JobKind, by category.', path: '/system/monitoring/atlas', stat: null },
+  { id: 'kb', title: 'Knowledge Base', blurb: 'ADRs, architecture diagrams, platform reference.', path: '/system/kb', stat: null },
+  { id: 'design', title: 'Design review', blurb: 'Open design questions across docs/design.', path: '/system/design', stat: null },
 ];
 
 /** Compact count formatting for the stat badges:

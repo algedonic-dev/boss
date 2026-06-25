@@ -125,7 +125,7 @@
 
 <div class="sysmodel theme-exec">
   <PageHeader
-    eyebrow="Platform · IT"
+    eyebrow="Platform · System Model"
     title="System Model"
     subtitle="The running state machine — Subjects, Jobs, Steps, Events, and the registries layered over them."
     motif="barrel"

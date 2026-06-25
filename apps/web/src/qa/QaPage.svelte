@@ -181,7 +181,7 @@
             Quality work rides on the JobKinds this tenant flags for
             QA — gravity, pH, IBU, ABV, sensory passes and equipment
             walkdowns, all tracked as Steps on those Jobs.
-            <Link to={href('/jobs?status=open')}>
+            <Link to={href('/ux/jobs?status=open')}>
               View open jobs →
             </Link>
           </p>
@@ -209,7 +209,7 @@
             Quarterly + annual walkdowns on fermenters, brite tanks,
             heat exchanger, canning line, glycol chiller — tracked as
             QA-surfaced Jobs alongside batch quality control.
-            <Link to={href('/jobs?status=open')}>
+            <Link to={href('/ux/jobs?status=open')}>
               View open jobs →
             </Link>
           </p>
@@ -224,7 +224,7 @@
         pH, IBU, ABV, and a sensory pass before the cellar handoff.
         <strong>{openQaJobs}</strong> QA jobs are currently in flight
         across the brewhouse.
-        <Link to={href('/jobs?status=open')}>
+        <Link to={href('/ux/jobs?status=open')}>
           Open all jobs →
         </Link>
       </p>
@@ -353,7 +353,7 @@
         Quarterly fermenter walkdowns, annual mash-tun rebuild,
         glycol chiller service, canning-line preventive — all
         tracked as QA-surfaced Jobs alongside batch quality control.
-        <Link to={href('/jobs?status=open')}>
+        <Link to={href('/ux/jobs?status=open')}>
           Open all jobs →
         </Link>
       </p>

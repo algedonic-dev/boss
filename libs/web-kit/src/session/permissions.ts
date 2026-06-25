@@ -21,32 +21,32 @@ export type Role = string;
 export type RouteName =
   | 'shop' | 'exec' | 'catalog' | 'accounts' | 'assets' | 'sales' | 'service'
   | 'refurb' | 'parts' | 'products' | 'finance' | 'people' | 'qa' | 'warehouse' | 'support' | 'ops'
-  | 'it-monitoring' | 'inbox' | 'shipping'
+  | 'system-monitoring' | 'inbox' | 'shipping'
   | 'vendors' | 'marketing-assets' | 'calendar' | 'schedule' | 'jobs'
   // Platform-administration surfaces. Same `permKey: 'it'` gate
   // as the legacy ADMIN footer; these route names exist so the
   // surfaces can land in role-keyed Work lists per the
   // three-axis IA simplifier ("administering is someone's job").
-  | 'policy' | 'job-kinds' | 'it-step-plugins' | 'it-dispatcher' | 'it-design'
+  | 'policy' | 'job-kinds' | 'system-step-plugins' | 'system-dispatcher' | 'system-design'
   // The model-vocabulary surface — SubjectKind taxonomy + Class registry
   // (read-only). Same `it-*` audience as the dispatcher cascade it sits beside.
-  | 'it-subjects'
+  | 'system-subjects'
   // The IT landing — a live-stats hub linking the model-reading surfaces.
-  | 'it-system'
+  | 'system-model'
   // Dispatcher rule-authoring surfaces — same `it-dispatcher` audience as
   // the cascade viz they hang off (reached via links from it, not their
   // own sidebar entries).
-  | 'it-dispatcher-rules' | 'it-dispatcher-rule'
-  | 'it-kb' | 'auth-admin'
+  | 'system-dispatcher-rules' | 'system-dispatcher-rule'
+  | 'system-kb' | 'auth-admin'
   | 'workflows';
 
 const ALL: ReadonlyArray<RouteName> = [
   'shop', 'exec', 'catalog', 'accounts', 'assets', 'sales', 'service', 'refurb',
-  'parts', 'products', 'finance', 'people', 'qa', 'warehouse', 'support', 'ops', 'it-monitoring',
+  'parts', 'products', 'finance', 'people', 'qa', 'warehouse', 'support', 'ops', 'system-monitoring',
   'shipping', 'vendors', 'marketing-assets', 'calendar',
   'schedule', 'jobs',
-  'policy', 'job-kinds', 'it-step-plugins', 'it-dispatcher',
-  'it-dispatcher-rules', 'it-dispatcher-rule', 'it-design', 'it-subjects', 'it-system', 'it-kb', 'auth-admin',
+  'policy', 'job-kinds', 'system-step-plugins', 'system-dispatcher',
+  'system-dispatcher-rules', 'system-dispatcher-rule', 'system-design', 'system-subjects', 'system-model', 'system-kb', 'auth-admin',
   'workflows',
 ];
 
@@ -85,9 +85,9 @@ export const ROUTE_ACCESS: Record<Role, ReadonlyArray<RouteName>> = {
   // policy or job-kinds — those belong to dept heads + COO who
   // model what their dept's work looks like (per the
   // "modeling-not-building" frame).
-  'it-manager': ['exec', 'it-monitoring', 'it-kb',
-    'it-step-plugins', 'it-dispatcher', 'it-dispatcher-rules', 'it-dispatcher-rule', 'it-subjects', 'it-system',
-    'it-design', 'jobs'],
+  'it-manager': ['exec', 'system-monitoring', 'system-kb',
+    'system-step-plugins', 'system-dispatcher', 'system-dispatcher-rules', 'system-dispatcher-rule', 'system-subjects', 'system-model',
+    'system-design', 'jobs'],
   auditor: ['finance', 'accounts', 'assets'],
   // Audit-readonly is the system audit account — Read on every
   // resource via the policy gate, so the sidebar surfaces every
@@ -163,13 +163,13 @@ export const ROUTE_ACCESS: Record<Role, ReadonlyArray<RouteName>> = {
   // policy or JobKinds — that authority belongs to dept heads
   // + COO (the people whose work the JobKind models) per the
   // "engineers are operators like anyone else" framing.
-  'it-director': ['exec', 'it-monitoring', 'it-kb',
-    'it-step-plugins', 'it-dispatcher', 'it-dispatcher-rules', 'it-dispatcher-rule', 'it-subjects', 'it-system',
-    'it-design', 'jobs'],
-  sysadmin:      ['it-monitoring', 'it-kb',
-    'it-step-plugins', 'it-dispatcher', 'it-dispatcher-rules', 'it-dispatcher-rule', 'it-subjects', 'it-system',
-    'it-design', 'jobs'],
-  helpdesk:      ['it-monitoring', 'it-kb', 'jobs'],
+  'it-director': ['exec', 'system-monitoring', 'system-kb',
+    'system-step-plugins', 'system-dispatcher', 'system-dispatcher-rules', 'system-dispatcher-rule', 'system-subjects', 'system-model',
+    'system-design', 'jobs'],
+  sysadmin:      ['system-monitoring', 'system-kb',
+    'system-step-plugins', 'system-dispatcher', 'system-dispatcher-rules', 'system-dispatcher-rule', 'system-subjects', 'system-model',
+    'system-design', 'jobs'],
+  helpdesk:      ['system-monitoring', 'system-kb', 'jobs'],
 
   // Heads of department.
   //

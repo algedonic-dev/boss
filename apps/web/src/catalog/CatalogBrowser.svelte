@@ -121,7 +121,7 @@
         <p class="empty">{getLabel('catalog.empty_state', 'No devices match those filters.')}</p>
       {:else}
         {#each visible as d (d.sku)}
-          <Link className="catalog-card" to={href(`/catalog/${d.sku}`)}>
+          <Link className="catalog-card" to={href(`/ux/catalog/${d.sku}`)}>
               <div class="catalog-card-tile" data-category={d.category}>
                 <div class="catalog-card-chip">{CATEGORY_LABEL[d.category]}</div>
               </div>

@@ -90,7 +90,7 @@
 </script>
 
 <div class="detail-page theme-exec">
-  <Breadcrumb to={href('/finance')}>
+  <Breadcrumb to={href('/ux/finance')}>
     ← Finance
   </Breadcrumb>
 
@@ -208,11 +208,11 @@
                       {#if !l.ref_id}
                         —
                       {:else if l.ref_id.startsWith('opp-')}
-                        <Link to={href(`/sales/${l.ref_id}`)} className="mono">
+                        <Link to={href(`/ux/sales/${l.ref_id}`)} className="mono">
                           {l.ref_id}
                         </Link>
                       {:else if l.ref_id.startsWith('tkt-')}
-                        <Link to={href(`/service/${l.ref_id}`)} className="mono">
+                        <Link to={href(`/ux/service/${l.ref_id}`)} className="mono">
                           {l.ref_id}
                         </Link>
                       {:else}

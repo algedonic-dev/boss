@@ -184,17 +184,17 @@
       : route.kind === 'calendar' ? 'calendar'
       : route.kind === 'schedule' ? 'schedule'
       : route.kind === 'exec' ? 'exec'
-      : route.kind === 'itMonitoring' || route.kind === 'itMonitoringPerf' || route.kind === 'itMonitoringEvents' || route.kind === 'itMonitoringAtlas' ? 'itMonitoring'
+      : route.kind === 'systemMonitoring' || route.kind === 'systemMonitoringPerf' || route.kind === 'systemMonitoringEvents' || route.kind === 'systemMonitoringAtlas' ? 'systemMonitoring'
       : route.kind === 'warehouse' ? 'warehouse'
       : route.kind === 'catalog' || route.kind === 'device' ? 'catalog'
       : route.kind === 'marketingAssets' || route.kind === 'marketingAsset' ? 'marketing-assets'
       : route.kind === 'manual' || route.kind === 'manualSection' ? 'manual'
       : route.kind === 'policy' ? 'policy'
       : route.kind === 'jobKinds' || route.kind === 'jobKindNew' || route.kind === 'jobKindDesign' || route.kind === 'jobKindDetail' ? 'jobKinds'
-      : route.kind === 'itStepPlugins' || route.kind === 'itStepPluginDetail' ? 'itStepPlugins'
-      : route.kind === 'dispatcherRules' || route.kind === 'dispatcherRulesList' || route.kind === 'dispatcherRuleEdit' ? 'it-dispatcher'
-      : route.kind === 'itSubjects' ? 'it-subjects'
-      : route.kind === 'itSystem' ? 'it-system'
+      : route.kind === 'systemStepPlugins' || route.kind === 'systemStepPluginDetail' ? 'systemStepPlugins'
+      : route.kind === 'dispatcherRules' || route.kind === 'dispatcherRulesList' || route.kind === 'dispatcherRuleEdit' ? 'system-dispatcher'
+      : route.kind === 'systemSubjects' ? 'system-subjects'
+      : route.kind === 'systemModel' ? 'system-model'
       : route.kind === 'workflows' ? 'workflows'
       : 'me',
   );
@@ -204,9 +204,9 @@
   // operator work surfaces are the other. (Simulator is its own app.)
   // This is the seam for the eventual Model/User app split.
   const MODEL_KINDS = new Set<Route['kind']>([
-    'itSystem', 'itSubjects', 'itKb', 'itDesign',
-    'itMonitoring', 'itMonitoringPerf', 'itMonitoringEvents', 'itMonitoringAtlas',
-    'itStepPlugins', 'itStepPluginDetail',
+    'systemModel', 'systemSubjects', 'systemKb', 'systemDesign',
+    'systemMonitoring', 'systemMonitoringPerf', 'systemMonitoringEvents', 'systemMonitoringAtlas',
+    'systemStepPlugins', 'systemStepPluginDetail',
     'dispatcherRules', 'dispatcherRulesList', 'dispatcherRuleEdit',
     'jobKinds', 'jobKindNew', 'jobKindDesign', 'jobKindDetail',
     'policy', 'workflows', 'authAdmin',
@@ -306,7 +306,7 @@
       <QaPage />
     {:else if route.kind === 'ops'}
       <OpsDashboard />
-    {:else if route.kind === 'itKb'}
+    {:else if route.kind === 'systemKb'}
       <ItKnowledgeBasePage />
     {:else if route.kind === 'policy'}
       <PolicyPage />
@@ -318,11 +318,11 @@
       <JobKindDesignWorkspace jobId={route.jobId} />
     {:else if route.kind === 'jobKindDetail'}
       <JobKindDetailPage kindSlug={route.kindSlug} />
-    {:else if route.kind === 'itStepPlugins'}
+    {:else if route.kind === 'systemStepPlugins'}
       <StepPluginsPage />
-    {:else if route.kind === 'itStepPluginDetail'}
+    {:else if route.kind === 'systemStepPluginDetail'}
       <StepPluginDetailPage pluginSlug={route.pluginSlug} />
-    {:else if route.kind === 'itDesign'}
+    {:else if route.kind === 'systemDesign'}
       <DesignReviewPage />
     {:else if route.kind === 'dispatcherRules'}
       <DispatcherCascadePage />
@@ -330,9 +330,9 @@
       <DispatcherRulesPage />
     {:else if route.kind === 'dispatcherRuleEdit'}
       <DispatcherRuleEditPage ruleName={route.ruleName} />
-    {:else if route.kind === 'itSubjects'}
+    {:else if route.kind === 'systemSubjects'}
       <SubjectsClassesPage />
-    {:else if route.kind === 'itSystem'}
+    {:else if route.kind === 'systemModel'}
       <SystemModelPage />
     {:else if route.kind === 'inbox'}
       <InboxPage />
@@ -360,13 +360,13 @@
       <ManualPage slug={route.slug} />
     {:else if route.kind === 'workflows'}
       <WorkflowsPage />
-    {:else if route.kind === 'itMonitoring'}
+    {:else if route.kind === 'systemMonitoring'}
       <MonitoringPage />
-    {:else if route.kind === 'itMonitoringPerf'}
+    {:else if route.kind === 'systemMonitoringPerf'}
       <PerfPage />
-    {:else if route.kind === 'itMonitoringEvents'}
+    {:else if route.kind === 'systemMonitoringEvents'}
       <EventsPage />
-    {:else if route.kind === 'itMonitoringAtlas'}
+    {:else if route.kind === 'systemMonitoringAtlas'}
       <AtlasPage />
     {:else if route.kind === 'po'}
       <PoPage poId={route.poId} />

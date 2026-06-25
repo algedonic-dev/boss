@@ -27,73 +27,82 @@ describe('parseRoute — every specific path matches its specific case', () => {
   // that the discriminator `kind` is right + any positional param
   // is captured.
   const cases: Array<[string, Record<string, unknown>]> = [
-    // Landing
+    // Landing — bare / is the public alias for the UX home; /ux is its
+    // canonical perspective root and resolves to the same home view.
     ['/', { kind: 'home' }],
-    // Browse / domain dashboards
-    ['/jobs', { kind: 'jobs' }],
-    ['/jobs/abc-123', { kind: 'jobDetail', jobId: 'abc-123' }],
-    ['/accounts', { kind: 'accounts' }],
-    ['/people', { kind: 'people' }],
-    ['/people/emp-aa-004', { kind: 'employee', empId: 'emp-aa-004' }],
-    ['/parts', { kind: 'parts' }],
-    ['/parts/SKU-1', { kind: 'part', partSku: 'SKU-1' }],
-    ['/products', { kind: 'products' }],
-    ['/products/FP-IPA-1-2-BBL', { kind: 'product', productSku: 'FP-IPA-1-2-BBL' }],
+    ['/ux', { kind: 'home' }],
+    // Browse / domain dashboards — User Experiences perspective (/ux/*).
+    ['/ux/jobs', { kind: 'jobs' }],
+    ['/ux/jobs/abc-123', { kind: 'jobDetail', jobId: 'abc-123' }],
+    ['/ux/accounts', { kind: 'accounts' }],
+    ['/ux/people', { kind: 'people' }],
+    ['/ux/people/emp-aa-004', { kind: 'employee', empId: 'emp-aa-004' }],
+    ['/ux/parts', { kind: 'parts' }],
+    ['/ux/parts/SKU-1', { kind: 'part', partSku: 'SKU-1' }],
+    ['/ux/products', { kind: 'products' }],
+    ['/ux/products/FP-IPA-1-2-BBL', { kind: 'product', productSku: 'FP-IPA-1-2-BBL' }],
     // Finance — the regression nest. Specific cases MUST win over
     // the catch-all `/finance/(.+)` → invoice route.
-    ['/finance', { kind: 'finance' }],
-    ['/finance/new', { kind: 'newInvoice' }],
-    ['/finance/journal-entries/new', { kind: 'newJournalEntry' }],
-    ['/finance/inv-step-12345678', { kind: 'invoice', invoiceId: 'inv-step-12345678' }],
+    ['/ux/finance', { kind: 'finance' }],
+    ['/ux/finance/new', { kind: 'newInvoice' }],
+    ['/ux/finance/journal-entries/new', { kind: 'newJournalEntry' }],
+    ['/ux/finance/inv-step-12345678', { kind: 'invoice', invoiceId: 'inv-step-12345678' }],
     // Shipping / shipments / support
-    ['/shipping', { kind: 'shipping' }],
-    ['/shipments/ship-1', { kind: 'shipmentDetail', shipmentId: 'ship-1' }],
-    ['/support', { kind: 'support' }],
+    ['/ux/shipping', { kind: 'shipping' }],
+    ['/ux/shipments/ship-1', { kind: 'shipmentDetail', shipmentId: 'ship-1' }],
+    ['/ux/support', { kind: 'support' }],
     // Calendar / scheduling
-    ['/calendar', { kind: 'calendar' }],
-    ['/calendar/me', { kind: 'myCalendar' }],
-    ['/service/schedule', { kind: 'schedule' }],
-    // Exec + IT (post the /cto retirement)
-    ['/exec', { kind: 'exec' }],
-    ['/it/monitoring', { kind: 'itMonitoring' }],
-    ['/it/monitoring/perf', { kind: 'itMonitoringPerf' }],
-    ['/it/monitoring/events', { kind: 'itMonitoringEvents' }],
-    ['/it/monitoring/atlas', { kind: 'itMonitoringAtlas' }],
-    ['/it/kb', { kind: 'itKb' }],
+    ['/ux/calendar', { kind: 'calendar' }],
+    ['/ux/calendar/me', { kind: 'myCalendar' }],
+    ['/ux/service/schedule', { kind: 'schedule' }],
+    // Exec (User Experiences)
+    ['/ux/exec', { kind: 'exec' }],
+    // System Model perspective — IT surfaces re-rooted under /system/*.
+    ['/system/monitoring', { kind: 'systemMonitoring' }],
+    ['/system/monitoring/perf', { kind: 'systemMonitoringPerf' }],
+    ['/system/monitoring/events', { kind: 'systemMonitoringEvents' }],
+    ['/system/monitoring/atlas', { kind: 'systemMonitoringAtlas' }],
+    ['/system/kb', { kind: 'systemKb' }],
+    ['/system', { kind: 'systemModel' }],
+    ['/system/subjects', { kind: 'systemSubjects' }],
+    ['/system/design', { kind: 'systemDesign' }],
+    ['/system/step-plugins', { kind: 'systemStepPlugins' }],
+    ['/system/step-plugins/pour-quality-check', { kind: 'systemStepPluginDetail', pluginSlug: 'pour-quality-check' }],
+    ['/system/dispatcher', { kind: 'dispatcherRules' }],
+    ['/system/dispatcher/rules', { kind: 'dispatcherRulesList' }],
+    ['/system/dispatcher/rules/restock-on-low', { kind: 'dispatcherRuleEdit', ruleName: 'restock-on-low' }],
     // Warehouse / catalog / assets
-    ['/warehouse', { kind: 'warehouse' }],
-    ['/catalog', { kind: 'catalog' }],
-    ['/catalog/some-sku', { kind: 'device', sku: 'some-sku' }],
-    ['/assets', { kind: 'assets' }],
-    ['/assets/asset-1', { kind: 'asset', assetId: 'asset-1' }],
-    ['/marketing-assets', { kind: 'marketingAssets' }],
-    ['/marketing-assets/mkt-1', { kind: 'marketingAsset', assetId: 'mkt-1' }],
+    ['/ux/warehouse', { kind: 'warehouse' }],
+    ['/ux/catalog', { kind: 'catalog' }],
+    ['/ux/catalog/some-sku', { kind: 'device', sku: 'some-sku' }],
+    ['/ux/assets', { kind: 'assets' }],
+    ['/ux/assets/asset-1', { kind: 'asset', assetId: 'asset-1' }],
+    ['/ux/marketing-assets', { kind: 'marketingAssets' }],
+    ['/ux/marketing-assets/mkt-1', { kind: 'marketingAsset', assetId: 'mkt-1' }],
     // Manual + workflows + watchlist + shop
-    ['/manual', { kind: 'manual' }],
-    ['/workflows', { kind: 'workflows' }],
-    ['/manual/intro', { kind: 'manualSection', slug: 'intro' }],
-    ['/watchlist', { kind: 'watchlist' }],
-    ['/shop', { kind: 'shop' }],
-    ['/shop/FP-IPA-1-2-BBL', { kind: 'shopProduct', sku: 'FP-IPA-1-2-BBL' }],
+    ['/ux/manual', { kind: 'manual' }],
+    ['/system/workflows', { kind: 'workflows' }],
+    ['/ux/manual/intro', { kind: 'manualSection', slug: 'intro' }],
+    ['/ux/watchlist', { kind: 'watchlist' }],
+    ['/ux/shop', { kind: 'shop' }],
+    ['/ux/shop/FP-IPA-1-2-BBL', { kind: 'shopProduct', sku: 'FP-IPA-1-2-BBL' }],
     // PO + purchase orders
-    ['/purchase-orders/po-1', { kind: 'po', poId: 'po-1' }],
-    ['/vendor-invoices/vi-1', { kind: 'vendorInvoice', vendorInvoiceId: 'vi-1' }],
+    ['/ux/purchase-orders/po-1', { kind: 'po', poId: 'po-1' }],
+    ['/ux/vendor-invoices/vi-1', { kind: 'vendorInvoice', vendorInvoiceId: 'vi-1' }],
     // HR + QA + ops
-    ['/hr', { kind: 'hr' }],
-    ['/qa', { kind: 'qa' }],
-    ['/ops', { kind: 'ops' }],
-    ['/ops/anything', { kind: 'ops' }],
-    // Policy + admin authoring. The job-kinds `/authoring/<jobId>` route
-    // is the wildcard-precedence trap: it MUST resolve before the
-    // catch-all `/job-kinds/(.+)` detail route.
-    ['/policy', { kind: 'policy' }],
-    ['/job-kinds', { kind: 'jobKinds' }],
-    ['/admin/job-kinds', { kind: 'jobKinds' }],
-    ['/job-kinds/new', { kind: 'jobKindNew' }],
-    ['/admin/job-kinds/new', { kind: 'jobKindNew' }],
-    ['/job-kinds/authoring/job-abc-123', { kind: 'jobKindDesign', jobId: 'job-abc-123' }],
-    ['/admin/job-kinds/authoring/job-abc-123', { kind: 'jobKindDesign', jobId: 'job-abc-123' }],
-    ['/job-kinds/seasonal-release', { kind: 'jobKindDetail', kindSlug: 'seasonal-release' }],
+    ['/ux/hr', { kind: 'hr' }],
+    ['/ux/qa', { kind: 'qa' }],
+    ['/ux/ops', { kind: 'ops' }],
+    ['/ux/ops/anything', { kind: 'ops' }],
+    // Policy + JobKind authoring (System Model). The job-kinds
+    // `/authoring/<jobId>` route is the wildcard-precedence trap: it MUST
+    // resolve before the catch-all `/job-kinds/(.+)` detail route.
+    ['/system/policy', { kind: 'policy' }],
+    ['/system/auth-admin', { kind: 'authAdmin' }],
+    ['/system/job-kinds', { kind: 'jobKinds' }],
+    ['/system/job-kinds/new', { kind: 'jobKindNew' }],
+    ['/system/job-kinds/authoring/job-abc-123', { kind: 'jobKindDesign', jobId: 'job-abc-123' }],
+    ['/system/job-kinds/seasonal-release', { kind: 'jobKindDetail', kindSlug: 'seasonal-release' }],
   ];
 
   for (const [path, expected] of cases) {
@@ -112,16 +121,16 @@ describe('parseRoute — wildcard does not shadow specific cases', () => {
   // wildcard or they resolve as `{ kind: 'invoice', invoiceId: ... }`.
   // Any new `/finance/X` case the SPA introduces should be added to
   // the table above + a regression assertion here.
-  test('/finance/new → newInvoice, NOT invoice', () => {
-    const r = parseRoute('/finance/new');
+  test('/ux/finance/new → newInvoice, NOT invoice', () => {
+    const r = parseRoute('/ux/finance/new');
     expect(r.kind).toBe('newInvoice');
   });
-  test('/finance/journal-entries/new → newJournalEntry, NOT invoice', () => {
-    const r = parseRoute('/finance/journal-entries/new');
+  test('/ux/finance/journal-entries/new → newJournalEntry, NOT invoice', () => {
+    const r = parseRoute('/ux/finance/journal-entries/new');
     expect(r.kind).toBe('newJournalEntry');
   });
-  test('/job-kinds/authoring/X → jobKindDesign, NOT jobKindDetail', () => {
-    const r = parseRoute('/job-kinds/authoring/job-abc-123');
+  test('/system/job-kinds/authoring/X → jobKindDesign, NOT jobKindDetail', () => {
+    const r = parseRoute('/system/job-kinds/authoring/job-abc-123');
     expect(r.kind).toBe('jobKindDesign');
   });
 });

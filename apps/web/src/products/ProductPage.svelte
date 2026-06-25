@@ -59,7 +59,7 @@
   {#if loading}
     <p class="empty">Loading product…</p>
   {:else if error}
-    <p class="empty err">{error} — <Link to={href('/products')}>back to products</Link></p>
+    <p class="empty err">{error} — <Link to={href('/ux/products')}>back to products</Link></p>
   {:else if detail}
     <PageHeader
       title={detail.name}
@@ -123,7 +123,7 @@
     {/if}
 
     <p class="back">
-      <Link to={href('/products')}>← All products</Link>
+      <Link to={href('/ux/products')}>← All products</Link>
     </p>
   {/if}
 </div>

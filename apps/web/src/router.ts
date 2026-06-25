@@ -55,21 +55,21 @@ export type Route =
   | { kind: 'qa' }
   | { kind: 'ops' }
   // 'itSim' retired 2026-05-03 with boss-sim-api (HumanWorker step 9b).
-  | { kind: 'itKb' }
-  | { kind: 'itMonitoring' }
-  | { kind: 'itMonitoringPerf' }
-  | { kind: 'itMonitoringEvents' }
-  | { kind: 'itMonitoringAtlas' }
+  | { kind: 'systemKb' }
+  | { kind: 'systemMonitoring' }
+  | { kind: 'systemMonitoringPerf' }
+  | { kind: 'systemMonitoringEvents' }
+  | { kind: 'systemMonitoringAtlas' }
   | { kind: 'policy' }
   | { kind: 'jobKinds' }
   | { kind: 'jobKindNew' }
   | { kind: 'jobKindDesign'; jobId: string }
   | { kind: 'jobKindDetail'; kindSlug: string }
-  | { kind: 'itStepPlugins' }
-  | { kind: 'itStepPluginDetail'; pluginSlug: string }
-  | { kind: 'itDesign' }
-  | { kind: 'itSubjects' }
-  | { kind: 'itSystem' }
+  | { kind: 'systemStepPlugins' }
+  | { kind: 'systemStepPluginDetail'; pluginSlug: string }
+  | { kind: 'systemDesign' }
+  | { kind: 'systemSubjects' }
+  | { kind: 'systemModel' }
   | { kind: 'dispatcherRules' }
   | { kind: 'dispatcherRulesList' }
   | { kind: 'dispatcherRuleEdit'; ruleName: string }
@@ -94,9 +94,42 @@ export type Route =
   | { kind: 'shopProduct'; sku: string };
 
 export function parseRoute(pathname: string): Route {
-  const p = pathname.replace(/^\/dashboard/, '').replace(/\/$/, '') || '/';
-  if (p === '/login') return { kind: 'login' };
-  if (p === '/auth-admin') return { kind: 'authAdmin' };
+  const raw = pathname.replace(/^\/dashboard/, '').replace(/\/$/, '') || '/';
+  if (raw === '/login') return { kind: 'login' };
+
+  // ===== System Model perspective — /system/* =====
+  if (raw === '/system' || raw.startsWith('/system/')) {
+    const p = raw.slice('/system'.length) || '/';
+    if (p === '/') return { kind: 'systemModel' };
+    if (p === '/monitoring') return { kind: 'systemMonitoring' };
+    if (p === '/monitoring/perf') return { kind: 'systemMonitoringPerf' };
+    if (p === '/monitoring/events') return { kind: 'systemMonitoringEvents' };
+    if (p === '/monitoring/atlas') return { kind: 'systemMonitoringAtlas' };
+    if (p === '/kb') return { kind: 'systemKb' };
+    if (p === '/design') return { kind: 'systemDesign' };
+    if (p === '/subjects') return { kind: 'systemSubjects' };
+    if (p === '/policy') return { kind: 'policy' };
+    if (p === '/workflows') return { kind: 'workflows' };
+    if (p === '/auth-admin') return { kind: 'authAdmin' };
+    if (p === '/job-kinds') return { kind: 'jobKinds' };
+    if (p === '/job-kinds/new') return { kind: 'jobKindNew' };
+    const jkDesignM = p.match(/^\/job-kinds\/authoring\/(.+)$/);
+    if (jkDesignM) return { kind: 'jobKindDesign', jobId: decodeURIComponent(jkDesignM[1]!) };
+    const jkM = p.match(/^\/job-kinds\/(.+)$/);
+    if (jkM) return { kind: 'jobKindDetail', kindSlug: decodeURIComponent(jkM[1]!) };
+    if (p === '/step-plugins') return { kind: 'systemStepPlugins' };
+    const spM = p.match(/^\/step-plugins\/(.+)$/);
+    if (spM) return { kind: 'systemStepPluginDetail', pluginSlug: decodeURIComponent(spM[1]!) };
+    if (p === '/dispatcher/rules') return { kind: 'dispatcherRulesList' };
+    const drM = p.match(/^\/dispatcher\/rules\/(.+)$/);
+    if (drM) return { kind: 'dispatcherRuleEdit', ruleName: decodeURIComponent(drM[1]!) };
+    if (p === '/dispatcher') return { kind: 'dispatcherRules' };
+    return { kind: 'systemModel' };
+  }
+
+  // ===== User Experiences perspective — /ux/* (canonical); bare / is the public alias for the UX home.
+  // Unprefixed legacy paths still resolve here (defensive). =====
+  const p = raw === '/' || raw === '/ux' ? '/' : raw.startsWith('/ux/') ? raw.slice('/ux'.length) : raw;
   if (p === '/me') return { kind: 'me' };
   if (p === '/inbox') return { kind: 'inbox' };
   if (p === '/accounts') return { kind: 'accounts' };
@@ -137,13 +170,6 @@ export function parseRoute(pathname: string): Route {
   if (p === '/calendar') return { kind: 'calendar' };
   if (p === '/service/schedule') return { kind: 'schedule' };
   if (p === '/exec') return { kind: 'exec' };
-  // /cto + /perf retired in favor of the IT-as-department IA.
-  // The new locations live under /it/monitoring/*; /cto/atlas
-  // similarly migrates below.
-  if (p === '/it/monitoring') return { kind: 'itMonitoring' };
-  if (p === '/it/monitoring/perf') return { kind: 'itMonitoringPerf' };
-  if (p === '/it/monitoring/events') return { kind: 'itMonitoringEvents' };
-  if (p === '/it/monitoring/atlas') return { kind: 'itMonitoringAtlas' };
   if (p === '/warehouse') return { kind: 'warehouse' };
   if (p === '/catalog') return { kind: 'catalog' };
   const catM = p.match(/^\/catalog\/(.+)$/);
@@ -155,7 +181,6 @@ export function parseRoute(pathname: string): Route {
   const mktM = p.match(/^\/marketing-assets\/(.+)$/);
   if (mktM) return { kind: 'marketingAsset', assetId: decodeURIComponent(mktM[1]!) };
   if (p === '/manual') return { kind: 'manual' };
-  if (p === '/workflows') return { kind: 'workflows' };
   const mManual = p.match(/^\/manual\/(.+)$/);
   if (mManual) return { kind: 'manualSection', slug: decodeURIComponent(mManual[1]!) };
   const poM = p.match(/^\/purchase-orders\/(.+)$/);
@@ -170,41 +195,6 @@ export function parseRoute(pathname: string): Route {
   if (p === '/hr') return { kind: 'hr' };
   if (p === '/qa') return { kind: 'qa' };
   if (p.startsWith('/ops')) return { kind: 'ops' };
-  // /it/sim retired 2026-05-03 with boss-sim-api (HumanWorker step 9b).
-  if (p === '/it/kb') return { kind: 'itKb' };
-
-  if (p === '/policy') return { kind: 'policy' };
-  // `/admin/job-kinds` is the README's documented authoring URL
-  // (the BOSS framing positions JobKinds as admin-tier authoring).
-  // Internally everything lives under /job-kinds/*; the /admin
-  // prefix is an alias kept stable for the public-facing docs.
-  if (p === '/job-kinds' || p === '/admin/job-kinds') return { kind: 'jobKinds' };
-  if (p === '/job-kinds/new' || p === '/admin/job-kinds/new') return { kind: 'jobKindNew' };
-  // The authoring-workspace route is keyed by the design Job's id and
-  // must match before the catch-all detail pattern, which would
-  // otherwise swallow `authoring/<jobId>` as a slug.
-  const jkDesignM = p.match(/^\/(?:admin\/)?job-kinds\/authoring\/(.+)$/);
-  if (jkDesignM) return { kind: 'jobKindDesign', jobId: decodeURIComponent(jkDesignM[1]!) };
-  const jkM = p.match(/^\/(?:admin\/)?job-kinds\/(.+)$/);
-  if (jkM) return { kind: 'jobKindDetail', kindSlug: decodeURIComponent(jkM[1]!) };
-  if (p === '/it/step-plugins') return { kind: 'itStepPlugins' };
-  const spM = p.match(/^\/it\/step-plugins\/(.+)$/);
-  if (spM) return { kind: 'itStepPluginDetail', pluginSlug: decodeURIComponent(spM[1]!) };
-  if (p === '/it/design') return { kind: 'itDesign' };
-  if (p === '/it/subjects' || p === '/admin/subjects') return { kind: 'itSubjects' };
-  if (p === '/it') return { kind: 'itSystem' };
-  // Dispatcher rule authoring. The list + editor patterns MUST precede the
-  // `/it/dispatcher` exact match below, which would otherwise be eclipsed —
-  // and the editor's `/rules/{name}` catch-all MUST come after the bare
-  // `/rules` list so the list doesn't get parsed as a rule named "".
-  if (p === '/it/dispatcher/rules' || p === '/admin/dispatcher/rules')
-    return { kind: 'dispatcherRulesList' };
-  const drM = p.match(/^\/(?:admin|it)\/dispatcher\/rules\/(.+)$/);
-  if (drM) return { kind: 'dispatcherRuleEdit', ruleName: decodeURIComponent(drM[1]!) };
-  // The dispatcher rule-cascade visualization. `/admin/dispatcher` is the
-  // README-style admin alias (like /admin/job-kinds); `/it/dispatcher` is
-  // the platform-internals nav home (beside step-plugins + monitoring).
-  if (p === '/it/dispatcher' || p === '/admin/dispatcher') return { kind: 'dispatcherRules' };
 
   if (p === '/service') return { kind: 'service' };
   const tm = p.match(/^\/service\/(.+)$/);

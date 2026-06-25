@@ -20,27 +20,29 @@ import { installAuthoringMocks, JOB_ID } from './_mockApi';
 // routes are included (a JobKind + a marketing asset) because the mock
 // seeds them, and that is where the omitted-field crashes live.
 const ROUTES: ReadonlyArray<string> = [
-  '/', '/me', '/inbox', '/jobs', '/accounts', '/vendors', '/people', '/parts',
-  '/products', '/shipping', '/assets', '/catalog',
-  '/marketing-assets', '/marketing-assets/ma-1', '/calendar', '/calendar/me',
-  '/support', '/service', '/refurb', '/qa', '/hr', '/sales',
-  '/shop', '/manual', '/workflows',
-  // The IT "read the running model" surfaces — the set the stale
-  // _console-crawl never covered.
-  '/it', '/it/subjects', '/it/dispatcher', '/it/dispatcher/rules',
-  '/it/monitoring/perf', '/it/monitoring/events',
-  '/it/monitoring/atlas', '/it/step-plugins', '/it/kb', '/it/design',
-  // Modeling + admin surfaces.
-  '/job-kinds', '/admin/job-kinds', '/admin/job-kinds/new',
-  '/admin/job-kinds/seasonal-release', '/policy', '/auth-admin',
+  // User Experiences perspective — bare / is the public home alias; the
+  // operator surfaces are re-rooted under /ux/*.
+  '/', '/ux/me', '/ux/inbox', '/ux/jobs', '/ux/accounts', '/ux/vendors', '/ux/people', '/ux/parts',
+  '/ux/products', '/ux/shipping', '/ux/assets', '/ux/catalog',
+  '/ux/marketing-assets', '/ux/marketing-assets/ma-1', '/ux/calendar', '/ux/calendar/me',
+  '/ux/support', '/ux/service', '/ux/refurb', '/ux/qa', '/ux/hr', '/ux/sales',
+  '/ux/shop', '/ux/manual',
+  // System Model perspective — the "read the running model" surfaces, now
+  // re-rooted under /system/*.
+  '/system', '/system/subjects', '/system/dispatcher', '/system/dispatcher/rules',
+  '/system/monitoring/perf', '/system/monitoring/events',
+  '/system/monitoring/atlas', '/system/step-plugins', '/system/kb', '/system/design',
+  // Modeling + admin surfaces (System Model).
+  '/system/workflows', '/system/job-kinds', '/system/job-kinds/new',
+  '/system/job-kinds/seasonal-release', '/system/policy', '/system/auth-admin',
 ];
 
 // DEFERRED, group 1 — aggregation dashboards that read OBJECT-shaped
 // responses (statements, snapshots, summaries) the generic `[]` catch-all
 // can't fake; they need faithful per-endpoint fixtures before they can be
 // gated without false positives:
-//   /finance (statements .reduce) · /warehouse (summary.below_reorder_count)
-//   /exec (.find/.length) · /watchlist (.length) · /it/monitoring (snapshot .length)
+//   /ux/finance (statements .reduce) · /ux/warehouse (summary.below_reorder_count)
+//   /ux/exec (.find/.length) · /ux/watchlist (.length) · /system/monitoring (snapshot .length)
 //
 // Resolved: the marketing-assets no-shell this harness first caught was a
 // real effect_update_depth_exceeded loop in loadClasses() called from a
@@ -121,7 +123,7 @@ test.describe('route smoke — every surface renders without a runtime crash', (
     const errors: string[] = [];
     page.on('pageerror', (e) => errors.push(e.message));
 
-    await page.goto(`/admin/job-kinds/authoring/${JOB_ID}`, { timeout: 20_000 });
+    await page.goto(`/system/job-kinds/authoring/${JOB_ID}`, { timeout: 20_000 });
     await expect(page.locator('.app-shell')).toBeVisible({ timeout: 10_000 });
     // Wait for the lazy graph + the step-authoring surface (which mounts
     // StepDagEditor) to render the seeded spec.

@@ -375,7 +375,7 @@
           {/each}
         </div>
         <div style="margin-top:12px; text-align:right">
-          <Link to={href('/jobs')}>
+          <Link to={href('/ux/jobs')}>
             View all jobs →
           </Link>
         </div>
@@ -422,7 +422,7 @@
         <div style="margin-top:8px; font-size:12px; color:#78716c">
           {#if scheduled.length > 8}+{scheduled.length - 8} more · {/if}
           {#if unscheduled > 0}{unscheduled} unscheduled · {/if}
-          <a href={href('/calendar')}>Open full calendar →</a>
+          <a href={href('/ux/calendar')}>Open full calendar →</a>
         </div>
       {/if}
     </section>
@@ -463,7 +463,7 @@
           </tbody>
         </table>
         <div style="margin-top:8px; text-align:right">
-          <Link to={href('/products')}>View full catalog →</Link>
+          <Link to={href('/ux/products')}>View full catalog →</Link>
         </div>
       {/if}
     </section>
@@ -505,7 +505,7 @@
           {/if}
         </div>
         <div style="margin-top:8px; text-align:right">
-          <Link to={href('/finance')}>Open finance dashboard →</Link>
+          <Link to={href('/ux/finance')}>Open finance dashboard →</Link>
         </div>
       {/if}
     </section>

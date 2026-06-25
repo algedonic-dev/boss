@@ -227,10 +227,10 @@
     </button>
     <a
       class="manual-tree-label"
-      href={href(`/manual/${node.section.slug}`)}
+      href={href(`/ux/manual/${node.section.slug}`)}
       onclick={(e) => {
         e.preventDefault();
-        navigate(href(`/manual/${node.section.slug}`));
+        navigate(href(`/ux/manual/${node.section.slug}`));
       }}
     >
       {node.section.title}

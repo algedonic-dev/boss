@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::ASSETS)),
         )
         // Dispatcher rule-registry surface (read-only) — backs the
-        // /admin/dispatcher cascade visualization.
+        // /system/dispatcher cascade visualization.
         .route(
             "/api/dispatcher/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::DISPATCHER)),

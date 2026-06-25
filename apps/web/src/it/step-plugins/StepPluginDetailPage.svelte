@@ -107,7 +107,7 @@
   {@const versions = loadState.versions}
   {@const hasDraft = versions.some((v) => v.status === 'draft')}
   <div class="catalog theme-exec">
-    <Breadcrumb to={href('/it/step-plugins')}>
+    <Breadcrumb to={href('/system/step-plugins')}>
       ← All step plugins
     </Breadcrumb>
     <PageHeader

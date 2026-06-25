@@ -114,10 +114,10 @@
 
   <div class="finance-actions" style="display:flex; gap:8px; align-items:flex-start; flex-wrap:wrap">
     {#if !readOnly}
-      <Link to={href('/finance/new')} className="fin-new-invoice">
+      <Link to={href('/ux/finance/new')} className="fin-new-invoice">
         + New invoice
       </Link>
-      <Link to={href('/finance/journal-entries/new')} className="fin-new-invoice">
+      <Link to={href('/ux/finance/journal-entries/new')} className="fin-new-invoice">
         + New journal entry
       </Link>
     {/if}

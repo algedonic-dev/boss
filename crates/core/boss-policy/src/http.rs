@@ -168,7 +168,7 @@ async fn my_scope<R: PolicyRepository + 'static>(
     // Iterate the platform's shipped resources (defaults::shipped_resources)
     // so the discovery endpoint covers everything `default_rules` enumerates
     // Read access against — including the registry resources (job_kind,
-    // step_plugin) the SPA needs for /workflows + /admin/step-plugins
+    // step_plugin) the SPA needs for /workflows + /system/step-plugins
     // nav-gating.
     for resource in boss_policy_client::defaults::shipped_resources() {
         for action in [

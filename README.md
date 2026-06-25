@@ -109,11 +109,11 @@ by the local install on `:4443`):
 | If you want to see … | Open |
 |---|---|
 | The home dashboard with live system activity | <http://localhost:4443/> |
-| A Job from the brewery flow with its step graph | <http://localhost:4443/jobs/> (click any open Job) |
-| The full event log streaming as the sim ticks | <http://localhost:4443/it/monitoring/events> |
-| The System Atlas — every service + its event topics | <http://localhost:4443/?atlas> |
-| The brewery's people, with role-based scoped views | <http://localhost:4443/people> |
-| A workflow's anatomy (JobKind authoring surface) | <http://localhost:4443/admin/job-kinds> |
+| A Job from the brewery flow with its step graph | <http://localhost:4443/ux/jobs/> (click any open Job) |
+| The full event log streaming as the sim ticks | <http://localhost:4443/system/monitoring/events> |
+| The System Atlas — every service + its event topics | <http://localhost:4443/system/monitoring/atlas> |
+| The brewery's people, with role-based scoped views | <http://localhost:4443/ux/people> |
+| A workflow's anatomy (JobKind authoring surface) | <http://localhost:4443/system/job-kinds> |
 
 Both install paths land on `:4443` (gateway in demo mode +
 local-auth). What you see is the head of `main` plus the data

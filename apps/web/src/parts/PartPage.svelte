@@ -250,7 +250,7 @@
     .filter((m): m is DeviceModel => m !== undefined)}
 
   <div class="detail-page theme-exec">
-    <Breadcrumb to={href('/parts')}>
+    <Breadcrumb to={href('/ux/parts')}>
       ← All parts
     </Breadcrumb>
 
@@ -374,7 +374,7 @@
           <ul class="checklist">
             {#each usedByModels as m (m.sku)}
               <li>
-                <Link to={href(`/catalog/${m.sku}`)}>
+                <Link to={href(`/ux/catalog/${m.sku}`)}>
                   {m.name}
                 </Link>
                 <span style="color:#78716c; margin-left:8px">

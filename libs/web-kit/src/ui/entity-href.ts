@@ -26,23 +26,23 @@ export type EntityKind =
 export function entityHref(kind: EntityKind, id: string): string {
   const encoded = encodeURIComponent(id);
   switch (kind) {
-    case 'account': return href(`/accounts/${encoded}`);
-    case 'employee': return href(`/people/${encoded}`);
-    case 'job': return href(`/jobs/${encoded}`);
-    case 'invoice': return href(`/finance/${encoded}`);
-    case 'asset': return href(`/assets/${encoded}`);
-    case 'part': return href(`/parts/${encoded}`);
-    case 'product': return href(`/products/${encoded}`);
-    case 'vendor': return href(`/vendors/${encoded}`);
-    case 'agreement': return href(`/accounts/agreements/${encoded}`);
-    case 'po': return href(`/purchase-orders/${encoded}`);
-    case 'vendor-invoice': return href(`/vendor-invoices/${encoded}`);
-    case 'shipment': return href(`/shipments/${encoded}`);
-    case 'opportunity': return href(`/sales/opportunities/${encoded}`);
-    case 'ticket': return href(`/support/${encoded}`);
-    case 'fact': return href(`/finance?fact=${encoded}`);
-    case 'ledger-entry': return href(`/finance?entry=${encoded}`);
-    case 'marketing-asset': return href(`/assets/${encoded}`);
+    case 'account': return href(`/ux/accounts/${encoded}`);
+    case 'employee': return href(`/ux/people/${encoded}`);
+    case 'job': return href(`/ux/jobs/${encoded}`);
+    case 'invoice': return href(`/ux/finance/${encoded}`);
+    case 'asset': return href(`/ux/assets/${encoded}`);
+    case 'part': return href(`/ux/parts/${encoded}`);
+    case 'product': return href(`/ux/products/${encoded}`);
+    case 'vendor': return href(`/ux/vendors/${encoded}`);
+    case 'agreement': return href(`/ux/accounts/agreements/${encoded}`);
+    case 'po': return href(`/ux/purchase-orders/${encoded}`);
+    case 'vendor-invoice': return href(`/ux/vendor-invoices/${encoded}`);
+    case 'shipment': return href(`/ux/shipments/${encoded}`);
+    case 'opportunity': return href(`/ux/sales/opportunities/${encoded}`);
+    case 'ticket': return href(`/ux/support/${encoded}`);
+    case 'fact': return href(`/ux/finance?fact=${encoded}`);
+    case 'ledger-entry': return href(`/ux/finance?entry=${encoded}`);
+    case 'marketing-asset': return href(`/ux/assets/${encoded}`);
   }
 }
 

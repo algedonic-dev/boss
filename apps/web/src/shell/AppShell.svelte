@@ -33,56 +33,56 @@
   // this catalog by RouteName, which keeps labels + module gates from
   // drifting between the two groups.
   const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
-    jobs:      { id: 'jobs',      label: 'All jobs',         path: '/jobs',      permKey: 'jobs' },
-    sales:     { id: 'sales',     label: 'Sales pipeline',   path: '/sales',     permKey: 'sales' },
-    service:   { id: 'service',   label: 'Service queue',    path: '/service',   permKey: 'service',   module: 'support' },
-    refurb:    { id: 'refurb',    label: 'Refurbishment',    path: '/refurb',    permKey: 'refurb',    module: 'support' },
-    qa:        { id: 'qa',        label: 'QA',               path: '/qa',        permKey: 'qa',        module: 'qa' },
-    finance:   { id: 'finance',   label: 'Finance',          path: '/finance',   permKey: 'finance',   module: 'finance' },
-    warehouse: { id: 'warehouse', label: 'Inventory',        path: '/warehouse', permKey: 'warehouse', module: 'warehouse' },
-    shipping:  { id: 'shipping',  label: 'Shipments',        path: '/shipping',  permKey: 'shipping',  module: 'shipping' },
-    support:   { id: 'support',   label: 'Support',          path: '/support',   permKey: 'support',   module: 'support' },
-    ops:       { id: 'ops',       label: 'Operations',       path: '/ops',       permKey: 'ops' },
-    exec:      { id: 'exec',      label: 'Exec',             path: '/exec',      permKey: 'exec',      module: 'exec' },
-    'it-monitoring': { id: 'it-monitoring', label: 'IT Monitoring', path: '/it/monitoring', permKey: 'it-monitoring' },
-    schedule:  { id: 'schedule',  label: 'My schedule',      path: '/calendar/me', permKey: 'schedule' },
-    catalog:   { id: 'catalog',   label: 'Equipment',        path: '/catalog',   permKey: 'catalog',   module: 'equipment' },
-    parts:     { id: 'parts',     label: 'Ingredients & parts', path: '/parts',  permKey: 'parts',     module: 'parts' },
-    products:  { id: 'products',  label: 'Products',         path: '/products',  permKey: 'parts',     module: 'parts' },
-    accounts:  { id: 'accounts',  label: 'Accounts',         path: '/accounts',  permKey: 'accounts' },
-    vendors:   { id: 'vendors',   label: 'Vendors',          path: '/vendors',   permKey: 'vendors' },
-    people:    { id: 'people',    label: 'Employees',        path: '/people',    permKey: 'people' },
-    assets:    { id: 'assets',    label: 'Assets',             path: '/assets',    permKey: 'assets',    module: 'equipment' },
-    shop:      { id: 'shop',      label: 'Shop',             path: '/shop',      permKey: 'shop' },
-    inbox:     { id: 'inbox',     label: 'Inbox',            path: '/inbox',     permKey: 'inbox' },
+    jobs:      { id: 'jobs',      label: 'All jobs',         path: '/ux/jobs',      permKey: 'jobs' },
+    sales:     { id: 'sales',     label: 'Sales pipeline',   path: '/ux/sales',     permKey: 'sales' },
+    service:   { id: 'service',   label: 'Service queue',    path: '/ux/service',   permKey: 'service',   module: 'support' },
+    refurb:    { id: 'refurb',    label: 'Refurbishment',    path: '/ux/refurb',    permKey: 'refurb',    module: 'support' },
+    qa:        { id: 'qa',        label: 'QA',               path: '/ux/qa',        permKey: 'qa',        module: 'qa' },
+    finance:   { id: 'finance',   label: 'Finance',          path: '/ux/finance',   permKey: 'finance',   module: 'finance' },
+    warehouse: { id: 'warehouse', label: 'Inventory',        path: '/ux/warehouse', permKey: 'warehouse', module: 'warehouse' },
+    shipping:  { id: 'shipping',  label: 'Shipments',        path: '/ux/shipping',  permKey: 'shipping',  module: 'shipping' },
+    support:   { id: 'support',   label: 'Support',          path: '/ux/support',   permKey: 'support',   module: 'support' },
+    ops:       { id: 'ops',       label: 'Operations',       path: '/ux/ops',       permKey: 'ops' },
+    exec:      { id: 'exec',      label: 'Exec',             path: '/ux/exec',      permKey: 'exec',      module: 'exec' },
+    'system-monitoring': { id: 'system-monitoring', label: 'Monitoring', path: '/system/monitoring', permKey: 'system-monitoring' },
+    schedule:  { id: 'schedule',  label: 'My schedule',      path: '/ux/calendar/me', permKey: 'schedule' },
+    catalog:   { id: 'catalog',   label: 'Equipment',        path: '/ux/catalog',   permKey: 'catalog',   module: 'equipment' },
+    parts:     { id: 'parts',     label: 'Ingredients & parts', path: '/ux/parts',  permKey: 'parts',     module: 'parts' },
+    products:  { id: 'products',  label: 'Products',         path: '/ux/products',  permKey: 'parts',     module: 'parts' },
+    accounts:  { id: 'accounts',  label: 'Accounts',         path: '/ux/accounts',  permKey: 'accounts' },
+    vendors:   { id: 'vendors',   label: 'Vendors',          path: '/ux/vendors',   permKey: 'vendors' },
+    people:    { id: 'people',    label: 'Employees',        path: '/ux/people',    permKey: 'people' },
+    assets:    { id: 'assets',    label: 'Assets',             path: '/ux/assets',    permKey: 'assets',    module: 'equipment' },
+    shop:      { id: 'shop',      label: 'Shop',             path: '/ux/shop',      permKey: 'shop' },
+    inbox:     { id: 'inbox',     label: 'Inbox',            path: '/ux/inbox',     permKey: 'inbox' },
     // 'it-sim' retired 2026-05-03 with boss-sim-api (HumanWorker step 9b).
-    'marketing-assets': { id: 'marketing-assets', label: 'Marketing assets', path: '/marketing-assets', permKey: 'marketing-assets', module: 'marketing-assets' },
-    calendar:  { id: 'calendar',  label: 'Release calendar', path: '/calendar',  permKey: 'calendar',  module: 'calendar' },
+    'marketing-assets': { id: 'marketing-assets', label: 'Marketing assets', path: '/ux/marketing-assets', permKey: 'marketing-assets', module: 'marketing-assets' },
+    calendar:  { id: 'calendar',  label: 'Release calendar', path: '/ux/calendar',  permKey: 'calendar',  module: 'calendar' },
     // Modeling surfaces — operator-tier (no separate /admin tier).
     // policy + job-kinds are dept-head + COO authority (per the
     // "engineers are operators like anyone else" frame). Step
     // plugins are JS bundle authoring → IT engineering work.
-    policy:               { id: 'policy',               label: 'Policy',              path: '/policy',         permKey: 'policy' },
-    'job-kinds':          { id: 'job-kinds',            label: 'Job kinds',           path: '/job-kinds',      permKey: 'job-kinds' },
-    'it-step-plugins':    { id: 'it-step-plugins',      label: 'Step plugins',        path: '/it/step-plugins', permKey: 'it-step-plugins' },
-    'it-dispatcher':      { id: 'it-dispatcher',        label: 'Dispatcher rules',    path: '/it/dispatcher',  permKey: 'it-dispatcher' },
-    'it-system':          { id: 'it-system',            label: 'System Model',        path: '/it',             permKey: 'it-system' },
-    'it-subjects':        { id: 'it-subjects',          label: 'Subjects & Classes',  path: '/it/subjects',    permKey: 'it-subjects' },
+    policy:               { id: 'policy',               label: 'Policy',              path: '/system/policy',  permKey: 'policy' },
+    'job-kinds':          { id: 'job-kinds',            label: 'Job kinds',           path: '/system/job-kinds', permKey: 'job-kinds' },
+    'system-step-plugins':    { id: 'system-step-plugins',      label: 'Step plugins',        path: '/system/step-plugins', permKey: 'system-step-plugins' },
+    'system-dispatcher':      { id: 'system-dispatcher',        label: 'Dispatcher rules',    path: '/system/dispatcher',  permKey: 'system-dispatcher' },
+    'system-model':          { id: 'system-model',            label: 'System Model',        path: '/system',             permKey: 'system-model' },
+    'system-subjects':        { id: 'system-subjects',          label: 'Subjects & Classes',  path: '/system/subjects',    permKey: 'system-subjects' },
     // The rule-authoring list + editor are reached via a link FROM the
-    // cascade viz (the it-dispatcher Surface entry), not their own sidebar
+    // cascade viz (the system-dispatcher Surface entry), not their own sidebar
     // rows — so these catalog entries exist to satisfy the
     // Record<RouteName,…> type but are intentionally absent from
     // SURFACE_ORDER (no sidebar item ⇒ no sidebar-consistency entry).
-    'it-dispatcher-rules': { id: 'it-dispatcher-rules', label: 'Dispatcher rules — authoring', path: '/it/dispatcher/rules', permKey: 'it-dispatcher-rules' },
-    'it-dispatcher-rule':  { id: 'it-dispatcher-rule',  label: 'Dispatcher rule — editor',    path: '/it/dispatcher/rules', permKey: 'it-dispatcher-rule' },
-    'it-design':          { id: 'it-design',            label: 'Design review',       path: '/it/design',      permKey: 'it-design' },
-    'it-kb':              { id: 'it-kb',                label: 'IT Knowledge Base',   path: '/it/kb',          permKey: 'it-kb' },
-    'auth-admin':         { id: 'auth-admin',           label: 'Auth admin',          path: '/auth-admin',     permKey: 'auth-admin' },
+    'system-dispatcher-rules': { id: 'system-dispatcher-rules', label: 'Dispatcher rules — authoring', path: '/system/dispatcher/rules', permKey: 'system-dispatcher-rules' },
+    'system-dispatcher-rule':  { id: 'system-dispatcher-rule',  label: 'Dispatcher rule — editor',    path: '/system/dispatcher/rules', permKey: 'system-dispatcher-rule' },
+    'system-design':          { id: 'system-design',            label: 'Design review',       path: '/system/design',      permKey: 'system-design' },
+    'system-kb':              { id: 'system-kb',                label: 'Knowledge Base',      path: '/system/kb',          permKey: 'system-kb' },
+    'auth-admin':         { id: 'auth-admin',           label: 'Auth admin',          path: '/system/auth-admin', permKey: 'auth-admin' },
     // KB view of every active JobKind — read-only catalog,
     // visible to every role via canSeeRoute() short-circuit.
     // Editing lives at /job-kinds (Surface, gated to dept heads +
     // COO who author their own dept's work types).
-    workflows:            { id: 'workflows',          label: 'Workflows',           path: '/workflows',     permKey: 'workflows' },
+    workflows:            { id: 'workflows',          label: 'Workflows',           path: '/system/workflows', permKey: 'workflows' },
   };
 
   // Surfaces — one entry per department-rooted dashboard, in the
@@ -98,11 +98,11 @@
     'shipping',   // shipping department
     'support',    // support department
     'finance',    // finance department
-    'it-system', // IT — System Model hub (the IT landing, leads the cluster)
-    'it-monitoring', // IT department live state — service map, perf, events, atlas
-    'it-step-plugins', // IT — custom step UX bundles
-    'it-dispatcher', // IT — dispatcher rule cascade (read-only)
-    'it-subjects', // IT — SubjectKind taxonomy + Class registry (read-only)
+    'system-model', // System Model hub (the landing, leads the cluster)
+    'system-monitoring', // live state — service map, perf, events, atlas
+    'system-step-plugins', // custom step UX bundles
+    'system-dispatcher', // dispatcher rule cascade (read-only)
+    'system-subjects', // SubjectKind taxonomy + Class registry (read-only)
     // 'it-sim' retired 2026-05-03 with boss-sim-api (HumanWorker step 9b).
     'ops',        // operations
     'policy',     // dept heads + COO — author role/scope policy
@@ -121,7 +121,7 @@
       ROUTE_CATALOG.people,
       ROUTE_CATALOG['marketing-assets'],
       ROUTE_CATALOG.calendar,
-      { id: 'manual', label: 'Company manual', path: '/manual', permKey: 'inbox' },
+      { id: 'manual', label: 'Company manual', path: '/ux/manual', permKey: 'inbox' },
       // Workflows = KB of every active JobKind — everyone's
       // read-only catalog of "what kinds of work does this place
       // run?" Pairs with the /job-kinds Surface (editor), which
@@ -133,13 +133,13 @@
       // entries: ADRs and the architecture diagrams now live
       // under the IT department surface (paired with /it/monitoring
       // for live state).
-      ROUTE_CATALOG['it-kb'],
+      ROUTE_CATALOG['system-kb'],
       // Design review — brings back the workflow that was retired
       // 2026-05-03. Lists every docs/design/*.md with parsed open
       // questions + the in-flight design-doc-review Job (if any).
       // The "system modeling its own development" claim depends on
       // this surface existing.
-      ROUTE_CATALOG['it-design'],
+      ROUTE_CATALOG['system-design'],
     ],
   };
 
@@ -192,9 +192,9 @@
   // which classifies the same split by route kind to drive the active
   // tab — the two must agree for every routed surface.
   const MODEL_ROUTES = new Set<RouteName>([
-    'it-system', 'it-monitoring', 'it-step-plugins', 'it-dispatcher',
-    'it-subjects', 'it-dispatcher-rules', 'it-dispatcher-rule',
-    'it-kb', 'it-design', 'policy', 'job-kinds', 'workflows', 'auth-admin',
+    'system-model', 'system-monitoring', 'system-step-plugins', 'system-dispatcher',
+    'system-subjects', 'system-dispatcher-rules', 'system-dispatcher-rule',
+    'system-kb', 'system-design', 'policy', 'job-kinds', 'workflows', 'auth-admin',
   ]);
   function inPerspective(i: NavItem): boolean {
     const isModel = i.permKey !== undefined && MODEL_ROUTES.has(i.permKey);
@@ -223,23 +223,23 @@
       {#if perspective === 'user'}
         <div class="shell-nav-personal">
           <a
-            href="/me"
+            href="/ux/me"
             class="shell-nav-item shell-nav-home {activeSection === 'me' ? 'shell-nav-item-active' : ''}"
-            onclick={(e) => onLinkClick(e, '/me')}
+            onclick={(e) => onLinkClick(e, '/ux/me')}
           >
             My Day
           </a>
           <a
-            href="/inbox"
+            href="/ux/inbox"
             class="shell-nav-item {activeSection === 'inbox' ? 'shell-nav-item-active' : ''}"
-            onclick={(e) => onLinkClick(e, '/inbox')}
+            onclick={(e) => onLinkClick(e, '/ux/inbox')}
           >
             Inbox
           </a>
           <a
-            href="/shop"
+            href="/ux/shop"
             class="shell-nav-item {activeSection === 'shop' ? 'shell-nav-item-active' : ''}"
-            onclick={(e) => onLinkClick(e, '/shop')}
+            onclick={(e) => onLinkClick(e, '/ux/shop')}
           >
             Shop
           </a>

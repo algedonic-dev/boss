@@ -62,7 +62,7 @@
   </div>
 {:else if !shipment}
   <div class="catalog theme-exec">
-    <Breadcrumb to={href('/shipping')}>
+    <Breadcrumb to={href('/ux/shipping')}>
       ← Shipping
     </Breadcrumb>
     <div class="exec-header"><h1 class="exec-title">Shipment not found</h1></div>
@@ -71,7 +71,7 @@
 {:else}
   {@const s = shipment}
   <div class="detail-page theme-exec">
-    <Breadcrumb to={href('/shipping')}>
+    <Breadcrumb to={href('/ux/shipping')}>
       ← Shipping
     </Breadcrumb>
 

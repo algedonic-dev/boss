@@ -130,7 +130,7 @@
   {@const s = d.service}
 
   <div class="detail-page theme-exec">
-    <Breadcrumb to={href('/catalog')}>
+    <Breadcrumb to={href('/ux/catalog')}>
       ← All devices
     </Breadcrumb>
 

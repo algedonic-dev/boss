@@ -199,7 +199,7 @@
 </script>
 
 <div class="theme-exec" style="padding:0 32px 32px">
-  <Breadcrumb to={href('/finance')}>
+  <Breadcrumb to={href('/ux/finance')}>
     ← Finance
   </Breadcrumb>
   <PageHeader
@@ -346,7 +346,7 @@
       <button
         type="button"
         class="ni-btn"
-        onclick={() => navigate(href('/finance'))}
+        onclick={() => navigate(href('/ux/finance'))}
         disabled={saving}
       >
         Cancel

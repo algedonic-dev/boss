@@ -130,7 +130,7 @@
     <div class="subject-actions">
       <a
         class="action-btn"
-        href={href(`/jobs?new=1&subject_kind=system&subject_id=${encodeURIComponent(device.asset_id)}`)}
+        href={href(`/ux/jobs?new=1&subject_kind=system&subject_id=${encodeURIComponent(device.asset_id)}`)}
       >
         + Create a Job for this device
       </a>

@@ -1,5 +1,5 @@
 <script lang="ts">
-  // /admin/job-kinds/:slug — port of
+  // /system/job-kinds/:slug — port of
   // apps/web/src/admin/JobKindDetailPage.tsx.
 
   import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
@@ -46,7 +46,7 @@
         appToday(),
         { title: `Edit ${spec.kind}`, previousVersion: spec.version },
       );
-      navigate(href(`/admin/job-kinds/authoring/${encodeURIComponent(jobId)}`));
+      navigate(href(`/system/job-kinds/authoring/${encodeURIComponent(jobId)}`));
     } catch (e) {
       actionError = e instanceof Error ? e.message : String(e);
       action = null;
@@ -202,7 +202,7 @@
     : null}
 
   <div class="catalog theme-exec">
-    <Breadcrumb to={href('/job-kinds')}>
+    <Breadcrumb to={href('/system/job-kinds')}>
       ← All job kinds
     </Breadcrumb>
     <PageHeader
@@ -233,7 +233,7 @@
       <button
         type="button"
         class="wb-btn"
-        onclick={() => navigate(href(`/admin/job-kinds/new?fork=${encodeURIComponent(spec.kind)}`))}
+        onclick={() => navigate(href(`/system/job-kinds/new?fork=${encodeURIComponent(spec.kind)}`))}
         title="Create a new kind pre-populated from this one"
       >
         Fork…

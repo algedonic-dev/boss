@@ -1,5 +1,5 @@
 <script lang="ts">
-  // /admin/job-kinds — port of apps/web/src/admin/JobKindsPage.tsx.
+  // /system/job-kinds — port of apps/web/src/admin/JobKindsPage.tsx.
 
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
@@ -55,7 +55,7 @@
   {/if}
 
   <div style="padding:0 24px 16px">
-    <Link to={href('/job-kinds/new')} className="wb-btn wb-btn-primary">
+    <Link to={href('/system/job-kinds/new')} className="wb-btn wb-btn-primary">
       + Create new kind
     </Link>
   </div>
@@ -78,7 +78,7 @@
               {#each byCategory.get(cat) ?? [] as k (k.kind)}
                 <tr>
                   <td>
-                    <Link to={href(`/admin/job-kinds/${encodeURIComponent(k.kind)}`)}>
+                    <Link to={href(`/system/job-kinds/${encodeURIComponent(k.kind)}`)}>
                       <span class="mono">{k.kind}</span>
                     </Link>
                   </td>

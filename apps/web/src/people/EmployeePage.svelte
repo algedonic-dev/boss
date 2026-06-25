@@ -103,7 +103,7 @@
 {:else}
   {@const e = employee}
   <div class="detail-page theme-exec">
-    <Breadcrumb to={href('/people')}>
+    <Breadcrumb to={href('/ux/people')}>
       ← All employees
     </Breadcrumb>
 
@@ -129,7 +129,7 @@
     <div class="subject-actions">
       <a
         class="action-btn"
-        href={href(`/jobs?new=1&subject_kind=employee&subject_id=${encodeURIComponent(e.id)}`)}
+        href={href(`/ux/jobs?new=1&subject_kind=employee&subject_id=${encodeURIComponent(e.id)}`)}
       >
         + Create a Job for this employee
       </a>
@@ -235,7 +235,7 @@
       <Section title="Job assignments" wide>
           <p class="prose">
             View this employee's owned jobs in the
-            <Link to={href(`/jobs?owner_id=${encodeURIComponent(e.id)}&status=`)}>
+            <Link to={href(`/ux/jobs?owner_id=${encodeURIComponent(e.id)}&status=`)}>
               Jobs list
             </Link>.
           </p>

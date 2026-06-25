@@ -302,9 +302,9 @@ which one matters first.
       top of this section.
 
 - [ ] **Workflow modeling UX improvements.** The release ships a
-      functional `/job-kinds` editor (read-only catalog at
-      `/workflows`, full author surface at `/job-kinds`) plus
-      `/admin/step-plugins` for custom step UX bundles. The
+      functional `/system/job-kinds` editor (read-only catalog at
+      `/system/workflows`, full author surface at `/system/job-kinds`) plus
+      `/system/step-plugins` for custom step UX bundles. The
       modeling experience is correct but rough — it leans on
       operators understanding the StepGraph / TierSpec / step
       registry up front. Polish:

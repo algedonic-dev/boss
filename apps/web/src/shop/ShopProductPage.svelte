@@ -193,7 +193,7 @@
 
 {#if !product}
   <div class="catalog theme-exec">
-    <Breadcrumb to={href('/shop')}>← All beer</Breadcrumb>
+    <Breadcrumb to={href('/ux/shop')}>← All beer</Breadcrumb>
     <div class="exec-header"><h1 class="exec-title">Beer not found</h1></div>
     <p class="empty">No beer with SKU <code>{sku}</code> in the brewery catalog.</p>
   </div>
@@ -204,7 +204,7 @@
   {@const inStock = (onHand ?? 0) > 0}
 
   <div class="detail-page theme-exec">
-    <Breadcrumb to={href('/shop')}>← All beer</Breadcrumb>
+    <Breadcrumb to={href('/ux/shop')}>← All beer</Breadcrumb>
 
     <header class="detail-hero">
       <div>

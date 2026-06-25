@@ -130,11 +130,11 @@
               {@const linkedCount = a.linked_device_skus.length + a.linked_account_ids.length + a.linked_campaign_ids.length}
               <tr
                 style={`cursor:pointer; opacity:${retired ? 0.55 : 1}`}
-                onclick={() => navigate(href(`/marketing-assets/${encodeURIComponent(a.id)}`))}
+                onclick={() => navigate(href(`/ux/marketing-assets/${encodeURIComponent(a.id)}`))}
               >
                 <td>
                   <a
-                    href={href(`/marketing-assets/${encodeURIComponent(a.id)}`)}
+                    href={href(`/ux/marketing-assets/${encodeURIComponent(a.id)}`)}
                     onclick={(e) => e.stopPropagation()}
                   >
                     {a.title}
