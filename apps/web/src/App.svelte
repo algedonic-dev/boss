@@ -13,6 +13,7 @@
   import { loadStepTypeRegistry } from './steps/surfaceRegistry.svelte';
   import { loadClasses } from '@boss/web-kit/session/classes.svelte';
   import AppShell from './shell/AppShell.svelte';
+  import PerspectiveTabs from '@boss/web-kit/PerspectiveTabs.svelte';
   import DebugGear from './debug/DebugGear.svelte';
   import MePage from './me/MePage.svelte';
   import JobsListPage from './jobs/JobsListPage.svelte';
@@ -197,11 +198,26 @@
       : route.kind === 'workflows' ? 'workflows'
       : 'me',
   );
+
+  // Top-level perspective for the PerspectiveTabs bar. The System Model
+  // surfaces (the IT / model-definition tools) are one perspective; the
+  // operator work surfaces are the other. (Simulator is its own app.)
+  // This is the seam for the eventual Model/User app split.
+  const MODEL_KINDS = new Set<Route['kind']>([
+    'itSystem', 'itSubjects', 'itKb', 'itDesign',
+    'itMonitoring', 'itMonitoringPerf', 'itMonitoringEvents', 'itMonitoringAtlas',
+    'itStepPlugins', 'itStepPluginDetail',
+    'dispatcherRules', 'dispatcherRulesList', 'dispatcherRuleEdit',
+    'jobKinds', 'jobKindNew', 'jobKindDesign', 'jobKindDetail',
+    'policy', 'workflows',
+  ]);
+  let perspective: 'model' | 'user' = $derived(MODEL_KINDS.has(route.kind) ? 'model' : 'user');
 </script>
 
 {#if route.kind === 'login'}
   <LoginPage />
 {:else}
+  <PerspectiveTabs active={perspective} />
 <AppShell {activeSection}>
   {#if blockedModule}
     <ModuleDisabled module={blockedModule.id} label={blockedModule.label} />

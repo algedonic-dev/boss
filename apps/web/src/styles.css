@@ -43,6 +43,9 @@ html, body {
   display: grid;
   grid-template-columns: 200px 1fr;
   min-height: 100vh;
+  /* Offset below the fixed 44px PerspectiveTabs bar. */
+  box-sizing: border-box;
+  padding-top: 44px;
 }
 
 .shell-sidebar {
@@ -51,7 +54,7 @@ html, body {
   display: flex;
   flex-direction: column;
   position: fixed;
-  top: 0; left: 0; bottom: 0;
+  top: 44px; left: 0; bottom: 0;
   width: 200px;
   z-index: 20;
   overflow-y: auto;
@@ -119,7 +122,7 @@ html, body {
 .shell-topbar {
   display: flex; align-items: center; justify-content: space-between;
   padding: 8px 24px; border-bottom: 1px solid #e7e5e4;
-  background: #fff; position: sticky; top: 0; z-index: 10;
+  background: #fff; position: sticky; top: 44px; z-index: 10;
 }
 .shell-topbar-left { display: flex; align-items: center; gap: 16px; }
 .shell-topbar-right { display: flex; align-items: center; gap: 8px; }

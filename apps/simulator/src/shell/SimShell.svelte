@@ -10,6 +10,7 @@
   // wrapper — keeps the shell self-contained. The brewery accent vars
   // (--brew-*) come from styles.css :root.
   import SystemTime from '@boss/web-kit/SystemTime.svelte';
+  import PerspectiveTabs from '@boss/web-kit/PerspectiveTabs.svelte';
   import { href, navigate, type Route } from '../router';
 
   let { route, children } = $props<{
@@ -30,6 +31,7 @@
 </script>
 
 <div class="sim-shell">
+  <PerspectiveTabs active="simulator" />
   <header class="sim-topbar">
     <div class="sim-brand">
       <span class="sim-brand-name">BOSS</span>
@@ -67,6 +69,9 @@
     --text-dim: #78716c;
 
     min-height: 100vh;
+    /* Offset below the fixed 44px PerspectiveTabs bar. */
+    padding-top: 44px;
+    box-sizing: border-box;
     background: var(--bg);
     color: var(--text);
     font-family: var(--font-body);
@@ -79,7 +84,7 @@
     background: var(--card);
     border-bottom: 2px solid var(--brew-amber);
     position: sticky;
-    top: 0;
+    top: 44px;
     z-index: 10;
   }
   .sim-brand {

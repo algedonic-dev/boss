@@ -9,7 +9,8 @@
     "./nav": "./src/nav.ts",
     "./sim-clock": "./src/sim-clock.svelte.ts",
     "./sim-clock-types": "./src/sim-clock-types.ts",
-    "./SystemTime.svelte": "./src/SystemTime.svelte"
+    "./SystemTime.svelte": "./src/SystemTime.svelte",
+    "./PerspectiveTabs.svelte": "./src/PerspectiveTabs.svelte"
   },
   "peerDependencies": { "svelte": "^5.55.9" }
 }
