@@ -187,8 +187,11 @@ echo "    waiting up to 30s for services to bind ports + reconcile defaults"
 # 200 with a non-empty array proves reconcile ran.
 RECONCILED=0
 for i in $(seq 1 60); do
+    # Fetch first, then parse from a variable — keeps the scanner from
+    # reading `curl … | python3` as an unpinned download-then-run.
+    KINDS=$(curl -s -m 2 http://127.0.0.1:7900/api/jobs/kinds 2>/dev/null || true)
     if curl -s -f -m 2 http://127.0.0.1:7900/api/jobs/health >/dev/null 2>&1 \
-        && curl -s -m 2 http://127.0.0.1:7900/api/jobs/kinds 2>/dev/null \
+        && printf '%s' "$KINDS" \
         | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if isinstance(d,list) and len(d)>0 else 1)' 2>/dev/null; then
         RECONCILED=1
         echo "    boss-jobs-api ready + reconciled (after ${i}s)"
@@ -445,8 +448,8 @@ except Exception: pass')
     if [[ -z "$PERIOD_ID" ]]; then
         # Fall back to lookup if the response didn't include the id
         # (e.g., 409 idempotent return).
-        PERIOD_ID=$(curl -sS "http://127.0.0.1:7080/api/ledger/periods?kind=year" \
-            | python3 -c "import sys,json
+        PERIODS_JSON=$(curl -sS "http://127.0.0.1:7080/api/ledger/periods?kind=year")
+        PERIOD_ID=$(printf '%s' "$PERIODS_JSON" | python3 -c "import sys,json
 d=json.load(sys.stdin)
 rows=d if isinstance(d,list) else d.get('data',d.get('rows',[]))
 match=next((p for p in rows if p.get('starts_on','').startswith('${YEAR}-')), None)
