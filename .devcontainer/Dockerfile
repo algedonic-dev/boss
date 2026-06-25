@@ -2,7 +2,10 @@
 # clippy), git, curl, and the non-root `vscode` user the container runs
 # as. We add the workspace's system build deps + the postgres client +
 # Bun (the web toolchain).
-FROM mcr.microsoft.com/devcontainers/rust:1-bookworm
+# Pinned by manifest-list digest (multi-arch) for supply-chain integrity;
+# tag kept in the comment so Dependabot/humans can see what it resolves to.
+# Refresh: docker buildx imagetools inspect mcr.microsoft.com/devcontainers/rust:1-bookworm
+FROM mcr.microsoft.com/devcontainers/rust:1-bookworm@sha256:7d2b4e7912ea2913ce82f29299b0934b716234d0fe49e5edf5f05f7d36ef2d80
 
 # - cmake + clang: ring / aws-lc-sys (rustls) build their C/asm bits
 # - pkg-config + libssl-dev: native crates that probe for OpenSSL
