@@ -1453,7 +1453,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "boss-policy-client",
  "boss-ports",
+ "reqwest 0.13.4",
+ "serde",
  "serde_json",
  "tokio",
  "tower-http 0.7.0",
