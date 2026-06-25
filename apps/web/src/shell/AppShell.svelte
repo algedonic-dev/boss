@@ -194,13 +194,25 @@
   const MODEL_GROUPS: ReadonlyArray<NavGroup> = [
     {
       label: 'Run',
-      items: [ROUTE_CATALOG['system-model'], ROUTE_CATALOG['system-monitoring']],
+      items: [
+        ROUTE_CATALOG['system-model'],
+        ROUTE_CATALOG['system-monitoring'],
+        // Audit Log + Atlas are sub-pages of monitoring with no
+        // distinct permKey — plain NavItems (permKey-less ⇒ always
+        // visible + always in-perspective; see visible()/inPerspective()).
+        { id: 'system-audit', label: 'Audit Log', path: '/system/monitoring/events' },
+        { id: 'system-atlas', label: 'Atlas', path: '/system/monitoring/atlas' },
+      ],
     },
     {
       label: 'Define',
       items: [
+        // Workflows is the single UI surface for JobKinds: the
+        // read-only catalog that also links into the authoring
+        // routes (/system/job-kinds*). The separate "Job kinds"
+        // sidebar entry was dropped — authoring is reached FROM
+        // Workflows, not its own sidebar row.
         ROUTE_CATALOG.workflows,
-        ROUTE_CATALOG['job-kinds'],
         ROUTE_CATALOG['system-subjects'],
         ROUTE_CATALOG['system-step-plugins'],
         ROUTE_CATALOG['system-dispatcher'],
@@ -234,7 +246,11 @@
     'system-kb', 'system-design', 'system-experiments', 'policy', 'job-kinds', 'workflows', 'auth-admin',
   ]);
   function inPerspective(i: NavItem): boolean {
-    const isModel = i.permKey !== undefined && MODEL_ROUTES.has(i.permKey);
+    // A permKey-less NavItem (e.g. a plain sub-page link like Audit
+    // Log / Atlas) carries no perspective classification — it belongs
+    // to whatever group it's placed in, so it's always in-perspective.
+    if (i.permKey === undefined) return true;
+    const isModel = MODEL_ROUTES.has(i.permKey);
     return perspective === 'model' ? isModel : !isModel;
   }
 

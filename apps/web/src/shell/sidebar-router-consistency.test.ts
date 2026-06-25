@@ -56,6 +56,8 @@ const SIDEBAR_PATHS: ReadonlyArray<string> = [
   '/ux/ops',
   '/ux/exec',
   '/system/monitoring',
+  '/system/monitoring/events', // "Audit Log" — plain sub-page link in the Run group
+  '/system/monitoring/atlas', // "Atlas" — plain sub-page link in the Run group
   '/ux/calendar/me', // "My schedule" — was /schedule (bug fixed 2026-05-22)
   '/ux/catalog',
   '/ux/parts',
@@ -69,7 +71,9 @@ const SIDEBAR_PATHS: ReadonlyArray<string> = [
   '/ux/marketing-assets',
   '/ux/calendar',
   '/system/policy',
-  '/system/job-kinds',
+  // '/system/job-kinds' removed: "Job kinds" is no longer a sidebar
+  // entry (Workflows is the single JobKind surface; authoring is
+  // reached from there). The route itself still resolves.
   '/system/step-plugins',
   '/system/dispatcher',
   '/system/kb',
