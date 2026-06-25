@@ -239,7 +239,7 @@ All five open questions resolved 2026-06-19.
   - `designJob.ts` — the design-Job client (create / load / find-step /
     persist-spec-to-publish-step / complete-step / sign-off) + the pure
     `initialSpec` seed (unit-tested).
-  - `JobKindDesignWorkspace.svelte` + `/admin/job-kinds/authoring/:jobId` —
+  - `JobKindDesignWorkspace.svelte` + `/system/job-kinds/authoring/:jobId` —
     loads the design Job, binds the surface to the publish step's
     `job_kind_spec` (debounced PATCH), drives author → validate (gated on the
     live dry-run being clean) → approve (sign-off) → publish.

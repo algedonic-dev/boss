@@ -1,0 +1,8 @@
+# Registers bun-plugin-svelte with Bun's Fullstack Dev Server so
+# `dev-server.ts`'s HTML entrypoint (index.html) gets bundled +
+# hot-reloaded when .svelte / .ts / .css files change. No effect
+# on the production build, which runs `Bun.build` with the plugin
+# passed explicitly.
+
+[serve.static]
+plugins = ["bun-plugin-svelte"]

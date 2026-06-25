@@ -8,7 +8,7 @@ point** in BOSS:
 
 | Want to add… | Build… | Code? |
 |---|---|---|
-| A new workflow that composes existing steps | A JobKind row at `/admin/job-kinds` | No |
+| A new workflow that composes existing steps | A JobKind row at `/system/job-kinds` | No |
 | A new step kind with its own UX surface | A StepPlugin (this directory) | JS only |
 | A new domain entity (Subject kind) | A new crate | Rust |
 
@@ -213,7 +213,7 @@ e.g. `pour-quality-check.js` — the gateway resolves it under
 **A. Via the API:**
 `POST /api/jobs/step-plugins` with that body. The row lands in the
 `step_plugins` table; on the next SPA load, any step with
-`kind=pour-quality-check` mounts your plugin. `/it/step-plugins`
+`kind=pour-quality-check` mounts your plugin. `/system/step-plugins`
 lists the active rows (read-only — there's no create form there yet).
 
 **B. Via SQL seed (canonical / testing flows):**
@@ -234,7 +234,7 @@ plugin registry is fetched at boot; a hard refresh forces it).
 ### 5. Use it
 
 Author or update a JobKind that includes a step of
-`kind=pour-quality-check` (via `/admin/job-kinds`), open a Job of
+`kind=pour-quality-check` (via `/system/job-kinds`), open a Job of
 that kind, and the step renders your plugin's surface instead of
 the generic typed-fields form.
 

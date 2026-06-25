@@ -167,14 +167,14 @@ is sparse on first load and fills in as the sim runs.
 
 Try:
 
-- `/exec` — the executive dashboard.
-- `/it/monitoring` — service health, deployment topology, ML
+- `/ux/exec` — the executive dashboard.
+- `/system/monitoring` — service health, deployment topology, ML
   oversight.
-- `/it/kb` — architecture diagrams, ADRs, hardware/software
+- `/system/kb` — architecture diagrams, ADRs, hardware/software
   reference.
-- `/jobs` — every Job in flight.
-- `/workflows` — the JobKind catalog (read-only).
-- `/job-kinds` — JobKind authoring (visible to your platform-admin
+- `/ux/jobs` — every Job in flight.
+- `/system/workflows` — the JobKind catalog (read-only).
+- `/system/job-kinds` — JobKind authoring (visible to your platform-admin
   role).
 
 ## Stop it

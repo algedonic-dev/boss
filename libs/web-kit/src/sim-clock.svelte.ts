@@ -22,7 +22,7 @@
 // See: docs/design/correctness-protocol.md (model the current time
 // as an input we control, end-to-end — backend + SPA halves).
 
-import type { SimClockState } from '../landing/types';
+import type { SimClockState } from './sim-clock-types';
 
 let _clock = $state<SimClockState | null>(null);
 let _asOfOverride = $state<string | null>(null);

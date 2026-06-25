@@ -9,13 +9,13 @@
   // department, the CTO is a role; the surface follows the
   // department, not the role.
 
-  import PageHeader from '../../ui/PageHeader.svelte';
-  import Section from '../../ui/Section.svelte';
-  import Link from '../../ui/Link.svelte';
-  import EntityLink from '../../ui/EntityLink.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import MlModelsPanel from './MlModelsPanel.svelte';
   import { href } from '../../router';
-  import { moduleEnabled } from '../../session/manifest.svelte';
+  import { moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
   import { PORTS } from '../../_generated/ports';
 
   type ServiceStatus = 'healthy' | 'degraded' | 'down' | 'unknown';
@@ -244,8 +244,8 @@
 
 <div class="catalog theme-exec">
   <PageHeader
-    eyebrow="IT department · Monitoring"
-    title="IT Monitoring"
+    eyebrow="System Model · Monitoring"
+    title="Monitoring"
     subtitle="Live state of every BOSS service — health probes, deployment topology, ML model oversight"
   />
 
@@ -324,7 +324,7 @@
             </tbody>
           </table>
           <p style="margin-top:12px; text-align:right">
-            <Link to={href('/watchlist')}>
+            <Link to={href('/ux/watchlist')}>
               View full watchlist →
             </Link>
           </p>
@@ -357,13 +357,13 @@
 
     <Section title="Quick links">
         <div class="cto-links">
-          <Link to={href('/ops')} className="cto-link">
+          <Link to={href('/ux/ops')} className="cto-link">
             Cybernetics Observability
           </Link>
-          <Link to={href('/it/monitoring/perf')} className="cto-link">
+          <Link to={href('/system/monitoring/perf')} className="cto-link">
             Gateway Latency
           </Link>
-          <Link to={href('/it/monitoring/events')} className="cto-link">
+          <Link to={href('/system/monitoring/events')} className="cto-link">
             Audit Log Tail
           </Link>
           {#if moduleEnabled('equipment')}
@@ -371,17 +371,17 @@
                  [modules].equipment = false; these links hide.
                  Used-device-shop's tenant manifest defaults
                  missing keys to true so all three show. -->
-            <Link to={href('/assets')} className="cto-link">
+            <Link to={href('/ux/assets')} className="cto-link">
               Devices Overview
             </Link>
-            <Link to={href('/catalog')} className="cto-link">
+            <Link to={href('/ux/catalog')} className="cto-link">
               Device Catalog
             </Link>
-            <Link to={href('/it/monitoring/atlas')} className="cto-link">
+            <Link to={href('/system/monitoring/atlas')} className="cto-link">
               System Atlas
             </Link>
           {/if}
-          <Link to={href('/exec')} className="cto-link">
+          <Link to={href('/ux/exec')} className="cto-link">
             Exec Dashboard
           </Link>
         </div>

@@ -7,13 +7,12 @@
   // shaped pages live in the regular sidebar gated by the policy
   // role check.
 
-  import { session } from '../session/session.svelte';
-  import { moduleEnabled, getLabel } from '../session/manifest.svelte';
-  import { canSeeRoute, type RouteName, type Role } from '../session/permissions';
-  import { workForRole } from '../session/work-by-role';
+  import { session } from '@boss/web-kit/session/session.svelte';
+  import { moduleEnabled, getLabel } from '@boss/web-kit/session/manifest.svelte';
+  import { canSeeRoute, type RouteName, type Role } from '@boss/web-kit/session/permissions';
+  import { workForRole } from '@boss/web-kit/session/work-by-role';
   import { navigate } from '../router';
   import PersonaSwitcher from '../session/PersonaSwitcher.svelte';
-  import SimClockBadge from './SimClockBadge.svelte';
 
   type NavItem = Readonly<{
     id: string;
@@ -34,56 +33,59 @@
   // this catalog by RouteName, which keeps labels + module gates from
   // drifting between the two groups.
   const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
-    jobs:      { id: 'jobs',      label: 'All jobs',         path: '/jobs',      permKey: 'jobs' },
-    sales:     { id: 'sales',     label: 'Sales pipeline',   path: '/sales',     permKey: 'sales' },
-    service:   { id: 'service',   label: 'Service queue',    path: '/service',   permKey: 'service',   module: 'support' },
-    refurb:    { id: 'refurb',    label: 'Refurbishment',    path: '/refurb',    permKey: 'refurb',    module: 'support' },
-    qa:        { id: 'qa',        label: 'QA',               path: '/qa',        permKey: 'qa',        module: 'qa' },
-    finance:   { id: 'finance',   label: 'Finance',          path: '/finance',   permKey: 'finance',   module: 'finance' },
-    warehouse: { id: 'warehouse', label: 'Inventory',        path: '/warehouse', permKey: 'warehouse', module: 'warehouse' },
-    shipping:  { id: 'shipping',  label: 'Shipments',        path: '/shipping',  permKey: 'shipping',  module: 'shipping' },
-    support:   { id: 'support',   label: 'Support',          path: '/support',   permKey: 'support',   module: 'support' },
-    ops:       { id: 'ops',       label: 'Operations',       path: '/ops',       permKey: 'ops' },
-    exec:      { id: 'exec',      label: 'Exec',             path: '/exec',      permKey: 'exec',      module: 'exec' },
-    'it-monitoring': { id: 'it-monitoring', label: 'IT Monitoring', path: '/it/monitoring', permKey: 'it-monitoring' },
-    schedule:  { id: 'schedule',  label: 'My schedule',      path: '/calendar/me', permKey: 'schedule' },
-    catalog:   { id: 'catalog',   label: 'Equipment',        path: '/catalog',   permKey: 'catalog',   module: 'equipment' },
-    parts:     { id: 'parts',     label: 'Ingredients & parts', path: '/parts',  permKey: 'parts',     module: 'parts' },
-    products:  { id: 'products',  label: 'Products',         path: '/products',  permKey: 'parts',     module: 'parts' },
-    accounts:  { id: 'accounts',  label: 'Accounts',         path: '/accounts',  permKey: 'accounts' },
-    vendors:   { id: 'vendors',   label: 'Vendors',          path: '/vendors',   permKey: 'vendors' },
-    people:    { id: 'people',    label: 'Employees',        path: '/people',    permKey: 'people' },
-    assets:    { id: 'assets',    label: 'Assets',             path: '/assets',    permKey: 'assets',    module: 'equipment' },
-    shop:      { id: 'shop',      label: 'Shop',             path: '/shop',      permKey: 'shop' },
-    inbox:     { id: 'inbox',     label: 'Inbox',            path: '/inbox',     permKey: 'inbox' },
+    jobs:      { id: 'jobs',      label: 'All jobs',         path: '/ux/jobs',      permKey: 'jobs' },
+    sales:     { id: 'sales',     label: 'Sales pipeline',   path: '/ux/sales',     permKey: 'sales' },
+    service:   { id: 'service',   label: 'Service queue',    path: '/ux/service',   permKey: 'service',   module: 'support' },
+    refurb:    { id: 'refurb',    label: 'Refurbishment',    path: '/ux/refurb',    permKey: 'refurb',    module: 'support' },
+    qa:        { id: 'qa',        label: 'QA',               path: '/ux/qa',        permKey: 'qa',        module: 'qa' },
+    finance:   { id: 'finance',   label: 'Finance',          path: '/ux/finance',   permKey: 'finance',   module: 'finance' },
+    warehouse: { id: 'warehouse', label: 'Inventory',        path: '/ux/warehouse', permKey: 'warehouse', module: 'warehouse' },
+    shipping:  { id: 'shipping',  label: 'Shipments',        path: '/ux/shipping',  permKey: 'shipping',  module: 'shipping' },
+    support:   { id: 'support',   label: 'Support',          path: '/ux/support',   permKey: 'support',   module: 'support' },
+    ops:       { id: 'ops',       label: 'Operations',       path: '/ux/ops',       permKey: 'ops' },
+    exec:      { id: 'exec',      label: 'Exec',             path: '/ux/exec',      permKey: 'exec',      module: 'exec' },
+    'system-monitoring': { id: 'system-monitoring', label: 'Monitoring', path: '/system/monitoring', permKey: 'system-monitoring' },
+    schedule:  { id: 'schedule',  label: 'My schedule',      path: '/ux/calendar/me', permKey: 'schedule' },
+    catalog:   { id: 'catalog',   label: 'Equipment',        path: '/ux/catalog',   permKey: 'catalog',   module: 'equipment' },
+    parts:     { id: 'parts',     label: 'Ingredients & parts', path: '/ux/parts',  permKey: 'parts',     module: 'parts' },
+    products:  { id: 'products',  label: 'Products',         path: '/ux/products',  permKey: 'parts',     module: 'parts' },
+    accounts:  { id: 'accounts',  label: 'Accounts',         path: '/ux/accounts',  permKey: 'accounts' },
+    vendors:   { id: 'vendors',   label: 'Vendors',          path: '/ux/vendors',   permKey: 'vendors' },
+    people:    { id: 'people',    label: 'Employees',        path: '/ux/people',    permKey: 'people' },
+    assets:    { id: 'assets',    label: 'Assets',             path: '/ux/assets',    permKey: 'assets',    module: 'equipment' },
+    shop:      { id: 'shop',      label: 'Shop',             path: '/ux/shop',      permKey: 'shop' },
+    inbox:     { id: 'inbox',     label: 'Inbox',            path: '/ux/inbox',     permKey: 'inbox' },
     // 'it-sim' retired 2026-05-03 with boss-sim-api (HumanWorker step 9b).
-    'marketing-assets': { id: 'marketing-assets', label: 'Marketing assets', path: '/marketing-assets', permKey: 'marketing-assets', module: 'marketing-assets' },
-    calendar:  { id: 'calendar',  label: 'Release calendar', path: '/calendar',  permKey: 'calendar',  module: 'calendar' },
+    'marketing-assets': { id: 'marketing-assets', label: 'Marketing assets', path: '/ux/marketing-assets', permKey: 'marketing-assets', module: 'marketing-assets' },
+    calendar:  { id: 'calendar',  label: 'Release calendar', path: '/ux/calendar',  permKey: 'calendar',  module: 'calendar' },
     // Modeling surfaces — operator-tier (no separate /admin tier).
     // policy + job-kinds are dept-head + COO authority (per the
     // "engineers are operators like anyone else" frame). Step
     // plugins are JS bundle authoring → IT engineering work.
-    policy:               { id: 'policy',               label: 'Policy',              path: '/policy',         permKey: 'policy' },
-    'job-kinds':          { id: 'job-kinds',            label: 'Job kinds',           path: '/job-kinds',      permKey: 'job-kinds' },
-    'it-step-plugins':    { id: 'it-step-plugins',      label: 'Step plugins',        path: '/it/step-plugins', permKey: 'it-step-plugins' },
-    'it-dispatcher':      { id: 'it-dispatcher',        label: 'Dispatcher rules',    path: '/it/dispatcher',  permKey: 'it-dispatcher' },
-    'it-system':          { id: 'it-system',            label: 'System Model',        path: '/it',             permKey: 'it-system' },
-    'it-subjects':        { id: 'it-subjects',          label: 'Subjects & Classes',  path: '/it/subjects',    permKey: 'it-subjects' },
+    policy:               { id: 'policy',               label: 'Policy',              path: '/system/policy',  permKey: 'policy' },
+    'job-kinds':          { id: 'job-kinds',            label: 'Job kinds',           path: '/system/job-kinds', permKey: 'job-kinds' },
+    'system-step-plugins':    { id: 'system-step-plugins',      label: 'Step plugins',        path: '/system/step-plugins', permKey: 'system-step-plugins' },
+    'system-dispatcher':      { id: 'system-dispatcher',        label: 'Dispatcher rules',    path: '/system/dispatcher',  permKey: 'system-dispatcher' },
+    'system-model':          { id: 'system-model',            label: 'System Model',        path: '/system',             permKey: 'system-model' },
+    'system-subjects':        { id: 'system-subjects',          label: 'Subjects & Classes',  path: '/system/subjects',    permKey: 'system-subjects' },
     // The rule-authoring list + editor are reached via a link FROM the
-    // cascade viz (the it-dispatcher Surface entry), not their own sidebar
+    // cascade viz (the system-dispatcher Surface entry), not their own sidebar
     // rows — so these catalog entries exist to satisfy the
     // Record<RouteName,…> type but are intentionally absent from
     // SURFACE_ORDER (no sidebar item ⇒ no sidebar-consistency entry).
-    'it-dispatcher-rules': { id: 'it-dispatcher-rules', label: 'Dispatcher rules — authoring', path: '/it/dispatcher/rules', permKey: 'it-dispatcher-rules' },
-    'it-dispatcher-rule':  { id: 'it-dispatcher-rule',  label: 'Dispatcher rule — editor',    path: '/it/dispatcher/rules', permKey: 'it-dispatcher-rule' },
-    'it-design':          { id: 'it-design',            label: 'Design review',       path: '/it/design',      permKey: 'it-design' },
-    'it-kb':              { id: 'it-kb',                label: 'IT Knowledge Base',   path: '/it/kb',          permKey: 'it-kb' },
-    'auth-admin':         { id: 'auth-admin',           label: 'Auth admin',          path: '/auth-admin',     permKey: 'auth-admin' },
+    'system-dispatcher-rules': { id: 'system-dispatcher-rules', label: 'Dispatcher rules — authoring', path: '/system/dispatcher/rules', permKey: 'system-dispatcher-rules' },
+    'system-dispatcher-rule':  { id: 'system-dispatcher-rule',  label: 'Dispatcher rule — editor',    path: '/system/dispatcher/rules', permKey: 'system-dispatcher-rule' },
+    'system-design':          { id: 'system-design',            label: 'Design review',       path: '/system/design',      permKey: 'system-design' },
+    // The "Evolve" surface — controlled, sandboxed model modifications
+    // (placeholder for now; visible to every role via canSeeRoute).
+    'system-experiments':     { id: 'system-experiments',       label: 'Experiments',         path: '/system/experiments', permKey: 'system-experiments' },
+    'system-kb':              { id: 'system-kb',                label: 'Knowledge Base',      path: '/system/kb',          permKey: 'system-kb' },
+    'auth-admin':         { id: 'auth-admin',           label: 'Auth admin',          path: '/system/auth-admin', permKey: 'auth-admin' },
     // KB view of every active JobKind — read-only catalog,
     // visible to every role via canSeeRoute() short-circuit.
     // Editing lives at /job-kinds (Surface, gated to dept heads +
     // COO who author their own dept's work types).
-    workflows:            { id: 'workflows',          label: 'Workflows',           path: '/workflows',     permKey: 'workflows' },
+    workflows:            { id: 'workflows',          label: 'Workflows',           path: '/system/workflows', permKey: 'workflows' },
   };
 
   // Surfaces — one entry per department-rooted dashboard, in the
@@ -99,11 +101,11 @@
     'shipping',   // shipping department
     'support',    // support department
     'finance',    // finance department
-    'it-system', // IT — System Model hub (the IT landing, leads the cluster)
-    'it-monitoring', // IT department live state — service map, perf, events, atlas
-    'it-step-plugins', // IT — custom step UX bundles
-    'it-dispatcher', // IT — dispatcher rule cascade (read-only)
-    'it-subjects', // IT — SubjectKind taxonomy + Class registry (read-only)
+    'system-model', // System Model hub (the landing, leads the cluster)
+    'system-monitoring', // live state — service map, perf, events, atlas
+    'system-step-plugins', // custom step UX bundles
+    'system-dispatcher', // dispatcher rule cascade (read-only)
+    'system-subjects', // SubjectKind taxonomy + Class registry (read-only)
     // 'it-sim' retired 2026-05-03 with boss-sim-api (HumanWorker step 9b).
     'ops',        // operations
     'policy',     // dept heads + COO — author role/scope policy
@@ -122,7 +124,7 @@
       ROUTE_CATALOG.people,
       ROUTE_CATALOG['marketing-assets'],
       ROUTE_CATALOG.calendar,
-      { id: 'manual', label: 'Company manual', path: '/manual', permKey: 'inbox' },
+      { id: 'manual', label: 'Company manual', path: '/ux/manual', permKey: 'inbox' },
       // Workflows = KB of every active JobKind — everyone's
       // read-only catalog of "what kinds of work does this place
       // run?" Pairs with the /job-kinds Surface (editor), which
@@ -134,13 +136,13 @@
       // entries: ADRs and the architecture diagrams now live
       // under the IT department surface (paired with /it/monitoring
       // for live state).
-      ROUTE_CATALOG['it-kb'],
+      ROUTE_CATALOG['system-kb'],
       // Design review — brings back the workflow that was retired
       // 2026-05-03. Lists every docs/design/*.md with parsed open
       // questions + the in-flight design-doc-review Job (if any).
       // The "system modeling its own development" claim depends on
       // this surface existing.
-      ROUTE_CATALOG['it-design'],
+      ROUTE_CATALOG['system-design'],
     ],
   };
 
@@ -161,8 +163,11 @@
   // Future surfaces should NOT bring back the Admin tier; pick
   // a department-rooted slug and a role-gated permKey.
 
-  let { activeSection, children } = $props<{
+  let { activeSection, perspective = 'user', children } = $props<{
     activeSection: string;
+    // Which top-level perspective tab this shell renders under. Drives
+    // which surfaces appear in the sidebar.
+    perspective?: 'model' | 'user';
     children: () => any;
   }>();
 
@@ -170,25 +175,6 @@
     session.value.kind === 'ready' ? session.value.user : null,
   );
   let role = $derived((user?.role ?? null) as Role | null);
-
-  // Whether the visitor is logged in via BOSS local-auth (vs being
-  // an anonymous demo-session visitor). Probes `/api/auth/me`,
-  // which the gateway returns 401 for demo sessions (per the
-  // 2026-05-25 fix). The result drives the top-bar Sign-in/out
-  // button: showing "Sign out" to someone who never signed in is
-  // confusing, and the demo-mode session would be immediately
-  // re-minted on the next request anyway.
-  let isLoggedIn = $state<boolean>(false);
-  $effect(() => {
-    (async () => {
-      try {
-        const r = await fetch('/api/auth/me');
-        isLoggedIn = r.ok;
-      } catch {
-        isLoggedIn = false;
-      }
-    })();
-  });
 
   // Work group is role-keyed: each role gets a tailored 3-5 item
   // list of the surfaces they personally operate from. The same
@@ -199,14 +185,81 @@
     items: workForRole(role).map((r) => ROUTE_CATALOG[r]),
   });
 
-  let MAIN = $derived<ReadonlyArray<NavGroup>>([WORK, BROWSE, KNOW]);
+  // System Model perspective — surfaces grouped by the aspects of
+  // operating the model: Run (observe the live machine), Define
+  // (configure the model), Evolve (controlled change + experiments),
+  // Platform (reference + admin). The User Experiences perspective
+  // keeps Work / Surfaces / Knowledge Bases (below). Selected via the
+  // `perspective` prop.
+  const MODEL_GROUPS: ReadonlyArray<NavGroup> = [
+    {
+      label: 'Run',
+      items: [
+        ROUTE_CATALOG['system-model'],
+        ROUTE_CATALOG['system-monitoring'],
+        // Audit Log + Atlas are sub-pages of monitoring with no
+        // distinct permKey — plain NavItems (permKey-less ⇒ always
+        // visible + always in-perspective; see visible()/inPerspective()).
+        { id: 'system-audit', label: 'Audit Log', path: '/system/monitoring/events' },
+        { id: 'system-atlas', label: 'Atlas', path: '/system/monitoring/atlas' },
+      ],
+    },
+    {
+      label: 'Define',
+      items: [
+        // Workflows is the single UI surface for JobKinds: the
+        // read-only catalog that also links into the authoring
+        // routes (/system/job-kinds*). The separate "Job kinds"
+        // sidebar entry was dropped — authoring is reached FROM
+        // Workflows, not its own sidebar row.
+        ROUTE_CATALOG.workflows,
+        ROUTE_CATALOG['system-subjects'],
+        ROUTE_CATALOG['system-step-plugins'],
+        ROUTE_CATALOG['system-dispatcher'],
+        ROUTE_CATALOG.policy,
+      ],
+    },
+    {
+      label: 'Evolve',
+      items: [ROUTE_CATALOG['system-experiments'], ROUTE_CATALOG['system-design']],
+    },
+    {
+      label: 'Platform',
+      items: [ROUTE_CATALOG['system-kb'], ROUTE_CATALOG['auth-admin']],
+    },
+  ];
+
+  let MAIN = $derived<ReadonlyArray<NavGroup>>(
+    perspective === 'model' ? MODEL_GROUPS : [WORK, BROWSE, KNOW],
+  );
+
+  // Perspective split: which surfaces belong to the System Model tab
+  // (the model's configuration + how it's running — most of what used
+  // to be "IT") vs the User Experiences tab (the actor work surfaces +
+  // knowledge bases — Finance, Inventory, the KBs, …). Keyed by
+  // permKey/RouteName. Keep in sync with App.svelte's MODEL_KINDS,
+  // which classifies the same split by route kind to drive the active
+  // tab — the two must agree for every routed surface.
+  const MODEL_ROUTES = new Set<RouteName>([
+    'system-model', 'system-monitoring', 'system-step-plugins', 'system-dispatcher',
+    'system-subjects', 'system-dispatcher-rules', 'system-dispatcher-rule',
+    'system-kb', 'system-design', 'system-experiments', 'policy', 'job-kinds', 'workflows', 'auth-admin',
+  ]);
+  function inPerspective(i: NavItem): boolean {
+    // A permKey-less NavItem (e.g. a plain sub-page link like Audit
+    // Log / Atlas) carries no perspective classification — it belongs
+    // to whatever group it's placed in, so it's always in-perspective.
+    if (i.permKey === undefined) return true;
+    const isModel = MODEL_ROUTES.has(i.permKey);
+    return perspective === 'model' ? isModel : !isModel;
+  }
 
   function visible(items: ReadonlyArray<NavItem>): ReadonlyArray<NavItem> {
     if (!role) return [];
     return items.filter((i) => {
       const policyOk = i.permKey === undefined || canSeeRoute(role, i.permKey);
       const moduleOk = i.module === undefined || moduleEnabled(i.module);
-      return policyOk && moduleOk;
+      return policyOk && moduleOk && inPerspective(i);
     });
   }
 
@@ -219,40 +272,32 @@
 
 <div class="app-shell">
   <aside class="shell-sidebar">
-    <a
-      class="shell-sidebar-header"
-      href="/"
-      onclick={(e) => onLinkClick(e, '/')}
-      aria-label="Algedonic Ales — home"
-    >
-      <div class="shell-logo">Algedonic</div>
-      <div class="shell-logo-sub">Ales</div>
-    </a>
-
     <nav class="shell-nav">
-      <div class="shell-nav-personal">
-        <a
-          href="/me"
-          class="shell-nav-item shell-nav-home {activeSection === 'me' ? 'shell-nav-item-active' : ''}"
-          onclick={(e) => onLinkClick(e, '/me')}
-        >
-          My Day
-        </a>
-        <a
-          href="/inbox"
-          class="shell-nav-item {activeSection === 'inbox' ? 'shell-nav-item-active' : ''}"
-          onclick={(e) => onLinkClick(e, '/inbox')}
-        >
-          Inbox
-        </a>
-        <a
-          href="/shop"
-          class="shell-nav-item {activeSection === 'shop' ? 'shell-nav-item-active' : ''}"
-          onclick={(e) => onLinkClick(e, '/shop')}
-        >
-          Shop
-        </a>
-      </div>
+      {#if perspective === 'user'}
+        <div class="shell-nav-personal">
+          <a
+            href="/ux/me"
+            class="shell-nav-item shell-nav-home {activeSection === 'me' ? 'shell-nav-item-active' : ''}"
+            onclick={(e) => onLinkClick(e, '/ux/me')}
+          >
+            My Day
+          </a>
+          <a
+            href="/ux/inbox"
+            class="shell-nav-item {activeSection === 'inbox' ? 'shell-nav-item-active' : ''}"
+            onclick={(e) => onLinkClick(e, '/ux/inbox')}
+          >
+            Inbox
+          </a>
+          <a
+            href="/ux/shop"
+            class="shell-nav-item {activeSection === 'shop' ? 'shell-nav-item-active' : ''}"
+            onclick={(e) => onLinkClick(e, '/ux/shop')}
+          >
+            Shop
+          </a>
+        </div>
+      {/if}
 
       {#each MAIN as group (group.label)}
         {@const items = visible(group.items)}
@@ -288,41 +333,13 @@
   </aside>
 
   <div class="shell-main">
-    <header class="shell-topbar">
-      <div class="shell-topbar-left">
-        <PersonaSwitcher />
-      </div>
-      <div class="shell-topbar-right">
-        {#if isLoggedIn}
-          <button class="shell-logout-btn" onclick={async () => {
-            try { await fetch('/api/auth/logout', { method: 'POST' }); }
-            catch {}
-            window.location.href = '/login';
-          }}>Sign out</button>
-        {:else}
-          <a class="shell-logout-btn" href={'/login'}>Sign in</a>
-        {/if}
-      </div>
-    </header>
+    <!-- Demo-mode persona switcher — fixed-positioned (bottom-left),
+         so it renders here but floats independently of the layout.
+         The system-time + sign-in chrome moved up to the perspective
+         tab bar; the old topbar is gone. -->
+    <PersonaSwitcher />
     <div class="shell-content">
       {@render children()}
     </div>
   </div>
-  <SimClockBadge />
 </div>
-
-<style>
-  .shell-logout-btn {
-    background: transparent;
-    border: 1px solid #d6d3d1;
-    border-radius: 6px;
-    padding: 5px 12px;
-    font-size: 12px;
-    color: #44403c;
-    cursor: pointer;
-  }
-  .shell-logout-btn:hover {
-    background: #f5f5f4;
-    color: #1c1917;
-  }
-</style>

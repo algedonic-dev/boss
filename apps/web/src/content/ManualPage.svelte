@@ -1,7 +1,7 @@
 <script lang="ts">
   // /manual — port of apps/web/src/content/ManualPage.tsx.
 
-  import PageHeader from '../ui/PageHeader.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import RichBody from './RichBody.svelte';
   import type { ManualSection } from './types';
   import { href, navigate } from '../router';
@@ -227,10 +227,10 @@
     </button>
     <a
       class="manual-tree-label"
-      href={href(`/manual/${node.section.slug}`)}
+      href={href(`/ux/manual/${node.section.slug}`)}
       onclick={(e) => {
         e.preventDefault();
-        navigate(href(`/manual/${node.section.slug}`));
+        navigate(href(`/ux/manual/${node.section.slug}`));
       }}
     >
       {node.section.title}

@@ -1,9 +1,9 @@
 <script lang="ts">
   // Field-service schedule — port of apps/web/src/schedule/SchedulePage.tsx.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import { appNow } from '../shell/sim-clock.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import { appNow } from '@boss/web-kit/sim-clock';
 
   type AvailabilityKind =
     | 'available' | 'pto' | 'sick' | 'holiday' | 'training' | 'blocked';

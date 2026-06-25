@@ -18,8 +18,8 @@
   // non-admin who navigates here sees the "no access" notice
   // instead of forms that would 403 anyway.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
 
   type ActionResult =
     | { kind: 'idle' }

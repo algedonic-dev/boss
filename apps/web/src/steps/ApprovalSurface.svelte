@@ -2,8 +2,8 @@
   // Approval / sign-off surface — port of
   // apps/web-legacy/src/steps/ApprovalSurface.tsx.
 
-  import { session } from '../session/session.svelte';
-  import { appNow, appToday } from '../shell/sim-clock.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
+  import { appNow, appToday } from '@boss/web-kit/sim-clock';
 
   type StepData = {
     id: string;

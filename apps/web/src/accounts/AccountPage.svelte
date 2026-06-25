@@ -10,13 +10,13 @@
   // components; everything else stays inline.
 
   import { onMount } from 'svelte';
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import { entityHref } from '../ui/entity-href';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import FileAttachments from '../content/FileAttachments.svelte';
-  import Link from '../ui/Link.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import TierChip from './TierChip.svelte';
   import ActivityTimeline from './ActivityTimeline.svelte';
   import KnowledgeBaseView from '../kb/KnowledgeBaseView.svelte';
@@ -187,7 +187,7 @@
   })()}
 
   <div class="account-page theme-exec">
-    <Breadcrumb to={href('/accounts')}>
+    <Breadcrumb to={href('/ux/accounts')}>
       ← All accounts
     </Breadcrumb>
     <PageHeader
@@ -199,7 +199,7 @@
     <div class="subject-actions">
       <a
         class="action-btn"
-        href={href(`/jobs?new=1&subject_kind=account&subject_id=${encodeURIComponent(account.id)}`)}
+        href={href(`/ux/jobs?new=1&subject_kind=account&subject_id=${encodeURIComponent(account.id)}`)}
       >
         + Create a Job for this account
       </a>
@@ -295,7 +295,7 @@
                 <ul class="pp-sku-list">
                   {#each bySku.slice(0, 6) as [sku, count] (sku)}
                     <li>
-                      <Link to={href(`/catalog/${sku}`)} className="mono">
+                      <Link to={href(`/ux/catalog/${sku}`)} className="mono">
                         {sku}
                       </Link>
                       <span class="pp-sku-count">{count}</span>

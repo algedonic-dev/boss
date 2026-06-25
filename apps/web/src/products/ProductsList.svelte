@@ -4,11 +4,11 @@
   // products are countable on-hand-by-location output the tenant
   // produces, with `total_on_hand` rolled up across locations.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import SearchInput from '../ui/SearchInput.svelte';
-  import Link from '../ui/Link.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import SearchInput from '@boss/web-kit/ui/SearchInput.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
   import { href } from '../router';
-  import { entityHref } from '../ui/entity-href';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
   import type { Product, ProductDetail } from './types';
 
   let products = $state<Product[]>([]);

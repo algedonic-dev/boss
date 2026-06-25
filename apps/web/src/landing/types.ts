@@ -39,19 +39,12 @@ export type JobKindSummary = Readonly<{
   category: string;
 }>;
 
-export type SimClockState = Readonly<{
-  /** Full sim-time instant (ISO 8601). Renders date + HH:MM. */
-  now: string;
-  current_sim_date: string;
-  epoch_start_date: string | null;
-  epoch_end_date: string | null;
-  paused: boolean;
-  /// True while the clean-reset path is mid-flight (audit_log
-  /// truncate + boss-rebuild-all replay). The SimClockBadge
-  /// renders a spinner instead of the Restart button while this
-  /// is true. Defaults to false on backends that don't track it.
-  restart_in_progress?: boolean;
-}>;
+// Re-export so existing landing importers (`import { SimClockState }
+// from './types'`) keep working after the type moved to web-kit.
+export type { SimClockState } from '@boss/web-kit/sim-clock-types';
+// …and import it locally too — `export type {…} from` does not bind
+// the name in this module's scope, but JobLiveSummary below uses it.
+import type { SimClockState } from '@boss/web-kit/sim-clock-types';
 
 export type JobLiveSummary = Readonly<{
   counts: Readonly<Record<string, number>>;

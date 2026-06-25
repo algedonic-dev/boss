@@ -15,8 +15,8 @@
   // registry (empty by design in OSS — operators name their own
   // hosts via `~/.config/boss/hosts.toml`).
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import PageHeader from '../ui/PageHeader.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { href } from '../router';
 
   // Diagrams under it/kb-assets/ — the rendered Mermaid output
@@ -58,8 +58,8 @@
   <Breadcrumb to={href('/')}>← Home</Breadcrumb>
 
   <PageHeader
-    eyebrow="IT department · Knowledge Base"
-    title="IT Systems Knowledge Base"
+    eyebrow="System Model · Knowledge Base"
+    title="Knowledge Base"
     subtitle="The four architecture diagrams — the source-derived reference for how BOSS is put together"
   />
 
@@ -77,7 +77,7 @@
   </div>
 
   <nav
-    aria-label="IT KB jump nav"
+    aria-label="Knowledge Base jump nav"
     style="display:flex; flex-wrap:wrap; gap:8px; padding:12px 16px; margin-bottom:8px; background:#fafaf9; border:1px solid #e7e5e4; border-radius:8px; font-size:13px"
   >
     <span style="color:#78716c; margin-right:4px">Jump to:</span>
@@ -89,7 +89,7 @@
     <span style="color:#d6d3d1">·</span>
     <a href="#it-deployment"  style="color:#1c1917">3 · Deployment</a>
     <span style="color:#d6d3d1">·</span>
-    <a href={href('/workflows')} style="color:#1c1917">Workflows ↗</a>
+    <a href={href('/system/workflows')} style="color:#1c1917">Workflows ↗</a>
   </nav>
 
   <div class="tab-content" style="display:flex; flex-direction:column; gap:24px; padding:16px 0">

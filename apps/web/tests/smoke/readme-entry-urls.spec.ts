@@ -37,7 +37,7 @@ const README_URLS = [
   { label: 'People list', path: '/people', expect: 'h1' },
   {
     label: 'JobKind authoring (admin alias)',
-    path: '/admin/job-kinds',
+    path: '/system/job-kinds',
     expect: 'h1',
   },
 ];

@@ -2,7 +2,7 @@
   // ICS calendar-feed management for a tech. Port of
   // apps/web/src/people/CalendarFeedSection.tsx.
 
-  import Section from '../ui/Section.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
 
   let { empId } = $props<{ empId: string }>();
 

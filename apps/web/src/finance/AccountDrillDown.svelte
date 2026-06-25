@@ -2,9 +2,9 @@
   // Per-account drill-down — list of entries touching this account
   // with an expandable detail view per entry. Used by TrialBalanceTab.
 
-  import Section from '../ui/Section.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import { type EntityKind } from '../ui/entity-href';
+  import Section from '@boss/web-kit/ui/Section.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import { type EntityKind } from '@boss/web-kit/ui/entity-href';
   import {
     loadEntriesForAccount,
     ENTRIES_PER_ACCOUNT_CAP,

@@ -1,15 +1,15 @@
 <script lang="ts">
   // Inbox — port of apps/web/src/inbox/InboxPage.tsx.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import { appNow } from '../shell/sim-clock.svelte';
-  import FilterGroup from '../ui/FilterGroup.svelte';
-  import FilterButton from '../ui/FilterButton.svelte';
-  import SearchInput from '../ui/SearchInput.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import { appNow } from '@boss/web-kit/sim-clock';
+  import FilterGroup from '@boss/web-kit/ui/FilterGroup.svelte';
+  import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
+  import SearchInput from '@boss/web-kit/ui/SearchInput.svelte';
   import type { Message, MessageKind } from './types';
   import type { Employee } from '../people/types';
   import { href, navigate } from '../router';
-  import { session } from '../session/session.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
 
   type KindFilter = MessageKind | 'all' | 'unread';
 

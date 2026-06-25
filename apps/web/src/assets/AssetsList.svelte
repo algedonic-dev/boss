@@ -5,11 +5,11 @@
   // panel that we're deferring to phase 2.
 
   import { navigate, href } from '../router';
-  import { entityHref } from '../ui/entity-href';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import OverflowBanner from '../ui/OverflowBanner.svelte';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import OverflowBanner from '@boss/web-kit/ui/OverflowBanner.svelte';
   import { fetchPaged, isCapped, type Paged } from '../data/paginated';
-  import { getLabel } from '../session/manifest.svelte';
+  import { getLabel } from '@boss/web-kit/session/manifest.svelte';
   import type { Asset, AssetsSummary, AssetLifecyclePhase } from './types';
 
   const PHASE_ORDER: ReadonlyArray<AssetLifecyclePhase> = [

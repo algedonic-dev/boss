@@ -8,12 +8,12 @@
   // proof.
 
   import { href, navigate } from '../router';
-  import { entityHref } from '../ui/entity-href';
-  import { getLabel } from '../session/manifest.svelte';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
+  import { getLabel } from '@boss/web-kit/session/manifest.svelte';
   import { shortId } from '../data/ids';
   import { formatActor } from '../data/actor';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import type { Asset, AssetEvent } from './types';
   import type { Job } from '../jobs/types';
   import { AssetDetailSchema, AssetPartListSchema } from './schemas';
@@ -130,7 +130,7 @@
     <div class="subject-actions">
       <a
         class="action-btn"
-        href={href(`/jobs?new=1&subject_kind=system&subject_id=${encodeURIComponent(device.asset_id)}`)}
+        href={href(`/ux/jobs?new=1&subject_kind=system&subject_id=${encodeURIComponent(device.asset_id)}`)}
       >
         + Create a Job for this device
       </a>

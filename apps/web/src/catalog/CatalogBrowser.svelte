@@ -1,18 +1,18 @@
 <script lang="ts">
   // Catalog browser — port of apps/web/src/catalog/CatalogBrowser.tsx.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import FilterGroup from '../ui/FilterGroup.svelte';
-  import FilterButton from '../ui/FilterButton.svelte';
-  import SearchInput from '../ui/SearchInput.svelte';
-  import Link from '../ui/Link.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import FilterGroup from '@boss/web-kit/ui/FilterGroup.svelte';
+  import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
+  import SearchInput from '@boss/web-kit/ui/SearchInput.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
   import {
     CATEGORY_LABEL,
     type DeviceModel,
     type DeviceCategory,
   } from './types';
   import { href } from '../router';
-  import { getLabel } from '../session/manifest.svelte';
+  import { getLabel } from '@boss/web-kit/session/manifest.svelte';
 
   let catalog = $state<DeviceModel[]>([]);
   let loading = $state(true);
@@ -121,7 +121,7 @@
         <p class="empty">{getLabel('catalog.empty_state', 'No devices match those filters.')}</p>
       {:else}
         {#each visible as d (d.sku)}
-          <Link className="catalog-card" to={href(`/catalog/${d.sku}`)}>
+          <Link className="catalog-card" to={href(`/ux/catalog/${d.sku}`)}>
               <div class="catalog-card-tile" data-category={d.category}>
                 <div class="catalog-card-chip">{CATEGORY_LABEL[d.category]}</div>
               </div>

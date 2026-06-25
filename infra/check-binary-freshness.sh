@@ -84,6 +84,7 @@ crate_for_binary() {
         boss-files-gc)               echo "crates/core/boss-content" ;;
         boss-cybernetics)            echo "crates/core/boss-cybernetics" ;;
         boss-observability)          echo "crates/core/boss-observability" ;;
+        boss-simulator)              echo "crates/orchestrators/boss-simulator" ;;
         boss-gateway)                echo "crates/core/boss-gateway" ;;
         boss-ports-list)             echo "crates/core/boss-ports" ;;
         boss-*-api)

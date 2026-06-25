@@ -11,8 +11,8 @@
   // fail (offline / missing data / unknown model).
 
   import { isPending, type StepStatus } from '../jobs/types';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import Section from '../ui/Section.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
 
   type StepData = {
     id: string;

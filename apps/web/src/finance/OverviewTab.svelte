@@ -18,7 +18,7 @@
     printReport,
     type CsvColumn,
   } from './csvExport';
-  import { formatMoney } from '../ui/money';
+  import { formatMoney } from '@boss/web-kit/ui/money';
 
   type Props = {
     summary: CommerceSummary | null;

@@ -1,0 +1,21 @@
+[Unit]
+Description=Boss — Simulator UX service (hosts the /simulator SPA + control API)
+Documentation=https://github.com/algedonic-dev/boss/blob/main/docs/design
+After=network-online.target boss-jobs-api.service boss-clock-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=RUST_LOG=info
+# Env-driven. Defaults if unset: BOSS_SIM_BIND=0.0.0.0:7010,
+# BOSS_JOBS_URL / BOSS_CLOCK_URL from boss_ports. The static dir holds
+# the apps/simulator bundle (installed by infra/deploy-simulator-web.sh).
+Environment=BOSS_SIM_STATIC_DIR=/var/lib/boss-simulator/dist
+ExecStart=/usr/local/bin/boss-simulator
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

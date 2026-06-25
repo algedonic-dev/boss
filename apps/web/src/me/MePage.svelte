@@ -12,13 +12,13 @@
   //   $effect   → a transition that reads/writes the world
   // This page uses all three.
 
-  import { session } from '../session/session.svelte';
-  import { appNow } from '../shell/sim-clock.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
+  import { appNow } from '@boss/web-kit/sim-clock';
   import { isPending, isInFlight, isTerminal, type StepStatus } from '../jobs/types';
   import { navigate, href } from '../router';
-  import { entityHref } from '../ui/entity-href';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
 
   type StepSummary = {
     id: string;

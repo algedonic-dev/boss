@@ -1,9 +1,9 @@
 <script lang="ts">
   // Launch calendar — port of apps/web/src/calendar/CalendarPage.tsx.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import { appNow, appToday } from '../shell/sim-clock.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import { appNow, appToday } from '@boss/web-kit/sim-clock';
 
   type LaunchCalendarRow = {
     job_id: string;

@@ -19,7 +19,7 @@
 //!   discriminating enum is handled by some successor, or a wildcard
 //!   fallback covers the open-ended case.
 //!
-//! Runs at author time (`/admin/job-kinds`), publish time (the
+//! Runs at author time (`/system/job-kinds`), publish time (the
 //! `job-kind-publish` dispatch path), and boot time (boss-jobs-api
 //! refuses to start against a broken registry).
 

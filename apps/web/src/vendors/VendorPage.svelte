@@ -8,11 +8,11 @@
   //   3. Facts (interactions timeline)
   //   4. Work (POs + vendor invoices)
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import Link from '../ui/Link.svelte';
-  import Meta from '../ui/Meta.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import Meta from '@boss/web-kit/ui/Meta.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import {
     loadVendorAccountTeam,
     loadVendorContacts,
@@ -186,7 +186,7 @@
   </div>
 {:else if !vendor}
   <div class="catalog theme-exec">
-    <Breadcrumb to={href('/warehouse')}>
+    <Breadcrumb to={href('/ux/warehouse')}>
       ← Warehouse
     </Breadcrumb>
     <div class="exec-header"><h1 class="exec-title">Vendor not found</h1></div>
@@ -194,7 +194,7 @@
   </div>
 {:else}
   <div class="detail-page theme-exec">
-    <Breadcrumb to={href('/warehouse')}>
+    <Breadcrumb to={href('/ux/warehouse')}>
       ← Warehouse
     </Breadcrumb>
 
@@ -228,7 +228,7 @@
     <div class="subject-actions">
       <a
         class="action-btn"
-        href={href(`/jobs?new=1&subject_kind=vendor&subject_id=${encodeURIComponent(vendor.id)}`)}
+        href={href(`/ux/jobs?new=1&subject_kind=vendor&subject_id=${encodeURIComponent(vendor.id)}`)}
       >
         + Create a Job for this vendor
       </a>
@@ -294,7 +294,7 @@
                     <td>
                       {#if c.signed_by_employee_id}
                         {@const signer = c.signed_by_employee_id}
-                        <Link to={href(`/hr/${signer}`)}>
+                        <Link to={href(`/ux/hr/${signer}`)}>
                             {empNames.get(signer) ?? signer}
                         </Link>
                       {:else}

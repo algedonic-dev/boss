@@ -3,7 +3,7 @@
   //
   // In the three-axis IA, Workflows is the *what* —
   // every active JobKind in the registry, browseable like a
-  // catalog. Editing JobKinds happens at /admin/job-kinds (the
+  // catalog. Editing JobKinds happens at /system/job-kinds (the
   // Surface for the platform-eng role). This page is the
   // read-only KB view non-admin operators land on when they
   // want to understand "what kinds of work does this brewery
@@ -22,9 +22,9 @@
   // every Subject kind owns — same shape as /catalog,
   // /accounts, /vendors, etc.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
-  import Link from '../ui/Link.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
   import type { JobKindSpec } from '../job-kinds/jobKindTypes';
   import { href } from '../router';
 
@@ -114,13 +114,17 @@
     <p class="empty" style="color:#dc2626; padding:0 24px">Failed to load: {error}</p>
   {/if}
 
-  <div style="padding:0 24px 16px; max-width:520px">
+  <div class="wf-toolbar">
     <input
       type="search"
       placeholder="Search workflows by kind, label, category…"
       bind:value={query}
-      style="width:100%; padding:8px 10px; font-size:14px; border:1px solid #e5e5e5; border-radius:6px"
+      class="wf-search"
     />
+    <!-- Authoring entry point. Workflows is the single UI surface for
+         JobKinds (the "Job kinds" sidebar entry was retired); the
+         authoring routes (/system/job-kinds*) are reached from here. -->
+    <Link to={href('/system/job-kinds/new')} className="wf-new">+ New workflow</Link>
   </div>
 
   <div class="tab-grid">
@@ -131,7 +135,7 @@
             {#each rows as k (k.kind)}
               <li class="kb-workflow-row">
                 <div class="kb-workflow-header">
-                  <Link to={href(`/admin/job-kinds/${encodeURIComponent(k.kind)}`)}>
+                  <Link to={href(`/system/job-kinds/${encodeURIComponent(k.kind)}`)}>
                     <span class="kb-workflow-kind mono">{k.kind}</span>
                   </Link>
                   <span class="kb-workflow-label">{k.label}</span>
@@ -169,6 +173,35 @@
 </div>
 
 <style>
+  .wf-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 0 24px 16px;
+    max-width: 760px;
+  }
+  .wf-search {
+    flex: 1 1 auto;
+    max-width: 520px;
+    padding: 8px 10px;
+    font-size: 14px;
+    border: 1px solid #e5e5e5;
+    border-radius: 6px;
+  }
+  .catalog :global(a.wf-new) {
+    flex: 0 0 auto;
+    padding: 8px 14px;
+    font-size: 14px;
+    font-weight: 600;
+    border-radius: 6px;
+    background: var(--brew-amber, #d97706);
+    color: #fff;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .catalog :global(a.wf-new:hover) {
+    background: var(--brew-malt, #b45309);
+  }
   .kb-workflow-list {
     list-style: none;
     margin: 0;

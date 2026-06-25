@@ -26,7 +26,7 @@
   import StepPluginMount from './StepPluginMount.svelte';
   import { hasActivePluginFor } from './pluginHost';
   import { surfaceOf } from './surfaceRegistry.svelte';
-  import { session } from '../session/session.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
   import FileAttachments from '../content/FileAttachments.svelte';
   import type { StepStatus } from '../jobs/types';
 

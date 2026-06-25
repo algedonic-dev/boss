@@ -18,7 +18,7 @@ export const WORK_BY_ROLE: Record<Role, ReadonlyArray<RouteName>> = {
   // ----- Executive -----
   ceo:  ['jobs', 'exec', 'sales'],
   coo:  ['jobs', 'ops', 'exec'],
-  cto:  ['jobs', 'it-monitoring'],
+  cto:  ['jobs', 'system-monitoring'],
   cfo:  ['jobs', 'finance', 'exec'],
 
   // ----- Sales -----
@@ -51,7 +51,7 @@ export const WORK_BY_ROLE: Record<Role, ReadonlyArray<RouteName>> = {
 
   // ----- Support / IT -----
   'support-specialist': ['support', 'jobs'],
-  'it-manager':         ['policy', 'job-kinds', 'it-step-plugins', 'it-monitoring', 'jobs'],
+  'it-manager':         ['policy', 'job-kinds', 'system-step-plugins', 'system-monitoring', 'jobs'],
 
   // ----- Audit -----
   auditor:          ['finance', 'jobs'],
@@ -125,9 +125,9 @@ export const WORK_BY_ROLE: Record<Role, ReadonlyArray<RouteName>> = {
   // simplifier — policy edits, JobKind authoring, step-plugin
   // publishes are all administrative work that lives here, not
   // in a separate /admin tier.
-  'it-director': ['policy', 'job-kinds', 'it-step-plugins', 'it-monitoring', 'exec'],
-  sysadmin:      ['policy', 'job-kinds', 'it-step-plugins', 'it-monitoring'],
-  helpdesk:      ['it-monitoring', 'jobs'],
+  'it-director': ['policy', 'job-kinds', 'system-step-plugins', 'system-monitoring', 'exec'],
+  sysadmin:      ['policy', 'job-kinds', 'system-step-plugins', 'system-monitoring'],
+  helpdesk:      ['system-monitoring', 'jobs'],
 
   // ----- Brewery: heads of department -----
   // Each head's Work is "their dept dashboard + the all-jobs view"

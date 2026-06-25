@@ -25,7 +25,7 @@ import {
   type TrialBalanceRow,
 } from './ledger';
 import { buildZip, type ZipFile } from './zipStore';
-import { appNow } from '../shell/sim-clock.svelte';
+import { appNow } from '@boss/web-kit/sim-clock';
 
 export type MonthRange = Readonly<{
   /// "YYYY-MM" — the calendar month being closed.

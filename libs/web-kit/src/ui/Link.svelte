@@ -1,6 +1,6 @@
 <script lang="ts">
   // Client-side navigation link. Mirrors apps/web/src/ui/index.tsx Link.
-  import { navigate } from '../router';
+  import { navigate } from '../nav';
 
   let { to, className = '', children } = $props<{
     to: string;

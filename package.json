@@ -1,1 +1,11 @@
-{}
+{
+  "name": "boss",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "libs/*"
+  ],
+  "patchedDependencies": {
+    "@xyflow/svelte@1.6.1": "patches/@xyflow%2Fsvelte@1.6.1.patch"
+  }
+}

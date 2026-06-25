@@ -37,7 +37,7 @@ documentation directory.
 - **[runbooks/](runbooks/)** — operator + developer runbooks.
 - **[architecture/](architecture/)** — Mermaid sources + rendered
   SVG / PNG for the four architecture diagrams. The app's IT
-  Knowledge Base page (`/it/kb`) imports these SVGs to render them
+  Knowledge Base page (`/system/kb`) imports these SVGs to render them
   in-app.
 - **[formal/](formal/)** — TLA+ specs (`StepStatus.tla` for the
   Step lifecycle, `LedgerPeriodLock.tla` for journal posting +

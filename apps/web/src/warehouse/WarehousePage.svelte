@@ -4,13 +4,13 @@
   // Three tabs: Overview (backed by the /warehouse-status projection),
   // Inventory (filterable SKU list), Receiving (PO queue + Create PO).
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import { entityHref } from '../ui/entity-href';
-  import Section from '../ui/Section.svelte';
-  import FilterGroup from '../ui/FilterGroup.svelte';
-  import FilterButton from '../ui/FilterButton.svelte';
-  import Link from '../ui/Link.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
+  import Section from '@boss/web-kit/ui/Section.svelte';
+  import FilterGroup from '@boss/web-kit/ui/FilterGroup.svelte';
+  import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import StatusChip from '../parts/StatusChip.svelte';
   import {
     stockStatus,

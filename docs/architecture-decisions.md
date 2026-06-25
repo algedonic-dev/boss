@@ -12,7 +12,7 @@ code does.
 
 **How decisions evolve.** Open questions are authored as
 `### Qn:` anchors in living docs under `docs/design/`; the in-app
-decision tracker (`/it/design`, backed by `boss-docs`) manages
+decision tracker (`/system/design`, backed by `boss-docs`) manages
 them; resolutions flush into the source doc's Decision history.
 Each release, settled material folds into this document and the
 source doc is deleted — the baseline is the canonical post-flatten
@@ -251,11 +251,11 @@ dispatcher's registry watch for those emissions and invoke
 handlers.** Rules are rows in the append-only versioned **`dispatcher_rules`
 registry** (`on_event`, `when`, `do`, over the shared expression
 DSL) — the step_plugins-style draft → active → retired lifecycle,
-authored in-app at `/it/dispatcher/rules` (`infra/dispatcher/rules.toml`
+authored in-app at `/system/dispatcher/rules` (`infra/dispatcher/rules.toml`
 is now just the human-authored seed source, not the runtime read).
 The reactive wiring is visualized as a cascade — trigger event →
 rule → handler → emitted event → re-triggered rule, feedback cycles
-highlighted, filterable by trigger event — at `/it/dispatcher`. The
+highlighted, filterable by trigger event — at `/system/dispatcher`. The
 dispatcher is reactive, not a catalog of everything the system can
 produce. Each rule is an
 **actor**: every side effect it fires is attributed

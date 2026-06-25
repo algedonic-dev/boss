@@ -13,7 +13,7 @@ test.beforeEach(async ({ page }) => {
 
 test.describe('Admin new job kind — name-it entry', () => {
   test('identity fields render and persist input', async ({ page }) => {
-    await mountPage(page, '/admin/job-kinds/new');
+    await mountPage(page, '/system/job-kinds/new');
 
     const slug = page.locator('input.mono').first();
     await slug.fill(KIND_SLUG);
@@ -29,7 +29,7 @@ test.describe('Admin new job kind — name-it entry', () => {
   });
 
   test('subject-kind checkboxes toggle', async ({ page }) => {
-    await mountPage(page, '/admin/job-kinds/new');
+    await mountPage(page, '/system/job-kinds/new');
     const first = page.locator('input[type="checkbox"]').first();
     const initial = await first.isChecked();
     await first.click();
@@ -37,7 +37,7 @@ test.describe('Admin new job kind — name-it entry', () => {
   });
 
   test('Create & author → creates the design Job and opens the workspace', async ({ page }) => {
-    await mountPage(page, '/admin/job-kinds/new');
+    await mountPage(page, '/system/job-kinds/new');
 
     await page.locator('input.mono').first().fill(KIND_SLUG);
     await page.locator('input').nth(1).fill('Seasonal Release');
@@ -46,7 +46,7 @@ test.describe('Admin new job kind — name-it entry', () => {
     await expect(create).toBeEnabled();
 
     await Promise.all([
-      page.waitForURL(new RegExp(`/admin/job-kinds/authoring/${JOB_ID}`), { timeout: 15_000 }),
+      page.waitForURL(new RegExp(`/system/job-kinds/authoring/${JOB_ID}`), { timeout: 15_000 }),
       create.click(),
     ]);
     // Landed on the workspace for the new design Job.

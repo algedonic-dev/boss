@@ -1,14 +1,14 @@
 <script lang="ts">
-  // /it/dispatcher/rules/{name} (and {name}==='new' for create mode) —
+  // /system/dispatcher/rules/{name} (and {name}==='new' for create mode) —
   // edit a dispatcher rule: a draft form seeded from the active/latest
   // version, a version-history table, and the draft → publish/retire
   // lifecycle actions. Models the step-plugin detail page (LoadState
   // discriminated union + action/actionError pattern + version-history
   // table). Writes flow through ./ruleAuthoring.
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import {
     listVersions,
     createDraft,
@@ -163,7 +163,7 @@
       const created = await createDraft(spec);
       if (isNew) {
         // Land on the now-existing rule's editor.
-        navigate(href(`/it/dispatcher/rules/${encodeURIComponent(created.name)}`));
+        navigate(href(`/system/dispatcher/rules/${encodeURIComponent(created.name)}`));
         return;
       }
       await load();
@@ -216,7 +216,7 @@
   </div>
 {:else if loadState.kind === 'error'}
   <div class="catalog theme-exec">
-    <Breadcrumb to={href('/it/dispatcher/rules')}>← All dispatcher rules</Breadcrumb>
+    <Breadcrumb to={href('/system/dispatcher/rules')}>← All dispatcher rules</Breadcrumb>
     <PageHeader eyebrow="Platform · Dispatcher rule" title={ruleName} subtitle={loadState.message} />
   </div>
 {:else}
@@ -225,7 +225,7 @@
   {@const hasActive = versions.some((v) => v.status === 'active')}
   {@const active = versions.find((v) => v.status === 'active')}
   <div class="catalog theme-exec">
-    <Breadcrumb to={href('/it/dispatcher/rules')}>← All dispatcher rules</Breadcrumb>
+    <Breadcrumb to={href('/system/dispatcher/rules')}>← All dispatcher rules</Breadcrumb>
     <PageHeader
       eyebrow="Platform · Dispatcher rule"
       title={isNew ? 'New dispatcher rule' : ruleName}

@@ -2,9 +2,9 @@
   // Manual journal entry form — port of
   // apps/web/src/finance/NewJournalEntryPage.tsx.
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import {
     createManualEntry,
     formatUsd,
@@ -12,7 +12,7 @@
     type Account,
   } from './ledger';
   import { href, navigate } from '../router';
-  import { appToday } from '../shell/sim-clock.svelte';
+  import { appToday } from '@boss/web-kit/sim-clock';
 
   type LineDraft = {
     account_code: string;
@@ -121,7 +121,7 @@
           };
         }),
       });
-      navigate(href(`/finance?entry=${encodeURIComponent(result.entry_id)}`));
+      navigate(href(`/ux/finance?entry=${encodeURIComponent(result.entry_id)}`));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -131,7 +131,7 @@
 </script>
 
 <div class="theme-exec" style="padding:0 32px 32px">
-  <Breadcrumb to={href('/finance')}>
+  <Breadcrumb to={href('/ux/finance')}>
     ← Finance
   </Breadcrumb>
   <PageHeader
@@ -288,7 +288,7 @@
       >
         {saving ? 'Posting…' : 'Post entry'}
       </button>
-      <button type="button" onclick={() => navigate(href('/finance'))} class="hr-done-btn">
+      <button type="button" onclick={() => navigate(href('/ux/finance'))} class="hr-done-btn">
         Cancel
       </button>
     </div>

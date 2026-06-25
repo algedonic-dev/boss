@@ -64,7 +64,7 @@ test.describe('Phase-3 Work + Admin', () => {
   });
 
   test('Admin: Policy page loads rule matrix', async ({ page }) => {
-    await page.goto('/admin/policy');
+    await page.goto('/system/policy');
     await expect(page.locator('h1')).toContainText(/policy rules/i);
     // Either the matrix or an error banner.
     await expect(
@@ -73,7 +73,7 @@ test.describe('Phase-3 Work + Admin', () => {
   });
 
   test('Admin: Job kinds list loads', async ({ page }) => {
-    await page.goto('/admin/job-kinds');
+    await page.goto('/system/job-kinds');
     await expect(page.locator('h1')).toContainText(/job kinds/i);
     // At least one category section with a table, once seeded.
     await expect(
@@ -82,7 +82,7 @@ test.describe('Phase-3 Work + Admin', () => {
   });
 
   test('Admin: Job kind detail loads for a seeded kind', async ({ page }) => {
-    await page.goto('/admin/job-kinds');
+    await page.goto('/system/job-kinds');
     const firstRow = page.locator('table tbody tr').first();
     await expect(firstRow).toBeVisible({ timeout: 10_000 });
     const link = firstRow.locator('a').first();
@@ -96,13 +96,13 @@ test.describe('Phase-3 Work + Admin', () => {
   });
 
   test('Admin: Job kind new page loads the DAG editor', async ({ page }) => {
-    await page.goto('/admin/job-kinds/new');
+    await page.goto('/system/job-kinds/new');
     await expect(page.locator('h1')).toContainText(/new job kind/i);
     await expect(page.locator('.sde')).toBeVisible({ timeout: 10_000 });
   });
 
   test('Admin: Step plugins list loads', async ({ page }) => {
-    await page.goto('/admin/step-plugins');
+    await page.goto('/system/step-plugins');
     await expect(page.locator('h1')).toContainText(/step ux plugins/i);
     // Either a table row or the "no plugins" empty state.
     await expect(

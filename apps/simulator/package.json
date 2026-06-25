@@ -1,0 +1,24 @@
+{
+  "name": "boss-simulator-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Svelte 5 Simulator UX for BOSS. Hosted by the boss-simulator service under /simulator: a read-only demo cockpit plus the engine controls (pause/resume/restart/configure).",
+  "scripts": {
+    "dev": "bun --hot src/dev-server.ts",
+    "build": "bun run src/build.ts",
+    "typecheck": "svelte-check --tsconfig ./tsconfig.json",
+    "test:unit": "bun test src/"
+  },
+  "dependencies": {
+    "@boss/web-kit": "workspace:*",
+    "svelte": "^5.55.9",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "bun-plugin-svelte": "^0.0.6",
+    "bun-types": "^1.3.14",
+    "svelte-check": "^4.4.8",
+    "typescript": "^6.0.3"
+  }
+}

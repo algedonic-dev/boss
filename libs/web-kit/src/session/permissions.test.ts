@@ -10,7 +10,7 @@ describe('canSeeRoute — platform-admin is the super-admin and sees every surfa
   // role the job-kind-design approve step requires. It must surface the
   // full set (esp. the admin/KB surfaces an operator needs to author).
   const surfaces: RouteName[] = [
-    'job-kinds', 'policy', 'it-kb', 'it-design', 'it-step-plugins',
+    'job-kinds', 'policy', 'system-kb', 'system-design', 'system-step-plugins',
     'people', 'catalog', 'accounts', 'finance', 'exec', 'auth-admin',
   ];
   for (const r of surfaces) {

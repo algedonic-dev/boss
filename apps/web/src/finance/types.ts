@@ -1,6 +1,6 @@
 // Finance domain types. Port of apps/web/src/finance/types.ts.
 
-import { getLabel } from '../session/manifest.svelte';
+import { getLabel } from '@boss/web-kit/session/manifest.svelte';
 
 export type InvoiceStatus = 'paid' | 'outstanding' | 'past-due';
 

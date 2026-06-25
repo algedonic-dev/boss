@@ -8,11 +8,12 @@
 
   import { onMount } from 'svelte';
   import { parseRoute, type Route } from './router';
-  import { DEMO_MODE, loadSession } from './session/session.svelte';
-  import { loadManifest } from './session/manifest.svelte';
+  import { DEMO_MODE, loadSession } from '@boss/web-kit/session/session.svelte';
+  import { loadManifest } from '@boss/web-kit/session/manifest.svelte';
   import { loadStepTypeRegistry } from './steps/surfaceRegistry.svelte';
-  import { loadClasses } from './session/classes.svelte';
+  import { loadClasses } from '@boss/web-kit/session/classes.svelte';
   import AppShell from './shell/AppShell.svelte';
+  import PerspectiveTabs from '@boss/web-kit/PerspectiveTabs.svelte';
   import DebugGear from './debug/DebugGear.svelte';
   import MePage from './me/MePage.svelte';
   import JobsListPage from './jobs/JobsListPage.svelte';
@@ -56,6 +57,7 @@
   import SubjectsClassesPage from './it/subjects/SubjectsClassesPage.svelte';
   import SystemModelPage from './it/system/SystemModelPage.svelte';
   import DesignReviewPage from './it/design/DesignReviewPage.svelte';
+  import ExperimentsPage from './it/experiments/ExperimentsPage.svelte';
   import InboxPage from './inbox/InboxPage.svelte';
   import CalendarPage from './calendar/CalendarPage.svelte';
   import MyCalendarPage from './calendar/MyCalendarPage.svelte';
@@ -80,7 +82,7 @@
   import LoginPage from './auth/LoginPage.svelte';
   import AuthAdminPage from './auth/AuthAdminPage.svelte';
   import ModuleDisabled from './shell/ModuleDisabled.svelte';
-  import { moduleEnabled } from './session/manifest.svelte';
+  import { moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
 
   let route = $state<Route>(parseRoute(window.location.pathname));
 
@@ -183,26 +185,42 @@
       : route.kind === 'calendar' ? 'calendar'
       : route.kind === 'schedule' ? 'schedule'
       : route.kind === 'exec' ? 'exec'
-      : route.kind === 'itMonitoring' || route.kind === 'itMonitoringPerf' || route.kind === 'itMonitoringEvents' || route.kind === 'itMonitoringAtlas' ? 'itMonitoring'
+      : route.kind === 'systemMonitoring' || route.kind === 'systemMonitoringPerf' || route.kind === 'systemMonitoringEvents' || route.kind === 'systemMonitoringAtlas' ? 'systemMonitoring'
       : route.kind === 'warehouse' ? 'warehouse'
       : route.kind === 'catalog' || route.kind === 'device' ? 'catalog'
       : route.kind === 'marketingAssets' || route.kind === 'marketingAsset' ? 'marketing-assets'
       : route.kind === 'manual' || route.kind === 'manualSection' ? 'manual'
       : route.kind === 'policy' ? 'policy'
       : route.kind === 'jobKinds' || route.kind === 'jobKindNew' || route.kind === 'jobKindDesign' || route.kind === 'jobKindDetail' ? 'jobKinds'
-      : route.kind === 'itStepPlugins' || route.kind === 'itStepPluginDetail' ? 'itStepPlugins'
-      : route.kind === 'dispatcherRules' || route.kind === 'dispatcherRulesList' || route.kind === 'dispatcherRuleEdit' ? 'it-dispatcher'
-      : route.kind === 'itSubjects' ? 'it-subjects'
-      : route.kind === 'itSystem' ? 'it-system'
+      : route.kind === 'systemStepPlugins' || route.kind === 'systemStepPluginDetail' ? 'systemStepPlugins'
+      : route.kind === 'dispatcherRules' || route.kind === 'dispatcherRulesList' || route.kind === 'dispatcherRuleEdit' ? 'system-dispatcher'
+      : route.kind === 'systemSubjects' ? 'system-subjects'
+      : route.kind === 'systemModel' ? 'system-model'
+      : route.kind === 'experiments' ? 'system-experiments'
       : route.kind === 'workflows' ? 'workflows'
       : 'me',
   );
+
+  // Top-level perspective for the PerspectiveTabs bar. The System Model
+  // surfaces (the IT / model-definition tools) are one perspective; the
+  // operator work surfaces are the other. (Simulator is its own app.)
+  // This is the seam for the eventual Model/User app split.
+  const MODEL_KINDS = new Set<Route['kind']>([
+    'systemModel', 'systemSubjects', 'systemKb', 'systemDesign',
+    'systemMonitoring', 'systemMonitoringPerf', 'systemMonitoringEvents', 'systemMonitoringAtlas',
+    'systemStepPlugins', 'systemStepPluginDetail',
+    'dispatcherRules', 'dispatcherRulesList', 'dispatcherRuleEdit',
+    'jobKinds', 'jobKindNew', 'jobKindDesign', 'jobKindDetail',
+    'policy', 'workflows', 'authAdmin', 'experiments',
+  ]);
+  let perspective: 'model' | 'user' = $derived(MODEL_KINDS.has(route.kind) ? 'model' : 'user');
 </script>
 
 {#if route.kind === 'login'}
   <LoginPage />
 {:else}
-<AppShell {activeSection}>
+  <PerspectiveTabs active={perspective} brandName="Algedonic" brandSub="Ales" />
+<AppShell {activeSection} {perspective}>
   {#if blockedModule}
     <ModuleDisabled module={blockedModule.id} label={blockedModule.label} />
   {:else if route.kind === 'home'}
@@ -290,7 +308,7 @@
       <QaPage />
     {:else if route.kind === 'ops'}
       <OpsDashboard />
-    {:else if route.kind === 'itKb'}
+    {:else if route.kind === 'systemKb'}
       <ItKnowledgeBasePage />
     {:else if route.kind === 'policy'}
       <PolicyPage />
@@ -302,21 +320,23 @@
       <JobKindDesignWorkspace jobId={route.jobId} />
     {:else if route.kind === 'jobKindDetail'}
       <JobKindDetailPage kindSlug={route.kindSlug} />
-    {:else if route.kind === 'itStepPlugins'}
+    {:else if route.kind === 'systemStepPlugins'}
       <StepPluginsPage />
-    {:else if route.kind === 'itStepPluginDetail'}
+    {:else if route.kind === 'systemStepPluginDetail'}
       <StepPluginDetailPage pluginSlug={route.pluginSlug} />
-    {:else if route.kind === 'itDesign'}
+    {:else if route.kind === 'systemDesign'}
       <DesignReviewPage />
+    {:else if route.kind === 'experiments'}
+      <ExperimentsPage />
     {:else if route.kind === 'dispatcherRules'}
       <DispatcherCascadePage />
     {:else if route.kind === 'dispatcherRulesList'}
       <DispatcherRulesPage />
     {:else if route.kind === 'dispatcherRuleEdit'}
       <DispatcherRuleEditPage ruleName={route.ruleName} />
-    {:else if route.kind === 'itSubjects'}
+    {:else if route.kind === 'systemSubjects'}
       <SubjectsClassesPage />
-    {:else if route.kind === 'itSystem'}
+    {:else if route.kind === 'systemModel'}
       <SystemModelPage />
     {:else if route.kind === 'inbox'}
       <InboxPage />
@@ -344,13 +364,13 @@
       <ManualPage slug={route.slug} />
     {:else if route.kind === 'workflows'}
       <WorkflowsPage />
-    {:else if route.kind === 'itMonitoring'}
+    {:else if route.kind === 'systemMonitoring'}
       <MonitoringPage />
-    {:else if route.kind === 'itMonitoringPerf'}
+    {:else if route.kind === 'systemMonitoringPerf'}
       <PerfPage />
-    {:else if route.kind === 'itMonitoringEvents'}
+    {:else if route.kind === 'systemMonitoringEvents'}
       <EventsPage />
-    {:else if route.kind === 'itMonitoringAtlas'}
+    {:else if route.kind === 'systemMonitoringAtlas'}
       <AtlasPage />
     {:else if route.kind === 'po'}
       <PoPage poId={route.poId} />

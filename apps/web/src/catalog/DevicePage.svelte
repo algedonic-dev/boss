@@ -1,8 +1,8 @@
 <script lang="ts">
   // Catalog device detail — port of apps/web/src/catalog/DevicePage.tsx.
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import Meta from '../ui/Meta.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import Meta from '@boss/web-kit/ui/Meta.svelte';
   import { CATEGORY_LABEL } from './types';
   import { DeviceModelSchema, type DeviceModel } from './schemas';
   import { fetchValidated } from '../data/parseResponse';
@@ -130,7 +130,7 @@
   {@const s = d.service}
 
   <div class="detail-page theme-exec">
-    <Breadcrumb to={href('/catalog')}>
+    <Breadcrumb to={href('/ux/catalog')}>
       ← All devices
     </Breadcrumb>
 

@@ -2,11 +2,11 @@
   // Invoices tab — filterable list. Port of InvoicesTab sub-component
   // from apps/web/src/finance/FinancePage.tsx.
 
-  import FilterGroup from '../ui/FilterGroup.svelte';
-  import FilterButton from '../ui/FilterButton.svelte';
-  import SearchInput from '../ui/SearchInput.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import OverflowBanner from '../ui/OverflowBanner.svelte';
+  import FilterGroup from '@boss/web-kit/ui/FilterGroup.svelte';
+  import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
+  import SearchInput from '@boss/web-kit/ui/SearchInput.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import OverflowBanner from '@boss/web-kit/ui/OverflowBanner.svelte';
   import InvoiceStatusChip from './InvoiceStatusChip.svelte';
   import {
     PAYMENT_METHOD_LABEL,
@@ -15,7 +15,7 @@
     type PaymentMethod,
   } from './types';
   import type { Account } from '../accounts/types';
-  import { formatMoney } from '../ui/money';
+  import { formatMoney } from '@boss/web-kit/ui/money';
 
   type Props = {
     invoices: ReadonlyArray<Invoice>;

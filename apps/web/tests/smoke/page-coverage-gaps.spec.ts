@@ -66,8 +66,8 @@ test.describe('Page-coverage gaps — render contract', () => {
     await expect(page.locator('h1').first()).toBeVisible({ timeout: 10_000 });
   });
 
-  test('Step Plugins admin (/admin/step-plugins) mounts', async ({ page }) => {
-    await mountPage(page, '/admin/step-plugins');
+  test('Step Plugins admin (/system/step-plugins) mounts', async ({ page }) => {
+    await mountPage(page, '/system/step-plugins');
     await expect(page.locator('h1').first()).toBeVisible({ timeout: 10_000 });
   });
 

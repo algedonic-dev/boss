@@ -1,7 +1,7 @@
 <script lang="ts">
   // Balance sheet — port of apps/web/src/finance/BalanceSheetTab.tsx.
 
-  import Section from '../ui/Section.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import DeferredRevenueRunoffPanel from './DeferredRevenueRunoffPanel.svelte';
   import {
     centsToDollars,
@@ -16,7 +16,7 @@
     type BalanceSheet,
     type StatementLine,
   } from './ledger';
-  import { appToday } from '../shell/sim-clock.svelte';
+  import { appToday } from '@boss/web-kit/sim-clock';
 
   let asOf = $state(appToday());
   let data = $state<BalanceSheet | null>(null);

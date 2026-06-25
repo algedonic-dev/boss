@@ -5,9 +5,9 @@
   // touching a selected account), entry detail (lines + fact payload).
   // Plus the Periods panel with lock/unlock buttons.
 
-  import Section from '../ui/Section.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import { type EntityKind } from '../ui/entity-href';
+  import Section from '@boss/web-kit/ui/Section.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import { type EntityKind } from '@boss/web-kit/ui/entity-href';
   import {
     centsToDollars,
     dateStamp,
@@ -31,7 +31,7 @@
     type TrialBalanceResponse,
     type TrialBalanceRow,
   } from './ledger';
-  import { session } from '../session/session.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
   import AccountDrillDown from './AccountDrillDown.svelte';
 
   let asOf = $state('');

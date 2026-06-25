@@ -8,7 +8,7 @@
     downloadZip,
     type CloseResult,
   } from './monthlyClose';
-  import { appNow } from '../shell/sim-clock.svelte';
+  import { appNow } from '@boss/web-kit/sim-clock';
 
   function defaultMonth(): string {
     // Default to the previous calendar month — an operator pulling a

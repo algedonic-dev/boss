@@ -9,10 +9,10 @@
   // /api/inventory/orders. Structure + loading/error states mirror
   // the invoice detail page (finance/InvoicePage.svelte).
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import Meta from '../ui/Meta.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import Meta from '@boss/web-kit/ui/Meta.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import type { VendorInvoice } from '../vendors/types';
   import { href } from '../router';
 
@@ -56,7 +56,7 @@
 </script>
 
 <div class="detail-page theme-exec">
-  <Breadcrumb to={href('/warehouse')}>
+  <Breadcrumb to={href('/ux/warehouse')}>
     ← Warehouse
   </Breadcrumb>
 

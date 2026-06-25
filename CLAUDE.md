@@ -205,7 +205,7 @@ The **JobKind registry** (`boss-jobs`, backed by the `job_kinds` table) is appen
 - `steps` — a flat set of Steps; the DAG is implicit in each step's `ready_when` predicate (an edge A → B exists iff B's `ready_when` references A), not an author-drawn graph
 - `metadata_schema` + `entitlements` — typed fields and policy hooks on the Job itself
 
-**Adding a new workflow means adding a JobKind row**, not touching core code. New versions supersede old ones; in-flight Jobs stay pinned to the version they were opened under. Authoring lives at `/admin/job-kinds`.
+**Adding a new workflow means adding a JobKind row**, not touching core code. New versions supersede old ones; in-flight Jobs stay pinned to the version they were opened under. Authoring lives at `/system/job-kinds`.
 
 ### Steps
 A **Step** is the typed unit of work inside a Job. Each step has a `kind` (from the StepType registry), `status` (pending → ready → active → completed (+ skipped)), optional assignee, `blocked_by` (a predicate-derived denormalized edge list for DAG rendering — recovered from the step's `ready_when` references, not an author-specified gate), optional sign-off, and free-form `metadata`.
@@ -224,13 +224,13 @@ Every state change emits an immutable fact through NATS (`boss-nats`) and lands 
 These three hang off the four primitives. They are load-bearing infrastructure, not foundational vocabulary.
 
 - **Class registry** — typed reference data each Subject kind owns. One `classes` table keyed `(subject_kind, code)` carries every taxonomy in the system: roles (Classes of `employee` Subjects), AccountTypes (Classes of `account` Subjects), asset models, departments, account tiers. See [docs/design/class-registry.md](docs/design/class-registry.md).
-- **StepPlugins** — UX extensions on Steps. A plugin is a small JS bundle served by the gateway at `/plugins/<path>` that renders a custom surface for a step kind. Plugins ship as data (a row in `step_plugins`) + a static JS asset; authoring at `/admin/step-plugins`. **New step surfaces do not require a core code change in `apps/web`.** Decision record: [docs/architecture-decisions.md](docs/architecture-decisions.md) §Step UX & frontend.
+- **StepPlugins** — UX extensions on Steps. A plugin is a small JS bundle served by the gateway at `/plugins/<path>` that renders a custom surface for a step kind. Plugins ship as data (a row in `step_plugins`) + a static JS asset; authoring at `/system/step-plugins`. **New step surfaces do not require a core code change in `apps/web`.** Decision record: [docs/architecture-decisions.md](docs/architecture-decisions.md) §Step UX & frontend.
 - **Policy** — every write passes through `boss-policy` (via the `PolicyClient` port). Rules are row-level: a rule grants an `(action, resource)` within a `scope`; user-specific overrides take precedence; `policy_rule_audit` tracks every decision.
 
 ### How to add a new thing
 The shape of an "add a new thing" change follows the primitives:
 
-1. **New work type** → add a JobKind row (authoring at `/admin/job-kinds`), declaring its `steps` (the DAG implicit in their `ready_when` predicates). Usually no Rust code change.
+1. **New work type** → add a JobKind row (authoring at `/system/job-kinds`), declaring its `steps` (the DAG implicit in their `ready_when` predicates). Usually no Rust code change.
 2. **New step behavior** → add a StepType entry (if the schema is new) + a StepPlugin row + a JS bundle. No core frontend change.
 3. **New domain entity** → a new crate following hexagonal structure: domain types + traits in `boss-core` or a `*-client` port crate, implementation in the service crate, HTTP surface in the service binary.
 4. **New cross-service contract** → extend `boss-core` events or add a `*-client` port shared between consumers.

@@ -2,8 +2,8 @@
   // Detail view for one finished-product SKU. Catalog row + on-hand-
   // by-location rollup. Sibling to PartPage.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Link from '../ui/Link.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
   import { href } from '../router';
   import type { ProductDetail, ProductInventory } from './types';
 
@@ -59,7 +59,7 @@
   {#if loading}
     <p class="empty">Loading product…</p>
   {:else if error}
-    <p class="empty err">{error} — <Link to={href('/products')}>back to products</Link></p>
+    <p class="empty err">{error} — <Link to={href('/ux/products')}>back to products</Link></p>
   {:else if detail}
     <PageHeader
       title={detail.name}
@@ -123,7 +123,7 @@
     {/if}
 
     <p class="back">
-      <Link to={href('/products')}>← All products</Link>
+      <Link to={href('/ux/products')}>← All products</Link>
     </p>
   {/if}
 </div>

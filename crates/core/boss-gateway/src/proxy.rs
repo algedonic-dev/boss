@@ -306,6 +306,10 @@ pub static CALENDAR: ProxyConfig = ProxyConfig::new("calendar");
 /// cybernetics rollup. Port 7880, declared in boss_ports.
 pub static OBSERVABILITY: ProxyConfig = ProxyConfig::new("observability");
 pub static PRODUCTS: ProxyConfig = ProxyConfig::new("products");
+/// Simulator UX service — hosts the /simulator SPA bundle + the
+/// /simulator/api/* control+status surface. Port 7010, declared in
+/// boss_ports.
+pub static SIMULATOR: ProxyConfig = ProxyConfig::new("simulator");
 
 /// Policy's `my-scope` POST is called on every page load. When the
 /// upstream is down we'd otherwise log a 502 into every browser
@@ -376,6 +380,7 @@ mod tests {
         let _ = SUBJECT_KINDS.upstream_url();
         let _ = CALENDAR.upstream_url();
         let _ = POLICY.upstream_url();
+        let _ = SIMULATOR.upstream_url();
     }
 
     /// Security: the gateway never forwards a client-supplied

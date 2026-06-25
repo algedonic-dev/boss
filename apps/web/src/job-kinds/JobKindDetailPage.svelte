@@ -1,18 +1,18 @@
 <script lang="ts">
-  // /admin/job-kinds/:slug — port of
+  // /system/job-kinds/:slug — port of
   // apps/web/src/admin/JobKindDetailPage.tsx.
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import type { JobKindSpec, StepSpec } from './jobKindTypes';
   import { href, navigate } from '../router';
   import StepDag from '../jobs/StepDag.svelte';
   import { jobKindToDag } from '../jobs/jobKindToDag';
   import { startDesignJob } from './designJob';
-  import { session } from '../session/session.svelte';
-  import { appToday } from '../shell/sim-clock.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
+  import { appToday } from '@boss/web-kit/sim-clock';
 
   type LoadState =
     | { kind: 'loading' }
@@ -46,7 +46,7 @@
         appToday(),
         { title: `Edit ${spec.kind}`, previousVersion: spec.version },
       );
-      navigate(href(`/admin/job-kinds/authoring/${encodeURIComponent(jobId)}`));
+      navigate(href(`/system/job-kinds/authoring/${encodeURIComponent(jobId)}`));
     } catch (e) {
       actionError = e instanceof Error ? e.message : String(e);
       action = null;
@@ -202,7 +202,7 @@
     : null}
 
   <div class="catalog theme-exec">
-    <Breadcrumb to={href('/job-kinds')}>
+    <Breadcrumb to={href('/system/job-kinds')}>
       ← All job kinds
     </Breadcrumb>
     <PageHeader
@@ -233,7 +233,7 @@
       <button
         type="button"
         class="wb-btn"
-        onclick={() => navigate(href(`/admin/job-kinds/new?fork=${encodeURIComponent(spec.kind)}`))}
+        onclick={() => navigate(href(`/system/job-kinds/new?fork=${encodeURIComponent(spec.kind)}`))}
         title="Create a new kind pre-populated from this one"
       >
         Fork…

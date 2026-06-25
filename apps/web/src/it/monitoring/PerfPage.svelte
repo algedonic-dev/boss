@@ -1,7 +1,7 @@
 <script lang="ts">
-  // Gateway latency dashboard — sub-page of /it/monitoring.
+  // Gateway latency dashboard — sub-page of /system/monitoring.
 
-  import Link from '../../ui/Link.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
   import { href } from '../../router';
 
   type EndpointSnapshot = {
@@ -136,7 +136,7 @@
 <div class="theme-exec" style="padding:32px; max-width:1400px; margin:0 auto">
   <div class="exec-header" style="margin-bottom:24px">
     <div>
-      <div class="exec-eyebrow">IT · Observability</div>
+      <div class="exec-eyebrow">System Model · Observability</div>
       <h1 class="exec-title">Gateway latency</h1>
       <p style="color:var(--muted); margin:4px 0 0">
         Per-endpoint p50/p95/p99 since gateway start. Refreshes every 2 seconds.
@@ -145,7 +145,7 @@
       </p>
     </div>
     <div style="display:flex; gap:12px; align-items:center">
-      <Link to={href('/it/monitoring')} className="btn">
+      <Link to={href('/system/monitoring')} className="btn">
         ← CTO
       </Link>
       <button type="button" class="btn" onclick={() => (paused = !paused)}>

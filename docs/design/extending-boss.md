@@ -58,7 +58,7 @@ ladder as you actually need:
 | You want to… | You author… | Code? | Where? |
 |---|---|---|---|
 | Run an existing workflow against a new Subject pool | Just open a Job | No | SPA, `/jobs/new` |
-| Compose a new workflow from existing StepTypes | A JobKind row | No (data only) | `/admin/job-kinds` |
+| Compose a new workflow from existing StepTypes | A JobKind row | No (data only) | `/system/job-kinds` |
 | Add a new step kind with a custom UX surface | A StepPlugin (JS bundle) | JavaScript only | `infra/step-plugins/` |
 | Add a new domain entity (Subject kind) | A new crate | Rust | `crates/modules/` |
 | Add a new event topic + projection | Cross-service contract | Rust | `crates/core/boss-core` events |
@@ -72,7 +72,7 @@ rare and only justified when you're modeling a fundamentally new
 ## Level 2 — JobKind authoring
 
 A JobKind is a row in the `job_kinds` table (authored at
-`/admin/job-kinds`). It declares:
+`/system/job-kinds`). It declares:
 
 - `kind` — unique slug (e.g. `wholesale-keg-order`).
 - `subject_kinds` — which Subject types the Job can target.
@@ -185,7 +185,7 @@ to level 3. Two pieces ship together:
 
 The plugin registry is a row in `step_plugins` keyed `(kind,
 version)`, with a `frontend_url` naming the bundle — operator-
-authored at `/admin/step-plugins` or canonical-seeded via SQL.
+authored at `/system/step-plugins` or canonical-seeded via SQL.
 `boss-gateway` serves bundles from `/var/lib/boss/step-plugins/`
 at `/plugins/*`. The full
 walk-through of authoring + deploying a plugin from scratch

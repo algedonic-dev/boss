@@ -1,6 +1,6 @@
 <script lang="ts">
   import { isPending, isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
-  import { appToday } from '../shell/sim-clock.svelte';
+  import { appToday } from '@boss/web-kit/sim-clock';
   // Receiving step surface — three-way match for inbound goods
   // (PO line + actual qty received + over/short delta). The
   // ingredient-restock JobKind opens with a procurement step

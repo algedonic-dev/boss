@@ -1,12 +1,12 @@
 <script lang="ts">
   // Marketing Asset detail.
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import Meta from '../ui/Meta.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import Meta from '@boss/web-kit/ui/Meta.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import { type MarketingAsset } from './types';
-  import { loadClasses, classesFor } from '../session/classes.svelte';
+  import { loadClasses, classesFor } from '@boss/web-kit/session/classes.svelte';
   import { href } from '../router';
 
   type Props = { assetId: string };
@@ -79,7 +79,7 @@
 </script>
 
 <div class="detail-page theme-exec">
-  <Breadcrumb to={href('/marketing-assets')}>
+  <Breadcrumb to={href('/ux/marketing-assets')}>
     ← Assets
   </Breadcrumb>
 
@@ -167,7 +167,7 @@
             <dt>Supersedes</dt>
             <dd>
               {#if hasPredecessor && a.supersedes_id}
-                <a href={href(`/marketing-assets/${encodeURIComponent(a.supersedes_id)}`)}>
+                <a href={href(`/ux/marketing-assets/${encodeURIComponent(a.supersedes_id)}`)}>
                   {a.supersedes_id}
                 </a>
               {:else}
@@ -202,7 +202,7 @@
               {:else}
                 <ul style="list-style:none; padding:0; margin:0; font-size:13px">
                   {#each a.linked_device_skus as id (id)}
-                    {@const path = id.startsWith('FP-') ? `/products/${encodeURIComponent(id)}` : `/catalog/${encodeURIComponent(id)}`}
+                    {@const path = id.startsWith('FP-') ? `/ux/products/${encodeURIComponent(id)}` : `/ux/catalog/${encodeURIComponent(id)}`}
                     <li style="margin-bottom:4px">
                       <a href={href(path)}>{id}</a>
                     </li>
@@ -238,7 +238,7 @@
                     <li style="margin-bottom:4px">
                       <a
                         href={href(
-                          `/jobs?subject_kind=campaign&subject_id=${encodeURIComponent(id)}`,
+                          `/ux/jobs?subject_kind=campaign&subject_id=${encodeURIComponent(id)}`,
                         )}
                       >
                         {id}
@@ -279,7 +279,7 @@
                     {#if h.id === a.id}
                       {h.id}
                     {:else}
-                      <a href={href(`/marketing-assets/${encodeURIComponent(h.id)}`)}>{h.id}</a>
+                      <a href={href(`/ux/marketing-assets/${encodeURIComponent(h.id)}`)}>{h.id}</a>
                     {/if}
                   </td>
                   <td>{h.title}</td>

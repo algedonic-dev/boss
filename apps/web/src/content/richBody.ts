@@ -2,7 +2,7 @@
 // render each token without an HTML string. Mirrors the logic in
 // apps/web/src/content/RichBody.tsx.
 
-import type { EntityKind } from '../ui/entity-href';
+import type { EntityKind } from '@boss/web-kit/ui/entity-href';
 
 type Pattern = {
   re: RegExp;

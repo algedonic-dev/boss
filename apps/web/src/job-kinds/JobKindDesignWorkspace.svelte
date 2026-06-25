@@ -1,5 +1,5 @@
 <script lang="ts">
-  // /admin/job-kinds/authoring/:jobId — the graphical authoring surface
+  // /system/job-kinds/authoring/:jobId — the graphical authoring surface
   // for a `job-kind-design` Job (decision D6). The working spec lives in
   // the design Job's publish-step `metadata.job_kind_spec`; edits persist
   // there (debounced) as ordinary STEP_UPDATED events — no `job_kinds`
@@ -9,9 +9,9 @@
   // Workflow: author → validate (gated on the live dry-run being clean)
   // → approve (job-kind-approver sign-off) → publish.
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import StepAuthoringSurface from './StepAuthoringSurface.svelte';
   import type { JobKindSpec } from './jobKindTypes';
   import type { Job, Step, StepStatus } from '../jobs/types';
@@ -216,7 +216,7 @@
         );
       }
       await completeStep(jobId, publishStep.id);
-      navigate(href(`/admin/job-kinds/${encodeURIComponent(slug)}`));
+      navigate(href(`/system/job-kinds/${encodeURIComponent(slug)}`));
     } catch (e) {
       actionError = e instanceof Error ? e.message : String(e);
       acting = null;
@@ -240,7 +240,7 @@
 </script>
 
 <div class="catalog theme-exec">
-  <Breadcrumb to={href('/job-kinds')}>← All job kinds</Breadcrumb>
+  <Breadcrumb to={href('/system/job-kinds')}>← All job kinds</Breadcrumb>
 
   {#if loadState.kind === 'loading'}
     <p class="empty">Loading…</p>

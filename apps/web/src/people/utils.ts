@@ -1,7 +1,7 @@
 // Pure helpers on employee data. Ported from apps/web/src/people/utils.ts.
 
 import type { Certification, Employee, EmployeeId } from './types';
-import { appNow } from '../shell/sim-clock.svelte';
+import { appNow } from '@boss/web-kit/sim-clock';
 
 export function tenureYears(employee: Employee, today: Date = appNow()): number {
   // Identity-first: no hire_date yet (an un-onboarded record) means no

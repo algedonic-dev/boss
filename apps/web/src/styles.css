@@ -43,6 +43,9 @@ html, body {
   display: grid;
   grid-template-columns: 200px 1fr;
   min-height: 100vh;
+  /* Offset below the fixed 44px PerspectiveTabs bar. */
+  box-sizing: border-box;
+  padding-top: 44px;
 }
 
 .shell-sidebar {
@@ -51,34 +54,14 @@ html, body {
   display: flex;
   flex-direction: column;
   position: fixed;
-  top: 0; left: 0; bottom: 0;
+  top: 44px; left: 0; bottom: 0;
   width: 200px;
   z-index: 20;
   overflow-y: auto;
 }
-.shell-sidebar-header {
-  display: flex;
-  align-items: baseline;
-  gap: 2px;
-  padding: 20px 20px 16px;
-}
-/* Sidebar logo: Boss in display-serif white, "Brewery" sub-mark in
-   warm brewery amber so the chrome itself nods at the tenant brand. */
-.shell-logo {
-  font-family: var(--font-display);
-  font-size: 22px;
-  font-weight: 700;
-  color: #fff;
-  letter-spacing: -0.01em;
-}
-.shell-logo-sub {
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--brew-amber);
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-}
-.shell-nav { flex: 1; padding: 0 8px; overflow-y: auto; }
+/* Sidebar leads with the nav now — the tenant wordmark moved up to
+   the perspective tab bar. */
+.shell-nav { flex: 1; padding: 16px 8px 0; overflow-y: auto; }
 .shell-nav-personal {
   margin-bottom: 24px;
   padding-bottom: 16px;
@@ -116,13 +99,8 @@ html, body {
 .shell-user-name { font-size: 13px; font-weight: 500; color: #fff; }
 .shell-user-role { font-size: 11px; color: #a8a29e; }
 
-.shell-topbar {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 8px 24px; border-bottom: 1px solid #e7e5e4;
-  background: #fff; position: sticky; top: 0; z-index: 10;
-}
-.shell-topbar-left { display: flex; align-items: center; gap: 16px; }
-.shell-topbar-right { display: flex; align-items: center; gap: 8px; }
+/* The old per-page topbar is gone — system-time + sign-in live in the
+   perspective tab bar now; content flows directly under it. */
 .shell-inbox {
   padding: 5px 12px; font-size: 12px; font-weight: 500;
   border-radius: 6px; text-decoration: none; color: #57534e;

@@ -10,18 +10,18 @@
   // is deferred to the session rewrite tracked in phase-1 trade-ins.
 
   import { navigate, href } from '../router';
-  import { entityHref } from '../ui/entity-href';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import FilterGroup from '../ui/FilterGroup.svelte';
-  import FilterButton from '../ui/FilterButton.svelte';
-  import SearchInput from '../ui/SearchInput.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import OverflowBanner from '../ui/OverflowBanner.svelte';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import FilterGroup from '@boss/web-kit/ui/FilterGroup.svelte';
+  import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
+  import SearchInput from '@boss/web-kit/ui/SearchInput.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import OverflowBanner from '@boss/web-kit/ui/OverflowBanner.svelte';
   import TierChip from './TierChip.svelte';
   import type { Asset, Job, Account } from './types';
   import type { Invoice } from '../finance/types';
   import { fetchPaged, isCapped, type Paged } from '../data/paginated';
-  import { moduleEnabled } from '../session/manifest.svelte';
+  import { moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
 
   type Tier = Account['tier'] | 'all';
 

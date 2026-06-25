@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::ASSETS)),
         )
         // Dispatcher rule-registry surface (read-only) — backs the
-        // /admin/dispatcher cascade visualization.
+        // /system/dispatcher cascade visualization.
         .route(
             "/api/dispatcher/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::DISPATCHER)),
@@ -435,6 +435,21 @@ async fn main() -> Result<()> {
         .route(
             "/api/docs/health",
             axum::routing::get(|s, r| proxy::handle_public(s, r, &proxy::DESIGN)),
+        )
+        // Simulator UX — boss-simulator hosts both the /simulator SPA
+        // bundle and its /simulator/api/* control+status surface. The
+        // whole prefix is proxied (not stripped); the service nests its
+        // sub-app under /simulator. Cookie-gated like the dashboard so the
+        // demo session + persona flow apply (the service's own operator
+        // gate refuses control writes for audit-readonly). These specific
+        // routes win over the /{*rest} SPA fallback below.
+        .route(
+            "/simulator",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::SIMULATOR)),
+        )
+        .route(
+            "/simulator/{*rest}",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::SIMULATOR)),
         )
         // Step UX plugin bundles — served from the plugins dir on
         // disk. See docs/architecture-decisions.md §Step UX & frontend.

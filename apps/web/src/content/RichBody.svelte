@@ -2,7 +2,7 @@
   // Render a plain-text body with entity-ID shortcodes promoted to
   // EntityLinks. Svelte port of apps/web/src/content/RichBody.tsx.
 
-  import EntityLink from '../ui/EntityLink.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import { tokenize } from './richBody';
 
   type Props = {

@@ -4,11 +4,11 @@
   // Aggregates POs + vendor invoices by vendor name and shows open PO
   // counts + outstanding balances. Sits under the Know bucket.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import FilterGroup from '../ui/FilterGroup.svelte';
-  import FilterButton from '../ui/FilterButton.svelte';
-  import SearchInput from '../ui/SearchInput.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import FilterGroup from '@boss/web-kit/ui/FilterGroup.svelte';
+  import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
+  import SearchInput from '@boss/web-kit/ui/SearchInput.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import type { PurchaseOrder, Vendor, VendorInvoice } from './types';
 
   let vendors = $state<Vendor[]>([]);

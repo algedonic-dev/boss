@@ -13,9 +13,9 @@
   // on every open question having a recorded resolution. The Job
   // itself is the durable record; pending-decisions / ADR-extraction
   // continue to use the existing /api/design endpoints unchanged.
-  import PageHeader from '../../ui/PageHeader.svelte';
-  import Section from '../../ui/Section.svelte';
-  import Link from '../../ui/Link.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
   import { href } from '../../router';
 
   type DesignDoc = {

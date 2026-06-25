@@ -11,7 +11,7 @@
 // find + prune later. Sim-control actions hit the new
 // `/api/jobs/sim-clock/{pause,resume}` endpoints.
 
-import { appToday } from '../shell/sim-clock.svelte';
+import { appToday } from '@boss/web-kit/sim-clock';
 
 export type SimLogger = (msg: string) => void;
 

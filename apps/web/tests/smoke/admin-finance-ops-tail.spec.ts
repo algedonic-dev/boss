@@ -4,9 +4,9 @@
 import { test, expect } from '@playwright/test';
 import { mountPage } from './_helpers';
 
-test.describe('Admin Policy (/admin/policy) — controls', () => {
+test.describe('Admin Policy (/system/policy) — controls', () => {
   test('Refresh button is visible + clickable', async ({ page }) => {
-    await mountPage(page, '/admin/policy', { titleMatch: /policy|rule/i });
+    await mountPage(page, '/system/policy', { titleMatch: /policy|rule/i });
     // The page exposes a single load-button + per-row Edit
     // buttons that open a flyout. The load button label is
     // ambiguous ("Refresh" / "Reload" / context-dependent); just
@@ -17,7 +17,7 @@ test.describe('Admin Policy (/admin/policy) — controls', () => {
   });
 
   test('row Edit button opens the policy flyout', async ({ page }) => {
-    await mountPage(page, '/admin/policy', { titleMatch: /policy|rule/i });
+    await mountPage(page, '/system/policy', { titleMatch: /policy|rule/i });
     const edit = page
       .locator('table tbody tr button')
       .filter({ hasText: /edit/i })
@@ -33,16 +33,16 @@ test.describe('Admin Policy (/admin/policy) — controls', () => {
   });
 });
 
-test.describe('Admin Step plugins (/admin/step-plugins) — list + detail', () => {
+test.describe('Admin Step plugins (/system/step-plugins) — list + detail', () => {
   test('list page mounts', async ({ page }) => {
-    await mountPage(page, '/admin/step-plugins');
+    await mountPage(page, '/system/step-plugins');
     await expect(page.locator('h1').first()).toBeVisible({ timeout: 10_000 });
   });
 
   test('detail page Publish + Retire buttons render', async ({ page }) => {
-    await mountPage(page, '/admin/step-plugins');
+    await mountPage(page, '/system/step-plugins');
     const link = page
-      .locator('a[href*="/admin/step-plugins/"]')
+      .locator('a[href*="/system/step-plugins/"]')
       .first();
     if ((await link.count()) === 0) {
       test.skip(true, 'no step plugins registered');

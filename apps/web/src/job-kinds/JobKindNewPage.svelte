@@ -1,5 +1,5 @@
 <script lang="ts">
-  // /admin/job-kinds/new — name a new kind, then open the authoring
+  // /system/job-kinds/new — name a new kind, then open the authoring
   // workspace. Under D6 a JobKind is authored *through* a
   // `job-kind-design` Job: this page collects the identity + headline
   // fields, creates the design Job (the slug becomes its immutable
@@ -7,13 +7,13 @@
   // off to JobKindDesignWorkspace. No `job_kinds` row is written until
   // the author drives that Job to its publish step.
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import type { JobKindSpec, StepSpec } from './jobKindTypes';
   import { initialSpec, startDesignJob } from './designJob';
-  import { session } from '../session/session.svelte';
-  import { appToday } from '../shell/sim-clock.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
+  import { appToday } from '@boss/web-kit/sim-clock';
   import { href, navigate } from '../router';
 
   let ownerId = $derived(
@@ -132,7 +132,7 @@
       const jobId = await startDesignJob(seed, ownerId, appToday(), {
         title: forkSource ? `Fork ${forkSource} → ${kindSlug}` : `Design ${kindSlug}`,
       });
-      navigate(href(`/admin/job-kinds/authoring/${encodeURIComponent(jobId)}`));
+      navigate(href(`/system/job-kinds/authoring/${encodeURIComponent(jobId)}`));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       starting = false;
@@ -141,7 +141,7 @@
 </script>
 
 <div class="catalog theme-exec">
-  <Breadcrumb to={href('/job-kinds')}>← All job kinds</Breadcrumb>
+  <Breadcrumb to={href('/system/job-kinds')}>← All job kinds</Breadcrumb>
   <PageHeader
     eyebrow="Platform · Job kind"
     title={forkSource ? `New job kind (forked from ${forkSource})` : 'New job kind'}

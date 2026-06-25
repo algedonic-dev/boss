@@ -1,7 +1,7 @@
 <script lang="ts">
   // Tax liability — port of apps/web/src/finance/TaxLiabilityTab.tsx.
 
-  import Section from '../ui/Section.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import {
     centsToDollars,
     dateStamp,
