@@ -8,7 +8,8 @@ PartOf=boss-jobs-api.service
 [Service]
 Type=simple
 Environment=RUST_LOG=info
-Environment=BOSS_POSTGRES_URL=postgres://boss:boss@127.0.0.1/boss
+# No BOSS_POSTGRES_URL: the simulator is a pure public-API client and
+# never connects to the database directly (see infra/lint/sim-boundary-audit.sh).
 Environment=BOSS_SIM_API_BASE=direct://127.0.0.1
 Environment=BOSS_SIM_SEEDS_DIR=/opt/boss/examples/brewery/seeds
 # Receive the dispatcher's pushed step.done.<kind> events on :7099 so the

@@ -65,6 +65,14 @@ for path in crates/modules/*/; do
     BANNED_CRATES+=("$name")
 done
 
+# Direct database drivers. The impl-crate ban above stops the Postgres
+# ADAPTERS; this stops a sim-side crate from declaring a raw DB driver
+# (e.g. sqlx) that would let it reach behind the public API straight
+# into the database. No allowlist — direct DB access from the sim is
+# never acceptable. (The simulator only ever touches the system through
+# the public HTTP API.)
+BANNED_DB_DRIVERS=("sqlx" "tokio-postgres" "deadpool-postgres" "diesel" "postgres" "rusqlite")
+
 # Allowlist of CURRENT violators. Each entry is
 # `<sim-crate-path>::<banned-dep-name>`. The lint succeeds when a
 # violation appears here, fails when it doesn't. Empty the list
@@ -108,6 +116,13 @@ for crate_path in "${SIM_SIDE_CRATES[@]}"; do
                     unexpected_violations+=("$crate_name → $banned (in $toml)")
                     violations=$((violations + 1))
                 fi
+                break
+            fi
+        done
+        for db in "${BANNED_DB_DRIVERS[@]}"; do
+            if [[ "$dep" == "$db" ]]; then
+                unexpected_violations+=("$crate_name → $dep (direct DB driver — the sim must use the public API)")
+                violations=$((violations + 1))
                 break
             fi
         done

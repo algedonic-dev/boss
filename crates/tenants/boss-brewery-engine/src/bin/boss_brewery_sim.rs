@@ -34,7 +34,6 @@
 //!
 //! Env vars (all optional — sim_clock row defaults win once
 //! initialized):
-//!   BOSS_POSTGRES_URL    default postgres://boss:boss@127.0.0.1/boss
 //!   BOSS_SIM_API_BASE    default direct://127.0.0.1
 //!   BOSS_SIM_SEEDS_DIR   default /opt/boss/examples/brewery/seeds
 //!   BOSS_SIM_INITIAL_DATE  YYYY-MM-DD — only consulted on first
@@ -336,10 +335,10 @@ async fn main() -> Result<()> {
         "boss-brewery-sim starting"
     );
 
-    // brewery-sim is a pure consumer of /api/clock/now and other
-    // public HTTP APIs; it never touches the DB directly. The
-    // DATABASE_URL env var (BOSS_POSTGRES_URL) is read by the
-    // boss-brewery-engine subprocess for its own purposes.
+    // brewery-sim is a pure public-API client — it only ever touches
+    // the system through the public HTTP API (/api/clock/now, /api/jobs,
+    // the domain services). It has no database or message-bus access by
+    // construction (see this crate's Cargo.toml + infra/lint/sim-boundary-audit.sh).
 
     // Business calendars as DATA — fetched from boss-calendar so the
     // sim shares ONE source of truth with the dispatcher + service

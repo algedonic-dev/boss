@@ -68,17 +68,11 @@ fi
 # ---- 1. cargo build -----------------------------------------------------------
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
-    # boss-brewery-sim is feature-gated behind sim-daemon (sqlx +
-    # tokio compile cost that the simpler brewery-engine bins
-    # don't need). Enable it via cross-package feature syntax so
-    # the workspace builds in a single invocation — the prior
-    # two-cargo-build pattern (one without sim-daemon, then a
-    # second with) invalidated cache and recompiled boss-brewery-
-    # engine + its dep tree from scratch on the second pass,
-    # costing ~5-15 min on a small VM for no benefit.
-    echo "==> [1/4] cargo build --release --workspace --features postgres,boss-brewery-engine/sim-daemon"
+    # boss-brewery-sim builds as a normal workspace bin now — it's a
+    # pure public-API client with no sqlx/DB feature to gate.
+    echo "==> [1/4] cargo build --release --workspace --features postgres"
     cd "$REPO_ROOT"
-    cargo build --release --workspace --features postgres --features boss-brewery-engine/sim-daemon
+    cargo build --release --workspace --features postgres
     # boss-accounts-api + boss-events-api gate on umbrella features, not
     # `postgres`, so the workspace build skips them. Build explicitly —
     # else nothing listens on 7550/7150 and accounts never seed.
