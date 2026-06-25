@@ -86,15 +86,23 @@ FROM oven/bun:1.3-debian@sha256:9dba1a1b43ce28c9d7931bfc4eb00feb63b0114720a0277a
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 
 WORKDIR /spa
-COPY apps/web/package.json apps/web/bun.lock* ./
-# `patchedDependencies` in package.json references patch files under
-# patches/; bun install needs them present, so copy that dir ahead of
-# the install (and ahead of the full-source COPY) to keep the
-# dependency layer cacheable.
-COPY apps/web/patches ./patches
+# The frontend is a Bun WORKSPACE (root package.json `workspaces`
+# [apps/*, libs/*]); the lockfile + `patchedDependencies` patch files
+# live at the workspace ROOT, and apps/web depends on @boss/web-kit
+# (workspace:*). Install from the root with every member's package.json
+# present so the dependency layer stays cacheable + the workspace symlinks
+# resolve.
+COPY package.json bun.lock ./
+COPY patches ./patches
+COPY apps/web/package.json ./apps/web/package.json
+COPY apps/simulator/package.json ./apps/simulator/package.json
+COPY libs/web-kit/package.json ./libs/web-kit/package.json
 RUN bun install --frozen-lockfile
 
-COPY apps/web/. ./
+# Source for the members the SPA build needs — apps/web + its
+# @boss/web-kit workspace dependency.
+COPY apps/web ./apps/web
+COPY libs/web-kit ./libs/web-kit
 
 # `apps/web/src/build.ts` shells out to `boss-ports-list` for the
 # canonical service-port table (single-source-of-truth shared with
@@ -105,7 +113,7 @@ COPY apps/web/. ./
 # `find_boss_bin`; in docker the stages are isolated so we have to
 # stage the binary explicitly.
 COPY --from=rust-build /out/boss-ports-list /usr/local/bin/boss-ports-list
-RUN bun run build
+RUN cd apps/web && bun run build
 
 # ---------------------------------------------------------------------------
 # Stage 3 — runtime.
@@ -146,7 +154,7 @@ COPY --from=rust-build /out/ /usr/local/bin/
 
 # SPA static files — Caddy serves these directly. A separate Caddy
 # container in compose mounts /opt/boss/spa as a read-only volume.
-COPY --from=spa-build /spa/dist /opt/boss/spa
+COPY --from=spa-build /spa/apps/web/dist /opt/boss/spa
 
 # Brewery seeds + reference data — the `init.sh` first-run path
 # applies these against the freshly-bootstrapped DB.
