@@ -248,9 +248,16 @@ is data (`crates/core/boss-jobs/seeds/step_types.toml`), loaded by
 
 Side effects are data: **steps emit events; rules in the
 dispatcher's registry watch for those emissions and invoke
-handlers.** Rules are TOML rows (`on_event`, `when`, `do`) over
-the shared expression DSL; the dispatcher is reactive, not a
-catalog of everything the system can produce. Each rule is an
+handlers.** Rules are rows in the append-only versioned **`dispatcher_rules`
+registry** (`on_event`, `when`, `do`, over the shared expression
+DSL) — the step_plugins-style draft → active → retired lifecycle,
+authored in-app at `/it/dispatcher/rules` (`infra/dispatcher/rules.toml`
+is now just the human-authored seed source, not the runtime read).
+The reactive wiring is visualized as a cascade — trigger event →
+rule → handler → emitted event → re-triggered rule, feedback cycles
+highlighted, filterable by trigger event — at `/it/dispatcher`. The
+dispatcher is reactive, not a catalog of everything the system can
+produce. Each rule is an
 **actor**: every side effect it fires is attributed
 `automation:rule:<name>`, so "why did this Job spawn?" is a query
 over data. Sim and prod run the **same dispatcher binary**;
@@ -312,7 +319,12 @@ data-driven `gl_fact_projection_rules`, so the
 rooted-at-audit-log replay check stays viable. RuleSets are
 versioned per-RuleSet; rebuild has online and offline modes;
 periods are monthly with a fiscal-year close pass; the chart of
-accounts is seeded and admin-authored. Money is an inline
+accounts is seeded and admin-authored. Financial statements read a
+**`gl_account_daily` rollup** (per-account/day debit + credit +
+attributed-cash totals) instead of scanning `gl_journal_lines ×
+gl_journal_entries` per request; the rollup is incremented live in
+`post_fact_in_tx` (same tx as the journal write) and re-derived on
+rebuild, so it stays a pure function of the log. Money is an inline
 TEXT currency column on every money-bearing row; `Currency` lives
 in `boss-core::money`; column prefixes (`amount_`, `price_`,
 `cost_`) distinguish kind, not currency.

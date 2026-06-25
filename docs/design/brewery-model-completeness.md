@@ -189,7 +189,8 @@ close and this doc flattens.
 ### Q1: Agent-step mechanism — dispatcher rule, jobs-api predicate, or both?
 
 A dispatcher rule on `step.ready.<kind>` can call services (query stock,
-issue an invoice) and is data in `rules.toml`; a jobs-api
+issue an invoice) and is data in the `dispatcher_rules` registry (seeded
+from `rules.toml`); a jobs-api
 `complete_when`/`skip_when` predicate (sibling to `ready_when`) is in-process
 and needs no round-trip but can't reach cross-service data. Leaning **both,
 each where it fits**: jobs-api predicate for pure in-Job decisions, the
