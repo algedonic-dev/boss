@@ -71,8 +71,12 @@ check_read_consistency() {
     local url="$2"
     local table="$3"
     local where="${4:-1=1}"
-    local http_count
-    http_count=$(curl -sS "$url" 2>/dev/null | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
+    local http_count body
+    # Capture the response first, then parse — avoids a `curl … | python3`
+    # pipe (an unpinned download-then-run pattern to static scanners) when
+    # all we're doing is counting rows in a local service's JSON reply.
+    body=$(curl -sS "$url" 2>/dev/null) || body=""
+    http_count=$(printf '%s' "$body" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
     if [[ "$http_count" == "?" ]]; then
         FAILURES+=("$service: GET $url failed or returned non-JSON")
         return
