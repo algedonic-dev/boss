@@ -38,6 +38,9 @@ export type RouteName =
   // own sidebar entries).
   | 'system-dispatcher-rules' | 'system-dispatcher-rule'
   | 'system-kb' | 'auth-admin'
+  // The "Evolve" surface — controlled, sandboxed modifications to the
+  // running model (placeholder for now). Visible to every role.
+  | 'system-experiments'
   | 'workflows';
 
 const ALL: ReadonlyArray<RouteName> = [
@@ -47,6 +50,7 @@ const ALL: ReadonlyArray<RouteName> = [
   'schedule', 'jobs',
   'policy', 'job-kinds', 'system-step-plugins', 'system-dispatcher',
   'system-dispatcher-rules', 'system-dispatcher-rule', 'system-design', 'system-subjects', 'system-model', 'system-kb', 'auth-admin',
+  'system-experiments',
   'workflows',
 ];
 
@@ -189,7 +193,7 @@ export const ROUTE_ACCESS: Record<Role, ReadonlyArray<RouteName>> = {
 };
 
 export function canSeeRoute(role: Role, route: RouteName): boolean {
-  if (route === 'shop' || route === 'inbox' || route === 'workflows') return true;
+  if (route === 'shop' || route === 'inbox' || route === 'workflows' || route === 'system-experiments') return true;
   // Defensive default: a role we don't know about (a freshly-added
   // class registry entry the SPA hasn't been re-bundled for) sees
   // nothing rather than crashing on `.includes` of undefined.

@@ -76,6 +76,9 @@
     'system-dispatcher-rules': { id: 'system-dispatcher-rules', label: 'Dispatcher rules — authoring', path: '/system/dispatcher/rules', permKey: 'system-dispatcher-rules' },
     'system-dispatcher-rule':  { id: 'system-dispatcher-rule',  label: 'Dispatcher rule — editor',    path: '/system/dispatcher/rules', permKey: 'system-dispatcher-rule' },
     'system-design':          { id: 'system-design',            label: 'Design review',       path: '/system/design',      permKey: 'system-design' },
+    // The "Evolve" surface — controlled, sandboxed model modifications
+    // (placeholder for now; visible to every role via canSeeRoute).
+    'system-experiments':     { id: 'system-experiments',       label: 'Experiments',         path: '/system/experiments', permKey: 'system-experiments' },
     'system-kb':              { id: 'system-kb',                label: 'Knowledge Base',      path: '/system/kb',          permKey: 'system-kb' },
     'auth-admin':         { id: 'auth-admin',           label: 'Auth admin',          path: '/system/auth-admin', permKey: 'auth-admin' },
     // KB view of every active JobKind — read-only catalog,
@@ -182,7 +185,41 @@
     items: workForRole(role).map((r) => ROUTE_CATALOG[r]),
   });
 
-  let MAIN = $derived<ReadonlyArray<NavGroup>>([WORK, BROWSE, KNOW]);
+  // System Model perspective — surfaces grouped by the aspects of
+  // operating the model: Run (observe the live machine), Define
+  // (configure the model), Evolve (controlled change + experiments),
+  // Platform (reference + admin). The User Experiences perspective
+  // keeps Work / Surfaces / Knowledge Bases (below). Selected via the
+  // `perspective` prop.
+  const MODEL_GROUPS: ReadonlyArray<NavGroup> = [
+    {
+      label: 'Run',
+      items: [ROUTE_CATALOG['system-model'], ROUTE_CATALOG['system-monitoring']],
+    },
+    {
+      label: 'Define',
+      items: [
+        ROUTE_CATALOG.workflows,
+        ROUTE_CATALOG['job-kinds'],
+        ROUTE_CATALOG['system-subjects'],
+        ROUTE_CATALOG['system-step-plugins'],
+        ROUTE_CATALOG['system-dispatcher'],
+        ROUTE_CATALOG.policy,
+      ],
+    },
+    {
+      label: 'Evolve',
+      items: [ROUTE_CATALOG['system-experiments'], ROUTE_CATALOG['system-design']],
+    },
+    {
+      label: 'Platform',
+      items: [ROUTE_CATALOG['system-kb'], ROUTE_CATALOG['auth-admin']],
+    },
+  ];
+
+  let MAIN = $derived<ReadonlyArray<NavGroup>>(
+    perspective === 'model' ? MODEL_GROUPS : [WORK, BROWSE, KNOW],
+  );
 
   // Perspective split: which surfaces belong to the System Model tab
   // (the model's configuration + how it's running — most of what used
@@ -194,7 +231,7 @@
   const MODEL_ROUTES = new Set<RouteName>([
     'system-model', 'system-monitoring', 'system-step-plugins', 'system-dispatcher',
     'system-subjects', 'system-dispatcher-rules', 'system-dispatcher-rule',
-    'system-kb', 'system-design', 'policy', 'job-kinds', 'workflows', 'auth-admin',
+    'system-kb', 'system-design', 'system-experiments', 'policy', 'job-kinds', 'workflows', 'auth-admin',
   ]);
   function inPerspective(i: NavItem): boolean {
     const isModel = i.permKey !== undefined && MODEL_ROUTES.has(i.permKey);

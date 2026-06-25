@@ -75,6 +75,10 @@ const SIDEBAR_PATHS: ReadonlyArray<string> = [
   '/system/kb',
   '/system/auth-admin',
   '/system/workflows',
+  '/system',
+  '/system/subjects',
+  '/system/design',
+  '/system/experiments',
   '/ux/manual',
   '/ux/me',
 ];

@@ -32,6 +32,7 @@ const ROUTES: ReadonlyArray<string> = [
   '/system', '/system/subjects', '/system/dispatcher', '/system/dispatcher/rules',
   '/system/monitoring/perf', '/system/monitoring/events',
   '/system/monitoring/atlas', '/system/step-plugins', '/system/kb', '/system/design',
+  '/system/experiments',
   // Modeling + admin surfaces (System Model).
   '/system/workflows', '/system/job-kinds', '/system/job-kinds/new',
   '/system/job-kinds/seasonal-release', '/system/policy', '/system/auth-admin',

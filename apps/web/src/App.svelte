@@ -57,6 +57,7 @@
   import SubjectsClassesPage from './it/subjects/SubjectsClassesPage.svelte';
   import SystemModelPage from './it/system/SystemModelPage.svelte';
   import DesignReviewPage from './it/design/DesignReviewPage.svelte';
+  import ExperimentsPage from './it/experiments/ExperimentsPage.svelte';
   import InboxPage from './inbox/InboxPage.svelte';
   import CalendarPage from './calendar/CalendarPage.svelte';
   import MyCalendarPage from './calendar/MyCalendarPage.svelte';
@@ -195,6 +196,7 @@
       : route.kind === 'dispatcherRules' || route.kind === 'dispatcherRulesList' || route.kind === 'dispatcherRuleEdit' ? 'system-dispatcher'
       : route.kind === 'systemSubjects' ? 'system-subjects'
       : route.kind === 'systemModel' ? 'system-model'
+      : route.kind === 'experiments' ? 'system-experiments'
       : route.kind === 'workflows' ? 'workflows'
       : 'me',
   );
@@ -209,7 +211,7 @@
     'systemStepPlugins', 'systemStepPluginDetail',
     'dispatcherRules', 'dispatcherRulesList', 'dispatcherRuleEdit',
     'jobKinds', 'jobKindNew', 'jobKindDesign', 'jobKindDetail',
-    'policy', 'workflows', 'authAdmin',
+    'policy', 'workflows', 'authAdmin', 'experiments',
   ]);
   let perspective: 'model' | 'user' = $derived(MODEL_KINDS.has(route.kind) ? 'model' : 'user');
 </script>
@@ -324,6 +326,8 @@
       <StepPluginDetailPage pluginSlug={route.pluginSlug} />
     {:else if route.kind === 'systemDesign'}
       <DesignReviewPage />
+    {:else if route.kind === 'experiments'}
+      <ExperimentsPage />
     {:else if route.kind === 'dispatcherRules'}
       <DispatcherCascadePage />
     {:else if route.kind === 'dispatcherRulesList'}

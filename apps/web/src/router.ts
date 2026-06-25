@@ -70,6 +70,7 @@ export type Route =
   | { kind: 'systemDesign' }
   | { kind: 'systemSubjects' }
   | { kind: 'systemModel' }
+  | { kind: 'experiments' }
   | { kind: 'dispatcherRules' }
   | { kind: 'dispatcherRulesList' }
   | { kind: 'dispatcherRuleEdit'; ruleName: string }
@@ -107,6 +108,7 @@ export function parseRoute(pathname: string): Route {
     if (p === '/monitoring/atlas') return { kind: 'systemMonitoringAtlas' };
     if (p === '/kb') return { kind: 'systemKb' };
     if (p === '/design') return { kind: 'systemDesign' };
+    if (p === '/experiments') return { kind: 'experiments' };
     if (p === '/subjects') return { kind: 'systemSubjects' };
     if (p === '/policy') return { kind: 'policy' };
     if (p === '/workflows') return { kind: 'workflows' };
