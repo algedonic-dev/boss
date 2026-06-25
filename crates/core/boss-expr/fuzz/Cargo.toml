@@ -1,0 +1,28 @@
+# cargo-fuzz harness for the boss-expr DSL. Standalone workspace (the
+# empty [workspace] table below) so it stays out of the main workspace
+# build — `cargo build/clippy --workspace` never touches it; you exercise
+# it explicitly with `cargo +nightly fuzz run parse_eval`.
+[package]
+name = "boss-expr-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+[dependencies.boss-expr]
+path = ".."
+
+[[bin]]
+name = "parse_eval"
+path = "fuzz_targets/parse_eval.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
