@@ -17,7 +17,7 @@
   // boss-policy-bootstrap, the brewery-engine LiveApiOutput), so
   // the SPA gear and the CLI tooling share one privilege model.
 
-  import { session } from '../session/session.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
   import { debugState, setDebugMode } from './debugMode.svelte';
   import {
     showSimClock,

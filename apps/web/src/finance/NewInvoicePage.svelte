@@ -1,10 +1,10 @@
 <script lang="ts">
   // Ad-hoc invoice form — port of apps/web/src/finance/NewInvoicePage.tsx.
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import { entityHref } from '../ui/entity-href';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import type { Account } from '../accounts/types';
   import {
     INVOICE_STATUS_LABEL,
@@ -14,7 +14,7 @@
   } from './types';
   import { fetchValidated, z } from '../data/parseResponse';
   import { href, navigate } from '../router';
-  import { appNow, appToday } from '../shell/sim-clock.svelte';
+  import { appNow, appToday } from '@boss/web-kit/sim-clock';
 
   const RevenueCategoryRowSchema = z.object({
     code: z.string(),

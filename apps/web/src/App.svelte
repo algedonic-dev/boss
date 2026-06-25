@@ -8,10 +8,10 @@
 
   import { onMount } from 'svelte';
   import { parseRoute, type Route } from './router';
-  import { DEMO_MODE, loadSession } from './session/session.svelte';
-  import { loadManifest } from './session/manifest.svelte';
+  import { DEMO_MODE, loadSession } from '@boss/web-kit/session/session.svelte';
+  import { loadManifest } from '@boss/web-kit/session/manifest.svelte';
   import { loadStepTypeRegistry } from './steps/surfaceRegistry.svelte';
-  import { loadClasses } from './session/classes.svelte';
+  import { loadClasses } from '@boss/web-kit/session/classes.svelte';
   import AppShell from './shell/AppShell.svelte';
   import DebugGear from './debug/DebugGear.svelte';
   import MePage from './me/MePage.svelte';
@@ -80,7 +80,7 @@
   import LoginPage from './auth/LoginPage.svelte';
   import AuthAdminPage from './auth/AuthAdminPage.svelte';
   import ModuleDisabled from './shell/ModuleDisabled.svelte';
-  import { moduleEnabled } from './session/manifest.svelte';
+  import { moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
 
   let route = $state<Route>(parseRoute(window.location.pathname));
 

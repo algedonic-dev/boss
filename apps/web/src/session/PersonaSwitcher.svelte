@@ -8,7 +8,7 @@
   // Always visible in Demo Mode (the public playground), so visitors
   // can explore every role's view without flipping a debug toggle.
 
-  import { session, setPersona, type Employee, DEMO_MODE } from './session.svelte';
+  import { session, setPersona, type Employee, DEMO_MODE } from '@boss/web-kit/session/session.svelte';
   import {
     humanizeClassCode,
     type Department,

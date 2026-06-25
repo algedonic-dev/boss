@@ -2,10 +2,10 @@
   // /admin/step-plugins/:slug — port of
   // apps/web/src/admin/StepPluginDetailPage.tsx.
 
-  import Breadcrumb from '../../ui/Breadcrumb.svelte';
-  import EntityLink from '../../ui/EntityLink.svelte';
-  import PageHeader from '../../ui/PageHeader.svelte';
-  import Section from '../../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import type { StepPluginSpec } from './stepPluginTypes';
   import type { JobKindStatus } from '../../job-kinds/jobKindTypes';
   import { href } from '../../router';

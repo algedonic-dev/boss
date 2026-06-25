@@ -2,9 +2,9 @@
   // PO approvals — port of ApprovalsTab from FinancePage.tsx. Draft POs
   // can be approved (moves them to 'submitted').
 
-  import EntityLink from '../ui/EntityLink.svelte';
-  import Section from '../ui/Section.svelte';
-  import { formatMoney } from '../ui/money';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
+  import { formatMoney } from '@boss/web-kit/ui/money';
 
   type PurchaseOrderLine = {
     part_sku: string;

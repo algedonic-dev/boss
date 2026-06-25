@@ -4,10 +4,10 @@
   // Models the step-plugins list page (PageHeader/Section + data-table +
   // load/error state). Writes flow through ./ruleAuthoring.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
-  import Link from '../ui/Link.svelte';
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
   import { listActiveRules, type DispatcherRule } from './ruleAuthoring';
   import { href } from '../router';
 

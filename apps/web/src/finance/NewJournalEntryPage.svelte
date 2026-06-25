@@ -2,9 +2,9 @@
   // Manual journal entry form — port of
   // apps/web/src/finance/NewJournalEntryPage.tsx.
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import {
     createManualEntry,
     formatUsd,
@@ -12,7 +12,7 @@
     type Account,
   } from './ledger';
   import { href, navigate } from '../router';
-  import { appToday } from '../shell/sim-clock.svelte';
+  import { appToday } from '@boss/web-kit/sim-clock';
 
   type LineDraft = {
     account_code: string;

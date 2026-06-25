@@ -6,16 +6,16 @@
   // share the dashboard-card layout. Keeping them together here
   // trades a bit of file length for a much shorter import graph.
 
-  import EntityLink from '../ui/EntityLink.svelte';
-  import Link from '../ui/Link.svelte';
-  import Section from '../ui/Section.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import { href } from '../router';
-  import { appNow } from '../shell/sim-clock.svelte';
+  import { appNow } from '@boss/web-kit/sim-clock';
   import {
     loadCommerceSummary,
     type CommerceSummary,
   } from '../finance/api';
-  import { getLabel } from '../session/manifest.svelte';
+  import { getLabel } from '@boss/web-kit/session/manifest.svelte';
 
   // --- Shared formatting ---------------------------------------------------
 

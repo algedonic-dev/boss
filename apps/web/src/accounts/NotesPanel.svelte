@@ -1,12 +1,12 @@
 <script lang="ts">
   // Notes / interactions compose + list. Optimistic prepend on post.
 
-  import Section from '../ui/Section.svelte';
-  import { appNow } from '../shell/sim-clock.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
+  import { appNow } from '@boss/web-kit/sim-clock';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import { createAccountNote } from './api';
   import type { AccountNote } from './types';
-  import { session } from '../session/session.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
 
   let { accountId, notes } = $props<{
     accountId: string;

@@ -1,10 +1,10 @@
 <script lang="ts">
   // /admin/policy — port of apps/web/src/admin/PolicyPage.tsx.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import EditPolicyFlyout from './EditPolicyFlyout.svelte';
-  import { session } from '../session/session.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
   import type { PolicyRule, Scope } from './policyTypes';
 
   const ACTIONS = [

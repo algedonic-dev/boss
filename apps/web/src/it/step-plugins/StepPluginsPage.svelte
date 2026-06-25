@@ -1,9 +1,9 @@
 <script lang="ts">
   // /admin/step-plugins — port of apps/web/src/admin/StepPluginsPage.tsx.
 
-  import PageHeader from '../../ui/PageHeader.svelte';
-  import Section from '../../ui/Section.svelte';
-  import Link from '../../ui/Link.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
   import type { StepPluginSpec } from './stepPluginTypes';
   import { href } from '../../router';
 

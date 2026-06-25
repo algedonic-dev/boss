@@ -7,7 +7,7 @@
   import StepDag from '../jobs/StepDag.svelte';
   import { jobKindToDag } from '../jobs/jobKindToDag';
   import { navigate } from '../router';
-  import { entityHref } from '../ui/entity-href';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
   import type {
     JobKindSpec,
     JobKindStep,

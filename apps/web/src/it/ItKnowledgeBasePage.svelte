@@ -15,8 +15,8 @@
   // registry (empty by design in OSS — operators name their own
   // hosts via `~/.config/boss/hosts.toml`).
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import PageHeader from '../ui/PageHeader.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { href } from '../router';
 
   // Diagrams under it/kb-assets/ — the rendered Mermaid output

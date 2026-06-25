@@ -1,14 +1,14 @@
 <script lang="ts">
   // Shipping dashboard — port of apps/web/src/shipping/ShippingPage.tsx.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import { entityHref } from '../ui/entity-href';
-  import FilterGroup from '../ui/FilterGroup.svelte';
-  import FilterButton from '../ui/FilterButton.svelte';
-  import SearchInput from '../ui/SearchInput.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import Link from '../ui/Link.svelte';
-  import OverflowBanner from '../ui/OverflowBanner.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
+  import FilterGroup from '@boss/web-kit/ui/FilterGroup.svelte';
+  import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
+  import SearchInput from '@boss/web-kit/ui/SearchInput.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import OverflowBanner from '@boss/web-kit/ui/OverflowBanner.svelte';
   import { fetchPaged, isCapped, type Paged } from '../data/paginated';
   import {
     CARRIER_LABEL,

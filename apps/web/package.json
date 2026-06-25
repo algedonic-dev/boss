@@ -12,8 +12,9 @@
     "test:mocked": "playwright test -c playwright.mocked.config.ts"
   },
   "dependencies": {
+    "@boss/web-kit": "workspace:*",
     "@dagrejs/dagre": "^3.0.0",
-    "@xyflow/svelte": "^1.6.0",
+    "@xyflow/svelte": "1.6.1",
     "puppeteer": "^25.1.0",
     "svelte": "^5.55.9",
     "zod": "^4.4.3"

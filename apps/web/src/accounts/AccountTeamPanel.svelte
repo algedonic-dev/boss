@@ -5,8 +5,8 @@
   // `team` array so the UI reflects changes before the next fetch.
   // Matches apps/web/src/accounts/AccountPage.tsx AccountTeamPanel.
 
-  import Section from '../ui/Section.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import {
     assignAccountTeamMember,
     unassignAccountTeamMember,
@@ -17,8 +17,8 @@
     type AccountTeamMember,
     type AccountTeamRole,
   } from './types';
-  import { session } from '../session/session.svelte';
-  import { appNow } from '../shell/sim-clock.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
+  import { appNow } from '@boss/web-kit/sim-clock';
 
   let { accountId, team } = $props<{
     accountId: string;

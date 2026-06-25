@@ -9,10 +9,10 @@
   // unauthorized callers.
 
   import { isPending, type StepStatus } from '../jobs/types';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import Section from '../ui/Section.svelte';
-  import { session } from '../session/session.svelte';
-  import { appToday } from '../shell/sim-clock.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
+  import { appToday } from '@boss/web-kit/sim-clock';
 
   type StepData = {
     id: string;

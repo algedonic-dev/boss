@@ -6,8 +6,8 @@
   // financial statements. New Invoice / New JE actions render unless
   // the user is an auditor.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Link from '../ui/Link.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
   import IncomeStatementTab from './IncomeStatementTab.svelte';
   import BalanceSheetTab from './BalanceSheetTab.svelte';
   import CashFlowTab from './CashFlowTab.svelte';
@@ -25,7 +25,7 @@
   } from './api';
   import type { Paged } from '../data/paginated';
   import { href } from '../router';
-  import { session } from '../session/session.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
 
   type Tab =
     | 'overview'

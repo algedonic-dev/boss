@@ -1,7 +1,7 @@
 <script lang="ts">
   // Gateway latency dashboard — sub-page of /it/monitoring.
 
-  import Link from '../../ui/Link.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
   import { href } from '../../router';
 
   type EndpointSnapshot = {

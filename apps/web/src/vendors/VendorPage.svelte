@@ -8,11 +8,11 @@
   //   3. Facts (interactions timeline)
   //   4. Work (POs + vendor invoices)
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import Link from '../ui/Link.svelte';
-  import Meta from '../ui/Meta.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import Meta from '@boss/web-kit/ui/Meta.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import {
     loadVendorAccountTeam,
     loadVendorContacts,

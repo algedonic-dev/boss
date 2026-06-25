@@ -9,8 +9,9 @@
       "name": "boss-web",
       "version": "0.8.0",
       "dependencies": {
+        "@boss/web-kit": "workspace:*",
         "@dagrejs/dagre": "^3.0.0",
-        "@xyflow/svelte": "^1.6.0",
+        "@xyflow/svelte": "1.6.1",
         "puppeteer": "^25.1.0",
         "svelte": "^5.55.9",
         "zod": "^4.4.3",
@@ -23,8 +24,20 @@
         "typescript": "^6.0.3",
       },
     },
+    "libs/web-kit": {
+      "name": "@boss/web-kit",
+      "version": "0.1.0",
+      "peerDependencies": {
+        "svelte": "^5.55.9",
+      },
+    },
+  },
+  "patchedDependencies": {
+    "@xyflow/svelte@1.6.1": "patches/@xyflow%2Fsvelte@1.6.1.patch",
   },
   "packages": {
+    "@boss/web-kit": ["@boss/web-kit@workspace:libs/web-kit"],
+
     "@dagrejs/dagre": ["@dagrejs/dagre@3.0.0", "", { "dependencies": { "@dagrejs/graphlib": "4.0.1" } }, "sha512-ZzhnTy1rfuoew9Ez3EIw4L2znPGnYYhfn8vc9c4oB8iw6QAsszbiU0vRhlxWPFnmmNSFAkrYeF1PhM5m4lAN0Q=="],
 
     "@dagrejs/graphlib": ["@dagrejs/graphlib@4.0.1", "", {}, "sha512-IvcV6FduIIAmLwnH+yun+QtV36SC7mERqa86aClNqmMN09WhmPPYU8ckHrZBozErf+UvHPWOTJYaGYiIcs0DgA=="],

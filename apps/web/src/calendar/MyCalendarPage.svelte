@@ -6,9 +6,9 @@
   // straightforward additions: "show me X's calendar" / "this
   // account's calendar" / "this system's history").
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import { session } from '../session/session.svelte';
-  import { appNow } from '../shell/sim-clock.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
+  import { appNow } from '@boss/web-kit/sim-clock';
 
   type Reservation = {
     id: string;

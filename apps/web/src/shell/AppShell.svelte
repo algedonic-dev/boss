@@ -7,13 +7,13 @@
   // shaped pages live in the regular sidebar gated by the policy
   // role check.
 
-  import { session } from '../session/session.svelte';
-  import { moduleEnabled, getLabel } from '../session/manifest.svelte';
-  import { canSeeRoute, type RouteName, type Role } from '../session/permissions';
-  import { workForRole } from '../session/work-by-role';
+  import { session } from '@boss/web-kit/session/session.svelte';
+  import { moduleEnabled, getLabel } from '@boss/web-kit/session/manifest.svelte';
+  import { canSeeRoute, type RouteName, type Role } from '@boss/web-kit/session/permissions';
+  import { workForRole } from '@boss/web-kit/session/work-by-role';
   import { navigate } from '../router';
   import PersonaSwitcher from '../session/PersonaSwitcher.svelte';
-  import SimClockBadge from './SimClockBadge.svelte';
+  import SystemTime from '@boss/web-kit/SystemTime.svelte';
 
   type NavItem = Readonly<{
     id: string;
@@ -293,6 +293,7 @@
         <PersonaSwitcher />
       </div>
       <div class="shell-topbar-right">
+        <SystemTime />
         {#if isLoggedIn}
           <button class="shell-logout-btn" onclick={async () => {
             try { await fetch('/api/auth/logout', { method: 'POST' }); }
@@ -308,7 +309,6 @@
       {@render children()}
     </div>
   </div>
-  <SimClockBadge />
 </div>
 
 <style>

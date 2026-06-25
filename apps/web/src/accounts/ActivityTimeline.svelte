@@ -3,11 +3,11 @@
   // normalize, sort desc. Window defaults to 90d; "Load older"
   // doubles it.
 
-  import Section from '../ui/Section.svelte';
-  import Link from '../ui/Link.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
   import { loadTimeline } from './api';
   import type { TimelineEntry } from './types';
-  import { appNow } from '../shell/sim-clock.svelte';
+  import { appNow } from '@boss/web-kit/sim-clock';
 
   let { accountId } = $props<{ accountId: string }>();
 

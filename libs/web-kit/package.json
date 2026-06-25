@@ -1,0 +1,15 @@
+{
+  "name": "@boss/web-kit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./ui/*": "./src/ui/*",
+    "./session/*": "./src/session/*",
+    "./nav": "./src/nav.ts",
+    "./sim-clock": "./src/sim-clock.svelte.ts",
+    "./sim-clock-types": "./src/sim-clock-types.ts",
+    "./SystemTime.svelte": "./src/SystemTime.svelte"
+  },
+  "peerDependencies": { "svelte": "^5.55.9" }
+}

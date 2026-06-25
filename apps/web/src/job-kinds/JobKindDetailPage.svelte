@@ -2,17 +2,17 @@
   // /admin/job-kinds/:slug — port of
   // apps/web/src/admin/JobKindDetailPage.tsx.
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import type { JobKindSpec, StepSpec } from './jobKindTypes';
   import { href, navigate } from '../router';
   import StepDag from '../jobs/StepDag.svelte';
   import { jobKindToDag } from '../jobs/jobKindToDag';
   import { startDesignJob } from './designJob';
-  import { session } from '../session/session.svelte';
-  import { appToday } from '../shell/sim-clock.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
+  import { appToday } from '@boss/web-kit/sim-clock';
 
   type LoadState =
     | { kind: 'loading' }

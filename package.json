@@ -6,6 +6,6 @@
     "libs/*"
   ],
   "patchedDependencies": {
-    "@xyflow/svelte@1.6.0": "patches/@xyflow%2Fsvelte@1.6.0.patch"
+    "@xyflow/svelte@1.6.1": "patches/@xyflow%2Fsvelte@1.6.1.patch"
   }
 }

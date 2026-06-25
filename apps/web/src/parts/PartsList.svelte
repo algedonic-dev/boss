@@ -1,12 +1,12 @@
 <script lang="ts">
   // Parts list — port of apps/web/src/parts/PartsList.tsx.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import { entityHref } from '../ui/entity-href';
-  import FilterGroup from '../ui/FilterGroup.svelte';
-  import FilterButton from '../ui/FilterButton.svelte';
-  import SearchInput from '../ui/SearchInput.svelte';
-  import Link from '../ui/Link.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
+  import FilterGroup from '@boss/web-kit/ui/FilterGroup.svelte';
+  import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
+  import SearchInput from '@boss/web-kit/ui/SearchInput.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
   import StatusChip from './StatusChip.svelte';
   import {
     collectParts,
@@ -19,7 +19,7 @@
     type StockStatus,
   } from './types';
   import { href } from '../router';
-  import { getLabel } from '../session/manifest.svelte';
+  import { getLabel } from '@boss/web-kit/session/manifest.svelte';
 
   type RowKind = 'ingredient' | 'packaging' | 'spare' | 'consumable';
   type Filter = 'all' | 'needs-attention' | RowKind | StockStatus;

@@ -9,9 +9,9 @@
   // Workflow: author → validate (gated on the live dry-run being clean)
   // → approve (job-kind-approver sign-off) → publish.
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import StepAuthoringSurface from './StepAuthoringSurface.svelte';
   import type { JobKindSpec } from './jobKindTypes';
   import type { Job, Step, StepStatus } from '../jobs/types';

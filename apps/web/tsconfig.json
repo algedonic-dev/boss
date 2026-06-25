@@ -12,7 +12,10 @@
     "resolveJsonModule": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["bun-types"]
+    "types": ["bun-types"],
+    "paths": {
+      "@boss/web-kit/*": ["../../libs/web-kit/src/*"]
+    }
   },
-  "include": ["src/**/*.ts", "src/**/*.svelte"]
+  "include": ["src/**/*.ts", "src/**/*.svelte", "../../libs/web-kit/src/**/*"]
 }

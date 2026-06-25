@@ -10,13 +10,13 @@
   // components; everything else stays inline.
 
   import { onMount } from 'svelte';
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import { entityHref } from '../ui/entity-href';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import FileAttachments from '../content/FileAttachments.svelte';
-  import Link from '../ui/Link.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import TierChip from './TierChip.svelte';
   import ActivityTimeline from './ActivityTimeline.svelte';
   import KnowledgeBaseView from '../kb/KnowledgeBaseView.svelte';

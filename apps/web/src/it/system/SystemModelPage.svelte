@@ -6,8 +6,8 @@
   // source leaves its card a plain link rather than breaking the panel.
 
   import { onMount } from 'svelte';
-  import PageHeader from '../../ui/PageHeader.svelte';
-  import Link from '../../ui/Link.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
   import { href } from '../../router';
   import { SURFACE_CARDS, fmtCount, type StatKind } from './systemModel';
 

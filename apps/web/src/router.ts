@@ -250,14 +250,7 @@ export function parseRoute(pathname: string): Route {
   return { kind: 'home' };
 }
 
-/** Absolute path that honors the /dashboard mount point. */
-export function href(relative: string): string {
-  const base = window.location.pathname.startsWith('/dashboard') ? '/dashboard' : '';
-  return base + (relative.startsWith('/') ? relative : `/${relative}`);
-}
-
-/** Programmatic navigation without a full page reload. */
-export function navigate(path: string): void {
-  window.history.pushState({}, '', path);
-  window.dispatchEvent(new PopStateEvent('popstate'));
-}
+// `href` (honors the /dashboard mount) + `navigate` (pushState SPA nav)
+// now live in the shared @boss/web-kit/nav module. Re-exported here so
+// the ~55 files importing them from '../router' need no change.
+export { href, navigate } from '@boss/web-kit/nav';

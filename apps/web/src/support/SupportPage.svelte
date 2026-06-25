@@ -4,15 +4,15 @@
   // Field-service-only view over /api/jobs filtered to kind=field-service,
   // joined with accounts + systems for the tabs.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import { appNow } from '../shell/sim-clock.svelte';
-  import Link from '../ui/Link.svelte';
-  import Section from '../ui/Section.svelte';
-  import OverflowBanner from '../ui/OverflowBanner.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import { appNow } from '@boss/web-kit/sim-clock';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
+  import OverflowBanner from '@boss/web-kit/ui/OverflowBanner.svelte';
   import type { Job } from '../jobs/types';
   import { shortId } from '../data/ids';
   import { href } from '../router';
-  import { entityHref } from '../ui/entity-href';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
   import { fetchPaged, isCapped, type Paged } from '../data/paginated';
 
   type Account = {

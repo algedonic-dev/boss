@@ -1,13 +1,13 @@
 <script lang="ts">
   // Part detail — port of apps/web/src/parts/PartPage.tsx.
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import { entityHref } from '../ui/entity-href';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import Link from '../ui/Link.svelte';
-  import { appToday } from '../shell/sim-clock.svelte';
-  import Meta from '../ui/Meta.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import { appToday } from '@boss/web-kit/sim-clock';
+  import Meta from '@boss/web-kit/ui/Meta.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import StatusChip from './StatusChip.svelte';
   import {
     collectParts,

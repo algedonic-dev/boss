@@ -17,7 +17,7 @@ import type {
   TimelineEntry,
 } from './types';
 import { href } from '../router';
-import { entityHref } from '../ui/entity-href';
+import { entityHref } from '@boss/web-kit/ui/entity-href';
 import { fetchPaged, type Paged } from '../data/paginated';
 import {
   AccountListSchema,
@@ -30,7 +30,7 @@ import {
   ShipmentSchema,
 } from './schemas';
 import { fetchPagedValidated, fetchValidated, type ParseResult } from '../data/parseResponse';
-import { appNow } from '../shell/sim-clock.svelte';
+import { appNow } from '@boss/web-kit/sim-clock';
 
 /// Thrown by loadAccountBundle (and the helpers it calls) when an
 /// API response is reachable + 200 but doesn't match the expected

@@ -2,7 +2,7 @@
 // import without pulling a component. Same contract as
 // apps/web/src/ui/EntityLink.tsx.
 
-import { href } from '../router';
+import { href } from '../nav';
 
 export type EntityKind =
   | 'account'

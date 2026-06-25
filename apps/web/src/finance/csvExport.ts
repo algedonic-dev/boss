@@ -7,7 +7,7 @@
 
 type CellValue = string | number | null | undefined;
 
-import { appToday } from '../shell/sim-clock.svelte';
+import { appToday } from '@boss/web-kit/sim-clock';
 
 export type CsvColumn<T> = Readonly<{
   header: string;

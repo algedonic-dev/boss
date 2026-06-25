@@ -12,8 +12,8 @@
     subjectPath,
     type Job,
   } from './types';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import StepSurface from '../steps/StepSurface.svelte';
   import StepGraph from './StepGraph.svelte';
   import FileAttachments from '../content/FileAttachments.svelte';

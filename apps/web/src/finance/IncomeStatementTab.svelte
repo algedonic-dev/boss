@@ -1,7 +1,7 @@
 <script lang="ts">
   // Income statement — port of apps/web/src/finance/IncomeStatementTab.tsx.
 
-  import Section from '../ui/Section.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import {
     centsToDollars,
     dateStamp,
@@ -15,7 +15,7 @@
     type IncomeStatement,
     type StatementLine,
   } from './ledger';
-  import { appNow, appToday } from '../shell/sim-clock.svelte';
+  import { appNow, appToday } from '@boss/web-kit/sim-clock';
 
   function startOfYearISO(): string {
     const d = appNow();

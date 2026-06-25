@@ -7,7 +7,7 @@
   //  - Direct (?method=direct): the four real-world cash buckets summed
   //    straight off financial_facts, with a GL cash-pool reconciliation.
 
-  import Section from '../ui/Section.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import {
     centsToDollars,
     dateStamp,
@@ -23,7 +23,7 @@
     type DirectCashFlowStatement,
     type StatementLine,
   } from './ledger';
-  import { appNow, appToday } from '../shell/sim-clock.svelte';
+  import { appNow, appToday } from '@boss/web-kit/sim-clock';
 
   function startOfYearISO(): string {
     const d = appNow();

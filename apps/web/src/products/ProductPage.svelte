@@ -2,8 +2,8 @@
   // Detail view for one finished-product SKU. Catalog row + on-hand-
   // by-location rollup. Sibling to PartPage.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Link from '../ui/Link.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
   import { href } from '../router';
   import type { ProductDetail, ProductInventory } from './types';
 

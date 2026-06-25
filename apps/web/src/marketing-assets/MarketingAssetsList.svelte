@@ -1,13 +1,13 @@
 <script lang="ts">
   // Marketing Asset KB list.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import FilterGroup from '../ui/FilterGroup.svelte';
-  import FilterButton from '../ui/FilterButton.svelte';
-  import SearchInput from '../ui/SearchInput.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import FilterGroup from '@boss/web-kit/ui/FilterGroup.svelte';
+  import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
+  import SearchInput from '@boss/web-kit/ui/SearchInput.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import { type MarketingAsset } from './types';
-  import { loadClasses, classesFor } from '../session/classes.svelte';
+  import { loadClasses, classesFor } from '@boss/web-kit/session/classes.svelte';
   import { href, navigate } from '../router';
 
   // Kind labels + the filter rail come from the Class registry

@@ -9,13 +9,13 @@
   // department, the CTO is a role; the surface follows the
   // department, not the role.
 
-  import PageHeader from '../../ui/PageHeader.svelte';
-  import Section from '../../ui/Section.svelte';
-  import Link from '../../ui/Link.svelte';
-  import EntityLink from '../../ui/EntityLink.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import MlModelsPanel from './MlModelsPanel.svelte';
   import { href } from '../../router';
-  import { moduleEnabled } from '../../session/manifest.svelte';
+  import { moduleEnabled } from '@boss/web-kit/session/manifest.svelte';
   import { PORTS } from '../../_generated/ports';
 
   type ServiceStatus = 'healthy' | 'degraded' | 'down' | 'unknown';

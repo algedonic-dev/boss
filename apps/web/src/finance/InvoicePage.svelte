@@ -1,12 +1,12 @@
 <script lang="ts">
   // Invoice detail — port of apps/web/src/finance/InvoicePage.tsx.
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import { entityHref } from '../ui/entity-href';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import Link from '../ui/Link.svelte';
-  import Meta from '../ui/Meta.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import Meta from '@boss/web-kit/ui/Meta.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import InvoiceStatusChip from './InvoiceStatusChip.svelte';
   import TierChip from '../accounts/TierChip.svelte';
   import {
@@ -17,7 +17,7 @@
     type InvoiceLineItem,
     type RevenueCategory,
   } from './types';
-  import { formatMoney } from '../ui/money';
+  import { formatMoney } from '@boss/web-kit/ui/money';
   import type { Account } from '../accounts/types';
   import { href } from '../router';
 

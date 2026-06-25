@@ -2,7 +2,7 @@
   // Policy-rule edit modal. Port of EditFlyout in PolicyPage.tsx.
 
   import type { PolicyRule, Scope } from './policyTypes';
-  import { classesFor } from '../session/classes.svelte';
+  import { classesFor } from '@boss/web-kit/session/classes.svelte';
 
   // Departments come from the Class registry — the canonical
   // tenant-extensible taxonomy. Brewery sees production /

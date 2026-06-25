@@ -2,7 +2,7 @@
   // CTO dashboard panel — ML platform. Port of
   // apps/web/src/cto/MlModelsPanel.tsx.
 
-  import Section from '../../ui/Section.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
 
   type ModelStatus = 'draft' | 'active' | 'shadow' | 'retired';
   type ModelKind =

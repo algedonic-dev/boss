@@ -15,10 +15,10 @@
   // is a data-side question — the component picks up a new kind as
   // soon as a fact / job / documents endpoint lands.
 
-  import Section from '../ui/Section.svelte';
-  import Link from '../ui/Link.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
   import { href } from '../router';
-  import { entityHref } from '../ui/entity-href';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
   import { formatActor } from '../data/actor';
   import type { Employee } from '../people/types';
 

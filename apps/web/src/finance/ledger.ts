@@ -1,8 +1,8 @@
 // Plain async fetchers + mutators for the boss-ledger API. Port of
 // apps/web/src/finance/ledger.ts, sans the React hook wrappers.
 
-import { formatMoney } from '../ui/money';
-import { appToday } from '../shell/sim-clock.svelte';
+import { formatMoney } from '@boss/web-kit/ui/money';
+import { appToday } from '@boss/web-kit/sim-clock';
 
 const API_BASE = '/api/ledger';
 

@@ -1,12 +1,12 @@
 <script lang="ts">
   // Marketing Asset detail.
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import Meta from '../ui/Meta.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import Meta from '@boss/web-kit/ui/Meta.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import { type MarketingAsset } from './types';
-  import { loadClasses, classesFor } from '../session/classes.svelte';
+  import { loadClasses, classesFor } from '@boss/web-kit/session/classes.svelte';
   import { href } from '../router';
 
   type Props = { assetId: string };

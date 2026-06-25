@@ -7,12 +7,12 @@
   // pre-filter. Same pattern as the React app.
 
   import { navigate, href } from '../router';
-  import { entityHref } from '../ui/entity-href';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
   import { shortId } from '../data/ids';
   import { subjectLabel, subjectPath, type Job } from './types';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import { session } from '../session/session.svelte';
-  import { appToday } from '../shell/sim-clock.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
+  import { appToday } from '@boss/web-kit/sim-clock';
 
   let userId = $derived(
     session.value.kind === 'ready' ? session.value.user.id : '',

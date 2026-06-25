@@ -4,7 +4,7 @@
   // sheet's `as_of`; renders a calendar-month table with the drift row
   // so a reader can see schedules-vs-GL parity at a glance.
 
-  import Section from '../ui/Section.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import {
     formatUsd,
     loadDeferredRevenueRunoff,

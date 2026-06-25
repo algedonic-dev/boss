@@ -5,11 +5,11 @@
   // tracking with POST mutations), Requisitions (placeholder),
   // Certifications, Headcount.
 
-  import PageHeader from '../ui/PageHeader.svelte';
-  import { entityHref } from '../ui/entity-href';
-  import Section from '../ui/Section.svelte';
-  import Link from '../ui/Link.svelte';
-  import { appNow } from '../shell/sim-clock.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
+  import Section from '@boss/web-kit/ui/Section.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
+  import { appNow } from '@boss/web-kit/sim-clock';
   import {
     humanizeClassCode,
     type Department,

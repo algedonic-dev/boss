@@ -1,10 +1,10 @@
 <script lang="ts">
   // Recursive node for the org-chart tree view. Renders one
   // employee as a card and nests their direct reports below.
-  import Link from '../ui/Link.svelte';
+  import Link from '@boss/web-kit/ui/Link.svelte';
   import { humanizeClassCode, type Employee } from './types';
   import { href } from '../router';
-  import { entityHref } from '../ui/entity-href';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
 
   type Props = {
     employee: Employee;

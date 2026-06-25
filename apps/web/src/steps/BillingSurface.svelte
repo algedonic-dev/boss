@@ -12,9 +12,9 @@
   // If #1 fails the step stays put and we render the error.
 
   import { isPending, isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import { formatMoney } from '../ui/money';
-  import { appNow, appToday } from '../shell/sim-clock.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import { formatMoney } from '@boss/web-kit/ui/money';
+  import { appNow, appToday } from '@boss/web-kit/sim-clock';
 
   type StepData = {
     id: string;

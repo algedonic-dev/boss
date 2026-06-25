@@ -1,10 +1,10 @@
 <script lang="ts">
   // Purchase order detail — port of apps/web/src/po/PoPage.tsx.
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import EntityLink from '../ui/EntityLink.svelte';
-  import Meta from '../ui/Meta.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import Meta from '@boss/web-kit/ui/Meta.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import type { PurchaseOrder } from '../parts/types';
   import type { VendorInvoice } from '../vendors/types';
   import { href } from '../router';

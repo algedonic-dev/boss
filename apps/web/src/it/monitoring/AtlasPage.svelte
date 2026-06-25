@@ -14,8 +14,8 @@
   // same shape as v1 so the legend + styles carry over.
 
   import { onMount } from 'svelte';
-  import PageHeader from '../../ui/PageHeader.svelte';
-  import Section from '../../ui/Section.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import { href, navigate } from '../../router';
   import {
     atlasLayout,

@@ -7,13 +7,13 @@
   // off to JobKindDesignWorkspace. No `job_kinds` row is written until
   // the author drives that Job to its publish step.
 
-  import Breadcrumb from '../ui/Breadcrumb.svelte';
-  import PageHeader from '../ui/PageHeader.svelte';
-  import Section from '../ui/Section.svelte';
+  import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import Section from '@boss/web-kit/ui/Section.svelte';
   import type { JobKindSpec, StepSpec } from './jobKindTypes';
   import { initialSpec, startDesignJob } from './designJob';
-  import { session } from '../session/session.svelte';
-  import { appToday } from '../shell/sim-clock.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
+  import { appToday } from '@boss/web-kit/sim-clock';
   import { href, navigate } from '../router';
 
   let ownerId = $derived(

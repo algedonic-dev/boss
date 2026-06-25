@@ -2,8 +2,8 @@
   // Ledger entry detail — lines + fact payload. Used by the trial-
   // balance drill-down.
 
-  import EntityLink from '../ui/EntityLink.svelte';
-  import { type EntityKind } from '../ui/entity-href';
+  import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import { type EntityKind } from '@boss/web-kit/ui/entity-href';
   import {
     formatUsd,
     loadEntryDetail,
@@ -11,7 +11,7 @@
     type LedgerEntryDetail,
   } from './ledger';
   import { shortId } from '../data/ids';
-  import { session } from '../session/session.svelte';
+  import { session } from '@boss/web-kit/session/session.svelte';
 
   type Props = {
     entryId: string;
