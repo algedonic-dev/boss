@@ -208,6 +208,7 @@ description_of() {
         events)        echo "Audit Log Read API (tail / stream / export)" ;;
         accounts)      echo "Accounts API (notes / team / next-actions / risk / cases)" ;;
         dispatcher)    echo "Dispatch Service (auto-assigns ready Steps to role-matched Employees)" ;;
+        simulator)     echo "Simulator UX service (SPA + control API)" ;;
         *)             echo "$1 API" ;;
     esac
 }
@@ -443,6 +444,15 @@ nats_url = "$NATS_URL"
 tick_seconds = 8
 EOF
             ;;
+        simulator)
+            # boss-simulator is env-var driven (BOSS_SIM_BIND /
+            # BOSS_SIM_STATIC_DIR / BOSS_JOBS_URL / BOSS_CLOCK_URL); see
+            # the systemd unit. This stub keeps the config path uniform.
+            cat <<EOF
+# Managed by infra/deploy-services.sh — edits will be overwritten.
+# boss-simulator is env-var driven; see the systemd unit.
+EOF
+            ;;
         *)
             echo "emit_solo_config: unknown service '$name'" >&2
             return 1
@@ -460,6 +470,7 @@ stem_for() {
     case "$1" in
         observability) echo "boss-observability" ;;
         dispatcher)    echo "boss-dispatcher" ;;
+        simulator)     echo "boss-simulator" ;;
         *)             echo "boss-$1-api" ;;
     esac
 }
@@ -536,11 +547,16 @@ emit_unit() {
         # (BOSS_SIM_CALLBACK_BIND=127.0.0.1:7099) consumes it. Without this the
         # counterparty stays dark and zero collections fire (AR balloons).
         extra_env=$"${extra_env}"$'\nEnvironment=BOSS_EVENT_WEBHOOK_URL=http://127.0.0.1:7099/callback'
+    elif [[ "$name" == "simulator" ]]; then
+        # boss-simulator serves the apps/simulator bundle from this dir
+        # (installed by infra/deploy-simulator-web.sh); BOSS_SIM_BIND +
+        # the jobs/clock URLs fall back to boss_ports defaults.
+        extra_env="Environment=BOSS_SIM_STATIC_DIR=/var/lib/boss-simulator/dist"
     fi
 
     # Env-driven services don't take a --config flag.
     local exec_start
-    if [[ "$name" == "clock" || "$name" == "dispatcher" ]]; then
+    if [[ "$name" == "clock" || "$name" == "dispatcher" || "$name" == "simulator" ]]; then
         exec_start="ExecStart=/usr/local/bin/${stem}"
     else
         exec_start="ExecStart=/usr/local/bin/${stem} --config $cfg_path"
