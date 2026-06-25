@@ -283,12 +283,12 @@
             <label class="sde-check">
               <input
                 type="checkbox"
-                checked={step.terminal !== null}
+                checked={step.terminal != null}
                 onchange={(e) => toggleTerminal(idx, (e.target as HTMLInputElement).checked)}
               />
               terminal (closes the Job)
             </label>
-            {#if step.terminal !== null}
+            {#if step.terminal}
               <input
                 type="text"
                 value={step.terminal.outcome}

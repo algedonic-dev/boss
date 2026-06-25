@@ -37,20 +37,37 @@ const classes = $state<{ value: Readonly<Record<string, ClassesState>> }>({
   value: {},
 });
 
-/// Load (once) the Class rows for a subject_kind. Idempotent — a kind
-/// already loaded is a no-op, so multiple surfaces can call it freely.
+// Dedupe guard for in-flight / loaded kinds — a plain Set, deliberately
+// NON-reactive. loadClasses both writes `classes.value` and needs to
+// dedupe; if the dedupe read touched `classes.value`, calling loadClasses
+// from a tracked $effect (as the marketing-asset surfaces do) would make
+// that effect depend on the very state it writes → an infinite
+// effect_update_depth_exceeded loop. Keeping the guard out of the
+// reactive graph makes loadClasses safe to call from any context.
+const requested = new Set<string>();
+
+/// Load (once) the Class rows for a subject_kind. Idempotent + safe to
+/// call from a tracked $effect. A failed load is NOT remembered, so a
+/// later mount can retry.
 export async function loadClasses(subject_kind: string): Promise<void> {
-  if (classes.value[subject_kind]?.kind === 'ready') return;
+  if (requested.has(subject_kind)) return;
+  requested.add(subject_kind);
   classes.value = { ...classes.value, [subject_kind]: { kind: 'loading' } };
   try {
     const r = await fetch(
       `/api/classes?subject_kind=${encodeURIComponent(subject_kind)}`,
     );
-    const next: ClassesState = r.ok
-      ? { kind: 'ready', rows: (await r.json()) as ClassRow[] }
-      : { kind: 'error' };
-    classes.value = { ...classes.value, [subject_kind]: next };
+    if (r.ok) {
+      classes.value = {
+        ...classes.value,
+        [subject_kind]: { kind: 'ready', rows: (await r.json()) as ClassRow[] },
+      };
+    } else {
+      requested.delete(subject_kind);
+      classes.value = { ...classes.value, [subject_kind]: { kind: 'error' } };
+    }
   } catch {
+    requested.delete(subject_kind);
     classes.value = { ...classes.value, [subject_kind]: { kind: 'error' } };
   }
 }

@@ -75,7 +75,7 @@
       }
       if (query) {
         const q = query.toLowerCase();
-        const hay = `${s.id} ${s.origin} ${s.destination} ${s.tracking_number ?? ''} ${s.carrier}`.toLowerCase();
+        const hay = `${s.id} ${s.origin} ${s.destination} ${s.tracking_number ?? ''} ${s.carrier ?? ''}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -192,7 +192,7 @@
                     {STATUS_LABEL[s.status]}
                   </span>
                 </td>
-                <td>{CARRIER_LABEL[s.carrier]}</td>
+                <td>{s.carrier ? CARRIER_LABEL[s.carrier] : '—'}</td>
                 <td class="mono">{s.tracking_number ?? '—'}</td>
                 <td>
                   {#if s.account_id && s.direction === 'inbound'}

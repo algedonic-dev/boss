@@ -9,7 +9,7 @@
 export type JobKindStatus = 'draft' | 'active' | 'retired';
 
 /// Terminal marker. When a step reaches Completed, the Job closes
-/// with this outcome. Absent (`null`) for non-terminal steps.
+/// with this outcome. Absent for non-terminal steps.
 export type Terminal = {
   outcome: string;
 };
@@ -25,9 +25,12 @@ export type StepSpec = {
   /// `ready_when` predicate. `"true"` marks a trigger that fires at
   /// Job open. See the grammar in StepDagEditor.svelte.
   ready_when: string;
-  /// When set, reaching Completed on this step closes the Job with
-  /// the given outcome. `null` for non-terminal steps.
-  terminal: Terminal | null;
+  /// When set, reaching Completed on this step closes the Job with the
+  /// given outcome. Non-terminal steps OMIT this field: the API uses
+  /// serde `skip_serializing_if`, so it reads back as `undefined`, not
+  /// `null`. The editor writes `null` when you untick "terminal". Treat
+  /// absent / null identically — always check it truthily, never `!== null`.
+  terminal?: Terminal | null;
   /// Human display template; `{subject.id}` etc. expand at runtime.
   /// Blank → humanized `title`.
   title_template: string;

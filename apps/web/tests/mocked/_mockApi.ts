@@ -27,7 +27,11 @@ function seedSpec() {
     kind: KIND_SLUG, version: 1, status: 'draft', label: 'Seasonal Release',
     description: null, category: 'production', subject_kinds: ['asset'],
     steps: [
-      { title: 'start', kind: 'generic', ready_when: 'true', terminal: null, title_template: '', sign_offs_required: [], authority_role: null, metadata_defaults: {} },
+      // `terminal` is intentionally OMITTED here (not `null`): the real API
+      // serializes non-terminal steps with skip_serializing_if, so the field
+      // is absent → undefined on the wire. Keeping the fixture faithful makes
+      // the authoring specs exercise the shape that crashed StepDagEditor.
+      { title: 'start', kind: 'generic', ready_when: 'true', title_template: '', sign_offs_required: [], authority_role: null, metadata_defaults: {} },
       { title: 'finish', kind: 'generic', ready_when: 'steps.start.done', terminal: { outcome: 'completed' }, title_template: '', sign_offs_required: [], authority_role: null, metadata_defaults: {} },
     ],
     metadata_schema: {}, metadata: {}, entitlements: {},

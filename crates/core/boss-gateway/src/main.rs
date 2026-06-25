@@ -358,13 +358,33 @@ async fn main() -> Result<()> {
         // subject_kind), Location entities, and SubjectKind rows.
         // The auth surface around them is unchanged: same
         // boss_session cookie gate as the rest of /api/*.
+        //
+        // Each needs BOTH a bare matcher (the list endpoint:
+        // `GET /api/classes?subject_kind=…`, `GET /api/subject-kinds`,
+        // `GET /api/locations`) AND a wildcard for per-row detail.
+        // axum's `{*rest}` requires at least one segment, so without
+        // the bare route the list call falls through to the SPA
+        // fallback and the client parses index.html as JSON. Same
+        // shape as /api/products + /api/people + /api/jobs.
+        .route(
+            "/api/classes",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::CLASSES)),
+        )
         .route(
             "/api/classes/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::CLASSES)),
         )
         .route(
+            "/api/locations",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::LOCATIONS)),
+        )
+        .route(
             "/api/locations/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::LOCATIONS)),
+        )
+        .route(
+            "/api/subject-kinds",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::SUBJECT_KINDS)),
         )
         .route(
             "/api/subject-kinds/{*rest}",

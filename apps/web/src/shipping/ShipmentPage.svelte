@@ -83,7 +83,7 @@
         </div>
         <h1 class="detail-title">{s.origin} → {s.destination}</h1>
         <div class="detail-tagline">
-          {CARRIER_LABEL[s.carrier]}
+          {s.carrier ? CARRIER_LABEL[s.carrier] : '—'}
           {#if s.tracking_number} · <span class="mono">{s.tracking_number}</span>{/if}
         </div>
         <div class="detail-meta">
@@ -100,7 +100,7 @@
           <dl class="kv">
             <dt>Direction</dt><dd>{DIRECTION_LABEL[s.direction]}</dd>
             <dt>Status</dt><dd>{STATUS_LABEL[s.status]}</dd>
-            <dt>Carrier</dt><dd>{CARRIER_LABEL[s.carrier]}</dd>
+            <dt>Carrier</dt><dd>{s.carrier ? CARRIER_LABEL[s.carrier] : '—'}</dd>
             <dt>Tracking</dt><dd>{s.tracking_number ?? '—'}</dd>
             <dt>Origin</dt><dd>{s.origin}</dd>
             <dt>Destination</dt><dd>{s.destination}</dd>

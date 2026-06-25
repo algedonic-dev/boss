@@ -13,7 +13,10 @@ export type Shipment = {
   id: string;
   direction: ShipmentDirection;
   status: ShipmentStatus;
-  carrier: Carrier;
+  /// Absent when no carrier is chosen yet — identity-first shipments
+  /// can exist before a label is purchased, and the API omits the field
+  /// for them (serde skip_serializing_if). Render with a fallback.
+  carrier: Carrier | null;
   tracking_number: string | null;
   origin: string;
   destination: string;
