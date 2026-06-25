@@ -8,16 +8,16 @@ import { mountPage } from './_helpers';
 
 test.describe('Admin Job kinds list', () => {
   test('renders rows', async ({ page }) => {
-    await mountPage(page, '/admin/job-kinds', { titleMatch: /job kind/i });
+    await mountPage(page, '/system/job-kinds', { titleMatch: /job kind/i });
     // The list is rendered as a table on this page.
     await expect(page.locator('table tbody tr').first()).toBeVisible({
       timeout: 10_000,
     });
   });
 
-  test('row link navigates to /admin/job-kinds/{kind}', async ({ page }) => {
-    await mountPage(page, '/admin/job-kinds', { titleMatch: /job kind/i });
-    const firstLink = page.locator('a[href*="/admin/job-kinds/"]').first();
+  test('row link navigates to /system/job-kinds/{kind}', async ({ page }) => {
+    await mountPage(page, '/system/job-kinds', { titleMatch: /job kind/i });
+    const firstLink = page.locator('a[href*="/system/job-kinds/"]').first();
     await expect(firstLink).toBeVisible({ timeout: 10_000 });
     await Promise.all([
       page.waitForURL(/\/admin\/job-kinds\/[^/]+/, { timeout: 10_000 }),
@@ -30,7 +30,7 @@ test.describe('Admin Job kind detail — controls', () => {
   test('Edit + Retire buttons render with correct enabled state', async ({
     page,
   }) => {
-    await mountPage(page, '/admin/job-kinds/ad-hoc');
+    await mountPage(page, '/system/job-kinds/ad-hoc');
     await expect(page.locator('h1')).toBeVisible({ timeout: 10_000 });
 
     // D6 removed the direct "Publish draft" control — authoring/publish
@@ -45,8 +45,8 @@ test.describe('Admin Job kind detail — controls', () => {
     await expect(retire).toBeEnabled();
   });
 
-  test('Fork navigates to /admin/job-kinds/new?fork=…', async ({ page }) => {
-    await mountPage(page, '/admin/job-kinds/ad-hoc');
+  test('Fork navigates to /system/job-kinds/new?fork=…', async ({ page }) => {
+    await mountPage(page, '/system/job-kinds/ad-hoc');
     await expect(page.locator('h1')).toBeVisible({ timeout: 10_000 });
 
     await Promise.all([

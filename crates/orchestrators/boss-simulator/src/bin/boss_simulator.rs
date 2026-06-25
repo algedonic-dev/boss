@@ -17,14 +17,14 @@ use std::{net::SocketAddr, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use axum::{
+    Json, Router,
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
-use boss_policy_client::{request_context_middleware, CurrentUser};
+use boss_policy_client::{CurrentUser, request_context_middleware};
 use reqwest::Client;
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -78,11 +78,14 @@ async fn forward_post(
         req = req.header("x-boss-user", u);
     }
     if let Some(b) = body {
-        req = req.header(reqwest::header::CONTENT_TYPE, "application/json").body(b);
+        req = req
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(b);
     }
     match req.send().await {
         Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let status =
+                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let bytes = resp.bytes().await.unwrap_or_default();
             (
                 status,
@@ -95,21 +98,45 @@ async fn forward_post(
     }
 }
 
-async fn control_pause(State(s): State<Arc<AppState>>, user: CurrentUser, headers: HeaderMap) -> Response {
+async fn control_pause(
+    State(s): State<Arc<AppState>>,
+    user: CurrentUser,
+    headers: HeaderMap,
+) -> Response {
     if let Some(r) = operator_guard(&user) {
         return r;
     }
-    forward_post(&s, format!("{}/api/jobs/sim-clock/pause", s.jobs_url), &headers, None).await
+    forward_post(
+        &s,
+        format!("{}/api/jobs/sim-clock/pause", s.jobs_url),
+        &headers,
+        None,
+    )
+    .await
 }
 
-async fn control_resume(State(s): State<Arc<AppState>>, user: CurrentUser, headers: HeaderMap) -> Response {
+async fn control_resume(
+    State(s): State<Arc<AppState>>,
+    user: CurrentUser,
+    headers: HeaderMap,
+) -> Response {
     if let Some(r) = operator_guard(&user) {
         return r;
     }
-    forward_post(&s, format!("{}/api/jobs/sim-clock/resume", s.jobs_url), &headers, None).await
+    forward_post(
+        &s,
+        format!("{}/api/jobs/sim-clock/resume", s.jobs_url),
+        &headers,
+        None,
+    )
+    .await
 }
 
-async fn control_restart_epoch(State(s): State<Arc<AppState>>, user: CurrentUser, headers: HeaderMap) -> Response {
+async fn control_restart_epoch(
+    State(s): State<Arc<AppState>>,
+    user: CurrentUser,
+    headers: HeaderMap,
+) -> Response {
     if let Some(r) = operator_guard(&user) {
         return r;
     }
@@ -133,7 +160,13 @@ async fn control_configure(
     }
     // The new capability with no public path: epoch_start / epoch_end /
     // warp_factor. clock-api validates the body; we just proxy it.
-    forward_post(&s, format!("{}/api/clock/configure", s.clock_url), &headers, Some(body)).await
+    forward_post(
+        &s,
+        format!("{}/api/clock/configure", s.clock_url),
+        &headers,
+        Some(body),
+    )
+    .await
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -147,7 +180,9 @@ async fn stub() -> Html<&'static str> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .compact()
         .init();
 
@@ -189,7 +224,9 @@ async fn main() -> Result<()> {
         .layer(axum::middleware::from_fn(request_context_middleware))
         .layer(TraceLayer::new_for_http());
 
-    let addr: SocketAddr = bind.parse().with_context(|| format!("invalid bind `{bind}`"))?;
+    let addr: SocketAddr = bind
+        .parse()
+        .with_context(|| format!("invalid bind `{bind}`"))?;
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding HTTP listener on {addr}"))?;

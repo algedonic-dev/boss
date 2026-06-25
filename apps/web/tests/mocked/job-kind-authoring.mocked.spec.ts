@@ -9,7 +9,7 @@ import { test, expect } from '@playwright/test';
 import { mountPage } from '../smoke/_helpers';
 import { installAuthoringMocks, JOB_ID, KIND_SLUG } from './_mockApi';
 
-const WORKSPACE = `/admin/job-kinds/authoring/${JOB_ID}`;
+const WORKSPACE = `/system/job-kinds/authoring/${JOB_ID}`;
 
 test.beforeEach(async ({ page }) => {
   await installAuthoringMocks(page);
@@ -76,7 +76,7 @@ test.describe('JobKind authoring workspace — workflow rail', () => {
 
     // Publishing completes the terminal step and routes to the kind.
     await Promise.all([
-      page.waitForURL(new RegExp(`/admin/job-kinds/${KIND_SLUG}$`), { timeout: 15_000 }),
+      page.waitForURL(new RegExp(`/system/job-kinds/${KIND_SLUG}$`), { timeout: 15_000 }),
       publish.click(),
     ]);
   });

@@ -13,7 +13,7 @@ import { mountPage } from './_helpers';
 
 test.describe('Admin new job kind — name-it entry', () => {
   test('identity fields render and persist user input', async ({ page }) => {
-    await mountPage(page, '/admin/job-kinds/new');
+    await mountPage(page, '/system/job-kinds/new');
 
     const slug = page.locator('input.mono').first();
     await slug.fill('smoke-test-kind');
@@ -30,7 +30,7 @@ test.describe('Admin new job kind — name-it entry', () => {
   });
 
   test('subject-kind checkboxes toggle', async ({ page }) => {
-    await mountPage(page, '/admin/job-kinds/new');
+    await mountPage(page, '/system/job-kinds/new');
     const first = page.locator('input[type="checkbox"]').first();
     const initial = await first.isChecked();
     await first.click();
@@ -40,7 +40,7 @@ test.describe('Admin new job kind — name-it entry', () => {
   });
 
   test('Create & author button is visible + enabled', async ({ page }) => {
-    await mountPage(page, '/admin/job-kinds/new');
+    await mountPage(page, '/system/job-kinds/new');
     const create = page.getByRole('button', { name: /create & author/i });
     await expect(create).toBeVisible({ timeout: 10_000 });
     await expect(create).toBeEnabled();
