@@ -13,7 +13,6 @@
   import { workForRole } from '@boss/web-kit/session/work-by-role';
   import { navigate } from '../router';
   import PersonaSwitcher from '../session/PersonaSwitcher.svelte';
-  import SystemTime from '@boss/web-kit/SystemTime.svelte';
 
   type NavItem = Readonly<{
     id: string;
@@ -171,25 +170,6 @@
   );
   let role = $derived((user?.role ?? null) as Role | null);
 
-  // Whether the visitor is logged in via BOSS local-auth (vs being
-  // an anonymous demo-session visitor). Probes `/api/auth/me`,
-  // which the gateway returns 401 for demo sessions (per the
-  // 2026-05-25 fix). The result drives the top-bar Sign-in/out
-  // button: showing "Sign out" to someone who never signed in is
-  // confusing, and the demo-mode session would be immediately
-  // re-minted on the next request anyway.
-  let isLoggedIn = $state<boolean>(false);
-  $effect(() => {
-    (async () => {
-      try {
-        const r = await fetch('/api/auth/me');
-        isLoggedIn = r.ok;
-      } catch {
-        isLoggedIn = false;
-      }
-    })();
-  });
-
   // Work group is role-keyed: each role gets a tailored 3-5 item
   // list of the surfaces they personally operate from. The same
   // visible() filter still applies, so a brewery manifest that turns
@@ -219,16 +199,6 @@
 
 <div class="app-shell">
   <aside class="shell-sidebar">
-    <a
-      class="shell-sidebar-header"
-      href="/"
-      onclick={(e) => onLinkClick(e, '/')}
-      aria-label="Algedonic Ales — home"
-    >
-      <div class="shell-logo">Algedonic</div>
-      <div class="shell-logo-sub">Ales</div>
-    </a>
-
     <nav class="shell-nav">
       <div class="shell-nav-personal">
         <a
@@ -288,41 +258,13 @@
   </aside>
 
   <div class="shell-main">
-    <header class="shell-topbar">
-      <div class="shell-topbar-left">
-        <PersonaSwitcher />
-      </div>
-      <div class="shell-topbar-right">
-        <SystemTime />
-        {#if isLoggedIn}
-          <button class="shell-logout-btn" onclick={async () => {
-            try { await fetch('/api/auth/logout', { method: 'POST' }); }
-            catch {}
-            window.location.href = '/login';
-          }}>Sign out</button>
-        {:else}
-          <a class="shell-logout-btn" href={'/login'}>Sign in</a>
-        {/if}
-      </div>
-    </header>
+    <!-- Demo-mode persona switcher — fixed-positioned (bottom-left),
+         so it renders here but floats independently of the layout.
+         The system-time + sign-in chrome moved up to the perspective
+         tab bar; the old topbar is gone. -->
+    <PersonaSwitcher />
     <div class="shell-content">
       {@render children()}
     </div>
   </div>
 </div>
-
-<style>
-  .shell-logout-btn {
-    background: transparent;
-    border: 1px solid #d6d3d1;
-    border-radius: 6px;
-    padding: 5px 12px;
-    font-size: 12px;
-    color: #44403c;
-    cursor: pointer;
-  }
-  .shell-logout-btn:hover {
-    background: #f5f5f4;
-    color: #1c1917;
-  }
-</style>

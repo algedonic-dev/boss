@@ -124,7 +124,7 @@
   .system-time-val {
     font-variant-numeric: tabular-nums;
     font-weight: 600;
-    color: #1c1917;
+    color: #fafaf9;
   }
   .system-time-sim {
     font-size: 10px;

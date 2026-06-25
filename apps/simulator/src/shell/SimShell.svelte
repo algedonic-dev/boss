@@ -9,7 +9,6 @@
   // .sim-shell here rather than relying on apps/web's `.theme-exec`
   // wrapper — keeps the shell self-contained. The brewery accent vars
   // (--brew-*) come from styles.css :root.
-  import SystemTime from '@boss/web-kit/SystemTime.svelte';
   import PerspectiveTabs from '@boss/web-kit/PerspectiveTabs.svelte';
   import { href, navigate, type Route } from '../router';
 
@@ -31,7 +30,7 @@
 </script>
 
 <div class="sim-shell">
-  <PerspectiveTabs active="simulator" />
+  <PerspectiveTabs active="simulator" brandName="Algedonic" brandSub="Ales" />
   <header class="sim-topbar">
     <div class="sim-brand">
       <span class="sim-brand-name">BOSS</span>
@@ -48,9 +47,6 @@
         >{item.label}</a>
       {/each}
     </nav>
-    <div class="sim-clock">
-      <SystemTime />
-    </div>
   </header>
 
   <main class="sim-main">
@@ -128,9 +124,6 @@
     background: var(--brew-amber-bg);
     color: var(--brew-malt);
     font-weight: 600;
-  }
-  .sim-clock {
-    flex: 0 0 auto;
   }
   .sim-main {
     padding: 28px max(20px, calc((100vw - 1280px) / 2)) 64px;

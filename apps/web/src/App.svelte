@@ -217,7 +217,7 @@
 {#if route.kind === 'login'}
   <LoginPage />
 {:else}
-  <PerspectiveTabs active={perspective} />
+  <PerspectiveTabs active={perspective} brandName="Algedonic" brandSub="Ales" />
 <AppShell {activeSection}>
   {#if blockedModule}
     <ModuleDisabled module={blockedModule.id} label={blockedModule.label} />
