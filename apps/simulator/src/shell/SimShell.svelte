@@ -1,14 +1,11 @@
 <script lang="ts">
-  // Simple app shell for the Simulator UX. Deliberately NOT the
-  // apps/web AppShell (too coupled to that app's sidebar/session
-  // model). A topbar with the brand, the shared <SystemTime> clock
-  // indicator, and a two-item nav (Cockpit | Controls). The page
-  // content renders in the snippet below.
-  //
-  // Neutral palette variables (--bg/--border/--text/...) are scoped to
-  // .sim-shell here rather than relying on apps/web's `.theme-exec`
-  // wrapper — keeps the shell self-contained. The brewery accent vars
-  // (--brew-*) come from styles.css :root.
+  // App shell for the Simulator UX. Mirrors the apps/web shell SHAPE —
+  // a dark left sidebar under the perspective tab bar + a content
+  // column — so the Simulator tab feels consistent with the System
+  // Model and User Experiences tabs. The sidebar nav is the
+  // simulator's own (Cockpit | Controls); it intentionally does NOT
+  // mirror the User Experiences Work / Surfaces / Knowledge-Bases
+  // grouping. New sim surfaces slot in as more NAV entries.
   import PerspectiveTabs from '@boss/web-kit/PerspectiveTabs.svelte';
   import { href, navigate, type Route } from '../router';
 
@@ -24,6 +21,7 @@
   ];
 
   function go(e: MouseEvent, rel: string): void {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
     e.preventDefault();
     navigate(href(rel));
   }
@@ -31,15 +29,12 @@
 
 <div class="sim-shell">
   <PerspectiveTabs active="simulator" brandName="Algedonic" brandSub="Ales" />
-  <header class="sim-topbar">
-    <div class="sim-brand">
-      <span class="sim-brand-name">BOSS</span>
-      <span class="sim-brand-sub">Simulator</span>
-    </div>
+  <aside class="sim-sidebar">
     <nav class="sim-nav" aria-label="Simulator sections">
+      <div class="sim-nav-group-label">Simulator</div>
       {#each NAV as item (item.kind)}
         <a
-          class="sim-nav-link"
+          class="sim-nav-item"
           class:active={route.kind === item.kind}
           href={href(item.rel)}
           aria-current={route.kind === item.kind ? 'page' : undefined}
@@ -47,7 +42,7 @@
         >{item.label}</a>
       {/each}
     </nav>
-  </header>
+  </aside>
 
   <main class="sim-main">
     {@render children()}
@@ -64,6 +59,8 @@
     --text: #1c1917;
     --text-dim: #78716c;
 
+    display: grid;
+    grid-template-columns: 200px 1fr;
     min-height: 100vh;
     /* Offset below the fixed 44px PerspectiveTabs bar. */
     padding-top: 44px;
@@ -72,60 +69,53 @@
     color: var(--text);
     font-family: var(--font-body);
   }
-  .sim-topbar {
-    display: flex;
-    align-items: center;
-    gap: 24px;
-    padding: 12px max(20px, calc((100vw - 1280px) / 2));
-    background: var(--card);
-    border-bottom: 2px solid var(--brew-amber);
-    position: sticky;
+  /* Dark left rail, matching the apps/web shell sidebar. */
+  .sim-sidebar {
+    background: #1c1917;
+    color: #e7e5e4;
+    position: fixed;
     top: 44px;
-    z-index: 10;
-  }
-  .sim-brand {
-    display: flex;
-    align-items: baseline;
-    gap: 4px;
-  }
-  .sim-brand-name {
-    font-family: var(--font-display);
-    font-size: 22px;
-    font-weight: 700;
-    letter-spacing: -0.01em;
-    color: var(--brew-malt-dark);
-  }
-  .sim-brand-sub {
-    font-size: 12px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    color: var(--brew-amber);
+    left: 0;
+    bottom: 0;
+    width: 200px;
+    z-index: 20;
+    overflow-y: auto;
   }
   .sim-nav {
-    display: flex;
-    gap: 4px;
-    flex: 1 1 auto;
+    padding: 16px 8px 0;
   }
-  .sim-nav-link {
+  .sim-nav-group-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #a8a29e;
+    padding: 4px 12px;
+    margin-bottom: 4px;
+  }
+  .sim-nav-item {
+    display: flex;
+    align-items: center;
     padding: 6px 12px;
     border-radius: 6px;
     font-size: 13px;
-    font-weight: 500;
-    color: var(--text-dim);
+    color: #d6d3d1;
     text-decoration: none;
-    transition: background 80ms, color 80ms;
+    transition:
+      background 0.1s,
+      color 0.1s;
   }
-  .sim-nav-link:hover {
-    background: #f5f5f4;
-    color: var(--text);
+  .sim-nav-item:hover {
+    background: #292524;
+    color: #fff;
   }
-  .sim-nav-link.active {
-    background: var(--brew-amber-bg);
-    color: var(--brew-malt);
-    font-weight: 600;
+  .sim-nav-item.active {
+    background: #44403c;
+    color: #fff;
+    font-weight: 500;
   }
   .sim-main {
-    padding: 28px max(20px, calc((100vw - 1280px) / 2)) 64px;
+    grid-column: 2;
+    padding: 28px max(24px, calc((100vw - 200px - 1180px) / 2)) 64px;
   }
 </style>
