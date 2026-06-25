@@ -209,7 +209,7 @@
     'itStepPlugins', 'itStepPluginDetail',
     'dispatcherRules', 'dispatcherRulesList', 'dispatcherRuleEdit',
     'jobKinds', 'jobKindNew', 'jobKindDesign', 'jobKindDetail',
-    'policy', 'workflows',
+    'policy', 'workflows', 'authAdmin',
   ]);
   let perspective: 'model' | 'user' = $derived(MODEL_KINDS.has(route.kind) ? 'model' : 'user');
 </script>
@@ -218,7 +218,7 @@
   <LoginPage />
 {:else}
   <PerspectiveTabs active={perspective} brandName="Algedonic" brandSub="Ales" />
-<AppShell {activeSection}>
+<AppShell {activeSection} {perspective}>
   {#if blockedModule}
     <ModuleDisabled module={blockedModule.id} label={blockedModule.label} />
   {:else if route.kind === 'home'}

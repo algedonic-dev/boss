@@ -160,8 +160,11 @@
   // Future surfaces should NOT bring back the Admin tier; pick
   // a department-rooted slug and a role-gated permKey.
 
-  let { activeSection, children } = $props<{
+  let { activeSection, perspective = 'user', children } = $props<{
     activeSection: string;
+    // Which top-level perspective tab this shell renders under. Drives
+    // which surfaces appear in the sidebar.
+    perspective?: 'model' | 'user';
     children: () => any;
   }>();
 
@@ -181,12 +184,29 @@
 
   let MAIN = $derived<ReadonlyArray<NavGroup>>([WORK, BROWSE, KNOW]);
 
+  // Perspective split: which surfaces belong to the System Model tab
+  // (the model's configuration + how it's running — most of what used
+  // to be "IT") vs the User Experiences tab (the actor work surfaces +
+  // knowledge bases — Finance, Inventory, the KBs, …). Keyed by
+  // permKey/RouteName. Keep in sync with App.svelte's MODEL_KINDS,
+  // which classifies the same split by route kind to drive the active
+  // tab — the two must agree for every routed surface.
+  const MODEL_ROUTES = new Set<RouteName>([
+    'it-system', 'it-monitoring', 'it-step-plugins', 'it-dispatcher',
+    'it-subjects', 'it-dispatcher-rules', 'it-dispatcher-rule',
+    'it-kb', 'it-design', 'policy', 'job-kinds', 'workflows', 'auth-admin',
+  ]);
+  function inPerspective(i: NavItem): boolean {
+    const isModel = i.permKey !== undefined && MODEL_ROUTES.has(i.permKey);
+    return perspective === 'model' ? isModel : !isModel;
+  }
+
   function visible(items: ReadonlyArray<NavItem>): ReadonlyArray<NavItem> {
     if (!role) return [];
     return items.filter((i) => {
       const policyOk = i.permKey === undefined || canSeeRoute(role, i.permKey);
       const moduleOk = i.module === undefined || moduleEnabled(i.module);
-      return policyOk && moduleOk;
+      return policyOk && moduleOk && inPerspective(i);
     });
   }
 
@@ -200,29 +220,31 @@
 <div class="app-shell">
   <aside class="shell-sidebar">
     <nav class="shell-nav">
-      <div class="shell-nav-personal">
-        <a
-          href="/me"
-          class="shell-nav-item shell-nav-home {activeSection === 'me' ? 'shell-nav-item-active' : ''}"
-          onclick={(e) => onLinkClick(e, '/me')}
-        >
-          My Day
-        </a>
-        <a
-          href="/inbox"
-          class="shell-nav-item {activeSection === 'inbox' ? 'shell-nav-item-active' : ''}"
-          onclick={(e) => onLinkClick(e, '/inbox')}
-        >
-          Inbox
-        </a>
-        <a
-          href="/shop"
-          class="shell-nav-item {activeSection === 'shop' ? 'shell-nav-item-active' : ''}"
-          onclick={(e) => onLinkClick(e, '/shop')}
-        >
-          Shop
-        </a>
-      </div>
+      {#if perspective === 'user'}
+        <div class="shell-nav-personal">
+          <a
+            href="/me"
+            class="shell-nav-item shell-nav-home {activeSection === 'me' ? 'shell-nav-item-active' : ''}"
+            onclick={(e) => onLinkClick(e, '/me')}
+          >
+            My Day
+          </a>
+          <a
+            href="/inbox"
+            class="shell-nav-item {activeSection === 'inbox' ? 'shell-nav-item-active' : ''}"
+            onclick={(e) => onLinkClick(e, '/inbox')}
+          >
+            Inbox
+          </a>
+          <a
+            href="/shop"
+            class="shell-nav-item {activeSection === 'shop' ? 'shell-nav-item-active' : ''}"
+            onclick={(e) => onLinkClick(e, '/shop')}
+          >
+            Shop
+          </a>
+        </div>
+      {/if}
 
       {#each MAIN as group (group.label)}
         {@const items = visible(group.items)}
