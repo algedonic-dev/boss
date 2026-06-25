@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": false,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["bun-types"],
+    "paths": {
+      "@boss/web-kit/*": ["../../libs/web-kit/src/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.svelte", "../../libs/web-kit/src/**/*"]
+}
