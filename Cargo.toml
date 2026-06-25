@@ -49,6 +49,7 @@ members = [
     "crates/core/boss-content",
     "crates/core/boss-testing",
     "crates/orchestrators/boss-rebuild",
+    "crates/orchestrators/boss-simulator",
     "crates/core/boss-ports",
 ]
 

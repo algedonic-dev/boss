@@ -95,6 +95,13 @@ pub const PAIRED: &[PortSpec] = &[
 /// + ledger / ml / docs / content. Mirrors `SOLO_SERVICES` in
 ///   `infra/deploy-services.sh`.
 pub const SOLO: &[PortSpec] = &[
+    // `simulator` hosts the /simulator UX — the SPA bundle + the
+    // /simulator/api/* control+status surface (boss-simulator service).
+    PortSpec {
+        name: "simulator",
+        prod: 7010,
+        scratch: None,
+    },
     // `clock` runs on port 7060. The Clock service is the single
     // authority for "what time is it" — services hold a `ClockClient`
     // and call `clock.now()` instead of `Utc::now()`. Production runs

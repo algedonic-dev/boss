@@ -1448,6 +1448,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-simulator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "boss-ports",
+ "serde_json",
+ "tokio",
+ "tower-http 0.7.0",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "boss-subject-kinds"
 version = "0.1.0"
 dependencies = [
