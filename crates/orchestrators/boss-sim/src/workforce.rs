@@ -100,7 +100,7 @@ pub struct RequiredField {
     pub field_type: String,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct WorkforceStats {
     pub checkins: u64,
     pub claimed: u64,

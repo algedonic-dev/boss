@@ -42,6 +42,10 @@ use boss_sim::shape_driven::{ShapeDrivenState, TenantConfig};
 /// binary and the future unified "prepare" step.
 pub mod prepare;
 
+/// Control + telemetry HTTP server for the live `boss-brewery-sim`
+/// daemon (localhost-only; boss-simulator proxies to it).
+pub mod sim_control;
+
 /// Result of a brewery-engine run — the day-loop's RunReport
 /// plus the populated InMemoryOutput so callers can assert on
 /// emitted facts.

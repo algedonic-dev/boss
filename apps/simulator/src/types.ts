@@ -37,3 +37,70 @@ export type AuditEntry = Readonly<{
   kind: string;
   payload: unknown;
 }>;
+
+// --- Simulator telemetry (GET /simulator/api/telemetry): how the daemon
+// is engaging the public API. Mirrors boss-brewery-engine's
+// sim_control::SimTelemetry (served by the daemon, proxied by
+// boss-simulator). ---
+
+export type SimCadence = Readonly<{
+  sim_date: string | null;
+  paused: boolean;
+  epoch_start: string | null;
+  epoch_end: string | null;
+  warp_factor: number | null;
+  days_per_tick: number | null;
+  tick_interval_seconds: number | null;
+}>;
+
+// Workforce step transitions — the PUT /api/jobs/{}/steps engagement.
+export type WorkforceStats = Readonly<{
+  checkins: number;
+  claimed: number;
+  completed: number;
+  deferred: number;
+  in_progress: number;
+  errors: number;
+}>;
+
+// Per-domain API writes — the step.done side-effect POSTs to the services.
+export type ApiWrites = Readonly<{
+  asset_events: number;
+  invoices_created: number;
+  invoices_updated: number;
+  shipments: number;
+  agreements: number;
+  jobs: number;
+  purchase_orders: number;
+  messages: number;
+  account_notes: number;
+  tax_filings: number;
+  bank_settlements: number;
+  scheduled_assignments: number;
+  revenue_schedules: number;
+  days_flushed: number;
+  errors: number;
+}>;
+
+// One tick's worth of engagement (the recent-activity ring buffer).
+export type TickActivity = Readonly<{
+  tick: number;
+  sim_date: string | null;
+  claimed: number;
+  completed: number;
+  deferred: number;
+  errors: number;
+}>;
+
+export type SimTelemetry = Readonly<{
+  actor: string;
+  role: string;
+  api_base: string;
+  started_unix: number;
+  cadence: SimCadence;
+  tick_count: number;
+  last_tick_unix: number | null;
+  workforce: WorkforceStats;
+  api_writes: ApiWrites;
+  recent: ReadonlyArray<TickActivity>;
+}>;

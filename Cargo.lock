@@ -494,6 +494,7 @@ name = "boss-brewery-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "boss-accounts",
  "boss-calendar-client",
  "boss-core",

@@ -747,6 +747,7 @@ pub mod live {
     }
 
     /// Per-run write counters, logged at flush.
+    #[derive(Debug, Default, Clone, serde::Serialize)]
     pub struct LiveApiStats {
         pub asset_events: u64,
         pub invoices_created: u64,
