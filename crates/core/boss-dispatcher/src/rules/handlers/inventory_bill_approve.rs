@@ -163,8 +163,15 @@ impl Handler for InventoryBillApprove {
             )));
         }
 
-        let vendor_invoice_no =
-            step.meta_string_or("vendor_invoice_no", |s| format!("VI-step-{}", s.step_id));
+        // PO-keyed so the human approval lands on the SAME invoice row the
+        // vendor's webhook posts (`vi-{po_id}` from the from-po endpoint),
+        // rather than a per-step row that would double it.
+        let vendor_invoice_no = step
+            .metadata
+            .get("vendor_invoice_no")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| format!("VI-{po_id}"));
 
         let received_offset_days = arg(args, "received_offset_days")
             .and_then(|v| match v {
@@ -191,7 +198,12 @@ impl Handler for InventoryBillApprove {
             })
             .unwrap_or_else(|| "USD".to_string());
 
-        let id = format!("vi-step-{}", step.step_id);
+        // `vi-{po_id}` (not per-step): the idempotent upsert transitions the
+        // vendor-posted `received` invoice to `approved`, or creates it
+        // `approved` directly when the vendor hasn't posted yet (the
+        // self-healing fallback — the human approval is authoritative either
+        // way). One invoice per PO, never doubled.
+        let id = format!("vi-{po_id}");
         let mut body = json!({
             "id": id,
             "po_id": po_id,
