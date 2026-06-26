@@ -13,7 +13,7 @@
   import { onMount } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
-  import type { SimTelemetry, ApiWrites, AuditEntry } from './types';
+  import type { SimTelemetry, ActorActivity, AuditEntry } from './types';
 
   const TELEMETRY_POLL_MS = 2_000;
   const EVENTS_POLL_MS = 3_000;
@@ -25,26 +25,44 @@
   let events = $state<ReadonlyArray<AuditEntry>>([]);
   let eventsError = $state<string | null>(null);
 
-  // The per-domain API-write engagement points, in display order — every
-  // place the sim POSTs to a domain service as a step side-effect.
-  const WRITE_POINTS: ReadonlyArray<{ key: keyof ApiWrites; label: string }> = [
-    { key: 'jobs', label: 'Jobs opened' },
-    { key: 'invoices_created', label: 'Invoices created' },
-    { key: 'invoices_updated', label: 'Invoices updated' },
-    { key: 'bank_settlements', label: 'Payments settled' },
-    { key: 'shipments', label: 'Shipments' },
-    { key: 'purchase_orders', label: 'Purchase orders' },
-    { key: 'agreements', label: 'Agreements' },
-    { key: 'messages', label: 'Messages' },
-    { key: 'tax_filings', label: 'Tax filings' },
-    { key: 'account_notes', label: 'Account notes' },
-    { key: 'asset_events', label: 'Asset events' },
-    { key: 'revenue_schedules', label: 'Revenue schedules' },
-    { key: 'scheduled_assignments', label: 'Scheduled assignments' },
+  // Actor panels — how the sim engages the API, grouped by who's acting.
+  // The sim already models its actors: the workforce (by role) + the named
+  // counterparty chains (which decode to Account / Vendor / Bank) + the
+  // Environment (world generation + materialization).
+  const ACTOR_KINDS: ReadonlyArray<{ kind: ActorActivity['kind']; title: string; sub: string }> = [
+    { kind: 'employee', title: 'Employee Actors', sub: 'the workforce — by role' },
+    { kind: 'account', title: 'Account Actors', sub: 'customers — orders, payments, defaults' },
+    { kind: 'vendor', title: 'Vendor Actors', sub: 'suppliers — fulfilment, invoicing, delivery' },
+    { kind: 'bank', title: 'Bank', sub: 'payment settlement' },
+    { kind: 'environment', title: 'Environment', sub: 'demand injected + end-of-day materialization' },
   ];
 
-  let writeRows = $derived<ReadonlyArray<{ label: string; count: number }>>(
-    tele ? WRITE_POINTS.map((p) => ({ label: p.label, count: tele!.api_writes[p.key] ?? 0 })) : [],
+  // Elapsed sim-days since the daemon started — the calls/sim-day rate base.
+  function simDaysBetween(from: string | null, to: string | null | undefined): number {
+    if (!from || !to) return 0;
+    const a = Date.parse(`${from}T00:00:00Z`);
+    const b = Date.parse(`${to}T00:00:00Z`);
+    if (Number.isNaN(a) || Number.isNaN(b)) return 0;
+    return Math.max(0, (b - a) / 86_400_000);
+  }
+  let elapsedSimDays = $derived(tele ? simDaysBetween(tele.started_sim_date, tele.cadence.sim_date) : 0);
+  function ratePerDay(calls: number): string {
+    if (elapsedSimDays <= 0) return '—';
+    const r = calls / elapsedSimDays;
+    return `${r >= 10 ? r.toFixed(0) : r.toFixed(1)}/day`;
+  }
+
+  // Actors grouped into the five panels, busiest-first within each. Empty
+  // panels are hidden.
+  let actorGroups = $derived(
+    tele
+      ? ACTOR_KINDS.map((k) => ({
+          ...k,
+          actors: [...(tele!.actors ?? [])]
+            .filter((a) => a.kind === k.kind)
+            .sort((a, b) => b.calls - a.calls),
+        })).filter((g) => g.actors.length > 0)
+      : [],
   );
 
   // Recent ticks, newest first.
@@ -180,16 +198,45 @@
     </div>
 
     <div class="cockpit-col">
-      <Section title="API writes by domain" wide>
-        <p class="point-sub">step.done side-effects → POSTs to the domain services (cumulative)</p>
-        <ul class="write-list">
-          {#each writeRows as row (row.label)}
-            <li class="write-row">
-              <span class="write-label">{row.label}</span>
-              <span class="write-count">{row.count.toLocaleString()}</span>
-            </li>
+      <Section title="API engagement by actor" wide>
+        <p class="point-sub">
+          Calls the sim makes to the public API, by who's acting — cumulative count + per-sim-day
+          rate (errors flagged)
+        </p>
+        {#if actorGroups.length === 0}
+          <p class="status">No API calls yet.</p>
+        {:else}
+          {#each actorGroups as group (group.kind)}
+            <div class="actor-group">
+              <h4 class="actor-group-title">
+                {group.title}<span class="actor-group-sub">{group.sub}</span>
+              </h4>
+              {#each group.actors as a (a.label)}
+                <div class="actor">
+                  <div class="actor-head">
+                    <span class="actor-label">{a.label}</span>
+                    <span class="actor-meta">
+                      <span class="actor-calls">{a.calls.toLocaleString()}</span>
+                      <span class="actor-rate">{ratePerDay(a.calls)}</span>
+                      {#if a.errors > 0}<span class="actor-err">{a.errors.toLocaleString()} err</span>{/if}
+                    </span>
+                  </div>
+                  <ul class="endpoint-list">
+                    {#each a.endpoints as e (e.endpoint)}
+                      <li class="endpoint-row">
+                        <code class="endpoint-name">{e.endpoint}</code>
+                        <span class="endpoint-nums">
+                          <span class="endpoint-calls">{e.calls.toLocaleString()}</span>
+                          {#if e.errors > 0}<span class="endpoint-err">{e.errors}✗</span>{/if}
+                        </span>
+                      </li>
+                    {/each}
+                  </ul>
+                </div>
+              {/each}
+            </div>
           {/each}
-        </ul>
+        {/if}
       </Section>
 
       <Section title="Live events landing" wide>
@@ -333,7 +380,7 @@
   .kv dd.err {
     color: #8b2b1f;
   }
-  .write-list,
+  .endpoint-list,
   .tick-list,
   .event-list {
     list-style: none;
@@ -342,23 +389,94 @@
     display: flex;
     flex-direction: column;
   }
-  .write-row {
+  .actor-group {
+    margin-bottom: 14px;
+  }
+  .actor-group-title {
+    margin: 0 0 6px;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--brew-malt-dark);
+    border-bottom: 1px solid #e6d2a8;
+    padding-bottom: 3px;
+  }
+  .actor-group-sub {
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 400;
+    color: #a8a29e;
+    margin-left: 8px;
+    font-size: 0.78rem;
+  }
+  .actor {
+    margin: 0 0 8px;
+  }
+  .actor-head {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
-    padding: 5px 8px;
-    border-radius: 4px;
+    gap: 8px;
+    padding: 2px 0;
   }
-  .write-row:nth-child(odd) {
-    background: rgba(217, 155, 58, 0.07);
+  .actor-label {
+    font-weight: 600;
+    color: var(--brew-malt-dark);
   }
-  .write-label {
+  .actor-meta {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    font-variant-numeric: tabular-nums;
+    font-size: 0.85rem;
+  }
+  .actor-calls {
+    font-weight: 600;
+    color: var(--brew-malt-dark);
+  }
+  .actor-rate {
     color: var(--brew-malt);
   }
-  .write-count {
+  .actor-err {
+    color: #8b2b1f;
     font-weight: 600;
+  }
+  .endpoint-list {
+    gap: 1px;
+    margin-left: 10px;
+  }
+  .endpoint-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 8px;
+    padding: 2px 6px;
+    border-radius: 3px;
+  }
+  .endpoint-row:nth-child(odd) {
+    background: rgba(217, 155, 58, 0.06);
+  }
+  .endpoint-name {
+    color: var(--brew-malt);
+    font-size: 0.76rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .endpoint-nums {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
     font-variant-numeric: tabular-nums;
+    font-size: 0.8rem;
+    flex-shrink: 0;
+  }
+  .endpoint-calls {
+    font-weight: 600;
     color: var(--brew-malt-dark);
+  }
+  .endpoint-err {
+    color: #8b2b1f;
   }
   .tick-list {
     gap: 2px;

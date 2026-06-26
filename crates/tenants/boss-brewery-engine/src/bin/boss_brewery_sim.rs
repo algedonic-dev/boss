@@ -455,8 +455,12 @@ async fn main() -> Result<()> {
     // chain would be visible). So we hoist the output up here,
     // share via Arc<Mutex>, and lock per tick alongside the
     // engine.
+    // Shared per-actor API-activity tally (cockpit telemetry). One handle,
+    // written by both the workforce + the live output, snapshotted into
+    // telemetry each tick.
+    let api_activity = boss_sim::api_activity::new_handle();
     let output = Arc::new(Mutex::new({
-        let mut o = LiveApiOutput::new(&api_base);
+        let mut o = LiveApiOutput::new(&api_base).with_api_activity(api_activity.clone());
         register_default_event_routes(&mut o);
         o
     }));
@@ -484,7 +488,18 @@ async fn main() -> Result<()> {
     // the clock here; clock-api owns it (primed by reset-to-baseline).
     let workforce = {
         let guard = engine.lock().expect("engine mutex poisoned");
-        Arc::new(Mutex::new(build_workforce(&guard, &api_base)))
+        // emp → role, inverted from the seeded roster, so the cockpit can
+        // attribute each PUT /steps to the worker's role.
+        let mut emp_roles: HashMap<String, String> = HashMap::new();
+        for (role, emps) in &guard.state.employees_by_role {
+            for emp in emps {
+                emp_roles.insert(emp.clone(), role.clone());
+            }
+        }
+        Arc::new(Mutex::new(
+            build_workforce(&guard, &api_base)
+                .with_actor_telemetry(api_activity.clone(), emp_roles),
+        ))
     };
     info!("workforce executor constructed; driving assigned steps each tick");
 
@@ -692,8 +707,15 @@ async fn main() -> Result<()> {
                     .map(|w| w.stats.clone())
                     .unwrap_or_default();
                 let api = output.lock().map(|o| o.stats.clone()).unwrap_or_default();
+                let actors = boss_sim::api_activity::snapshot(&api_activity);
                 if let Ok(mut t) = telemetry.lock() {
-                    t.record_tick(global_tick, cadence_of(&clock, Some(day)), &wf, &api);
+                    t.record_tick(
+                        global_tick,
+                        cadence_of(&clock, Some(day)),
+                        &wf,
+                        &api,
+                        actors,
+                    );
                 }
             }
             // Sleep between sim-ticks so events spread across the

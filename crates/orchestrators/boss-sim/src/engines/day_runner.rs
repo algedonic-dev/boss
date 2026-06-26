@@ -469,6 +469,7 @@ mod tests {
         );
         let mut counterparty = CounterpartyEngine::new(
             vec![CounterpartySpec {
+                actor_kind: None,
                 name: "settler".into(),
                 listens_to: "job.closed".into(),
                 delay: DelaySpec {

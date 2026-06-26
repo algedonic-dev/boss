@@ -577,7 +577,11 @@ fn birth_subjects(
             if let Some(topic) = sr.created_event_kind.as_deref() {
                 let mut payload = synthesized_birth_payload(kind, &id, day);
                 payload["born_on"] = serde_json::Value::String(day.format("%Y-%m-%d").to_string());
-                if let Err(e) = output.emit_event(topic, &payload) {
+                if let Err(e) = output.emit_event(
+                    topic,
+                    &payload,
+                    Some((crate::api_activity::ActorKind::Environment, "demand")),
+                ) {
                     tracing::warn!(
                         kind = %kind,
                         topic = %topic,
@@ -2030,7 +2034,12 @@ mod tests {
         }
     }
     impl crate::output::SimOutput for FailingEmitOutput {
-        fn emit_event(&mut self, _topic: &str, _payload: &serde_json::Value) -> anyhow::Result<()> {
+        fn emit_event(
+            &mut self,
+            _topic: &str,
+            _payload: &serde_json::Value,
+            _source: Option<(crate::api_activity::ActorKind, &str)>,
+        ) -> anyhow::Result<()> {
             anyhow::bail!("test: emit always fails")
         }
         fn emit_system_event(&mut self, e: &boss_assets::types::AssetEvent) -> anyhow::Result<()> {

@@ -55,6 +55,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use crate::api_activity::{self, ActorKind, ApiActivity};
+
 /// Default duration for step kinds with no `typical_duration_hours`
 /// (generic / task / sub-job) — paces an untyped step as a full
 /// working day.
@@ -156,6 +158,14 @@ pub struct Workforce {
     /// StepRegistry. On completion the workforce supplies any the JobKind
     /// didn't default — the executor filling the step's form.
     required_fields: HashMap<String, Vec<RequiredField>>,
+    /// Shared per-actor API-call tally (cockpit telemetry). The daemon
+    /// injects the shared handle via `with_actor_telemetry`; default is a
+    /// detached fresh handle so non-daemon callers + tests work unchanged.
+    api_activity: ApiActivity,
+    /// Employee id → role. Attributes this executor's `PUT /steps` calls
+    /// to the worker's role (sign-offs carry their own role). The workforce
+    /// holds no *routing* roster — this is display attribution only.
+    emp_roles: HashMap<String, String>,
     pub stats: WorkforceStats,
 }
 
@@ -201,8 +211,37 @@ impl Workforce {
             api_base: api_base.to_string(),
             durations,
             required_fields,
+            api_activity: api_activity::new_handle(),
+            emp_roles: HashMap::new(),
             stats: WorkforceStats::default(),
         }
+    }
+
+    /// Inject the shared per-actor API-activity handle + the emp→role map
+    /// (cockpit telemetry). The daemon creates one handle, hands it to
+    /// both the workforce + the live output, and snapshots it each tick.
+    pub fn with_actor_telemetry(
+        mut self,
+        handle: ApiActivity,
+        emp_roles: HashMap<String, String>,
+    ) -> Self {
+        self.api_activity = handle;
+        self.emp_roles = emp_roles;
+        self
+    }
+
+    /// The role to attribute an employee's API calls to (cockpit display).
+    fn role_of(&self, emp: &str) -> &str {
+        self.emp_roles
+            .get(emp)
+            .map(String::as_str)
+            .unwrap_or("unassigned-role")
+    }
+
+    /// Record one workforce call on its ack, under the Employee actor.
+    fn record_employee_call(&self, method: &str, path: &str, role: &str, ok: bool) {
+        let endpoint = api_activity::endpoint_label(method, path);
+        api_activity::record(&self.api_activity, ActorKind::Employee, role, &endpoint, ok);
     }
 
     fn duration_hours(&self, kind: &str) -> f64 {
@@ -459,7 +498,7 @@ impl Workforce {
             "assignee_id": emp,
             "metadata": md,
         });
-        self.put_step(job_id, step_id, &body)
+        self.put_step(job_id, step_id, &body, self.role_of(emp))
     }
 
     /// Active → Completed, attributed to `emp`. For a demand-gate step,
@@ -503,14 +542,19 @@ impl Workforce {
         // only labor; see docs/design/brewery-model-completeness.md).
         obj.insert("metadata".to_string(), Value::Object(md.clone()));
         if sign_offs_required.is_empty() {
-            return self.put_step(job_id, step_id, &body);
+            return self.put_step(job_id, step_id, &body, self.role_of(emp));
         }
         // Sign-off contract: stamps attest the step's FINAL shape, so the
         // metadata the executor fills lands first, then the stamps,
         // then the status flip. Stamping happens as the role-matched
         // human — policy (the seeded step-signoff:<role> rules)
         // decides, no sim exemption.
-        self.put_step(job_id, step_id, &json!({ "metadata": Value::Object(md) }))?;
+        self.put_step(
+            job_id,
+            step_id,
+            &json!({ "metadata": Value::Object(md) }),
+            self.role_of(emp),
+        )?;
         for role in sign_offs_required {
             self.post_sign_off(job_id, step_id, emp, role)?;
         }
@@ -518,6 +562,7 @@ impl Workforce {
             job_id,
             step_id,
             &json!({ "status": "completed", "completed_by": emp }),
+            self.role_of(emp),
         )
     }
 
@@ -569,7 +614,14 @@ impl Workforce {
             .json(&json!({ "role": role }))
             .send()
             .with_context(|| format!("POST {url}"))?;
-        if !resp.status().is_success() {
+        let ok = resp.status().is_success();
+        self.record_employee_call(
+            "POST",
+            &format!("/api/jobs/{job_id}/steps/{step_id}/sign-offs"),
+            role,
+            ok,
+        );
+        if !ok {
             let status = resp.status();
             let body = resp.text().unwrap_or_default();
             anyhow::bail!("POST {url} returned {status}: {body}");
@@ -577,18 +629,18 @@ impl Workforce {
         Ok(())
     }
 
-    fn put_step(&self, job_id: &str, step_id: &str, body: &Value) -> Result<()> {
-        let url = service_url(
-            &self.api_base,
-            &format!("/api/jobs/{job_id}/steps/{step_id}"),
-        );
+    fn put_step(&self, job_id: &str, step_id: &str, body: &Value, role: &str) -> Result<()> {
+        let path = format!("/api/jobs/{job_id}/steps/{step_id}");
+        let url = service_url(&self.api_base, &path);
         let resp = self
             .client
             .put(&url)
             .json(body)
             .send()
             .with_context(|| format!("PUT {url}"))?;
-        if !resp.status().is_success() {
+        let ok = resp.status().is_success();
+        self.record_employee_call("PUT", &path, role, ok);
+        if !ok {
             let status = resp.status();
             let text = resp.text().unwrap_or_default();
             anyhow::bail!("PUT {url} -> {status}: {text}");
