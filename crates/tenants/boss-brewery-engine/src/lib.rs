@@ -338,6 +338,79 @@ fn calendar_base_url(api_base: &str) -> String {
     }
 }
 
+/// Fetch the employee roster from boss-people (`GET /api/people`),
+/// returning `emp_id → role` for every employee the SYSTEM knows that has
+/// a role assigned. This is the authoritative actor identity the cockpit
+/// attributes workforce calls by: the sim's own seed roster
+/// (`employees.json`) can lag the running system — a hire onboarded
+/// mid-run, or any assignee the system holds but the seed doesn't — which
+/// surfaced as `unassigned-role` in the actor panels. Sourcing the map
+/// from the model means an assignee only reads as `unassigned-role` when
+/// the system genuinely has no role for it.
+///
+/// Blocking (`reqwest::blocking`); call from the async daemon via
+/// `spawn_blocking`. A fetch failure (service down, non-2xx, decode error)
+/// returns an empty map and is logged — the caller keeps its seed-derived
+/// fallback so telemetry attribution degrades gracefully rather than
+/// blanking out.
+pub fn fetch_employees(api_base: &str) -> std::collections::HashMap<String, String> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        id: String,
+        #[serde(default)]
+        role: Option<String>,
+    }
+    let mut out = std::collections::HashMap::new();
+    let url = format!("{}/api/people", people_base_url(api_base));
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "building people HTTP client failed; keeping seed roster");
+            return out;
+        }
+    };
+    // x-sim-origin marks this as simulator traffic, consistent with the
+    // daemon's writes; the GET itself is an ungated read.
+    match client.get(&url).header("x-sim-origin", "true").send() {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Vec<Row>>() {
+            Ok(rows) => {
+                for r in rows {
+                    if let Some(role) = r.role {
+                        out.insert(r.id, role);
+                    }
+                }
+                tracing::info!(
+                    count = out.len(),
+                    "fetched employee roster from boss-people"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "decoding /api/people failed; keeping seed roster")
+            }
+        },
+        Ok(resp) => {
+            tracing::warn!(status = %resp.status(), url = %url, "GET /api/people non-2xx; keeping seed roster")
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, url = %url, "fetching /api/people failed; keeping seed roster")
+        }
+    }
+    out
+}
+
+/// Resolve the boss-people service base URL from the sim's `api_base`,
+/// mirroring [`calendar_base_url`].
+fn people_base_url(api_base: &str) -> String {
+    if api_base.starts_with("direct://") {
+        std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people"))
+    } else {
+        api_base.trim_end_matches('/').to_string()
+    }
+}
+
 /// Inline business calendars — the FALLBACK used only when the seed
 /// file is absent (synthetic/minimal seed dirs in tests). Production
 /// paths use DATA instead: the live daemon fetches from boss-calendar

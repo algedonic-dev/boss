@@ -21,6 +21,7 @@ use axum::{
 };
 use serde::Serialize;
 
+use boss_sim::api_activity::ActorActivity;
 use boss_sim::output::live::LiveApiStats;
 use boss_sim::shape_driven::TenantConfig;
 use boss_sim::workforce::WorkforceStats;
@@ -125,6 +126,15 @@ pub struct SimTelemetry {
 
     // --- recent per-tick activity (ring buffer) ---
     pub recent: VecDeque<TickActivity>,
+
+    // --- per-actor API engagement (the cockpit's actor panels) ---
+    /// How the sim engages the API, attributed to the acting party
+    /// (Employee by role · Account · Vendor · Bank · Environment) → each
+    /// endpoint's calls + errors. Cumulative since process start.
+    pub actors: Vec<ActorActivity>,
+    /// Sim-date at the first recorded tick — the rate denominator
+    /// (calls/sim-day = calls ÷ (current sim-date − this)).
+    pub started_sim_date: Option<String>,
 }
 
 impl SimTelemetry {
@@ -147,6 +157,7 @@ impl SimTelemetry {
         cadence: Cadence,
         workforce: &WorkforceStats,
         api_writes: &LiveApiStats,
+        actors: Vec<ActorActivity>,
     ) {
         // Deltas vs the previous cumulative snapshot (read before we
         // overwrite self.workforce below).
@@ -166,11 +177,15 @@ impl SimTelemetry {
             self.recent.pop_front();
         }
 
+        if self.started_sim_date.is_none() {
+            self.started_sim_date = cadence.sim_date.clone();
+        }
         self.cadence = cadence;
         self.tick_count = tick;
         self.last_tick_unix = Some(now_unix());
         self.workforce = workforce.clone();
         self.api_writes = api_writes.clone();
+        self.actors = actors;
     }
 
     /// Update just the cadence (paused / restarting branches, where no

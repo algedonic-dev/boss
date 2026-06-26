@@ -12,6 +12,10 @@
 //! A tenant is described as data: a `tenant.toml`, a
 //! `job_kinds.toml`, and a per-tenant engine crate.
 
+/// Per-actor API-call tallies — the cockpit's "how the sim engages the
+/// API, by who's acting" telemetry. Shared between the workforce + the
+/// live output adapter.
+pub mod api_activity;
 pub mod calendar;
 pub mod engines;
 pub mod event_routes;

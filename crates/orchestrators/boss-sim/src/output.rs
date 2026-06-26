@@ -237,7 +237,18 @@ pub trait SimOutput {
     /// up in its registered endpoint map and POSTs the payload there;
     /// other outputs default to capturing the (topic, payload) pair
     /// for tests.
-    fn emit_event(&mut self, _topic: &str, _payload: &serde_json::Value) -> anyhow::Result<()> {
+    ///
+    /// `source` names the acting party (cockpit telemetry) — the
+    /// counterparty engine passes the chain's `(actor_kind, name)`;
+    /// other callers pass `Some((Environment, "<label>"))` or `None`.
+    /// Only `LiveApiOutput` uses it (to attribute the resulting HTTP
+    /// call); the in-memory + test outputs ignore it.
+    fn emit_event(
+        &mut self,
+        _topic: &str,
+        _payload: &serde_json::Value,
+        _source: Option<(crate::api_activity::ActorKind, &str)>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -573,7 +584,12 @@ impl SimOutput for InMemoryOutput {
         Ok(())
     }
 
-    fn emit_event(&mut self, topic: &str, payload: &serde_json::Value) -> anyhow::Result<()> {
+    fn emit_event(
+        &mut self,
+        topic: &str,
+        payload: &serde_json::Value,
+        _source: Option<(crate::api_activity::ActorKind, &str)>,
+    ) -> anyhow::Result<()> {
         self.events.push((topic.to_string(), payload.clone()));
         Ok(())
     }
@@ -688,6 +704,7 @@ pub mod http {
 #[cfg(feature = "http")]
 pub mod live {
     use super::*;
+    use crate::api_activity::{self, ActorKind, ApiActivity};
     use boss_assets::types::AssetEvent;
     use boss_commerce::types::Invoice;
     use boss_shipping::types::Shipment;
@@ -899,6 +916,20 @@ pub mod live {
         /// `start_of_day`), so this is a per-flush record rather than
         /// a per-request header stamp.
         current_sim_day: Option<chrono::NaiveDate>,
+        /// Shared per-actor API-call tally (cockpit telemetry). Both the
+        /// workforce + this output write to it; the daemon snapshots it
+        /// each tick. Default fresh; the daemon injects the shared handle
+        /// via `with_api_activity`.
+        api_activity: ApiActivity,
+        /// The actor attributed to the call currently in flight, as
+        /// `(kind, rollup label)`. Set by `emit_event` (from its `source`)
+        /// and at the top of `end_of_day` (Environment / materialization);
+        /// read by the send helpers when they record on the ack. These calls
+        /// are counterparty chains + materialization — single processes, not
+        /// per-Subject actors — so they carry no distinct-actor id in the
+        /// chain model (the workforce path is the only per-actor source;
+        /// per-Subject counterparty actors are a later step).
+        current_actor: (ActorKind, String),
     }
 
     impl LiveApiOutput {
@@ -997,7 +1028,30 @@ pub mod live {
                     errors: 0,
                 },
                 current_sim_day: None,
+                api_activity: api_activity::new_handle(),
+                current_actor: (ActorKind::Environment, "materialization".to_string()),
             }
+        }
+
+        /// Inject the shared per-actor API-activity handle (cockpit
+        /// telemetry). The daemon creates one handle, hands it to both
+        /// the workforce + this output, and snapshots it each tick.
+        pub fn with_api_activity(mut self, handle: ApiActivity) -> Self {
+            self.api_activity = handle;
+            self
+        }
+
+        /// Record one outbound call **on its ack**, attributed to the
+        /// actor currently in flight (`current_actor`) + the templated
+        /// endpoint. `ok = status.is_success()`.
+        fn record_call(&self, method: &str, path: &str, ok: bool) {
+            let (kind, label) = &self.current_actor;
+            let endpoint = api_activity::endpoint_label(method, path);
+            // Empty actor id: counterparty + materialization calls are single
+            // processes in the chain model, not per-Subject actors, so they
+            // contribute nothing to a rollup's distinct-actor count (only the
+            // workforce, with a real employee id, does).
+            api_activity::record(&self.api_activity, *kind, label, &endpoint, ok, "");
         }
 
         /// Inject step durations (kind → hours) so end_of_day can
@@ -1045,25 +1099,29 @@ pub mod live {
             let mut count = 0u64;
             for chunk in items.chunks(chunk_size) {
                 let url = service_url(&self.api_base, path);
-                match self.client.post(&url).json(&chunk).send() {
+                let ok = match self.client.post(&url).json(&chunk).send() {
                     Ok(r) if r.status().is_success() => {
                         if let Ok(j) = r.json::<serde_json::Value>() {
                             count += j["inserted"].as_u64().unwrap_or(chunk.len() as u64);
                         } else {
                             count += chunk.len() as u64;
                         }
+                        true
                     }
                     Ok(r) => {
                         let status = r.status();
                         let body = r.text().unwrap_or_default();
                         warn!(%status, path, body = %body, "batch POST failed");
                         self.record_error(path, status.as_u16());
+                        false
                     }
                     Err(e) => {
                         warn!(error = %e, path, "batch POST error");
                         self.record_error(path, 0);
+                        false
                     }
-                }
+                };
+                self.record_call("POST", path, ok);
             }
             count
         }
@@ -1147,7 +1205,7 @@ pub mod live {
             // hold a `ClockClient` and call `/api/clock/now` rather
             // than reading anything off this request.
             let req = self.client.post(&url).json(body);
-            match req.send() {
+            let ok = match req.send() {
                 Ok(r) if r.status().is_success() || r.status().as_u16() == 409 => true,
                 Ok(r) => {
                     let status = r.status();
@@ -1162,7 +1220,9 @@ pub mod live {
                     self.record_error(path, 0);
                     false
                 }
-            }
+            };
+            self.record_call("POST", path, ok);
+            ok
         }
 
         fn put(&mut self, path: &str, body: &serde_json::Value) -> bool {
@@ -1208,7 +1268,7 @@ pub mod live {
                 req = req.header("x-boss-user", actor);
                 req = req.header("x-sim-origin", "true");
             }
-            match req.send() {
+            let ok = match req.send() {
                 Ok(r) if r.status().is_success() => true,
                 Ok(r) => {
                     let status = r.status();
@@ -1222,7 +1282,9 @@ pub mod live {
                     self.record_error(path, 0);
                     false
                 }
-            }
+            };
+            self.record_call("PUT", path, ok);
+            ok
         }
 
         /// PUT that tolerates the invoice-materialization race.
@@ -1251,7 +1313,10 @@ pub mod live {
             let mut attempt = 0usize;
             loop {
                 match self.client.put(&url).json(body).send() {
-                    Ok(r) if r.status().is_success() => return true,
+                    Ok(r) if r.status().is_success() => {
+                        self.record_call("PUT", path, true);
+                        return true;
+                    }
                     Ok(r) if r.status().as_u16() == 404 && attempt < BACKOFF_MS.len() => {
                         std::thread::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt]));
                         attempt += 1;
@@ -1261,11 +1326,13 @@ pub mod live {
                         let resp = r.text().unwrap_or_default();
                         warn!(%status, path, attempts = attempt + 1, body = %resp, "PUT failed");
                         self.record_error(path, status.as_u16());
+                        self.record_call("PUT", path, false);
                         return false;
                     }
                     Err(e) => {
                         warn!(error = %e, path, "PUT error");
                         self.record_error(path, 0);
+                        self.record_call("PUT", path, false);
                         return false;
                     }
                 }
@@ -1452,7 +1519,18 @@ pub mod live {
             Ok(())
         }
 
-        fn emit_event(&mut self, topic: &str, payload: &serde_json::Value) -> anyhow::Result<()> {
+        fn emit_event(
+            &mut self,
+            topic: &str,
+            payload: &serde_json::Value,
+            source: Option<(ActorKind, &str)>,
+        ) -> anyhow::Result<()> {
+            // Attribute the resulting HTTP call to the acting party (the
+            // send helpers read `current_actor` when they record on ack).
+            self.current_actor = match source {
+                Some((kind, label)) => (kind, label.to_string()),
+                None => (ActorKind::Environment, "uncategorized".to_string()),
+            };
             let route = match self.lookup_route(topic) {
                 Some(r) => EventRoute {
                     topic: r.topic.clone(),
@@ -1473,7 +1551,7 @@ pub mod live {
                 EventHttpMethod::Put => self.put(&resolved_path, payload),
                 EventHttpMethod::Patch => {
                     let url = service_url(&self.api_base, &resolved_path);
-                    match self.client.patch(&url).json(payload).send() {
+                    let ok = match self.client.patch(&url).json(payload).send() {
                         Ok(r) if r.status().is_success() => true,
                         Ok(r) => {
                             let status = r.status();
@@ -1487,7 +1565,9 @@ pub mod live {
                             self.record_error(&resolved_path, 0);
                             false
                         }
-                    }
+                    };
+                    self.record_call("PATCH", &resolved_path, ok);
+                    ok
                 }
             };
             // No per-topic stats counter yet — flush() prints the
@@ -1530,6 +1610,11 @@ pub mod live {
             // Cleared at the bottom so callers outside a sim flush
             // (ad-hoc helpers) don't inherit a stale day.
             self.current_sim_day = Some(day);
+            // Every call this flush issues is the sim materializing the
+            // world (new jobs/orders, invoices, POs, …) — attribute to the
+            // Environment actor. A specific `emit_event` overrides this for
+            // the duration of its own call.
+            self.current_actor = (ActorKind::Environment, "materialization".to_string());
 
             // --- Device events (batch) ---
             // Each section gets a realistic time-of-day anchor so
@@ -2481,11 +2566,16 @@ mod emit_event_tests {
     #[test]
     fn in_memory_captures_emit_event_calls() {
         let mut out = InMemoryOutput::default();
-        out.emit_event("ledger.payment_settled", &json!({"amount_cents": 1000}))
-            .unwrap();
+        out.emit_event(
+            "ledger.payment_settled",
+            &json!({"amount_cents": 1000}),
+            None,
+        )
+        .unwrap();
         out.emit_event(
             "inventory.vendor_invoice_received",
             &json!({"po_id": "po-1"}),
+            None,
         )
         .unwrap();
         assert_eq!(out.events.len(), 2);
@@ -2505,8 +2595,8 @@ mod emit_event_tests {
         // network, an unmatched topic should bump unrouted_topics, but
         // a matched one tries (and likely fails) to POST/PUT — we
         // assert the topic is *not* recorded as unrouted.
-        let _ = out.emit_event("a.b", &json!({}));
-        let _ = out.emit_event("c.d", &json!({}));
+        let _ = out.emit_event("a.b", &json!({}), None);
+        let _ = out.emit_event("c.d", &json!({}), None);
         // Best assertion we can make without exposing internals: the
         // unrouted_topics report only fires for un-registered topics.
         // This proves c.d was treated as unrouted but a.b wasn't.

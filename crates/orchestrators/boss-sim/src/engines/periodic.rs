@@ -331,14 +331,22 @@ impl SimEngine for PeriodicEngine {
                         format!("periodic:{}", spec.name),
                         payload.clone(),
                     );
-                    ctx.output.emit_event("periodic.job_requested", &payload)?;
+                    ctx.output.emit_event(
+                        "periodic.job_requested",
+                        &payload,
+                        Some((crate::api_activity::ActorKind::Environment, "periodic")),
+                    )?;
                 }
                 PeriodicAction::EmitEvent { topic, payload } => {
                     let mut p = payload.clone();
                     inject_day(&mut p, ctx.day);
                     ctx.bus
                         .publish(topic.clone(), format!("periodic:{}", spec.name), p.clone());
-                    ctx.output.emit_event(topic, &p)?;
+                    ctx.output.emit_event(
+                        topic,
+                        &p,
+                        Some((crate::api_activity::ActorKind::Environment, "periodic")),
+                    )?;
                 }
             }
         }

@@ -107,6 +107,10 @@ pub enum PeriodicActionToml {
 /// independent of the TOML loader.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CounterpartyToml {
+    /// Real-world actor kind this chain represents — `account` |
+    /// `vendor` | `bank` | `environment`. Drives the cockpit grouping.
+    #[serde(default)]
+    pub actor_kind: Option<String>,
     pub listens_to: String,
     pub delay: DelayToml,
     #[serde(default = "default_one")]
@@ -179,6 +183,9 @@ pub struct DelayToml {
 fn named_to_spec(n: &NamedCounterpartyToml) -> crate::engines::CounterpartySpec {
     crate::engines::CounterpartySpec {
         name: n.name.clone(),
+        // Followups inherit the root chain's actor kind via the qualified
+        // name's root segment, so leave this unset here.
+        actor_kind: None,
         listens_to: n.listens_to.clone(),
         delay: crate::engines::DelaySpec {
             mean_days: n.delay.mean_days,
@@ -770,6 +777,7 @@ impl TenantConfig {
             .into_iter()
             .map(|(name, c)| crate::engines::CounterpartySpec {
                 name: name.clone(),
+                actor_kind: c.actor_kind.clone(),
                 listens_to: c.listens_to.clone(),
                 delay: crate::engines::DelaySpec {
                     mean_days: c.delay.mean_days,

@@ -15,6 +15,7 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::api_activity::ActorKind;
 use crate::calendar::CalendarRegistry;
 use crate::engines::{DayContext, SimBusEvent, SimEngine};
 
@@ -54,6 +55,13 @@ pub struct CounterpartySpec {
     /// Stable identifier — bus events emitted by this counterparty
     /// carry `source = "counterparty:<name>"`.
     pub name: String,
+    /// Real-world actor kind this chain represents — `account` | `vendor`
+    /// | `bank` | `environment`. The cockpit groups by this, not the raw
+    /// chain name. Set on the root `[counterparty.*]`; followups + scan
+    /// stages inherit it via their qualified name's root segment. Absent →
+    /// `environment` (the catch-all).
+    #[serde(default)]
+    pub actor_kind: Option<String>,
     /// Bus topic this hop listens to. Exact-string match.
     pub listens_to: String,
     pub delay: DelaySpec,
@@ -158,6 +166,7 @@ impl CounterpartySpec {
             // empty predicate — no redundant re-checking.
             out.push(CounterpartySpec {
                 name: qualified_name.clone(),
+                actor_kind: self.actor_kind.clone(),
                 listens_to: self.listens_to.clone(),
                 delay: self.delay.clone(),
                 emit_probability: self.emit_probability,
@@ -181,6 +190,7 @@ impl CounterpartySpec {
                 let stage_name = format!("{qualified_name}.{}", scan.status);
                 out.push(CounterpartySpec {
                     name: stage_name,
+                    actor_kind: self.actor_kind.clone(),
                     listens_to: prev_emit.clone(),
                     delay: scan.delay.clone(),
                     // Each stage inherits the parent's emit_probability.
@@ -356,17 +366,33 @@ pub struct CounterpartyEngine {
     specs: Vec<CounterpartySpec>,
     state: CounterpartyState,
     calendars: CalendarRegistry,
+    /// Root chain name → real-world actor kind, for cockpit attribution.
+    root_actor_kinds: BTreeMap<String, ActorKind>,
 }
 
 impl CounterpartyEngine {
     /// Build from a list of root specs. Each spec's followups
     /// recursively flatten into siblings.
     pub fn new(specs: Vec<CounterpartySpec>, calendars: CalendarRegistry) -> Self {
+        // Root chain → actor kind, from the `actor_kind` data tag on each
+        // `[counterparty.*]`. Followups + scan stages inherit via their
+        // qualified name's root segment (`grain-supplier.ap-pay` →
+        // `grain-supplier` → Vendor) at drain time.
+        let root_actor_kinds = specs
+            .iter()
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    ActorKind::from_tag(s.actor_kind.as_deref().unwrap_or("")),
+                )
+            })
+            .collect();
         let flat: Vec<CounterpartySpec> = specs.iter().flat_map(|s| s.flatten(None)).collect();
         Self {
             specs: flat,
             state: CounterpartyState::new(),
             calendars,
+            root_actor_kinds,
         }
     }
 
@@ -484,7 +510,17 @@ impl SimEngine for CounterpartyEngine {
                 format!("counterparty:{}", e.counterparty),
                 e.payload.clone(),
             );
-            ctx.output.emit_event(&e.topic, &e.payload)?;
+            // Attribute the API call to the real-world actor this chain
+            // represents: the root segment of the qualified name carries
+            // the `actor_kind` tag (followups/scans inherit it).
+            let root = e.counterparty.split('.').next().unwrap_or(&e.counterparty);
+            let kind = self
+                .root_actor_kinds
+                .get(root)
+                .copied()
+                .unwrap_or(ActorKind::Environment);
+            ctx.output
+                .emit_event(&e.topic, &e.payload, Some((kind, &e.counterparty)))?;
         }
 
         // 2. Consume today's bus events. For each event, find every
@@ -548,6 +584,7 @@ mod tests {
 
     fn ach_spec() -> CounterpartySpec {
         CounterpartySpec {
+            actor_kind: None,
             name: "bank-ach".into(),
             listens_to: "ledger.payment_instructed".into(),
             delay: DelaySpec {
@@ -634,6 +671,7 @@ mod tests {
     #[test]
     fn flatten_collects_followups_with_qualified_names() {
         let spec = CounterpartySpec {
+            actor_kind: None,
             name: "vendor-x".into(),
             listens_to: "po.sent".into(),
             delay: DelaySpec {
@@ -645,6 +683,7 @@ mod tests {
             emits: "vendor.invoice_received".into(),
             payload: Value::Null,
             followups: vec![CounterpartySpec {
+                actor_kind: None,
                 name: "ack".into(),
                 listens_to: "ap.invoice_matched".into(),
                 delay: DelaySpec {
@@ -673,6 +712,7 @@ mod tests {
     #[test]
     fn scans_flatten_into_chained_followups() {
         let spec = CounterpartySpec {
+            actor_kind: None,
             name: "fedex".into(),
             listens_to: "shipping.handed_off".into(),
             delay: DelaySpec {
@@ -734,6 +774,7 @@ mod tests {
     #[should_panic(expected = "declares both `followups` and `scans`")]
     fn scans_and_followups_are_mutually_exclusive() {
         let spec = CounterpartySpec {
+            actor_kind: None,
             name: "bad".into(),
             listens_to: "x.y".into(),
             delay: DelaySpec {
@@ -745,6 +786,7 @@ mod tests {
             emits: "z.w".into(),
             payload: Value::Null,
             followups: vec![CounterpartySpec {
+                actor_kind: None,
                 name: "f".into(),
                 listens_to: "z.w".into(),
                 delay: DelaySpec {
@@ -779,6 +821,7 @@ mod tests {
         // 3-stage carrier chain with 0-day delays so every stage
         // can drain on a single sim day and keep the test compact.
         let spec = CounterpartySpec {
+            actor_kind: None,
             name: "fast-carrier".into(),
             listens_to: "shipping.handed_off".into(),
             delay: DelaySpec {
@@ -939,6 +982,7 @@ mod tests {
         // the first hop's emission lands on the bus, the second hop
         // (which listens to that topic) schedules its own emission.
         let spec = CounterpartySpec {
+            actor_kind: None,
             name: "vendor".into(),
             listens_to: "po.sent".into(),
             delay: DelaySpec {
@@ -950,6 +994,7 @@ mod tests {
             emits: "vendor.invoice_received".into(),
             payload: Value::Null,
             followups: vec![CounterpartySpec {
+                actor_kind: None,
                 name: "ack".into(),
                 listens_to: "vendor.invoice_received".into(),
                 delay: DelaySpec {
@@ -1107,6 +1152,7 @@ mod tests {
         // it consumes new events; same-day-due rows wait for the
         // next step to drain.
         let mk = |name: &str, category: &str, emits: &str| CounterpartySpec {
+            actor_kind: None,
             name: name.into(),
             listens_to: "step.done.procurement".into(),
             delay: DelaySpec {
@@ -1155,6 +1201,7 @@ mod tests {
         // Empty match_payload preserves the pre-filter behavior:
         // every event on the topic schedules an emission.
         let spec = CounterpartySpec {
+            actor_kind: None,
             name: "open-handler".into(),
             listens_to: "step.done.procurement".into(),
             delay: DelaySpec {
@@ -1190,6 +1237,7 @@ mod tests {
     fn engine_step_predicate_miss_schedules_nothing() {
         // The predicate doesn't match → no scheduling, no draining.
         let spec = CounterpartySpec {
+            actor_kind: None,
             name: "dairy".into(),
             listens_to: "step.done.procurement".into(),
             delay: DelaySpec {
@@ -1229,6 +1277,7 @@ mod tests {
         // Stage-0 of a `scans` chain inherits the parent predicate
         // so the whole chain gates correctly.
         let spec_with_followup = CounterpartySpec {
+            actor_kind: None,
             name: "vendor".into(),
             listens_to: "step.done.procurement".into(),
             delay: DelaySpec {
@@ -1240,6 +1289,7 @@ mod tests {
             emits: "ap.invoice".into(),
             payload: Value::Null,
             followups: vec![CounterpartySpec {
+                actor_kind: None,
                 name: "ack".into(),
                 listens_to: "ap.invoice".into(),
                 delay: DelaySpec {
@@ -1274,6 +1324,7 @@ mod tests {
 
         // scans path: stage 0 inherits, later stages don't.
         let spec_with_scans = CounterpartySpec {
+            actor_kind: None,
             name: "carrier".into(),
             listens_to: "step.done.shipment".into(),
             delay: DelaySpec {

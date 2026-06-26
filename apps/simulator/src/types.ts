@@ -92,6 +92,31 @@ export type TickActivity = Readonly<{
   errors: number;
 }>;
 
+// --- Per-actor API engagement (the cockpit's actor panels) ---
+// The sim acts as the workforce (employees, by role) + the named
+// counterparty chains (which decode to Account / Vendor / Bank), plus the
+// Environment (world generation + materialization). Each actor's calls are
+// tallied per endpoint, on the ack.
+export type ActorKind = 'employee' | 'account' | 'vendor' | 'bank' | 'environment';
+
+export type EndpointCount = Readonly<{
+  endpoint: string;
+  calls: number;
+  errors: number;
+}>;
+
+export type ActorActivity = Readonly<{
+  kind: ActorKind;
+  label: string;
+  calls: number;
+  errors: number;
+  // Distinct acting identities behind this rollup — how many people are
+  // the `shipping-clerk` role, how many accounts the `ar-aging` chain
+  // touched. 0 when no identity was attributed (Environment).
+  distinct: number;
+  endpoints: ReadonlyArray<EndpointCount>;
+}>;
+
 export type SimTelemetry = Readonly<{
   actor: string;
   role: string;
@@ -103,6 +128,10 @@ export type SimTelemetry = Readonly<{
   workforce: WorkforceStats;
   api_writes: ApiWrites;
   recent: ReadonlyArray<TickActivity>;
+  // How the sim engages the API, by who's acting (the actor panels).
+  actors: ReadonlyArray<ActorActivity>;
+  // Sim-date at the first tick — the calls/sim-day rate denominator.
+  started_sim_date: string | null;
 }>;
 
 // --- Simulator behavior config (GET/POST /simulator/api/config). The
