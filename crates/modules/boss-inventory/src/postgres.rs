@@ -676,7 +676,7 @@ impl InventoryRepository for PgInventory {
 
     async fn all_vendors(&self) -> Result<Vec<Vendor>, InventoryError> {
         let rows: Vec<VendorRow> =
-            sqlx::query_as("SELECT id, name, contact_name, contact_email, city, state, lead_time_days, payment_terms, category FROM vendors ORDER BY name")
+            sqlx::query_as("SELECT id, name, contact_name, contact_email, city, state, lead_time_days, payment_terms, category, behavior FROM vendors ORDER BY name")
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| InventoryError::Storage(e.to_string()))?;
@@ -689,8 +689,8 @@ impl InventoryRepository for PgInventory {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<String, InventoryError> {
         sqlx::query(
-            "INSERT INTO vendors (id, name, contact_name, contact_email, city, state, lead_time_days, payment_terms, category, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            "INSERT INTO vendors (id, name, contact_name, contact_email, city, state, lead_time_days, payment_terms, category, behavior, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(&vendor.id)
         .bind(&vendor.name)
@@ -701,6 +701,7 @@ impl InventoryRepository for PgInventory {
         .bind(vendor.lead_time_days as i16)
         .bind(&vendor.payment_terms)
         .bind(&vendor.category)
+        .bind(vendor.behavior.as_ref().map(|b| serde_json::to_value(b).unwrap_or_default()))
         .bind(now)
         .execute(&self.pool)
         .await
@@ -718,8 +719,9 @@ impl InventoryRepository for PgInventory {
     async fn update_vendor(&self, id: &str, vendor: &Vendor) -> Result<(), InventoryError> {
         let result = sqlx::query(
             "UPDATE vendors SET name = $1, contact_name = $2, contact_email = $3, \
-             city = $4, state = $5, lead_time_days = $6, payment_terms = $7, category = $8 \
-             WHERE id = $9",
+             city = $4, state = $5, lead_time_days = $6, payment_terms = $7, category = $8, \
+             behavior = $9 \
+             WHERE id = $10",
         )
         .bind(&vendor.name)
         .bind(&vendor.contact_name)
@@ -729,6 +731,12 @@ impl InventoryRepository for PgInventory {
         .bind(vendor.lead_time_days as i16)
         .bind(&vendor.payment_terms)
         .bind(&vendor.category)
+        .bind(
+            vendor
+                .behavior
+                .as_ref()
+                .map(|b| serde_json::to_value(b).unwrap_or_default()),
+        )
         .bind(id)
         .execute(&self.pool)
         .await
@@ -1010,6 +1018,7 @@ struct VendorRow {
     lead_time_days: i16,
     payment_terms: Option<String>,
     category: Option<String>,
+    behavior: Option<serde_json::Value>,
 }
 
 impl VendorRow {
@@ -1024,6 +1033,9 @@ impl VendorRow {
             lead_time_days: self.lead_time_days as u16,
             payment_terms: self.payment_terms,
             category: self.category,
+            // A malformed profile degrades to None rather than failing the
+            // whole vendor read.
+            behavior: self.behavior.and_then(|v| serde_json::from_value(v).ok()),
         }
     }
 }

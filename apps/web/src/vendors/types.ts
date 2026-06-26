@@ -1,6 +1,28 @@
 // Vendor + procurement CRM types.
 // Aligned with crates/modules/boss-inventory/src/procurement/types.rs.
 
+// How a vendor's behavior profile came to be. `hand_set` is bootstrapped
+// from the vendor's category Class template; `data_derived` is learned
+// from real procurement performance (future). Kept visible via
+// ProvenanceBadge so the distinction is never silent.
+export type BehaviorSource = 'hand_set' | 'data_derived';
+
+export type BehaviorProvenance = {
+  source: BehaviorSource;
+  // Names the category Class code the profile was bootstrapped from
+  // (e.g. `grain-supplier`); null/absent for data-derived profiles.
+  template?: string | null;
+};
+
+export type VendorBehavior = {
+  lead_time_days: number; // expected procurement lead time (days)
+  lead_spread_days: number; // ± spread
+  fulfilment_rate: number; // 0..1 (probability a procurement is fulfilled)
+  ap_payment_days: number; // invoice received -> AP payment (days)
+  ap_spread_days: number; // ± spread
+  provenance: BehaviorProvenance;
+};
+
 export type Vendor = {
   id: string;
   // Identity-first: only `id` is guaranteed. Descriptive fields are
@@ -13,6 +35,8 @@ export type Vendor = {
   lead_time_days: number;
   payment_terms: string | null;
   category: string | null;
+  // null/absent for uncategorized vendors — they have no profile yet.
+  behavior?: VendorBehavior | null;
 };
 
 export type PurchaseOrder = {

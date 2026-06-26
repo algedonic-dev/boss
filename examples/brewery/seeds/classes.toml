@@ -308,6 +308,15 @@ sort_order = 60
 
 # ---------------------------------------------------------------------------
 # Vendor categories — brewery-specific supplier kinds.
+#
+# Supplier categories carry a `behavior_template` in metadata: the hand-set
+# expectation of how a vendor of this kind behaves (procurement lead time,
+# fulfilment reliability, AP-payment timing). The simulator stamps each new
+# vendor's per-actor `behavior` from its category template at birth (marked
+# hand-set), then drives that vendor's supply chain from it — replacing the
+# hand-authored `[counterparty.*]` specs. Over time a vendor's profile
+# becomes data-derived from its real performance. See
+# docs/design/actor-behavior-model.md + boss_inventory::types::VendorBehavior.
 # ---------------------------------------------------------------------------
 
 [[class]]
@@ -315,6 +324,7 @@ subject_kind = "vendor"
 member_attribute = "category"
 code = "grain-supplier"
 display_name = "Grain / Malthouse"
+metadata = { behavior_template = { lead_time_days = 3.0, lead_spread_days = 1.5, fulfilment_rate = 0.98, ap_payment_days = 5.0, ap_spread_days = 2.0 } }
 sort_order = 10
 
 [[class]]
@@ -322,6 +332,7 @@ subject_kind = "vendor"
 member_attribute = "category"
 code = "hops-supplier"
 display_name = "Hops Yard / Broker"
+metadata = { behavior_template = { lead_time_days = 1.5, lead_spread_days = 0.5, fulfilment_rate = 0.99, ap_payment_days = 5.0, ap_spread_days = 2.0 } }
 sort_order = 20
 
 [[class]]
@@ -329,6 +340,7 @@ subject_kind = "vendor"
 member_attribute = "category"
 code = "yeast-bank"
 display_name = "Yeast Bank / Cultures"
+metadata = { behavior_template = { lead_time_days = 2.0, lead_spread_days = 1.0, fulfilment_rate = 0.98, ap_payment_days = 5.0, ap_spread_days = 2.0 } }
 sort_order = 30
 
 [[class]]
@@ -336,6 +348,7 @@ subject_kind = "vendor"
 member_attribute = "category"
 code = "specialty-ingredients"
 display_name = "Specialty Ingredients"
+metadata = { behavior_template = { lead_time_days = 4.0, lead_spread_days = 2.0, fulfilment_rate = 0.95, ap_payment_days = 5.0, ap_spread_days = 2.0 } }
 sort_order = 40
 
 [[class]]
@@ -343,6 +356,7 @@ subject_kind = "vendor"
 member_attribute = "category"
 code = "packaging"
 display_name = "Packaging (Kegs / Cans / Labels)"
+metadata = { behavior_template = { lead_time_days = 5.0, lead_spread_days = 2.0, fulfilment_rate = 0.97, ap_payment_days = 5.0, ap_spread_days = 2.0 } }
 sort_order = 50
 
 [[class]]

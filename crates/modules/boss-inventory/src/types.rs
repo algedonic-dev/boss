@@ -65,6 +65,87 @@ pub struct Vendor {
     pub payment_terms: Option<String>,
     #[serde(default)]
     pub category: Option<String>,
+    /// How the system expects this vendor to behave — supply lead time,
+    /// fulfilment, AP-payment timing. Per-actor data the simulator reads to
+    /// drive the vendor's supply chain (replacing a hand-authored
+    /// `[counterparty.*]` spec). Bootstrapped from the vendor's category
+    /// Class template at birth (see [`VendorBehavior::provenance`]); `None`
+    /// until set (an uncategorized vendor has no template to bootstrap from).
+    #[serde(default)]
+    pub behavior: Option<VendorBehavior>,
+}
+
+/// How the system expects a vendor to behave. The simulator reads this and
+/// drives the vendor's procurement → invoice → AP chain from it, within the
+/// stated bounds (anomalies are layered on separately, by the sim/Controls).
+/// Hand-set values are bootstrapped from the vendor's category Class
+/// template; the profile is a candidate to become data-driven from the
+/// vendor's real performance over time (see [`BehaviorProvenance`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VendorBehavior {
+    /// Expected procurement lead time (PO placed → goods/invoice), in days.
+    pub lead_time_days: f64,
+    /// Uniform ± spread around `lead_time_days`.
+    #[serde(default)]
+    pub lead_spread_days: f64,
+    /// Probability a procurement is fulfilled (1 − short-ship/fail rate).
+    pub fulfilment_rate: f64,
+    /// Expected delay from vendor-invoice received → AP payment, in days.
+    pub ap_payment_days: f64,
+    /// Uniform ± spread around `ap_payment_days`.
+    #[serde(default)]
+    pub ap_spread_days: f64,
+    /// Where this profile came from — hand-set (bootstrapped from a class
+    /// template) vs data-derived (learned from real performance). Surfaced
+    /// in the UI so the distinction is visible, never silent.
+    pub provenance: BehaviorProvenance,
+}
+
+/// Provenance of a behavior profile — the honest record of whether a value
+/// is a hand-set template default or learned from the actor's real history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BehaviorProvenance {
+    pub source: BehaviorSource,
+    /// The Class `behavior_template` this was bootstrapped from (the class
+    /// code, e.g. `grain-supplier`). `None` once data-derived.
+    #[serde(default)]
+    pub template: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BehaviorSource {
+    HandSet,
+    DataDerived,
+}
+
+impl VendorBehavior {
+    /// Bootstrap a hand-set profile from a Class's `behavior_template`
+    /// metadata — the per-category default the simulator stamps onto each
+    /// new vendor of that category. `template` is the `behavior_template`
+    /// JSON object on the vendor category Class; `category` is that class
+    /// code, recorded as the provenance template. Returns `None` if the
+    /// template is missing a required field (the vendor then has no profile,
+    /// which is the honest outcome for a non-supplier category).
+    pub fn from_template(template: &serde_json::Value, category: &str) -> Option<Self> {
+        Some(Self {
+            lead_time_days: template.get("lead_time_days")?.as_f64()?,
+            lead_spread_days: template
+                .get("lead_spread_days")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            fulfilment_rate: template.get("fulfilment_rate")?.as_f64()?,
+            ap_payment_days: template.get("ap_payment_days")?.as_f64()?,
+            ap_spread_days: template
+                .get("ap_spread_days")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            provenance: BehaviorProvenance {
+                source: BehaviorSource::HandSet,
+                template: Some(category.to_string()),
+            },
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,6 +364,56 @@ pub struct BillLine {
     pub part_sku: String,
     pub qty: i64,
     pub unit_cost_cents: i64,
+}
+
+#[cfg(test)]
+mod behavior_tests {
+    use super::*;
+
+    #[test]
+    fn from_template_builds_hand_set_profile() {
+        let tmpl = serde_json::json!({
+            "lead_time_days": 3.0,
+            "lead_spread_days": 1.5,
+            "fulfilment_rate": 0.98,
+            "ap_payment_days": 5.0,
+            "ap_spread_days": 2.0,
+        });
+        let b = VendorBehavior::from_template(&tmpl, "grain-supplier").unwrap();
+        assert_eq!(b.lead_time_days, 3.0);
+        assert_eq!(b.lead_spread_days, 1.5);
+        assert_eq!(b.fulfilment_rate, 0.98);
+        assert_eq!(b.ap_payment_days, 5.0);
+        assert_eq!(b.provenance.source, BehaviorSource::HandSet);
+        assert_eq!(b.provenance.template.as_deref(), Some("grain-supplier"));
+    }
+
+    #[test]
+    fn from_template_none_without_required_fields() {
+        // A non-supplier category carries no behavior_template — no profile.
+        assert!(VendorBehavior::from_template(&serde_json::json!({}), "equipment").is_none());
+        // Missing fulfilment_rate is still incomplete.
+        assert!(
+            VendorBehavior::from_template(
+                &serde_json::json!({ "lead_time_days": 3.0, "ap_payment_days": 5.0 }),
+                "grain-supplier"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn behavior_round_trips_through_json() {
+        let tmpl = serde_json::json!({
+            "lead_time_days": 2.0, "fulfilment_rate": 0.97, "ap_payment_days": 5.0,
+        });
+        let b = VendorBehavior::from_template(&tmpl, "yeast-bank").unwrap();
+        // Spreads default to 0 when the template omits them.
+        assert_eq!(b.lead_spread_days, 0.0);
+        let back: VendorBehavior =
+            serde_json::from_value(serde_json::to_value(&b).unwrap()).unwrap();
+        assert_eq!(b, back);
+    }
 }
 
 #[cfg(test)]
