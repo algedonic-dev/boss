@@ -400,6 +400,39 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    #[tokio::test]
+    async fn from_po_no_op_when_invoice_already_exists() {
+        // The guard: once an invoice exists for the PO (e.g. the human
+        // bill-approval landed first and advanced it), a late vendor post
+        // must NOT overwrite/downgrade it — it no-ops with 200.
+        let app = test_app();
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/inventory/vendor-invoices/from-po/PO-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/inventory/vendor-invoices/from-po/PO-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK); // no-op, not CREATED
+    }
+
     // ----- DiscrepancyKind Class-registry gate -----------------------
 
     fn app_with_classes_client(classes: Arc<dyn boss_classes_client::ClassesClient>) -> Router {

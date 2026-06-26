@@ -898,6 +898,23 @@ impl InventoryRepository for PgInventory {
         Ok(rows.into_iter().map(|r| r.into_domain()).collect())
     }
 
+    async fn vendor_invoice_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<VendorInvoice>, InventoryError> {
+        let row: Option<VendorInvoiceRow> = sqlx::query_as(
+            "SELECT id, po_id, vendor, vendor_invoice_no, amount_cents, currency, received_on,
+                matched_on, approved_on, paid_on, status,
+                discrepancy_cents, discrepancy_kind
+             FROM vendor_invoices WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| InventoryError::Storage(e.to_string()))?;
+        Ok(row.map(|r| r.into_domain()))
+    }
+
     async fn ap_aging(&self, today: chrono::NaiveDate) -> Result<ApAging, InventoryError> {
         // Unpaid vendor invoices bucketed by days since `received_on`.
         // MVP-simple: no vendor join for due-date computation, so "1-30"

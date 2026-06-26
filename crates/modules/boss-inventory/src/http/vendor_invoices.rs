@@ -187,6 +187,24 @@ pub(super) async fn create_vendor_invoice_from_po<R: InventoryRepository + 'stat
     axum::extract::Path(po_id): axum::extract::Path<String>,
     Json(req): Json<FromPoRequest>,
 ) -> Response {
+    let id = format!("vi-{po_id}");
+    // Guard: the vendor's post must never DOWNGRADE an invoice the human
+    // bill-approval step already advanced (to approved/paid). If a row for
+    // this PO already exists it's authoritative — no-op. (The human flow is
+    // often faster than the vendor's lead time, so bill-approval can land
+    // first; without this a late vendor post would strand the invoice back
+    // at `received`, where batch-pay never settles it.)
+    match state.inventory.vendor_invoice_by_id(&id).await {
+        Ok(Some(_)) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "id": id, "existing": true })),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
     let po = match state.inventory.purchase_order_by_id(&po_id).await {
         Ok(Some(po)) => po,
         Ok(None) => {
@@ -220,7 +238,7 @@ pub(super) async fn create_vendor_invoice_from_po<R: InventoryRepository + 'stat
     let now = boss_clock_client::now_from(&state.clock).await;
     let received_on = req.received_on.unwrap_or_else(|| now.date_naive());
     let invoice = VendorInvoice {
-        id: format!("vi-{po_id}"),
+        id,
         po_id: po_id.clone(),
         vendor,
         vendor_invoice_no: req
