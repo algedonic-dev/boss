@@ -812,6 +812,11 @@ html, body {
 .chip-tier-gold { background: #fef3c7; color: #92400e; border-color: #fde68a; }
 .chip-tier-silver { background: #f5f5f4; color: #57534e; border-color: #e7e5e4; }
 
+/* Provenance chips — visible origin of a derived value */
+.chip-provenance { font-weight: 500; }
+.chip-provenance-hand-set { background: #fff7e0; color: #92400e; border-color: #fde68a; }
+.chip-provenance-data-derived { background: #dbeafe; color: #1e40af; border-color: #bfdbfe; }
+
 /* Kanban summary for refurbishment board */
 .kanban {
   display: grid;

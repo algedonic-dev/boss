@@ -72,6 +72,14 @@ CREATE TABLE IF NOT EXISTS vendors (
     -- general. Class registry validates per-tenant. Nullable: an
     -- un-categorized vendor isn't an auto-restock target yet.
     category          TEXT,
+    -- How the system expects this vendor to behave (supply lead time,
+    -- fulfilment, AP timing) — per-actor data the simulator reads to drive
+    -- the vendor's supply chain. Bootstrapped from the category Class's
+    -- `behavior_template` (classes.metadata) at birth, marked hand-set;
+    -- becomes data-derived from real performance over time. NULL until set
+    -- (an uncategorized vendor has no template). Shape: see
+    -- boss_inventory::types::VendorBehavior.
+    behavior          JSONB,
     active            BOOLEAN NOT NULL DEFAULT true,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

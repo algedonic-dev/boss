@@ -20,9 +20,11 @@
 //! it with every service routed through the gateway
 //! ([`SeedBases::all`]).
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use boss_inventory::types::VendorBehavior;
 use reqwest::blocking::Client;
 use serde_json::json;
 use tracing::{info, warn};
@@ -346,8 +348,13 @@ pub fn seed_tenant_data(
         ensure_prospect_account(&client, &bases.accounts, &headers, &id, i)?;
     }
 
+    // Per-category vendor behavior templates (hand-set defaults the
+    // simulator stamps onto each vendor and then drives its supply chain
+    // from). Sourced from the brewery class seed (`classes.json`) — the same
+    // file seed_classes posts to /api/classes.
+    let vendor_templates = load_vendor_behavior_templates(seeds_dir);
     for i in 0..VENDOR_COUNT {
-        ensure_vendor(&client, &bases.inventory, &headers, i)?;
+        ensure_vendor(&client, &bases.inventory, &headers, i, &vendor_templates)?;
     }
     ensure_messages(&client, &bases.messages, &headers)?;
 
@@ -735,6 +742,7 @@ fn ensure_vendor(
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
     i: u32,
+    templates: &HashMap<String, serde_json::Value>,
 ) -> Result<()> {
     let id = format!("vnd-bigseed-{i:03}");
     let url_one = format!("{api_base}/api/inventory/vendors/{id}");
@@ -755,17 +763,32 @@ fn ensure_vendor(
     let terms = &vendors.payment_terms[i as usize % vendors.payment_terms.len()];
     let contact = &accounts.directors[(i as usize + 7) % accounts.directors.len()];
 
-    let payload = json!({
+    // Bootstrap this vendor's hand-set behavior from its category template
+    // (a supplier category). When present, the supply lead time also drives
+    // the canonical `lead_time_days` field so reorder timing and the
+    // behavior profile agree; non-supplier vendors keep the spread default.
+    let behavior = templates
+        .get(category.as_str())
+        .and_then(|t| VendorBehavior::from_template(t, category));
+    let lead_time_days = match &behavior {
+        Some(b) => b.lead_time_days.round().max(1.0) as u32,
+        None => 7 + (i % 14),
+    };
+
+    let mut payload = json!({
         "id": id,
         "name": name,
         "contact_name": contact,
         "contact_email": format!("contact@{}.example", id),
         "city": city,
         "state": state,
-        "lead_time_days": 7 + (i % 14),
+        "lead_time_days": lead_time_days,
         "payment_terms": terms,
         "category": category,
     });
+    if let Some(b) = &behavior {
+        payload["behavior"] = serde_json::to_value(b).unwrap_or_default();
+    }
 
     let url = format!("{api_base}/api/inventory/vendors");
     let resp = client
@@ -785,6 +808,36 @@ fn ensure_vendor(
         warn!(vendor_id = %id, status = %status, body = %body, "vendor create failed");
         Ok(())
     }
+}
+
+/// Read the per-category vendor behavior templates from the brewery class
+/// seed (`classes.json`) — `category → behavior_template` (the raw JSON
+/// object). Only supplier categories carry one. Empty on a missing or
+/// unparseable seed (vendors then seed without a behavior profile, the same
+/// as before this feature).
+fn load_vendor_behavior_templates(seeds_dir: &Path) -> HashMap<String, serde_json::Value> {
+    let mut out = HashMap::new();
+    let path = seeds_dir.join("classes.json");
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return out;
+    };
+    let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(&body) else {
+        warn!(path = %path.display(), "classes.json unparseable; vendors seed without behavior");
+        return out;
+    };
+    for row in rows {
+        let is_vendor_category = row.get("subject_kind").and_then(|v| v.as_str()) == Some("vendor")
+            && row.get("member_attribute").and_then(|v| v.as_str()) == Some("category");
+        if !is_vendor_category {
+            continue;
+        }
+        if let Some(code) = row.get("code").and_then(|v| v.as_str())
+            && let Some(tmpl) = row.get("metadata").and_then(|m| m.get("behavior_template"))
+        {
+            out.insert(code.to_string(), tmpl.clone());
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

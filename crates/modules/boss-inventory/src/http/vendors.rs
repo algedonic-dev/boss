@@ -12,7 +12,7 @@ use boss_policy_client::CurrentUser;
 
 use super::InventoryApiState;
 use crate::port::{InventoryError, InventoryRepository};
-use crate::types::Vendor;
+use crate::types::{Vendor, VendorBehavior};
 
 pub(super) async fn list_vendors<R: InventoryRepository + 'static>(
     State(state): State<Arc<InventoryApiState<R>>>,
@@ -45,6 +45,11 @@ pub(super) struct CreateVendorRequest {
     payment_terms: Option<String>,
     #[serde(default)]
     category: Option<String>,
+    /// How the system expects this vendor to behave (supply lead time,
+    /// fulfilment, AP timing) — the simulator stamps this from the
+    /// category Class template at birth.
+    #[serde(default)]
+    behavior: Option<VendorBehavior>,
 }
 
 fn default_vendor_lead_time_days() -> u16 {
@@ -73,6 +78,7 @@ pub(super) async fn create_vendor<R: InventoryRepository + 'static>(
         lead_time_days: body.lead_time_days,
         payment_terms: body.payment_terms,
         category: body.category,
+        behavior: body.behavior,
     };
 
     let now = boss_clock_client::now_from(&state.clock).await;
@@ -118,6 +124,7 @@ pub(super) async fn update_vendor<R: InventoryRepository + 'static>(
         lead_time_days: body.lead_time_days,
         payment_terms: body.payment_terms,
         category: body.category,
+        behavior: body.behavior,
     };
 
     match state.inventory.update_vendor(&id, &vendor).await {

@@ -383,5 +383,45 @@
     "display_name": "Executive Sponsor",
     "member_attribute": "account_team_role",
     "sort_order": 304
+  },
+  {
+    "subject_kind": "vendor",
+    "code": "grain-supplier",
+    "display_name": "Grain / Malthouse",
+    "member_attribute": "category",
+    "metadata": { "behavior_template": { "lead_time_days": 3.0, "lead_spread_days": 1.5, "fulfilment_rate": 0.98, "ap_payment_days": 5.0, "ap_spread_days": 2.0 } },
+    "sort_order": 10
+  },
+  {
+    "subject_kind": "vendor",
+    "code": "hops-supplier",
+    "display_name": "Hops Yard / Broker",
+    "member_attribute": "category",
+    "metadata": { "behavior_template": { "lead_time_days": 1.5, "lead_spread_days": 0.5, "fulfilment_rate": 0.99, "ap_payment_days": 5.0, "ap_spread_days": 2.0 } },
+    "sort_order": 20
+  },
+  {
+    "subject_kind": "vendor",
+    "code": "yeast-bank",
+    "display_name": "Yeast Bank / Cultures",
+    "member_attribute": "category",
+    "metadata": { "behavior_template": { "lead_time_days": 2.0, "lead_spread_days": 1.0, "fulfilment_rate": 0.98, "ap_payment_days": 5.0, "ap_spread_days": 2.0 } },
+    "sort_order": 30
+  },
+  {
+    "subject_kind": "vendor",
+    "code": "specialty-ingredients",
+    "display_name": "Specialty Ingredients",
+    "member_attribute": "category",
+    "metadata": { "behavior_template": { "lead_time_days": 4.0, "lead_spread_days": 2.0, "fulfilment_rate": 0.95, "ap_payment_days": 5.0, "ap_spread_days": 2.0 } },
+    "sort_order": 40
+  },
+  {
+    "subject_kind": "vendor",
+    "code": "packaging",
+    "display_name": "Packaging (Kegs / Cans / Labels)",
+    "member_attribute": "category",
+    "metadata": { "behavior_template": { "lead_time_days": 5.0, "lead_spread_days": 2.0, "fulfilment_rate": 0.97, "ap_payment_days": 5.0, "ap_spread_days": 2.0 } },
+    "sort_order": 50
   }
 ]

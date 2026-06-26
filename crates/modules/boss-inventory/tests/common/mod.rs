@@ -113,6 +113,7 @@ pub fn vendor_fixture(id: &str) -> Vendor {
         lead_time_days: 14,
         payment_terms: Some("Net 30".to_string()),
         category: Some("parts".to_string()),
+        behavior: None,
     }
 }
 

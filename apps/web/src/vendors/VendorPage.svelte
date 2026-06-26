@@ -12,6 +12,7 @@
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import Link from '@boss/web-kit/ui/Link.svelte';
   import Meta from '@boss/web-kit/ui/Meta.svelte';
+  import ProvenanceBadge from '@boss/web-kit/ui/ProvenanceBadge.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import {
     loadVendorAccountTeam,
@@ -244,6 +245,30 @@
             <dt>Lead time</dt><dd>{vendor.lead_time_days} days</dd>
             <dt>Location</dt><dd>{vendor.city}, {vendor.state}</dd>
           </dl>
+      </Section>
+
+      <Section title="Behavior profile">
+          {#if vendor.behavior}
+            {@const b = vendor.behavior}
+            <dl class="kv">
+              <dt>Lead time</dt>
+              <dd>
+                {b.lead_time_days} ± {b.lead_spread_days} days
+                <span style="margin-left:8px">
+                  <ProvenanceBadge source={b.provenance.source} />
+                </span>
+              </dd>
+              <dt>Fulfilment</dt><dd>{(b.fulfilment_rate * 100).toFixed(0)}%</dd>
+              <dt>AP payment</dt><dd>{b.ap_payment_days} ± {b.ap_spread_days} days</dd>
+            </dl>
+            {#if b.provenance.template}
+              <p class="empty" style="margin-top:8px">
+                Bootstrapped from <strong>{b.provenance.template}</strong> template.
+              </p>
+            {/if}
+          {:else}
+            <p class="empty">No behavior profile (uncategorized vendor).</p>
+          {/if}
       </Section>
 
       <Section title={`Account team (${team.length})`}>
