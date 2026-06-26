@@ -19,6 +19,7 @@
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import FileAttachments from '../../content/FileAttachments.svelte';
+  import { appNow, appToday } from '@boss/web-kit/sim-clock';
 
   type AuditEntry = {
     event_id: string;
@@ -47,16 +48,27 @@
   let expanded = $state<string | null>(null);
   let lastFetched = $state<Date | null>(null);
 
-  // Download-on-demand state. Defaults the from-date to 7 days
-  // back, to to now. Operator can override either before downloading.
-  // The export inherits the page's source + kind filters; the
-  // browser handles the file save via Content-Disposition.
+  // Download-on-demand state. The audit_log is SIM-dated, so the default
+  // window comes from sim time (appNow/appToday), NOT wallclock — a
+  // wallclock default lands after every event and exports an empty file.
+  // Populated when the panel opens (the sim clock is loaded by then); the
+  // operator can override either date. The export inherits the page's
+  // source + kind filters; the browser saves via Content-Disposition.
   function isoDate(d: Date): string {
     return d.toISOString().slice(0, 10);
   }
   let downloadOpen = $state(false);
-  let downloadFrom = $state<string>(isoDate(new Date(Date.now() - 7 * 86400_000)));
-  let downloadTo = $state<string>(isoDate(new Date()));
+  let downloadFrom = $state<string>('');
+  let downloadTo = $state<string>('');
+
+  function toggleDownload(): void {
+    if (!downloadOpen) {
+      // Default window: 7 sim-days back to the sim's "today".
+      downloadFrom = isoDate(new Date(appNow().getTime() - 7 * 86400_000));
+      downloadTo = appToday();
+    }
+    downloadOpen = !downloadOpen;
+  }
 
   function startDownload(): void {
     const params = new URLSearchParams();
@@ -260,7 +272,7 @@
         <button
           type="button"
           class="events-download-btn"
-          onclick={() => (downloadOpen = !downloadOpen)}
+          onclick={toggleDownload}
           title="Export matching events as a JSON Lines file"
         >
           Download ⤓
