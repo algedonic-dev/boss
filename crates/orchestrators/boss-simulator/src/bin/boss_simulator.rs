@@ -37,6 +37,10 @@ struct AppState {
     http: Client,
     jobs_url: String,
     clock_url: String,
+    /// The brewery-sim DAEMON's localhost control+telemetry server
+    /// (boss-ports `sim-control`). Read endpoints (telemetry, config GET)
+    /// are open; config writes are operator-gated + forwarded here.
+    sim_control_url: String,
 }
 
 const STUB_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\">\
@@ -96,6 +100,63 @@ async fn forward_post(
         }
         Err(e) => (StatusCode::BAD_GATEWAY, format!("upstream error: {e}")).into_response(),
     }
+}
+
+/// Forward a plain GET to the daemon's localhost control server and relay
+/// the JSON. Read-only (telemetry / config read) — no operator gate and no
+/// actor header needed; the daemon control server is localhost-only.
+async fn forward_get(state: &AppState, url: String) -> Response {
+    match state.http.get(&url).send().await {
+        Ok(resp) => {
+            let status =
+                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let bytes = resp.bytes().await.unwrap_or_default();
+            (
+                status,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("sim daemon unreachable: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /simulator/api/telemetry — how the daemon is engaging the public
+/// API right now (Cockpit). Open read; proxies the daemon's /telemetry.
+async fn get_telemetry(State(s): State<Arc<AppState>>) -> Response {
+    forward_get(&s, format!("{}/telemetry", s.sim_control_url)).await
+}
+
+/// GET /simulator/api/config — the daemon's effective behavior config
+/// (the Controls editor loads this). Open read.
+async fn get_config(State(s): State<Arc<AppState>>) -> Response {
+    forward_get(&s, format!("{}/config", s.sim_control_url)).await
+}
+
+/// POST /simulator/api/config — operator-gated. Persists an operator-
+/// edited behavior config to the daemon, which validates it, writes the
+/// override, and restarts to apply it (the "edit + restart" model).
+async fn post_config(
+    State(s): State<Arc<AppState>>,
+    user: CurrentUser,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(r) = operator_guard(&user) {
+        return r;
+    }
+    forward_post(
+        &s,
+        format!("{}/config", s.sim_control_url),
+        &headers,
+        Some(body),
+    )
+    .await
 }
 
 async fn control_pause(
@@ -195,6 +256,8 @@ async fn main() -> Result<()> {
         http: Client::new(),
         jobs_url: std::env::var("BOSS_JOBS_URL").unwrap_or_else(|_| boss_ports::url("jobs")),
         clock_url: std::env::var("BOSS_CLOCK_URL").unwrap_or_else(|_| boss_ports::url("clock")),
+        sim_control_url: std::env::var("BOSS_SIM_CONTROL_URL")
+            .unwrap_or_else(|_| boss_ports::url("sim-control")),
     });
 
     // The /simulator sub-app: control API routes + the SPA (or a stub
@@ -202,6 +265,8 @@ async fn main() -> Result<()> {
     // gateway forwards that prefix unchanged.
     let api = Router::new()
         .route("/api/health", get(health))
+        .route("/api/telemetry", get(get_telemetry))
+        .route("/api/config", get(get_config).post(post_config))
         .route("/api/control/pause", post(control_pause))
         .route("/api/control/resume", post(control_resume))
         .route("/api/control/restart-epoch", post(control_restart_epoch))

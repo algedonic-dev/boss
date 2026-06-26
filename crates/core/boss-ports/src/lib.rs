@@ -102,6 +102,15 @@ pub const SOLO: &[PortSpec] = &[
         prod: 7010,
         scratch: None,
     },
+    // `sim-control` is the brewery-sim DAEMON's localhost-only control +
+    // telemetry server (NOT gateway-proxied). boss-simulator (7010)
+    // proxies to it for the Cockpit telemetry + behavior-config get/set.
+    // Inert unless the daemon is running (demo mode).
+    PortSpec {
+        name: "sim-control",
+        prod: 7011,
+        scratch: None,
+    },
     // `clock` runs on port 7060. The Clock service is the single
     // authority for "what time is it" — services hold a `ClockClient`
     // and call `clock.now()` instead of `Utc::now()`. Production runs

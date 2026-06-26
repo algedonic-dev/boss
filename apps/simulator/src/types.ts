@@ -37,3 +37,109 @@ export type AuditEntry = Readonly<{
   kind: string;
   payload: unknown;
 }>;
+
+// --- Simulator telemetry (GET /simulator/api/telemetry): how the daemon
+// is engaging the public API. Mirrors boss-brewery-engine's
+// sim_control::SimTelemetry (served by the daemon, proxied by
+// boss-simulator). ---
+
+export type SimCadence = Readonly<{
+  sim_date: string | null;
+  paused: boolean;
+  epoch_start: string | null;
+  epoch_end: string | null;
+  warp_factor: number | null;
+  days_per_tick: number | null;
+  tick_interval_seconds: number | null;
+}>;
+
+// Workforce step transitions — the PUT /api/jobs/{}/steps engagement.
+export type WorkforceStats = Readonly<{
+  checkins: number;
+  claimed: number;
+  completed: number;
+  deferred: number;
+  in_progress: number;
+  errors: number;
+}>;
+
+// Per-domain API writes — the step.done side-effect POSTs to the services.
+export type ApiWrites = Readonly<{
+  asset_events: number;
+  invoices_created: number;
+  invoices_updated: number;
+  shipments: number;
+  agreements: number;
+  jobs: number;
+  purchase_orders: number;
+  messages: number;
+  account_notes: number;
+  tax_filings: number;
+  bank_settlements: number;
+  scheduled_assignments: number;
+  revenue_schedules: number;
+  days_flushed: number;
+  errors: number;
+}>;
+
+// One tick's worth of engagement (the recent-activity ring buffer).
+export type TickActivity = Readonly<{
+  tick: number;
+  sim_date: string | null;
+  claimed: number;
+  completed: number;
+  deferred: number;
+  errors: number;
+}>;
+
+export type SimTelemetry = Readonly<{
+  actor: string;
+  role: string;
+  api_base: string;
+  started_unix: number;
+  cadence: SimCadence;
+  tick_count: number;
+  last_tick_unix: number | null;
+  workforce: WorkforceStats;
+  api_writes: ApiWrites;
+  recent: ReadonlyArray<TickActivity>;
+}>;
+
+// --- Simulator behavior config (GET/POST /simulator/api/config). The
+// editable subset of the daemon's effective config; every other field
+// is preserved verbatim through the round-trip via the `[k: string]:
+// unknown` passthrough on each level. The POST body must be a
+// structurally-complete config (all fields from the GET, with edits
+// applied) so the daemon's validation passes. NOT Readonly — the
+// Controls editor binds inputs directly to the nested objects. ---
+
+export type SimBehaviorConfig = {
+  meta: { step_speed_multiplier?: number | null; [k: string]: unknown };
+  job_rates: Record<
+    string,
+    {
+      rate: number;
+      weekday_multiplier?: number | null;
+      weekend_multiplier?: number | null;
+      [k: string]: unknown;
+    }
+  >;
+  subject_rates: Record<string, { rate: number; [k: string]: unknown }>;
+  counterparty: Record<
+    string,
+    {
+      emit_probability: number;
+      delay: { mean_days: number; spread_days?: number; [k: string]: unknown };
+      [k: string]: unknown;
+    }
+  >;
+  // AnomalyRates is #[serde(transparent)] on the daemon — each entry is
+  // the flat prob-name → probability map directly (NOT wrapped in
+  // `probs`). Round-trips transparently.
+  anomalies: Record<string, Record<string, number>>;
+  periodic: Record<
+    string,
+    { cadence: string; anchor_date: string; [k: string]: unknown }
+  >;
+  [k: string]: unknown;
+};

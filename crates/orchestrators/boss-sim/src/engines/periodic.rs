@@ -6,7 +6,7 @@
 //! "open a Job of kind X" or "emit a raw event onto the bus".
 
 use chrono::{Datelike, Days, NaiveDate};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::calendar::{BusinessCalendar, CalendarRegistry};
@@ -27,7 +27,7 @@ use crate::engines::{DayContext, SimEngine};
 /// period; at day-tick (`tick_duration = "1d"`) they degenerate
 /// to one fire per sim-day (the day-tick covers `[0, 24)` which
 /// includes the anchor). See [`Cadence::fires_on_tick`].
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Cadence {
     Daily,

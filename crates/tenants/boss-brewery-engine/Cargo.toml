@@ -11,15 +11,9 @@ path = "src/bin/boss_brewery_data_seed.rs"
 [[bin]]
 name = "boss-brewery-sim"
 path = "src/bin/boss_brewery_sim.rs"
-required-features = ["sim-daemon"]
 
 [features]
 default = []
-# Pulls in sqlx for the postgres-bound live-tick daemon. tokio is
-# now a hard dep (was here behind this flag pre-v1.0.6) because
-# the scheduler-shaped engine (#72) needs `tokio::time::sleep`
-# in the dispatch loop for sub-day timestamp distribution.
-sim-daemon = ["dep:sqlx"]
 
 [dependencies]
 boss-ports = { path = "../../core/boss-ports" }
@@ -33,6 +27,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# Control + telemetry HTTP server for the live daemon (GET /telemetry,
+# GET/POST /config) — boss-simulator proxies to it on localhost.
+axum = { workspace = true }
 
 boss-accounts = { path = "../../modules/boss-accounts" }
 boss-inventory = { path = "../../modules/boss-inventory" }
@@ -49,8 +46,11 @@ boss-core = { path = "../../core/boss-core" }
 # boss-calendar (one source of truth) instead of hardcoding holidays.
 boss-calendar-client = { path = "../../core/boss-calendar-client" }
 
-# Optional — only the sim-daemon binary needs sqlx.
-sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio-rustls", "postgres", "chrono", "uuid"], optional = true }
+# NOTE: this crate (incl. the boss-brewery-sim daemon) is deliberately a
+# pure public-API client — it has NO database or message-bus dependency
+# (no sqlx, no boss-nats, no `postgres` adapter feature on its boss-*
+# deps). The simulator only ever touches the system through the public
+# HTTP API. infra/lint/sim-boundary-audit.sh enforces this.
 
 [dev-dependencies]
 

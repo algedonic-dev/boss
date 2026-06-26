@@ -115,12 +115,11 @@ done < "$TMP/crates.tsv" > "$TMP/bins.tsv"
 # when a [[bin]] is genuinely opt-in (developer convenience binary,
 # not a service deployed in production).
 ALLOWLIST=(
-    # boss-brewery-sim is the per-VM live daemon (+ the `prepare` and
-    # `run` subcommands) — deployed only when an operator explicitly
-    # runs `cargo build -p boss-brewery-engine --features sim-daemon`.
-    # The other two boss-brewery-* binaries (data-seed/bootstrap) ship
-    # in default workspace builds.
-    "boss-brewery-engine::boss-brewery-sim::sim-daemon"
+    # (empty) — every [[bin]] is built by the default workspace build.
+    # boss-brewery-sim was previously gated behind the sim-daemon feature
+    # (sqlx); that feature was removed when the daemon became a pure
+    # public-API client, so it now ships in the default workspace build
+    # like the other boss-brewery-* binaries.
 )
 
 # Pass 4: for each bin, check feature satisfaction.

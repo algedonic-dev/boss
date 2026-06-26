@@ -11,7 +11,6 @@ edition.workspace = true
 [features]
 default = ["http"]
 http = ["dep:reqwest"]
-nats = ["dep:boss-nats"]
 
 [dependencies]
 boss-ports = { path = "../../core/boss-ports" }
@@ -23,7 +22,6 @@ boss-jobs = { path = "../../core/boss-jobs" }
 # boss-core is now a required dep: ActorId flows through every
 # generator (invariant I-2 — every transition has a named CPU).
 boss-core = { path = "../../core/boss-core" }
-boss-nats = { path = "../../core/boss-nats", optional = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

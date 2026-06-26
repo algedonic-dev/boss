@@ -747,6 +747,7 @@ pub mod live {
     }
 
     /// Per-run write counters, logged at flush.
+    #[derive(Debug, Default, Clone, serde::Serialize)]
     pub struct LiveApiStats {
         pub asset_events: u64,
         pub invoices_created: u64,
@@ -2468,104 +2469,6 @@ pub mod live {
                 path_key("/api/people/employees/emp-032/calendar-token"),
                 "/api/people/employees/emp-032/calendar-token"
             );
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// NATS output — publish events directly to the event bus
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "nats")]
-pub mod nats {
-    use super::*;
-    use tracing::{debug, warn};
-
-    /// Publishes system events to NATS using the assets bridge conventions.
-    pub struct NatsOutput {
-        rt: tokio::runtime::Handle,
-        bus: std::sync::Arc<boss_nats::NatsEventBus>,
-        events_published: u32,
-    }
-
-    impl NatsOutput {
-        /// Connect to NATS and return an output adapter. Must be called from
-        /// within a tokio runtime.
-        pub async fn connect(nats_url: &str) -> anyhow::Result<Self> {
-            let bus = boss_nats::NatsEventBus::connect(nats_url).await?;
-            Ok(Self {
-                rt: tokio::runtime::Handle::current(),
-                bus: std::sync::Arc::new(bus),
-                events_published: 0,
-            })
-        }
-
-        pub fn events_published(&self) -> u32 {
-            self.events_published
-        }
-    }
-
-    impl SimOutput for NatsOutput {
-        fn emit_shipment(&mut self, _shipment: &Shipment) -> anyhow::Result<()> {
-            // No NATS subject for shipments yet.
-            Ok(())
-        }
-
-        fn emit_agreement(&mut self, _agreement: &ActiveAgreement) -> anyhow::Result<()> {
-            // No NATS subject for agreements yet.
-            Ok(())
-        }
-
-        fn emit_purchase_order(&mut self, _po: &PurchaseOrderSnapshot) -> anyhow::Result<()> {
-            // No NATS subject for purchase orders yet.
-            Ok(())
-        }
-
-        fn emit_message(&mut self, _msg: &MessageSnapshot) -> anyhow::Result<()> {
-            // No NATS subject for messages yet.
-            Ok(())
-        }
-
-        fn emit_account_note(&mut self, _note: &AccountNoteSnapshot) -> anyhow::Result<()> {
-            // No NATS subject for account notes yet.
-            Ok(())
-        }
-
-        fn emit_system_event(&mut self, event: &AssetEvent) -> anyhow::Result<()> {
-            // Direct-NATS path (not the regen, which uses LiveApiOutput →
-            // the clock-stamped HTTP handler). This is the sim itself —
-            // the system in sim mode, not an external client — so the
-            // recording time is the engine's sim-day (`event.ts`), which
-            // is legitimate system time. External API clients can't reach
-            // this path.
-            let event_time = event.ts.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc();
-            let core_event = boss_assets::bridge::asset_event_to_core(event, event_time);
-            let bus = self.bus.clone();
-            let result = self.rt.block_on(async {
-                use boss_core::port::EventBus;
-                bus.publish(core_event).await
-            });
-            match result {
-                Ok(()) => {
-                    self.events_published += 1;
-                    debug!(id = %event.id.0, "published to NATS");
-                }
-                Err(e) => {
-                    warn!(id = %event.id.0, error = %e, "NATS publish failed");
-                }
-            }
-            Ok(())
-        }
-
-        fn emit_invoice(&mut self, _invoice: &Invoice) -> anyhow::Result<()> {
-            // No NATS subject for invoices yet.
-            Ok(())
-        }
-
-        fn flush(&mut self) -> anyhow::Result<()> {
-            let bus = self.bus.clone();
-            self.rt.block_on(async { bus.flush().await })?;
-            Ok(())
         }
     }
 }

@@ -34,7 +34,6 @@
 //!
 //! Env vars (all optional — sim_clock row defaults win once
 //! initialized):
-//!   BOSS_POSTGRES_URL    default postgres://boss:boss@127.0.0.1/boss
 //!   BOSS_SIM_API_BASE    default direct://127.0.0.1
 //!   BOSS_SIM_SEEDS_DIR   default /opt/boss/examples/brewery/seeds
 //!   BOSS_SIM_INITIAL_DATE  YYYY-MM-DD — only consulted on first
@@ -52,6 +51,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use boss_brewery_engine::sim_control;
 use boss_brewery_engine::{
     BreweryEngineState, brewery_end_of_day, build_workforce, run_brewery_live,
     run_brewery_one_tick, start_callback_receiver,
@@ -336,10 +336,10 @@ async fn main() -> Result<()> {
         "boss-brewery-sim starting"
     );
 
-    // brewery-sim is a pure consumer of /api/clock/now and other
-    // public HTTP APIs; it never touches the DB directly. The
-    // DATABASE_URL env var (BOSS_POSTGRES_URL) is read by the
-    // boss-brewery-engine subprocess for its own purposes.
+    // brewery-sim is a pure public-API client — it only ever touches
+    // the system through the public HTTP API (/api/clock/now, /api/jobs,
+    // the domain services). It has no database or message-bus access by
+    // construction (see this crate's Cargo.toml + infra/lint/sim-boundary-audit.sh).
 
     // Business calendars as DATA — fetched from boss-calendar so the
     // sim shares ONE source of truth with the dispatcher + service
@@ -381,7 +381,14 @@ async fn main() -> Result<()> {
     let engine = Arc::new(Mutex::new(
         tokio::task::spawn_blocking({
             let seeds = seeds_path.clone();
-            move || BreweryEngineState::load(&seeds, calendars)
+            // Boot from the control-plane config override if an operator
+            // has set one (else the seed tenant.toml) — the "edit +
+            // restart" config model — feeding in the calendars fetched
+            // above so every engine shares one source of truth.
+            move || -> anyhow::Result<BreweryEngineState> {
+                let tenant = sim_control::effective_tenant(&seeds)?;
+                BreweryEngineState::load_with_tenant(&seeds, tenant, calendars)
+            }
         })
         .await
         .context("spawn_blocking engine load")??,
@@ -481,6 +488,27 @@ async fn main() -> Result<()> {
     };
     info!("workforce executor constructed; driving assigned steps each tick");
 
+    // Control + telemetry server: exposes how the daemon is engaging the
+    // public API (the Cockpit reads this) over a localhost-only port.
+    // boss-simulator proxies to it. Background task on this runtime,
+    // sharing the telemetry the tick loop refreshes each tick.
+    let telemetry = Arc::new(Mutex::new(sim_control::SimTelemetry::new(
+        "automation:sim".to_string(),
+        "system-sim".to_string(),
+        api_base.clone(),
+    )));
+    {
+        let control_bind =
+            std::env::var("BOSS_SIM_CONTROL_BIND").unwrap_or_else(|_| "127.0.0.1:7011".to_string());
+        let telemetry = telemetry.clone();
+        let seeds = seeds_path.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sim_control::serve(control_bind, telemetry, seeds).await {
+                warn!(error = %e, "sim control + telemetry server exited");
+            }
+        });
+    }
+
     // ---- pre-Go readiness gate ------------------------------------------------
     // Before the tick loop opens its first Job, verify the stack can actually
     // CARRY a Job to a terminal state — not merely answer /health 200. The
@@ -514,6 +542,7 @@ async fn main() -> Result<()> {
     // hiccups, NATS blips) log + retry on the next tick. The
     // engine is mutex-guarded so two ticks can't race; with
     // tick_interval_seconds ≥ 1 they realistically don't.
+    let mut global_tick: u64 = 0;
     loop {
         let clock = read_clock().await?;
         if clock.paused {
@@ -522,6 +551,9 @@ async fn main() -> Result<()> {
                 "sim_clock paused; sleeping {}s",
                 clock.tick_interval_seconds
             );
+            if let Ok(mut t) = telemetry.lock() {
+                t.note_cadence(cadence_of(&clock, None));
+            }
             tokio::time::sleep(Duration::from_secs(clock.tick_interval_seconds as u64)).await;
             continue;
         }
@@ -650,6 +682,20 @@ async fn main() -> Result<()> {
             if let Err(e) = run_workforce_pass(workforce.clone()).await {
                 warn!(error = %e, day = %day, tick_idx, "workforce pass failed; continuing");
             }
+            // Refresh the telemetry the control server serves: this tick's
+            // public-API engagement (workforce step transitions + per-domain
+            // writes) + cadence. Cheap post-tick snapshot copy.
+            global_tick += 1;
+            {
+                let wf = workforce
+                    .lock()
+                    .map(|w| w.stats.clone())
+                    .unwrap_or_default();
+                let api = output.lock().map(|o| o.stats.clone()).unwrap_or_default();
+                if let Ok(mut t) = telemetry.lock() {
+                    t.record_tick(global_tick, cadence_of(&clock, Some(day)), &wf, &api);
+                }
+            }
             // Sleep between sim-ticks so events spread across the
             // wall-clock window. Skip the sleep on the very last
             // tick of the loop; the outer loop's sleep at the
@@ -697,7 +743,9 @@ struct Clock {
     /// have passed, and emits events for them.
     tick_interval_seconds: i32,
     paused: bool,
+    epoch_start_date: Option<NaiveDate>,
     epoch_end_date: Option<NaiveDate>,
+    warp_factor: Option<f64>,
     restart_in_progress: bool,
 }
 
@@ -743,14 +791,42 @@ async fn read_clock() -> Result<Clock> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
+    let epoch_start_date = body
+        .get("epoch_start")
+        .and_then(|v| v.as_str())
+        .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+    let warp_factor = body.get("warp_factor").and_then(|v| v.as_f64());
     Ok(Clock {
         current_sim_date: now.date_naive(),
         days_per_tick,
         tick_interval_seconds,
         paused,
+        epoch_start_date,
         epoch_end_date,
+        warp_factor,
         restart_in_progress,
     })
+}
+
+/// Build a telemetry [`sim_control::Cadence`] snapshot from the current
+/// clock state. `day` overrides the sim-date for a specific tick (the
+/// loop reports each tick's own day); `None` falls back to the clock's
+/// current_sim_date (idle / paused branches).
+fn cadence_of(clock: &Clock, day: Option<NaiveDate>) -> sim_control::Cadence {
+    let d = day.unwrap_or(clock.current_sim_date);
+    sim_control::Cadence {
+        sim_date: Some(d.format("%Y-%m-%d").to_string()),
+        paused: clock.paused,
+        epoch_start: clock
+            .epoch_start_date
+            .map(|x| x.format("%Y-%m-%d").to_string()),
+        epoch_end: clock
+            .epoch_end_date
+            .map(|x| x.format("%Y-%m-%d").to_string()),
+        warp_factor: clock.warp_factor,
+        days_per_tick: Some(clock.days_per_tick),
+        tick_interval_seconds: Some(clock.tick_interval_seconds),
+    }
 }
 
 /// POST /api/jobs/sim-clock/restart-epoch — same endpoint the

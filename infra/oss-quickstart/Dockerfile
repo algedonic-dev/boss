@@ -44,16 +44,15 @@ COPY infra/postgres ./infra/postgres
 RUN --mount=type=cache,target=/build/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
     set -eu && \
-    # Single cargo invocation — sim-daemon feature is enabled via
-    # the cross-package syntax so boss-brewery-sim builds in the
-    # same pass as the workspace, sharing dep compilation.
+    # Single cargo invocation across the whole workspace —
+    # boss-brewery-sim builds by default (no feature gate), so it
+    # rides the same --workspace --bins pass, sharing dep compilation.
     # The prior two-cargo-build pattern invalidated cache between
     # passes (different feature set) and recompiled boss-brewery-
-    # engine + dep tree twice; collapsing it halves the cold-build
+    # engine + dep tree twice; one pass halves the cold-build
     # wall-clock on cache-cold builds.
     cargo build --release --workspace \
         --features postgres \
-        --features boss-brewery-engine/sim-daemon \
         --bins && \
     # boss-accounts-api + boss-events-api gate on umbrella features
     # (accounts-api / events-api), not `postgres`, so the workspace

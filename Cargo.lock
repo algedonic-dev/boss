@@ -494,6 +494,7 @@ name = "boss-brewery-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "boss-accounts",
  "boss-calendar-client",
  "boss-core",
@@ -507,7 +508,6 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "sqlx",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
@@ -1436,7 +1436,6 @@ dependencies = [
  "boss-commerce",
  "boss-core",
  "boss-jobs",
- "boss-nats",
  "boss-ports",
  "boss-shipping",
  "chrono",
@@ -4304,7 +4303,6 @@ dependencies = [
  "once_cell",
  "percent-encoding",
  "rust_decimal",
- "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4315,7 +4313,6 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]

@@ -4,11 +4,18 @@ Documentation=https://github.com/algedonic-dev/boss/blob/main/docs/design/projec
 After=postgresql.service nats-server.service network-online.target boss-jobs-api.service boss-dispatcher.service
 Wants=network-online.target
 PartOf=boss-jobs-api.service
+# exit(75) is normal control flow here — every config Apply (POST
+# /simulator/api/config) restarts the daemon (see Restart= below) — so
+# disable systemd's start-rate limiter. A deliberate restart must never
+# trip the limit and leave the unit `failed` (which would need a manual
+# `systemctl reset-failed` before the sim would run again).
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 Environment=RUST_LOG=info
-Environment=BOSS_POSTGRES_URL=postgres://boss:boss@127.0.0.1/boss
+# No BOSS_POSTGRES_URL: the simulator is a pure public-API client and
+# never connects to the database directly (see infra/lint/sim-boundary-audit.sh).
 Environment=BOSS_SIM_API_BASE=direct://127.0.0.1
 Environment=BOSS_SIM_SEEDS_DIR=/opt/boss/examples/brewery/seeds
 # Receive the dispatcher's pushed step.done.<kind> events on :7099 so the
@@ -25,8 +32,12 @@ Environment=BOSS_SIM_CALLBACK_BIND=127.0.0.1:7099
 ExecStartPre=/bin/sh -c '[ "${BOSS_DEMO_MODE:-0}" = "1" ] || { echo "BOSS_DEMO_MODE not set; sim will not start." >&2; exit 0; }'
 ExecStartPre=/bin/sh -c '[ "${BOSS_DEMO_MODE:-0}" = "1" ] || exit 1'
 ExecStart=/usr/local/bin/boss-brewery-sim
+# on-failure also restarts on the daemon's deliberate exit(75) after a
+# config Apply (POST /simulator/api/config) — that's how the "edit +
+# restart" behavior-config model lands the new config. RestartSec kept
+# low for a snappy apply.
 Restart=on-failure
-RestartSec=10
+RestartSec=3
 StandardOutput=journal
 StandardError=journal
 
