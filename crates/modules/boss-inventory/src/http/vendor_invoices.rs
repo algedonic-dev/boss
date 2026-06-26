@@ -14,7 +14,7 @@ use boss_policy_client::CurrentUser;
 
 use super::InventoryApiState;
 use crate::port::InventoryRepository;
-use crate::types::VendorInvoice;
+use crate::types::{BillLine, VendorInvoice, VendorInvoiceStatus};
 
 pub(super) async fn ap_aging<R: InventoryRepository + 'static>(
     State(state): State<Arc<InventoryApiState<R>>>,
@@ -150,6 +150,113 @@ pub(super) async fn upsert_vendor_invoice<R: InventoryRepository + 'static>(
                     )
                     .await;
                 }
+            }
+            (StatusCode::CREATED, Json(invoice)).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Body for "a vendor posts its invoice for a PO". All fields optional —
+/// the PO is the source of truth for vendor/lines/amount, so a bare `{}`
+/// (or the simulator's webhook payload, whose extra fields serde ignores)
+/// is a valid post.
+#[derive(Deserialize, Default)]
+pub(super) struct FromPoRequest {
+    /// The date the invoice was received; defaults to the current sim day
+    /// (the vendor posts on its own schedule, so post-time is the receipt).
+    #[serde(default)]
+    received_on: Option<chrono::NaiveDate>,
+    /// Explicit vendor invoice number; defaults to `VI-{po_id}`.
+    #[serde(default)]
+    vendor_invoice_no: Option<String>,
+}
+
+/// A vendor "posts" its invoice for an existing PO — the automated
+/// counterparty path. The simulator's per-vendor supplier chain routes
+/// `inventory.vendor_invoice_received` here ~lead-time after the PO is
+/// placed (the vendor's "API" responding); the human bill-approval step
+/// later APPROVES it. The PO is the source of truth for the lines + amount
+/// (the webhook only names the PO), so we resolve them from the PO row
+/// rather than trusting the caller. Lands the invoice in **`received`**
+/// state, idempotent on `vi-{po_id}` (the underlying upsert), so a
+/// redelivered webhook is harmless.
+pub(super) async fn create_vendor_invoice_from_po<R: InventoryRepository + 'static>(
+    State(state): State<Arc<InventoryApiState<R>>>,
+    CurrentUser(user): CurrentUser,
+    axum::extract::Path(po_id): axum::extract::Path<String>,
+    Json(req): Json<FromPoRequest>,
+) -> Response {
+    let po = match state.inventory.purchase_order_by_id(&po_id).await {
+        Ok(Some(po)) => po,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("PO {po_id} not found")).into_response();
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let Some(vendor) = po.vendor.clone() else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("PO {po_id} has no vendor; cannot raise an invoice"),
+        )
+            .into_response();
+    };
+    let lines: Vec<BillLine> = po
+        .lines
+        .iter()
+        .map(|l| BillLine {
+            part_sku: l.part_sku.clone(),
+            qty: l.qty as i64,
+            unit_cost_cents: l.unit_cost_cents,
+        })
+        .collect();
+    let amount_cents: i64 = lines.iter().map(|l| l.qty * l.unit_cost_cents).sum();
+    let currency = po
+        .lines
+        .first()
+        .map(|l| l.currency.clone())
+        .unwrap_or_else(|| "USD".to_string());
+
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let received_on = req.received_on.unwrap_or_else(|| now.date_naive());
+    let invoice = VendorInvoice {
+        id: format!("vi-{po_id}"),
+        po_id: po_id.clone(),
+        vendor,
+        vendor_invoice_no: req
+            .vendor_invoice_no
+            .unwrap_or_else(|| format!("VI-{po_id}")),
+        amount_cents,
+        currency,
+        received_on,
+        matched_on: None,
+        approved_on: None,
+        paid_on: None,
+        status: VendorInvoiceStatus::Received,
+        discrepancy_cents: None,
+        discrepancy_kind: None,
+        lines,
+    };
+
+    match state
+        .inventory
+        .upsert_vendor_invoice_at(&invoice, now)
+        .await
+    {
+        Ok(()) => {
+            if let Some(pub_) = &state.publisher {
+                // Received state → only the full-row UPSERTED event (no
+                // approved/paid transition yet; that's the human step).
+                let actor = user
+                    .ambient_actor()
+                    .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+                pub_.emit_with_actor_at(
+                    crate::events::VENDOR_INVOICE_UPSERTED,
+                    actor,
+                    serde_json::to_value(&invoice).unwrap_or_default(),
+                    now,
+                )
+                .await;
             }
             (StatusCode::CREATED, Json(invoice)).into_response()
         }
