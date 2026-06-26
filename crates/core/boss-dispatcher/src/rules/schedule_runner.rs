@@ -352,62 +352,91 @@ impl ScheduleRunner {
                     "schedule runner: catch-up gap exceeded cap; skipped oldest days"
                 );
             }
+            // Fire each due day, persisting the cursor PER DAY (not once
+            // after the whole range). The spawn is not idempotent, so a
+            // crash between firing and persisting must re-fire at most the
+            // single in-flight day on restart — never the whole catch-up
+            // range. The in-memory cursor advances only in lockstep with the
+            // persisted one; a persist failure stops the advance so we never
+            // run ahead of what's durably recorded (we retry next tick).
+            let mut persist_failed = false;
             for day in &advance.days_to_fire {
                 let (matched, payload) = Self::matched_for_day(&self.registry, &calendars, *day);
-                if matched.is_empty() {
-                    continue;
-                }
-                // Synthesize a clock-day dispatch context: the topic is
-                // `clock.day` and the "triggering event id" is the day
-                // itself, so audit provenance chains the spawned work
-                // back to the calendar day that produced it.
-                let event_id = format!("clock-day:{}", day.format("%Y-%m-%d"));
-                match handler::dispatch(&matched, &self.handlers, &event_id, "clock.day", &payload)
+                if !matched.is_empty() {
+                    // Synthesize a clock-day dispatch context: the topic is
+                    // `clock.day` and the "triggering event id" is the day
+                    // itself, so audit provenance chains the spawned work
+                    // back to the calendar day that produced it.
+                    let event_id = format!("clock-day:{}", day.format("%Y-%m-%d"));
+                    match handler::dispatch(
+                        &matched,
+                        &self.handlers,
+                        &event_id,
+                        "clock.day",
+                        &payload,
+                    )
                     .await
-                {
-                    Ok(results) => {
-                        let mut fired = 0u64;
-                        let mut failed = 0u64;
-                        for r in results {
-                            match &r.outcome {
-                                Ok(()) => {
-                                    fired += 1;
-                                    debug!(
-                                        rule = %r.rule_name, handler = %r.handler,
-                                        day = %day, "schedule rule fired"
-                                    );
-                                }
-                                Err(e) => {
-                                    failed += 1;
-                                    warn!(
-                                        rule = %r.rule_name, handler = %r.handler,
-                                        day = %day, error = %e,
-                                        "schedule rule handler failed"
-                                    );
+                    {
+                        Ok(results) => {
+                            let mut fired = 0u64;
+                            let mut failed = 0u64;
+                            for r in results {
+                                match &r.outcome {
+                                    Ok(()) => {
+                                        fired += 1;
+                                        debug!(
+                                            rule = %r.rule_name, handler = %r.handler,
+                                            day = %day, "schedule rule fired"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        failed += 1;
+                                        warn!(
+                                            rule = %r.rule_name, handler = %r.handler,
+                                            day = %day, error = %e,
+                                            "schedule rule handler failed"
+                                        );
+                                    }
                                 }
                             }
+                            info!(day = %day, fired, failed, "schedule runner: fired day");
+                            live.record_schedule();
                         }
-                        info!(day = %day, fired, failed, "schedule runner: fired day");
-                        live.record_schedule();
-                    }
-                    Err(e) => {
-                        // UnknownHandler is a registry/code drift — surface
-                        // it loudly, but DON'T wedge the loop or skip the
-                        // cursor advance (a bad rule must not freeze every
-                        // other schedule). The day still counts as
-                        // processed; the operator fixes the rule.
-                        warn!(day = %day, error = %e, "schedule runner: dispatch error");
+                        Err(e) => {
+                            // UnknownHandler is a registry/code drift — surface
+                            // it loudly, but DON'T wedge the loop or skip the
+                            // cursor advance (a bad rule must not freeze every
+                            // other schedule). The day still counts as
+                            // processed; the operator fixes the rule.
+                            warn!(day = %day, error = %e, "schedule runner: dispatch error");
+                        }
                     }
                 }
+                // Record this day done before moving to the next, so a crash
+                // re-fires at most this one day. Stop advancing if the persist
+                // fails — the in-memory cursor must never lead the durable one.
+                if let Err(e) = self.save_cursor(*day).await {
+                    warn!(
+                        day = %day, error = %e,
+                        "schedule runner: cursor persist failed; pausing advance until next tick"
+                    );
+                    persist_failed = true;
+                    break;
+                }
+                cursor = Some(*day);
             }
-            // Persist the advanced cursor (only when it actually moved).
-            if advance.new_cursor != cursor {
-                if let Some(nc) = advance.new_cursor
-                    && let Err(e) = self.save_cursor(nc).await
-                {
+            // Non-fire cursor moves (first-observation baseline, backward-jump
+            // reset): `days_to_fire` is empty but the cursor still settles.
+            if !persist_failed
+                && advance.days_to_fire.is_empty()
+                && advance.new_cursor != cursor
+                && let Some(nc) = advance.new_cursor
+            {
+                if let Err(e) = self.save_cursor(nc).await {
                     warn!(error = %e, "schedule runner: failed to persist cursor");
+                } else {
+                    cursor = advance.new_cursor;
                 }
-                cursor = advance.new_cursor;
             }
         }
         live.mark_schedule_stopped();
