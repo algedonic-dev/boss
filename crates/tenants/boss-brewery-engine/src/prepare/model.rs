@@ -52,6 +52,9 @@ pub fn prepare_model(gateway_base: Option<&str>, seeds_dir: &Path) -> Result<()>
     let classes_base = gateway_base
         .map(str::to_string)
         .unwrap_or_else(|| boss_ports::url("classes"));
+    let calendar_base = gateway_base
+        .map(str::to_string)
+        .unwrap_or_else(|| boss_ports::url("calendar"));
     let jobs_base = gateway_base
         .map(str::to_string)
         .unwrap_or_else(|| boss_ports::url("jobs"));
@@ -72,6 +75,11 @@ pub fn prepare_model(gateway_base: Option<&str>, seeds_dir: &Path) -> Result<()>
     // 1. Classes first — employee role + account-type writes validate
     //    against the Class registry.
     seed_classes(&classes_base, seeds_dir)?;
+
+    // 1b. Business calendars — reference data (banking/tax holidays) the
+    //     dispatcher's timing triggers and the simulator resolve business
+    //     days from. Like classes: load before anything that consumes them.
+    seed_business_calendars(&calendar_base, seeds_dir)?;
 
     // 2. JobKinds — the workflow registry the sim drives. dev=true
     //    auto-walks the sign-off step (the brewery seed runs
@@ -136,5 +144,41 @@ fn seed_classes(api_base: &str, seeds_dir: &Path) -> Result<()> {
         anyhow::bail!("POST {url} → {status} {}", resp.text().unwrap_or_default());
     }
     info!(path = %path.display(), "brewery classes seeded");
+    Ok(())
+}
+
+/// POST the brewery's business calendars (`seeds/business_calendars.json`)
+/// to `/api/calendar/business-calendars/batch`. These are the banking +
+/// tax calendars the dispatcher's timing triggers and the simulator
+/// resolve business days from — DATA, not hardcoded Rust. Same
+/// seed-origin provenance as the Class registry.
+fn seed_business_calendars(api_base: &str, seeds_dir: &Path) -> Result<()> {
+    let path = seeds_dir.join("business_calendars.json");
+    let body =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let url = format!(
+        "{}/api/calendar/business-calendars/batch",
+        api_base.trim_end_matches('/')
+    );
+    let resp = client
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header("x-sim-origin", "true")
+        .header(
+            "x-boss-user",
+            r#"{"id":"automation:calendar-seed","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}"#,
+        )
+        .body(body)
+        .send()
+        .with_context(|| format!("POST {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("POST {url} → {status} {}", resp.text().unwrap_or_default());
+    }
+    info!(path = %path.display(), "brewery business calendars seeded");
     Ok(())
 }

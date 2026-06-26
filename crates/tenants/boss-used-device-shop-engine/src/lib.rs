@@ -152,12 +152,15 @@ impl UsedDeviceShopEngineState {
         };
         seed_used_device_shop_subjects(&mut state, employees_arg);
 
-        let periodic =
-            PeriodicEngine::new(tenant.periodic_specs(), CalendarRegistry::with_builtins());
-        let counterparty = CounterpartyEngine::new(
-            tenant.counterparty_specs(),
-            CalendarRegistry::with_builtins(),
-        );
+        // Business calendars as DATA. This tenant has no live-fetch
+        // daemon wired yet, so it uses the inline test calendars (the
+        // same us-banking / us-tax / weekdays-only set the old
+        // `with_builtins` provided). When this tenant grows a live
+        // daemon, fetch from boss-calendar the way boss-brewery-engine
+        // does and pass the result through here.
+        let periodic = PeriodicEngine::new(tenant.periodic_specs(), CalendarRegistry::for_tests());
+        let counterparty =
+            CounterpartyEngine::new(tenant.counterparty_specs(), CalendarRegistry::for_tests());
 
         let rng = Rng::new(tenant.meta.seed);
 

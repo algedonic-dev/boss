@@ -1,203 +1,222 @@
-//! `BusinessCalendar` trait + lookup registry. Counterparty + Periodic
-//! engines hold a `CalendarRegistry` and consult it whenever a delay
-//! or cadence is qualified by a calendar name. Lookup misses fall
-//! back to a permissive "every day is a business day" calendar so a
-//! typo in tenant.toml doesn't silently swallow events.
+//! `CalendarRegistry` — a lookup map of calendar `code` →
+//! [`boss_core::calendar::BusinessCalendar`] DATA. Counterparty +
+//! Periodic engines hold a registry and consult it whenever a delay
+//! or cadence is qualified by a calendar code; the shape-driven
+//! sampler consults the `us-banking` calendar for its
+//! weekday/weekend/holiday demand multipliers.
+//!
+//! The calendars are not hardcoded here — they are seeded into the
+//! boss-calendar service and fetched at daemon startup via
+//! `boss-calendar-client`, so there is one source of truth. Lookup
+//! misses fall back to a permissive all-business calendar (every day
+//! is a business day) so a typo in tenant.toml doesn't silently
+//! swallow events.
 
 use std::collections::HashMap;
 
-use chrono::{Datelike, NaiveDate, Weekday};
+use boss_core::calendar::BusinessCalendar;
 
-/// Predicate trait. Implementations decide whether a given day is a
-/// business day for their domain.
-pub trait BusinessCalendar: Send + Sync {
-    /// Stable identifier (e.g. `"us-banking"`, `"us-tax"`,
-    /// `"uk-banking"`).
-    fn name(&self) -> &str;
-
-    /// Returns true iff `day` is a business day under this calendar.
-    fn is_business_day(&self, day: NaiveDate) -> bool;
-
-    /// Walk forward from `day` until a business day is found. Returns
-    /// `day` itself when it's already a business day. Used to
-    /// "round up" delay-queue dates so a Saturday-due settlement
-    /// fires on Monday.
-    fn next_business_day(&self, day: NaiveDate) -> NaiveDate {
-        let mut d = day;
-        while !self.is_business_day(d) {
-            d = d.succ_opt().expect("date sequence overflow");
-        }
-        d
-    }
-
-    /// Add `n` business days to `day`. `n=0` returns `day` (or the
-    /// next business day if `day` itself is non-business). Negative
-    /// `n` walks backward.
-    fn add_business_days(&self, day: NaiveDate, n: i64) -> NaiveDate {
-        if n == 0 {
-            return self.next_business_day(day);
-        }
-        let mut d = day;
-        let mut remaining = n.unsigned_abs();
-        let step = if n > 0 { 1 } else { -1 };
-        while remaining > 0 {
-            d = if step > 0 {
-                d.succ_opt().expect("date sequence overflow")
-            } else {
-                d.pred_opt().expect("date sequence underflow")
-            };
-            if self.is_business_day(d) {
-                remaining -= 1;
-            }
-        }
-        d
-    }
-}
-
-/// Permissive fallback: every day is a business day. Used when a
-/// counterparty/periodic spec names a calendar that nobody has
-/// registered (typo, tenant-side calendar shipped later, etc.).
-pub struct EveryDay;
-
-impl BusinessCalendar for EveryDay {
-    fn name(&self) -> &str {
-        "every-day"
-    }
-    fn is_business_day(&self, _day: NaiveDate) -> bool {
-        true
-    }
-}
-
-/// Skips Sat/Sun only. Useful as a parent calendar for the built-ins.
-pub struct WeekdaysOnly;
-
-impl BusinessCalendar for WeekdaysOnly {
-    fn name(&self) -> &str {
-        "weekdays-only"
-    }
-    fn is_business_day(&self, day: NaiveDate) -> bool {
-        !matches!(day.weekday(), Weekday::Sat | Weekday::Sun)
-    }
-}
-
-/// Lookup map of calendar name → BusinessCalendar. Engines read this
-/// when they need to resolve a tenant.toml `business_calendar = "..."`
-/// reference.
+/// Lookup map of calendar code → [`BusinessCalendar`] data. Engines
+/// read this to resolve a tenant.toml `business_calendar = "..."`
+/// reference into the concrete non-business-day set.
 pub struct CalendarRegistry {
-    calendars: HashMap<String, Box<dyn BusinessCalendar>>,
-    fallback: Box<dyn BusinessCalendar>,
+    calendars: HashMap<String, BusinessCalendar>,
+    /// Permissive fallback: every day is a business day. Returned on
+    /// a lookup miss (unknown code, or a calendar that failed to
+    /// fetch) so a missing calendar degrades to "no closures" rather
+    /// than dropping events.
+    fallback: BusinessCalendar,
 }
 
 impl CalendarRegistry {
-    /// New registry with no calendars; lookups fall through to
-    /// `EveryDay`. Callers usually want `with_builtins()` instead.
-    pub fn empty() -> Self {
-        Self {
-            calendars: HashMap::new(),
-            fallback: Box::new(EveryDay),
+    /// Build the permissive all-business fallback calendar — empty
+    /// weekend, empty closed set, so `is_business_day` is always
+    /// true. Built explicitly (not via `BusinessCalendar::new`, which
+    /// defaults to a Sat+Sun weekend).
+    fn all_business() -> BusinessCalendar {
+        BusinessCalendar {
+            code: String::new(),
+            name: String::new(),
+            weekend: std::collections::BTreeSet::new(),
+            closed: std::collections::BTreeSet::new(),
         }
     }
 
-    /// Pre-loaded with `us-banking` and `us-tax`.
-    pub fn with_builtins() -> Self {
-        let mut r = Self::empty();
-        r.register(Box::new(super::us_banking::UsBanking));
-        r.register(Box::new(super::us_tax::UsTax));
-        r.register(Box::new(WeekdaysOnly));
-        r
+    /// Registry holding the supplied calendar data. The map is keyed
+    /// by each calendar's `code`; the fallback is the all-business
+    /// calendar.
+    pub fn from_data(cals: Vec<BusinessCalendar>) -> Self {
+        let calendars = cals.into_iter().map(|c| (c.code.clone(), c)).collect();
+        Self {
+            calendars,
+            fallback: Self::all_business(),
+        }
     }
 
-    pub fn register(&mut self, cal: Box<dyn BusinessCalendar>) {
-        self.calendars.insert(cal.name().to_string(), cal);
+    /// Empty registry — no calendars; every lookup falls through to
+    /// the all-business fallback. Used when no calendar service is
+    /// reachable; engines still run, just without closures.
+    pub fn empty() -> Self {
+        Self::from_data(Vec::new())
     }
 
-    /// Resolve by name; falls back to `EveryDay` on miss.
-    pub fn get<'a>(&'a self, name: Option<&str>) -> &'a dyn BusinessCalendar {
-        match name {
-            Some(n) => self
-                .calendars
-                .get(n)
-                .map(|b| b.as_ref())
-                .unwrap_or_else(|| self.fallback.as_ref()),
-            None => self.fallback.as_ref(),
+    /// Test registry — `us-banking` + `us-tax` + `weekdays-only`
+    /// built inline as DATA, with enough closed dates to satisfy the
+    /// engine + sampler unit tests. Production fetches these from the
+    /// boss-calendar service instead.
+    pub fn for_tests() -> Self {
+        Self::from_data(vec![
+            us_banking_for_tests(),
+            us_tax_for_tests(),
+            weekdays_only_for_tests(),
+        ])
+    }
+
+    /// Resolve by code; falls back to the all-business calendar on a
+    /// miss (unknown code or `None`).
+    pub fn get(&self, code: Option<&str>) -> &BusinessCalendar {
+        match code {
+            Some(c) => self.calendars.get(c).unwrap_or(&self.fallback),
+            None => &self.fallback,
         }
     }
 }
 
 impl Default for CalendarRegistry {
+    /// Empty (all-business) by default. Real deployments call
+    /// [`CalendarRegistry::from_data`] with calendars fetched from
+    /// boss-calendar; tests call [`CalendarRegistry::for_tests`].
     fn default() -> Self {
-        Self::with_builtins()
+        Self::empty()
     }
+}
+
+/// `us-banking` test calendar: Sat+Sun weekend plus the observed US
+/// federal-bank holidays for 2024–2026. Carries the dates the engine
+/// + sampler unit tests assert against (e.g. MLK Day 2024-01-15, the
+/// 2026-07-03 observed Independence Day, 2026-12-25 Christmas) plus
+/// the weekend-snapping cases. Sat-falling holidays roll back to
+/// Friday, Sun-falling roll forward to Monday — baked into the list.
+///
+/// Production fetches the equivalent data from the boss-calendar
+/// service; this inline copy exists only so tests + non-daemon paths
+/// behave correctly without a fetch.
+///
+/// `pub(crate)` so `ShapeDrivenState::default` can seed the same
+/// us-banking calendar the sampler tests expect when no fetched
+/// calendar has been injected.
+pub(crate) fn us_banking_for_tests() -> BusinessCalendar {
+    use chrono::NaiveDate;
+    let d = |y: i32, m: u32, day: u32| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+    BusinessCalendar::new("us-banking", "US Banking").with_closed([
+        // 2024
+        d(2024, 1, 1),   // New Year's Day
+        d(2024, 1, 15),  // MLK Day
+        d(2024, 2, 19),  // Presidents Day
+        d(2024, 5, 27),  // Memorial Day
+        d(2024, 6, 19),  // Juneteenth
+        d(2024, 7, 4),   // Independence Day
+        d(2024, 9, 2),   // Labor Day
+        d(2024, 10, 14), // Columbus Day
+        d(2024, 11, 11), // Veterans Day
+        d(2024, 11, 28), // Thanksgiving
+        d(2024, 12, 25), // Christmas
+        // 2025
+        d(2025, 1, 1),
+        d(2025, 1, 20),
+        d(2025, 2, 17),
+        d(2025, 5, 26),
+        d(2025, 6, 19),
+        d(2025, 7, 4),
+        d(2025, 9, 1),
+        d(2025, 10, 13),
+        d(2025, 11, 11),
+        d(2025, 11, 27),
+        d(2025, 12, 25),
+        // 2026
+        d(2026, 1, 1),
+        d(2026, 1, 19),
+        d(2026, 2, 16),
+        d(2026, 5, 25),
+        d(2026, 6, 19),
+        d(2026, 7, 3), // 7/4 is Saturday → Friday observed
+        d(2026, 9, 7),
+        d(2026, 10, 12),
+        d(2026, 11, 11),
+        d(2026, 11, 26),
+        d(2026, 12, 25),
+    ])
+}
+
+/// `us-tax` test calendar: the `us-banking` baseline plus the
+/// Apr 12-19 filing-surge window expanded to concrete closed dates.
+fn us_tax_for_tests() -> BusinessCalendar {
+    use chrono::NaiveDate;
+    let surge = (12..=19).map(|day| NaiveDate::from_ymd_opt(2026, 4, day).unwrap());
+    let mut cal = us_banking_for_tests();
+    cal.code = "us-tax".to_string();
+    cal.name = "US Tax".to_string();
+    cal.closed.extend(surge);
+    cal
+}
+
+/// `weekdays-only` test calendar: Sat+Sun weekend, no holidays. Used
+/// by the periodic engine's coarse-cadence postponement test.
+fn weekdays_only_for_tests() -> BusinessCalendar {
+    BusinessCalendar::new("weekdays-only", "Weekdays Only")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDate;
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
     }
 
     #[test]
-    fn weekdays_only_skips_weekends() {
-        let cal = WeekdaysOnly;
-        // 2026-04-25 is a Saturday.
-        assert!(!cal.is_business_day(d(2026, 4, 25)));
-        assert!(!cal.is_business_day(d(2026, 4, 26)));
-        // 2026-04-27 is Monday.
-        assert!(cal.is_business_day(d(2026, 4, 27)));
+    fn fallback_is_all_business() {
+        let r = CalendarRegistry::empty();
+        // No calendars → every day, including Saturday, is a business
+        // day under the fallback.
+        assert!(r.get(Some("nope")).is_business_day(d(2026, 4, 25))); // Sat
+        assert!(r.get(None).is_business_day(d(2026, 4, 26))); // Sun
     }
 
     #[test]
-    fn next_business_day_rounds_to_monday_from_friday_evening() {
-        let cal = WeekdaysOnly;
-        // Saturday → Monday.
-        assert_eq!(cal.next_business_day(d(2026, 4, 25)), d(2026, 4, 27));
-        // Sunday → Monday.
-        assert_eq!(cal.next_business_day(d(2026, 4, 26)), d(2026, 4, 27));
-        // Friday → Friday (already business day).
-        assert_eq!(cal.next_business_day(d(2026, 4, 24)), d(2026, 4, 24));
-    }
-
-    #[test]
-    fn add_business_days_skips_weekends() {
-        let cal = WeekdaysOnly;
-        // Friday + 1 → Monday.
-        assert_eq!(cal.add_business_days(d(2026, 4, 24), 1), d(2026, 4, 27));
-        // Friday + 5 → Friday next week.
-        assert_eq!(cal.add_business_days(d(2026, 4, 24), 5), d(2026, 5, 1));
-        // Monday - 1 → previous Friday.
-        assert_eq!(cal.add_business_days(d(2026, 4, 27), -1), d(2026, 4, 24));
-    }
-
-    #[test]
-    fn add_zero_business_days_rounds_to_next_business() {
-        let cal = WeekdaysOnly;
-        // Saturday + 0 → Monday (next business).
-        assert_eq!(cal.add_business_days(d(2026, 4, 25), 0), d(2026, 4, 27));
-        // Friday + 0 → Friday (already business).
-        assert_eq!(cal.add_business_days(d(2026, 4, 24), 0), d(2026, 4, 24));
-    }
-
-    #[test]
-    fn registry_falls_back_to_every_day_for_unknown_name() {
-        let r = CalendarRegistry::with_builtins();
-        let cal = r.get(Some("not-a-real-calendar"));
-        // EveryDay treats Saturday as a business day.
-        assert!(cal.is_business_day(d(2026, 4, 25)));
-    }
-
-    #[test]
-    fn registry_returns_us_banking_when_named() {
-        let r = CalendarRegistry::with_builtins();
+    fn from_data_resolves_by_code() {
+        let r = CalendarRegistry::from_data(vec![us_banking_for_tests()]);
         let cal = r.get(Some("us-banking"));
-        assert_eq!(cal.name(), "us-banking");
+        assert_eq!(cal.code, "us-banking");
+        // Saturday + the observed Independence Day are non-business.
+        assert!(!cal.is_business_day(d(2026, 4, 25))); // Sat
+        assert!(!cal.is_business_day(d(2026, 7, 3))); // observed July 4
     }
 
     #[test]
-    fn registry_default_loads_builtins() {
-        let r = CalendarRegistry::default();
-        assert_eq!(r.get(Some("us-banking")).name(), "us-banking");
-        assert_eq!(r.get(Some("us-tax")).name(), "us-tax");
+    fn unknown_code_falls_back_to_all_business() {
+        let r = CalendarRegistry::for_tests();
+        // EveryDay-style fallback treats Saturday as a business day.
+        assert!(
+            r.get(Some("not-a-real-calendar"))
+                .is_business_day(d(2026, 4, 25))
+        );
+    }
+
+    #[test]
+    fn for_tests_loads_the_three_builtins() {
+        let r = CalendarRegistry::for_tests();
+        assert_eq!(r.get(Some("us-banking")).code, "us-banking");
+        assert_eq!(r.get(Some("us-tax")).code, "us-tax");
+        assert_eq!(r.get(Some("weekdays-only")).code, "weekdays-only");
+        // us-tax inherits the banking closures AND the surge window.
+        assert!(!r.get(Some("us-tax")).is_business_day(d(2026, 12, 25))); // banking
+        assert!(!r.get(Some("us-tax")).is_business_day(d(2026, 4, 15))); // surge
+        // weekdays-only has no holidays — Christmas is a business day.
+        assert!(
+            r.get(Some("weekdays-only"))
+                .is_business_day(d(2026, 12, 25))
+        );
     }
 }

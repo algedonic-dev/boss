@@ -819,7 +819,7 @@ mod tests {
             emit_else: None,
             match_payload: serde_json::Map::new(),
         };
-        let mut engine = CounterpartyEngine::new(vec![spec], CalendarRegistry::with_builtins());
+        let mut engine = CounterpartyEngine::new(vec![spec], CalendarRegistry::for_tests());
         let mut rng = Rng::new(0x5CA75);
 
         // Day 0: trigger lands. Stage 0 queues for tomorrow.
@@ -854,8 +854,7 @@ mod tests {
 
     #[test]
     fn matching_event_schedules_emission_after_delay() {
-        let mut engine =
-            CounterpartyEngine::new(vec![ach_spec()], CalendarRegistry::with_builtins());
+        let mut engine = CounterpartyEngine::new(vec![ach_spec()], CalendarRegistry::for_tests());
         let mut rng = Rng::new(0xACE);
         // Trigger on a Monday.
         let monday = d(2026, 4, 27);
@@ -877,8 +876,7 @@ mod tests {
 
     #[test]
     fn weekend_delay_snaps_forward_to_monday() {
-        let mut engine =
-            CounterpartyEngine::new(vec![ach_spec()], CalendarRegistry::with_builtins());
+        let mut engine = CounterpartyEngine::new(vec![ach_spec()], CalendarRegistry::for_tests());
         let mut rng = Rng::new(0xACE);
         // Trigger on a Friday; 1 business day later = Monday, not Saturday.
         let friday = d(2026, 4, 24);
@@ -894,8 +892,7 @@ mod tests {
 
     #[test]
     fn drain_emits_on_target_day_and_clears_queue() {
-        let mut engine =
-            CounterpartyEngine::new(vec![ach_spec()], CalendarRegistry::with_builtins());
+        let mut engine = CounterpartyEngine::new(vec![ach_spec()], CalendarRegistry::for_tests());
         let mut rng = Rng::new(0xACE);
         // Trigger Monday; emission queued Tuesday.
         let _ = step_engine_with_event(
@@ -919,7 +916,7 @@ mod tests {
         // emit_probability = 0 means nothing should ever queue.
         let mut spec = ach_spec();
         spec.emit_probability = 0.0;
-        let mut engine = CounterpartyEngine::new(vec![spec], CalendarRegistry::with_builtins());
+        let mut engine = CounterpartyEngine::new(vec![spec], CalendarRegistry::for_tests());
         let mut rng = Rng::new(0xDEAD);
         for _ in 0..50 {
             let _ = step_engine_with_event(
@@ -972,7 +969,7 @@ mod tests {
             emit_else: None,
             match_payload: serde_json::Map::new(),
         };
-        let mut engine = CounterpartyEngine::new(vec![spec], CalendarRegistry::with_builtins());
+        let mut engine = CounterpartyEngine::new(vec![spec], CalendarRegistry::for_tests());
         let mut rng = Rng::new(0xC0FFEE);
         // Monday: trigger.
         let _ = step_engine_with_event(
@@ -1008,7 +1005,7 @@ mod tests {
     fn deterministic_run_matches_under_same_seed() {
         let make = || {
             (
-                CounterpartyEngine::new(vec![ach_spec()], CalendarRegistry::with_builtins()),
+                CounterpartyEngine::new(vec![ach_spec()], CalendarRegistry::for_tests()),
                 Rng::new(0xFEED),
             )
         };
@@ -1130,7 +1127,7 @@ mod tests {
                 mk("flour", "flour-mill", "ap.invoice.flour"),
                 mk("dairy", "dairy", "ap.invoice.dairy"),
             ],
-            CalendarRegistry::with_builtins(),
+            CalendarRegistry::for_tests(),
         );
         let mut rng = Rng::new(0x77);
         let _ = step_engine_with_event(
@@ -1173,7 +1170,7 @@ mod tests {
             emit_else: None,
             match_payload: serde_json::Map::new(),
         };
-        let mut engine = CounterpartyEngine::new(vec![spec], CalendarRegistry::with_builtins());
+        let mut engine = CounterpartyEngine::new(vec![spec], CalendarRegistry::for_tests());
         let mut rng = Rng::new(0x88);
         let _ = step_engine_with_event(
             &mut engine,
@@ -1208,7 +1205,7 @@ mod tests {
             emit_else: None,
             match_payload: pred(&[("metadata.vendor.category", json!("dairy"))]),
         };
-        let mut engine = CounterpartyEngine::new(vec![spec], CalendarRegistry::with_builtins());
+        let mut engine = CounterpartyEngine::new(vec![spec], CalendarRegistry::for_tests());
         let mut rng = Rng::new(0x99);
         let (out, _) = step_engine_with_event(
             &mut engine,
@@ -1340,7 +1337,7 @@ mod tests {
     /// the same trigger emits ~3 business days later.
     #[test]
     fn counterparty_shock_multiplies_sampled_delay() {
-        let _engine = CounterpartyEngine::new(vec![ach_spec()], CalendarRegistry::with_builtins());
+        let _engine = CounterpartyEngine::new(vec![ach_spec()], CalendarRegistry::for_tests());
         let mut rng = Rng::new(0xc0ffeeu32);
         let day = d(2026, 5, 4); // Mon
         let trigger = SimBusEvent::new(
@@ -1352,8 +1349,7 @@ mod tests {
         let mut spec = ach_spec();
         spec.delay.business_calendar = None;
         spec.delay.mean_days = 2.0; // base 2 days
-        let mut engine_no_cal =
-            CounterpartyEngine::new(vec![spec], CalendarRegistry::with_builtins());
+        let mut engine_no_cal = CounterpartyEngine::new(vec![spec], CalendarRegistry::for_tests());
 
         // No shock: schedules out 2 days.
         let _ = step_engine_with_event(&mut engine_no_cal, day, &mut rng, trigger.clone());
@@ -1372,7 +1368,7 @@ mod tests {
         spec2.delay.business_calendar = None;
         spec2.delay.mean_days = 2.0;
         let mut engine_shocked =
-            CounterpartyEngine::new(vec![spec2], CalendarRegistry::with_builtins());
+            CounterpartyEngine::new(vec![spec2], CalendarRegistry::for_tests());
         let mut rng2 = Rng::new(0xc0ffeeu32);
         let _ = step_engine_with_event_and_shocks(
             &mut engine_shocked,
@@ -1408,7 +1404,7 @@ mod tests {
         let mut spec = ach_spec();
         spec.delay.business_calendar = None;
         spec.delay.mean_days = 2.0;
-        let mut engine = CounterpartyEngine::new(vec![spec], CalendarRegistry::with_builtins());
+        let mut engine = CounterpartyEngine::new(vec![spec], CalendarRegistry::for_tests());
         let mut rng = Rng::new(0xb0a7u32);
         let trigger = SimBusEvent::new(
             "ledger.payment_instructed".to_string(),
@@ -1435,7 +1431,7 @@ mod tests {
         let mut spec = ach_spec();
         spec.delay.business_calendar = None;
         spec.delay.mean_days = 2.0;
-        let mut engine = CounterpartyEngine::new(vec![spec], CalendarRegistry::with_builtins());
+        let mut engine = CounterpartyEngine::new(vec![spec], CalendarRegistry::for_tests());
         let mut rng = Rng::new(0xfacadeu32);
         let trigger = SimBusEvent::new(
             "ledger.payment_instructed".to_string(),

@@ -464,7 +464,7 @@ mod tests {
                     payload: serde_json::Value::Null,
                 },
             }],
-            CalendarRegistry::with_builtins(),
+            CalendarRegistry::for_tests(),
         );
         let mut counterparty = CounterpartyEngine::new(
             vec![CounterpartySpec {
@@ -483,7 +483,7 @@ mod tests {
                 emit_else: None,
                 match_payload: serde_json::Map::new(),
             }],
-            CalendarRegistry::with_builtins(),
+            CalendarRegistry::for_tests(),
         );
 
         let report = run_days(
@@ -579,9 +579,9 @@ mod tests {
                     payload: serde_json::Value::Null,
                 },
             }],
-            CalendarRegistry::with_builtins(),
+            CalendarRegistry::for_tests(),
         );
-        let mut counterparty = CounterpartyEngine::new(vec![], CalendarRegistry::with_builtins());
+        let mut counterparty = CounterpartyEngine::new(vec![], CalendarRegistry::for_tests());
 
         // Mon 4/27 through Sun 5/3 = 7 calendar days, 5 weekdays.
         let report = run_days(
@@ -656,9 +656,9 @@ mod tests {
                     subject_id: Some("loc-1".into()),
                 },
             }],
-            CalendarRegistry::with_builtins(),
+            CalendarRegistry::for_tests(),
         );
-        let mut counterparty = CounterpartyEngine::new(vec![], CalendarRegistry::with_builtins());
+        let mut counterparty = CounterpartyEngine::new(vec![], CalendarRegistry::for_tests());
 
         let report = run_days(
             d(2026, 4, 27),
@@ -731,9 +731,9 @@ mod tests {
                     subject_id: Some("loc-1".into()),
                 },
             }],
-            CalendarRegistry::with_builtins(),
+            CalendarRegistry::for_tests(),
         );
-        let mut counterparty = CounterpartyEngine::new(vec![], CalendarRegistry::with_builtins());
+        let mut counterparty = CounterpartyEngine::new(vec![], CalendarRegistry::for_tests());
 
         let report = run_days(
             d(2026, 4, 27),
@@ -839,8 +839,8 @@ mod tests {
         state_a.seed_subject("location", "loc-1");
         let mut rng_a = Rng::new(tenant.meta.seed);
         let mut output_a = InMemoryOutput::default();
-        let mut p_a = PeriodicEngine::new(vec![], CalendarRegistry::with_builtins());
-        let mut c_a = CounterpartyEngine::new(vec![], CalendarRegistry::with_builtins());
+        let mut p_a = PeriodicEngine::new(vec![], CalendarRegistry::for_tests());
+        let mut c_a = CounterpartyEngine::new(vec![], CalendarRegistry::for_tests());
         let report_daily = run_ticks_with_handlers(
             start,
             end,
@@ -862,8 +862,8 @@ mod tests {
         state_b.seed_subject("location", "loc-1");
         let mut rng_b = Rng::new(tenant.meta.seed);
         let mut output_b = InMemoryOutput::default();
-        let mut p_b = PeriodicEngine::new(vec![], CalendarRegistry::with_builtins());
-        let mut c_b = CounterpartyEngine::new(vec![], CalendarRegistry::with_builtins());
+        let mut p_b = PeriodicEngine::new(vec![], CalendarRegistry::for_tests());
+        let mut c_b = CounterpartyEngine::new(vec![], CalendarRegistry::for_tests());
         let report_hourly = run_ticks_with_handlers(
             start,
             end,

@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use boss_core::calendar::BusinessCalendar;
 use chrono::NaiveDate;
 
 /// In-memory state for a shape-driven sim run. Tracks only what the
@@ -16,7 +17,7 @@ use chrono::NaiveDate;
 /// and a roster reference. It holds NO job/step/inventory mirror: the
 /// live system owns that state; the sim posts jobs and the workforce
 /// executor reads jobs/steps/inventory back through the public API.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ShapeDrivenState {
     /// Pool of Subjects available to be picked as Job targets.
     /// Keyed by SubjectKind slug ("account", "vendor", "location",
@@ -37,6 +38,27 @@ pub struct ShapeDrivenState {
     /// completion happen in the workforce executor, which resolves
     /// employees from the live people-api.
     pub employees_by_role: HashMap<String, Vec<String>>,
+    /// The `us-banking` business calendar (DATA) the shape-driven
+    /// sampler consults for weekday/weekend/holiday demand
+    /// multipliers — "Memorial Day suppresses weekday production"
+    /// without per-rate holiday lists. Production seeds this from the
+    /// calendar fetched out of boss-calendar (see
+    /// [`ShapeDrivenState::set_us_banking`]); the `Default` carries the
+    /// 2026 federal-holiday set so tests + non-daemon paths behave
+    /// correctly without a fetch.
+    pub us_banking: BusinessCalendar,
+}
+
+impl Default for ShapeDrivenState {
+    fn default() -> Self {
+        Self {
+            subjects: HashMap::new(),
+            counters: RunCounters::default(),
+            active_shocks: Vec::new(),
+            employees_by_role: HashMap::new(),
+            us_banking: crate::calendar::registry::us_banking_for_tests(),
+        }
+    }
 }
 
 /// A shock that has rolled into its active window. Carried in
@@ -126,6 +148,14 @@ impl ShapeDrivenState {
     /// attach to.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Replace the `us-banking` calendar the sampler consults — called
+    /// by the daemon after fetching calendars from boss-calendar, so
+    /// the demand multipliers run against the seeded data rather than
+    /// the `Default` fallback.
+    pub fn set_us_banking(&mut self, cal: BusinessCalendar) {
+        self.us_banking = cal;
     }
 
     /// Register one Subject under its kind. Idempotent — duplicates
