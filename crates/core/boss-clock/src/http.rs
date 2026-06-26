@@ -74,11 +74,12 @@ pub fn router(state: ClockApiState) -> Router {
 
 /// `GET /api/clock/ticks` — Server-Sent Events stream of Ticks.
 ///
-/// Per design D3: ephemeral, stateless. Each event payload is
-/// `{ "time": "<ISO-8601>" }` — the current time as known to this
-/// clock-api. Emits at a fixed wall-time cadence (one tick per
-/// second by default); the consumer sees sim time advancing
-/// proportional to warp_factor in sim mode.
+/// Per design D3: ephemeral, stateless. Each event payload is a full
+/// `ClockNow` JSON (now + simulated + epoch_start/end + paused +
+/// restart_in_progress) — the clock's whole state, so a streaming
+/// consumer drives its loop off this alone. Emits at a fixed wall-time
+/// cadence (one tick per second by default); the consumer sees sim time
+/// advancing proportional to warp_factor in sim mode.
 ///
 /// No persistence, no replay, no cursor. On reconnect the consumer
 /// gets live ticks from now() onward. Recovery from gaps is the
@@ -97,10 +98,11 @@ async fn ticks_stream_handler(
                 Err(_) => ClockNow::wall(),
             },
         };
-        let payload = serde_json::json!({
-            "time": now.now,
-        });
-        Ok(Event::default().data(payload.to_string()))
+        // Emit the full `ClockNow`, not just the timestamp, so streaming
+        // consumers — the dispatcher's timing triggers and the sim daemon —
+        // drive their loops off the stream alone, with no companion
+        // `/api/clock/now` poll.
+        Ok(Event::default().data(serde_json::to_string(&now).unwrap_or_default()))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }

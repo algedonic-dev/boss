@@ -14,7 +14,8 @@ use boss_testing::TestDb;
 fn rule(name: &str, on_event: &str, when: Option<&str>) -> RawRule {
     RawRule {
         name: name.to_string(),
-        on_event: on_event.to_string(),
+        on_event: Some(on_event.to_string()),
+        schedule: None,
         when: when.map(|s| s.to_string()),
         do_steps: vec![RawDoStep {
             handler: "jobs.spawn".into(),

@@ -15,7 +15,7 @@
 use serde::Serialize;
 use sqlx::{PgPool, Row};
 
-use super::registry::{RawDoStep, RawRule, RegistryError, Rule};
+use super::registry::{Cadence, RawDoStep, RawRule, RawSchedule, RegistryError, Rule};
 
 /// One stored `dispatcher_rules` row: the rule content + its lifecycle.
 #[derive(Debug, Clone, Serialize)]
@@ -23,7 +23,13 @@ pub struct RuleVersion {
     pub name: String,
     pub version: i32,
     pub status: String,
-    pub on_event: String,
+    /// `None` for a schedule-triggered rule (mutually exclusive with
+    /// `schedule`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_event: Option<String>,
+    /// `None` for an event-triggered rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<RawSchedule>,
     pub when: Option<String>,
     // Serialize as `do` to match the cascade-viz feed (RawRule) + the SPA's
     // DispatcherRuleDo type — one rule-content shape across the API.
@@ -47,7 +53,8 @@ fn store<E: std::fmt::Display>(e: E) -> AuthoringError {
     AuthoringError::Storage(e.to_string())
 }
 
-const SELECT_COLS: &str = "name, version, status, on_event, when_expr, do_steps, delay, created_at";
+const SELECT_COLS: &str = "name, version, status, on_event, when_expr, do_steps, delay, \
+     schedule_cadence, schedule_anchor, schedule_calendar, created_at";
 
 /// Parse a draft through the SAME `Rule::from_raw` the runtime uses, so an
 /// authoring error (bad topic / `when` / arg expr) surfaces before persist.
@@ -60,11 +67,34 @@ fn row_to_version(row: &sqlx::postgres::PgRow) -> Result<RuleVersion, AuthoringE
     let do_json: serde_json::Value = row.try_get("do_steps").map_err(store)?;
     let do_steps: Vec<RawDoStep> = serde_json::from_value(do_json)
         .map_err(|e| AuthoringError::Storage(format!("do_steps: {e}")))?;
+    // Reassemble the schedule from its columns (both NULL for an event rule).
+    let cadence: Option<String> = row.try_get("schedule_cadence").map_err(store)?;
+    let anchor: Option<chrono::NaiveDate> = row.try_get("schedule_anchor").map_err(store)?;
+    let calendar: Option<String> = row.try_get("schedule_calendar").map_err(store)?;
+    let schedule = match (cadence, anchor) {
+        (Some(c), Some(anchor_date)) => {
+            let cadence = Cadence::parse(&c).ok_or_else(|| {
+                AuthoringError::Storage(format!("unknown schedule_cadence {c:?}"))
+            })?;
+            Some(RawSchedule {
+                cadence,
+                anchor_date,
+                business_calendar: calendar,
+            })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(AuthoringError::Storage(
+                "schedule_cadence and schedule_anchor must both be set or both NULL".into(),
+            ));
+        }
+    };
     Ok(RuleVersion {
         name: row.try_get("name").map_err(store)?,
         version: row.try_get("version").map_err(store)?,
         status: row.try_get("status").map_err(store)?,
         on_event: row.try_get("on_event").map_err(store)?,
+        schedule,
         when: row.try_get("when_expr").map_err(store)?,
         do_steps,
         delay: row.try_get("delay").map_err(store)?,
@@ -129,10 +159,18 @@ pub async fn create_draft(pool: &PgPool, raw: &RawRule) -> Result<RuleVersion, A
     .fetch_one(&mut *tx)
     .await
     .map_err(store)?;
+    // Decompose the schedule into its columns (all NULL for an event rule).
+    let sched_cadence = raw.schedule.as_ref().map(|s| s.cadence.as_str());
+    let sched_anchor = raw.schedule.as_ref().map(|s| s.anchor_date);
+    let sched_calendar = raw
+        .schedule
+        .as_ref()
+        .and_then(|s| s.business_calendar.clone());
     sqlx::query(
         "INSERT INTO dispatcher_rules \
-            (name, version, status, on_event, when_expr, do_steps, delay) \
-         VALUES ($1, $2, 'draft', $3, $4, $5, $6)",
+            (name, version, status, on_event, when_expr, do_steps, delay, \
+             schedule_cadence, schedule_anchor, schedule_calendar) \
+         VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(&raw.name)
     .bind(next)
@@ -140,6 +178,9 @@ pub async fn create_draft(pool: &PgPool, raw: &RawRule) -> Result<RuleVersion, A
     .bind(&raw.when)
     .bind(&do_json)
     .bind(&raw.delay)
+    .bind(sched_cadence)
+    .bind(sched_anchor)
+    .bind(sched_calendar)
     .execute(&mut *tx)
     .await
     .map_err(store)?;

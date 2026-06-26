@@ -13,8 +13,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 tracing = { workspace = true }
+# Streaming clock subscriber (SSE consumer of /api/clock/ticks): the
+# dispatcher's timing triggers + the sim daemon drive their loops off it.
+async-stream = "0.3"
+futures = { workspace = true }
 
 [dev-dependencies]
 boss-clock = { path = "../boss-clock" }

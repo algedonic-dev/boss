@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use boss_calendar_client::ReqwestCalendarClient;
 use boss_dispatcher::config::DispatcherConfig;
 use boss_dispatcher::dispatcher::{DispatcherCtx, run_loop};
 use boss_dispatcher::http::{HttpState, router};
@@ -26,6 +27,7 @@ use boss_dispatcher::rules::helpers_inventory::InventoryHelpers;
 use boss_dispatcher::rules::jobs_spawn::JobsSpawn;
 use boss_dispatcher::rules::registry::{Registry as RuleRegistry, load_active_rules};
 use boss_dispatcher::rules::runner::RulesRunner;
+use boss_dispatcher::rules::schedule_runner::{DEFAULT_CATCHUP_CAP, ScheduleRunner};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -191,6 +193,14 @@ async fn main() -> Result<()> {
                 cfg.inventory_api_url.clone(),
                 cfg.jobs_api_url.clone(),
             ));
+            // The schedule runner shares the SAME handlers (jobs.spawn et
+            // al.) + the SAME parsed registry as the event runner — only
+            // the trigger differs (clock day vs NATS event). Both are
+            // Clone (handlers are Arc'd; the registry is parsed Exprs), so
+            // clone before moving the originals into the event runner.
+            let sched_registry = registry.clone();
+            let sched_handlers = handlers.clone();
+
             let runner = Arc::new(RulesRunner {
                 registry,
                 handlers,
@@ -201,6 +211,24 @@ async fn main() -> Result<()> {
             tokio::spawn(async move {
                 if let Err(e) = runner.run(js_for_runner, live_for_runner).await {
                     tracing::error!(error = %e, "rules runner exited with error");
+                }
+            });
+
+            // Clock-driven schedule runner: fires schedule-triggered rules
+            // on sim-day boundaries off the clock SSE feed. No-op (returns
+            // immediately) when the registry has no schedule rules.
+            let schedule_runner = Arc::new(ScheduleRunner {
+                registry: sched_registry,
+                handlers: sched_handlers,
+                clock_url: cfg.clock_api_url.clone(),
+                pool: pool.clone(),
+                calendar: Arc::new(ReqwestCalendarClient::new(cfg.calendar_api_url.clone())),
+                catchup_cap: DEFAULT_CATCHUP_CAP,
+            });
+            let live_for_schedule = live.clone();
+            tokio::spawn(async move {
+                if let Err(e) = schedule_runner.run(live_for_schedule).await {
+                    tracing::error!(error = %e, "schedule runner exited with error");
                 }
             });
         }

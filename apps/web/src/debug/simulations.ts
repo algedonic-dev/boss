@@ -11,7 +11,7 @@
 // find + prune later. Sim-control actions hit the new
 // `/api/jobs/sim-clock/{pause,resume}` endpoints.
 
-import { appToday } from '@boss/web-kit/sim-clock';
+import { appNow, appToday } from '@boss/web-kit/sim-clock';
 
 export type SimLogger = (msg: string) => void;
 
@@ -314,7 +314,9 @@ export async function runHire(log: SimLogger): Promise<void> {
   });
   log(`Hiring Job ${jobId.slice(0, 8)}… created`);
 
-  const interviewAt = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
+  // Sim-time + 7 days — the demo runs in sim-time, so a wallclock
+  // interview date would land years off the brewery's calendar.
+  const interviewAt = new Date(appNow().getTime() + 7 * 24 * 3600 * 1000).toISOString();
 
   await runSteps(log, jobId, [
     {

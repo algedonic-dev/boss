@@ -40,11 +40,13 @@ pub struct RulesRunner {
 impl RulesRunner {
     /// Compute the set of NATS topics to subscribe to. Walks the
     /// rule registry, deduplicating identical `on_event` patterns.
+    /// Schedule-triggered rules contribute nothing — they fire off the
+    /// clock stream, not a NATS subscription.
     pub fn subscriptions(&self) -> HashSet<String> {
         self.registry
             .rules()
             .iter()
-            .map(|r| r.on_event.raw().to_string())
+            .filter_map(|r| r.event_pattern().map(|p| p.raw().to_string()))
             .collect()
     }
 
