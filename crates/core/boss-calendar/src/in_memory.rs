@@ -6,13 +6,15 @@
 //! requested window. Soft reservations always succeed regardless
 //! of overlap.
 
+use std::collections::HashMap;
 use std::sync::RwLock;
 
 use async_trait::async_trait;
 use chrono::Utc;
 
 use boss_core::calendar::{
-    Reservation, ReservationId, ReservationRequest, ReservationStrength, TimeWindow,
+    BusinessCalendar, Reservation, ReservationId, ReservationRequest, ReservationStrength,
+    TimeWindow,
 };
 use boss_core::job::Subject;
 
@@ -21,6 +23,9 @@ use crate::port::{CalendarClient, CalendarError};
 #[derive(Default)]
 pub struct InMemoryCalendar {
     rows: RwLock<Vec<Reservation>>,
+    /// Business calendars keyed by `code`. Mirrors the
+    /// `business_calendars` + `business_calendar_closed_days` tables.
+    business_calendars: RwLock<HashMap<String, BusinessCalendar>>,
 }
 
 impl InMemoryCalendar {
@@ -162,6 +167,24 @@ impl CalendarClient for InMemoryCalendar {
             }
         }
         Ok(count)
+    }
+
+    async fn get_business_calendar(
+        &self,
+        code: &str,
+    ) -> Result<Option<BusinessCalendar>, CalendarError> {
+        Ok(self.business_calendars.read().unwrap().get(code).cloned())
+    }
+
+    async fn upsert_business_calendars(
+        &self,
+        calendars: &[BusinessCalendar],
+    ) -> Result<usize, CalendarError> {
+        let mut store = self.business_calendars.write().unwrap();
+        for cal in calendars {
+            store.insert(cal.code.clone(), cal.clone());
+        }
+        Ok(calendars.len())
     }
 }
 

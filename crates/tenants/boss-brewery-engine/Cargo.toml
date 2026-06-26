@@ -43,6 +43,11 @@ boss-jobs = { path = "../../core/boss-jobs" }
 # the postgres adapter out — prepare is a pure public-API client.
 boss-policy = { path = "../../core/boss-policy", default-features = false }
 boss-sim = { path = "../../orchestrators/boss-sim" }
+# Core type for business-calendar DATA passed into the engine.
+boss-core = { path = "../../core/boss-core" }
+# HTTP client port — the daemon fetches business calendars from
+# boss-calendar (one source of truth) instead of hardcoding holidays.
+boss-calendar-client = { path = "../../core/boss-calendar-client" }
 
 # Optional — only the sim-daemon binary needs sqlx.
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio-rustls", "postgres", "chrono", "uuid"], optional = true }

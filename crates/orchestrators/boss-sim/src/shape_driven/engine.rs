@@ -144,6 +144,13 @@ pub fn simulate_tick_with_handlers(
     birth_subjects(tenant, day, tick, state, rng, output, &mut summary);
 
     // 3. Sample new Jobs from the JobKind registry's tenant rates.
+    //    The sampler's weekday/weekend/holiday demand multipliers read
+    //    the `us-banking` calendar DATA carried on state (seeded by the
+    //    daemon from boss-calendar; the `Default` carries the 2026
+    //    holiday set for tests). Clone once per tick into a local so
+    //    the immutable calendar borrow doesn't conflict with the
+    //    mutable `state` borrows in the loop below.
+    let us_banking = state.us_banking.clone();
     let mut kinds: Vec<(&String, &crate::shape_driven::tenant::JobRate)> =
         tenant.job_rates.iter().collect();
     kinds.sort_by(|a, b| a.0.cmp(b.0));
@@ -154,13 +161,13 @@ pub fn simulate_tick_with_handlers(
             // we did before the cadence path was added. Tick-scaled
             // so an unknown kind doesn't 24x its drop count at
             // hourly granularity.
-            let count = count_jobs_for_tick(rate, day, tick, rng) as u64;
+            let count = count_jobs_for_tick(rate, day, tick, &us_banking, rng) as u64;
             summary.jobs_skipped_unknown_kind += count;
             state.counters.jobs_skipped_unknown_kind += count;
             continue;
         };
         if spec.subject_kinds.is_empty() {
-            let count = count_jobs_for_tick(rate, day, tick, rng) as u64;
+            let count = count_jobs_for_tick(rate, day, tick, &us_banking, rng) as u64;
             summary.jobs_skipped_no_subject += count;
             state.counters.jobs_skipped_no_subject += count;
             continue;
@@ -202,7 +209,8 @@ pub fn simulate_tick_with_handlers(
         //     after `pick_subject` returns. Per-tick lambda is
         //     `effective_rate × kind_wide_mult × tick.day_fraction`.
         let kind_wide_mult = active_shock_multiplier(state, kind, None);
-        let count = count_jobs_with_multiplier(rate, day, tick, rng, kind_wide_mult) as u64;
+        let count =
+            count_jobs_with_multiplier(rate, day, tick, &us_banking, rng, kind_wide_mult) as u64;
         if count == 0 {
             continue;
         }
@@ -901,6 +909,7 @@ fn count_jobs_with_multiplier(
     jr: &crate::shape_driven::tenant::JobRate,
     today: chrono::NaiveDate,
     tick: &Tick,
+    us_banking: &boss_core::calendar::BusinessCalendar,
     rng: &mut Rng,
     multiplier: f64,
 ) -> u32 {
@@ -908,14 +917,14 @@ fn count_jobs_with_multiplier(
         if !tick.is_first_in_day {
             return 0;
         }
-        let effective =
-            crate::shape_driven::sampler::effective_rate_for_day(jr, today) * multiplier;
+        let effective = crate::shape_driven::sampler::effective_rate_for_day(jr, today, us_banking)
+            * multiplier;
         if effective <= 0.0 {
             return 0;
         }
         return effective.round() as u32;
     }
-    let lambda = crate::shape_driven::sampler::effective_rate_for_day(jr, today)
+    let lambda = crate::shape_driven::sampler::effective_rate_for_day(jr, today, us_banking)
         * multiplier
         * tick.day_fraction();
     if lambda <= 0.0 {

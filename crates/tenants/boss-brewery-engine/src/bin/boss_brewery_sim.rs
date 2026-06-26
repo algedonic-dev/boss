@@ -341,6 +341,33 @@ async fn main() -> Result<()> {
     // DATABASE_URL env var (BOSS_POSTGRES_URL) is read by the
     // boss-brewery-engine subprocess for its own purposes.
 
+    // Business calendars as DATA — fetched from boss-calendar so the
+    // sim shares ONE source of truth with the dispatcher + service
+    // rather than hardcoding holiday lists. Collect the distinct codes
+    // the tenant's counterparty + periodic specs reference (plus
+    // us-banking, which the sampler always needs), fetch each, and feed
+    // the result into `load`. A calendar that's absent / fails to fetch
+    // is logged + skipped; the engine's all-business fallback covers
+    // the miss. The tenant.toml parse here is cheap + repeated inside
+    // `load`; collecting codes off it keeps the fetch list data-driven.
+    let codes = {
+        let seeds = seeds_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let tenant = boss_sim::shape_driven::TenantConfig::load(&seeds.join("tenant.toml"))
+                .with_context(|| format!("loading tenant config from {}", seeds.display()))?;
+            Ok(boss_brewery_engine::brewery_calendar_codes(&tenant))
+        })
+        .await
+        .context("spawn_blocking collect calendar codes")??
+    };
+    info!(?codes, "fetching business calendars from boss-calendar");
+    let calendars = boss_brewery_engine::fetch_calendars(&api_base, &codes).await;
+    info!(
+        fetched = calendars.len(),
+        requested = codes.len(),
+        "business calendars fetched"
+    );
+
     // Long-lived engine state. Held across every tick so
     // counterparty pending-action chains survive the 1-day-chunk
     // boundaries. spawn_blocking + Mutex so the sync engine can
@@ -354,7 +381,7 @@ async fn main() -> Result<()> {
     let engine = Arc::new(Mutex::new(
         tokio::task::spawn_blocking({
             let seeds = seeds_path.clone();
-            move || BreweryEngineState::load(&seeds)
+            move || BreweryEngineState::load(&seeds, calendars)
         })
         .await
         .context("spawn_blocking engine load")??,

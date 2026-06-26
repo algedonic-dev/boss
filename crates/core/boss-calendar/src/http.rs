@@ -14,6 +14,12 @@
 //! - `POST /api/calendar/cancel-by-reason` — cascade cancel by
 //!   `(reason_kind, reason_ref_id)`. Body: `{kind, ref_id, actor}`.
 //!   Returns `{ "cancelled": <n> }`.
+//! - `POST /api/calendar/business-calendars/batch` — seed/replace
+//!   business calendars. Body: `Vec<BusinessCalendar>`. Operator-gated
+//!   (with the `x-sim-origin` bypass). Returns
+//!   `{ "received": <n>, "upserted": <m> }`.
+//! - `GET  /api/calendar/business-calendars/{code}` — fetch one business
+//!   calendar with its full closed-day set, or 404. Open read.
 
 use std::sync::Arc;
 
@@ -25,8 +31,9 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use boss_core::calendar::{ReservationId, ReservationRequest, TimeWindow};
+use boss_core::calendar::{BusinessCalendar, ReservationId, ReservationRequest, TimeWindow};
 use boss_core::job::Subject;
+use boss_policy_client::{AccessTier, CurrentUser};
 
 use crate::port::{CalendarClient, CalendarError};
 
@@ -53,6 +60,14 @@ pub fn router(state: CalendarApiState) -> Router {
             delete(cancel_reservation),
         )
         .route("/api/calendar/cancel-by-reason", post(cancel_by_reason))
+        .route(
+            "/api/calendar/business-calendars/batch",
+            post(batch_business_calendars),
+        )
+        .route(
+            "/api/calendar/business-calendars/{code}",
+            get(get_business_calendar),
+        )
         .with_state(state)
 }
 
@@ -209,6 +224,52 @@ async fn cancel_by_reason(
             }
             Json(serde_json::json!({ "cancelled": n })).into_response()
         }
+        Err(e) => calendar_error_response(e),
+    }
+}
+
+/// Batch-upsert business calendars — the seed surface, used to load
+/// the `us-banking` / `us-tax` reference calendars from JSON instead of
+/// `psql -f`. Each calendar is upserted by `code`; its closed-day set is
+/// replaced wholesale.
+///
+/// Gated to operator-tier callers, with the `x-sim-origin` bypass that
+/// every seed path honors (the trusted simulator/seeder masquerades as
+/// operators; its requests carry `x-sim-origin: true`, which the
+/// request-context middleware scopes into `is_in_sim_chain`). Reads stay
+/// open; only this write is privileged.
+async fn batch_business_calendars(
+    State(state): State<CalendarApiState>,
+    CurrentUser(user): CurrentUser,
+    Json(calendars): Json<Vec<BusinessCalendar>>,
+) -> Response {
+    let sim = boss_core::sim_origin::is_in_sim_chain();
+    let tier_ok = matches!(user.access_tier, AccessTier::Operator);
+    if !(sim || tier_ok) {
+        return (StatusCode::FORBIDDEN, "operator tier required").into_response();
+    }
+
+    let received = calendars.len();
+    match state.calendar.upsert_business_calendars(&calendars).await {
+        Ok(upserted) => Json(serde_json::json!({
+            "received": received,
+            "upserted": upserted,
+        }))
+        .into_response(),
+        Err(e) => calendar_error_response(e),
+    }
+}
+
+/// Fetch one business calendar by `code` with its full closed-day set,
+/// or 404 if no such calendar exists. Open read — callers run the
+/// business-day math locally via `boss_core::calendar::BusinessCalendar`.
+async fn get_business_calendar(
+    State(state): State<CalendarApiState>,
+    Path(code): Path<String>,
+) -> Response {
+    match state.calendar.get_business_calendar(&code).await {
+        Ok(Some(cal)) => Json(cal).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no such business calendar").into_response(),
         Err(e) => calendar_error_response(e),
     }
 }
@@ -370,5 +431,156 @@ mod tests {
         assert_eq!(json["error"], "conflict");
         assert_eq!(json["existing"].as_array().unwrap().len(), 1);
         assert_eq!(json["existing"][0]["reason_ref_id"], "stp-1");
+    }
+
+    // --- business-calendar batch (operator-gated) + get round-trip ---
+
+    /// `x-boss-user` JSON for an operator-tier caller — mirrors the
+    /// header the gateway injects + the seed binaries send.
+    fn operator_header() -> String {
+        serde_json::json!({
+            "id": "automation:test-seed",
+            "role": "platform-admin",
+            "access_tier": "operator",
+            "territory_account_ids": [],
+            "direct_report_ids": [],
+        })
+        .to_string()
+    }
+
+    fn batch_request(user_header: Option<&str>, body: serde_json::Value) -> Request<Body> {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri("/api/calendar/business-calendars/batch")
+            .header("content-type", "application/json");
+        if let Some(h) = user_header {
+            b = b.header("x-boss-user", h);
+        }
+        b.body(Body::from(body.to_string())).unwrap()
+    }
+
+    fn one_calendar(closed: &[&str]) -> serde_json::Value {
+        serde_json::json!([{
+            "code": "us-banking",
+            "name": "US Banking",
+            "weekend": [5, 6],
+            "closed": closed,
+        }])
+    }
+
+    async fn get_calendar(app: &Router, code: &str) -> (StatusCode, Option<serde_json::Value>) {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/calendar/business-calendars/{code}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        if status != StatusCode::OK {
+            return (status, None);
+        }
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, Some(serde_json::from_slice(&bytes).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn get_business_calendar_404_for_missing() {
+        let (status, _) = get_calendar(&app(), "no-such-calendar").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn batch_upsert_inserts_for_operator_then_get_round_trips() {
+        let app = app();
+        let resp = app
+            .clone()
+            .oneshot(batch_request(
+                Some(&operator_header()),
+                one_calendar(&["2026-01-01", "2026-07-03"]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["received"], serde_json::json!(1));
+        assert_eq!(v["upserted"], serde_json::json!(1));
+
+        let (status, cal) = get_calendar(&app, "us-banking").await;
+        assert_eq!(status, StatusCode::OK);
+        let cal = cal.unwrap();
+        assert_eq!(cal["code"], "us-banking");
+        assert_eq!(
+            cal["closed"],
+            serde_json::json!(["2026-01-01", "2026-07-03"])
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_upsert_replaces_closed_set_wholesale() {
+        let app = app();
+        // v1: one closed day.
+        let r1 = app
+            .clone()
+            .oneshot(batch_request(
+                Some(&operator_header()),
+                one_calendar(&["2026-01-01"]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        // v2 (same code): a different closed set — replaces, does NOT merge.
+        let r2 = app
+            .clone()
+            .oneshot(batch_request(
+                Some(&operator_header()),
+                one_calendar(&["2026-07-03", "2026-12-25"]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+
+        let (_, cal) = get_calendar(&app, "us-banking").await;
+        assert_eq!(
+            cal.unwrap()["closed"],
+            serde_json::json!(["2026-07-03", "2026-12-25"]),
+            "re-seed replaces the closed set wholesale (no merge with v1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_upsert_forbidden_for_non_operator() {
+        // No `x-boss-user` header → anonymous, AccessTier::User.
+        let resp = app()
+            .oneshot(batch_request(None, one_calendar(&["2026-01-01"])))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn batch_upsert_bypassed_by_sim_origin() {
+        // Sim traffic carries `x-sim-origin: true`, scoped into
+        // `is_in_sim_chain`. The router omits that middleware, so set the
+        // task-local directly to exercise the bypass with an anonymous caller.
+        let app = app();
+        let resp = boss_core::sim_origin::with_sim_chain(
+            true,
+            app.clone()
+                .oneshot(batch_request(None, one_calendar(&["2026-01-01"]))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (status, _) = get_calendar(&app, "us-banking").await;
+        assert_eq!(status, StatusCode::OK);
     }
 }

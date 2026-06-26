@@ -12,6 +12,12 @@ use serde_json::Value;
 use crate::calendar::{BusinessCalendar, CalendarRegistry};
 use crate::engines::{DayContext, SimEngine};
 
+// `BusinessCalendar` here is the data type re-exported from
+// `boss_core::calendar` via `crate::calendar` — the business-day
+// methods (`is_business_day`, `next_business_day`, `add_business_days`)
+// are identical to the old sim trait, so the engine logic below is
+// unchanged.
+
 /// Built-in cadence shapes. Tenants pick one per spec; firing math
 /// is below in `Cadence::fires_on` (date-only) and
 /// `Cadence::fires_on_tick` (sub-day-aware).
@@ -189,7 +195,7 @@ fn coarse_fires_today(
     cadence: &Cadence,
     anchor: NaiveDate,
     day: NaiveDate,
-    cal: &dyn BusinessCalendar,
+    cal: &BusinessCalendar,
 ) -> bool {
     if !cal.is_business_day(day) {
         return false;
@@ -198,7 +204,13 @@ fn coarse_fires_today(
         let Some(nominal) = day.checked_sub_days(Days::new(back)) else {
             break;
         };
-        if cadence.fires_on(anchor, nominal) && cal.next_business_day(nominal) == day {
+        // `business_day_on_or_after` (not `next_business_day`): a nominal
+        // day that is itself a business day must map to itself (back==0
+        // fires on the day), and a non-business nominal carries forward
+        // to the first business day on or after it. The boss-core
+        // `next_business_day` is "strictly after", which would skip the
+        // on-the-day case — so use the on-or-after primitive here.
+        if cadence.fires_on(anchor, nominal) && cal.business_day_on_or_after(nominal) == day {
             return true;
         }
     }
@@ -457,7 +469,7 @@ mod tests {
         // Day-31 quarterly on a weekday-only calendar. 2026-01-31 is a
         // Saturday, so the Jan-quarter fire is carried forward to Monday
         // 2026-02-02 rather than dropped for the whole quarter.
-        let reg = CalendarRegistry::with_builtins();
+        let reg = CalendarRegistry::for_tests();
         let cal = reg.get(Some("weekdays-only"));
         let anchor = d(2024, 1, 31);
         let q = Cadence::Quarterly;
@@ -487,7 +499,7 @@ mod tests {
                     subject_id: Some("loc-brewery-brewhouse".into()),
                 },
             }],
-            CalendarRegistry::with_builtins(),
+            CalendarRegistry::for_tests(),
         );
         let out = step_engine(&mut engine, d(2026, 4, 15));
         assert_eq!(out.events.len(), 1);
@@ -512,7 +524,7 @@ mod tests {
                     payload: json!({"as_of": "today"}),
                 },
             }],
-            CalendarRegistry::with_builtins(),
+            CalendarRegistry::for_tests(),
         );
         // Monday: fires.
         let out = step_engine(&mut engine, d(2026, 4, 27));
@@ -534,7 +546,7 @@ mod tests {
                     payload: Value::Null,
                 },
             }],
-            CalendarRegistry::with_builtins(),
+            CalendarRegistry::for_tests(),
         );
         // Saturday: no fire.
         let out = step_engine(&mut engine, d(2026, 5, 2));
@@ -557,7 +569,7 @@ mod tests {
                     payload: Value::Null,
                 },
             }],
-            CalendarRegistry::with_builtins(),
+            CalendarRegistry::for_tests(),
         );
         let out = step_engine(&mut engine, d(2026, 5, 31));
         assert_eq!(out.events.len(), 0);
@@ -655,7 +667,7 @@ mod tests {
                     payload: Value::Null,
                 },
             }],
-            CalendarRegistry::with_builtins(),
+            CalendarRegistry::for_tests(),
         );
         // 24 hourly ticks over one sim-day → 24 fires.
         let mut state = ShapeDrivenState::new();

@@ -8,7 +8,9 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use boss_core::calendar::{Reservation, ReservationId, ReservationRequest, TimeWindow};
+use boss_core::calendar::{
+    BusinessCalendar, Reservation, ReservationId, ReservationRequest, TimeWindow,
+};
 use boss_core::job::Subject;
 
 #[derive(Debug, thiserror::Error)]
@@ -115,5 +117,22 @@ pub trait CalendarClient: Send + Sync {
         reason_ref_id: &str,
         actor: &str,
         now: DateTime<Utc>,
+    ) -> Result<usize, CalendarError>;
+
+    /// Fetch a named business calendar (`us-banking`, `us-tax`, …) with
+    /// its full `closed`-day set. `None` if no calendar with that code
+    /// exists. Callers run the business-day math locally via the
+    /// `boss_core::calendar::BusinessCalendar` methods.
+    async fn get_business_calendar(
+        &self,
+        code: &str,
+    ) -> Result<Option<BusinessCalendar>, CalendarError>;
+
+    /// Seed/replace business calendars. Each calendar is upserted by
+    /// `code` and its `closed`-day set is replaced wholesale. Returns the
+    /// number of calendars upserted.
+    async fn upsert_business_calendars(
+        &self,
+        calendars: &[BusinessCalendar],
     ) -> Result<usize, CalendarError>;
 }

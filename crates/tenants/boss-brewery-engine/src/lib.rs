@@ -21,6 +21,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use boss_calendar_client::{CalendarClient, ReqwestCalendarClient};
+use boss_core::calendar::BusinessCalendar;
 use boss_inventory::types::InventoryItem;
 use chrono::NaiveDate;
 use serde::Deserialize;
@@ -189,7 +191,20 @@ impl BreweryEngineState {
     /// boss-dispatcher rule registry, which subscribes to
     /// `step.done.<kind>` on NATS and fires the registered HTTP
     /// handlers. The engine just drives Job/Step lifecycle here.
-    pub fn load(seeds: &Path) -> Result<Self> {
+    /// `calendars` are the business calendars the engines consult
+    /// (counterparty delays, periodic postponement, the sampler's
+    /// holiday demand-multiplier) — passed as DATA so a single fetch
+    /// feeds every consumer. The daemon fetches these from
+    /// boss-calendar (see [`fetch_calendars`]) so there is one source
+    /// of truth; the offline regen + test paths pass
+    /// [`test_calendars`]. The `us-banking` calendar is copied onto the
+    /// engine's `ShapeDrivenState` for the sampler; the periodic +
+    /// counterparty engines each get their own registry built from the
+    /// same data.
+    pub fn load(
+        seeds: &Path,
+        calendars: Vec<boss_core::calendar::BusinessCalendar>,
+    ) -> Result<Self> {
         let tenant_path = seeds.join("tenant.toml");
         let kinds_path = seeds.join("job_kinds.toml");
         let tenant = TenantConfig::load(&tenant_path)
@@ -200,12 +215,23 @@ impl BreweryEngineState {
 
         let mut state = ShapeDrivenState::new();
         seed_brewery_subjects(&mut state);
+        // The sampler's weekday/weekend/holiday demand multipliers read
+        // us-banking off state. Seed it from the fetched data; if it
+        // wasn't fetched, the all-business fallback applies (no holiday
+        // suppression — degrades safely).
+        if let Some(us_banking) = calendars.iter().find(|c| c.code == "us-banking") {
+            state.set_us_banking(us_banking.clone());
+        }
 
-        let periodic =
-            PeriodicEngine::new(tenant.periodic_specs(), CalendarRegistry::with_builtins());
+        // The periodic + counterparty engines each own a registry; both
+        // are built from the same fetched data.
+        let periodic = PeriodicEngine::new(
+            tenant.periodic_specs(),
+            CalendarRegistry::from_data(calendars.clone()),
+        );
         let counterparty = CounterpartyEngine::new(
             tenant.counterparty_specs(),
-            CalendarRegistry::with_builtins(),
+            CalendarRegistry::from_data(calendars),
         );
         let rng = Rng::new(tenant.meta.seed);
 
@@ -221,6 +247,114 @@ impl BreweryEngineState {
             report: RunReport::default(),
         })
     }
+}
+
+/// The distinct business-calendar codes the tenant's counterparty +
+/// periodic specs reference, plus an unconditional `"us-banking"` (the
+/// shape-driven sampler always needs it for its holiday demand
+/// multipliers). Sorted + de-duplicated. This is the fetch list the
+/// daemon hands to [`fetch_calendars`].
+pub fn brewery_calendar_codes(tenant: &TenantConfig) -> Vec<String> {
+    let mut codes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // The sampler reads us-banking regardless of any spec referencing it.
+    codes.insert("us-banking".to_string());
+    for spec in tenant.counterparty_specs() {
+        if let Some(c) = spec.delay.business_calendar {
+            codes.insert(c);
+        }
+    }
+    for spec in tenant.periodic_specs() {
+        if let Some(c) = spec.business_calendar {
+            codes.insert(c);
+        }
+    }
+    codes.into_iter().collect()
+}
+
+/// Fetch each named calendar from the boss-calendar service via
+/// `boss-calendar-client`, returning the ones that resolve. A calendar
+/// that 404s (absent) or whose fetch errors (service down) is logged
+/// and skipped — the `CalendarRegistry`/`ShapeDrivenState` fallbacks
+/// cover the miss (an absent calendar degrades to "all days are
+/// business days", same permissive policy as the rest of the sim).
+///
+/// `api_base` is the sim's API base (`direct://host` or an http
+/// origin). The calendar service's URL is resolved from boss_ports for
+/// the `direct://` loopback; an explicit gateway base is used verbatim.
+pub async fn fetch_calendars(api_base: &str, codes: &[String]) -> Vec<BusinessCalendar> {
+    let base = calendar_base_url(api_base);
+    let client = ReqwestCalendarClient::new(base);
+    let mut out = Vec::new();
+    for code in codes {
+        match client.get_business_calendar(code).await {
+            Ok(Some(cal)) => {
+                tracing::info!(code = %code, closed = cal.closed.len(), "fetched business calendar");
+                out.push(cal);
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    code = %code,
+                    "business calendar absent in boss-calendar; using all-business fallback"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    code = %code,
+                    error = %e,
+                    "fetching business calendar failed; using all-business fallback"
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Resolve the boss-calendar service base URL from the sim's
+/// `api_base`. The `direct://host` loopback marker maps to the
+/// calendar service's own localhost port via boss_ports; an explicit
+/// gateway base routes through that one origin.
+fn calendar_base_url(api_base: &str) -> String {
+    if api_base.starts_with("direct://") {
+        std::env::var("BOSS_CALENDAR_URL").unwrap_or_else(|_| boss_ports::url("calendar"))
+    } else {
+        api_base.trim_end_matches('/').to_string()
+    }
+}
+
+/// Inline business calendars — the FALLBACK used only when the seed
+/// file is absent (synthetic/minimal seed dirs in tests). Production
+/// paths use DATA instead: the live daemon fetches from boss-calendar
+/// ([`fetch_calendars`]); the offline regen reads the seed bundle
+/// ([`calendars_from_seeds`]). Kept aligned with `for_tests` so the
+/// unit suite has self-contained fixtures.
+pub fn test_calendars() -> Vec<BusinessCalendar> {
+    let reg = CalendarRegistry::for_tests();
+    ["us-banking", "us-tax", "weekdays-only"]
+        .into_iter()
+        .map(|c| reg.get(Some(c)).clone())
+        .collect()
+}
+
+/// Load the tenant's business calendars from the seed bundle
+/// (`business_calendars.json`) — the same DATA boss-calendar is seeded
+/// from, so the offline regen + in-memory runs resolve business days
+/// from the single source of truth rather than a hardcoded copy. Falls
+/// back to [`test_calendars`] only if the seed file is absent or
+/// unparseable (minimal seed dirs in tests).
+pub fn calendars_from_seeds(seeds: &Path) -> Vec<BusinessCalendar> {
+    let path = seeds.join("business_calendars.json");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => match serde_json::from_str::<Vec<BusinessCalendar>>(&s) {
+            Ok(cals) => return cals,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "business_calendars.json parse failed; using inline fallback")
+            }
+        },
+        Err(_) => {
+            tracing::warn!(path = %path.display(), "business_calendars.json absent; using inline fallback")
+        }
+    }
+    test_calendars()
 }
 
 /// Advance the engine by exactly one tick. The `boss-brewery-sim`
@@ -292,7 +426,7 @@ pub fn run_brewery_into(
     start: Option<NaiveDate>,
     output: &mut dyn SimOutput,
 ) -> Result<RunReport> {
-    let mut engine = BreweryEngineState::load(seeds)?;
+    let mut engine = BreweryEngineState::load(seeds, calendars_from_seeds(seeds))?;
     let start = start.unwrap_or(engine.tenant.meta.start_date);
     let end = start + chrono::Duration::days(days as i64 - 1);
     let ticks_per_day = engine.tenant.meta.ticks_per_day();
@@ -464,7 +598,7 @@ pub fn run_brewery_live(
     poll_sleep_ms: u64,
     output: &mut dyn SimOutput,
 ) -> Result<RunReport> {
-    let mut engine = BreweryEngineState::load(seeds)?;
+    let mut engine = BreweryEngineState::load(seeds, calendars_from_seeds(seeds))?;
     let start = start.unwrap_or(engine.tenant.meta.start_date);
     let end = start + chrono::Duration::days(days as i64 - 1);
     let ticks_per_day = engine.tenant.meta.ticks_per_day();
