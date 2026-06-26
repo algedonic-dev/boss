@@ -15,6 +15,7 @@ boss-nats = { path = "../boss-nats" }
 boss-jobs = { path = "../boss-jobs" }
 boss-expr = { path = "../boss-expr" }
 boss-clock-client = { path = "../boss-clock-client" }
+boss-calendar-client = { path = "../boss-calendar-client" }
 boss-events = { path = "../boss-events" }
 anyhow = { workspace = true }
 async-nats = { workspace = true }

@@ -56,6 +56,13 @@ pub struct DispatcherConfig {
     pub shipping_api_url: String,
     pub ledger_api_url: String,
     pub messages_api_url: String,
+    /// Clock service base URL. The schedule runner consumes its SSE tick
+    /// feed (`GET /api/clock/ticks`) to drive sim-day-boundary firing of
+    /// schedule-triggered rules.
+    pub clock_api_url: String,
+    /// Calendar service base URL. The schedule runner fetches the
+    /// business calendars its schedule rules reference at startup.
+    pub calendar_api_url: String,
     pub http_bind: String,
     /// Postgres URL — the dispatcher loads its rule registry (the
     /// append-only versioned `dispatcher_rules` table) from here at
@@ -99,6 +106,10 @@ impl Default for DispatcherConfig {
                 .unwrap_or_else(|_| boss_ports::url("ledger")),
             messages_api_url: std::env::var("BOSS_MESSAGES_URL")
                 .unwrap_or_else(|_| boss_ports::url("messages")),
+            clock_api_url: std::env::var("BOSS_CLOCK_URL")
+                .unwrap_or_else(|_| boss_ports::url("clock")),
+            calendar_api_url: std::env::var("BOSS_CALENDAR_URL")
+                .unwrap_or_else(|_| boss_ports::url("calendar")),
             http_bind: format!("0.0.0.0:{}", boss_ports::prod("dispatcher")),
             postgres_url: std::env::var("BOSS_POSTGRES_URL")
                 .unwrap_or_else(|_| "postgres://boss:boss@127.0.0.1/boss".to_string()),

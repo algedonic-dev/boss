@@ -29,6 +29,15 @@ pub struct DispatcherLiveness {
     rules_running: AtomicBool,
     /// Side-effect events the rules runner has handled since bind (monotonic).
     rules_events: AtomicU64,
+    /// The schedule runner's clock-stream loop is live (consuming ticks).
+    /// Unlike the two JetStream consumers this is an SSE loop, but it's the
+    /// same liveness question: a process that's health-200 but whose
+    /// schedule loop died fires zero clock-driven rules (payroll, tax,
+    /// sweeps stop). `true` only matters when the registry HAS schedule
+    /// rules — with none, the runner never starts and this stays false.
+    schedule_running: AtomicBool,
+    /// Sim-days the schedule runner has fired since start (monotonic).
+    schedule_events: AtomicU64,
     /// Wall-clock unix seconds of the most recently handled event (0 = none yet).
     last_event_unix: AtomicI64,
 }
@@ -71,18 +80,40 @@ impl DispatcherLiveness {
             .store(Self::now_unix(), Ordering::Relaxed);
     }
 
+    /// Called by the schedule runner once its clock-stream loop is live.
+    pub fn mark_schedule_running(&self) {
+        self.schedule_running.store(true, Ordering::Relaxed);
+    }
+    /// Called by the schedule runner when its clock stream ends.
+    pub fn mark_schedule_stopped(&self) {
+        self.schedule_running.store(false, Ordering::Relaxed);
+    }
+    /// Called by the schedule runner per sim-day it fires.
+    pub fn record_schedule(&self) {
+        self.schedule_events.fetch_add(1, Ordering::Relaxed);
+        self.last_event_unix
+            .store(Self::now_unix(), Ordering::Relaxed);
+    }
+
     /// JSON body for `/api/dispatcher/readyz`. `ready` is true only when BOTH
     /// durable consumers are bound — the precondition for a Job to flow
     /// step-ready → assigned → worked → side-effects → closed.
     pub fn snapshot(&self) -> serde_json::Value {
         let assigning = self.assigning.load(Ordering::Relaxed);
         let rules_running = self.rules_running.load(Ordering::Relaxed);
+        // `ready` stays gated on the two JetStream consumers only — the
+        // schedule runner is optional (it never starts when the registry
+        // has no schedule rules), so gating readiness on it would falsely
+        // mark a schedule-free deployment not-ready. Its liveness is
+        // reported as informational fields instead.
         serde_json::json!({
             "ready": assigning && rules_running,
             "assigning": assigning,
             "assignment_events": self.assignment_events.load(Ordering::Relaxed),
             "rules_running": rules_running,
             "rules_events": self.rules_events.load(Ordering::Relaxed),
+            "schedule_running": self.schedule_running.load(Ordering::Relaxed),
+            "schedule_events": self.schedule_events.load(Ordering::Relaxed),
             "last_event_unix": self.last_event_unix.load(Ordering::Relaxed),
         })
     }

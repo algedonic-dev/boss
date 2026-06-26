@@ -35,10 +35,20 @@ def main() -> None:
     rows = []
     for r in rules:
         do = [{"handler": s["handler"], "args": s.get("args", {})} for s in r.get("do", [])]
+        # A rule is triggered by EXACTLY ONE of `on_event` or `[rule.schedule]`.
+        # The schedule columns are NULL for an event rule and vice versa.
+        sched = r.get("schedule")
+        if sched is not None:
+            cadence = sql_str(sched["cadence"])
+            anchor = sql_str(sched["anchor_date"])
+            calendar = sql_str(sched.get("business_calendar"))
+        else:
+            cadence = anchor = calendar = "NULL"
         rows.append(
             f"  ({sql_str(r['name'])}, {r.get('version', 1)}, 'active', "
-            f"{sql_str(r['on_event'])}, {sql_str(r.get('when'))}, "
-            f"{sql_jsonb(do)}, {sql_str(r.get('delay'))})"
+            f"{sql_str(r.get('on_event'))}, {sql_str(r.get('when'))}, "
+            f"{sql_jsonb(do)}, {sql_str(r.get('delay'))}, "
+            f"{cadence}, {anchor}, {calendar})"
         )
 
     header = """\
@@ -58,10 +68,20 @@ CREATE TABLE IF NOT EXISTS dispatcher_rules (
     name        TEXT NOT NULL,
     version     INT  NOT NULL,
     status      TEXT NOT NULL CHECK (status IN ('draft', 'active', 'retired')),
-    on_event    TEXT NOT NULL,
+    -- A rule is triggered by EXACTLY ONE of `on_event` (NATS event) or a
+    -- `schedule_*` group (clock-driven). on_event is nullable now so a
+    -- scheduled rule can omit it; the application enforces the XOR.
+    on_event    TEXT,
     when_expr   TEXT,                 -- the rule's `when` predicate (NULL = always)
     do_steps    JSONB NOT NULL,       -- [{"handler": "...", "args": {...}}, ...]
     delay       TEXT,                 -- optional delay spec
+    -- Clock trigger (all-or-nothing): cadence + anchor are both set for a
+    -- scheduled rule, both NULL for an event rule. The dispatcher fires the
+    -- rule on each sim-DAY the cadence selects (postponed onto a business
+    -- day when schedule_calendar names one).
+    schedule_cadence  TEXT,          -- daily|weekly|biweekly|monthly|quarterly|annually
+    schedule_anchor   DATE,          -- cadence anchor date
+    schedule_calendar TEXT,          -- optional business-calendar code (us-banking, …)
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (name, version)
 );
@@ -69,7 +89,17 @@ CREATE TABLE IF NOT EXISTS dispatcher_rules (
 CREATE UNIQUE INDEX IF NOT EXISTS dispatcher_rules_one_active_per_name
     ON dispatcher_rules (name) WHERE status = 'active';
 
-INSERT INTO dispatcher_rules (name, version, status, on_event, when_expr, do_steps, delay) VALUES
+-- Single-row cursor for the clock-driven schedule runner: the last sim-DAY
+-- whose schedule rules have already been fired. The runner reads it at
+-- startup, fires `(cursor, today]` (capped), and persists the advance —
+-- so a restart resumes where it left off instead of replaying or skipping.
+-- The CHECK pins the table to one row (id = 1).
+CREATE TABLE IF NOT EXISTS dispatcher_clock_cursor (
+    id           INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    last_sim_day DATE
+);
+
+INSERT INTO dispatcher_rules (name, version, status, on_event, when_expr, do_steps, delay, schedule_cadence, schedule_anchor, schedule_calendar) VALUES
 """
     OUT.write_text(header + ",\n".join(rows) + ";\n")
     print(f"wrote {OUT.relative_to(ROOT)} with {len(rows)} rules")
