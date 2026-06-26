@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
+use futures::{Stream, StreamExt};
 
 pub use boss_clock::types::ClockNow;
 
@@ -84,6 +85,81 @@ pub trait ClockClient: Send + Sync {
 /// ```
 pub async fn now_from(clock: &Arc<dyn ClockClient>) -> chrono::DateTime<Utc> {
     clock.now().await.now
+}
+
+/// Subscribe to the clock's streaming tick feed (`GET /api/clock/ticks`,
+/// Server-Sent Events) and yield each [`ClockNow`] as it arrives — the
+/// low-latency, always-connected clock feed the dispatcher's timing
+/// triggers and the sim daemon drive their loops off, instead of polling
+/// [`ClockClient::now`] per tick.
+///
+/// Reconnects on disconnect: the SSE is ephemeral with no replay, so a
+/// gap just resumes from the live time (consumers tolerate missed
+/// sub-day ticks via their own cursor). The stream never ends; drop it
+/// to stop.
+///
+/// Deliberately a free fn, off the `ClockClient` trait: only the two
+/// daemons that run time-based loops need streaming; the ~dozen
+/// request/response services keep using `now()`, and the trait stays
+/// object-safe.
+pub fn subscribe_ticks(base_url: impl Into<String>) -> impl Stream<Item = ClockNow> + Send {
+    let url = format!("{}/api/clock/ticks", base_url.into().trim_end_matches('/'));
+    async_stream::stream! {
+        let client = reqwest::Client::new();
+        loop {
+            match client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let mut bytes = resp.bytes_stream();
+                    let mut buf: Vec<u8> = Vec::new();
+                    while let Some(chunk) = bytes.next().await {
+                        let Ok(chunk) = chunk else { break };
+                        buf.extend_from_slice(&chunk);
+                        // SSE events are separated by a blank line ("\n\n").
+                        while let Some(pos) = find_event_boundary(&buf) {
+                            let frame: Vec<u8> = buf.drain(..pos + 2).collect();
+                            if let Ok(s) = std::str::from_utf8(&frame)
+                                && let Some(now) = parse_tick_event(s)
+                            {
+                                yield now;
+                            }
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    tracing::warn!(status = %resp.status(), "clock /ticks returned non-success; retrying");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "clock /ticks unreachable; retrying");
+                }
+            }
+            // Disconnected / failed — back off, then reconnect.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+}
+
+/// Index of the first byte of the first SSE event boundary (`\n\n`) in
+/// `buf`, or `None` if no complete event is buffered yet. Caller drains
+/// `pos + 2` to consume the event including its terminating blank line.
+fn find_event_boundary(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\n\n")
+}
+
+/// Parse one SSE event's `data:` payload into a [`ClockNow`].
+/// Concatenates multiple `data:` lines (SSE permits them), ignores
+/// comment/keep-alive lines (`:`), and returns `None` for an empty or
+/// unparseable event.
+fn parse_tick_event(event: &str) -> Option<ClockNow> {
+    let mut data = String::new();
+    for line in event.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+    }
+    if data.is_empty() {
+        return None;
+    }
+    serde_json::from_str(&data).ok()
 }
 
 /// Adapter that lets any `ClockClient` act as a
@@ -363,5 +439,37 @@ mod tests {
             restart_in_progress: false,
         });
         assert_eq!(c.now().await.now, later);
+    }
+
+    // --- streaming tick subscriber (SSE parsing) ---
+
+    #[test]
+    fn find_event_boundary_locates_blank_line() {
+        assert_eq!(find_event_boundary(b"data: x\n\nrest"), Some(7));
+        assert_eq!(find_event_boundary(b"data: x\n"), None);
+        assert_eq!(find_event_boundary(b""), None);
+    }
+
+    #[test]
+    fn parse_tick_event_round_trips_a_clocknow() {
+        let original = ClockNow::wall();
+        let frame = format!("data: {}\n\n", serde_json::to_string(&original).unwrap());
+        let parsed = parse_tick_event(&frame).expect("a data frame parses");
+        assert_eq!(parsed.now, original.now);
+        assert_eq!(parsed.simulated, original.simulated);
+    }
+
+    #[test]
+    fn parse_tick_event_handles_minimal_and_junk_frames() {
+        // Minimal wire frame — epoch/paused fields default.
+        let now =
+            parse_tick_event("data: {\"now\":\"2025-04-01T13:00:00Z\",\"simulated\":true}\n\n")
+                .expect("minimal frame parses");
+        assert!(now.simulated);
+        assert!(!now.paused);
+        // Keep-alive comment, empty event, and non-JSON → None.
+        assert!(parse_tick_event(": keep-alive\n\n").is_none());
+        assert!(parse_tick_event("\n").is_none());
+        assert!(parse_tick_event("data: not-json\n\n").is_none());
     }
 }
