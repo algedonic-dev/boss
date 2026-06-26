@@ -73,6 +73,12 @@ done
 # the public HTTP API.)
 BANNED_DB_DRIVERS=("sqlx" "tokio-postgres" "deadpool-postgres" "diesel" "postgres" "rusqlite")
 
+# Direct message-bus / event-store crates. Same rule as the DB drivers:
+# a sim-side crate pulling boss-nats (the bus) or boss-events (the event
+# store) could publish or persist behind the public API. The sim emits
+# only through the public HTTP API (LiveApiOutput -> POST /api/...).
+BANNED_BUS_CRATES=("boss-nats" "boss-events")
+
 # Allowlist of CURRENT violators. Each entry is
 # `<sim-crate-path>::<banned-dep-name>`. The lint succeeds when a
 # violation appears here, fails when it doesn't. Empty the list
@@ -122,6 +128,13 @@ for crate_path in "${SIM_SIDE_CRATES[@]}"; do
         for db in "${BANNED_DB_DRIVERS[@]}"; do
             if [[ "$dep" == "$db" ]]; then
                 unexpected_violations+=("$crate_name → $dep (direct DB driver — the sim must use the public API)")
+                violations=$((violations + 1))
+                break
+            fi
+        done
+        for bus in "${BANNED_BUS_CRATES[@]}"; do
+            if [[ "$dep" == "$bus" ]]; then
+                unexpected_violations+=("$crate_name → $dep (direct bus/event-store — the sim must use the public API)")
                 violations=$((violations + 1))
                 break
             fi

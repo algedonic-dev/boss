@@ -1436,7 +1436,6 @@ dependencies = [
  "boss-commerce",
  "boss-core",
  "boss-jobs",
- "boss-nats",
  "boss-ports",
  "boss-shipping",
  "chrono",

@@ -858,6 +858,18 @@ impl TenantConfig {
                 "meta.tick_duration: {e}"
             )));
         }
+        // The workforce-execution knob is operator-editable via the control
+        // plane; a 0 / negative / NaN or absurdly-large multiplier would
+        // freeze the sim. Keep the validator's contract — turn the silent
+        // build_workforce clamp into a loud config-load error. (The bound
+        // rejects NaN and +inf too: both fail the `0 < m <= 100` test.)
+        if let Some(m) = self.meta.step_speed_multiplier
+            && !(0.0 < m && m <= 100.0)
+        {
+            return Err(TenantConfigError::Validation(format!(
+                "meta.step_speed_multiplier must be in (0, 100] (got {m})"
+            )));
+        }
         for (kind, jr) in &self.job_rates {
             if jr.rate < 0.0 {
                 return Err(TenantConfigError::Validation(format!(
@@ -942,6 +954,34 @@ mod tests {
         let sr = &cfg.job_rates["seasonal-release"];
         assert_eq!(sr.weekday_multiplier, Some(1.0));
         assert_eq!(sr.weekend_multiplier, Some(1.0));
+    }
+
+    /// The workforce-execution multiplier is operator-editable via the
+    /// control plane (POST /config), so validate() must reject a value
+    /// that would freeze the sim before it's persisted — turning the
+    /// silent build_workforce clamp into a loud config-load error.
+    #[test]
+    fn validate_rejects_out_of_range_step_speed_multiplier() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("examples/brewery/seeds/tenant.toml");
+        let mut cfg = TenantConfig::load(&path).expect("brewery tenant.toml parses");
+
+        // Sane values pass (None = registry durations as-authored).
+        for ok in [None, Some(0.5), Some(1.0), Some(100.0)] {
+            cfg.meta.step_speed_multiplier = ok;
+            assert!(cfg.validate().is_ok(), "{ok:?} should be accepted");
+        }
+        // 0, negative, NaN, +inf, and absurdly-large all fail loudly.
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e9] {
+            cfg.meta.step_speed_multiplier = Some(bad);
+            assert!(
+                matches!(cfg.validate(), Err(TenantConfigError::Validation(_))),
+                "step_speed_multiplier {bad} should be rejected"
+            );
+        }
     }
 
     /// Sibling test for the used-device-shop tenant. Step 5 of the

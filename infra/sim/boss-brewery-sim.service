@@ -4,6 +4,12 @@ Documentation=https://github.com/algedonic-dev/boss/blob/main/docs/design/projec
 After=postgresql.service nats-server.service network-online.target boss-jobs-api.service boss-dispatcher.service
 Wants=network-online.target
 PartOf=boss-jobs-api.service
+# exit(75) is normal control flow here — every config Apply (POST
+# /simulator/api/config) restarts the daemon (see Restart= below) — so
+# disable systemd's start-rate limiter. A deliberate restart must never
+# trip the limit and leave the unit `failed` (which would need a manual
+# `systemctl reset-failed` before the sim would run again).
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
