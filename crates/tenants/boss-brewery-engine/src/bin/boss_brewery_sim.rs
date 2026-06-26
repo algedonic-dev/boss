@@ -395,16 +395,33 @@ async fn main() -> Result<()> {
     // JobKinds whose terminal step's side-effect POSTs to the
     // canonical `/api/ledger/*` endpoint — every such event has a
     // JobKind / Step / audit-trail behind it.
+    // Vendor behaviors from the model (boss-inventory) — the simulator reads
+    // each vendor's supply profile and synthesizes one supplier counterparty
+    // chain per vendor (paced by its lead time + fulfilment), so the vendor
+    // responds to its own procurement with an invoice. Blocking client →
+    // spawn_blocking. Empty on failure (no synthesized chains).
+    let vendor_behaviors = {
+        let api_base = api_base.clone();
+        tokio::task::spawn_blocking(move || boss_brewery_engine::fetch_vendors(&api_base))
+            .await
+            .unwrap_or_default()
+    };
+    info!(
+        count = vendor_behaviors.len(),
+        "vendor behaviors fetched from boss-inventory"
+    );
+
     let engine = Arc::new(Mutex::new(
         tokio::task::spawn_blocking({
             let seeds = seeds_path.clone();
             // Boot from the control-plane config override if an operator
             // has set one (else the seed tenant.toml) — the "edit +
-            // restart" config model — feeding in the calendars fetched
-            // above so every engine shares one source of truth.
+            // restart" config model — feeding in the calendars + vendor
+            // behaviors fetched above so every engine shares one source of
+            // truth.
             move || -> anyhow::Result<BreweryEngineState> {
                 let tenant = sim_control::effective_tenant(&seeds)?;
-                BreweryEngineState::load_with_tenant(&seeds, tenant, calendars)
+                BreweryEngineState::load_with_tenant(&seeds, tenant, calendars, vendor_behaviors)
             }
         })
         .await

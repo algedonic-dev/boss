@@ -59,6 +59,17 @@ pub fn register_default_event_routes(out: &mut LiveApiOutput) {
         "/api/inventory/vendor-invoices/batch-pay",
         EventHttpMethod::Post,
     );
+    // Vendor "posts" its invoice for a PO — the automated-counterparty path.
+    // The brewery's synthesized per-vendor supplier specs emit this
+    // ~lead-time after `step.done.procurement` (the vendor's API responding);
+    // the from-po endpoint resolves the PO + lands the invoice `received`,
+    // which the human bill-approval step then approves. The po_id is pulled
+    // from the procurement step's metadata inside the folded trigger.
+    out.register_event_route(
+        "inventory.vendor_invoice_received",
+        "/api/inventory/vendor-invoices/from-po/{trigger.metadata.po_id}",
+        EventHttpMethod::Post,
+    );
     // PO placement from the procurement StepType's
     // `inventory.po.place` side effect. Inventory create-order
     // upserts on `id`. Required because the downstream
