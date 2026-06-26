@@ -519,3 +519,37 @@ CREATE INDEX IF NOT EXISTS calendar_reservations_reason_ref
     ON calendar_reservations (reason_kind, reason_ref_id)
     WHERE cancelled_at IS NULL;
 
+
+-- ---------------------------------------------------------------------------
+-- Business calendars — named, data-defined sets of non-business days
+-- (`us-banking`, `us-tax`, …). Reference data, like `classes`: seeded via
+-- POST /api/calendar/business-calendars/batch, queried for business-day math
+-- by the dispatcher's timing triggers and the simulator. The business-day
+-- LOGIC is generic (`boss_core::calendar::BusinessCalendar`); only the
+-- holiday/window DATA lives here. "A tax calendar is just data."
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS business_calendars (
+    code         TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    -- Non-business weekdays as `Weekday::num_days_from_monday()`
+    -- (Mon=0 … Sun=6). Default Sat+Sun. Stored so a tenant with a
+    -- different week (e.g. Fri+Sat) is data, not a code change.
+    weekend      SMALLINT[] NOT NULL DEFAULT '{5,6}',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- The non-business dates for a calendar — federal holidays plus any
+-- closed windows expanded to individual days. `reason` is for humans
+-- (the SPA / audit); the business-day query only needs the date.
+CREATE TABLE IF NOT EXISTS business_calendar_closed_days (
+    calendar_code TEXT NOT NULL
+                  REFERENCES business_calendars(code) ON DELETE CASCADE,
+    day           DATE NOT NULL,
+    reason        TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (calendar_code, day)
+);
+
+CREATE INDEX IF NOT EXISTS business_calendar_closed_days_cal
+    ON business_calendar_closed_days (calendar_code);
+

@@ -13,7 +13,9 @@
 //!
 //! Decision record: `docs/architecture-decisions.md` §Calendar.
 
-use chrono::{DateTime, Utc};
+use std::collections::BTreeSet;
+
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::define_id;
@@ -139,6 +141,107 @@ pub struct Reservation {
     pub cancelled_at: Option<DateTime<Utc>>,
 }
 
+/// A named business calendar — as DATA, not code. The set of
+/// non-business days for a calendar (`us-banking`, `us-tax`, …):
+/// `weekend` weekdays plus concrete `closed` dates (federal holidays
+/// + any closed windows expanded to individual days). The business-day
+/// queries below are GENERIC over this data — there is no per-calendar
+/// Rust. This is the type that makes "a tax calendar just data": the
+/// rows are seeded into `boss-calendar` and fetched by callers (the
+/// dispatcher's timing triggers, the simulator) via `boss-calendar-client`.
+///
+/// Lives in `boss-core` so the dispatcher + client + service share one
+/// definition and one business-day implementation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BusinessCalendar {
+    /// Stable code, e.g. `us-banking` / `us-tax`.
+    pub code: String,
+    pub name: String,
+    /// Weekdays that are non-business, as `Weekday::num_days_from_monday()`
+    /// (Mon=0 … Sun=6). [`BusinessCalendar::new`] defaults to Sat+Sun.
+    pub weekend: BTreeSet<u8>,
+    /// Concrete non-business dates — holidays + closed windows expanded
+    /// to individual days. The "just data" part of a tax calendar.
+    pub closed: BTreeSet<NaiveDate>,
+}
+
+impl BusinessCalendar {
+    /// A calendar with the conventional Sat+Sun weekend and no holidays.
+    pub fn new(code: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            name: name.into(),
+            weekend: [5, 6].into_iter().collect(), // Sat, Sun
+            closed: BTreeSet::new(),
+        }
+    }
+
+    /// Builder: add closed (non-business) dates.
+    pub fn with_closed(mut self, dates: impl IntoIterator<Item = NaiveDate>) -> Self {
+        self.closed.extend(dates);
+        self
+    }
+
+    /// True iff `date` is a working day on this calendar — not a weekend
+    /// weekday and not a `closed` day.
+    pub fn is_business_day(&self, date: NaiveDate) -> bool {
+        let wd = date.weekday().num_days_from_monday() as u8;
+        !self.weekend.contains(&wd) && !self.closed.contains(&date)
+    }
+
+    /// The first business day strictly after `date`. Bounded so a
+    /// pathological all-closed calendar can't loop forever; a sane
+    /// calendar resolves within days.
+    pub fn next_business_day(&self, date: NaiveDate) -> NaiveDate {
+        let mut d = date;
+        for _ in 0..366 {
+            d = d.succ_opt().unwrap_or(d);
+            if self.is_business_day(d) {
+                return d;
+            }
+        }
+        d
+    }
+
+    /// The first business day on or after `date` (returns `date` when it
+    /// is already a business day). The postponement primitive for sparse
+    /// cadences: a monthly/quarterly fire landing on a holiday pushes to
+    /// the next business day.
+    pub fn business_day_on_or_after(&self, date: NaiveDate) -> NaiveDate {
+        if self.is_business_day(date) {
+            date
+        } else {
+            self.next_business_day(date)
+        }
+    }
+
+    /// `date` shifted by `n` business days (n>0 forward, n<0 back; n=0
+    /// returns `date` unchanged even if it's non-business). Counts only
+    /// business days crossed.
+    pub fn add_business_days(&self, date: NaiveDate, n: i64) -> NaiveDate {
+        if n == 0 {
+            return date;
+        }
+        let forward = n > 0;
+        let mut remaining = n.unsigned_abs();
+        let mut d = date;
+        for _ in 0..(366 * 4) {
+            d = if forward {
+                d.succ_opt().unwrap_or(d)
+            } else {
+                d.pred_opt().unwrap_or(d)
+            };
+            if self.is_business_day(d) {
+                remaining -= 1;
+                if remaining == 0 {
+                    return d;
+                }
+            }
+        }
+        d
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +307,76 @@ mod tests {
         let back: ReservationRequest = serde_json::from_str(&s).unwrap();
         assert_eq!(back.reason_ref_id, "stp-xyz");
         assert_eq!(back.subject.kind, "employee");
+    }
+
+    // --- business calendars: data-driven business-day logic ---------------
+    // These port the assertions that used to live in the simulator's
+    // hardcoded `us_banking.rs` / `us_tax.rs` — now expressed over DATA.
+
+    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn weekend_and_holidays_are_non_business() {
+        // us-banking-like: Sat+Sun weekend + a weekday federal holiday.
+        // 2026-01-01 (New Year's Day) is a Thursday.
+        let cal = BusinessCalendar::new("us-banking", "US Banking").with_closed([day(2026, 1, 1)]);
+        assert!(!cal.is_business_day(day(2026, 1, 1))); // Thu holiday
+        assert!(cal.is_business_day(day(2026, 1, 2))); // Fri
+        assert!(!cal.is_business_day(day(2026, 1, 3))); // Sat
+        assert!(!cal.is_business_day(day(2026, 1, 4))); // Sun
+        assert!(cal.is_business_day(day(2026, 1, 5))); // Mon
+    }
+
+    #[test]
+    fn tax_surge_window_as_data_is_non_business() {
+        // Ports us_tax.rs: the Apr 12-19 filing-surge window, now DATA
+        // (the window expanded to concrete closed dates).
+        let window = (12..=19).map(|d| day(2026, 4, d));
+        let cal = BusinessCalendar::new("us-tax", "US Tax").with_closed(window);
+        assert!(!cal.is_business_day(day(2026, 4, 13))); // Mon in surge
+        assert!(!cal.is_business_day(day(2026, 4, 15))); // Apr 15 itself (Wed)
+        assert!(!cal.is_business_day(day(2026, 4, 17))); // Fri in surge
+        assert!(cal.is_business_day(day(2026, 4, 27))); // Mon, outside surge
+    }
+
+    #[test]
+    fn next_business_day_skips_weekend_and_holiday() {
+        let cal = BusinessCalendar::new("c", "c").with_closed([day(2026, 1, 1)]);
+        // Wed 12/31 → Thu 1/1 is a holiday → Fri 1/2.
+        assert_eq!(cal.next_business_day(day(2025, 12, 31)), day(2026, 1, 2));
+        // Fri 1/2 → Sat/Sun skipped → Mon 1/5.
+        assert_eq!(cal.next_business_day(day(2026, 1, 2)), day(2026, 1, 5));
+    }
+
+    #[test]
+    fn business_day_on_or_after_is_identity_on_a_business_day() {
+        let cal = BusinessCalendar::new("c", "c");
+        assert_eq!(
+            cal.business_day_on_or_after(day(2026, 1, 2)),
+            day(2026, 1, 2)
+        ); // Fri
+        assert_eq!(
+            cal.business_day_on_or_after(day(2026, 1, 3)),
+            day(2026, 1, 5)
+        ); // Sat → Mon
+    }
+
+    #[test]
+    fn add_business_days_counts_only_business_days() {
+        let cal = BusinessCalendar::new("c", "c");
+        assert_eq!(cal.add_business_days(day(2026, 1, 2), 1), day(2026, 1, 5)); // Fri +1 → Mon
+        assert_eq!(cal.add_business_days(day(2026, 1, 5), -1), day(2026, 1, 2)); // Mon -1 → Fri
+        assert_eq!(cal.add_business_days(day(2026, 1, 3), 0), day(2026, 1, 3)); // 0 = identity
+    }
+
+    #[test]
+    fn business_calendar_round_trips_through_json() {
+        let cal = BusinessCalendar::new("us-tax", "US Tax").with_closed([day(2026, 4, 15)]);
+        let s = serde_json::to_string(&cal).unwrap();
+        let back: BusinessCalendar = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, cal);
+        assert!(!back.is_business_day(day(2026, 4, 15)));
     }
 }

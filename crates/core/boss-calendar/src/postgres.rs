@@ -4,13 +4,16 @@
 //! conflict-detection work; this adapter translates the Postgres
 //! error into `CalendarError::Conflict { existing }`.
 
+use std::collections::BTreeSet;
+
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use boss_core::calendar::{
-    Reservation, ReservationId, ReservationRequest, ReservationStrength, TimeWindow,
+    BusinessCalendar, Reservation, ReservationId, ReservationRequest, ReservationStrength,
+    TimeWindow,
 };
 use boss_core::job::Subject;
 
@@ -273,6 +276,89 @@ impl CalendarClient for PgCalendar {
         .await
         .map_err(|e| CalendarError::Storage(e.to_string()))?;
         Ok(res.rows_affected() as usize)
+    }
+
+    async fn get_business_calendar(
+        &self,
+        code: &str,
+    ) -> Result<Option<BusinessCalendar>, CalendarError> {
+        // The calendar header (None if no such code). `weekend` is a
+        // SMALLINT[] — sqlx maps it to Vec<i16>.
+        let header: Option<(String, Vec<i16>)> =
+            sqlx::query_as("SELECT name, weekend FROM business_calendars WHERE code = $1")
+                .bind(code)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| CalendarError::Storage(e.to_string()))?;
+        let Some((name, weekend)) = header else {
+            return Ok(None);
+        };
+        // The concrete closed (non-business) dates for this calendar.
+        let days: Vec<(NaiveDate,)> = sqlx::query_as(
+            "SELECT day FROM business_calendar_closed_days WHERE calendar_code = $1 ORDER BY day",
+        )
+        .bind(code)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CalendarError::Storage(e.to_string()))?;
+
+        let weekend: BTreeSet<u8> = weekend.into_iter().map(|d| d as u8).collect();
+        let closed: BTreeSet<NaiveDate> = days.into_iter().map(|(d,)| d).collect();
+        Ok(Some(BusinessCalendar {
+            code: code.to_string(),
+            name,
+            weekend,
+            closed,
+        }))
+    }
+
+    async fn upsert_business_calendars(
+        &self,
+        calendars: &[BusinessCalendar],
+    ) -> Result<usize, CalendarError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CalendarError::Storage(e.to_string()))?;
+        for cal in calendars {
+            let weekend: Vec<i16> = cal.weekend.iter().map(|&w| w as i16).collect();
+            sqlx::query(
+                "INSERT INTO business_calendars (code, name, weekend)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (code) DO UPDATE
+                   SET name = EXCLUDED.name,
+                       weekend = EXCLUDED.weekend,
+                       updated_at = NOW()",
+            )
+            .bind(&cal.code)
+            .bind(&cal.name)
+            .bind(&weekend)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CalendarError::Storage(e.to_string()))?;
+
+            // Replace the closed-day set wholesale.
+            sqlx::query("DELETE FROM business_calendar_closed_days WHERE calendar_code = $1")
+                .bind(&cal.code)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| CalendarError::Storage(e.to_string()))?;
+            for day in &cal.closed {
+                sqlx::query(
+                    "INSERT INTO business_calendar_closed_days (calendar_code, day) VALUES ($1, $2)",
+                )
+                .bind(&cal.code)
+                .bind(day)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| CalendarError::Storage(e.to_string()))?;
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|e| CalendarError::Storage(e.to_string()))?;
+        Ok(calendars.len())
     }
 }
 

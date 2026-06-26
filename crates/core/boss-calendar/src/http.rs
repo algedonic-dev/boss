@@ -14,6 +14,12 @@
 //! - `POST /api/calendar/cancel-by-reason` — cascade cancel by
 //!   `(reason_kind, reason_ref_id)`. Body: `{kind, ref_id, actor}`.
 //!   Returns `{ "cancelled": <n> }`.
+//! - `POST /api/calendar/business-calendars/batch` — seed/replace
+//!   business calendars. Body: `Vec<BusinessCalendar>`. Operator-gated
+//!   (with the `x-sim-origin` bypass). Returns
+//!   `{ "received": <n>, "upserted": <m> }`.
+//! - `GET  /api/calendar/business-calendars/{code}` — fetch one business
+//!   calendar with its full closed-day set, or 404. Open read.
 
 use std::sync::Arc;
 
@@ -25,8 +31,9 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use boss_core::calendar::{ReservationId, ReservationRequest, TimeWindow};
+use boss_core::calendar::{BusinessCalendar, ReservationId, ReservationRequest, TimeWindow};
 use boss_core::job::Subject;
+use boss_policy_client::{AccessTier, CurrentUser};
 
 use crate::port::{CalendarClient, CalendarError};
 
@@ -53,6 +60,14 @@ pub fn router(state: CalendarApiState) -> Router {
             delete(cancel_reservation),
         )
         .route("/api/calendar/cancel-by-reason", post(cancel_by_reason))
+        .route(
+            "/api/calendar/business-calendars/batch",
+            post(batch_business_calendars),
+        )
+        .route(
+            "/api/calendar/business-calendars/{code}",
+            get(get_business_calendar),
+        )
         .with_state(state)
 }
 
@@ -209,6 +224,52 @@ async fn cancel_by_reason(
             }
             Json(serde_json::json!({ "cancelled": n })).into_response()
         }
+        Err(e) => calendar_error_response(e),
+    }
+}
+
+/// Batch-upsert business calendars — the seed surface, used to load
+/// the `us-banking` / `us-tax` reference calendars from JSON instead of
+/// `psql -f`. Each calendar is upserted by `code`; its closed-day set is
+/// replaced wholesale.
+///
+/// Gated to operator-tier callers, with the `x-sim-origin` bypass that
+/// every seed path honors (the trusted simulator/seeder masquerades as
+/// operators; its requests carry `x-sim-origin: true`, which the
+/// request-context middleware scopes into `is_in_sim_chain`). Reads stay
+/// open; only this write is privileged.
+async fn batch_business_calendars(
+    State(state): State<CalendarApiState>,
+    CurrentUser(user): CurrentUser,
+    Json(calendars): Json<Vec<BusinessCalendar>>,
+) -> Response {
+    let sim = boss_core::sim_origin::is_in_sim_chain();
+    let tier_ok = matches!(user.access_tier, AccessTier::Operator);
+    if !(sim || tier_ok) {
+        return (StatusCode::FORBIDDEN, "operator tier required").into_response();
+    }
+
+    let received = calendars.len();
+    match state.calendar.upsert_business_calendars(&calendars).await {
+        Ok(upserted) => Json(serde_json::json!({
+            "received": received,
+            "upserted": upserted,
+        }))
+        .into_response(),
+        Err(e) => calendar_error_response(e),
+    }
+}
+
+/// Fetch one business calendar by `code` with its full closed-day set,
+/// or 404 if no such calendar exists. Open read — callers run the
+/// business-day math locally via `boss_core::calendar::BusinessCalendar`.
+async fn get_business_calendar(
+    State(state): State<CalendarApiState>,
+    Path(code): Path<String>,
+) -> Response {
+    match state.calendar.get_business_calendar(&code).await {
+        Ok(Some(cal)) => Json(cal).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no such business calendar").into_response(),
         Err(e) => calendar_error_response(e),
     }
 }

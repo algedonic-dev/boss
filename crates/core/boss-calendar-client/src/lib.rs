@@ -11,7 +11,9 @@
 
 use async_trait::async_trait;
 
-use boss_core::calendar::{Reservation, ReservationId, ReservationRequest, TimeWindow};
+use boss_core::calendar::{
+    BusinessCalendar, Reservation, ReservationId, ReservationRequest, TimeWindow,
+};
 use boss_core::job::Subject;
 
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +72,15 @@ pub trait CalendarClient: Send + Sync {
         reason_ref_id: &str,
         actor: &str,
     ) -> Result<usize, CalendarClientError>;
+
+    /// Fetch a named business calendar (`us-banking`, `us-tax`, …) with
+    /// its full `closed`-day set. `None` if no calendar with that code
+    /// exists. Callers run the business-day math locally via the
+    /// `boss_core::calendar::BusinessCalendar` methods.
+    async fn get_business_calendar(
+        &self,
+        code: &str,
+    ) -> Result<Option<BusinessCalendar>, CalendarClientError>;
 }
 
 /// Production client over `reqwest`. 5-second per-call timeout so a
@@ -222,6 +233,32 @@ impl CalendarClient for ReqwestCalendarClient {
                 CalendarClientError::MalformedBody(format!("missing `cancelled` in {body}"))
             })
     }
+
+    async fn get_business_calendar(
+        &self,
+        code: &str,
+    ) -> Result<Option<BusinessCalendar>, CalendarClientError> {
+        let url = format!(
+            "{}/api/calendar/business-calendars/{}",
+            self.base_url,
+            urlencode_minimal(code),
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| CalendarClientError::Unreachable(e.to_string()))?;
+        match resp.status() {
+            reqwest::StatusCode::OK => resp
+                .json::<BusinessCalendar>()
+                .await
+                .map(Some)
+                .map_err(|e| CalendarClientError::MalformedBody(e.to_string())),
+            reqwest::StatusCode::NOT_FOUND => Ok(None),
+            other => Err(CalendarClientError::UnexpectedStatus(other.as_u16())),
+        }
+    }
 }
 
 fn uuid_parse(s: &str) -> Result<uuid::Uuid, CalendarClientError> {
@@ -372,6 +409,16 @@ impl CalendarClient for FakeCalendarClient {
             actor.to_string(),
         ));
         Ok(state.cancel_by_reason_count)
+    }
+
+    async fn get_business_calendar(
+        &self,
+        _code: &str,
+    ) -> Result<Option<BusinessCalendar>, CalendarClientError> {
+        // The fake doesn't model business calendars — callers that need
+        // them use a real (in-memory or pg) calendar. Returns None so a
+        // caller treats it as "no such calendar."
+        Ok(None)
     }
 }
 
