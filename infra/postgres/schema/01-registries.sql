@@ -547,9 +547,9 @@ CREATE TABLE IF NOT EXISTS business_calendar_closed_days (
                   REFERENCES business_calendars(code) ON DELETE CASCADE,
     day           DATE NOT NULL,
     reason        TEXT NOT NULL DEFAULT '',
+    -- The PK btree (calendar_code, day) already serves the only query
+    -- (`WHERE calendar_code = $1 ORDER BY day`) on its leading column,
+    -- so no separate index on calendar_code is needed.
     PRIMARY KEY (calendar_code, day)
 );
-
-CREATE INDEX IF NOT EXISTS business_calendar_closed_days_cal
-    ON business_calendar_closed_days (calendar_code);
 
