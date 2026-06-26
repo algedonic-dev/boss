@@ -103,10 +103,28 @@ export const AccountNoteSchema = z.object({
 });
 export const AccountNoteListSchema = z.array(AccountNoteSchema);
 
-export const NextActionSchema = z.object({
-  title: z.string(),
-  detail: z.string().optional(),
-  severity: z.enum(['critical', 'warning', 'info']).optional(),
-  link: z.string().optional(),
-});
+/// `GET /api/people/accounts/{id}/next-actions` returns the server's
+/// `Action` shape (boss-accounts `account_next_actions.rs`): kebab-case
+/// `severity` + `headline` / `context` / `deep_link` (plus `id` / `rule`
+/// / `due_on`). The action card renders the UI vocabulary
+/// (`title` / `detail` / `severity` / `link`), so validate the wire
+/// honestly and transform it to that shape — the component stays in UI
+/// terms and a real wire drift still surfaces. Empty `context` /
+/// `deep_link` collapse to `undefined` so the card hides them.
+export const NextActionSchema = z
+  .object({
+    id: z.string(),
+    rule: z.string(),
+    severity: z.enum(['critical', 'warning', 'info']),
+    headline: z.string(),
+    context: z.string(),
+    deep_link: z.string(),
+    due_on: z.string().nullish(),
+  })
+  .transform((a) => ({
+    title: a.headline,
+    detail: a.context.length > 0 ? a.context : undefined,
+    severity: a.severity,
+    link: a.deep_link.length > 0 ? a.deep_link : undefined,
+  }));
 export const NextActionListSchema = z.array(NextActionSchema);

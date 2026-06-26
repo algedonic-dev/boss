@@ -165,6 +165,15 @@ async fn main() -> Result<()> {
         // Domain-service reverse proxies, all cookie-gated. Each entry
         // pairs a path prefix with a ProxyConfig in proxy.rs (which holds
         // the default upstream URL + any BOSS_<NAME>_UPSTREAM override).
+        // Bare `/api/assets` (the SPA lists devices via
+        // `/api/assets?account_id=…`, no sub-path) AND `/api/assets/{*rest}`
+        // — same dual registration as /api/jobs + /api/people/accounts.
+        // Without the bare route, `/api/assets?…` misses the proxy and
+        // falls through to the SPA static handler (HTML, not JSON).
+        .route(
+            "/api/assets",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::ASSETS)),
+        )
         .route(
             "/api/assets/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::ASSETS)),
