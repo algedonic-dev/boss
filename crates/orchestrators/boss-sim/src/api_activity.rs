@@ -16,7 +16,7 @@
 //! telemetry each tick, mirroring how `WorkforceStats` / `LiveApiStats`
 //! already flow.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -56,26 +56,57 @@ pub struct Tally {
     pub errors: u64,
 }
 
-/// Shared per-`(kind, label, endpoint)` tally. Cumulative since daemon
-/// start (like the existing stats; resets on restart).
-pub type ApiActivity = Arc<Mutex<BTreeMap<(ActorKind, String, String), Tally>>>;
+/// Inner state behind the shared handle: the per-`(kind, label, endpoint)`
+/// call tallies, plus the SET of distinct acting identities seen per
+/// `(kind, label)` rollup. The set is what lets the cockpit say "200
+/// shipping-clerk calls — from N distinct people" (1 vs 50). Cumulative
+/// since daemon start (resets on restart).
+#[derive(Debug, Default)]
+pub struct ApiActivityInner {
+    tallies: BTreeMap<(ActorKind, String, String), Tally>,
+    /// Distinct acting identities per actor rollup — employee ids under a
+    /// role, counterparty subject ids under a chain. An empty id is never
+    /// inserted, so Environment materialization (no single actor) counts 0.
+    distinct: BTreeMap<(ActorKind, String), BTreeSet<String>>,
+}
+
+/// Shared activity handle. Cumulative since daemon start.
+pub type ApiActivity = Arc<Mutex<ApiActivityInner>>;
 
 /// Fresh, empty handle.
 pub fn new_handle() -> ApiActivity {
-    Arc::new(Mutex::new(BTreeMap::new()))
+    Arc::new(Mutex::new(ApiActivityInner::default()))
 }
 
 /// Record one call **on its ack**. `ok = status.is_success()`; a false
-/// bumps `errors` too. A poisoned lock drops the sample rather than
-/// panicking the tick loop — telemetry must never wedge the sim.
-pub fn record(act: &ApiActivity, kind: ActorKind, label: &str, endpoint: &str, ok: bool) {
+/// bumps `errors` too. `actor_id` is the concrete acting identity (an
+/// employee id, a counterparty subject id) — counted toward the rollup's
+/// distinct-actor tally; an empty id is ignored. A poisoned lock drops the
+/// sample rather than panicking the tick loop — telemetry must never wedge
+/// the sim.
+pub fn record(
+    act: &ApiActivity,
+    kind: ActorKind,
+    label: &str,
+    endpoint: &str,
+    ok: bool,
+    actor_id: &str,
+) {
     if let Ok(mut m) = act.lock() {
         let t = m
+            .tallies
             .entry((kind, label.to_string(), endpoint.to_string()))
             .or_default();
         t.calls += 1;
         if !ok {
             t.errors += 1;
+        }
+        let id = actor_id.trim();
+        if !id.is_empty() {
+            m.distinct
+                .entry((kind, label.to_string()))
+                .or_default()
+                .insert(id.to_string());
         }
     }
 }
@@ -116,6 +147,11 @@ pub struct ActorActivity {
     pub label: String,
     pub calls: u64,
     pub errors: u64,
+    /// Count of distinct acting identities behind this rollup — how many
+    /// people are the `shipping-clerk` role, how many accounts the
+    /// `ar-aging` chain touched. 0 when no identity was attributed
+    /// (Environment materialization).
+    pub distinct: u64,
     pub endpoints: Vec<EndpointCount>,
 }
 
@@ -128,7 +164,7 @@ pub fn snapshot(act: &ApiActivity) -> Vec<ActorActivity> {
         Err(_) => return Vec::new(),
     };
     let mut grouped: BTreeMap<(ActorKind, String), Vec<EndpointCount>> = BTreeMap::new();
-    for ((kind, label, endpoint), t) in m.iter() {
+    for ((kind, label, endpoint), t) in m.tallies.iter() {
         grouped
             .entry((*kind, label.clone()))
             .or_default()
@@ -144,11 +180,17 @@ pub fn snapshot(act: &ApiActivity) -> Vec<ActorActivity> {
             endpoints.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.endpoint.cmp(&b.endpoint)));
             let calls = endpoints.iter().map(|e| e.calls).sum();
             let errors = endpoints.iter().map(|e| e.errors).sum();
+            let distinct = m
+                .distinct
+                .get(&(kind, label.clone()))
+                .map(|s| s.len() as u64)
+                .unwrap_or(0);
             ActorActivity {
                 kind,
                 label,
                 calls,
                 errors,
+                distinct,
                 endpoints,
             }
         })
@@ -194,12 +236,15 @@ mod tests {
     #[test]
     fn record_and_snapshot_group_by_actor_busiest_first() {
         let act = new_handle();
+        // Two distinct people in the head-brewer role (emp-1 twice, emp-2
+        // once) → 3 calls, 2 distinct actors.
         record(
             &act,
             ActorKind::Employee,
             "head-brewer",
             "PUT /api/jobs/{}/steps",
             true,
+            "emp-1",
         );
         record(
             &act,
@@ -207,6 +252,7 @@ mod tests {
             "head-brewer",
             "PUT /api/jobs/{}/steps",
             false,
+            "emp-1",
         );
         record(
             &act,
@@ -214,6 +260,7 @@ mod tests {
             "head-brewer",
             "POST /api/jobs/{}/steps/{}/sign-offs",
             true,
+            "emp-2",
         );
         record(
             &act,
@@ -221,6 +268,7 @@ mod tests {
             "ar-aging",
             "PUT /api/commerce/invoices/{}/paid",
             true,
+            "acc-bigseed-0007",
         );
 
         let snap = snapshot(&act);
@@ -229,9 +277,29 @@ mod tests {
         assert_eq!(brewer.kind, ActorKind::Employee);
         assert_eq!(brewer.calls, 3);
         assert_eq!(brewer.errors, 1);
+        assert_eq!(brewer.distinct, 2, "emp-1 + emp-2");
         // Busiest endpoint first.
         assert_eq!(brewer.endpoints[0].endpoint, "PUT /api/jobs/{}/steps");
         assert_eq!(brewer.endpoints[0].calls, 2);
         assert_eq!(brewer.endpoints[0].errors, 1);
+        let aging = snap.iter().find(|a| a.label == "ar-aging").unwrap();
+        assert_eq!(aging.distinct, 1, "one account touched");
+    }
+
+    #[test]
+    fn empty_actor_id_is_not_counted_distinct() {
+        let act = new_handle();
+        record(
+            &act,
+            ActorKind::Environment,
+            "materialization",
+            "POST /api/jobs",
+            true,
+            "",
+        );
+        let snap = snapshot(&act);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].calls, 1);
+        assert_eq!(snap[0].distinct, 0, "no identity attributed");
     }
 }

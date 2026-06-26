@@ -238,10 +238,19 @@ impl Workforce {
             .unwrap_or("unassigned-role")
     }
 
-    /// Record one workforce call on its ack, under the Employee actor.
-    fn record_employee_call(&self, method: &str, path: &str, role: &str, ok: bool) {
+    /// Record one workforce call on its ack, under the Employee actor —
+    /// rolled up by `role` (the cockpit panel grouping) and counting `emp`
+    /// toward that role's distinct-people tally.
+    fn record_employee_call(&self, method: &str, path: &str, emp: &str, role: &str, ok: bool) {
         let endpoint = api_activity::endpoint_label(method, path);
-        api_activity::record(&self.api_activity, ActorKind::Employee, role, &endpoint, ok);
+        api_activity::record(
+            &self.api_activity,
+            ActorKind::Employee,
+            role,
+            &endpoint,
+            ok,
+            emp,
+        );
     }
 
     fn duration_hours(&self, kind: &str) -> f64 {
@@ -498,7 +507,7 @@ impl Workforce {
             "assignee_id": emp,
             "metadata": md,
         });
-        self.put_step(job_id, step_id, &body, self.role_of(emp))
+        self.put_step(job_id, step_id, &body, emp)
     }
 
     /// Active → Completed, attributed to `emp`. For a demand-gate step,
@@ -542,7 +551,7 @@ impl Workforce {
         // only labor; see docs/design/brewery-model-completeness.md).
         obj.insert("metadata".to_string(), Value::Object(md.clone()));
         if sign_offs_required.is_empty() {
-            return self.put_step(job_id, step_id, &body, self.role_of(emp));
+            return self.put_step(job_id, step_id, &body, emp);
         }
         // Sign-off contract: stamps attest the step's FINAL shape, so the
         // metadata the executor fills lands first, then the stamps,
@@ -553,7 +562,7 @@ impl Workforce {
             job_id,
             step_id,
             &json!({ "metadata": Value::Object(md) }),
-            self.role_of(emp),
+            emp,
         )?;
         for role in sign_offs_required {
             self.post_sign_off(job_id, step_id, emp, role)?;
@@ -562,7 +571,7 @@ impl Workforce {
             job_id,
             step_id,
             &json!({ "status": "completed", "completed_by": emp }),
-            self.role_of(emp),
+            emp,
         )
     }
 
@@ -618,6 +627,7 @@ impl Workforce {
         self.record_employee_call(
             "POST",
             &format!("/api/jobs/{job_id}/steps/{step_id}/sign-offs"),
+            emp,
             role,
             ok,
         );
@@ -629,7 +639,7 @@ impl Workforce {
         Ok(())
     }
 
-    fn put_step(&self, job_id: &str, step_id: &str, body: &Value, role: &str) -> Result<()> {
+    fn put_step(&self, job_id: &str, step_id: &str, body: &Value, emp: &str) -> Result<()> {
         let path = format!("/api/jobs/{job_id}/steps/{step_id}");
         let url = service_url(&self.api_base, &path);
         let resp = self
@@ -639,7 +649,8 @@ impl Workforce {
             .send()
             .with_context(|| format!("PUT {url}"))?;
         let ok = resp.status().is_success();
-        self.record_employee_call("PUT", &path, role, ok);
+        let role = self.role_of(emp);
+        self.record_employee_call("PUT", &path, emp, role, ok);
         if !ok {
             let status = resp.status();
             let text = resp.text().unwrap_or_default();

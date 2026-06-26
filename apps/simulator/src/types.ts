@@ -110,6 +110,10 @@ export type ActorActivity = Readonly<{
   label: string;
   calls: number;
   errors: number;
+  // Distinct acting identities behind this rollup — how many people are
+  // the `shipping-clerk` role, how many accounts the `ar-aging` chain
+  // touched. 0 when no identity was attributed (Environment).
+  distinct: number;
   endpoints: ReadonlyArray<EndpointCount>;
 }>;
 

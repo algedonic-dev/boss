@@ -368,6 +368,23 @@ async fn main() -> Result<()> {
         "business calendars fetched"
     );
 
+    // Authoritative actor identity for the cockpit: emp → role from the
+    // running system (boss-people), not the sim's seed roster. Fetched once
+    // at boot and overlaid on the seed-derived map below, so an assignee the
+    // system holds resolves to its real role instead of `unassigned-role`.
+    // Blocking client → spawn_blocking. Empty on failure (caller keeps the
+    // seed fallback).
+    let system_emp_roles = {
+        let api_base = api_base.clone();
+        tokio::task::spawn_blocking(move || boss_brewery_engine::fetch_employees(&api_base))
+            .await
+            .unwrap_or_default()
+    };
+    info!(
+        count = system_emp_roles.len(),
+        "employee roster fetched from boss-people"
+    );
+
     // Long-lived engine state. Held across every tick so
     // counterparty pending-action chains survive the 1-day-chunk
     // boundaries. spawn_blocking + Mutex so the sync engine can
@@ -495,6 +512,12 @@ async fn main() -> Result<()> {
             for emp in emps {
                 emp_roles.insert(emp.clone(), role.clone());
             }
+        }
+        // Overlay the system's authoritative emp → role on top, so an
+        // assignee the system holds resolves to its real role even when the
+        // seed roster lags (the fix for `unassigned-role`).
+        for (emp, role) in &system_emp_roles {
+            emp_roles.insert(emp.clone(), role.clone());
         }
         Arc::new(Mutex::new(
             build_workforce(&guard, &api_base)

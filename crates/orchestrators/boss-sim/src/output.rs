@@ -921,10 +921,14 @@ pub mod live {
         /// each tick. Default fresh; the daemon injects the shared handle
         /// via `with_api_activity`.
         api_activity: ApiActivity,
-        /// The actor attributed to the call currently in flight. Set by
-        /// `emit_event` (from its `source`) and at the top of `end_of_day`
-        /// (Environment / materialization); read by the send helpers when
-        /// they record on the ack.
+        /// The actor attributed to the call currently in flight, as
+        /// `(kind, rollup label)`. Set by `emit_event` (from its `source`)
+        /// and at the top of `end_of_day` (Environment / materialization);
+        /// read by the send helpers when they record on the ack. These calls
+        /// are counterparty chains + materialization — single processes, not
+        /// per-Subject actors — so they carry no distinct-actor id in the
+        /// chain model (the workforce path is the only per-actor source;
+        /// per-Subject counterparty actors are a later step).
         current_actor: (ActorKind, String),
     }
 
@@ -1043,7 +1047,11 @@ pub mod live {
         fn record_call(&self, method: &str, path: &str, ok: bool) {
             let (kind, label) = &self.current_actor;
             let endpoint = api_activity::endpoint_label(method, path);
-            api_activity::record(&self.api_activity, *kind, label, &endpoint, ok);
+            // Empty actor id: counterparty + materialization calls are single
+            // processes in the chain model, not per-Subject actors, so they
+            // contribute nothing to a rollup's distinct-actor count (only the
+            // workforce, with a real employee id, does).
+            api_activity::record(&self.api_activity, *kind, label, &endpoint, ok, "");
         }
 
         /// Inject step durations (kind → hours) so end_of_day can

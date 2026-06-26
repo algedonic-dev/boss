@@ -52,6 +52,29 @@
     return `${r >= 10 ? r.toFixed(0) : r.toFixed(1)}/day`;
   }
 
+  // The realism signal: how many distinct actors are behind a rollup, so
+  // "200 shipping-clerk calls" reads as "from 1 person" vs "from 50". Only
+  // the workforce is a per-Subject actor population today — each counterparty
+  // is a single named chain (one process), not a set of distinct accounts /
+  // vendors, so those rollups show no distinct count until the actors are
+  // sourced per-Subject from the model. Empty noun = no label shown.
+  const DISTINCT_NOUN: Record<ActorActivity['kind'], string> = {
+    employee: 'person',
+    account: '',
+    vendor: '',
+    bank: '',
+    environment: '',
+  };
+  function distinctLabel(kind: ActorActivity['kind'], n: number): string {
+    const noun = DISTINCT_NOUN[kind];
+    // `!(n > 0)` (not `n <= 0`) so a missing/undefined count during a
+    // daemon↔SPA version skew degrades to no label rather than throwing.
+    if (!noun || !(n > 0)) return '';
+    if (n === 1) return `1 ${noun}`;
+    const plural = noun === 'person' ? 'people' : `${noun}s`;
+    return `${n.toLocaleString()} ${plural}`;
+  }
+
   // Actors grouped into the five panels, busiest-first within each. Empty
   // panels are hidden.
   let actorGroups = $derived(
@@ -195,13 +218,32 @@
           </ul>
         {/if}
       </Section>
+
+      <Section title="Audit log tail">
+        <p class="point-sub">The audit log as the sim's calls land (GET /api/events/tail)</p>
+        {#if eventsError}
+          <p class="status error">Couldn't load events: {eventsError}</p>
+        {:else if events.length === 0}
+          <p class="status">No events yet.</p>
+        {:else}
+          <ul class="event-list">
+            {#each events as ev (ev.event_id)}
+              <li class="event-row">
+                <span class="event-kind" title={ev.source}>{ev.kind}</span>
+                <span class="event-time">{fmtTime(ev.timestamp)}</span>
+                <span class="event-source">{ev.source}</span>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </Section>
     </div>
 
     <div class="cockpit-col">
       <Section title="API engagement by actor" wide>
         <p class="point-sub">
-          Calls the sim makes to the public API, by who's acting — cumulative count + per-sim-day
-          rate (errors flagged)
+          Calls the sim makes to the public API, by who's acting — cumulative count, distinct people
+          per workforce role, + per-sim-day rate (errors flagged)
         </p>
         {#if actorGroups.length === 0}
           <p class="status">No API calls yet.</p>
@@ -212,11 +254,13 @@
                 {group.title}<span class="actor-group-sub">{group.sub}</span>
               </h4>
               {#each group.actors as a (a.label)}
+                {@const dl = distinctLabel(group.kind, a.distinct)}
                 <div class="actor">
                   <div class="actor-head">
                     <span class="actor-label">{a.label}</span>
                     <span class="actor-meta">
                       <span class="actor-calls">{a.calls.toLocaleString()}</span>
+                      {#if dl}<span class="actor-distinct">{dl}</span>{/if}
                       <span class="actor-rate">{ratePerDay(a.calls)}</span>
                       {#if a.errors > 0}<span class="actor-err">{a.errors.toLocaleString()} err</span>{/if}
                     </span>
@@ -236,25 +280,6 @@
               {/each}
             </div>
           {/each}
-        {/if}
-      </Section>
-
-      <Section title="Live events landing" wide>
-        <p class="point-sub">The audit log as the sim's calls land (GET /api/events/tail)</p>
-        {#if eventsError}
-          <p class="status error">Couldn't load events: {eventsError}</p>
-        {:else if events.length === 0}
-          <p class="status">No events yet.</p>
-        {:else}
-          <ul class="event-list">
-            {#each events as ev (ev.event_id)}
-              <li class="event-row">
-                <span class="event-kind">{ev.kind}</span>
-                <span class="event-source">{ev.source}</span>
-                <span class="event-time">{fmtTime(ev.timestamp)}</span>
-              </li>
-            {/each}
-          </ul>
         {/if}
       </Section>
     </div>
@@ -437,6 +462,13 @@
   .actor-rate {
     color: var(--brew-malt);
   }
+  .actor-distinct {
+    color: var(--brew-malt);
+    background: rgba(217, 155, 58, 0.12);
+    padding: 0 0.4em;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
   .actor-err {
     color: #8b2b1f;
     font-weight: 600;
@@ -527,27 +559,33 @@
   }
   .event-row {
     display: grid;
-    grid-template-columns: 1fr 8em 9.5em;
-    gap: 0.5rem;
+    grid-template-columns: 1fr auto;
+    gap: 0 0.5rem;
     padding: 3px 8px;
     border-bottom: 1px solid #f0e6cf;
   }
   .event-kind {
+    grid-row: 1;
     color: var(--brew-malt-dark);
     font-weight: 600;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .event-time {
+    grid-row: 1;
+    grid-column: 2;
+    color: #a8a29e;
+    text-align: right;
+  }
   .event-source {
-    color: #7a6855;
+    grid-row: 2;
+    grid-column: 1 / -1;
+    color: #a8957a;
+    font-size: 0.72rem;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-  .event-time {
-    color: #a8a29e;
-    text-align: right;
   }
   .badge {
     display: inline-block;
