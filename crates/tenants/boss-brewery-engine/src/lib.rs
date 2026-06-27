@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use boss_calendar_client::{CalendarClient, ReqwestCalendarClient};
 use boss_core::calendar::BusinessCalendar;
-use boss_inventory::types::InventoryItem;
+use boss_inventory::types::{InventoryItem, VendorBehavior};
 use chrono::NaiveDate;
 use serde::Deserialize;
 
@@ -31,8 +31,8 @@ use boss_jobs::seed_loader::load_job_kinds_with_owning_team;
 use boss_jobs::step_registry::StepRegistry;
 use boss_sim::calendar::CalendarRegistry;
 use boss_sim::engines::{
-    CounterpartyEngine, PeriodicEngine, RunReport, SimBusEvent, SimEventBus, end_of_day_rollup,
-    run_one_tick_with_handlers, run_ticks_with_handlers,
+    CounterpartyEngine, CounterpartySpec, DelaySpec, PeriodicEngine, RunReport, SimBusEvent,
+    SimEventBus, end_of_day_rollup, run_one_tick_with_handlers, run_ticks_with_handlers,
 };
 use boss_sim::output::{InMemoryOutput, SimOutput};
 use boss_sim::rng::Rng;
@@ -212,7 +212,10 @@ impl BreweryEngineState {
         let tenant_path = seeds.join("tenant.toml");
         let tenant = TenantConfig::load(&tenant_path)
             .with_context(|| format!("loading tenant config from {}", tenant_path.display()))?;
-        Self::load_with_tenant(seeds, tenant, calendars)
+        // Offline / test path: no live model to read vendor behavior from, so
+        // no synthesized supplier specs (the daemon path passes the
+        // API-fetched behaviors via `load_with_tenant`).
+        Self::load_with_tenant(seeds, tenant, calendars, Vec::new())
     }
 
     /// Same as [`load`], but with a caller-supplied [`TenantConfig`]
@@ -224,6 +227,7 @@ impl BreweryEngineState {
         seeds: &Path,
         tenant: TenantConfig,
         calendars: Vec<boss_core::calendar::BusinessCalendar>,
+        vendor_behaviors: Vec<(String, VendorBehavior)>,
     ) -> Result<Self> {
         let kinds_path = seeds.join("job_kinds.toml");
         let kinds = load_job_kinds_with_owning_team(&kinds_path, &tenant.meta.tenant_id)
@@ -246,10 +250,16 @@ impl BreweryEngineState {
             tenant.periodic_specs(),
             CalendarRegistry::from_data(calendars.clone()),
         );
-        let counterparty = CounterpartyEngine::new(
-            tenant.counterparty_specs(),
-            CalendarRegistry::from_data(calendars),
-        );
+        // The counterparty specs = the tenant.toml chains (ar-aging, bank,
+        // broadcasts) PLUS one synthesized supplier spec per vendor, built
+        // from each vendor's behavior read from the model. The vendor specs
+        // replace the (removed) hand-authored grain/hops blocks: each real
+        // vendor now responds to its own procurement with an invoice paced by
+        // its own lead time + fulfilment, instead of two placeholder chains.
+        let mut counterparty_specs = tenant.counterparty_specs();
+        counterparty_specs.extend(synthesize_vendor_specs(&vendor_behaviors));
+        let counterparty =
+            CounterpartyEngine::new(counterparty_specs, CalendarRegistry::from_data(calendars));
         let rng = Rng::new(tenant.meta.seed);
 
         Ok(Self {
@@ -409,6 +419,111 @@ fn people_base_url(api_base: &str) -> String {
     } else {
         api_base.trim_end_matches('/').to_string()
     }
+}
+
+/// Fetch each vendor's behavior profile from boss-inventory
+/// (`GET /api/inventory/vendors`) → `(vendor_id, VendorBehavior)` for every
+/// vendor that carries one (the supplier categories, bootstrapped from their
+/// category Class template at seed). This is the model the simulator reads to
+/// drive each vendor's supply response — [`synthesize_vendor_specs`] turns it
+/// into one counterparty chain per vendor. Blocking (`reqwest::blocking`);
+/// call from the async daemon via `spawn_blocking`. Empty on failure (the
+/// vendor chains simply aren't synthesized, logged — the same as before).
+pub fn fetch_vendors(api_base: &str) -> Vec<(String, VendorBehavior)> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        id: String,
+        #[serde(default)]
+        behavior: Option<VendorBehavior>,
+    }
+    let mut out = Vec::new();
+    let url = format!("{}/api/inventory/vendors", inventory_base_url(api_base));
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "building inventory HTTP client failed; no vendor specs");
+            return out;
+        }
+    };
+    match client.get(&url).header("x-sim-origin", "true").send() {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Vec<Row>>() {
+            Ok(rows) => {
+                for r in rows {
+                    if let Some(b) = r.behavior {
+                        out.push((r.id, b));
+                    }
+                }
+                tracing::info!(
+                    count = out.len(),
+                    "fetched vendor behaviors from boss-inventory"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "decoding /api/inventory/vendors failed; no vendor specs")
+            }
+        },
+        Ok(resp) => {
+            tracing::warn!(status = %resp.status(), url = %url, "GET /api/inventory/vendors non-2xx; no vendor specs")
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, url = %url, "fetching /api/inventory/vendors failed; no vendor specs")
+        }
+    }
+    out
+}
+
+/// Resolve the boss-inventory service base URL, mirroring [`people_base_url`].
+fn inventory_base_url(api_base: &str) -> String {
+    if api_base.starts_with("direct://") {
+        std::env::var("BOSS_INVENTORY_URL").unwrap_or_else(|_| boss_ports::url("inventory"))
+    } else {
+        api_base.trim_end_matches('/').to_string()
+    }
+}
+
+/// Build one supplier `CounterpartySpec` per vendor from its behavior — the
+/// simulator parsing the model's vendor understanding into its driving
+/// config. Each spec reacts to that vendor's own `step.done.procurement`
+/// (matched on `subject_id`), waits the vendor's `lead_time_days ± spread`
+/// (its response time), then emits `inventory.vendor_invoice_received` with
+/// probability `fulfilment_rate` (a short-ship is a no-emit). That event
+/// routes to the from-po endpoint, where the vendor's invoice lands
+/// `received`. No AP-pay followup — payment is the existing daily
+/// `inventory.bill.payment_batch` run. Replaces the inert hand-authored
+/// grain/hops chains.
+pub fn synthesize_vendor_specs(
+    vendor_behaviors: &[(String, VendorBehavior)],
+) -> Vec<CounterpartySpec> {
+    vendor_behaviors
+        .iter()
+        .map(|(vendor_id, b)| {
+            let mut match_payload = serde_json::Map::new();
+            match_payload.insert(
+                "subject_id".to_string(),
+                serde_json::Value::String(vendor_id.clone()),
+            );
+            CounterpartySpec {
+                name: format!("supplier-{vendor_id}"),
+                actor_kind: Some("vendor".to_string()),
+                listens_to: "step.done.procurement".to_string(),
+                delay: DelaySpec {
+                    mean_days: b.lead_time_days,
+                    spread_days: b.lead_spread_days,
+                    business_calendar: Some("us-banking".to_string()),
+                },
+                emit_probability: b.fulfilment_rate,
+                emits: "inventory.vendor_invoice_received".to_string(),
+                emit_else: None,
+                payload: serde_json::json!({ "vendor": vendor_id }),
+                followups: Vec::new(),
+                scans: Vec::new(),
+                match_payload,
+            }
+        })
+        .collect()
 }
 
 /// Inline business calendars — the FALLBACK used only when the seed
@@ -815,4 +930,53 @@ pub fn run_brewery(seeds: &Path, days: u32, start: Option<NaiveDate>) -> Result<
     let mut output = InMemoryOutput::default();
     let report = run_brewery_into(seeds, days, start, &mut output)?;
     Ok(BreweryRunResult { report, output })
+}
+
+#[cfg(test)]
+mod synth_tests {
+    use super::*;
+    use boss_inventory::types::{BehaviorProvenance, BehaviorSource};
+
+    fn behavior(lead: f64, fulfil: f64) -> VendorBehavior {
+        VendorBehavior {
+            lead_time_days: lead,
+            lead_spread_days: 1.0,
+            fulfilment_rate: fulfil,
+            ap_payment_days: 5.0,
+            ap_spread_days: 2.0,
+            provenance: BehaviorProvenance {
+                source: BehaviorSource::HandSet,
+                template: Some("grain-supplier".into()),
+            },
+        }
+    }
+
+    #[test]
+    fn synthesizes_one_supplier_spec_per_vendor_keyed_to_real_id() {
+        let specs = synthesize_vendor_specs(&[
+            ("vnd-bigseed-001".to_string(), behavior(3.0, 0.98)),
+            ("vnd-bigseed-002".to_string(), behavior(1.5, 0.99)),
+        ]);
+        assert_eq!(specs.len(), 2);
+        let s = &specs[0];
+        assert_eq!(s.name, "supplier-vnd-bigseed-001");
+        assert_eq!(s.listens_to, "step.done.procurement");
+        assert_eq!(s.emits, "inventory.vendor_invoice_received");
+        assert_eq!(s.actor_kind.as_deref(), Some("vendor"));
+        assert_eq!(s.emit_probability, 0.98); // fulfilment_rate
+        assert_eq!(s.delay.mean_days, 3.0); // lead_time_days
+        // Keyed to the REAL vendor id so only this vendor's procurement
+        // fires it — the fix for the inert placeholder-id chains.
+        assert_eq!(
+            s.match_payload.get("subject_id").and_then(|v| v.as_str()),
+            Some("vnd-bigseed-001")
+        );
+        // No followup — AP is the existing daily batch-pay run.
+        assert!(s.followups.is_empty());
+    }
+
+    #[test]
+    fn synthesize_empty_when_no_behaviors() {
+        assert!(synthesize_vendor_specs(&[]).is_empty());
+    }
 }

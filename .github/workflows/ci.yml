@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 
+# Retry transient crates.io download failures (curl / "SSL unexpected eof")
+# rather than failing the whole run on an infra flake — these blips have
+# red-X'd green code mid-clippy. Applies to every job's cargo invocations.
+env:
+  CARGO_NET_RETRY: "10"
+
 jobs:
   rust:
     runs-on: ubuntu-latest

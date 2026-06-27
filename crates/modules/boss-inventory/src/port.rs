@@ -227,6 +227,12 @@ pub trait InventoryRepository: Send + Sync {
         limit: i64,
     ) -> Result<Vec<VendorInvoice>, InventoryError>;
 
+    /// Fetch one vendor invoice by id (or `None`). Guards the
+    /// vendor-posts-invoice path against downgrading an already-approved
+    /// invoice back to `received`.
+    async fn vendor_invoice_by_id(&self, id: &str)
+    -> Result<Option<VendorInvoice>, InventoryError>;
+
     /// AP aging: unpaid vendor invoices bucketed by days since
     /// `received_on`. Mirrors the AR aging shape so finance surfaces
     /// can render both sides with one layout. Ages from received_on;

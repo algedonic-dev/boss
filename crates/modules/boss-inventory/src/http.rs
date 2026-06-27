@@ -104,6 +104,10 @@ pub fn router<R: InventoryRepository + 'static>(state: InventoryApiState<R>) -> 
             "/api/inventory/vendor-invoices/batch-pay",
             post(batch_pay_vendor_invoices::<R>),
         )
+        .route(
+            "/api/inventory/vendor-invoices/from-po/{po_id}",
+            post(create_vendor_invoice_from_po::<R>),
+        )
         .route("/api/inventory/ap-aging", get(ap_aging::<R>))
         .route(
             "/api/inventory/warehouse-status",
@@ -347,6 +351,86 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "VI-1");
         assert_eq!(rows[0].status, VendorInvoiceStatus::Received);
+    }
+
+    #[tokio::test]
+    async fn vendor_posts_invoice_from_po_resolves_lines() {
+        // The vendor's webhook only names the PO; the endpoint resolves the
+        // lines + amount from the PO row and lands the invoice `received`.
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/inventory/vendor-invoices/from-po/PO-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let inv: VendorInvoice = serde_json::from_slice(&body).unwrap();
+        assert_eq!(inv.id, "vi-PO-001");
+        assert_eq!(inv.po_id, "PO-001");
+        assert_eq!(inv.vendor, "Acme Parts Co");
+        assert_eq!(inv.status, VendorInvoiceStatus::Received);
+        // Resolved from the PO's line (25 × 15_000), not supplied by caller.
+        assert_eq!(inv.amount_cents, 25 * 15_000);
+        assert_eq!(inv.lines.len(), 1);
+        assert_eq!(inv.lines[0].part_sku, "PART-001");
+        assert!(inv.approved_on.is_none());
+    }
+
+    #[tokio::test]
+    async fn from_po_404_for_unknown_po() {
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/inventory/vendor-invoices/from-po/PO-NOPE")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn from_po_no_op_when_invoice_already_exists() {
+        // The guard: once an invoice exists for the PO (e.g. the human
+        // bill-approval landed first and advanced it), a late vendor post
+        // must NOT overwrite/downgrade it — it no-ops with 200.
+        let app = test_app();
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/inventory/vendor-invoices/from-po/PO-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/inventory/vendor-invoices/from-po/PO-001")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK); // no-op, not CREATED
     }
 
     // ----- DiscrepancyKind Class-registry gate -----------------------

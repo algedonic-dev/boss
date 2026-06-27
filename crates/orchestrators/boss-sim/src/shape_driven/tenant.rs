@@ -1473,7 +1473,7 @@ delay_probability = 1.5
         let cfg = TenantConfig::load(&path).unwrap();
         let specs = cfg.counterparty_specs();
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
-        for required in &["bank-ach", "grain-supplier", "keg-courier"] {
+        for required in &["bank-ach", "keg-courier", "ar-aging"] {
             assert!(
                 names.contains(required),
                 "expected {required}; got {names:?}"
@@ -1490,11 +1490,19 @@ delay_probability = 1.5
         assert_eq!(bank.delay.business_calendar.as_deref(), Some("us-banking"));
         assert_eq!(bank.payload["channel"], "ach");
 
-        // Grain supplier carries a single followup hop (ap-pay).
-        let grain = specs.iter().find(|s| s.name == "grain-supplier").unwrap();
-        assert_eq!(grain.followups.len(), 1);
-        assert_eq!(grain.followups[0].name, "ap-pay");
-        assert_eq!(grain.followups[0].emits, "ap.payment_acknowledged");
+        // Supplier chains (grain/hops) are NO LONGER hand-authored in
+        // tenant.toml — the simulator synthesizes one supplier
+        // CounterpartySpec per vendor from each vendor's behavior at boot
+        // (boss_brewery_engine::synthesize_vendor_specs). The static section
+        // carries none.
+        assert!(
+            !names.contains(&"grain-supplier"),
+            "grain-supplier is synthesized per-vendor now, not static"
+        );
+        assert!(
+            !names.contains(&"hops-supplier"),
+            "hops-supplier is synthesized per-vendor now, not static"
+        );
 
         // Keg courier uses the `scans` sugar — 3 stages.
         let courier = specs.iter().find(|s| s.name == "keg-courier").unwrap();

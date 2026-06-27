@@ -261,6 +261,17 @@ impl InventoryRepository for InMemoryInventory {
         Ok(filtered)
     }
 
+    async fn vendor_invoice_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<VendorInvoice>, InventoryError> {
+        let rows = self
+            .vendor_invoices
+            .read()
+            .map_err(|e| InventoryError::Storage(e.to_string()))?;
+        Ok(rows.iter().find(|v| v.id == id).cloned())
+    }
+
     async fn ap_aging(&self, today: chrono::NaiveDate) -> Result<ApAging, InventoryError> {
         let rows = self
             .vendor_invoices

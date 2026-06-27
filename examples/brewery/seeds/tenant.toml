@@ -831,72 +831,18 @@ emit_probability = 1.0
   spread_days = 14.0
   business_calendar = "us-banking"
 
-# Grain supplier — three-hop A/P chain. PO sent → vendor invoice
-# arrives ~3 days later → AP cuts a check ~5 days after match. The
-# loss rate stays at 1.0 here; vendor disputes are anomaly-layer
-# concerns (Q4 in sim-engines.md). Listens to
-# `step.done.procurement` — the shape-driven engine emits one of
-# those per-completed `procurement` step (e.g. the
-# `ingredient-restock` JobKind's "Place order" step). The
-# `match_payload` predicate gates the counterparty on the parent
-# Job's Subject so this hop only fires for grain-vendor procurement
-# events; hops, yeast, and other categories route to their own
-# counterparties below.
-# Success-gated (step.completed.procurement) — same reason as
-# ar-aging: the procurement step's side-effects materialize the
-# PO row the vendor invoice will reference. If they failed,
-# emitting the vendor invoice would dangle.
-[counterparty.grain-supplier]
-actor_kind = "vendor"
-listens_to = "step.done.procurement"
-emits = "inventory.vendor_invoice_received"
-emit_probability = 1.0
-match_payload = { "subject_id" = "vnd-riverside-malt" }
-
-  [counterparty.grain-supplier.delay]
-  mean_days = 3.0
-  spread_days = 1.5
-  business_calendar = "us-banking"
-
-  [counterparty.grain-supplier.payload]
-  vendor = "riverside-malting"
-
-  [[counterparty.grain-supplier.followups]]
-  name = "ap-pay"
-  listens_to = "inventory.vendor_invoice_received"
-  emits = "ap.payment_acknowledged"
-  emit_probability = 0.97
-
-    [counterparty.grain-supplier.followups.delay]
-    mean_days = 5.0
-    spread_days = 2.0
-    business_calendar = "us-banking"
-
-    [counterparty.grain-supplier.followups.payload]
-    method = "ach"
-
-# Hops supplier — second per-vendor procurement counterparty
-# demonstrating the `match_payload` predicate. Same shape as
-# grain-supplier, different subject_id, slightly tighter delays
-# (yard-direct hops ship next-day during harvest). Without
-# `match_payload` both counterparties would fire on every
-# procurement event regardless of which vendor the Job was about —
-# see `engines::CounterpartyEngine::match_payload` for the
-# semantics.
-[counterparty.hops-supplier]
-actor_kind = "vendor"
-listens_to = "step.done.procurement"
-emits = "inventory.vendor_invoice_received"
-emit_probability = 1.0
-match_payload = { "subject_id" = "vnd-cascade-hops" }
-
-  [counterparty.hops-supplier.delay]
-  mean_days = 1.5
-  spread_days = 0.5
-  business_calendar = "us-banking"
-
-  [counterparty.hops-supplier.payload]
-  vendor = "cascade-hop-yard"
+# Supplier counterparties (grain, hops, and every other procurement
+# vendor) are NO LONGER hand-authored here. The simulator synthesizes one
+# supplier chain PER VENDOR from each vendor's behavior profile read from
+# the model (boss-inventory) — lead time + fulfilment — keyed to the
+# vendor's REAL id, reacting to `step.done.procurement` and emitting
+# `inventory.vendor_invoice_received` (routed to the from-po endpoint, where
+# the vendor's invoice lands `received`; the human bill-approval step then
+# approves it; AP is the daily `inventory.bill.payment_batch` run). The old
+# grain/hops blocks matched PLACEHOLDER ids (vnd-riverside-malt,
+# vnd-cascade-hops) that aren't seeded vendors and emitted an UNROUTED topic,
+# so they never landed anything — the synthesized per-vendor chains replace
+# them. See boss_brewery_engine::{fetch_vendors, synthesize_vendor_specs}.
 
 # Keg-courier — multi-stage chain via the `scans` sugar. Each scan
 # emits `delivery.tracking_<status>` with the status field +
