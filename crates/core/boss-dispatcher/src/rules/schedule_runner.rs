@@ -467,6 +467,7 @@ mod tests {
             epoch_end: None,
             paused,
             restart_in_progress: restart,
+            warp_factor: None,
         }
     }
 

@@ -102,9 +102,10 @@ async fn forward_post(
     }
 }
 
-/// Forward a plain GET to the daemon's localhost control server and relay
-/// the JSON. Read-only (telemetry / config read) — no operator gate and no
-/// actor header needed; the daemon control server is localhost-only.
+/// Forward a plain read-only GET to a localhost upstream — the daemon's
+/// control server (telemetry / config) or clock-api (clock state) — and
+/// relay the JSON. No operator gate and no actor header needed; these
+/// upstreams are localhost-only.
 async fn forward_get(state: &AppState, url: String) -> Response {
     match state.http.get(&url).send().await {
         Ok(resp) => {
@@ -120,7 +121,7 @@ async fn forward_get(state: &AppState, url: String) -> Response {
         }
         Err(e) => (
             StatusCode::BAD_GATEWAY,
-            format!("sim daemon unreachable: {e}"),
+            format!("upstream unreachable: {e}"),
         )
             .into_response(),
     }
@@ -130,6 +131,16 @@ async fn forward_get(state: &AppState, url: String) -> Response {
 /// API right now (Cockpit). Open read; proxies the daemon's /telemetry.
 async fn get_telemetry(State(s): State<Arc<AppState>>) -> Response {
     forward_get(&s, format!("{}/telemetry", s.sim_control_url)).await
+}
+
+/// GET /simulator/api/clock — the authoritative clock state (sim time,
+/// warp, paused) straight from clock-api, which owns it. The cockpit reads
+/// its clock readouts here rather than off the daemon's /telemetry, so they
+/// stay correct even while the daemon is stopped (e.g. mid seed-rebuild,
+/// when its /telemetry is down). clock-api isn't gateway-proxied, so this is
+/// the cockpit's only path to it. Open read.
+async fn get_clock(State(s): State<Arc<AppState>>) -> Response {
+    forward_get(&s, format!("{}/api/clock/now", s.clock_url)).await
 }
 
 /// GET /simulator/api/config — the daemon's effective behavior config
@@ -266,6 +277,7 @@ async fn main() -> Result<()> {
     let api = Router::new()
         .route("/api/health", get(health))
         .route("/api/telemetry", get(get_telemetry))
+        .route("/api/clock", get(get_clock))
         .route("/api/config", get(get_config).post(post_config))
         .route("/api/control/pause", post(control_pause))
         .route("/api/control/resume", post(control_resume))

@@ -150,6 +150,7 @@ async fn now_handler(State(state): State<Arc<ClockApiState>>) -> Response {
                         epoch_end: None,
                         paused: false,
                         restart_in_progress: false,
+                        warp_factor: None,
                     }
                 }
             },
