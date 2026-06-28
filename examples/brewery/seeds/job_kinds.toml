@@ -794,12 +794,16 @@ title_template = "Place order — {subject.id}"
 # invoice's po_id FK lines up with the PO this step creates.
 # `inventory.po.place` (StepType-level side effect) reads this
 # on step.done and POSTs the PurchaseOrder to inventory.
-# po_id stamped with {day} so every ingredient-restock Job mints
-# a unique PO id; pre-fix every Job for a given vendor reused
-# "PO-{subject.id}" and the upsert collapsed 541 events into 10
-# rows (#143 finding). bill-approval step picks up the
-# same template so the vendor_invoice.po_id FK still resolves.
-metadata_defaults = { po_id = "PO-{subject.id}-{day}", items = [
+# po_id is stamped {day}-{metadata.part_sku} so every per-SKU
+# ingredient-restock Job mints a unique PO id. {day} alone (the
+# #143 fix for the original "PO-{subject.id}", which collapsed 541
+# events into 10 rows) STILL collided when several per-SKU restocks
+# hit the same vendor on the same sim-day — the `vi-{po_id}` upsert
+# overwrote, so those restocks' raw never capitalized (DR 1300 rides
+# bill-approval, not the GL-inert receive). Adding {metadata.part_sku}
+# (one SKU per restock) makes it unique. The inbound + bill-approval
+# steps pick up the same template so the vendor_invoice.po_id FK resolves.
+metadata_defaults = { po_id = "PO-{subject.id}-{day}-{metadata.part_sku}", items = [
     { part_sku = "{metadata.part_sku}" },
 ] }
 
@@ -853,7 +857,7 @@ title_template = "Receive delivery"
 # derives qty + unit_cost from the live inventory item (its current
 # reorder_qty + avg_cost), so each restock buys one ingredient — not the
 # whole catalog (which over-bought ~$44M of raw against ~$1M consumed).
-metadata_defaults = { po_id = "PO-{subject.id}-{day}", expected_items = [
+metadata_defaults = { po_id = "PO-{subject.id}-{day}-{metadata.part_sku}", expected_items = [
     { part_sku = "{metadata.part_sku}" },
 ] }
 
@@ -883,7 +887,7 @@ authority_role = "bookkeeper"
 # ingredient. amount_cents is omitted; the inventory.bill.approve handler
 # derives qty + unit_cost from the live inventory item and sums the single
 # line, mirroring what the receive step actually received.
-metadata_defaults = { po_id = "PO-{subject.id}-{day}", currency = "USD", lines = [
+metadata_defaults = { po_id = "PO-{subject.id}-{day}-{metadata.part_sku}", currency = "USD", lines = [
     { part_sku = "{metadata.part_sku}" },
 ] }
 
