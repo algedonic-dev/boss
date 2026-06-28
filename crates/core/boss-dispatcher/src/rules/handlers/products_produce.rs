@@ -353,16 +353,57 @@ fn this_step_volume(steps: &[Value], this_step_id: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Whether a produce step's format actually packages, decided by its
+/// gating demand-gate's resolved `outcome` (`"brew"`), matched to the
+/// produce step by finished-goods SKU. The demand gate resolves at agent
+/// speed the moment it's ready (off the QC checkpoint) — well before any
+/// package step is worked — so this is reliable at produce time. The
+/// produce step's own `status` is NOT: a format that will skip is often
+/// still `pending` (not yet `skipped`) when a sibling produces, which made
+/// the denominator over-count and the run UNDER-drain WIP (the skipped
+/// format's mash share never got drained). No demand gate found (a brew
+/// with no stock gating) → the format packages.
+fn format_packages(steps: &[Value], produce_step: &Value) -> bool {
+    let produce_skus: Vec<&str> = produce_step
+        .get("metadata")
+        .and_then(|m| m.get("produces_products"))
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r.get("sku").and_then(|v| v.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if produce_skus.is_empty() {
+        return false; // not a producing step
+    }
+    for s in steps {
+        let Some(md) = s.get("metadata") else {
+            continue;
+        };
+        let Some(targets) = md.get("target_skus").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        if targets
+            .iter()
+            .filter_map(|t| t.as_str())
+            .any(|t| produce_skus.contains(&t))
+        {
+            return md.get("outcome").and_then(|v| v.as_str()) == Some("brew");
+        }
+    }
+    true
+}
+
 /// Total packaged BBL the joint mash spreads across: every format that
-/// actually packages. A step contributes its `produce_step_volume` (zero
-/// for a step that yields no goods), excluding any `skipped` step — so a
-/// format whose demand gate skipped it drops out and the packaged formats
-/// absorb its mash share. Dispatches on the produced-goods property +
-/// step status, never on the kind name.
+/// actually packages — i.e. whose gating demand-gate resolved to `"brew"`
+/// (read from the gate outcome, not the produce step's lagging `status`).
+/// Skipped (`oversupply`) formats drop out, so the packaged formats absorb
+/// their mash share ("absorb into packaged COGS"), race-free.
 fn packaged_volume_denominator(steps: &[Value]) -> f64 {
     steps
         .iter()
-        .filter(|s| s.get("status").and_then(|v| v.as_str()) != Some("skipped"))
+        .filter(|&s| format_packages(steps, s))
         .map(produce_step_volume)
         .sum()
 }
@@ -516,15 +557,29 @@ mod tests {
     }
 
     #[test]
-    fn denominator_excludes_skipped_produce_steps() {
+    fn denominator_uses_demand_gate_outcome_not_lagging_status() {
+        // The fix: a format is in the denominator iff its gating demand-gate
+        // resolved to "brew" — read from the GATE, not the produce step's
+        // `status`. Here the sixtel produce step is still `pending` (its
+        // status hasn't flipped to `skipped` yet) but its gate already says
+        // `oversupply`, so it must be EXCLUDED. The old status-based check
+        // (`status != skipped`) wrongly counted it → the under-drain bug.
         let steps = vec![
-            json!({ "id": "s1", "kind": "production-consume", "status": "completed", "metadata": {} }),
-            json!({ "id": "s2", "kind": "production-produce", "status": "completed",
-                    "metadata": { "produces_products": [{ "sku": "FP-PALE-1-2-BBL", "qty": 210 }] } }), // 105
-            json!({ "id": "s3", "kind": "production-produce", "status": "skipped",
-                    "metadata": { "produces_products": [{ "sku": "FP-PALE-1-6-BBL", "qty": 315 }] } }), // 52.5, excluded
+            json!({ "id": "dc-half", "kind": "demand-gate",
+                    "metadata": { "target_skus": ["FP-PALE-1-2-BBL"], "outcome": "brew" } }),
+            json!({ "id": "dc-sixtel", "kind": "demand-gate",
+                    "metadata": { "target_skus": ["FP-PALE-1-6-BBL"], "outcome": "oversupply" } }),
+            json!({ "id": "pkg-half", "kind": "production-produce", "status": "completed",
+                    "metadata": { "produces_products": [{ "sku": "FP-PALE-1-2-BBL", "qty": 210 }] } }), // 105, brew
+            json!({ "id": "pkg-sixtel", "kind": "production-produce", "status": "pending",
+                    "metadata": { "produces_products": [{ "sku": "FP-PALE-1-6-BBL", "qty": 315 }] } }), // oversupply → excluded
         ];
         assert!((packaged_volume_denominator(&steps) - 105.0).abs() < 1e-6);
+        // Both brewing → both counted (split).
+        let mut both = steps.clone();
+        both[1] = json!({ "id": "dc-sixtel", "kind": "demand-gate",
+                          "metadata": { "target_skus": ["FP-PALE-1-6-BBL"], "outcome": "brew" } });
+        assert!((packaged_volume_denominator(&both) - 157.5).abs() < 1e-6); // 105 + 52.5
     }
 
     #[test]
