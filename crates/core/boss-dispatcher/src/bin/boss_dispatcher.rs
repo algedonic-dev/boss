@@ -149,13 +149,15 @@ async fn main() -> Result<()> {
             ));
             handlers.register(InventoryPartsConsume::new(cfg.inventory_api_url.clone()));
             handlers.register(InventoryPartsProduce::new(cfg.inventory_api_url.clone()));
-            // FG cost basis is derived from the brew's real
-            // consumed-input cost (Job + inventory avg_cost), not a
-            // plug — so the handler needs the jobs + inventory APIs.
+            // FG cost basis is derived from the brew's real consumed-input
+            // cost, not a plug. The drain-actual-wip basis drains exactly
+            // what consume capitalized (the ledger's DR-1310 facts), so the
+            // handler needs the jobs + inventory + ledger APIs.
             handlers.register(ProductsProduce::new(
                 cfg.products_api_url.clone(),
                 cfg.jobs_api_url.clone(),
                 cfg.inventory_api_url.clone(),
+                cfg.ledger_api_url.clone(),
             ));
             handlers.register(ProductsConsume::new(cfg.products_api_url.clone()));
             handlers.register(CommerceInvoiceIssue::new(cfg.commerce_api_url.clone()));

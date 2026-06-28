@@ -622,3 +622,74 @@ pub(super) async fn supersede_fact_handler(
     })
     .into_response()
 }
+
+// --- cost-basis sum (read) ------------------------------------------------
+
+/// Body for `POST /api/ledger/financial-facts/sum`. Read-only
+/// aggregate: returns the summed `payload.total_cost_cents` over the
+/// live `financial_facts` rows matching `(kind, source_table)` for any
+/// of `source_ids`, plus how many matched. Superseded rows are excluded
+/// (`supersede_reason IS NULL`) so the sum reflects the GL's effective
+/// state, matching the rebuild projection's filter.
+///
+/// Why it exists: the dispatcher's `products.produce` `drain-actual-wip`
+/// cost basis asks the ledger for the *real* WIP that a brew's
+/// `inventory.parts.consume` legs capitalized (DR 1310, keyed
+/// `source_table="inventory_consume"`, `source_id="{step_id}:{part_sku}"`).
+/// Draining finished goods by that actual figure — instead of
+/// re-deriving from a since-drifted `avg_cost` — is what keeps WIP from
+/// trending negative. POST (not GET) only because the source-id list
+/// rides in a body.
+#[derive(Deserialize)]
+pub(super) struct FactsSumBody {
+    kind: String,
+    source_table: String,
+    #[serde(default)]
+    source_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct FactsSumResponse {
+    total_cost_cents: i64,
+    /// How many of the requested `source_ids` matched a live fact. Lets
+    /// the caller distinguish "summed every leg" from a partial/empty
+    /// match (a missing-fact signal) and fall back safely, without a
+    /// second round-trip.
+    matched: i64,
+}
+
+pub(super) async fn financial_facts_sum_handler(
+    State(state): State<Arc<LedgerApiState>>,
+    Json(body): Json<FactsSumBody>,
+) -> Response {
+    // Empty request → trivially zero; skip the round-trip.
+    if body.source_ids.is_empty() {
+        return Json(FactsSumResponse {
+            total_cost_cents: 0,
+            matched: 0,
+        })
+        .into_response();
+    }
+    let row: Result<(i64, i64), _> = sqlx::query_as(
+        "SELECT \
+            COALESCE(SUM((payload->>'total_cost_cents')::bigint), 0)::bigint, \
+            COUNT(*)::bigint \
+         FROM financial_facts \
+         WHERE kind = $1 AND source_table = $2 \
+           AND source_id = ANY($3) \
+           AND supersede_reason IS NULL",
+    )
+    .bind(&body.kind)
+    .bind(&body.source_table)
+    .bind(&body.source_ids)
+    .fetch_one(&state.pool)
+    .await;
+    match row {
+        Ok((total_cost_cents, matched)) => Json(FactsSumResponse {
+            total_cost_cents,
+            matched,
+        })
+        .into_response(),
+        Err(e) => storage_err(e),
+    }
+}

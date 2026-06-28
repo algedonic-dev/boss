@@ -110,6 +110,10 @@ pub fn router(state: LedgerApiState) -> Router {
             axum::routing::post(create_manual_entry),
         )
         .route(
+            "/api/ledger/financial-facts/sum",
+            axum::routing::post(financial_facts_sum_handler),
+        )
+        .route(
             "/api/ledger/financial-facts/{id}/supersede",
             axum::routing::post(supersede_fact_handler),
         )
