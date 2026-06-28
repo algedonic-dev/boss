@@ -120,19 +120,6 @@ pub fn publish_job_kinds(
     Ok(())
 }
 
-/// Brewery sim epoch as a NaiveDate, used to stamp bootstrap
-/// design Jobs at the canonical seed date instead of wallclock
-/// today. Reads BOSS_EPOCH_START env (YYYY-MM-DD), falls back to
-/// 2025-04-01 — the same default the data-seed path uses.
-/// Bootstrap design Jobs are pre-sim provisioning work; stamping
-/// them at epoch keeps the bundle stable across re-runs.
-fn epoch_date() -> chrono::NaiveDate {
-    std::env::var("BOSS_EPOCH_START")
-        .ok()
-        .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
-        .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(2025, 4, 1).unwrap())
-}
-
 fn jobs_url(api_base: &str, path: &str) -> String {
     format!("{}{}", api_base.trim_end_matches('/'), path)
 }
@@ -206,7 +193,13 @@ fn bootstrap_kind(
         "owner_id": "automation:bootstrap",
         "status": "open",
         "priority": "standard",
-        "opened_on": epoch_date().to_string(),
+        // opened_on is intentionally omitted so the jobs-api stamps it
+        // from the sim clock (its create_job default) — the SAME clock the
+        // step-walk below closes the Job against. A hardcoded epoch date
+        // diverged from the prior-day seed anchor the close lands on
+        // (seed_tenant_data's configure_clock_to_epoch rebases the clock to
+        // the prior day), so closed_on < opened_on whenever JobKinds publish
+        // after that rebase — tripping the lifecycle-ordering invariant.
         "metadata": json!({
             "target_kind": target.kind,
         }),
