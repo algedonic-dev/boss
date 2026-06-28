@@ -5,11 +5,20 @@
 //!
 //! 1. classes — POST /api/classes/batch (the taxonomy that employee +
 //!    account writes validate against, so it lands first).
-//! 2. JobKinds — the brewery workflow registry ([`super::publish_job_kinds`]).
-//! 3. policy — tenant role grants ([`boss_policy::bootstrap`]).
-//! 4. data — operators, employees, accounts, vendors, messages,
+//! 2. policy — tenant role grants ([`boss_policy::bootstrap`]); these are
+//!    capability-level (`resource = "job-kind"`, not a specific kind), so
+//!    they need no published JobKinds, and the design-Job approval in
+//!    step 4 needs the `job-kind-approver` grant resolved first.
+//! 3. data — operators, employees, accounts, vendors, messages,
 //!    finished-goods, raw materials, equipment, assets, and opening
 //!    balances ([`super::seed_tenant_data`]).
+//! 4. JobKinds LAST ([`super::publish_job_kinds`]) — each one opens a real
+//!    `job-kind-design` Job with role-bearing `approve` + `publish` steps
+//!    that the dispatcher auto-assigns the moment they go ready. Their
+//!    holders (the `job-kind-approver`-granted leaders, it-director,
+//!    platform-admin) must already be seeded AND queryable, or the
+//!    assignment dead-letters against a cold roster — so we barrier on the
+//!    people projection before opening them.
 //!
 //! This collapses what reset-to-baseline / seed-brewery-tenant.sh
 //! drove as four scattered binary + curl steps into one library call,
@@ -61,6 +70,9 @@ pub fn prepare_model(gateway_base: Option<&str>, seeds_dir: &Path) -> Result<()>
     let policy_base = gateway_base
         .map(str::to_string)
         .unwrap_or_else(|| boss_ports::url("policy"));
+    let people_base = gateway_base
+        .map(str::to_string)
+        .unwrap_or_else(|| boss_ports::url("people"));
     let data_bases = match gateway_base {
         Some(g) => SeedBases::all(g),
         None => SeedBases::from_ports(),
@@ -81,20 +93,13 @@ pub fn prepare_model(gateway_base: Option<&str>, seeds_dir: &Path) -> Result<()>
     //     days from. Like classes: load before anything that consumes them.
     seed_business_calendars(&calendar_base, seeds_dir)?;
 
-    // 2. JobKinds — the workflow registry the sim drives. dev=true
-    //    auto-walks the sign-off step (the brewery seed runs
-    //    unattended, same as `boss-brewery-bootstrap --dev`).
-    //    publish_job_kinds takes the job_kinds.toml FILE (not the dir).
-    publish_job_kinds(
-        &jobs_base,
-        &seeds_dir.join("job_kinds.toml"),
-        true,
-        false,
-        None,
-    )?;
-
-    // 3. Tenant policy grants — core ships only platform rules; the
-    //    brewery org chart's row-level access matrix arrives here.
+    // 2. Tenant policy grants — core ships only platform rules; the
+    //    brewery org chart's row-level access matrix arrives here. These
+    //    grants are capability-level (`resource = "job-kind"`, not a
+    //    specific published kind), so they don't depend on the JobKind
+    //    registry being populated — and the design-Job approval in step 4
+    //    needs the `job-kind-approver` grant to resolve to its
+    //    operational-leader holders.
     boss_policy::bootstrap::publish_policy_rules(
         &policy_base,
         &seeds_dir.join("policy_rules.toml"),
@@ -103,12 +108,76 @@ pub fn prepare_model(gateway_base: Option<&str>, seeds_dir: &Path) -> Result<()>
         None,
     )?;
 
-    // 4. Tenant data — operators, employees, accounts, vendors,
+    // 3. Tenant data — operators, employees, accounts, vendors,
     //    messages, finished-goods, raw materials, equipment, assets,
-    //    + opening balances.
+    //    + opening balances. None of it opens Jobs (so it needs no
+    //    JobKinds yet); it DOES seed the workforce step 4 depends on.
     seed_tenant_data(&data_bases, seeds_dir, None)?;
 
+    // 4. JobKinds LAST — publishing each brewery JobKind opens a real
+    //    `job-kind-design` Job whose `approve` (sign-off, authority
+    //    `job-kind-approver`) and `publish` (it-director / platform-admin)
+    //    steps are role-bearing. The dispatcher auto-assigns role-bearing
+    //    steps the instant they go ready, so those holders must already be
+    //    seeded AND queryable — otherwise the assignment NAKs against an
+    //    empty roster and dead-letters (the prepare flow still completes
+    //    the steps directly, but the dispatcher's parallel attempt is what
+    //    exhausts its redelivery budget). Barrier on the people projection
+    //    first, then open the design Jobs. dev=true auto-walks the sign-off
+    //    (unattended seed, same as `boss-brewery-bootstrap --dev`);
+    //    publish_job_kinds takes the job_kinds.toml FILE (not the dir).
+    wait_for_people_projection(&people_base)?;
+    publish_job_kinds(
+        &jobs_base,
+        &seeds_dir.join("job_kinds.toml"),
+        true,
+        false,
+        None,
+    )?;
+
     info!("brewery tenant model prepared");
+    Ok(())
+}
+
+/// Block until the people read-model reflects the just-seeded workforce,
+/// so the role-bearing steps opened immediately after (the
+/// `job-kind-design` Jobs) can be assigned to real holders instead of
+/// dead-lettering against a cold roster. Polls `/api/people` until the
+/// count is non-trivial and stable across three reads (the hire backlog
+/// has drained), or 90s elapse. Mirrors the sim-readiness barrier in
+/// `validate-brewery-sim.sh`, but inside the shared prepare path so every
+/// caller (offline regen, live demo, CI) gets it. Best-effort: a timeout
+/// logs and proceeds rather than aborting the seed.
+fn wait_for_people_projection(people_base: &str) -> Result<()> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let url = format!("{}/api/people", people_base.trim_end_matches('/'));
+    let (mut prev, mut stable) = (0usize, 0u32);
+    for _ in 0..90 {
+        let count = client
+            .get(&url)
+            .send()
+            .ok()
+            .and_then(|r| r.json::<serde_json::Value>().ok())
+            .and_then(|v| v.as_array().map(|a| a.len()))
+            .unwrap_or(0);
+        if count > 100 && count == prev {
+            stable += 1;
+            if stable >= 3 {
+                info!(people = count, "roster ready — opening design Jobs");
+                return Ok(());
+            }
+        } else {
+            stable = 0;
+        }
+        prev = count;
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    info!(
+        people = prev,
+        "people projection did not stabilize in 90s; opening design Jobs anyway"
+    );
     Ok(())
 }
 
