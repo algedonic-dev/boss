@@ -110,7 +110,7 @@ async fn list_accounts_returns_seeded_chart() {
     let (status, body) = get(r, "/api/ledger/accounts").await;
     assert_eq!(status, StatusCode::OK);
     let accounts = body.as_array().unwrap();
-    // The starter chart ships 30 active accounts. Recent additions:
+    // The starter chart ships 31 active accounts. Recent additions:
     //   1010 Cash in Transit (two-phase bank settlement),
     //   2150 Payroll Liability + 6400 Payroll Taxes & Benefits (payroll),
     //   2200 Deferred Revenue (ASC 606 step 1),
@@ -120,10 +120,17 @@ async fn list_accounts_returns_seeded_chart() {
     //   4140 Revenue — Distribution Contracts,
     //   5200 COGS — Packaging,
     //   6700 Bad Debt Expense,
-    //   6900 Depreciation Expense.
+    //   6900 Depreciation Expense,
+    //   2110 Goods Received Not Invoiced (GR-IR capitalize-at-receive).
     // When adding a new account, bump this count + add a presence
     // check below.
-    assert_eq!(accounts.len(), 30);
+    assert_eq!(accounts.len(), 31);
+    assert!(
+        accounts
+            .iter()
+            .any(|a| a["code"] == "2110" && a["name"] == "Goods Received Not Invoiced"),
+        "2110 GR-IR should be in the chart for capitalize-at-receive",
+    );
     assert!(
         accounts
             .iter()

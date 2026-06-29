@@ -296,10 +296,11 @@ fn payroll_run_missing_gross_fails() {
 }
 
 #[test]
-fn bill_approved_lands_inventory_and_ap() {
+fn bill_approved_clears_grir_and_lands_ap() {
     // Lines array is the source of truth: Σ(qty × unit_cost_cents)
     // = 450_000. The lump amount_cents alongside is a redundant
-    // assertion the rule cross-checks.
+    // assertion the rule cross-checks. The inventory bill now DEBITS
+    // 2110 GR-IR (raw was capitalized at goods receipt), not 1300.
     let payload = json!({
         "vendor_invoice_id": "vi-1",
         "amount_cents": 450_000,
@@ -311,7 +312,7 @@ fn bill_approved_lands_inventory_and_ap() {
     });
     let draft = evaluate(&BossRuleSet, &fact("finance.bill.approved", &payload)).unwrap();
     assert!(draft.is_balanced());
-    assert_eq!(line_for(&draft.lines, "1300").debit_cents, 450_000i64);
+    assert_eq!(line_for(&draft.lines, "2110").debit_cents, 450_000i64);
     assert_eq!(line_for(&draft.lines, "2100").credit_cents, 450_000i64);
 }
 
