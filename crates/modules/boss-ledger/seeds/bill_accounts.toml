@@ -6,19 +6,24 @@
 # match arm in the posting rule.
 #
 # A bill's `bill_category` selects what the approved bill debits;
-# the credit is always 2100 Accounts Payable. Asset categories
-# capitalize onto the balance sheet (inventory, equipment); expense
-# categories hit the P&L immediately (rent, utilities, …). When a
-# bill omits `bill_category` the rule defaults to "inventory" —
-# preserving the ingredient-restock pipeline shape.
+# the credit is always 2100 Accounts Payable. Inventory bills clear
+# the GR-IR accrual (raw already capitalized at goods receipt);
+# equipment capitalizes directly; expense categories hit the P&L
+# immediately (rent, utilities, …). When a bill omits `bill_category`
+# the rule defaults to "inventory" — preserving the ingredient-restock
+# pipeline shape.
 #
 # Per-tenant overrides land via `BOSS_LEDGER_BILL_ACCOUNTS_TOML`
 # (replaces — does not merge with — these defaults), and the map is
 # exhaustive at runtime: an unknown category trips a hard error
 # rather than silently mis-posting spend.
 
-# --- Asset purchases (capitalize onto the balance sheet) ---
-"inventory" = "1300"
+# --- Asset purchases ---
+# Raw inventory capitalizes at GOODS RECEIPT (DR 1300 / CR 2110 GR-IR,
+# via /api/ledger/inventory-capitalized), so the vendor bill instead
+# CLEARS that accrual: DR 2110 GR-IR / CR 2100 A/P. Equipment has no
+# separate receipt leg, so its bill still capitalizes directly (DR 1500).
+"inventory" = "2110"
 "equipment" = "1500"
 
 # --- Operating expenses (hit the P&L) ---

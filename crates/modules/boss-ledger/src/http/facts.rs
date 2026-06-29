@@ -361,8 +361,51 @@ struct InventoryTransferredResponse {
 
 pub(super) async fn inventory_transferred_handler(
     State(state): State<Arc<LedgerApiState>>,
-    CurrentUser(user): CurrentUser,
+    user: CurrentUser,
     Json(body): Json<InventoryTransferredBody>,
+) -> Response {
+    post_inventory_movement(
+        state,
+        user,
+        body,
+        "finance.inventory.transferred",
+        "ledger.inventory.transferred",
+    )
+    .await
+}
+
+/// `POST /api/ledger/inventory-capitalized` — goods-receipt
+/// capitalization (DR 1300 raw / CR 2110 GR-IR). The `inventory.receive`
+/// handler posts here when a delivery lands, so raw inventory tracks
+/// physical on_hand regardless of when the vendor bill arrives. The
+/// distinct `finance.inventory.capitalized` kind keeps goods-receipt
+/// provenance separate from inter-tier transfers; the JE body is the
+/// same value-movement shape.
+pub(super) async fn inventory_capitalized_handler(
+    State(state): State<Arc<LedgerApiState>>,
+    user: CurrentUser,
+    Json(body): Json<InventoryTransferredBody>,
+) -> Response {
+    post_inventory_movement(
+        state,
+        user,
+        body,
+        "finance.inventory.capitalized",
+        "ledger.inventory.capitalized",
+    )
+    .await
+}
+
+/// Shared body for the inventory value-movement endpoints (transfer +
+/// capitalization): validate, record the fact, post the JE, and emit the
+/// audit event the rebuild registry re-projects from. Parameterized on
+/// the fact + event kind.
+async fn post_inventory_movement(
+    state: Arc<LedgerApiState>,
+    CurrentUser(user): CurrentUser,
+    body: InventoryTransferredBody,
+    fact_kind: &'static str,
+    event_kind: &'static str,
 ) -> Response {
     if let Some(r) = reject_if_auditor(&user) {
         return r;
@@ -406,7 +449,7 @@ pub(super) async fn inventory_transferred_handler(
         &mut tx,
         crate::events::FactWrite {
             fact_id,
-            kind: "finance.inventory.transferred",
+            kind: fact_kind,
             happened_on: posted_on,
             payload: &payload,
             source_table: Some(&source_table),
@@ -456,7 +499,7 @@ pub(super) async fn inventory_transferred_handler(
         event_payload["source_id"] = serde_json::Value::String(source_id.clone());
         event_payload["happened_on"] = serde_json::Value::String(posted_on.to_string());
         let now = boss_clock_client::now_from(&state.clock).await;
-        pub_.emit_with_actor_at("ledger.inventory.transferred", actor, event_payload, now)
+        pub_.emit_with_actor_at(event_kind, actor, event_payload, now)
             .await;
     }
     Json(InventoryTransferredResponse {

@@ -113,6 +113,11 @@ impl RuleSet for BossRuleSet {
             "finance.bill.paid" => bill_paid(fact),
             "finance.cogs.recognized" => cogs_recognized(fact),
             "finance.inventory.transferred" => inventory_transferred(fact),
+            // Goods-receipt capitalization (DR 1300 raw / CR 2110 GR-IR).
+            // Same caller-specified-account value-movement shape as a
+            // transfer, so it shares the rule; the distinct fact kind keeps
+            // the goods-receipt provenance separate from inter-tier transfers.
+            "finance.inventory.capitalized" => inventory_transferred(fact),
             "finance.payroll.run" => payroll_run(fact),
             "finance.tax.accrued" => tax_accrued(fact),
             "finance.tax.remitted" => tax_remitted(fact),
@@ -1664,6 +1669,42 @@ mod v2_tests {
             "5100 should have one close line (the expense zero), not a WIP variance line"
         );
         assert_eq!(cogs_lines[0].credit_cents, 60_000);
+    }
+
+    #[test]
+    fn inventory_capitalized_posts_dr_raw_cr_grir() {
+        // Goods-receipt capitalization routes through the value-movement
+        // rule via the distinct `finance.inventory.capitalized` kind:
+        // DR 1300 raw / CR 2110 GR-IR. The vendor bill later clears 2110.
+        let id = uuid::Uuid::new_v4();
+        let payload = serde_json::json!({
+            "total_cost_cents": 42_000,
+            "debit_account": "1300",
+            "credit_account": "2110",
+        });
+        let fact_ref = FactRef {
+            id,
+            kind: "finance.inventory.capitalized",
+            happened_on: chrono::NaiveDate::from_ymd_opt(2025, 4, 1).unwrap(),
+            payload: &payload,
+        };
+        let draft = evaluate(&BossRuleSet, &fact_ref).unwrap();
+        assert!(draft.is_balanced(), "capitalization must balance");
+        assert_eq!(draft.total_debits(), 42_000);
+        let raw = draft
+            .lines
+            .iter()
+            .find(|l| l.account_code.as_ref() == "1300")
+            .expect("1300 raw line");
+        assert_eq!(raw.debit_cents, 42_000);
+        assert_eq!(raw.credit_cents, 0);
+        let grir = draft
+            .lines
+            .iter()
+            .find(|l| l.account_code.as_ref() == "2110")
+            .expect("2110 GR-IR line");
+        assert_eq!(grir.credit_cents, 42_000);
+        assert_eq!(grir.debit_cents, 0);
     }
 
     #[test]
