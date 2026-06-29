@@ -70,11 +70,13 @@ INSERT INTO gl_accounts (id, code, name, kind, normal_side) VALUES
     ('00000000-0000-0000-0000-000000001010', '1010', 'Cash in Transit', 'asset', 'debit'),
     ('00000000-0000-0000-0000-000000001100', '1100', 'Accounts Receivable', 'asset', 'debit'),
     -- Inventory three-tier (Model B cost flow): raw materials
-    -- enter at PO line cost (DR 1300 / CR 2100 A/P); production
-    -- consumes raw into WIP (DR 1310 / CR 1300); packaging
-    -- transfers WIP to finished goods at standard cost (DR 1320 /
-    -- CR 1310); sale recognizes COGS against FG (DR 5100 / CR 1320).
-    -- See docs/design/correctness-protocol.md.
+    -- capitalize at GOODS RECEIPT (DR 1300 / CR 2110 GR-IR), so raw
+    -- inventory tracks physical on_hand regardless of when the vendor
+    -- bill lands; the bill then clears the accrual (DR 2110 / CR 2100
+    -- A/P). Production consumes raw into WIP (DR 1310 / CR 1300);
+    -- packaging transfers WIP to finished goods at standard cost
+    -- (DR 1320 / CR 1310); sale recognizes COGS against FG (DR 5100 /
+    -- CR 1320). See docs/design/correctness-protocol.md.
     ('00000000-0000-0000-0000-000000001300', '1300', 'Inventory — Raw Materials', 'asset', 'debit'),
     ('00000000-0000-0000-0000-000000001310', '1310', 'Inventory — Work in Process', 'asset', 'debit'),
     ('00000000-0000-0000-0000-000000001320', '1320', 'Inventory — Finished Goods', 'asset', 'debit'),
@@ -85,6 +87,11 @@ INSERT INTO gl_accounts (id, code, name, kind, normal_side) VALUES
     -- reverses cost + accumulated-depreciation in one JE.
     ('00000000-0000-0000-0000-000000001510', '1510', 'Accumulated Depreciation', 'asset', 'credit'),
     ('00000000-0000-0000-0000-000000002100', '2100', 'Accounts Payable', 'liability', 'credit'),
+    -- GR-IR clearing: goods received but not yet vendor-billed. The
+    -- receipt credits it (raw capitalizes); the bill debits it (and
+    -- credits A/P). Nets to ~0 per PO once billed; a standing balance
+    -- is genuine received-not-invoiced liability.
+    ('00000000-0000-0000-0000-000000002110', '2110', 'Goods Received Not Invoiced', 'liability', 'credit'),
     ('00000000-0000-0000-0000-000000002150', '2150', 'Payroll Liability', 'liability', 'credit'),
     -- Deferred Revenue: the target account for ASC 606 ratable
     -- invoice lines (docs/architecture-decisions.md §Finance & ledger).
@@ -446,7 +453,12 @@ INSERT INTO gl_fact_projection_rules (event_kind, fact_kind, source_table, sourc
     -- this rule, a TRUNCATE-then-replay rebuild would lose every
     -- opening balance because they're inserted via the handler,
     -- not via an upstream audit-event flow.
-    ('ledger.inventory.transferred',       'finance.inventory.transferred', 'manual_inventory_transferred', '/source_id', '/happened_on', NULL)
+    ('ledger.inventory.transferred',       'finance.inventory.transferred', 'manual_inventory_transferred', '/source_id', '/happened_on', NULL),
+    -- Goods-receipt capitalization: the inventory.receive handler POSTs
+    -- /api/ledger/inventory-capitalized (DR 1300 raw / CR 2110 GR-IR),
+    -- which emits this kind. Same event-payload-carries-source_table
+    -- shape as the transferred row above, so rebuild reproduces the tag.
+    ('ledger.inventory.capitalized',       'finance.inventory.capitalized', 'inventory_capitalization', '/source_id', '/happened_on', NULL)
 ON CONFLICT (event_kind) DO NOTHING;
 
 

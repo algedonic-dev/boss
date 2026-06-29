@@ -172,6 +172,10 @@ pub fn router(state: LedgerApiState) -> Router {
             "/api/ledger/inventory-transferred",
             axum::routing::post(inventory_transferred_handler),
         )
+        .route(
+            "/api/ledger/inventory-capitalized",
+            axum::routing::post(inventory_capitalized_handler),
+        )
         // General accounts-payable bills (rent, utilities, …) — routed to a
         // GL debit account by `bill_category`, decoupled from inventory POs.
         .route("/api/ledger/bills", get(list_bills).post(create_bill))

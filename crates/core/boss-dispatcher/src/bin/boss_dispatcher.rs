@@ -140,7 +140,10 @@ async fn main() -> Result<()> {
             // Step-completion handlers — F15 migration. Each
             // is a pure HTTP client to the relevant public API.
             handlers.register(InventoryPoPlace::new(cfg.inventory_api_url.clone()));
-            handlers.register(InventoryReceive::new(cfg.inventory_api_url.clone()));
+            handlers.register(InventoryReceive::new(
+                cfg.inventory_api_url.clone(),
+                cfg.ledger_api_url.clone(),
+            ));
             handlers.register(InventoryBillApprove::new(cfg.inventory_api_url.clone()));
             handlers.register(BillPaymentBatch::new(
                 "inventory.bill.payment_batch",

@@ -28,13 +28,15 @@ struct ReceivedItem {
 pub struct InventoryReceive {
     client: reqwest::Client,
     inventory_base: String,
+    ledger_base: String,
 }
 
 impl InventoryReceive {
-    pub fn new(inventory_base: impl Into<String>) -> Arc<Self> {
+    pub fn new(inventory_base: impl Into<String>, ledger_base: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
             client: reqwest::Client::new(),
             inventory_base: inventory_base.into(),
+            ledger_base: ledger_base.into(),
         })
     }
 
@@ -107,6 +109,9 @@ impl Handler for InventoryReceive {
             let items: Vec<ReceivedItem> = serde_json::from_value(raw.clone())
                 .map_err(|e| HandlerError::Downstream(format!("decode expected_items: {e}")))?;
             let contract = self.po_lines(&po_id, &header).await;
+            // Accumulate the capitalized value of this receipt (Σ qty ×
+            // unit_cost) so it posts as one goods-receipt JE below.
+            let mut total_cap_cents: i64 = 0;
             for it in items {
                 // A line carrying only part_sku receives what the PO
                 // ordered, at the PO's price.
@@ -145,6 +150,29 @@ impl Handler for InventoryReceive {
                     sku
                 );
                 common::post_json(&self.client, &url, &body, &ctx.rule_name).await?;
+                if let Some(c) = cost {
+                    total_cap_cents += qty * c;
+                }
+            }
+            // Capitalize the receipt: DR 1300 raw / CR 2110 GR-IR, one JE
+            // for the delivery. Raw inventory tracks physical on_hand the
+            // moment goods land; the vendor bill later clears 2110. The
+            // source_id keys off the step so a redelivered step.done is
+            // idempotent (the ledger fact dedups on it).
+            if total_cap_cents > 0 {
+                let cap_url = format!(
+                    "{}/api/ledger/inventory-capitalized",
+                    self.ledger_base.trim_end_matches('/')
+                );
+                let cap_body = json!({
+                    "total_cost_cents": total_cap_cents,
+                    "debit_account": "1300",
+                    "credit_account": "2110",
+                    "memo": format!("Goods received — raw capitalized (PO {po_id})"),
+                    "source_table": "inventory_capitalization",
+                    "source_id": format!("cap:{}", step.step_id),
+                });
+                common::post_json(&self.client, &cap_url, &cap_body, &ctx.rule_name).await?;
             }
         }
 
