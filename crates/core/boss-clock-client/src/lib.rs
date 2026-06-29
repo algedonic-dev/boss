@@ -293,6 +293,7 @@ impl ClockClient for ReqwestClockClient {
                     epoch_end: None,
                     paused: false,
                     restart_in_progress: false,
+                    warp_factor: None,
                 };
                 self.store(fallback);
                 fallback
@@ -327,6 +328,7 @@ impl ClockClient for WallClockClient {
             epoch_end: None,
             paused: false,
             restart_in_progress: false,
+            warp_factor: None,
         }
     }
 }
@@ -405,6 +407,7 @@ mod tests {
             epoch_end: None,
             paused: false,
             restart_in_progress: false,
+            warp_factor: None,
         };
         let c = FixedClockClient::new(snapshot);
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -428,6 +431,7 @@ mod tests {
             epoch_end: None,
             paused: false,
             restart_in_progress: false,
+            warp_factor: None,
         });
         assert_eq!(c.now().await.now, early);
         c.set(ClockNow {
@@ -437,6 +441,7 @@ mod tests {
             epoch_end: None,
             paused: false,
             restart_in_progress: false,
+            warp_factor: None,
         });
         assert_eq!(c.now().await.now, later);
     }

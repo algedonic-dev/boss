@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 /// every event payload they emit, so downstream queries can
 /// filter sim activity from real activity without going back
 /// to the source.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+// No `Eq`: `warp_factor` is `Option<f64>` and f64 is only `PartialEq`
+// (same reason `SimClockParams` below isn't `Eq`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct ClockNow {
     /// Effective `now` for any handler stamping a date.
     pub now: DateTime<Utc>,
@@ -37,6 +39,14 @@ pub struct ClockNow {
     /// in wall mode.
     #[serde(default)]
     pub restart_in_progress: bool,
+    /// Sim-mode pacing — sim-seconds advanced per wall-second
+    /// (`8640.0` = 1 sim-day every 10 wall-seconds). `None` in
+    /// wall mode. clock-api owns this, so a UI reading it here is
+    /// reading the authoritative warp directly — correct even
+    /// while the brewery-sim daemon (which carries its own
+    /// `/telemetry`) is stopped, e.g. mid seed-rebuild.
+    #[serde(default)]
+    pub warp_factor: Option<f64>,
 }
 
 impl ClockNow {
@@ -51,6 +61,7 @@ impl ClockNow {
             epoch_end: None,
             paused: false,
             restart_in_progress: false,
+            warp_factor: None,
         }
     }
 }
@@ -149,6 +160,7 @@ impl SimClockParams {
             epoch_end: self.epoch_end,
             paused: self.paused,
             restart_in_progress: self.restart_in_progress,
+            warp_factor: Some(self.warp_factor),
         }
     }
 }

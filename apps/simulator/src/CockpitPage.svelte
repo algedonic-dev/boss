@@ -13,14 +13,23 @@
   import { onMount } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
-  import type { SimTelemetry, ActorActivity, AuditEntry } from './types';
+  import type { SimTelemetry, ActorActivity, AuditEntry, ClockNow } from './types';
 
   const TELEMETRY_POLL_MS = 2_000;
+  const CLOCK_POLL_MS = 2_000;
   const EVENTS_POLL_MS = 3_000;
   const EVENTS_LIMIT = 40;
 
   let tele = $state<SimTelemetry | null>(null);
   let teleError = $state<string | null>(null);
+
+  // The clock (sim time / warp / paused) comes from clock-api, which owns
+  // it — NOT the daemon telemetry, which is only up while the daemon ticks.
+  // So these readouts stay correct even while the daemon is stopped (e.g.
+  // mid seed-rebuild). clock-api isn't gateway-proxied, so boss-simulator
+  // proxies it at /simulator/api/clock.
+  let clock = $state<ClockNow | null>(null);
+  let clockError = $state<string | null>(null);
 
   let events = $state<ReadonlyArray<AuditEntry>>([]);
   let eventsError = $state<string | null>(null);
@@ -45,7 +54,10 @@
     if (Number.isNaN(a) || Number.isNaN(b)) return 0;
     return Math.max(0, (b - a) / 86_400_000);
   }
-  let elapsedSimDays = $derived(tele ? simDaysBetween(tele.started_sim_date, tele.cadence.sim_date) : 0);
+  // Authoritative current sim date — clock-api's `now` (it owns the clock),
+  // falling back to the daemon's telemetry only if clock-api is unreachable.
+  let currentSimDate = $derived(clock ? clock.now.slice(0, 10) : (tele?.cadence.sim_date ?? null));
+  let elapsedSimDays = $derived(tele ? simDaysBetween(tele.started_sim_date, currentSimDate) : 0);
   function ratePerDay(calls: number): string {
     if (elapsedSimDays <= 0) return '—';
     const r = calls / elapsedSimDays;
@@ -102,6 +114,17 @@
     }
   }
 
+  async function refreshClock(): Promise<void> {
+    try {
+      const r = await fetch('/simulator/api/clock', { headers: { accept: 'application/json' } });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      clock = (await r.json()) as ClockNow;
+      clockError = null;
+    } catch (e) {
+      clockError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
   async function refreshEvents(): Promise<void> {
     try {
       const r = await fetch(`/api/events/tail?limit=${EVENTS_LIMIT}`, {
@@ -129,11 +152,14 @@
 
   onMount(() => {
     void refreshTelemetry();
+    void refreshClock();
     void refreshEvents();
     const t = window.setInterval(() => void refreshTelemetry(), TELEMETRY_POLL_MS);
+    const c = window.setInterval(() => void refreshClock(), CLOCK_POLL_MS);
     const e = window.setInterval(() => void refreshEvents(), EVENTS_POLL_MS);
     return () => {
       window.clearInterval(t);
+      window.clearInterval(c);
       window.clearInterval(e);
     };
   });
@@ -146,6 +172,21 @@
   motif="glass"
 />
 
+<!-- Clock — authoritative sim time / warp / paused from clock-api, which
+     owns the clock. Rendered independently of the daemon telemetry so it
+     stays live even while the daemon is stopped (e.g. mid seed-rebuild),
+     when the rest of this page can't load. -->
+{#if clock}
+  <div class="cadence clock-strip">
+    {#if currentSimDate}<span class="cad"><b>{currentSimDate}</b> sim date</span>{/if}
+    {#if clock.warp_factor}<span class="cad">warp ×{clock.warp_factor}</span>{/if}
+    <span class="badge" class:paused={clock.paused}>{clock.paused ? 'Paused' : 'Running'}</span>
+    {#if clock.restart_in_progress}<span class="cad muted">rebuilding…</span>{/if}
+  </div>
+{:else if clockError}
+  <p class="status error">Couldn't reach clock-api: {clockError}</p>
+{/if}
+
 {#if teleError}
   <p class="status error">Couldn't reach the simulator daemon: {teleError}</p>
   <p class="status">The daemon exposes its telemetry on a localhost-only control port; this is
@@ -153,7 +194,8 @@
 {:else if !tele}
   <p class="status">Loading telemetry…</p>
 {:else}
-  <!-- Identity + cadence: who the sim is on the API, and at what speed. -->
+  <!-- Identity + tick cadence: who the sim is on the API, and its tick
+       rhythm. (Sim time / warp / paused are clock-api's — the strip above.) -->
   <div class="identity">
     <div class="identity-main">
       <span class="id-label">Acting as</span>
@@ -164,14 +206,9 @@
       <code class="id-base">{tele.api_base}</code>
     </div>
     <div class="cadence">
-      {#if tele.cadence.sim_date}<span class="cad"><b>{tele.cadence.sim_date}</b> sim date</span>{/if}
-      {#if tele.cadence.warp_factor}<span class="cad">warp ×{tele.cadence.warp_factor}</span>{/if}
       {#if tele.cadence.days_per_tick && tele.cadence.tick_interval_seconds}
         <span class="cad">{tele.cadence.days_per_tick}d / {tele.cadence.tick_interval_seconds}s per tick</span>
       {/if}
-      <span class="badge" class:paused={tele.cadence.paused}>
-        {tele.cadence.paused ? 'Paused' : 'Running'}
-      </span>
       <span class="cad muted">tick #{tele.tick_count.toLocaleString()}</span>
     </div>
   </div>
@@ -339,6 +376,15 @@
     gap: 12px;
     font-size: 0.85rem;
     color: var(--brew-malt);
+  }
+  /* The clock strip stands on its own under the header (clock-api-sourced,
+     independent of the daemon telemetry below it). */
+  .clock-strip {
+    margin: 4px 0 18px;
+    padding: 9px 14px;
+    border: 1px solid #ece7df;
+    border-radius: 8px;
+    background: #fbf9f5;
   }
   .cad b {
     color: var(--brew-malt-dark);

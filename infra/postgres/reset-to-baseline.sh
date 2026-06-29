@@ -64,6 +64,17 @@ for svc in "${SERVICES_TO_STOP[@]}"; do
 done
 sleep 2
 
+# Clear the brewery-sim daemon's checkpointed counterparty queue. The daemon
+# persists the ar-aging chain's scheduled paid/past-due/write-off emissions
+# (keyed by billing step_id) to BOSS_SIM_STATE_DIR/counterparty-queue.json so
+# they survive a plain daemon restart. But those step_ids reference invoices
+# the DB drop below wipes — a surviving queue replays
+# PUT /api/commerce/invoices/inv-step-<id>/paid against rows that no longer
+# exist, a 404 flood that drains for sim-days. The queue is DB-derived state,
+# so a full reset must clear it WITH the DB. (Only this host-level reset does;
+# a plain `systemctl restart boss-brewery-sim` still keeps the queue.)
+rm -f "${BOSS_SIM_STATE_DIR:-/var/lib/boss-sim}/counterparty-queue.json"
+
 echo "==> [2/9] dropping + recreating boss DB"
 # --force terminates any straggler connection (a timer mid-run, or a service
 # missing from the stop-list) so the drop can't be blocked.
