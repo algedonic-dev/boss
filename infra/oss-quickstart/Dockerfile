@@ -16,7 +16,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1 — Rust build.
 # ---------------------------------------------------------------------------
-FROM rust:1.96-slim-bookworm@sha256:c8a94a78f67ec8c4d474ec7f71e0720f21eb7e584e158daec0874cafa7c30e4d AS rust-build
+FROM rust:1.96-slim-bookworm@sha256:4732ca96fd086cb9be682050c3f0176288eebaac2b80aa2bcefccfaf198e1950 AS rust-build
 
 # sqlx + reqwest need pkg-config + libssl-dev for the rustls-native
 # bridge; the rest of the workspace is pure Rust.
@@ -117,7 +117,7 @@ RUN cd apps/web && bun run build
 # ---------------------------------------------------------------------------
 # Stage 3 — runtime.
 # ---------------------------------------------------------------------------
-FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716 AS runtime
+FROM debian:bookworm-slim@sha256:60eac759739651111db372c07be67863818726f754804b8707c90979bda511df AS runtime
 
 # Runtime deps: ca-certs for outbound HTTPS (the gateway), libssl
 # for rustls's native bridge, postgresql-client for the init
