@@ -53,6 +53,20 @@ export type SimCadence = Readonly<{
   tick_interval_seconds: number | null;
 }>;
 
+// GET /simulator/api/clock — clock-api's authoritative ClockNow (it owns
+// sim time + warp + paused). The cockpit reads its clock readouts here, so
+// they're correct even while the daemon's /telemetry is down (e.g. mid
+// seed-rebuild). Mirrors boss-clock's ClockNow.
+export type ClockNow = Readonly<{
+  now: string;
+  simulated: boolean;
+  epoch_start: string | null;
+  epoch_end: string | null;
+  paused: boolean;
+  restart_in_progress: boolean;
+  warp_factor: number | null;
+}>;
+
 // Workforce step transitions — the PUT /api/jobs/{}/steps engagement.
 export type WorkforceStats = Readonly<{
   checkins: number;
