@@ -172,6 +172,22 @@ development. Platform kinds ship in code (`platform_kinds()`);
 tenant kinds load from `examples/<tenant>/seeds/job_kinds.toml`
 (governance rule: `docs/design/platform-vs-tenant-jobkinds.md`).
 
+**Authoring is graphical and author-gated.** The `job-kind-design`
+surface is an interactive trigger→outcome canvas (Svelte Flow + dagre,
+code-split onto the editor route): steps are nodes (trigger / terminal
+/ fork / work), an edge A→B *is* `steps.A.done` in B's `ready_when`, and
+a structured predicate builder emits the boss-expr behind a
+live-validated raw "advanced" escape hatch. A non-persisting dry-run
+(`POST /api/jobs/kinds/_validate`) runs the publish-path lint against
+the same in-process `StepRegistry::v1()`, so editor-green publishes by
+construction; the SPA persists drafts as `metadata.job_kind_spec`
+PATCHes on the design Job and never calls the direct `/api/jobs/kinds`
+create/update/publish handlers (kept only for bootstrap + tests). The
+design **approve** step requires a `job-kind-approver` capability —
+authoring a work-type is operational leadership's call, not the deploy
+operator's alone (core policy grants it to `platform-admin`; tenants
+grant it to their leaders; `design-doc-review` stays `platform-admin`).
+
 ## Step types are property bundles; the alphabet is the mechanisms
 
 A step *type* enforces rules, and each rule is an orthogonal,

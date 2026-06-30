@@ -129,7 +129,8 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         )
         // Author-time dry run: lint a draft spec without persisting, so
         // the editor surfaces the same validate_all the publish path
-        // enforces (live, on the graph). See docs/design/jobkind-authoring-ux.md.
+        // enforces (live, on the graph). See architecture-decisions.md
+        // §Jobs, JobKinds, Steps.
         .route("/api/jobs/kinds/_validate", post(validate_kind::<R, B>))
         .route(
             "/api/jobs/kinds/{kind}",
