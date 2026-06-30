@@ -217,7 +217,11 @@ answer "yes" stops the search:
 - Format: cargo fmt -- --check
 - Lint:   infra/lint/seed-bypass-smell.sh
 - Lint:   infra/lint/no-todo-citation.sh
-- Web:    bun install + bun run typecheck + bun run build
+- Lint:   infra/lint/no-step-kind-match.sh
+- Lint:   infra/lint/api-path-bypass-smell.sh
+- Lint:   infra/lint/sim-boundary-audit.sh
+- Lint:   infra/lint/no-wallclock.sh
+- Web:    bun install + bun run typecheck + bun run build + bun run test:mocked
 ```
 
 `.github/workflows/release.yml` cuts cross-platform `boss` CLI

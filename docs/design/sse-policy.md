@@ -46,11 +46,11 @@ diagrams, design-doc text.
 Choose by answering, in order:
 
 1. **Does the view show state-machine state where a single event
-   flips the visible value?** → SSE-push. (The four wired today:
-   `sim_clock.current_sim_date` via `/api/jobs/sim-clock/stream`,
-   a Job's step-status changes via `/api/jobs/{id}/stream`, the
-   audit-log tail via `/api/events/stream`, and Ops telemetry via
-   `/api/events`.)
+   flips the visible value?** → SSE-push. (Several read surfaces are
+   wired this way — sim-clock, per-Job step status, the audit-log tail,
+   plus asset and clock-tick streams. This is a policy, not a route
+   registry: the live set is whatever the SSE route handlers expose,
+   so we deliberately don't enumerate it here.)
 2. **Does the view show data that doesn't change during a
    session?** → On-mount only. (Examples: architecture diagrams,
    ADR catalog, JobKind step graphs.)

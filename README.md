@@ -94,7 +94,8 @@ Install it locally and open it in a browser: the demo tenant,
 Algedonic Ales, **builds itself live**. A fresh install starts
 with an empty audit log (schema + reference data only); the
 brewery simulator then ticks forward from the demo epoch (~1
-sim-day per ~10 wall-seconds) and generates the operation as it
+sim-day per ~43 wall-seconds at the warp-2000 demo default) and
+generates the operation as it
 goes — jobs, orders, invoices, ledger entries, projections. So
 the SPA is **sparse on first load and fills in as the sim runs**,
 and the audit log grows while you click around. The install (see
@@ -123,7 +124,7 @@ the simulator has generated since you started the stack.
 
 | If you want to … | Read |
 |---|---|
-| See it in a browser | [Quick start](#quick-start) below — `docker compose up`, ~10 min cold |
+| See it in a browser | [Quick start](#quick-start) below — `docker compose up`, ~20-25 min cold |
 | Understand the architecture | [docs/architecture-diagram.md](docs/architecture-diagram.md) — four diagrams, conceptual to concrete |
 | Read the BOSS core domain | [CLAUDE.md §Primitives + §Supporting concepts](CLAUDE.md#primitives) |
 | See the public demo tenant | [examples/brewery/DOMAIN.md](examples/brewery/DOMAIN.md) — Algedonic Ales |
@@ -173,7 +174,7 @@ Port assignments are the canonical
 
 Two paths — pick whichever matches your environment.
 
-**Docker compose** (fastest, ~10 min cold):
+**Docker compose** (fastest, ~20-25 min cold):
 
 ```sh
 git clone https://github.com/algedonic-dev/boss.git
@@ -199,8 +200,8 @@ Open `http://127.0.0.1:4443`.
 Either way, the bootstrap-admin email you provide becomes the
 seed `platform-admin` Employee, the install seeds the brewery
 tenant (JobKinds, accounts, vendors, reference data), and the live
-brewery sim ticks ~1 sim-day per 86 wall-seconds, building the demo
-from there. Full runbook + troubleshooting at
+brewery sim ticks ~1 sim-day per ~43 wall-seconds (warp-2000 demo
+default), building the demo from there. Full runbook + troubleshooting at
 [`infra/oss-quickstart/README.md`](infra/oss-quickstart/README.md).
 
 > **The demo builds itself live.** The install starts the brewery sim
