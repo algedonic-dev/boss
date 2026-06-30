@@ -534,5 +534,829 @@
     "oem_serial": "TRX-WIN-U60-2023-3005",
     "first_seen": "2023-12-06",
     "warranty_through": "2029-12-06"
+  },
+  {
+    "asset_id": "SYS-FV2-001",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0001",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-002",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0002",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-003",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0003",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-004",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0004",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-005",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0005",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-006",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0006",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-007",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0007",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-008",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0008",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-009",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0009",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-010",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0010",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-011",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0011",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-012",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0012",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-013",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0013",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-014",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0014",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-015",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0015",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-016",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0016",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-017",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0017",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-018",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0018",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-019",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0019",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-020",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0020",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-021",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0021",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-022",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0022",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-023",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0023",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-024",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0024",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-025",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0025",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-026",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0026",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-027",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0027",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-028",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0028",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-029",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0029",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-030",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0030",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-031",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0031",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-032",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0032",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-033",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0033",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-034",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0034",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-035",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0035",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-036",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0036",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-037",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0037",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-038",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0038",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-039",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0039",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-040",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0040",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-041",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0041",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-042",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0042",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-043",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0043",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-044",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0044",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-045",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0045",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-046",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0046",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-047",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0047",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-048",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0048",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-049",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0049",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-050",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0050",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-051",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0051",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-052",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0052",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-053",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0053",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-054",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0054",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-055",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0055",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-056",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0056",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-057",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0057",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-058",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0058",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-059",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0059",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-060",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0060",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-061",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0061",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-062",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0062",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-063",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0063",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-064",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0064",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-FV2-065",
+    "sku": "BREW-FV-200BBL",
+    "phase": "installed",
+    "oem_serial": "FV2-2021-0065",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-001",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0001",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-002",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0002",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-003",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0003",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-004",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0004",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-005",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0005",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-006",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0006",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-007",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0007",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-008",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0008",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-009",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0009",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-010",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0010",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-011",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0011",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-012",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0012",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-013",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0013",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-014",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0014",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-015",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0015",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-016",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0016",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-017",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0017",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-018",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0018",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-019",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0019",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-020",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0020",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-021",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0021",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-022",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0022",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-023",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0023",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-024",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0024",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-025",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0025",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-026",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0026",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-027",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0027",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-028",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0028",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-029",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0029",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-030",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0030",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-031",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0031",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BR2-032",
+    "sku": "BREW-BRITE-200BBL",
+    "phase": "installed",
+    "oem_serial": "BR2-2021-0032",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-CANHS-001",
+    "sku": "BREW-CAN-LINE-HS",
+    "phase": "installed",
+    "oem_serial": "CANHS-2021-0001",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-KGL-001",
+    "sku": "BREW-KEG-LINE-AUTO",
+    "phase": "installed",
+    "oem_serial": "KGL-2021-0001",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-GLYC-001",
+    "sku": "BREW-GLYCOL-CENTRAL",
+    "phase": "installed",
+    "oem_serial": "GLYC-2021-0001",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-BLR3-001",
+    "sku": "BREW-BOILER-300HP",
+    "phase": "installed",
+    "oem_serial": "BLR3-2021-0001",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-CO2-001",
+    "sku": "BREW-CO2-RECOVERY",
+    "phase": "installed",
+    "oem_serial": "CO2-2021-0001",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
+  },
+  {
+    "asset_id": "SYS-WW-001",
+    "sku": "BREW-WASTEWATER",
+    "phase": "installed",
+    "oem_serial": "WW-2021-0001",
+    "first_seen": "2021-02-15",
+    "warranty_through": "2031-02-15"
   }
 ]
