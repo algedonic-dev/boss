@@ -598,6 +598,10 @@ async fn main() -> Result<()> {
     // engine is mutex-guarded so two ticks can't race; with
     // tick_interval_seconds ≥ 1 they realistically don't.
     let mut global_tick: u64 = 0;
+    // The last sim-day the daemon has fully run; persists across outer
+    // passes so a day is never re-run while the warp clock sits on it
+    // (the cold-start over-fire fix). `None` until the first pass.
+    let mut cursor: Option<NaiveDate> = None;
     loop {
         let clock = read_clock().await?;
         if clock.paused {
@@ -679,17 +683,34 @@ async fn main() -> Result<()> {
             guard.tenant.meta.ticks_per_day()
         };
         assert!(ticks_per_day > 0);
-        let total_ticks = (clock.days_per_tick as u32) * ticks_per_day;
         let per_tick_sleep_ms =
             (clock.tick_interval_seconds as u64 * 1000) / (ticks_per_day as u64);
 
-        let mut last_advanced = clock.current_sim_date;
+        // Run only sim-days the daemon hasn't run yet — (cursor,
+        // current_sim_date], each exactly once. While the warp clock sits
+        // on a day this is empty and the daemon idles instead of re-running
+        // it (the old loop re-ran current_sim_date every pass, double-firing
+        // periodics + rate jobs at cold-start). days_per_tick caps the
+        // per-pass catch-up batch.
+        let days = days_to_run(
+            cursor,
+            clock.current_sim_date,
+            (clock.days_per_tick.max(1)) as u32,
+        );
+        let Some(&start_day) = days.first() else {
+            // No new sim-day yet: drive in-flight workforce, then idle.
+            if let Err(e) = run_workforce_pass(workforce.clone()).await {
+                warn!(error = %e, "workforce pass failed; continuing");
+            }
+            tokio::time::sleep(Duration::from_millis(per_tick_sleep_ms)).await;
+            continue;
+        };
+        let total_ticks = (days.len() as u32) * ticks_per_day;
         let mut break_outer = false;
         for tick_offset in 0..total_ticks {
             let day_offset = tick_offset / ticks_per_day;
             let tick_idx = tick_offset % ticks_per_day;
-            let day = clock
-                .current_sim_date
+            let day = start_day
                 .checked_add_signed(chrono::Duration::days(day_offset as i64))
                 .expect("date overflow");
             if let Err(e) = advance_one_tick(
@@ -727,7 +748,7 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
-                last_advanced = day;
+                cursor = Some(day);
             }
             // Drive the workforce after this tick's generation: claim
             // newly-Ready steps and complete Active steps whose duration
@@ -768,27 +789,118 @@ async fn main() -> Result<()> {
             }
         }
 
-        if !break_outer {
-            let next = last_advanced
-                .checked_add_signed(chrono::Duration::days(1))
-                .expect("date overflow");
-            // clock-api is the single writer for current_sim_date;
-            // this daemon just drives the advance + logs. Writing
-            // sim_clock from here too would race clock-api (which
-            // writes it on every /advance) — a late write landing
-            // after clock-api had advanced past `next` would
-            // regress sim_clock backward and the SPA's Simulator
-            // panel would show a date older than the events being
-            // written.
+        if !break_outer && let Some(ran_through) = cursor {
+            // clock-api is the single writer for current_sim_date; this
+            // daemon only drives + logs. We never write sim_clock from here
+            // — a late write could regress it behind clock-api and show the
+            // SPA a date older than the events being written.
             info!(
-                advanced_to = %next,
+                ran_through = %ran_through,
+                days_this_pass = days.len(),
                 ticks_per_day,
-                total_ticks,
-                "tick complete"
+                "pass complete"
             );
         }
 
         tokio::time::sleep(Duration::from_millis(per_tick_sleep_ms)).await;
+    }
+}
+
+/// Decide which sim-days to run this pass, given `cursor` (the last day
+/// the daemon already ran) and `target` (the clock's current day).
+/// Forward-only, each day exactly once — the daemon never re-runs a day
+/// it already processed.
+///
+/// This is the fix for the cold-start over-firing: the old loop ran
+/// `current_sim_date` every pass regardless, so while the warp clock sat
+/// on a day the daemon re-ran it — double-firing periodics (6× facility/
+/// utilities/tax) and re-spawning rate jobs (~2× early revenue). Mirrors
+/// the dispatcher's `schedule_runner::advance_cursor`, except first
+/// observation *runs* the current day (the daemon builds the demo
+/// forward from wherever the clock sits — the epoch on a fresh reset)
+/// rather than establishing a fire-nothing baseline.
+///
+/// - First observation (`cursor == None`) → run `target`.
+/// - No advance (`target <= cursor`, incl. an epoch-restart rewind) → run
+///   nothing; the daemon idles until the clock ticks over.
+/// - Forward (`target > cursor`) → the half-open range `(cursor, target]`,
+///   capped at `max_batch` days this pass. The cursor advances, so the
+///   next pass continues — catch-up never skips a day, only spreads it.
+fn days_to_run(cursor: Option<NaiveDate>, target: NaiveDate, max_batch: u32) -> Vec<NaiveDate> {
+    match cursor {
+        None => vec![target],
+        Some(c) if target <= c => Vec::new(),
+        Some(c) => {
+            let mut days = Vec::new();
+            let mut d = c;
+            while (days.len() as u32) < max_batch.max(1) {
+                match d.succ_opt() {
+                    Some(n) if n <= target => {
+                        d = n;
+                        days.push(d);
+                    }
+                    _ => break,
+                }
+            }
+            days
+        }
+    }
+}
+
+#[cfg(test)]
+mod day_cursor_tests {
+    use super::*;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn first_observation_runs_current_day() {
+        // Cold start: cursor None, clock at the epoch → run the epoch day,
+        // so the daemon still builds the demo forward from day 0.
+        assert_eq!(days_to_run(None, d(2025, 4, 1), 31), vec![d(2025, 4, 1)]);
+    }
+
+    #[test]
+    fn no_advance_runs_nothing() {
+        // The warp clock hasn't ticked over: same day → idle. (THE bug:
+        // the old loop re-ran this day, double-firing the periodics.)
+        assert!(days_to_run(Some(d(2025, 4, 5)), d(2025, 4, 5), 31).is_empty());
+    }
+
+    #[test]
+    fn backward_clock_runs_nothing() {
+        // An epoch restart rewinds the clock; never re-run on a rewind.
+        assert!(days_to_run(Some(d(2025, 4, 5)), d(2025, 4, 1), 31).is_empty());
+    }
+
+    #[test]
+    fn single_day_advance_runs_that_day_once() {
+        assert_eq!(
+            days_to_run(Some(d(2025, 4, 5)), d(2025, 4, 6), 31),
+            vec![d(2025, 4, 6)]
+        );
+    }
+
+    #[test]
+    fn multi_day_gap_runs_each_missing_day_in_order() {
+        // Daemon fell behind: clock jumped 04-05 → 04-08. Run 06, 07, 08
+        // (each once, oldest first) — no skip, no re-run.
+        assert_eq!(
+            days_to_run(Some(d(2025, 4, 5)), d(2025, 4, 8), 31),
+            vec![d(2025, 4, 6), d(2025, 4, 7), d(2025, 4, 8)]
+        );
+    }
+
+    #[test]
+    fn catch_up_is_capped_per_pass_without_skipping() {
+        // A big gap caps at max_batch this pass; the cursor advances so the
+        // next pass continues from there (no day skipped).
+        let first = days_to_run(Some(d(2025, 4, 1)), d(2025, 5, 1), 3);
+        assert_eq!(first, vec![d(2025, 4, 2), d(2025, 4, 3), d(2025, 4, 4)]);
+        let next = days_to_run(Some(d(2025, 4, 4)), d(2025, 5, 1), 3);
+        assert_eq!(next, vec![d(2025, 4, 5), d(2025, 4, 6), d(2025, 4, 7)]);
     }
 }
 
