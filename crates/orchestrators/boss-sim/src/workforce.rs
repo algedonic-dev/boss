@@ -548,7 +548,7 @@ impl Workforce {
         // The workforce only drives assigned steps and agent steps are never
         // assigned, so the workforce never sees a gate — the gate decision
         // lives in boss-dispatcher's gate.resolve handler (the sim drives
-        // only labor; see docs/design/brewery-model-completeness.md).
+        // only labor; see docs/architecture-decisions.md).
         obj.insert("metadata".to_string(), Value::Object(md.clone()));
         if sign_offs_required.is_empty() {
             return self.put_step(job_id, step_id, &body, emp);

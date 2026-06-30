@@ -278,7 +278,7 @@ the tier it touches.**
   `boss-assets`, plus matching `*-client` HTTP-contract crates and
   `boss-ml-plugins`.
 
-- **`crates/orchestrators/` — Cross-tier orchestrators** (4).
+- **`crates/orchestrators/` — Cross-tier orchestrators** (5).
   Binaries that fan out across both tiers by design. The
   Tier-1-must-not-depend-on-Tier-2 rule applies to **libraries**,
   not orchestrators. An orchestrator's purpose IS to wire core
@@ -288,7 +288,9 @@ the tier it touches.**
   `boss-cli` (operator commands across domains),
   `boss-sim` (synthetic event generator with tight domain-type
   coupling), `boss-ml-api` (ML HTTP surface that loads
-  inference plugins from both tiers). Step side-effects are
+  inference plugins from both tiers), `boss-simulator` (the
+  standalone `/simulator` UX — SPA bundle + `/simulator/api/*`
+  control/status surface). Step side-effects are
   owned by the core `boss-dispatcher` crate, which subscribes to
   `step.done.<kind>` topics and runs data-driven rules.
 
@@ -337,6 +339,7 @@ HTTP calls + a `Pg*` adapter behind the `postgres` feature.
 ```
 apps/
   web/            # Svelte 5 frontend (Bun + bun-plugin-svelte)
+  simulator/      # Simulator UX SPA (served by boss-simulator; shares @boss/web-kit)
 ```
 
 Type definitions that need to be shared between services live in

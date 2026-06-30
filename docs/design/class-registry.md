@@ -218,10 +218,11 @@ Two deliberate non-targets, recorded so passes don't re-open them:
   `locations` table with hierarchy + geo + timezone (see TODO.md),
   not a `classes` row.
 
-`accounts.account_type` has its CHECK dropped and `account_type`
-Class rows seeded, but the `accounts.rs` write path does not yet call
-`class_exists` on it. Remaining tenant taxonomies stay on closed
-CHECK constraints until each is lifted by the four-step pattern above.
+`accounts.account_type` has its CHECK dropped, `account_type` Class
+rows seeded, and the `accounts.rs` write path validates it against the
+registry (`check_account_type` → `class_exists(ClassRef::new("account",
+…))`). Remaining tenant taxonomies stay on closed CHECK constraints
+until each is lifted by the four-step pattern above.
 
 ## Authoring
 

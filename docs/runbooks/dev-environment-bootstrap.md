@@ -208,7 +208,7 @@ sudo /opt/boss/infra/deploy-services.sh both
 ```
 
 Boots every service in the port table (`boss-ports-list` — 9
-paired prod+scratch services, 14 prod-only solo services). Health
+paired prod+scratch services, 16 prod-only solo services). Health
 probes follow.
 
 **Known false negatives in the probe output.** The script greps

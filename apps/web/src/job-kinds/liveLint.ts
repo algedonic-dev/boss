@@ -2,8 +2,8 @@
 // /_validate endpoint, which runs the same `validate_all` the publish
 // path enforces — WITHOUT persisting. "ok: true" here means the spec
 // publishes cleanly (the server reuses the same StepType registry, per
-// docs/design/jobkind-authoring-ux.md D5). The graph editor paints
-// `problems` onto the offending nodes live.
+// architecture-decisions.md §Jobs, JobKinds, Steps). The graph editor
+// paints `problems` onto the offending nodes live.
 
 import type { StepSpec } from './jobKindTypes';
 

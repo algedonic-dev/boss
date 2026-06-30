@@ -92,9 +92,11 @@ boss status
 ```
 
 `restore.sh` stops the services it knows about, reloads Postgres,
-copies configs back, then returns. It does **not** restart
-services — the final `systemctl start` is deliberate so you can
-inspect the restored state first.
+copies configs back, then **restarts the core services in its list**
+(gateway, assets, catalog, commerce, people, shipping, messages,
+inventory). It does **not** start `boss-jobs-api` or `boss-ledger-api`
+— the manual `systemctl start` above covers those (and is a harmless
+no-op for the services restore.sh already restarted).
 
 ### What restore does not cover
 
@@ -137,9 +139,9 @@ boss deploy web            # web frontend (Bun bundle)
 If only the TOML config or unit file changed:
 
 ```sh
-sudo ./infra/deploy-services.sh apply prod       # just prod
-sudo ./infra/deploy-services.sh apply scratch    # just the +1000-port scratch stack
-sudo ./infra/deploy-services.sh apply both       # both at once
+sudo ./infra/deploy-services.sh prod       # just prod
+sudo ./infra/deploy-services.sh scratch    # just the +1000-port scratch stack
+sudo ./infra/deploy-services.sh both       # both at once
 sudo ./infra/deploy-services.sh check prod       # dry-run — diff only, no writes
 ```
 
@@ -264,7 +266,7 @@ Common causes:
 
 - **Config drift.** `/etc/boss-<service>-api.toml` references an
   env var or secret that isn't set. Fix: re-run
-  `sudo ./infra/deploy-services.sh apply prod` to regenerate.
+  `sudo ./infra/deploy-services.sh prod` to regenerate.
 - **DB unreachable.** Postgres is down or the credentials are
   wrong. `sudo systemctl status postgresql`. If the DB is up,
   test the connection string from the config file directly.
