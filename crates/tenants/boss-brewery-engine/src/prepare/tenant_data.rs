@@ -1511,18 +1511,19 @@ fn ensure_asset_opening_balances(
     Ok(())
 }
 
-/// Quarterly depreciation pass for the seeded brewery assets.
+/// Monthly depreciation pass for the seeded brewery assets.
 /// Mirrors the opening-balance pattern: at seed time we post
-/// four DR 6900 / CR 1510 JEs covering the 12-month sim window,
-/// one per quarter, sized at (total_cost / useful_life_years / 4).
+/// twelve DR 6900 / CR 1510 JEs covering the 12-month sim window,
+/// one per month, sized at (total_cost / useful_life_years / 12).
 /// Useful life is a flat 10 years for brewery vessels — the
 /// catalog carries no per-model depreciation schedule, so the
 /// pass applies one rate across every asset. This gives the GL
-/// real quarterly expense activity in 6900 and a 1510
-/// contra-asset that grows visibly.
+/// real monthly expense activity in 6900 and a 1510 contra-asset
+/// that grows visibly; reseeding each epoch re-posts the year, so
+/// depreciation recurs rather than being a one-off.
 ///
-/// Quarter end-dates: 2025-06-30, 2025-09-30, 2025-12-31,
-/// 2026-03-31 (matches the 2025-04-01 → 2026-03-31 sim window).
+/// Month end-dates: 2025-04-30 … 2026-03-31 (matches the
+/// 2025-04-01 → 2026-03-31 sim window).
 fn ensure_asset_depreciation_schedule(
     client: &Client,
     ledger_base: &str,
@@ -1569,21 +1570,32 @@ fn ensure_asset_depreciation_schedule(
 
     const USEFUL_LIFE_YEARS: i64 = 10;
     let annual_cents = total_cost_cents / USEFUL_LIFE_YEARS;
-    let quarterly_cents = annual_cents / 4;
-    if quarterly_cents <= 0 {
+    let monthly_cents = annual_cents / 12;
+    if monthly_cents <= 0 {
         return Ok(());
     }
 
-    let quarter_ends = [
-        ("Q1", "2025-06-30"),
-        ("Q2", "2025-09-30"),
-        ("Q3", "2025-12-31"),
-        ("Q4", "2026-03-31"),
+    // Twelve monthly JEs across the 12-month sim window (epoch
+    // 2025-04-01 → 2026-03-31), so depreciation accrues monthly the
+    // way a real business books it (and recurs each epoch on reseed).
+    let month_ends = [
+        ("M01", "2025-04-30"),
+        ("M02", "2025-05-31"),
+        ("M03", "2025-06-30"),
+        ("M04", "2025-07-31"),
+        ("M05", "2025-08-31"),
+        ("M06", "2025-09-30"),
+        ("M07", "2025-10-31"),
+        ("M08", "2025-11-30"),
+        ("M09", "2025-12-31"),
+        ("M10", "2026-01-31"),
+        ("M11", "2026-02-28"),
+        ("M12", "2026-03-31"),
     ];
     let je_url = format!("{ledger_base}/api/ledger/inventory-transferred");
-    for (label, end_date) in &quarter_ends {
+    for (label, end_date) in &month_ends {
         let body = serde_json::json!({
-            "total_cost_cents": quarterly_cents,
+            "total_cost_cents": monthly_cents,
             "debit_account": "6900",
             "credit_account": "1510",
             "happened_on": end_date,
@@ -1607,18 +1619,18 @@ fn ensure_asset_depreciation_schedule(
             anyhow::bail!("POST {je_url} ({}) returned {status}: {txt}", label);
         }
         info!(
-            quarter = label,
+            month = label,
             posted_on = end_date,
-            amount_cents = quarterly_cents,
+            amount_cents = monthly_cents,
             "asset depreciation JE posted (DR 6900 / CR 1510)"
         );
     }
     info!(
         annual_cents,
-        quarterly_cents,
+        monthly_cents,
         total_asset_cost_cents = total_cost_cents,
         useful_life_years = USEFUL_LIFE_YEARS,
-        "asset depreciation schedule complete (4 quarterly JEs)"
+        "asset depreciation schedule complete (12 monthly JEs)"
     );
     Ok(())
 }

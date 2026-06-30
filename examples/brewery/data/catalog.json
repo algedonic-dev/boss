@@ -828,7 +828,7 @@
       "currency": "USD",
       "lead_time_days": 21,
       "tagline": "Used 60-gal French oak ex-wine barrel, sour-program vessel",
-      "description": "60-gallon French oak barrel previously used for red-wine aging (typical: 2-3 vintages). Arrives with residual wine character + the indigenous microflora (Brettanomyces, Pediococcus, Lactobacillus) that resident wine programs cultivate. The canonical vessel for wild + sour aging in the brewery: tannins from French oak, fruit notes from wine, microbiome for slow secondary fermentation. Lifecycle is years, not months — expect 4-7 fills over 3-6 years before character flattens.",
+      "description": "60-gallon French oak barrel previously used for red-wine aging (typical: 2-3 vintages). Arrives with residual wine character + the indigenous microflora (Brettanomyces, Pediococcus, Lactobacillus) that resident wine programs cultivate. The canonical vessel for wild + sour aging in the brewery: tannins from French oak, fruit notes from wine, microbiome for slow secondary fermentation. Lifecycle is years, not months \u2014 expect 4-7 fills over 3-6 years before character flattens.",
       "hero_image": "/dashboard/catalog/brew-barrel-wine-used.jpg",
       "use_cases": [
         "wild-ale-aging",
@@ -864,10 +864,487 @@
       ],
       "pm_checklist": [
         "Visual inspection for stave + hoop integrity",
-        "Top-off check (more frequent for sours — ullage drives VA)",
+        "Top-off check (more frequent for sours \u2014 ullage drives VA)",
         "Bung integrity check",
         "Sample for sensory + VA every 180 days",
         "Track fill count + age for terroir-reporting"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-FV-200BBL",
+    "name": "Conical Fermentation Vessel, 200-BBL",
+    "manufacturer": "Cascade Brewing Systems",
+    "model_year": 2021,
+    "category": "fermentation-vessel",
+    "physical": {
+      "width_cm": 0,
+      "depth_cm": 0,
+      "height_cm": 0,
+      "weight_kg": 0,
+      "power_requirements": "see installation spec"
+    },
+    "regulatory": {
+      "clearance_id": "ASME-PV-2021-200BBL",
+      "clearance_date": "2021-01-15",
+      "regulator_device_class": 2
+    },
+    "commerce": {
+      "list_price_new_cents": 18500000,
+      "typical_refurb_price_cents": 11100000,
+      "currency": "USD",
+      "lead_time_days": 150,
+      "tagline": "200-BBL conical fermenter, dual glycol zones",
+      "description": "Production-scale 200-BBL cylindro-conical fermenter (230-BBL gross), dual glycol zones, bottom dump + racking arm, 15 PSI. The cellar workhorse for a regional production brewery.",
+      "hero_image": "/dashboard/catalog/brew-fv-200bbl.jpg",
+      "use_cases": [
+        "primary-fermentation",
+        "secondary-conditioning",
+        "yeast-harvest"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 2.0,
+      "preventive_maintenance_interval_months": 12,
+      "calibration_interval_months": 12,
+      "required_skill_level": 3,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-FV2-001",
+          "name": "Glycol jacket leak",
+          "frequency": 0.04,
+          "typical_fix": "Pressure-test jacket; isolate affected zone."
+        },
+        {
+          "code": "BREW-FV2-002",
+          "name": "Dump valve seal weep",
+          "frequency": 0.1,
+          "typical_fix": "Replace tri-clamp gasket."
+        }
+      ],
+      "pm_checklist": [
+        "Pressure-test vessel to 18 PSI",
+        "Inspect dump-valve gasket",
+        "Verify glycol jacket leak-free",
+        "Crack-test PRV",
+        "CIP cycle + verify swab clean"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-BRITE-200BBL",
+    "name": "Brite Conditioning Tank, 200-BBL",
+    "manufacturer": "Cascade Brewing Systems",
+    "model_year": 2021,
+    "category": "conditioning-vessel",
+    "physical": {
+      "width_cm": 0,
+      "depth_cm": 0,
+      "height_cm": 0,
+      "weight_kg": 0,
+      "power_requirements": "see installation spec"
+    },
+    "regulatory": {
+      "clearance_id": "ASME-PV-2021-200BBL",
+      "clearance_date": "2021-01-15",
+      "regulator_device_class": 2
+    },
+    "commerce": {
+      "list_price_new_cents": 13000000,
+      "typical_refurb_price_cents": 7800000,
+      "currency": "USD",
+      "lead_time_days": 150,
+      "tagline": "200-BBL brite tank for carbonation + cold-conditioning",
+      "description": "Production-scale 200-BBL horizontal brite/serving tank for natural carbonation, cold-conditioning, and the packaging bridge.",
+      "hero_image": "/dashboard/catalog/brew-brite-200bbl.jpg",
+      "use_cases": [
+        "carbonation",
+        "cold-conditioning",
+        "packaging-bridge"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 1.5,
+      "preventive_maintenance_interval_months": 12,
+      "calibration_interval_months": 12,
+      "required_skill_level": 2,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-BT2-001",
+          "name": "Carb stone clogging",
+          "frequency": 0.18,
+          "typical_fix": "Sonic-clean stone in citric acid."
+        }
+      ],
+      "pm_checklist": [
+        "Sonic-clean carb stone",
+        "Pressure-test vessel to 18 PSI",
+        "CIP cycle + verify swab clean"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-CAN-LINE-HS",
+    "name": "High-Speed Canning Line, 150 cans/min",
+    "manufacturer": "Krones",
+    "model_year": 2021,
+    "category": "packaging",
+    "physical": {
+      "width_cm": 0,
+      "depth_cm": 0,
+      "height_cm": 0,
+      "weight_kg": 0,
+      "power_requirements": "see installation spec"
+    },
+    "regulatory": {
+      "clearance_id": "ASME-PV-2021-INE-HS",
+      "clearance_date": "2021-01-15",
+      "regulator_device_class": 2
+    },
+    "commerce": {
+      "list_price_new_cents": 350000000,
+      "typical_refurb_price_cents": 210000000,
+      "currency": "USD",
+      "lead_time_days": 210,
+      "tagline": "Inline rinse-fill-seam canning line, 150 cans/min",
+      "description": "Fixed high-speed canning line: depalletizer, rinser, CO2-purge counter-pressure filler, seamer, date-coder, packer. 150 cans/min at 12oz \u2014 the production-scale DTC + retail packaging line.",
+      "hero_image": "/dashboard/catalog/brew-can-line-hs.jpg",
+      "use_cases": [
+        "12oz-canning",
+        "16oz-canning",
+        "retail-packaging"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 12.0,
+      "preventive_maintenance_interval_months": 1,
+      "calibration_interval_months": 12,
+      "required_skill_level": 4,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-CANHS-001",
+          "name": "Seamer roll wear",
+          "frequency": 0.2,
+          "typical_fix": "Tear-down seam check; replace seamer roll; recalibrate."
+        },
+        {
+          "code": "BREW-CANHS-002",
+          "name": "Filler valve O-ring failure",
+          "frequency": 0.15,
+          "typical_fix": "Swap O-rings on affected valve."
+        }
+      ],
+      "pm_checklist": [
+        "Tear-down seam check",
+        "Replace fill-valve O-rings",
+        "Verify CO2 purge pressure",
+        "Test DO meter",
+        "Inspect conveyor + packer"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-KEG-LINE-AUTO",
+    "name": "Automated Keg Wash + Fill Line",
+    "manufacturer": "KHS",
+    "model_year": 2021,
+    "category": "packaging",
+    "physical": {
+      "width_cm": 0,
+      "depth_cm": 0,
+      "height_cm": 0,
+      "weight_kg": 0,
+      "power_requirements": "see installation spec"
+    },
+    "regulatory": {
+      "clearance_id": "ASME-PV-2021-E-AUTO",
+      "clearance_date": "2021-01-15",
+      "regulator_device_class": 2
+    },
+    "commerce": {
+      "list_price_new_cents": 150000000,
+      "typical_refurb_price_cents": 90000000,
+      "currency": "USD",
+      "lead_time_days": 180,
+      "tagline": "Automated 4-head keg wash + fill, 80 kegs/hr",
+      "description": "Automated rotary keg line: external wash, internal 5-stage CIP, steam sterilize, counter-pressure fill. 80 kegs/hr \u2014 the production-scale wholesale/distribution keg packaging.",
+      "hero_image": "/dashboard/catalog/brew-keg-line-auto.jpg",
+      "use_cases": [
+        "keg-washing",
+        "keg-filling",
+        "wholesale-packaging"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 8.0,
+      "preventive_maintenance_interval_months": 2,
+      "calibration_interval_months": 12,
+      "required_skill_level": 3,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-KGL-001",
+          "name": "Spear coupler seal leak",
+          "frequency": 0.12,
+          "typical_fix": "Replace coupler O-ring stack."
+        }
+      ],
+      "pm_checklist": [
+        "Replace coupler O-rings",
+        "Calibrate caustic dosing",
+        "Verify steam sterilization temp",
+        "Inspect fill heads"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-GLYCOL-CENTRAL",
+    "name": "Central Glycol Chiller Plant, 250-Ton",
+    "manufacturer": "Pro Refrigeration",
+    "model_year": 2021,
+    "category": "utility",
+    "physical": {
+      "width_cm": 0,
+      "depth_cm": 0,
+      "height_cm": 0,
+      "weight_kg": 0,
+      "power_requirements": "see installation spec"
+    },
+    "regulatory": {
+      "clearance_id": "ASME-PV-2021-ENTRAL",
+      "clearance_date": "2021-01-15",
+      "regulator_device_class": 2
+    },
+    "commerce": {
+      "list_price_new_cents": 150000000,
+      "typical_refurb_price_cents": 90000000,
+      "currency": "USD",
+      "lead_time_days": 120,
+      "tagline": "250-ton central glycol plant for the production cellar",
+      "description": "Central 250-ton (880 kW) glycol chiller plant with multiple compressors, large insulated reservoir, and redundant pump trains supplying the full production cellar + brewhouse knockout.",
+      "hero_image": "/dashboard/catalog/brew-glycol-central.jpg",
+      "use_cases": [
+        "fermentation-cooling",
+        "brite-cooling",
+        "wort-knockout"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 8.0,
+      "preventive_maintenance_interval_months": 3,
+      "calibration_interval_months": 12,
+      "required_skill_level": 5,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-GLYC-001",
+          "name": "Compressor short-cycling",
+          "frequency": 0.08,
+          "typical_fix": "Check charge + cutout setpoints; inspect contactors."
+        },
+        {
+          "code": "BREW-GLYC-002",
+          "name": "Glycol concentration drift",
+          "frequency": 0.2,
+          "typical_fix": "Refractometer test; top up to 35% propylene glycol."
+        }
+      ],
+      "pm_checklist": [
+        "Test glycol concentration",
+        "Inspect pump seals",
+        "Verify cutout setpoints",
+        "Clean condenser coils",
+        "Verify lead-lag staging"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-BOILER-300HP",
+    "name": "Steam Boiler, 300 HP",
+    "manufacturer": "Hurst Boiler",
+    "model_year": 2021,
+    "category": "utility",
+    "physical": {
+      "width_cm": 0,
+      "depth_cm": 0,
+      "height_cm": 0,
+      "weight_kg": 0,
+      "power_requirements": "see installation spec"
+    },
+    "regulatory": {
+      "clearance_id": "ASME-PV-2021--300HP",
+      "clearance_date": "2021-01-15",
+      "regulator_device_class": 2
+    },
+    "commerce": {
+      "list_price_new_cents": 60000000,
+      "typical_refurb_price_cents": 36000000,
+      "currency": "USD",
+      "lead_time_days": 120,
+      "tagline": "300-HP gas-fired packaged steam boiler",
+      "description": "Hurst 300-HP packaged steam boiler (150 PSI design) supplying the production brewhouse, CIP heating, and keg sterilization. Annual ASME inspection.",
+      "hero_image": "/dashboard/catalog/brew-boiler-300hp.jpg",
+      "use_cases": [
+        "mash-jacket-heat",
+        "cip-heating",
+        "keg-steam"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 8.0,
+      "preventive_maintenance_interval_months": 6,
+      "calibration_interval_months": 12,
+      "required_skill_level": 5,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-BLR3-001",
+          "name": "Burner soot buildup",
+          "frequency": 0.3,
+          "typical_fix": "Vacuum tubes + firebox; tune air/fuel ratio."
+        }
+      ],
+      "pm_checklist": [
+        "Annual ASME inspection",
+        "Vacuum tubes + firebox",
+        "Test low-water cutoff",
+        "Calibrate combustion analyzer",
+        "Verify safety relief"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-CO2-RECOVERY",
+    "name": "CO2 Recovery System",
+    "manufacturer": "Dalum",
+    "model_year": 2021,
+    "category": "utility",
+    "physical": {
+      "width_cm": 0,
+      "depth_cm": 0,
+      "height_cm": 0,
+      "weight_kg": 0,
+      "power_requirements": "see installation spec"
+    },
+    "regulatory": {
+      "clearance_id": "ASME-PV-2021-COVERY",
+      "clearance_date": "2021-01-15",
+      "regulator_device_class": 2
+    },
+    "commerce": {
+      "list_price_new_cents": 120000000,
+      "typical_refurb_price_cents": 72000000,
+      "currency": "USD",
+      "lead_time_days": 180,
+      "tagline": "Fermentation CO2 recovery + purification",
+      "description": "Captures fermentation CO2, scrubs + dries + liquefies it for reuse in purging, carbonation, and counter-pressure filling \u2014 cutting purchased CO2 and emissions.",
+      "hero_image": "/dashboard/catalog/brew-co2-recovery.jpg",
+      "use_cases": [
+        "co2-capture",
+        "co2-purification",
+        "carbonation-supply"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 6.0,
+      "preventive_maintenance_interval_months": 3,
+      "calibration_interval_months": 12,
+      "required_skill_level": 4,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-CO2-001",
+          "name": "Activated-carbon filter saturation",
+          "frequency": 0.15,
+          "typical_fix": "Replace carbon + dryer media."
+        }
+      ],
+      "pm_checklist": [
+        "Replace carbon/dryer media",
+        "Verify purity at outlet",
+        "Inspect compressor seals",
+        "Test liquefaction temp"
+      ]
+    },
+    "spare_parts": [],
+    "consumables": [],
+    "documents": []
+  },
+  {
+    "sku": "BREW-WASTEWATER",
+    "name": "Wastewater Pre-Treatment Plant",
+    "manufacturer": "Veolia",
+    "model_year": 2021,
+    "category": "utility",
+    "physical": {
+      "width_cm": 0,
+      "depth_cm": 0,
+      "height_cm": 0,
+      "weight_kg": 0,
+      "power_requirements": "see installation spec"
+    },
+    "regulatory": {
+      "clearance_id": "ASME-PV-2021-EWATER",
+      "clearance_date": "2021-01-15",
+      "regulator_device_class": 2
+    },
+    "commerce": {
+      "list_price_new_cents": 200000000,
+      "typical_refurb_price_cents": 120000000,
+      "currency": "USD",
+      "lead_time_days": 240,
+      "tagline": "Anaerobic + aerobic wastewater pre-treatment",
+      "description": "On-site wastewater pre-treatment (pH balance, anaerobic digestion, aerobic polishing) bringing high-BOD brewery effluent within municipal discharge limits.",
+      "hero_image": "/dashboard/catalog/brew-wastewater.jpg",
+      "use_cases": [
+        "effluent-treatment",
+        "ph-balance",
+        "bod-reduction"
+      ]
+    },
+    "service": {
+      "preventive_maintenance_hours": 10.0,
+      "preventive_maintenance_interval_months": 3,
+      "calibration_interval_months": 12,
+      "required_skill_level": 4,
+      "depot_required": false,
+      "common_failure_modes": [
+        {
+          "code": "BREW-WW-001",
+          "name": "Aeration blower failure",
+          "frequency": 0.1,
+          "typical_fix": "Inspect/replace blower; verify DO setpoint in aerobic basin."
+        }
+      ],
+      "pm_checklist": [
+        "Verify pH neutralization",
+        "Test effluent BOD vs permit",
+        "Inspect aeration blowers",
+        "Check sludge return pumps"
       ]
     },
     "spare_parts": [],
