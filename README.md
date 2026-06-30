@@ -151,7 +151,7 @@ The workspace splits into four tiers (see CLAUDE.md):
   surface. A non-company tenant (a research lab, a robot fleet)
   can deploy without these.
 - **Orchestrators** — `crates/orchestrators/`. Binaries that fan out across both tiers:
-  `boss-rebuild`, `boss-cli`, `boss-sim`, `boss-ml-api`.
+  `boss-rebuild`, `boss-cli`, `boss-sim`, `boss-ml-api`, `boss-simulator`.
 - **Tenants** — `crates/tenants/`.
   - **Algedonic Ales** (`boss-brewery-engine`) — the public OSS
     demo tenant. Data-first seeds at `examples/brewery/` (TOML +

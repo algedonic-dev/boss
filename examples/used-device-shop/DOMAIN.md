@@ -118,7 +118,7 @@ for the platform-level definitions.
 
 ## Data layer
 
-- Postgres holds all structured business data: systems, accounts, orders, tickets, invoices, inventory, shipments, jobs, steps, service agreements, employees, audit log. 97 tables total; see `infra/postgres/schema/`.
+- Postgres holds all structured business data: systems, accounts, orders, tickets, invoices, inventory, shipments, jobs, steps, service agreements, employees, audit log. 102 tables total; see `infra/postgres/schema/`.
 - NATS carries events across services. `boss-nats` is the event bus adapter; every domain service publishes on write via a `DomainPublisher`, and `PgAuditWriter` persists every published event to the `audit_log` table alongside the NATS publish.
 - Domain types and ports (traits) live in Rust crates under `crates/`. Platform crates (catalog, assets, people, messages, jobs) are reused as-is; the tenant-specific crates layer the goods-and-services flows.
   - **Platform** — `boss-catalog` (Equipment KB: asset_models, parts, consumables), `boss-assets` (per-unit System Subjects + event history), `boss-people` (employees, contacts, accounts), `boss-messages` (inbox), `boss-jobs` (Jobs + Steps).

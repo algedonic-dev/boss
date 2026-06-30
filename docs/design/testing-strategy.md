@@ -114,7 +114,7 @@ re-derives every projection table; `infra/verify-replay.sh`
 diffs the rebuilt state against live state. The brewery 365-day
 regen (`infra/postgres/validate-brewery-sim.sh`) drives a
 year of sim-events through the live API services then runs the
-rebuilders — the assertion is "0 failures across all 14
+rebuilders — the assertion is "0 failures across all 15
 rebuilders `boss-rebuild-all` runs, 0 net drift between live and
 replayed projections."
 

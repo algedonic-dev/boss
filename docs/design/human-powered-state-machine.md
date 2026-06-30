@@ -81,9 +81,9 @@ the app":
 - **Messages are inter-CPU signalling.** DMs, system signals, and
   escalations are all messages on a shared bus that route attention
   to the CPU that needs to act next.
-- **Sign-off gates name a required second CPU.** Tier-2 steps with
-  `needs_sign_off` encode a two-phase-commit transition: one CPU
-  proposes, another CPU confirms.
+- **Sign-off gates name a required second CPU.** Steps with a
+  non-empty `sign_offs_required` encode a two-phase-commit transition:
+  one CPU proposes, another CPU confirms.
 
 ---
 
@@ -93,15 +93,17 @@ Four primitives — Subjects, Jobs, Steps, Events — take on sharper
 roles:
 
 ### Subjects
-The nouns the machine tracks across time. Each Subject (`System`,
-`Account`, `Employee`, `Vendor`, `PurchaseOrder`, `Campaign`) is a
-named cell of memory with its own event log. A Step on a Job always
+The nouns the machine tracks across time. Each Subject (`Account`,
+`Employee`, `Vendor`, `PurchaseOrder`, `Campaign`, … — see the
+`subject_kinds` registry for the full roster) is a named cell of
+memory with its own event log. A Step on a Job always
 acts on exactly one Subject, which is how the machine knows which
 cell a transition writes into.
 
 ### Jobs
 A Job is a **program invocation**. Its JobKind is the program; the
-versioned `step_graph` declares the call shape. A Job opened under
+versioned `steps` set (the DAG implicit in each step's `ready_when`)
+declares the call shape. A Job opened under
 `v3` of `field-service` executes against `v3`'s semantics for the
 rest of its life, even if `v4` ships midway. This is exactly how
 ISAs version.
@@ -175,7 +177,7 @@ that renders numbers the event log doesn't explain is a bug.
 Projections are deterministic functions of the log.
 
 ### I-2. Every transition has a named CPU and a legal scope.
-`actor_id` on events, `assignee_id` on Steps, `owner_id` on Jobs.
+`actor_id` in event payloads, `assignee_id` on Steps, `owner_id` on Jobs.
 If we cannot name who executed a transition, we cannot audit it and
 we probably shouldn't be allowing it.
 

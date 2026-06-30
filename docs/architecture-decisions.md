@@ -473,9 +473,9 @@ plus `*-client` crates) and **Tier 2 — company-modeling layer**
 inventory, shipping, ledger, products, messages, catalog, assets,
 clients, ML plugins). A non-company tenant deploys Tier 1 alone.
 **Orchestrators** (`crates/orchestrators/`: `boss-rebuild`,
-`boss-cli`, `boss-sim`, `boss-ml-api`) fan out across tiers by
-design; **tenants** (`crates/tenants/`: brewery engine,
-used-device-shop engine) carry tenant binaries.
+`boss-cli`, `boss-sim`, `boss-ml-api`, `boss-simulator`) fan out
+across tiers by design; **tenants** (`crates/tenants/`: brewery
+engine, used-device-shop engine) carry tenant binaries.
 `infra/lint/tier-import-audit.sh` enforces
 Tier-1-never-imports-Tier-2 for libraries. Seeds never write
 emergent state — if a seed wants to `INSERT INTO invoices`, the

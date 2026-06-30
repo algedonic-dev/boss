@@ -47,7 +47,7 @@ builds on:
 
 ## What the audit found
 
-24 JobKinds, 43 StepTypes, 30 dispatcher rules. Three gap classes, in
+25 JobKinds, 43 StepTypes, 31 dispatcher rules. Three gap classes, in
 priority order.
 
 ### Gap 1 — computer-speed work modeled as human labor (dominant)
