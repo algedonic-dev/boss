@@ -413,8 +413,12 @@ runs at the throughput the serial write path sustains, and the
 canonical 365-day world must pass hard-fail (any non-2xx aborts),
 queue drain, full rebuild parity, and chain integrity for the
 validation gate to go green. The scratch stack mirrors prod at +1000 ports
-for experiments. (The scheduler-shaped engine evolution is
-in-flight: `docs/design/scheduler-shaped-sim-engine.md`.)
+for experiments. The daemon is a **cursor-gated auto-tick loop**:
+clock-authoritative time, each sim-day processed exactly once
+(`days_to_run`) — which fixed the cold-start over-firing (periodics +
+rate engines re-firing on overlapping day windows) without the
+heap-scheduler refactor that was prototyped (`boss-sim/scheduler.rs`)
+but deliberately not adopted, the simpler cursor gate being sufficient.
 
 ## ML platform
 

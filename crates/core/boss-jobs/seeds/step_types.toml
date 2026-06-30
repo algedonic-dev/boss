@@ -1778,7 +1778,7 @@ required_roles = ["platform-admin"]
   name = "doc_path"
   field_type = "string"
   required = true
-  description = "Path to the design doc, e.g. docs/design/scheduler-shaped-sim-engine.md"
+  description = "Path to the design doc, e.g. docs/design/class-registry.md"
 
   [[step_type.fields]]
   name = "resolutions"

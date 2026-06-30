@@ -1825,9 +1825,8 @@ pub mod live {
             // Insertion order preserved so parent step.completed
             // always lands at an earlier sim_time than child
             // step.in_progress (causal ordering matters for the
-            // rebuild path's prereq checks). See the
-            // scheduler-shaped-sim-engine design doc for the target
-            // shape of per-step duration distribution.
+            // rebuild path's prereq checks). The per-step duration
+            // distribution is computed below (duration-based mode).
             let step_updates: Vec<_> = self.day_step_updates.drain(..).collect();
             let count = step_updates.len() as i64;
             // Two ordering modes, picked at construction:
@@ -1870,9 +1869,9 @@ pub mod live {
             // step is followed in insertion order by a short one,
             // both share the long step's completion time + a
             // microsecond bump — imperfect but causally correct.
-            // (The scheduler-shaped-sim-engine design doc describes
-            // the heap-with-causal-graph dispatch this clamp stands
-            // in for.)
+            // (The parked heap scheduler in `boss-sim/scheduler.rs` is
+            // the heap-with-causal-graph dispatch this clamp stands in
+            // for; see architecture-decisions.md §Simulator.)
             let mut prev_sim_time = day_start + chrono::Duration::seconds(FALLBACK_START_SEC);
             for (i, (job_id, step_id, status, metadata, completed_by, signed_off_by)) in
                 step_updates.iter().enumerate()
