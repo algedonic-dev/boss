@@ -337,17 +337,14 @@ month_multipliers = { 1 = 1.30, 2 = 1.30, 3 = 1.40, 4 = 1.20, 5 = 0.90, 6 = 0.70
 subject_distribution = { "acc-prospect-000" = 0.034, "acc-prospect-001" = 0.034, "acc-prospect-002" = 0.034, "acc-prospect-003" = 0.034, "acc-prospect-004" = 0.034, "acc-prospect-005" = 0.034, "acc-prospect-006" = 0.034, "acc-prospect-007" = 0.034, "acc-prospect-008" = 0.034, "acc-prospect-009" = 0.034, "acc-prospect-010" = 0.034, "acc-prospect-011" = 0.034, "acc-prospect-012" = 0.034, "acc-prospect-013" = 0.034, "acc-prospect-014" = 0.034, "acc-prospect-015" = 0.034, "acc-prospect-016" = 0.034, "acc-prospect-017" = 0.034, "acc-prospect-018" = 0.034, "acc-prospect-019" = 0.034, "acc-prospect-020" = 0.034, "acc-prospect-021" = 0.034, "acc-prospect-022" = 0.034, "acc-prospect-023" = 0.034, "acc-prospect-024" = 0.034, "acc-prospect-025" = 0.034, "acc-prospect-026" = 0.034, "acc-prospect-027" = 0.034, "acc-prospect-028" = 0.034, "acc-prospect-029" = 0.014 }
 
 [job_rates.wholesale-keg-order]
-# Steady state targets the ~$30M/yr playground revenue line. With
-# wholesale-keg-order metadata_defaults at $2,400/invoice (4 1/2-BBL
-# Pale + 8 IPA sixtels — see job_kinds.toml comment for the rebalance
-# rationale), 35 orders/day × 365 days ≈ $30.6M, with seasonal-release
-# + restock rounding the rest. Pre-2025-04 rates ramp from launch
-# through growth so the historical chart shows arc, not a step.
-rate = 48.0  # ~48 orders/day at steady state (scaled from 35 for a
-             # profitable revenue line: 48 × $2,850 × 365 ≈ $50M wholesale,
-             # which covers the ~$29M payroll + COGS + OpEx with margin.
-             # Production (morning-brew 1.5 / -ipa 1.9) scaled in lockstep
-             # so peak demand stays under brewhouse capacity.
+# 48 wholesale orders/day at steady state. wholesale-keg-order
+# metadata_defaults are re-priced to realistic self-distributed draft
+# (half-BBL $185, sixtel $65 → ~$1,570/invoice avg; see job_kinds.toml),
+# so 48 × ~$1,570 × 365 ≈ $27.5M/yr wholesale. Margin is an emergent
+# output of realistic inputs, never a tuned target. Pre-2025-04 rates
+# ramp from launch through growth so the historical chart shows arc.
+rate = 48.0  # Production (morning-brew 1.5 / -ipa 1.9) scaled in
+             # lockstep so peak demand stays under brewhouse capacity.
 # Distributors order Mon-Fri. Some weekend trickle from
 # direct-shop-order accounts that route to wholesale-keg
 # fulfillment. (5×1.3 + 2×0.25 = 7.0 → preserves weekly mean.)
@@ -516,7 +513,7 @@ weekend_multiplier = 1.5  # taproom traffic peaks Fri-Sun
 subject_distribution = { "acc-direct-shop" = 1.0 }
 
 # Bulk distribution pulls of surplus co-product kegs. Weekday-heavy (dock
-# days). ~$5.5M/yr → Revenue-Distribution. Together with taproom this lifts
+# days). ~$2.2M/yr → Revenue-Distribution. Together with taproom this lifts
 # the revenue mix off ~98% wholesale toward a diversified book.
 [job_rates.distribution-contract]
 rate = 1.0
