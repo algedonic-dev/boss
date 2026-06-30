@@ -412,7 +412,7 @@ ready_when = "steps.trigger.done"
 title_template = "Confirm order — {subject.id}"
 # Default order shape — 4 half-BBL kegs of Pale Ale + 8 sixtels
 # of IPA, matching the shipment step's `consumes_products` and
-# the billing step's $2,400 invoice template. The 32+64 numbers
+# the billing step's invoice template. The 32+64 numbers
 # this used to carry pre-2026-05-04 came from the original demo
 # template, but the shipment side was rebalanced to 4+8 for sim-
 # economic balance (production 210/315 per brew × 0.7-1.0 rate vs
@@ -533,17 +533,17 @@ authority_role = "bookkeeper"
 # the cost basis in the same tx as the invoice insert. The
 # shipment step's `consumes_products` array is no longer
 # load-bearing for COGS — billing is the single source of truth.
-metadata_defaults = { account_id = "{subject.id}", amount_cents = 330000, currency = "USD", line_items = [
-    { sku = "FP-IPA-1-2-BBL", qty = 2, amount_cents = 60000, revenue_category = "wholesale", description = "IPA 1/2 BBL × 2" },
-    { sku = "FP-IPA-1-6-BBL", qty = 3, amount_cents = 45000, revenue_category = "wholesale", description = "IPA 1/6 BBL × 3" },
-    { sku = "FP-PALE-1-2-BBL", qty = 2, amount_cents = 60000, revenue_category = "wholesale", description = "Pale Ale 1/2 BBL × 2" },
-    { sku = "FP-PALE-1-6-BBL", qty = 2, amount_cents = 30000, revenue_category = "wholesale", description = "Pale Ale 1/6 BBL × 2" },
-    { sku = "FP-LAGER-1-2-BBL", qty = 1, amount_cents = 30000, revenue_category = "wholesale", description = "Lager 1/2 BBL × 1" },
-    { sku = "FP-LAGER-1-6-BBL", qty = 1, amount_cents = 15000, revenue_category = "wholesale", description = "Lager 1/6 BBL × 1" },
-    { sku = "FP-STOUT-1-2-BBL", qty = 1, amount_cents = 30000, revenue_category = "wholesale", description = "Stout 1/2 BBL × 1" },
-    { sku = "FP-STOUT-1-6-BBL", qty = 1, amount_cents = 15000, revenue_category = "wholesale", description = "Stout 1/6 BBL × 1" },
-    { sku = "FP-HAZY-1-2-BBL", qty = 1, amount_cents = 30000, revenue_category = "wholesale", description = "Hazy IPA 1/2 BBL × 1" },
-    { sku = "FP-HAZY-1-6-BBL", qty = 1, amount_cents = 15000, revenue_category = "wholesale", description = "Hazy IPA 1/6 BBL × 1" },
+metadata_defaults = { account_id = "{subject.id}", amount_cents = 181500, currency = "USD", line_items = [
+    { sku = "FP-IPA-1-2-BBL", qty = 2, amount_cents = 37000, revenue_category = "wholesale", description = "IPA 1/2 BBL × 2" },
+    { sku = "FP-IPA-1-6-BBL", qty = 3, amount_cents = 19500, revenue_category = "wholesale", description = "IPA 1/6 BBL × 3" },
+    { sku = "FP-PALE-1-2-BBL", qty = 2, amount_cents = 37000, revenue_category = "wholesale", description = "Pale Ale 1/2 BBL × 2" },
+    { sku = "FP-PALE-1-6-BBL", qty = 2, amount_cents = 13000, revenue_category = "wholesale", description = "Pale Ale 1/6 BBL × 2" },
+    { sku = "FP-LAGER-1-2-BBL", qty = 1, amount_cents = 18500, revenue_category = "wholesale", description = "Lager 1/2 BBL × 1" },
+    { sku = "FP-LAGER-1-6-BBL", qty = 1, amount_cents = 6500, revenue_category = "wholesale", description = "Lager 1/6 BBL × 1" },
+    { sku = "FP-STOUT-1-2-BBL", qty = 1, amount_cents = 18500, revenue_category = "wholesale", description = "Stout 1/2 BBL × 1" },
+    { sku = "FP-STOUT-1-6-BBL", qty = 1, amount_cents = 6500, revenue_category = "wholesale", description = "Stout 1/6 BBL × 1" },
+    { sku = "FP-HAZY-1-2-BBL", qty = 1, amount_cents = 18500, revenue_category = "wholesale", description = "Hazy IPA 1/2 BBL × 1" },
+    { sku = "FP-HAZY-1-6-BBL", qty = 1, amount_cents = 6500, revenue_category = "wholesale", description = "Hazy IPA 1/6 BBL × 1" },
 ] }
 
 [[job_kind.step]]
@@ -2689,10 +2689,10 @@ ready_when = "steps.pull-contract.done"
 title_template = "Invoice distributor — {subject.id}"
 authority_role = "ar-clerk"
 terminal = { outcome = "completed" }
-# Bulk pricing: a surplus sixtel at ~$150 (distributor), a co-product
-# half-BBL at ~$250. ~50 sixtels + 30 half-BBLs per contract ≈ $15k → at
-# ~1/day ≈ $5.5M/yr distribution revenue.
-metadata_defaults = { account_id = "acc-bigseed-0000", amount_cents = 1500000, currency = "USD", line_items = [
-    { sku = "FP-PALE-1-6-BBL", qty = 50, amount_cents = 750000, revenue_category = "distribution", description = "Pale Ale sixtels — bulk distribution (50 × $150)" },
-    { sku = "FP-LAGER-1-2-BBL", qty = 30, amount_cents = 750000, revenue_category = "distribution", description = "Lager half-BBLs — bulk distribution (30 × $250)" },
+# Bulk pricing: a surplus sixtel at ~$50 (FOB to distributor), a co-product
+# half-BBL at ~$120. ~50 sixtels + 30 half-BBLs per contract ≈ $6.1k → at
+# ~1/day ≈ $2.2M/yr distribution revenue.
+metadata_defaults = { account_id = "acc-bigseed-0000", amount_cents = 610000, currency = "USD", line_items = [
+    { sku = "FP-PALE-1-6-BBL", qty = 50, amount_cents = 250000, revenue_category = "distribution", description = "Pale Ale sixtels — bulk distribution (50 × $50)" },
+    { sku = "FP-LAGER-1-2-BBL", qty = 30, amount_cents = 360000, revenue_category = "distribution", description = "Lager half-BBLs — bulk distribution (30 × $120)" },
 ] }
