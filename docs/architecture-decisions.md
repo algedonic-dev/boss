@@ -163,6 +163,16 @@ metadata is checked **at done, not at create**;
 The Jobs list takes exactly one subject filter — `?subject_id=` —
 and the Job's subject column is `subject_id`.
 
+The brewery's `wholesale-keg-order` is the worked example of
+agent-gated fulfillment: an `availability-gate` reads finished-goods
+for the order's lines and forks fulfill|backorder — an order the cooler
+can't cover exits to a terminal `backordered` outcome instead of
+marching through pick → ship → bill against stock that isn't there —
+then a human `pull-and-stage` pick precedes delivery and billing. The
+gate is the release valve that bounds open WIP the way human
+stock-judgment does in a real brewery; finished-goods / COGS draw on the
+billing line items.
+
 **JobKinds bootstrap through Jobs.** The system-owned
 `job-kind-design` kind authors new JobKinds inside a Job (draft
 edits live in the authoring Job; the terminal `job-kind-publish`
@@ -423,7 +433,14 @@ required-at-done fields (bundle + step-authored) and collecting
 sign-off stamps before completing — metadata first, stamps
 attesting the final shape, then the status flip. Gates are
 agent-executed by the dispatcher reading real stock — the
-workforce never sees them. Batch engines (payroll, taxes) are
+workforce never sees them. Brewery production is **demand-pull, not
+open-loop**: each `morning-brew*` kind is a `deterministic` daily
+review (one brew *reviewed* per working day — the rate is the
+brewhouse's per-beer slot capacity, never a Poisson draw that could
+silently emit nothing), and the gate is in-flight-aware, crediting the
+pipeline (`effective_on_hand = real + open_sibling_jobs × batch_yield`)
+before deciding brew|oversupply so the daily review doesn't double-brew
+through the multi-day brew lag. Batch engines (payroll, taxes) are
 generic over Population + Rule traits. Warp is honest: the sim
 runs at the throughput the serial write path sustains, and the
 canonical 365-day world must pass hard-fail (any non-2xx aborts),

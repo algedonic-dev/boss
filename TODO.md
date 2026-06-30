@@ -200,6 +200,19 @@ which one matters first.
       lands. Decide whether the WIP account (1310) is hardcoded or
       payload-driven before implementing.
 
+- [ ] **Conservation-P: finished-goods cost-basis reconciliation
+      (consume-side).** `finished_product_inventory.production_cost_cents`
+      is an integer-rounded moving weighted average
+      (`boss-products/{in_memory,postgres}.rs`) while the GL tracks exact
+      transaction costs, so 1320 can diverge from physical-on-hand-at-cost
+      by a small percentage. Fix shape: per-SKU `GL − (on_hand × cost)`
+      diff on a fresh regen to attribute the drift, then decide whether
+      the basis reconciles to exact cost or the closure check tolerates
+      rounding. **Distinct** from the WIP-variance close above (that's the
+      1310 residual; this is the 1320 cost-basis drift), and **coupled to
+      costing PR4** (production-drivers-into-COGS changes the FG basis) —
+      land after PR4 so the reconciliation targets the final basis.
+
 - [ ] **Sales-tax accrual on retail / taproom invoices.** The
       brewery's wholesale invoices are tax-exempt (resale), but
       retail + taproom line items should accrue sales tax. The

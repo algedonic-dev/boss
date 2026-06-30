@@ -190,7 +190,7 @@ required_roles = ["head-brewer"]
 # brew/oversupply outcome at computer speed on step.ready, instead of the
 # gate waiting on a head-brewer to pull it (which throttled it at warp and
 # put a system decision inside the sim). See
-# docs/design/brewery-model-completeness.md. The role above is retained as
+# docs/architecture-decisions.md. The role above is retained as
 # the human fallback / "who owns this" attribution.
 completion = "agent"
 
@@ -213,7 +213,7 @@ can be fulfilled from stock now (fulfill) or must be backordered
 (backorder). The `outcome` enum is the fork discriminator the JobKind
 branches on. Agent-executed — the dispatcher reads real stock and stamps
 the outcome at computer speed on step.ready, no human in the loop. See
-docs/design/brewery-model-completeness.md.
+docs/architecture-decisions.md.
 """
 typical_duration_hours = 0.0
 typical_duration_jitter = 0.0
@@ -714,7 +714,7 @@ required_roles = ["ar-clerk", "bookkeeper"]
 # dispatcher auto-completes it on step.ready (the JobKind defaults the
 # required account_id / amount_cents / currency / line_items) and the
 # invoice-issue side-effect fires on step.done.billing as before. See
-# docs/design/brewery-model-completeness.md.
+# docs/architecture-decisions.md.
 completion = "agent"
 
   [[step_type.fields]]
@@ -1725,7 +1725,7 @@ required_roles = ["sales-rep", "bookkeeper"]
 # Agent-executed: confirming an order from a feed/system is computer-speed
 # automation, not human labor. The dispatcher auto-completes it on
 # step.ready so high-volume order flow (wholesale 48/day) doesn't queue
-# behind the human workforce. See docs/design/brewery-model-completeness.md.
+# behind the human workforce. See docs/architecture-decisions.md.
 completion = "agent"
 
   [[step_type.fields]]

@@ -14,7 +14,7 @@
 //! decision through a human workforce slot — so gates queued behind labor
 //! at warp — and put system logic inside the sim, against
 //! `feedback_sim_separate_from_system`. Moving it here fixes both. See
-//! docs/design/brewery-model-completeness.md.
+//! docs/architecture-decisions.md.
 //!
 //! Rides the `step.ready.*` subscription (one NATS consumer) alongside
 //! `jobs.complete_step` + `messages.notify`; self-filters to agent gates so

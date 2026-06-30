@@ -440,7 +440,7 @@ metadata_defaults = { delivery_window = "", line_items = [
 # speed on step.ready). A release valve that costs no labor: an order the
 # cooler can't cover exits to the `backordered` outcome instead of marching
 # through pick → ship → bill against stock that isn't there. The old flow had
-# no inventory check at all. See docs/design/brewery-model-completeness.md.
+# no inventory check at all. See docs/architecture-decisions.md.
 [[job_kind.step]]
 title = "stock-check"
 kind = "availability-gate"
@@ -556,9 +556,9 @@ metadata_defaults = { outcome_kind = "completed" }
 
 # The backorder branch of the stock-check gate — the order couldn't be
 # covered from the cooler. Terminal (skipped) for now; a follow-up backorder
-# Job that fulfills once stock returns is the next enhancement (see Q3 in
-# docs/design/brewery-model-completeness.md). This is the release valve that
-# keeps unfulfillable orders from lingering as open WIP.
+# Job that fulfills once stock returns is the next enhancement (see
+# architecture-decisions.md §Jobs, JobKinds, Steps). This is the release
+# valve that keeps unfulfillable orders from lingering as open WIP.
 [[job_kind.step]]
 title = "backordered"
 kind = "outcome"

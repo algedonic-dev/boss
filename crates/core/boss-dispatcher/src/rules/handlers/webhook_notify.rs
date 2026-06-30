@@ -11,7 +11,7 @@
 //! deployment the URL is unset and this is a no-op. The simulator never
 //! subscribes to the system's event stream; it only receives these
 //! callbacks and replies over the public API — preserving the sim/system
-//! boundary in both directions. See docs/design/brewery-model-completeness.md.
+//! boundary in both directions. See docs/architecture-decisions.md.
 //!
 //! Lenient by design: an unset URL, a non-2xx, or an unreachable endpoint is
 //! a no-op, never a dead-letter — the dispatcher's durable queue must never
