@@ -17,7 +17,6 @@ pub use boss_expr as expr;
 
 pub mod authoring;
 pub mod handler;
-pub mod handlers;
 pub mod helpers_inventory;
 pub mod jobs_spawn;
 pub mod registry;

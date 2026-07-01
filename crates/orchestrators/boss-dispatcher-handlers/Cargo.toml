@@ -1,0 +1,42 @@
+[package]
+name = "boss-dispatcher-handlers"
+description = "Side-effect handler library + the boss-dispatcher service binary. The generic rule-driven engine lives in the core `boss-dispatcher` crate; this crate holds the handler implementations (the side effects of step transitions) and the binary that assembles engine + handlers. Handlers speak the domain HTTP APIs — they do not import the module crates — so new handlers land here as the model grows, without churning core."
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-dispatcher"
+path = "src/bin/boss_dispatcher.rs"
+
+[dependencies]
+boss-dispatcher = { path = "../../core/boss-dispatcher" }
+boss-core = { path = "../../core/boss-core" }
+boss-ports = { path = "../../core/boss-ports" }
+boss-nats = { path = "../../core/boss-nats" }
+boss-jobs = { path = "../../core/boss-jobs" }
+boss-expr = { path = "../../core/boss-expr" }
+boss-clock-client = { path = "../../core/boss-clock-client" }
+boss-calendar-client = { path = "../../core/boss-calendar-client" }
+boss-events = { path = "../../core/boss-events" }
+anyhow = { workspace = true }
+async-nats = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
+
+[lints]
+workspace = true
