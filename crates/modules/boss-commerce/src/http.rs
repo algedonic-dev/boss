@@ -321,7 +321,25 @@ async fn batch_invoices<R: CommerceRepository + 'static>(
             ));
             continue;
         }
-        match state.commerce.create_invoice_at(inv, now).await {
+        // Retry a transient Postgres deadlock (40P01): concurrent invoice
+        // txs can briefly contend on finished-goods FOR UPDATE row locks
+        // under burst load. Deterministic lock ordering in the adapter
+        // (sort by SKU) prevents the common case; this rides out any
+        // residual so the batch recovers in-request instead of skipping →
+        // NAK → dead-letter (which then 404s the downstream collection).
+        // create_invoice_at is idempotent (ON CONFLICT + already-issued
+        // guard), so re-invoking is safe.
+        let mut attempt = 0u32;
+        let result = loop {
+            match state.commerce.create_invoice_at(inv, now).await {
+                Err(e) if attempt < 4 && e.to_string().contains("deadlock detected") => {
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(15 * attempt as u64)).await;
+                }
+                other => break other,
+            }
+        };
+        match result {
             Ok(enriched) => {
                 inserted += 1;
                 if let Some(pub_) = &state.publisher {

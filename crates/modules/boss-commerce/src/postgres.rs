@@ -293,7 +293,15 @@ impl CommerceRepository for PgCommerce {
         // both the invoice_line_items insert AND the
         // finance.invoice.issued event payload.
         let mut enriched_lines: Vec<InvoiceLineItem> = Vec::with_capacity(inv.line_items.len());
-        for line in &inv.line_items {
+        // Deadlock prevention: take the FG `FOR UPDATE` row locks in a
+        // deterministic (SKU-sorted) order so two concurrent invoice txs
+        // sharing SKUs acquire them in the same global order and queue
+        // instead of deadlocking. Line-item read order is unaffected
+        // (projections read ORDER BY id) and the per-SKU drawdown math is
+        // order-independent, so reordering the loop is semantically inert.
+        let mut ordered: Vec<&InvoiceLineItem> = inv.line_items.iter().collect();
+        ordered.sort_by(|a, b| a.sku.cmp(&b.sku));
+        for line in ordered {
             let mut enriched = line.clone();
             if let (Some(sku), Some(qty)) = (line.sku.as_deref(), line.qty)
                 && qty > 0
