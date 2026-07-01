@@ -9,7 +9,7 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"] }
+sqlx = { version = "0.9", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"] }
 tracing = { workspace = true }
 
 boss-ml = { path = "../../core/boss-ml", features = ["postgres"] }

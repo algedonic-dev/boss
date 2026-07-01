@@ -27,7 +27,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
-sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"], optional = true }
+sqlx = { version = "0.9", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"], optional = true }
 axum = { workspace = true, optional = true }
 async-stream = { version = "0.3", optional = true }
 futures = { version = "0.3", optional = true }
@@ -50,7 +50,7 @@ required-features = ["events-api"]
 
 [dev-dependencies]
 boss-testing = { path = "../boss-testing", features = ["postgres"] }
-sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"] }
+sqlx = { version = "0.9", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 uuid = { workspace = true }
 tower = { workspace = true, features = ["util"] }
