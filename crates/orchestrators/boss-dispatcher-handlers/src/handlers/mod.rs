@@ -29,6 +29,7 @@ pub mod ledger_payroll_run_submit;
 pub mod ledger_tax_accrue;
 pub mod ledger_tax_remit;
 pub mod messages_notify;
+pub mod packaging_allocate;
 pub mod people_hire;
 pub mod people_terminate;
 pub mod products_consume;

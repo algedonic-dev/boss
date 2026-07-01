@@ -11,7 +11,12 @@ use boss_dispatcher::dispatcher::{DispatcherCtx, run_loop};
 use boss_dispatcher::http::{HttpState, router};
 use boss_dispatcher::liveness::DispatcherLiveness;
 use boss_dispatcher::rules::handler::HandlerRegistry;
-use boss_dispatcher::rules::handlers::{
+use boss_dispatcher::rules::helpers_inventory::InventoryHelpers;
+use boss_dispatcher::rules::jobs_spawn::JobsSpawn;
+use boss_dispatcher::rules::registry::{Registry as RuleRegistry, load_active_rules};
+use boss_dispatcher::rules::runner::RulesRunner;
+use boss_dispatcher::rules::schedule_runner::{DEFAULT_CATCHUP_CAP, ScheduleRunner};
+use boss_dispatcher_handlers::handlers::{
     bill_payment_batch::BillPaymentBatch, commerce_invoice_issue::CommerceInvoiceIssue,
     gate_resolve::GateResolve, inventory_bill_approve::InventoryBillApprove,
     inventory_parts_consume::InventoryPartsConsume, inventory_parts_produce::InventoryPartsProduce,
@@ -19,15 +24,11 @@ use boss_dispatcher::rules::handlers::{
     jobs_complete_step::JobsCompleteStep, jobs_subjob_resolve::JobsSubjobResolve,
     ledger_bill_approve::LedgerBillApprove, ledger_payroll_run_submit::LedgerPayrollRunSubmit,
     ledger_tax_accrue::LedgerTaxAccrue, ledger_tax_remit::LedgerTaxRemit,
-    messages_notify::MessagesNotify, people_hire::PeopleHire, people_terminate::PeopleTerminate,
-    products_consume::ProductsConsume, products_produce::ProductsProduce,
-    shipping_create::ShippingCreate, webhook_notify::WebhookNotify,
+    messages_notify::MessagesNotify, packaging_allocate::PackagingAllocate,
+    people_hire::PeopleHire, people_terminate::PeopleTerminate, products_consume::ProductsConsume,
+    products_produce::ProductsProduce, shipping_create::ShippingCreate,
+    webhook_notify::WebhookNotify,
 };
-use boss_dispatcher::rules::helpers_inventory::InventoryHelpers;
-use boss_dispatcher::rules::jobs_spawn::JobsSpawn;
-use boss_dispatcher::rules::registry::{Registry as RuleRegistry, load_active_rules};
-use boss_dispatcher::rules::runner::RulesRunner;
-use boss_dispatcher::rules::schedule_runner::{DEFAULT_CATCHUP_CAP, ScheduleRunner};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -136,6 +137,13 @@ async fn main() -> Result<()> {
                 cfg.jobs_api_url.clone(),
                 cfg.products_api_url.clone(),
                 ctx.registry.clone(),
+            ));
+            // Packaging allocation — splits a brewed batch across formats by
+            // demand and writes the packaged quantities, so the whole batch
+            // always packages (WIP → FG, never dumped).
+            handlers.register(PackagingAllocate::new(
+                cfg.jobs_api_url.clone(),
+                cfg.products_api_url.clone(),
             ));
             // Step-completion handlers — F15 migration. Each
             // is a pure HTTP client to the relevant public API.

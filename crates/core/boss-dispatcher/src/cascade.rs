@@ -72,6 +72,7 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         ("jobs.complete_step", vec!["jobs.step.completed"]),
         ("jobs.subjob_resolve", vec!["jobs.step.completed"]),
         ("gate.resolve", vec!["jobs.step.completed"]),
+        ("packaging.allocate", vec!["jobs.step.completed"]),
         ("messages.notify", vec![]),
         ("webhook.notify", vec![]),
     ])

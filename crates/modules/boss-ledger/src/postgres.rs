@@ -349,7 +349,17 @@ async fn upsert_daily_rollup(
         }
     }
 
-    for (aid, (debit, credit, cash_flow)) in deltas {
+    // Lock the rollup rows in a deterministic order (by account_id) so
+    // concurrent entries posting to the same day can't deadlock. The
+    // `ON CONFLICT DO UPDATE` below takes a row lock on each
+    // `(account_id, posted_on)`; iterating the `deltas` HashMap in its
+    // arbitrary order let two entries that share accounts grab those locks
+    // in opposite orders and deadlock — worsened once a consume JE grew to
+    // five accounts (1310 + 1300 + the 6xxx absorption legs). Same
+    // lock-ordering fix the commerce invoice path uses.
+    let mut rollup: Vec<(Uuid, (i64, i64, i64))> = deltas.into_iter().collect();
+    rollup.sort_by_key(|(aid, _)| *aid);
+    for (aid, (debit, credit, cash_flow)) in rollup {
         sqlx::query(
             "INSERT INTO gl_account_daily \
                 (account_id, posted_on, debit_cents, credit_cents, cash_flow_cents) \

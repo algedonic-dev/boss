@@ -214,32 +214,35 @@ title_template = "QC checkpoint — pH, gravity, microbial"
 # anomaly. Pre-fix the engine string-matched the title.
 metadata_defaults = { ph_target = 4.4, fg_target = 1.012, microbial_pass = true, batch_id = "", is_qc_checkpoint = true }
 
-# PER-FORMAT PACKAGING GATES — after fermentation, decide EACH keg
-# format independently against its OWN current stock. This is the
-# feedback that prevents co-product glut: if sixtels are already
-# stocked, demand-check-sixtel returns "oversupply" and package-sixtel
-# never fires, while package-half still runs if half-BBLs are short
-# (and vice-versa). One mash (raw consumed once at mash-in) → split,
-# stock-gated packaging. Reuses the same demand-gate handler as the
-# top gate, pointed at a single format.
+# PACKAGING ALLOCATION — a brewed batch is one tank of fungible wort. After
+# fermentation the dispatcher reads real FG stock (crediting in-flight
+# brews), splits the WHOLE ~158-BBL batch across the two keg formats in
+# proportion to each format's shortfall to target, and writes the packaged
+# keg quantities + excise onto the package steps below. The whole batch
+# ALWAYS packages — WIP drains fully to FG, the brewery never dumps a batch
+# — while a format at/above target gets zero kegs and routes to its skip
+# successor, so co-product glut is still prevented. Replaces the two
+# independent per-format skip gates that stranded a whole batch's wort in
+# WIP when BOTH skipped (the demand caught up during the multi-day lag).
+# All numbers are data (fork_keys map SKU→a predicate-safe label).
 [[job_kind.step]]
-title = "demand-check-half"
-kind = "demand-gate"
+title = "allocate-packaging"
+kind = "packaging-allocate"
 ready_when = "steps.qc-checkpoint.done"
-title_template = "Package half-BBLs? — stock check"
-metadata_defaults = { target_skus = ["FP-PALE-1-2-BBL"], expected_daily_demand = { FP-PALE-1-2-BBL = 240 }, batch_yield = { FP-PALE-1-2-BBL = 210 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
-
-[[job_kind.step]]
-title = "demand-check-sixtel"
-kind = "demand-gate"
-ready_when = "steps.qc-checkpoint.done"
-title_template = "Package sixtels? — stock check"
-metadata_defaults = { target_skus = ["FP-PALE-1-6-BBL"], expected_daily_demand = { FP-PALE-1-6-BBL = 240 }, batch_yield = { FP-PALE-1-6-BBL = 315 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+authority_role = "head-brewer"
+title_template = "Allocate packaging — split the batch by demand"
+# `outcome_half` / `outcome_sixtel` are stamped by the packaging.allocate
+# handler at run time (a format allocated zero kegs → "skip", else "package").
+# Declared inline here as `package|skip` — tenant data — so the viability lint
+# proves the per-format fork covers every outcome, without pushing brewery
+# format names into the core packaging-allocate StepType.
+fields = [{ name = "outcome_half", field_type = "package|skip", required = false }, { name = "outcome_sixtel", field_type = "package|skip", required = false }]
+metadata_defaults = { batch_bbl = 158, target_skus = ["FP-PALE-1-2-BBL", "FP-PALE-1-6-BBL"], expected_daily_demand = { FP-PALE-1-2-BBL = 240, FP-PALE-1-6-BBL = 240 }, batch_yield = { FP-PALE-1-2-BBL = 210, FP-PALE-1-6-BBL = 315 }, default_kegs = { FP-PALE-1-2-BBL = 210, FP-PALE-1-6-BBL = 315 }, fork_keys = { FP-PALE-1-2-BBL = "half", FP-PALE-1-6-BBL = "sixtel" }, demand_window_days = 30, oversupply_multiplier = 1.5 }
 
 [[job_kind.step]]
 title = "package-half"
 kind = "production-produce"
-ready_when = "steps.demand-check-half.done AND steps.demand-check-half.metadata.outcome = \"brew\""
+ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_half = \"package\""
 title_template = "Package half-BBLs + cellar handoff"
 authority_role = "packaging-tech"
 # Excise is charged per BBL REMOVED (packaged), so it splits across the
@@ -261,7 +264,7 @@ metadata_defaults = { batch_id = "", excise_bbl = 105, produces_products = [
 [[job_kind.step]]
 title = "package-sixtel"
 kind = "production-produce"
-ready_when = "steps.demand-check-sixtel.done AND steps.demand-check-sixtel.metadata.outcome = \"brew\""
+ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_sixtel = \"package\""
 title_template = "Package sixtels + cellar handoff"
 authority_role = "packaging-tech"
 # 315 sixtels × 0.1667 ≈ 53 BBL of excise — the other half of the
@@ -279,14 +282,14 @@ metadata_defaults = { batch_id = "", excise_bbl = 53, produces_products = [
 [[job_kind.step]]
 title = "skip-half"
 kind = "task"
-ready_when = "steps.demand-check-half.metadata.outcome = \"oversupply\""
+ready_when = "steps.allocate-packaging.metadata.outcome_half = \"skip\""
 title_template = "Hold half-BBLs — sufficient stock on hand"
 authority_role = "packaging-tech"
 
 [[job_kind.step]]
 title = "skip-sixtel"
 kind = "task"
-ready_when = "steps.demand-check-sixtel.metadata.outcome = \"oversupply\""
+ready_when = "steps.allocate-packaging.metadata.outcome_sixtel = \"skip\""
 title_template = "Hold sixtels — sufficient stock on hand"
 authority_role = "packaging-tech"
 
@@ -1802,30 +1805,28 @@ authority_role = "brewer"
 title_template = "Fermentation start (pitch yeast + dry hop schedule)"
 metadata_defaults = { ferm_temp_c = 19, yeast_strain = "California Ale", vessel = "" }
 
-# PER-FORMAT PACKAGING GATES — after fermentation, decide EACH keg
-# format independently against its OWN current stock. If sixtels are
-# already stocked, demand-check-sixtel returns "oversupply" and
-# package-sixtel never fires, while package-half still runs if
-# half-BBLs are short (and vice-versa). One mash (raw consumed once at
-# mash-in) → split, stock-gated packaging. See morning-brew (pale).
+# PACKAGING ALLOCATION — one tank of fungible wort, split across formats by
+# demand shortfall so the whole ~133-BBL batch ALWAYS packages (WIP → FG,
+# never dumped); an over-supplied format gets zero and routes to its skip.
+# See morning-brew (pale) for the full rationale; all numbers are data.
 [[job_kind.step]]
-title = "demand-check-half"
-kind = "demand-gate"
+title = "allocate-packaging"
+kind = "packaging-allocate"
 ready_when = "steps.fermentation-start.done"
-title_template = "Package half-BBLs? — stock check"
-metadata_defaults = { target_skus = ["FP-IPA-1-2-BBL"], expected_daily_demand = { FP-IPA-1-2-BBL = 470 }, batch_yield = { FP-IPA-1-2-BBL = 160 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
-
-[[job_kind.step]]
-title = "demand-check-sixtel"
-kind = "demand-gate"
-ready_when = "steps.fermentation-start.done"
-title_template = "Package sixtels? — stock check"
-metadata_defaults = { target_skus = ["FP-IPA-1-6-BBL"], expected_daily_demand = { FP-IPA-1-6-BBL = 470 }, batch_yield = { FP-IPA-1-6-BBL = 320 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+authority_role = "head-brewer"
+title_template = "Allocate packaging — split the batch by demand"
+# `outcome_half` / `outcome_sixtel` are stamped by the packaging.allocate
+# handler at run time (a format allocated zero kegs → "skip", else "package").
+# Declared inline here as `package|skip` — tenant data — so the viability lint
+# proves the per-format fork covers every outcome, without pushing brewery
+# format names into the core packaging-allocate StepType.
+fields = [{ name = "outcome_half", field_type = "package|skip", required = false }, { name = "outcome_sixtel", field_type = "package|skip", required = false }]
+metadata_defaults = { batch_bbl = 133, target_skus = ["FP-IPA-1-2-BBL", "FP-IPA-1-6-BBL"], expected_daily_demand = { FP-IPA-1-2-BBL = 470, FP-IPA-1-6-BBL = 470 }, batch_yield = { FP-IPA-1-2-BBL = 160, FP-IPA-1-6-BBL = 320 }, default_kegs = { FP-IPA-1-2-BBL = 160, FP-IPA-1-6-BBL = 320 }, fork_keys = { FP-IPA-1-2-BBL = "half", FP-IPA-1-6-BBL = "sixtel" }, demand_window_days = 30, oversupply_multiplier = 1.5 }
 
 [[job_kind.step]]
 title = "package-half"
 kind = "production-produce"
-ready_when = "steps.demand-check-half.done AND steps.demand-check-half.metadata.outcome = \"brew\""
+ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_half = \"package\""
 title_template = "Package half-BBLs + cellar handoff (IPA)"
 authority_role = "packaging-tech"
 # IPA brews skew sixtel-heavy because tap rotations turn IPAs faster
@@ -1844,7 +1845,7 @@ metadata_defaults = { batch_id = "", excise_bbl = 80, produces_products = [
 [[job_kind.step]]
 title = "package-sixtel"
 kind = "production-produce"
-ready_when = "steps.demand-check-sixtel.done AND steps.demand-check-sixtel.metadata.outcome = \"brew\""
+ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_sixtel = \"package\""
 title_template = "Package sixtels + cellar handoff (IPA)"
 authority_role = "packaging-tech"
 # 320 sixtels × 0.1667 ≈ 53 BBL of excise — the other share of the
@@ -1862,14 +1863,14 @@ metadata_defaults = { batch_id = "", excise_bbl = 53, produces_products = [
 [[job_kind.step]]
 title = "skip-half"
 kind = "task"
-ready_when = "steps.demand-check-half.metadata.outcome = \"oversupply\""
+ready_when = "steps.allocate-packaging.metadata.outcome_half = \"skip\""
 title_template = "Hold half-BBLs — sufficient stock on hand"
 authority_role = "packaging-tech"
 
 [[job_kind.step]]
 title = "skip-sixtel"
 kind = "task"
-ready_when = "steps.demand-check-sixtel.metadata.outcome = \"oversupply\""
+ready_when = "steps.allocate-packaging.metadata.outcome_sixtel = \"skip\""
 title_template = "Hold sixtels — sufficient stock on hand"
 authority_role = "packaging-tech"
 
@@ -2001,30 +2002,28 @@ authority_role = "brewer"
 title_template = "Fermentation start (pitch yeast)"
 metadata_defaults = { ferm_temp_c = 18, yeast_strain = "English Ale", vessel = "" }
 
-# PER-FORMAT PACKAGING GATES — after fermentation, decide EACH keg
-# format independently against its OWN current stock. If sixtels are
-# already stocked, demand-check-sixtel returns "oversupply" and
-# package-sixtel never fires, while package-half still runs if
-# half-BBLs are short (and vice-versa). One mash (raw consumed once at
-# mash-in) → split, stock-gated packaging. See morning-brew (pale).
+# PACKAGING ALLOCATION — one tank of fungible wort, split across formats by
+# demand shortfall so the whole ~110-BBL batch ALWAYS packages (WIP → FG,
+# never dumped); an over-supplied format gets zero and routes to its skip.
+# See morning-brew (pale) for the full rationale; all numbers are data.
 [[job_kind.step]]
-title = "demand-check-half"
-kind = "demand-gate"
+title = "allocate-packaging"
+kind = "packaging-allocate"
 ready_when = "steps.fermentation-start.done"
-title_template = "Package half-BBLs? — stock check"
-metadata_defaults = { target_skus = ["FP-STOUT-1-2-BBL"], expected_daily_demand = { FP-STOUT-1-2-BBL = 64 }, batch_yield = { FP-STOUT-1-2-BBL = 100 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
-
-[[job_kind.step]]
-title = "demand-check-sixtel"
-kind = "demand-gate"
-ready_when = "steps.fermentation-start.done"
-title_template = "Package sixtels? — stock check"
-metadata_defaults = { target_skus = ["FP-STOUT-1-6-BBL"], expected_daily_demand = { FP-STOUT-1-6-BBL = 64 }, batch_yield = { FP-STOUT-1-6-BBL = 360 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+authority_role = "head-brewer"
+title_template = "Allocate packaging — split the batch by demand"
+# `outcome_half` / `outcome_sixtel` are stamped by the packaging.allocate
+# handler at run time (a format allocated zero kegs → "skip", else "package").
+# Declared inline here as `package|skip` — tenant data — so the viability lint
+# proves the per-format fork covers every outcome, without pushing brewery
+# format names into the core packaging-allocate StepType.
+fields = [{ name = "outcome_half", field_type = "package|skip", required = false }, { name = "outcome_sixtel", field_type = "package|skip", required = false }]
+metadata_defaults = { batch_bbl = 110, target_skus = ["FP-STOUT-1-2-BBL", "FP-STOUT-1-6-BBL"], expected_daily_demand = { FP-STOUT-1-2-BBL = 64, FP-STOUT-1-6-BBL = 64 }, batch_yield = { FP-STOUT-1-2-BBL = 100, FP-STOUT-1-6-BBL = 360 }, default_kegs = { FP-STOUT-1-2-BBL = 100, FP-STOUT-1-6-BBL = 360 }, fork_keys = { FP-STOUT-1-2-BBL = "half", FP-STOUT-1-6-BBL = "sixtel" }, demand_window_days = 30, oversupply_multiplier = 1.5 }
 
 [[job_kind.step]]
 title = "package-half"
 kind = "production-produce"
-ready_when = "steps.demand-check-half.done AND steps.demand-check-half.metadata.outcome = \"brew\""
+ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_half = \"package\""
 title_template = "Package half-BBLs + cellar handoff (stout)"
 authority_role = "packaging-tech"
 # Stout split: heavier on sixtels because nitro pours run on smaller
@@ -2043,7 +2042,7 @@ metadata_defaults = { batch_id = "", excise_bbl = 50, produces_products = [
 [[job_kind.step]]
 title = "package-sixtel"
 kind = "production-produce"
-ready_when = "steps.demand-check-sixtel.done AND steps.demand-check-sixtel.metadata.outcome = \"brew\""
+ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_sixtel = \"package\""
 title_template = "Package sixtels + cellar handoff (stout)"
 authority_role = "packaging-tech"
 # 360 sixtels × 0.1667 ≈ 60 BBL of excise — the other share of the
@@ -2061,14 +2060,14 @@ metadata_defaults = { batch_id = "", excise_bbl = 60, produces_products = [
 [[job_kind.step]]
 title = "skip-half"
 kind = "task"
-ready_when = "steps.demand-check-half.metadata.outcome = \"oversupply\""
+ready_when = "steps.allocate-packaging.metadata.outcome_half = \"skip\""
 title_template = "Hold half-BBLs — sufficient stock on hand"
 authority_role = "packaging-tech"
 
 [[job_kind.step]]
 title = "skip-sixtel"
 kind = "task"
-ready_when = "steps.demand-check-sixtel.metadata.outcome = \"oversupply\""
+ready_when = "steps.allocate-packaging.metadata.outcome_sixtel = \"skip\""
 title_template = "Hold sixtels — sufficient stock on hand"
 authority_role = "packaging-tech"
 
@@ -2196,30 +2195,28 @@ authority_role = "brewer"
 title_template = "Fermentation start (pitch lager yeast)"
 metadata_defaults = { ferm_temp_c = 11, yeast_strain = "German Lager", vessel = "" }
 
-# PER-FORMAT PACKAGING GATES — after fermentation, decide EACH keg
-# format independently against its OWN current stock. If sixtels are
-# already stocked, demand-check-sixtel returns "oversupply" and
-# package-sixtel never fires, while package-half still runs if
-# half-BBLs are short (and vice-versa). One mash (raw consumed once at
-# mash-in) → split, stock-gated packaging. See morning-brew (pale).
+# PACKAGING ALLOCATION — one tank of fungible wort, split across formats by
+# demand shortfall so the whole ~133-BBL batch ALWAYS packages (WIP → FG,
+# never dumped); an over-supplied format gets zero and routes to its skip.
+# See morning-brew (pale) for the full rationale; all numbers are data.
 [[job_kind.step]]
-title = "demand-check-half"
-kind = "demand-gate"
+title = "allocate-packaging"
+kind = "packaging-allocate"
 ready_when = "steps.fermentation-start.done"
-title_template = "Package half-BBLs? — stock check"
-metadata_defaults = { target_skus = ["FP-LAGER-1-2-BBL"], expected_daily_demand = { FP-LAGER-1-2-BBL = 50 }, batch_yield = { FP-LAGER-1-2-BBL = 200 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
-
-[[job_kind.step]]
-title = "demand-check-sixtel"
-kind = "demand-gate"
-ready_when = "steps.fermentation-start.done"
-title_template = "Package sixtels? — stock check"
-metadata_defaults = { target_skus = ["FP-LAGER-1-6-BBL"], expected_daily_demand = { FP-LAGER-1-6-BBL = 50 }, batch_yield = { FP-LAGER-1-6-BBL = 200 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+authority_role = "head-brewer"
+title_template = "Allocate packaging — split the batch by demand"
+# `outcome_half` / `outcome_sixtel` are stamped by the packaging.allocate
+# handler at run time (a format allocated zero kegs → "skip", else "package").
+# Declared inline here as `package|skip` — tenant data — so the viability lint
+# proves the per-format fork covers every outcome, without pushing brewery
+# format names into the core packaging-allocate StepType.
+fields = [{ name = "outcome_half", field_type = "package|skip", required = false }, { name = "outcome_sixtel", field_type = "package|skip", required = false }]
+metadata_defaults = { batch_bbl = 133, target_skus = ["FP-LAGER-1-2-BBL", "FP-LAGER-1-6-BBL"], expected_daily_demand = { FP-LAGER-1-2-BBL = 50, FP-LAGER-1-6-BBL = 50 }, batch_yield = { FP-LAGER-1-2-BBL = 200, FP-LAGER-1-6-BBL = 200 }, default_kegs = { FP-LAGER-1-2-BBL = 200, FP-LAGER-1-6-BBL = 200 }, fork_keys = { FP-LAGER-1-2-BBL = "half", FP-LAGER-1-6-BBL = "sixtel" }, demand_window_days = 30, oversupply_multiplier = 1.5 }
 
 [[job_kind.step]]
 title = "package-half"
 kind = "production-produce"
-ready_when = "steps.demand-check-half.done AND steps.demand-check-half.metadata.outcome = \"brew\""
+ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_half = \"package\""
 title_template = "Package half-BBLs + cellar handoff (lager)"
 authority_role = "packaging-tech"
 # Lager split: heavier on half-BBLs because lagers move steady at
@@ -2239,7 +2236,7 @@ metadata_defaults = { batch_id = "", excise_bbl = 100, produces_products = [
 [[job_kind.step]]
 title = "package-sixtel"
 kind = "production-produce"
-ready_when = "steps.demand-check-sixtel.done AND steps.demand-check-sixtel.metadata.outcome = \"brew\""
+ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_sixtel = \"package\""
 title_template = "Package sixtels + cellar handoff (lager)"
 authority_role = "packaging-tech"
 # 200 sixtels × 0.1667 ≈ 33 BBL of excise — the other share of the
@@ -2257,14 +2254,14 @@ metadata_defaults = { batch_id = "", excise_bbl = 33, produces_products = [
 [[job_kind.step]]
 title = "skip-half"
 kind = "task"
-ready_when = "steps.demand-check-half.metadata.outcome = \"oversupply\""
+ready_when = "steps.allocate-packaging.metadata.outcome_half = \"skip\""
 title_template = "Hold half-BBLs — sufficient stock on hand"
 authority_role = "packaging-tech"
 
 [[job_kind.step]]
 title = "skip-sixtel"
 kind = "task"
-ready_when = "steps.demand-check-sixtel.metadata.outcome = \"oversupply\""
+ready_when = "steps.allocate-packaging.metadata.outcome_sixtel = \"skip\""
 title_template = "Hold sixtels — sufficient stock on hand"
 authority_role = "packaging-tech"
 
@@ -2393,30 +2390,28 @@ authority_role = "brewer"
 title_template = "Fermentation start (pitch yeast + biotransformation dry hop)"
 metadata_defaults = { ferm_temp_c = 20, yeast_strain = "English Ale", vessel = "" }
 
-# PER-FORMAT PACKAGING GATES — after fermentation, decide EACH keg
-# format independently against its OWN current stock. If sixtels are
-# already stocked, demand-check-sixtel returns "oversupply" and
-# package-sixtel never fires, while package-half still runs if
-# half-BBLs are short (and vice-versa). One mash (raw consumed once at
-# mash-in) → split, stock-gated packaging. See morning-brew (pale).
+# PACKAGING ALLOCATION — one tank of fungible wort, split across formats by
+# demand shortfall so the whole ~107-BBL batch ALWAYS packages (WIP → FG,
+# never dumped); an over-supplied format gets zero and routes to its skip.
+# See morning-brew (pale) for the full rationale; all numbers are data.
 [[job_kind.step]]
-title = "demand-check-half"
-kind = "demand-gate"
+title = "allocate-packaging"
+kind = "packaging-allocate"
 ready_when = "steps.fermentation-start.done"
-title_template = "Package half-BBLs? — stock check"
-metadata_defaults = { target_skus = ["FP-HAZY-1-2-BBL"], expected_daily_demand = { FP-HAZY-1-2-BBL = 60 }, batch_yield = { FP-HAZY-1-2-BBL = 80 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
-
-[[job_kind.step]]
-title = "demand-check-sixtel"
-kind = "demand-gate"
-ready_when = "steps.fermentation-start.done"
-title_template = "Package sixtels? — stock check"
-metadata_defaults = { target_skus = ["FP-HAZY-1-6-BBL"], expected_daily_demand = { FP-HAZY-1-6-BBL = 60 }, batch_yield = { FP-HAZY-1-6-BBL = 400 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
+authority_role = "head-brewer"
+title_template = "Allocate packaging — split the batch by demand"
+# `outcome_half` / `outcome_sixtel` are stamped by the packaging.allocate
+# handler at run time (a format allocated zero kegs → "skip", else "package").
+# Declared inline here as `package|skip` — tenant data — so the viability lint
+# proves the per-format fork covers every outcome, without pushing brewery
+# format names into the core packaging-allocate StepType.
+fields = [{ name = "outcome_half", field_type = "package|skip", required = false }, { name = "outcome_sixtel", field_type = "package|skip", required = false }]
+metadata_defaults = { batch_bbl = 107, target_skus = ["FP-HAZY-1-2-BBL", "FP-HAZY-1-6-BBL"], expected_daily_demand = { FP-HAZY-1-2-BBL = 60, FP-HAZY-1-6-BBL = 60 }, batch_yield = { FP-HAZY-1-2-BBL = 80, FP-HAZY-1-6-BBL = 400 }, default_kegs = { FP-HAZY-1-2-BBL = 80, FP-HAZY-1-6-BBL = 400 }, fork_keys = { FP-HAZY-1-2-BBL = "half", FP-HAZY-1-6-BBL = "sixtel" }, demand_window_days = 30, oversupply_multiplier = 1.5 }
 
 [[job_kind.step]]
 title = "package-half"
 kind = "production-produce"
-ready_when = "steps.demand-check-half.done AND steps.demand-check-half.metadata.outcome = \"brew\""
+ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_half = \"package\""
 title_template = "Package half-BBLs + cellar handoff (hazy)"
 authority_role = "packaging-tech"
 # Hazy split: extreme sixtel skew. Hazies oxidize fast — bars want
@@ -2436,7 +2431,7 @@ metadata_defaults = { batch_id = "", excise_bbl = 40, produces_products = [
 [[job_kind.step]]
 title = "package-sixtel"
 kind = "production-produce"
-ready_when = "steps.demand-check-sixtel.done AND steps.demand-check-sixtel.metadata.outcome = \"brew\""
+ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_sixtel = \"package\""
 title_template = "Package sixtels + cellar handoff (hazy)"
 authority_role = "packaging-tech"
 # 400 sixtels × 0.1667 ≈ 67 BBL of excise — the other share of the
@@ -2454,14 +2449,14 @@ metadata_defaults = { batch_id = "", excise_bbl = 67, produces_products = [
 [[job_kind.step]]
 title = "skip-half"
 kind = "task"
-ready_when = "steps.demand-check-half.metadata.outcome = \"oversupply\""
+ready_when = "steps.allocate-packaging.metadata.outcome_half = \"skip\""
 title_template = "Hold half-BBLs — sufficient stock on hand"
 authority_role = "packaging-tech"
 
 [[job_kind.step]]
 title = "skip-sixtel"
 kind = "task"
-ready_when = "steps.demand-check-sixtel.metadata.outcome = \"oversupply\""
+ready_when = "steps.allocate-packaging.metadata.outcome_sixtel = \"skip\""
 title_template = "Hold sixtels — sufficient stock on hand"
 authority_role = "packaging-tech"
 

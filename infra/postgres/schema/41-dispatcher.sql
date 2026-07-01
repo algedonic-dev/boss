@@ -66,6 +66,7 @@ INSERT INTO dispatcher_rules (name, version, status, on_event, when_expr, do_ste
   ('spawn-subjob-on-delegate-subjob-step-ready', 1, 'active', 'step.ready.delegate-subjob', NULL, '[{"handler":"jobs.spawn","args":{"kind":"metadata.subjob_kind","subject_kind":"subject_kind","subject":"subject_id","parent_step_id":"step_id"}}]'::jsonb, NULL, NULL, NULL, NULL),
   ('complete-marker-on-step-ready', 1, 'active', 'step.ready.*', NULL, '[{"handler":"jobs.complete_step","args":{}}]'::jsonb, NULL, NULL, NULL, NULL),
   ('resolve-agent-gate-on-step-ready', 1, 'active', 'step.ready.*', NULL, '[{"handler":"gate.resolve","args":{}}]'::jsonb, NULL, NULL, NULL, NULL),
+  ('allocate-packaging-on-step-ready', 1, 'active', 'step.ready.packaging-allocate', NULL, '[{"handler":"packaging.allocate","args":{}}]'::jsonb, NULL, NULL, NULL, NULL),
   ('notify-assignee-on-step-ready', 1, 'active', 'step.ready.*', NULL, '[{"handler":"messages.notify","args":{}}]'::jsonb, NULL, NULL, NULL, NULL),
   ('resolve-subjob-on-child-job-closed', 1, 'active', 'jobs.job.closed', 'parent_step_id != null', '[{"handler":"jobs.subjob_resolve","args":{}}]'::jsonb, NULL, NULL, NULL, NULL),
   ('forward-billing-done-to-webhook', 1, 'active', 'step.done.billing', NULL, '[{"handler":"webhook.notify","args":{}}]'::jsonb, NULL, NULL, NULL, NULL),
