@@ -692,6 +692,20 @@ async fn main() -> Result<()> {
         // it (the old loop re-ran current_sim_date every pass, double-firing
         // periodics + rate jobs at cold-start). days_per_tick caps the
         // per-pass catch-up batch.
+        // If the epoch was restarted underneath us the clock has jumped
+        // backward to epoch_start; drop the now-stale cursor so the new
+        // epoch runs from day one instead of idling until the clock climbs
+        // a full year back to it (the post-auto-restart stall).
+        let rewound = cursor_after_clock(cursor, clock.current_sim_date);
+        if rewound != cursor {
+            info!(
+                stale_cursor = ?cursor,
+                current_sim_date = %clock.current_sim_date,
+                "epoch rewind detected; resetting day cursor so the new epoch runs from day one"
+            );
+            cursor = rewound;
+        }
+
         let days = days_to_run(
             cursor,
             clock.current_sim_date,
@@ -847,6 +861,22 @@ fn days_to_run(cursor: Option<NaiveDate>, target: NaiveDate, max_batch: u32) -> 
     }
 }
 
+/// Reset the day cursor when the clock jumps backward. A restart-epoch
+/// rewinds `current_sim_date` to `epoch_start`, but the daemon's in-memory
+/// cursor still holds the last day of the epoch that just finished — a year
+/// ahead. Left as-is, `days_to_run(cursor, current)` returns empty until the
+/// clock climbs a full year back to the stale cursor, so the daemon idles
+/// silently the whole time (the "running but no activity for ~8.7h after an
+/// auto-restart" stall). A backward jump only happens on a rewind, so drop
+/// the cursor to `None` and let the new epoch resume from day one. A
+/// monotonic (forward-or-equal) clock keeps its cursor unchanged.
+fn cursor_after_clock(cursor: Option<NaiveDate>, current: NaiveDate) -> Option<NaiveDate> {
+    match cursor {
+        Some(c) if current < c => None,
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod day_cursor_tests {
     use super::*;
@@ -901,6 +931,37 @@ mod day_cursor_tests {
         assert_eq!(first, vec![d(2025, 4, 2), d(2025, 4, 3), d(2025, 4, 4)]);
         let next = days_to_run(Some(d(2025, 4, 4)), d(2025, 5, 1), 3);
         assert_eq!(next, vec![d(2025, 4, 5), d(2025, 4, 6), d(2025, 4, 7)]);
+    }
+
+    #[test]
+    fn cursor_survives_a_forward_or_equal_clock() {
+        // The common case — a monotonic clock keeps its cursor.
+        assert_eq!(
+            cursor_after_clock(Some(d(2025, 4, 5)), d(2025, 4, 5)),
+            Some(d(2025, 4, 5))
+        );
+        assert_eq!(
+            cursor_after_clock(Some(d(2025, 4, 5)), d(2025, 4, 6)),
+            Some(d(2025, 4, 5))
+        );
+        assert_eq!(cursor_after_clock(None, d(2025, 4, 5)), None);
+    }
+
+    #[test]
+    fn cursor_resets_on_epoch_rewind_so_the_new_epoch_runs() {
+        // The stall: after a restart-epoch, current_sim_date rewinds to
+        // epoch_start while the cursor still holds the last day of the
+        // finished epoch (a year ahead). Without the reset days_to_run
+        // idles for a full year; with it the new epoch runs from day one.
+        let stale = Some(d(2026, 3, 31)); // last day of the finished epoch
+        let epoch_start = d(2025, 4, 1); // clock rewound here
+        assert_eq!(cursor_after_clock(stale, epoch_start), None);
+        // Regression guard: stale cursor → idle (the bug); reset cursor → runs.
+        assert!(days_to_run(stale, epoch_start, 31).is_empty());
+        assert_eq!(
+            days_to_run(cursor_after_clock(stale, epoch_start), epoch_start, 31),
+            vec![epoch_start]
+        );
     }
 }
 
