@@ -234,6 +234,43 @@ completion = "agent"
   description = "Order lines (sku + qty) checked against finished-goods stock."
 
 [[step_type]]
+kind = "packaging-allocate"
+label = "Packaging Allocation"
+category = "operations"
+ux = "inline"
+version = 1
+description = """
+Allocation gate: a brewed batch is one tank of fungible wort, packaged
+into whatever finished-good formats current demand needs — never dumped.
+Agent-executed — on step.ready the dispatcher reads real finished-goods
+stock (crediting in-flight brews), splits the whole batch across its
+formats in proportion to each format's shortfall, writes the packaged
+quantities + excise onto the produce steps, and stamps a per-format
+`outcome_<fork_key>` = package|skip the JobKind forks on. The whole batch
+always packages, so WIP drains fully to finished goods; a format at/above
+target gets zero and routes to its skip successor. Config is all metadata
+(batch_bbl, target_skus, per-format demand + batch_yield + default_kegs +
+fork_keys) — no tenant constants in code. See architecture-decisions.md
+§Simulator.
+"""
+typical_duration_hours = 0.25
+typical_duration_jitter = 0.3
+required_roles = ["head-brewer"]
+completion = "agent"
+
+  [[step_type.fields]]
+  name = "batch_bbl"
+  field_type = "number"
+  required = false
+  description = "Wort volume (BBL) to allocate across the formats."
+
+  [[step_type.fields]]
+  name = "target_skus"
+  field_type = "array"
+  required = false
+  description = "The finished-good formats this batch can package into."
+
+[[step_type]]
 kind = "outcome"
 label = "Job Outcome"
 category = "coordination"

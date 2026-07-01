@@ -561,9 +561,10 @@ mod tests {
     fn registry_has_43_types() {
         // Test name predates the count bumps; leaving the name alone
         // keeps blame-diff churn down. Count is just "length of
-        // seeded types", not any load-bearing invariant.
+        // seeded types", not any load-bearing invariant. 44 since
+        // PR5 added `packaging-allocate` (the brewery batch-allocation gate).
         let reg = StepRegistry::v1();
-        assert_eq!(reg.all().len(), 43);
+        assert_eq!(reg.all().len(), 44);
     }
 
     #[test]
@@ -791,8 +792,8 @@ mod tests {
         let v = all_v1_types();
         assert_eq!(
             v.len(),
-            43,
-            "step_types.toml should have 43 [[step_type]] blocks"
+            44,
+            "step_types.toml should have 44 [[step_type]] blocks"
         );
     }
 

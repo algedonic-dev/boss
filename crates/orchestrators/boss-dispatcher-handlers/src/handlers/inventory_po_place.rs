@@ -13,9 +13,9 @@
 //! mints its own UUID and discards the caller's id.
 
 use super::common::{self, StepEvent};
-use crate::rules::expr::Value;
-use crate::rules::handler::{Handler, HandlerError, InvocationContext};
 use async_trait::async_trait;
+use boss_dispatcher::rules::expr::Value;
+use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;

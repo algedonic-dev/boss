@@ -11,9 +11,9 @@
 //! (generic / outcome kinds an operator picks off a queue) are a no-op.
 
 use super::common::{StepEvent, dispatcher_actor_header};
-use crate::rules::expr::Value;
-use crate::rules::handler::{Handler, HandlerError, InvocationContext};
 use async_trait::async_trait;
+use boss_dispatcher::rules::expr::Value;
+use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
