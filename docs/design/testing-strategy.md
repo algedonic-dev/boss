@@ -114,7 +114,7 @@ re-derives every projection table; `infra/verify-replay.sh`
 diffs the rebuilt state against live state. The brewery 365-day
 regen (`infra/postgres/validate-brewery-sim.sh`) drives a
 year of sim-events through the live API services then runs the
-rebuilders — the assertion is "0 failures across all 14
+rebuilders — the assertion is "0 failures across all 15
 rebuilders `boss-rebuild-all` runs, 0 net drift between live and
 replayed projections."
 
@@ -217,7 +217,11 @@ answer "yes" stops the search:
 - Format: cargo fmt -- --check
 - Lint:   infra/lint/seed-bypass-smell.sh
 - Lint:   infra/lint/no-todo-citation.sh
-- Web:    bun install + bun run typecheck + bun run build
+- Lint:   infra/lint/no-step-kind-match.sh
+- Lint:   infra/lint/api-path-bypass-smell.sh
+- Lint:   infra/lint/sim-boundary-audit.sh
+- Lint:   infra/lint/no-wallclock.sh
+- Web:    bun install + bun run typecheck + bun run build + bun run test:mocked
 ```
 
 `.github/workflows/release.yml` cuts cross-platform `boss` CLI

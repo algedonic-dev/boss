@@ -1,12 +1,8 @@
 [package]
 name = "boss-dispatcher"
-description = "Core dispatch service — auto-assigns ready Steps to role-matched Employees. Subscribes to jobs.step.* NATS events; for any step.created or step.updated transitioning to ready with no assignee, picks an active employee whose role matches the step's authority_role (or the StepType's required_roles) and PUTs the assignment. Drives the same flow whether the simulator OR a human operator opens the Job — the assignment is a SYSTEM concern, not a sim concern."
+description = "Core dispatch engine — the generic, rule-driven side-effect runtime. Owns the Handler trait, the rule registry, the durable NATS consumers, and topic routing; also the step-assignment flow (auto-assigns ready Steps to role-matched Employees). The handler implementations + the service binary live in `boss-dispatcher-handlers` so new side effects land there without changing core."
 version.workspace = true
 edition.workspace = true
-
-[[bin]]
-name = "boss-dispatcher"
-path = "src/bin/boss_dispatcher.rs"
 
 [dependencies]
 boss-core = { path = "../boss-core" }

@@ -228,7 +228,7 @@ rate = 2.0
 # so morning-brew-stout went ~28 days without a single brew at the
 # top of the 365-day regen and Stout finished-goods hit 0 ~day 58.
 # A deterministic daily review makes that drought structurally
-# impossible. See docs/design/brewery-model-completeness.md.
+# impossible. See docs/architecture-decisions.md.
 #
 # The `rate` is the brewhouse's brew-SLOT capacity for this beer per
 # working day — the number of batches the brewmaster can schedule,

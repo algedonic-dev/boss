@@ -14,15 +14,15 @@
 //! decision through a human workforce slot — so gates queued behind labor
 //! at warp — and put system logic inside the sim, against
 //! `feedback_sim_separate_from_system`. Moving it here fixes both. See
-//! docs/design/brewery-model-completeness.md.
+//! docs/architecture-decisions.md.
 //!
 //! Rides the `step.ready.*` subscription (one NATS consumer) alongside
 //! `jobs.complete_step` + `messages.notify`; self-filters to agent gates so
 //! every other kind is a no-op.
 
-use crate::rules::expr::Value;
-use crate::rules::handler::{Handler, HandlerError, InvocationContext};
 use async_trait::async_trait;
+use boss_dispatcher::rules::expr::Value;
+use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 use boss_jobs::step_registry::{Completion, StepRegistry};
 use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;

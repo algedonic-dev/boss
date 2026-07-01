@@ -34,22 +34,12 @@ The pre-release back-compat audit found vestigial code preserving
 compatibility with implementations that no longer exist after the
 public cut. Each removal needs a small decision before landing.
 
-- [ ] **BC1: `ActorId::from_legacy` removal.** ~32 callsites of
-      `ActorId::from_legacy(&user.id)` collapse to
-      `ActorId::Human(user.id.clone())`. Drops lenient
-      Deserialize + bare-string Serialize. **Question:** changing
-      the Serialize impl flips the `actor_id` JSON wire format
-      from `"emp-032"` to `"human:emp-032"` — does the SPA
-      tolerate that, or do Svelte components index into the bare
-      string?
-
-- [ ] **BC2: `StepStatus` legacy aliases.** Drop
-      `#[serde(alias = "pending"/"done"/"waived")]` + the
-      `parse_step_status` fallback arms + SPA helpers. No wire
-      changes if every emitter / DB row already uses the
-      canonical variants. **Question:** confirm test fixtures
-      + brewery seed audit_log have no rows with the legacy
-      strings before deleting.
+- [ ] **BC2: `StepStatus` `parse_step_status` fallback.** The serde
+      `alias = "pending"/"done"/"waived"` attributes are already
+      removed; what remains is the `parse_step_status` fallback in
+      `boss-jobs/src/postgres.rs` (+ any SPA helpers). **Question:**
+      confirm no DB row / fixture still relies on the fallback arms,
+      then collapse to the canonical parse.
 
 - [ ] **BC20: `account_risk_scores` legacy module.** ~600 LoC
       across `boss-accounts/src/account_risk_scores.rs` +
@@ -59,15 +49,6 @@ public cut. Each removal needs a small decision before landing.
       landed (the comment says it did) — if so, delete legacy
       module + the duplicate ml-generator code + the
       `/api/people/accounts/risk-scores` route.
-
-- [ ] **BC3: `RuleSetV1` removal.** Riskiest tranche (~1000 LoC).
-      Rename `RuleSetV2` → `RuleSet`, inline what V2 forwards to
-      V1, drop `BOSS_LEDGER_RULESET` env var + the two UUID consts
-      + V1 test file, retarget tests. No wire impact if all live
-      JE rows already pin a `rule_version_id` — but the period-
-      lock contract has nothing to protect on a fresh DB.
-      **Question:** worth doing now, or defer as a later cleanup
-      sweep?
 
 - [ ] **BC-tail: remaining safe-delete items deferred for bulky
       callsite work.** Each is mechanical but touches enough call
@@ -219,6 +200,19 @@ which one matters first.
       lands. Decide whether the WIP account (1310) is hardcoded or
       payload-driven before implementing.
 
+- [ ] **Conservation-P: finished-goods cost-basis reconciliation
+      (consume-side).** `finished_product_inventory.production_cost_cents`
+      is an integer-rounded moving weighted average
+      (`boss-products/{in_memory,postgres}.rs`) while the GL tracks exact
+      transaction costs, so 1320 can diverge from physical-on-hand-at-cost
+      by a small percentage. Fix shape: per-SKU `GL − (on_hand × cost)`
+      diff on a fresh regen to attribute the drift, then decide whether
+      the basis reconciles to exact cost or the closure check tolerates
+      rounding. **Distinct** from the WIP-variance close above (that's the
+      1310 residual; this is the 1320 cost-basis drift), and **coupled to
+      costing PR4** (production-drivers-into-COGS changes the FG basis) —
+      land after PR4 so the reconciliation targets the final basis.
+
 - [ ] **Sales-tax accrual on retail / taproom invoices.** The
       brewery's wholesale invoices are tax-exempt (resale), but
       retail + taproom line items should accrue sales tax. The
@@ -325,6 +319,11 @@ which one matters first.
       Compounds with Integrated IAM above — once dept heads
       sign in with their real identity, the modeling UX they
       reach is what the platform is for.
+      - **used-device-shop `job-kind-approver` parity.** Core defaults
+        grant `step-signoff:job-kind-approver` to `platform-admin` and the
+        brewery grants it to its leaders; the used-device-shop tenant has
+        no grant, so if it ever drives `job-kind-design` Jobs its leaders
+        can't approve. Add the grant when that tenant authors JobKinds.
 
 - [ ] **Information theory on audit_log — triage, anomaly
       detection, error handling.** The audit_log is a stream

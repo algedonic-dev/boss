@@ -5,7 +5,7 @@
 //! metadata + subject + day, build an HTTP body, POST it. These
 //! helpers cut the boilerplate to ~5 lines per handler.
 
-use crate::rules::handler::HandlerError;
+use boss_dispatcher::rules::handler::HandlerError;
 use serde_json::Value;
 
 /// Step-event payload fields the handlers commonly read.

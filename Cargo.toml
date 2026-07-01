@@ -50,6 +50,7 @@ members = [
     "crates/core/boss-testing",
     "crates/orchestrators/boss-rebuild",
     "crates/orchestrators/boss-simulator",
+    "crates/orchestrators/boss-dispatcher-handlers",
     "crates/core/boss-ports",
 ]
 

@@ -1,0 +1,557 @@
+//! `packaging.allocate` — the agent executor that decides how to package
+//! a brewed batch.
+//!
+//! ## Why this exists
+//!
+//! A brew is one tank of fungible wort. The brewery packages it into
+//! whatever finished-good formats current demand needs — you don't
+//! pre-commit a batch to a fixed "N half-BBLs + M sixtels" split and then
+//! dump the format nobody wants. The pre-PR5 model did exactly that: two
+//! independent per-format demand gates could each *skip*, and when both
+//! skipped the wort stranded in WIP forever (251 brews / $6.7M over a
+//! 365-day run). A real brewer never dumps a whole batch — they package
+//! all of it and hold the surplus as finished-goods buffer.
+//!
+//! So this handler replaces the two per-format skip gates with one
+//! **allocation** decision: on `step.ready.*` it reads real finished-goods
+//! stock (crediting in-flight brews, like the demand gate), splits the
+//! whole batch across its formats **in proportion to each format's
+//! shortfall to target**, and stamps the per-format keg quantities onto the
+//! package steps. The whole batch is always packaged → WIP drains 100% to
+//! finished goods, `1310` nets ~0, and nothing is dumped.
+//!
+//! ## Data-driven
+//!
+//! The policy is generic; the brewery-specific numbers are seed data on the
+//! allocation step's metadata — mirroring `gate.resolve`/`demand-gate`:
+//! `batch_bbl` (wort volume to allocate), `target_skus` (the formats),
+//! `expected_daily_demand` + `demand_window_days` + `oversupply_multiplier`
+//! (the per-format target — short if effective on-hand is below it, same as
+//! the demand gate), `batch_yield` (per-format yield, for the in-flight
+//! credit), and `default_kegs` (the seeded split, used when no format is
+//! short so the batch still packages, as buffer). Keg volume is read off the
+//! SKU (`FP-…-1-2-BBL` → ½ BBL). No brewery constants live in this file.
+//!
+//! ## Fork mechanism
+//!
+//! boss-expr forks on `steps.X.metadata.<key> = "value"`, so the handler
+//! stamps a per-format outcome `outcome_<fork_key>` = `package|skip` on
+//! its own step (the `fork_keys` map — SKU → short label like `half` —
+//! is seed data; the seed also declares each `outcome_<fork_key>` as an
+//! inline `package|skip` field so the viability lint proves the fork is
+//! exhaustive without a brewery-specific core StepType). It writes every
+//! format's allocated keg quantity — INCLUDING a 0 for a skipped format —
+//! plus excise onto that format's produce step. The morning-brew DAG keeps
+//! its package/skip steps, forked on those outcomes; a format allocated
+//! zero kegs routes to its skip step (its produce step never runs), the
+//! rest package the whole batch. The 0 it writes only corrects the packaged
+//! siblings' `products.produce` cost basis (a skipped format drains no WIP).
+
+use async_trait::async_trait;
+use boss_dispatcher::rules::expr::Value as ExprValue;
+use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
+use serde_json::{Value as JsonValue, json};
+use std::sync::Arc;
+
+use super::common::{StepEvent, dispatcher_actor_header};
+
+/// One finished-good format a brewed batch can be packaged into. All
+/// fields come from the allocation step's seed metadata + a live stock
+/// read — the pure allocator never touches IO.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FormatNeed {
+    pub sku: String,
+    /// Volume per keg in BBL (0.5 for a half-BBL, 1/6 for a sixtel).
+    pub keg_bbl: f64,
+    /// Demand target in kegs; the format is "short" below this.
+    pub target_kegs: i64,
+    /// Real on-hand + in-flight yield, in kegs (the demand gate's
+    /// `effective_on_hand`).
+    pub effective_kegs: i64,
+}
+
+/// Allocate a brewed batch's `batch_bbl` of wort across its formats by
+/// need, so the **whole** batch is packaged (WIP drains fully to FG — the
+/// brewery never dumps a batch).
+///
+/// - A format short of target absorbs batch volume in proportion to its
+///   shortfall (bbl); a format at/above target gets zero (no glut).
+/// - When no format is short (demand caught up during the multi-day brew
+///   lag), fall back to `default_kegs` (the seeded split) so the batch
+///   still packages and lands as bounded FG buffer.
+///
+/// Returns kegs-to-package per format, index-aligned with `formats`.
+/// `Σ(kegs × keg_bbl) ≈ batch_bbl` (modulo per-keg rounding).
+pub fn allocate_batch(batch_bbl: f64, formats: &[FormatNeed], default_kegs: &[i64]) -> Vec<i64> {
+    // Each format's shortfall, in BBL.
+    let shortfalls: Vec<f64> = formats
+        .iter()
+        .map(|f| ((f.target_kegs - f.effective_kegs).max(0) as f64) * f.keg_bbl)
+        .collect();
+    let total_short: f64 = shortfalls.iter().sum();
+
+    // Nobody short → the batch still has to go somewhere; use the seeded
+    // split and hold it as buffer. Fall back to an even split if the seed
+    // didn't provide one (never strands the wort).
+    if total_short <= 0.0 {
+        if default_kegs.len() == formats.len() {
+            return default_kegs.to_vec();
+        }
+        return even_split(batch_bbl, formats);
+    }
+
+    // Allocate the whole batch ∝ shortfall, converted to whole kegs.
+    formats
+        .iter()
+        .zip(&shortfalls)
+        .map(|(f, &short)| {
+            if f.keg_bbl <= 0.0 {
+                return 0;
+            }
+            let bbl = batch_bbl * (short / total_short);
+            (bbl / f.keg_bbl).round() as i64
+        })
+        .collect()
+}
+
+/// Last-resort even split of the batch across formats (used only when no
+/// format is short AND the seed provided no default split).
+fn even_split(batch_bbl: f64, formats: &[FormatNeed]) -> Vec<i64> {
+    if formats.is_empty() {
+        return Vec::new();
+    }
+    let per = batch_bbl / formats.len() as f64;
+    formats
+        .iter()
+        .map(|f| {
+            if f.keg_bbl <= 0.0 {
+                0
+            } else {
+                (per / f.keg_bbl).round() as i64
+            }
+        })
+        .collect()
+}
+
+/// Total packaged volume (BBL) an allocation yields — the volume the
+/// batch's WIP drains across. Used to sanity-check conservation.
+pub fn allocated_bbl(formats: &[FormatNeed], kegs: &[i64]) -> f64 {
+    formats
+        .iter()
+        .zip(kegs)
+        .map(|(f, &k)| f.keg_bbl * k as f64)
+        .sum()
+}
+
+/// The `packaging.allocate` agent handler. Reads FG stock (crediting
+/// in-flight brews), allocates the batch via [`allocate_batch`], writes
+/// each packaged format's keg qty + excise onto its produce step, and
+/// stamps per-format `outcome_<fork_key>` on its own step so the DAG
+/// routes package vs skip. Every number is data — no brewery constants.
+pub struct PackagingAllocate {
+    client: reqwest::Client,
+    jobs_base: String,
+    products_base: String,
+}
+
+impl PackagingAllocate {
+    pub fn new(jobs_base: impl Into<String>, products_base: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            client: reqwest::Client::new(),
+            jobs_base: jobs_base.into(),
+            products_base: products_base.into(),
+        })
+    }
+
+    /// Real finished-goods on-hand for one SKU (kegs). Unknown / unreachable
+    /// reads as 0 (treated as short) so we fail toward packaging, never
+    /// toward stranding wort; transport failure errors → NAK + redeliver.
+    async fn product_on_hand(&self, sku: &str) -> Result<i64, HandlerError> {
+        let url = format!(
+            "{}/api/products/{}",
+            self.products_base.trim_end_matches('/'),
+            sku
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
+        if !resp.status().is_success() {
+            return Ok(0);
+        }
+        let v: JsonValue = resp
+            .json()
+            .await
+            .map_err(|e| HandlerError::Downstream(format!("decode product {sku}: {e}")))?;
+        Ok(v.get("total_on_hand").and_then(|x| x.as_i64()).unwrap_or(0))
+    }
+
+    async fn fetch_job(&self, job_id: &str) -> Result<JsonValue, HandlerError> {
+        let url = format!(
+            "{}/api/jobs/{}",
+            self.jobs_base.trim_end_matches('/'),
+            job_id
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(HandlerError::Downstream(format!(
+                "GET {url} returned {status}: {body}"
+            )));
+        }
+        resp.json()
+            .await
+            .map_err(|e| HandlerError::Downstream(format!("GET {url} not JSON: {e}")))
+    }
+
+    /// Count of OPEN Jobs of `kind` — the in-flight pipeline depth. Non-2xx
+    /// reads as 0 (no pipeline credit → fail toward brewing).
+    async fn open_jobs_of_kind(&self, kind: &str) -> Result<i64, HandlerError> {
+        let url = format!(
+            "{}/api/jobs?kind={}&status=open&limit=1",
+            self.jobs_base.trim_end_matches('/'),
+            kind
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
+        if !resp.status().is_success() {
+            return Ok(0);
+        }
+        let v: JsonValue = resp
+            .json()
+            .await
+            .map_err(|e| HandlerError::Downstream(format!("decode jobs list {kind}: {e}")))?;
+        Ok(v.get("total").and_then(|x| x.as_i64()).unwrap_or(0))
+    }
+
+    async fn put_step(
+        &self,
+        job_id: &str,
+        step_id: &str,
+        body: JsonValue,
+        rule: &str,
+    ) -> Result<(), HandlerError> {
+        let url = format!(
+            "{}/api/jobs/{}/steps/{}",
+            self.jobs_base.trim_end_matches('/'),
+            job_id,
+            step_id
+        );
+        let resp = self
+            .client
+            .put(&url)
+            .header("content-type", "application/json")
+            .header("x-boss-user", dispatcher_actor_header(rule))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| HandlerError::Downstream(format!("PUT {url}: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(HandlerError::Downstream(format!(
+                "PUT {url} returned {status}: {text}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Write the packaged qty + excise onto the produce step that yields
+    /// `sku`. Metadata is cloned + overwritten (PUT replaces top-level keys
+    /// wholesale). No status change — the step stays pending until the fork
+    /// lets it become ready and the workforce packages it.
+    async fn stamp_produce_qty(
+        &self,
+        job_id: &str,
+        steps: &[JsonValue],
+        sku: &str,
+        kegs: i64,
+        keg_bbl: f64,
+        rule: &str,
+    ) -> Result<(), HandlerError> {
+        for s in steps {
+            let Some(sid) = s.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(md) = s.get("metadata").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            let Some(produces) = md.get("produces_products").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            if !produces
+                .iter()
+                .any(|p| p.get("sku").and_then(|v| v.as_str()) == Some(sku))
+            {
+                continue;
+            }
+            let mut new_produces = produces.clone();
+            for p in new_produces.iter_mut() {
+                if p.get("sku").and_then(|v| v.as_str()) == Some(sku) {
+                    p["qty"] = json!(kegs);
+                }
+            }
+            let mut new_md = md.clone();
+            new_md.insert(
+                "produces_products".to_string(),
+                JsonValue::Array(new_produces),
+            );
+            new_md.insert(
+                "excise_bbl".to_string(),
+                json!((kegs as f64 * keg_bbl).round() as i64),
+            );
+            return self
+                .put_step(job_id, sid, json!({ "metadata": new_md }), rule)
+                .await;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Handler for PackagingAllocate {
+    fn name(&self) -> &'static str {
+        "packaging.allocate"
+    }
+
+    async fn invoke(
+        &self,
+        _args: &[(String, ExprValue)],
+        ctx: &InvocationContext,
+    ) -> Result<(), HandlerError> {
+        let ev = StepEvent::from_payload(&ctx.event_payload)?;
+        let md = ev.metadata;
+        // Self-filter: an allocation step carries a positive batch_bbl +
+        // target_skus. Anything else is a no-op (this handler shares the
+        // step.ready.* subscription).
+        let batch_bbl = md.get("batch_bbl").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let skus = string_array(md, "target_skus");
+        if batch_bbl <= 0.0 || skus.is_empty() {
+            return Ok(());
+        }
+
+        let window = md
+            .get("demand_window_days")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(30.0);
+        let mult = md
+            .get("oversupply_multiplier")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.5);
+        let demand = md.get("expected_daily_demand");
+        let batch_yield = md.get("batch_yield");
+        let fork_keys = md.get("fork_keys");
+        let default_map = md.get("default_kegs");
+
+        // Fetch the Job once — used for its JobKind (the in-flight count)
+        // and its steps (to write package quantities).
+        let job = self.fetch_job(ev.job_id).await?;
+        // In-flight pipeline depth (open Jobs of this kind minus this one),
+        // crediting yield-in-flight like the demand gate.
+        let in_flight = match job.get("kind").and_then(|k| k.as_str()) {
+            Some(kind) => (self.open_jobs_of_kind(kind).await? - 1).max(0),
+            None => 0,
+        };
+
+        let mut formats = Vec::with_capacity(skus.len());
+        let mut default_kegs = Vec::with_capacity(skus.len());
+        for sku in &skus {
+            let keg_bbl = keg_volume_bbl(sku);
+            let daily = demand
+                .and_then(|d| d.get(sku))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let target_kegs = (daily * window * mult) as i64;
+            let real = self.product_on_hand(sku).await?;
+            let per_batch = batch_yield
+                .and_then(|m| m.get(sku))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            formats.push(FormatNeed {
+                sku: sku.clone(),
+                keg_bbl,
+                target_kegs,
+                effective_kegs: real + in_flight * per_batch,
+            });
+            default_kegs.push(
+                default_map
+                    .and_then(|m| m.get(sku))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0),
+            );
+        }
+
+        let kegs = allocate_batch(batch_bbl, &formats, &default_kegs);
+
+        // Write the packaged formats' quantities + stamp per-format outcomes.
+        let steps = job
+            .get("steps")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut own_md = ev.metadata.clone();
+        for (fmt, &alloc) in formats.iter().zip(&kegs) {
+            let packaged = alloc > 0;
+            // Write the allocated qty onto every format's produce step — the
+            // packaged split, INCLUDING a 0 for a skipped format. products.produce
+            // reads these quantities to spread the batch's WIP across the formats
+            // by packaged volume; a 0-qty format contributes 0 volume, drains no
+            // WIP, and its share is absorbed by the packaged formats. (Its produce
+            // step never runs — the fork routes it to `skip` — so writing 0 only
+            // corrects the sibling's cost basis; it never produces phantom FG.)
+            self.stamp_produce_qty(
+                ev.job_id,
+                &steps,
+                &fmt.sku,
+                alloc,
+                fmt.keg_bbl,
+                &ctx.rule_name,
+            )
+            .await?;
+            // Fork label: seed `fork_keys[sku]` (a short predicate-safe key
+            // like `half`), else the SKU itself.
+            let key = fork_keys
+                .and_then(|m| m.get(fmt.sku.as_str()))
+                .and_then(|v| v.as_str())
+                .unwrap_or(fmt.sku.as_str());
+            own_md.insert(
+                format!("outcome_{key}"),
+                json!(if packaged { "package" } else { "skip" }),
+            );
+        }
+
+        // Complete this step, carrying its metadata forward + the outcomes
+        // (PATCH-on-PUT replaces top-level metadata wholesale).
+        self.put_step(
+            ev.job_id,
+            ev.step_id,
+            json!({ "status": "completed", "metadata": own_md }),
+            &ctx.rule_name,
+        )
+        .await
+    }
+}
+
+fn string_array(md: &serde_json::Map<String, JsonValue>, key: &str) -> Vec<String> {
+    md.get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Volume per keg (BBL) from a finished-product SKU like `FP-PALE-1-2-BBL`
+/// (½) or `FP-IPA-1-6-BBL` (⅙). Non-keg SKUs → 1.0.
+fn keg_volume_bbl(sku: &str) -> f64 {
+    let parts: Vec<&str> = sku.split('-').collect();
+    if let [.., num, den, unit] = parts.as_slice()
+        && unit.eq_ignore_ascii_case("BBL")
+        && let (Ok(n), Ok(d)) = (num.parse::<f64>(), den.parse::<f64>())
+        && d > 0.0
+    {
+        return n / d;
+    }
+    1.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HALF: f64 = 0.5;
+    const SIXTEL: f64 = 1.0 / 6.0;
+
+    fn fmt(sku: &str, keg_bbl: f64, target: i64, effective: i64) -> FormatNeed {
+        FormatNeed {
+            sku: sku.into(),
+            keg_bbl,
+            target_kegs: target,
+            effective_kegs: effective,
+        }
+    }
+
+    #[test]
+    fn only_one_format_short_absorbs_the_whole_batch() {
+        // Half-BBL short (0 on hand vs 500 target); sixtel over target.
+        let formats = vec![
+            fmt("FP-PALE-1-2-BBL", HALF, 500, 0),
+            fmt("FP-PALE-1-6-BBL", SIXTEL, 500, 900),
+        ];
+        let kegs = allocate_batch(158.0, &formats, &[210, 315]);
+        // The whole 158 bbl goes to half-BBLs; sixtel gets none (no glut).
+        assert_eq!(kegs[1], 0);
+        assert_eq!(kegs[0], 316); // 158 / 0.5
+        // Whole batch packaged.
+        assert!((allocated_bbl(&formats, &kegs) - 158.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn both_short_split_in_proportion_to_shortfall() {
+        // Half short by 100 kegs×0.5 = 50 bbl; sixtel short by 180×(1/6)=30 bbl.
+        let formats = vec![
+            fmt("FP-PALE-1-2-BBL", HALF, 100, 0),
+            fmt("FP-PALE-1-6-BBL", SIXTEL, 180, 0),
+        ];
+        let kegs = allocate_batch(158.0, &formats, &[210, 315]);
+        // total shortfall 80 bbl → half gets 158×50/80=98.75, sixtel 59.25.
+        let half_bbl = kegs[0] as f64 * HALF;
+        let sixtel_bbl = kegs[1] as f64 * SIXTEL;
+        assert!((half_bbl - 98.75).abs() < 1.0, "half {half_bbl}");
+        assert!((sixtel_bbl - 59.25).abs() < 1.0, "sixtel {sixtel_bbl}");
+        // Whole batch packaged (∝ need), nothing stranded.
+        assert!((allocated_bbl(&formats, &kegs) - 158.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn neither_short_falls_back_to_seeded_split_as_buffer() {
+        // Both formats over target → no shortfall → seeded split.
+        let formats = vec![
+            fmt("FP-PALE-1-2-BBL", HALF, 100, 5000),
+            fmt("FP-PALE-1-6-BBL", SIXTEL, 100, 5000),
+        ];
+        let kegs = allocate_batch(158.0, &formats, &[210, 315]);
+        assert_eq!(kegs, vec![210, 315]); // held as buffer, not dumped
+    }
+
+    #[test]
+    fn neither_short_no_seed_split_falls_back_to_even() {
+        let formats = vec![
+            fmt("FP-PALE-1-2-BBL", HALF, 100, 5000),
+            fmt("FP-PALE-1-6-BBL", SIXTEL, 100, 5000),
+        ];
+        // Empty default → even split of 158 bbl: 79 bbl each.
+        let kegs = allocate_batch(158.0, &formats, &[]);
+        assert_eq!(kegs[0], 158); // 79 / 0.5
+        assert_eq!(kegs[1], 474); // 79 / (1/6)
+        // Still the whole batch — never dumps.
+        assert!((allocated_bbl(&formats, &kegs) - 158.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn the_251_stranding_case_is_gone_batch_always_packages() {
+        // The old both-skip case: both formats "oversupplied" at package
+        // time. Old model skipped both → wort stranded. Now the batch still
+        // packages (as buffer) — allocated volume is never zero.
+        let formats = vec![
+            fmt("FP-IPA-1-2-BBL", HALF, 240, 9999),
+            fmt("FP-IPA-1-6-BBL", SIXTEL, 240, 9999),
+        ];
+        let kegs = allocate_batch(133.0, &formats, &[160, 320]);
+        assert!(allocated_bbl(&formats, &kegs) > 0.0, "batch must package");
+    }
+}

@@ -36,9 +36,9 @@
 //! structural marker kind auto-completes with no change here, per the
 //! "registries over hardcoded paths" principle.
 
-use crate::rules::expr::Value;
-use crate::rules::handler::{Handler, HandlerError, InvocationContext};
 use async_trait::async_trait;
+use boss_dispatcher::rules::expr::Value;
+use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 use boss_jobs::step_registry::{Completion, StepRegistry};
 use serde_json::json;
 use std::sync::Arc;

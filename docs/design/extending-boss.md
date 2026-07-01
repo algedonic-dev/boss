@@ -57,7 +57,7 @@ ladder as you actually need:
 
 | You want to… | You author… | Code? | Where? |
 |---|---|---|---|
-| Run an existing workflow against a new Subject pool | Just open a Job | No | SPA, `/jobs/new` |
+| Run an existing workflow against a new Subject pool | Just open a Job | No | SPA, `/ux/jobs` |
 | Compose a new workflow from existing StepTypes | A JobKind row | No (data only) | `/system/job-kinds` |
 | Add a new step kind with a custom UX surface | A StepPlugin (JS bundle) | JavaScript only | `infra/step-plugins/` |
 | Add a new domain entity (Subject kind) | A new crate | Rust | `crates/modules/` |

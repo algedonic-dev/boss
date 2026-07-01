@@ -163,6 +163,16 @@ metadata is checked **at done, not at create**;
 The Jobs list takes exactly one subject filter — `?subject_id=` —
 and the Job's subject column is `subject_id`.
 
+The brewery's `wholesale-keg-order` is the worked example of
+agent-gated fulfillment: an `availability-gate` reads finished-goods
+for the order's lines and forks fulfill|backorder — an order the cooler
+can't cover exits to a terminal `backordered` outcome instead of
+marching through pick → ship → bill against stock that isn't there —
+then a human `pull-and-stage` pick precedes delivery and billing. The
+gate is the release valve that bounds open WIP the way human
+stock-judgment does in a real brewery; finished-goods / COGS draw on the
+billing line items.
+
 **JobKinds bootstrap through Jobs.** The system-owned
 `job-kind-design` kind authors new JobKinds inside a Job (draft
 edits live in the authoring Job; the terminal `job-kind-publish`
@@ -171,6 +181,22 @@ published with full audit provenance — the system models its own
 development. Platform kinds ship in code (`platform_kinds()`);
 tenant kinds load from `examples/<tenant>/seeds/job_kinds.toml`
 (governance rule: `docs/design/platform-vs-tenant-jobkinds.md`).
+
+**Authoring is graphical and author-gated.** The `job-kind-design`
+surface is an interactive trigger→outcome canvas (Svelte Flow + dagre,
+code-split onto the editor route): steps are nodes (trigger / terminal
+/ fork / work), an edge A→B *is* `steps.A.done` in B's `ready_when`, and
+a structured predicate builder emits the boss-expr behind a
+live-validated raw "advanced" escape hatch. A non-persisting dry-run
+(`POST /api/jobs/kinds/_validate`) runs the publish-path lint against
+the same in-process `StepRegistry::v1()`, so editor-green publishes by
+construction; the SPA persists drafts as `metadata.job_kind_spec`
+PATCHes on the design Job and never calls the direct `/api/jobs/kinds`
+create/update/publish handlers (kept only for bootstrap + tests). The
+design **approve** step requires a `job-kind-approver` capability —
+authoring a work-type is operational leadership's call, not the deploy
+operator's alone (core policy grants it to `platform-admin`; tenants
+grant it to their leaders; `design-doc-review` stays `platform-admin`).
 
 ## Step types are property bundles; the alphabet is the mechanisms
 
@@ -407,14 +433,25 @@ required-at-done fields (bundle + step-authored) and collecting
 sign-off stamps before completing — metadata first, stamps
 attesting the final shape, then the status flip. Gates are
 agent-executed by the dispatcher reading real stock — the
-workforce never sees them. Batch engines (payroll, taxes) are
+workforce never sees them. Brewery production is **demand-pull, not
+open-loop**: each `morning-brew*` kind is a `deterministic` daily
+review (one brew *reviewed* per working day — the rate is the
+brewhouse's per-beer slot capacity, never a Poisson draw that could
+silently emit nothing), and the gate is in-flight-aware, crediting the
+pipeline (`effective_on_hand = real + open_sibling_jobs × batch_yield`)
+before deciding brew|oversupply so the daily review doesn't double-brew
+through the multi-day brew lag. Batch engines (payroll, taxes) are
 generic over Population + Rule traits. Warp is honest: the sim
 runs at the throughput the serial write path sustains, and the
 canonical 365-day world must pass hard-fail (any non-2xx aborts),
 queue drain, full rebuild parity, and chain integrity for the
 validation gate to go green. The scratch stack mirrors prod at +1000 ports
-for experiments. (The scheduler-shaped engine evolution is
-in-flight: `docs/design/scheduler-shaped-sim-engine.md`.)
+for experiments. The daemon is a **cursor-gated auto-tick loop**:
+clock-authoritative time, each sim-day processed exactly once
+(`days_to_run`) — which fixed the cold-start over-firing (periodics +
+rate engines re-firing on overlapping day windows) without the
+heap-scheduler refactor that was prototyped (`boss-sim/scheduler.rs`)
+but deliberately not adopted, the simpler cursor gate being sufficient.
 
 ## ML platform
 
@@ -473,9 +510,9 @@ plus `*-client` crates) and **Tier 2 — company-modeling layer**
 inventory, shipping, ledger, products, messages, catalog, assets,
 clients, ML plugins). A non-company tenant deploys Tier 1 alone.
 **Orchestrators** (`crates/orchestrators/`: `boss-rebuild`,
-`boss-cli`, `boss-sim`, `boss-ml-api`) fan out across tiers by
-design; **tenants** (`crates/tenants/`: brewery engine,
-used-device-shop engine) carry tenant binaries.
+`boss-cli`, `boss-sim`, `boss-ml-api`, `boss-simulator`) fan out
+across tiers by design; **tenants** (`crates/tenants/`: brewery
+engine, used-device-shop engine) carry tenant binaries.
 `infra/lint/tier-import-audit.sh` enforces
 Tier-1-never-imports-Tier-2 for libraries. Seeds never write
 emergent state — if a seed wants to `INSERT INTO invoices`, the

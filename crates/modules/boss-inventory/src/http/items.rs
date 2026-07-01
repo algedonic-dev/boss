@@ -538,13 +538,19 @@ pub(super) async fn labor_absorbed_handler<R: InventoryRepository + 'static>(
     let step_id = body.step_id.clone();
 
     // Source-id strategy: when a step_id is supplied (the typical
-    // production-consume case), use `labor-absorbed@<step_id>` so
-    // re-emits for the same step (e.g. rebuild replays) collapse on
-    // the (kind, source_table, source_id) unique key. Without a
-    // step_id we fall back to the timestamp — best-effort
-    // idempotency for ad-hoc absorption posts.
+    // production-consume case), key on
+    // `labor-absorbed@<step_id>:<credit_account>`. Folding in the
+    // credit account makes the id unique *per driver*, so a step that
+    // absorbs several granular drivers (direct labor → 6100, process
+    // utilities → 6300, production depreciation → 6900) lands one fact
+    // each instead of colliding on the (kind, source_table, source_id)
+    // unique key; re-emits for the same (step, account) — e.g. rebuild
+    // replays — still collapse. The drain's `drain-actual-wip` basis
+    // reconstructs the same key to sum what was capitalized. Without a
+    // step_id we fall back to the timestamp — best-effort idempotency
+    // for ad-hoc absorption posts.
     let source_id = match &step_id {
-        Some(s) => format!("labor-absorbed@{s}"),
+        Some(s) => format!("labor-absorbed@{s}:{}", body.credit_account),
         None => format!("labor-absorbed@{}", now.to_rfc3339()),
     };
 

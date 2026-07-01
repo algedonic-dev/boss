@@ -325,7 +325,7 @@ fn check_fork_coverage(
         });
 
         for field in &fields {
-            match enum_domain(registry, &fork.kind, field) {
+            match enum_domain(registry, fork, field) {
                 Some(values) => {
                     for v in &values {
                         let payload = synth_fork_payload(
@@ -386,13 +386,29 @@ fn discriminator_fields(fork: &str, successors: &[&StepSpec]) -> Vec<String> {
     fields
 }
 
-/// The declared enum values of `field` on StepType `kind`, if the
+/// The declared enum values of `field` on the fork step, if the
 /// field_type is pipe-shaped (`a|b|c`). `None` for free-text fields.
-fn enum_domain(registry: &StepRegistry, kind: &str, field: &str) -> Option<Vec<String>> {
-    let st = registry.get(kind)?;
-    let f = st.fields.iter().find(|f| f.name == field)?;
-    if f.field_type.contains('|') {
-        Some(f.field_type.split('|').map(|s| s.to_string()).collect())
+///
+/// An **inline** field authored on the step itself wins over the
+/// StepType's field of the same name — so a tenant seed can declare a
+/// fork's outcome vocabulary as data (keeping the core StepType generic)
+/// and still get exhaustive fork-coverage checking, exactly as Phase-0
+/// already type-checks inline `metadata_defaults`.
+fn enum_domain(registry: &StepRegistry, fork: &StepSpec, field: &str) -> Option<Vec<String>> {
+    let field_type = fork
+        .fields
+        .iter()
+        .find(|f| f.name == field)
+        .map(|f| f.field_type.to_string())
+        .or_else(|| {
+            let st = registry.get(&fork.kind)?;
+            st.fields
+                .iter()
+                .find(|f| f.name == field)
+                .map(|f| f.field_type.to_string())
+        })?;
+    if field_type.contains('|') {
+        Some(field_type.split('|').map(|s| s.to_string()).collect())
     } else {
         None
     }
@@ -703,6 +719,110 @@ mod tests {
                 .any(|e| e.reason.contains("orphan outcome")
                     && e.reason.contains("changes-requested")),
             "expected changes-requested orphan, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn inline_field_enum_makes_fork_coverage_pass_without_a_fallback() {
+        // A fork step whose kind declares no `outcome` enum (so the domain
+        // is free-text by default) but which authors `outcome` inline as
+        // `package|skip`. Both values are covered by a successor → the fork
+        // is exhaustively covered and needs no `.done` fallback. This is how
+        // a tenant seed (e.g. the brewery's packaging allocation) declares a
+        // fork's vocabulary as data without a brewery-specific core StepType.
+        let reg = StepRegistry::v1();
+        let spec = JobKindSpec::platform_seed(
+            "inline-fork",
+            "inline-fork",
+            "test",
+            vec!["asset".into()],
+            vec![
+                StepSpec {
+                    title: "allocate".into(),
+                    kind: "task".into(),
+                    ready_when: "true".into(),
+                    fields: vec![boss_core::job::StepField {
+                        name: "outcome".into(),
+                        field_type: "package|skip".into(),
+                        required: false,
+                    }],
+                    ..Default::default()
+                },
+                StepSpec {
+                    title: "package".into(),
+                    kind: "task".into(),
+                    ready_when: "steps.allocate.metadata.outcome = \"package\"".into(),
+                    terminal: Some(Terminal {
+                        outcome: "packaged".into(),
+                    }),
+                    ..Default::default()
+                },
+                StepSpec {
+                    title: "skip".into(),
+                    kind: "task".into(),
+                    ready_when: "steps.allocate.metadata.outcome = \"skip\"".into(),
+                    terminal: Some(Terminal {
+                        outcome: "skipped".into(),
+                    }),
+                    ..Default::default()
+                },
+            ],
+        );
+        let errs = validate_job_kind(&spec, &reg);
+        assert!(
+            !errs.iter().any(|e| e.reason.contains("fork")),
+            "inline package|skip enum should make the fork exhaustive, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn inline_field_enum_still_catches_an_orphan_outcome() {
+        // Same inline `outcome = package|skip`, but only "package" is handled.
+        // "skip" is now a provable orphan (not free-text), so the lint must
+        // flag it rather than silently accept an uncovered branch.
+        let reg = StepRegistry::v1();
+        let spec = JobKindSpec::platform_seed(
+            "inline-orphan",
+            "inline-orphan",
+            "test",
+            vec!["asset".into()],
+            vec![
+                StepSpec {
+                    title: "allocate".into(),
+                    kind: "task".into(),
+                    ready_when: "true".into(),
+                    fields: vec![boss_core::job::StepField {
+                        name: "outcome".into(),
+                        field_type: "package|skip".into(),
+                        required: false,
+                    }],
+                    ..Default::default()
+                },
+                StepSpec {
+                    title: "package".into(),
+                    kind: "task".into(),
+                    ready_when: "steps.allocate.metadata.outcome = \"package\"".into(),
+                    terminal: Some(Terminal {
+                        outcome: "packaged".into(),
+                    }),
+                    ..Default::default()
+                },
+                StepSpec {
+                    title: "hold".into(),
+                    kind: "task".into(),
+                    ready_when: "steps.allocate.metadata.outcome = \"package\"".into(),
+                    terminal: Some(Terminal {
+                        outcome: "held".into(),
+                    }),
+                    ..Default::default()
+                },
+            ],
+        );
+        let errs = validate_job_kind(&spec, &reg);
+        assert!(
+            errs.iter()
+                .any(|e| e.reason.contains("orphan outcome") && e.reason.contains("skip")),
+            "expected `skip` orphan from the inline enum, got: {errs:?}"
         );
     }
 

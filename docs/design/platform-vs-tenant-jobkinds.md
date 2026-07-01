@@ -13,7 +13,8 @@ BOSS core ships **the alphabet, not the programs**:
   rows `infra/postgres/schema/01-registries.sql` seeds: the five roots
   `person` / `location` / `object` / `intangible` / `calendar`, their
   specializations `account` / `customer` / `employee` / `vendor` /
-  `campaign` / `asset` / `product` / `purchase_order`, and the
+  `campaign` / `asset` / `product` / `purchase_order` / `shipment` /
+  `vendor-invoice` / `marketing-asset` / `invoice` / `message`, and the
   `custom` escape hatch), the side-effect handler registry
   (`boss-dispatcher`, keyed by `step.done.<kind>`), the Class registry
   mechanism, the Job and Step primitives.

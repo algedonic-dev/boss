@@ -243,12 +243,24 @@ handler = "jobs.complete_step"
 # computer speed — so a release valve costs no labor and resolves the moment
 # it's ready instead of queuing behind the human workforce at warp. Agents
 # are CPUs in the same machine: the sim drives only labor, the gate decides
-# itself. See docs/design/brewery-model-completeness.md.
+# itself. See docs/architecture-decisions.md.
 [[rule]]
 name = "resolve-agent-gate-on-step-ready"
 on_event = "step.ready.*"
 [[rule.do]]
 handler = "gate.resolve"
+
+# Packaging allocation — a brewed batch is fungible wort. On step.ready the
+# dispatcher reads real FG stock, splits the whole batch across its formats
+# by demand shortfall, writes the packaged keg quantities + excise onto the
+# produce steps, and stamps per-format outcomes the JobKind forks on — so
+# the whole batch always packages (WIP → FG, never dumped). Same
+# computer-speed agent pattern as the gate above.
+[[rule]]
+name = "allocate-packaging-on-step-ready"
+on_event = "step.ready.packaging-allocate"
+[[rule.do]]
+handler = "packaging.allocate"
 
 # ---------------------------------------------------------------------------
 # Push notifier (human-powered-state-machine awareness)
