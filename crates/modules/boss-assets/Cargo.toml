@@ -41,14 +41,14 @@ futures = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
 async-nats = { workspace = true }
-sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"], optional = true }
+sqlx = { version = "0.9", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"], optional = true }
 
 [dev-dependencies]
 boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
 tower = { workspace = true }
 http-body-util = "0.1"
 proptest = "1"
-sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
+sqlx = { version = "0.9", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
 
 [lints]
 workspace = true
