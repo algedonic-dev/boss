@@ -13,6 +13,7 @@
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import Meta from '@boss/web-kit/ui/Meta.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
+  import { formatMoney } from '@boss/web-kit/ui/money';
   import type { VendorInvoice } from '../vendors/types';
   import { href } from '../router';
 
@@ -74,7 +75,7 @@
     <p class="empty">{fetchState.message}</p>
   {:else}
     {@const bill = fetchState.bill}
-    {@const moneyFmt = (c: number) => `$${(c / 100).toLocaleString()} ${bill.currency}`}
+    {@const moneyFmt = (c: number) => formatMoney({ amount_cents: c, currency: bill.currency })}
 
     <header class="detail-hero">
       <div>

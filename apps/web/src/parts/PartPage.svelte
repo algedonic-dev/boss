@@ -8,6 +8,7 @@
   import { appToday } from '@boss/web-kit/sim-clock';
   import Meta from '@boss/web-kit/ui/Meta.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
+  import { formatMoney } from '@boss/web-kit/ui/money';
   import StatusChip from './StatusChip.svelte';
   import {
     collectParts,
@@ -288,7 +289,7 @@
       <Section title="Part">
           <dl class="kv">
             <dt>SKU</dt><dd><EntityLink kind="part" id={sku} /></dd>
-            <dt>Unit price</dt><dd>${(part.part.unit_price_cents / 100).toLocaleString()}</dd>
+            <dt>Unit price</dt><dd>{formatMoney({ amount_cents: part.part.unit_price_cents, currency: part.part.currency })}</dd>
             <dt>Lead time</dt>
             <dd>
               {'lead_time_days' in part.part ? `${part.part.lead_time_days} days` : '—'}
@@ -323,7 +324,7 @@
                     <td>{ol.po.placed_on}</td>
                     <td>{ol.po.expected_on}</td>
                     <td class="num">{ol.line.qty}</td>
-                    <td class="num">${(ol.line.unit_cost_cents / 100).toLocaleString()}</td>
+                    <td class="num">{formatMoney({ amount_cents: ol.line.unit_cost_cents, currency: ol.line.currency })}</td>
                   </tr>
                 {/each}
               </tbody>

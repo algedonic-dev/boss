@@ -13,6 +13,7 @@
   import { isPending, type StepStatus } from '../jobs/types';
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
+  import { formatMoney } from '@boss/web-kit/ui/money';
 
   type StepData = {
     id: string;
@@ -284,7 +285,7 @@
                   </div>
                   <div class="step-kb-item-name">{p.name}</div>
                   <div class="step-kb-item-price">
-                    ${(p.unit_price_cents / 100).toLocaleString()}
+                    {formatMoney({ amount_cents: p.unit_price_cents, currency: p.currency })}
                   </div>
                 </div>
               {/each}

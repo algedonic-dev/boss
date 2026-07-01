@@ -3,6 +3,7 @@
 
   import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
   import Meta from '@boss/web-kit/ui/Meta.svelte';
+  import { formatMoney } from '@boss/web-kit/ui/money';
   import { CATEGORY_LABEL } from './types';
   import { DeviceModelSchema, type DeviceModel } from './schemas';
   import { fetchValidated } from '../data/parseResponse';
@@ -143,12 +144,12 @@
           <Meta label="SKU" mono={true}>{d.sku}</Meta>
           <Meta label="Manufacturer">{d.manufacturer}</Meta>
           <Meta label="List price">
-              ${(d.commerce.list_price_new_cents / 100).toLocaleString()}
+              {formatMoney({ amount_cents: d.commerce.list_price_new_cents, currency: d.commerce.currency })}
           </Meta>
           {#if d.commerce.typical_refurb_price_cents !== null}
             {@const refurbCents = d.commerce.typical_refurb_price_cents}
             <Meta label="Refurb typical">
-                ${(refurbCents / 100).toLocaleString()}
+                {formatMoney({ amount_cents: refurbCents, currency: d.commerce.currency })}
             </Meta>
           {/if}
         </div>
@@ -179,7 +180,7 @@
           <dt>Firmware</dt>
           <dd>{d.current_firmware ?? '—'}</dd>
           <dt>List price</dt>
-          <dd>${(d.commerce.list_price_new_cents / 100).toLocaleString()}</dd>
+          <dd>{formatMoney({ amount_cents: d.commerce.list_price_new_cents, currency: d.commerce.currency })}</dd>
           <dt>Lead time</dt>
           <dd>{d.commerce.lead_time_days} days</dd>
         </dl>
@@ -282,7 +283,7 @@
                   <td class="mono">{p.part_sku}</td>
                   <td>{p.name}</td>
                   <td class="prose-cell">{p.description}</td>
-                  <td class="num">${(p.unit_price_cents / 100).toLocaleString()}</td>
+                  <td class="num">{formatMoney({ amount_cents: p.unit_price_cents, currency: p.currency })}</td>
                   <td class="num">{p.lead_time_days}d</td>
                   <td>
                     {#if p.high_usage}
@@ -313,7 +314,7 @@
                   <td class="mono">{c.part_sku}</td>
                   <td>{c.name}</td>
                   <td class="prose-cell">{c.description}</td>
-                  <td class="num">${(c.unit_price_cents / 100).toLocaleString()}</td>
+                  <td class="num">{formatMoney({ amount_cents: c.unit_price_cents, currency: c.currency })}</td>
                   <td class="num">{c.treatments_per_unit ?? '—'}</td>
                 </tr>
               {/each}
