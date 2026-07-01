@@ -6,9 +6,9 @@
 //! supplied amount_cents. POST `/api/inventory/vendor-invoices`.
 
 use super::common::{self, StepEvent, dispatcher_actor_header};
-use crate::rules::expr::Value;
-use crate::rules::handler::{Handler, HandlerError, InvocationContext, arg};
 use async_trait::async_trait;
+use boss_dispatcher::rules::expr::Value;
+use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext, arg};
 use serde_json::json;
 use std::sync::Arc;
 

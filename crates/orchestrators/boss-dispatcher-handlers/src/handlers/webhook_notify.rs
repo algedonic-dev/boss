@@ -17,9 +17,9 @@
 //! a no-op, never a dead-letter — the dispatcher's durable queue must never
 //! wedge on a missing external party.
 
-use crate::rules::expr::Value;
-use crate::rules::handler::{Handler, HandlerError, InvocationContext};
 use async_trait::async_trait;
+use boss_dispatcher::rules::expr::Value;
+use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 use serde_json::json;
 use std::sync::Arc;
 use tracing::{debug, warn};
