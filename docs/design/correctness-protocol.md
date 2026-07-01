@@ -82,8 +82,9 @@ These follow from the protocol; they're not separate choices.
 - **Corrections are events, not edits.** A miscounted
   inventory becomes a `correction` event; a misposted JE
   becomes a reversing JE; a wrong invoice gets a credit memo.
-- **Append-only event log + hash chain** (the CPA-ready audit
-  log work in TODO) is what makes the audit-log replay
+- **Append-only event log + hash chain** (live: the `prev_hash` /
+  `row_hash` insert trigger in `schema/02-events.sql` + `verify_chain`
+  in `boss-events/src/integrity.rs`) is what makes the audit-log replay
   externally verifiable. An auditor independently replays the
   log and checks the projection.
 
@@ -185,9 +186,9 @@ checks for itself, not something authors have to remember.
 
 5. **Replay-diff audit.** Wipe projections, replay audit_log
    into a fresh DB via `boss-rebuild-all`, diff against live.
-   Any row-level difference is a system bug. The CPA-ready
-   audit-log work in TODO turns this from a CI step into the
-   external auditor's first command.
+   Any row-level difference is a system bug. The shipped hash chain
+   (`verify_chain`) is what turns this from an internal CI step into a
+   check an external auditor can run as their first command.
 
 The static lint + the bypass-smell lint described in
 [seed-vs-emergent-state.md](seed-vs-emergent-state.md) are the

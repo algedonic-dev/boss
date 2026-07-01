@@ -243,7 +243,7 @@ handler = "jobs.complete_step"
 # computer speed — so a release valve costs no labor and resolves the moment
 # it's ready instead of queuing behind the human workforce at warp. Agents
 # are CPUs in the same machine: the sim drives only labor, the gate decides
-# itself. See docs/design/brewery-model-completeness.md.
+# itself. See docs/architecture-decisions.md.
 [[rule]]
 name = "resolve-agent-gate-on-step-ready"
 on_event = "step.ready.*"

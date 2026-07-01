@@ -155,9 +155,10 @@ pub(super) struct DraftLintRequest {
 /// Author-time dry run — lint a draft's steps WITHOUT persisting.
 /// Runs the same `validate_job_kind` the publish path enforces, against
 /// the same process-resident StepType registry, so an editor showing
-/// "no problems" will publish cleanly (D5). Always returns 200 with a
+/// "no problems" will publish cleanly. Always returns 200 with a
 /// structured result; lint failures are data, not an HTTP error — the
-/// editor renders them on the graph. See docs/design/jobkind-authoring-ux.md.
+/// editor renders them on the graph. See architecture-decisions.md
+/// §Jobs, JobKinds, Steps.
 pub(super) async fn validate_kind<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,

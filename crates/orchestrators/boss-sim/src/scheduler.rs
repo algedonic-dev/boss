@@ -1,11 +1,13 @@
 //! Sim-time scheduler — a min-by-sim-time event heap.
 //!
-//! See `docs/design/scheduler-shaped-sim-engine.md` for the full
-//! design. This module owns the heap + the `ScheduledEvent` type:
-//! events are pushed with a target sim instant and popped in
-//! sim-time order, so a dispatch loop can wait for clock-api to
-//! reach each event's instant before firing it. The dispatch loop
-//! itself is not wired into the engine yet.
+//! Prototype of the heap-scheduled engine evolution (see
+//! `architecture-decisions.md` §Simulator). This module owns the heap +
+//! the `ScheduledEvent` type: events are pushed with a target sim instant
+//! and popped in sim-time order, so a dispatch loop can wait for clock-api
+//! to reach each event's instant before firing it. The dispatch loop
+//! itself is **not wired into the engine** — the live daemon uses the
+//! simpler cursor-gated tick loop (`days_to_run`), which the ADR records
+//! as the adopted approach; this heap is kept as a parked exploration.
 //!
 //! ## Invariants
 //!
