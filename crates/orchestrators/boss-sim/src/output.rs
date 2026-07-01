@@ -1245,6 +1245,31 @@ pub mod live {
         }
     }
 
+    /// The Account id a job body is about, if its subject is an account —
+    /// the customer whose demand this Job represents (a wholesale / direct /
+    /// distribution order, a taproom shift). `None` for jobs about a
+    /// location / vendor / employee, which keep the ambient actor.
+    ///
+    /// Handles both body shapes: the normal nested `subject: { subject_kind,
+    /// id }` and the engine's flat serialization fallback (`subject_kind` +
+    /// `id_`).
+    fn account_subject(body: &serde_json::Value) -> Option<String> {
+        let (kind, id) = match body.get("subject") {
+            Some(s) => (
+                s.get("subject_kind").and_then(|v| v.as_str()),
+                s.get("id").and_then(|v| v.as_str()),
+            ),
+            None => (
+                body.get("subject_kind").and_then(|v| v.as_str()),
+                body.get("id_").and_then(|v| v.as_str()),
+            ),
+        };
+        match (kind, id) {
+            (Some("account"), Some(id)) => Some(id.to_string()),
+            _ => None,
+        }
+    }
+
     impl SimOutput for LiveApiOutput {
         fn emit_system_event(&mut self, event: &AssetEvent) -> anyhow::Result<()> {
             self.day_events.push(event.clone());
@@ -1299,9 +1324,22 @@ pub mod live {
             // opt-out — the SERVER materializes the step graph and emits
             // `step.ready.<kind>` (the sim no longer posts step rows
             // itself; the workforce drives them via the public API).
+            //
+            // Attribute the create to the buying Account when the Job is
+            // about one — a wholesale/direct/distribution order, a taproom
+            // shift — so the actor cockpit shows the *customer* placing the
+            // demand rather than the catch-all Environment. Jobs about a
+            // location / vendor / employee keep the ambient actor. Restore
+            // afterward so a following materialization call isn't
+            // mis-attributed to this Account.
+            let prev = self.current_actor.clone();
+            if let Some(account_id) = account_subject(body) {
+                self.current_actor = (ActorKind::Account, account_id);
+            }
             if self.post_individual("/api/jobs", body) {
                 self.stats.jobs += 1;
             }
+            self.current_actor = prev;
             Ok(())
         }
 
@@ -2458,6 +2496,48 @@ pub mod live {
                 path_key("/api/people/employees/emp-032/calendar-token"),
                 "/api/people/employees/emp-032/calendar-token"
             );
+        }
+    }
+
+    #[cfg(test)]
+    mod account_subject_tests {
+        use super::*;
+        use serde_json::json;
+
+        #[test]
+        fn extracts_customer_from_an_order_job() {
+            // A wholesale order about a customer Account → attribute to it.
+            let body = json!({
+                "kind": "wholesale-keg-order",
+                "subject": { "subject_kind": "account", "id": "acc-bigseed-0000" }
+            });
+            assert_eq!(account_subject(&body).as_deref(), Some("acc-bigseed-0000"));
+        }
+
+        #[test]
+        fn reads_the_flat_fallback_body_shape() {
+            // The engine's serialization-fallback body is flat (subject_kind + id_).
+            let body = json!({
+                "kind": "direct-shop-order",
+                "subject_kind": "account",
+                "id_": "acc-direct-shop"
+            });
+            assert_eq!(account_subject(&body).as_deref(), Some("acc-direct-shop"));
+        }
+
+        #[test]
+        fn none_for_non_customer_jobs() {
+            // Internal / supply work keeps the ambient actor, not an Account.
+            let brew = json!({
+                "kind": "morning-brew",
+                "subject": { "subject_kind": "location", "id": "loc-brewery-brewhouse" }
+            });
+            assert_eq!(account_subject(&brew), None);
+            let restock = json!({
+                "kind": "ingredient-restock",
+                "subject": { "subject_kind": "vendor", "id": "vendor-hops" }
+            });
+            assert_eq!(account_subject(&restock), None);
         }
     }
 }
