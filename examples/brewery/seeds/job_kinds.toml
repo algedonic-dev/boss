@@ -131,11 +131,35 @@ authority_role = "brewer"
 # `inventory.parts.consume` side effect drains these raw SKUs at
 # their inventory cost, which is what the finished-goods cost basis
 # (and therefore COGS) is derived from — no hard-coded margin.
+#
+# overhead_absorbed: production drivers capitalized into WIP at mash-in
+# — DR 1310 / CR <expense> per driver — so direct labor, process
+# utilities, and production depreciation flow WIP → FG → COGS at sale
+# instead of sitting in period OpEx. PREDETERMINED per-bbl rates × this
+# batch's bbl (the excise_bbl sum of the package steps = 158 bbl for
+# pale), each pinned to the model's own inputs at the ~262k-bbl/yr
+# expected volume:
+#   • Direct labor  $36.60/bbl = $9.59M/yr gross production payroll
+#     (171 floor staff: brewers, cellar, packaging, palletizers,
+#     QA-line) ÷ 262k bbl → CR 6100; indirect labor stays in OpEx.
+#   • Process utilities $5.60/bbl = 70% (variable energy + brewing
+#     water) of the $2.1M/yr utilities bill ÷ 262k → CR 6300; the fixed
+#     facility baseline stays in OpEx.
+#   • Production depreciation $8.60/bbl = 80% (production-equipment
+#     share) of the $2.82M/yr depreciation ÷ 262k → CR 6900;
+#     non-production depreciation stays in OpEx.
+# Absorption nets each expense to its over/under-absorption variance
+# (textbook absorption costing). Margin is an OUTPUT, never a target;
+# maintenance + consumables drivers are deferred (incomplete > wrong).
 metadata_defaults = { mash_temp_f = 152, mash_minutes = 60, ingredients_consumed = [
     { part_sku = "ING-MALT-2ROW-50", qty = 196 },
     { part_sku = "ING-MALT-MUNICH-50", qty = 20 },
     { part_sku = "ING-HOPS-CASCADE-44", qty = 4 },
     { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
+], overhead_absorbed = [
+    { amount_cents = 578280, credit_account = "6100", memo = "Direct labor — 158 bbl × $36.60/bbl" },
+    { amount_cents = 88480, credit_account = "6300", memo = "Process utilities — 158 bbl × $5.60/bbl" },
+    { amount_cents = 135880, credit_account = "6900", memo = "Production depreciation — 158 bbl × $8.60/bbl" },
 ] }
 
 [[job_kind.step]]
@@ -1732,11 +1756,18 @@ title_template = "Mash in (drain IPA ingredients)"
 authority_role = "brewer"
 # IPA grain bill: more 2-row, less Munich; aggressive Cascade
 # hops; California ale yeast like the Pale Ale.
+# overhead_absorbed: per-bbl production drivers × this style's 133-bbl
+# batch (excise_bbl sum). See the pale-ale mash-in for the full rate
+# derivation. DR 1310 / CR <expense> → flows WIP → FG → COGS at sale.
 metadata_defaults = { mash_temp_f = 150, mash_minutes = 60, ingredients_consumed = [
     { part_sku = "ING-MALT-2ROW-50", qty = 160 },
     { part_sku = "ING-MALT-MUNICH-50", qty = 12 },
     { part_sku = "ING-HOPS-CASCADE-44", qty = 6 },
     { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
+], overhead_absorbed = [
+    { amount_cents = 486780, credit_account = "6100", memo = "Direct labor — 133 bbl × $36.60/bbl" },
+    { amount_cents = 74480, credit_account = "6300", memo = "Process utilities — 133 bbl × $5.60/bbl" },
+    { amount_cents = 114380, credit_account = "6900", memo = "Production depreciation — 133 bbl × $8.60/bbl" },
 ] }
 
 [[job_kind.step]]
@@ -1924,11 +1955,18 @@ authority_role = "brewer"
 # Stout grain bill: base 2-row + roasted barley + chocolate malt
 # (modeled as MUNICH for inventory purposes — the brewery's KB
 # doesn't yet split chocolate vs roast); modest hop bill.
+# overhead_absorbed: per-bbl production drivers × this style's 110-bbl
+# batch (excise_bbl sum). See the pale-ale mash-in for the full rate
+# derivation. DR 1310 / CR <expense> → flows WIP → FG → COGS at sale.
 metadata_defaults = { mash_temp_f = 154, mash_minutes = 60, ingredients_consumed = [
     { part_sku = "ING-MALT-2ROW-50", qty = 150 },
     { part_sku = "ING-MALT-MUNICH-50", qty = 25 },
     { part_sku = "ING-HOPS-CASCADE-44", qty = 4 },
     { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
+], overhead_absorbed = [
+    { amount_cents = 402600, credit_account = "6100", memo = "Direct labor — 110 bbl × $36.60/bbl" },
+    { amount_cents = 61600, credit_account = "6300", memo = "Process utilities — 110 bbl × $5.60/bbl" },
+    { amount_cents = 94600, credit_account = "6900", memo = "Production depreciation — 110 bbl × $8.60/bbl" },
 ] }
 
 [[job_kind.step]]
@@ -2113,10 +2151,17 @@ title_template = "Mash in (drain lager ingredients)"
 authority_role = "brewer"
 # Pilsner-style grain bill: 100% pilsner malt (modeled as 2-row,
 # the closest KB SKU); modest noble hop bill.
+# overhead_absorbed: per-bbl production drivers × this style's 133-bbl
+# batch (excise_bbl sum). See the pale-ale mash-in for the full rate
+# derivation. DR 1310 / CR <expense> → flows WIP → FG → COGS at sale.
 metadata_defaults = { mash_temp_f = 148, mash_minutes = 90, ingredients_consumed = [
     { part_sku = "ING-MALT-2ROW-50", qty = 160 },
     { part_sku = "ING-HOPS-CASCADE-44", qty = 3 },
     { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
+], overhead_absorbed = [
+    { amount_cents = 486780, credit_account = "6100", memo = "Direct labor — 133 bbl × $36.60/bbl" },
+    { amount_cents = 74480, credit_account = "6300", memo = "Process utilities — 133 bbl × $5.60/bbl" },
+    { amount_cents = 114380, credit_account = "6900", memo = "Production depreciation — 133 bbl × $8.60/bbl" },
 ] }
 
 [[job_kind.step]]
@@ -2302,11 +2347,18 @@ authority_role = "brewer"
 # Hazy grain bill: lots of 2-row + Munich for body, heavy hop charge.
 # Real recipes also use flaked oats + wheat — modeled as additional
 # 2-row for inventory purposes until the brewery's KB grows the SKU.
+# overhead_absorbed: per-bbl production drivers × this style's 107-bbl
+# batch (excise_bbl sum). See the pale-ale mash-in for the full rate
+# derivation. DR 1310 / CR <expense> → flows WIP → FG → COGS at sale.
 metadata_defaults = { mash_temp_f = 156, mash_minutes = 60, ingredients_consumed = [
     { part_sku = "ING-MALT-2ROW-50", qty = 130 },
     { part_sku = "ING-MALT-MUNICH-50", qty = 15 },
     { part_sku = "ING-HOPS-CASCADE-44", qty = 8 },
     { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
+], overhead_absorbed = [
+    { amount_cents = 391620, credit_account = "6100", memo = "Direct labor — 107 bbl × $36.60/bbl" },
+    { amount_cents = 59920, credit_account = "6300", memo = "Process utilities — 107 bbl × $5.60/bbl" },
+    { amount_cents = 92020, credit_account = "6900", memo = "Production depreciation — 107 bbl × $8.60/bbl" },
 ] }
 
 [[job_kind.step]]

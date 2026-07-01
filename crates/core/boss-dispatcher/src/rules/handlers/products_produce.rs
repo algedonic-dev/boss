@@ -30,9 +30,12 @@
 //!     side effect will debit moments later, so they net to zero; plus
 //!   - its **share of the joint mash**, `mash × (this format's packaged
 //!     volume / Σ volume of every format that packages)`, where `mash` is
-//!     the real DR-1310 cost the mash-in legs capitalized (summed by the
-//!     ledger). A format that skips (oversupplied) is excluded from the
-//!     denominator, so the packaged formats absorb its mash share.
+//!     the real DR-1310 cost the mash-in legs capitalized — **raw
+//!     materials plus any production overhead absorbed at the mash step**
+//!     (direct labor, process utilities, production depreciation; see
+//!     `overhead_source_ids`) — summed from the ledger. A format that
+//!     skips (oversupplied) is excluded from the denominator, so the
+//!     packaged formats absorb its mash share.
 //!
 //! That total is allocated across the produced FG by keg volume and posted
 //! as each line's `unit_cost_cents`. COGS then emerges at sale from that
@@ -138,11 +141,19 @@ impl ProductsProduce {
                 own_cost.saturating_add(self.avg_cost_cents(&sku).await?.saturating_mul(qty));
         }
 
-        // Shared mash: the real DR-1310 cost its consume legs capitalized.
+        // Shared mash: the real DR-1310 cost its consume legs capitalized
+        // — raw materials plus any production overhead absorbed at those
+        // same mash steps (direct labor / utilities / depreciation
+        // drivers). Both are DR-1310 facts; summing both is what drains
+        // the *full* WIP a brew capitalized, so the drivers reach FG/COGS
+        // instead of stranding in WIP.
         let mut mash_ids = mash_source_ids(steps, step.step_id);
         mash_ids.sort();
         mash_ids.dedup();
-        let mash_cost = match self.ledger_transferred_sum(&mash_ids).await {
+        let raw_mash_cost = match self
+            .ledger_transferred_sum("inventory_consume", &mash_ids)
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(
@@ -153,6 +164,26 @@ impl ProductsProduce {
                 return Ok(None);
             }
         };
+        // Absorbed production overhead at the mash steps — keyed
+        // `labor-absorbed@{step}:{credit_account}` (the absorption
+        // endpoint's source_id), `source_table=ledger_labor_absorbed`. A
+        // failed read drains raw only this run (the overhead stays in WIP,
+        // recoverable on rebuild) rather than breaking production.
+        let mut overhead_ids = overhead_source_ids(steps, step.step_id);
+        overhead_ids.sort();
+        overhead_ids.dedup();
+        let overhead_cost = self
+            .ledger_transferred_sum("ledger_labor_absorbed", &overhead_ids)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "products.produce drain-actual-wip: overhead sum failed for job {} ({e}); \
+                     draining raw mash only this run",
+                    step.job_id
+                );
+                0
+            });
+        let mash_cost = raw_mash_cost.saturating_add(overhead_cost);
 
         // This format's share of the joint mash, spread across every
         // format that actually packages.
@@ -186,11 +217,18 @@ impl ProductsProduce {
         Ok((total > 0).then_some(total))
     }
 
-    /// Sum the real DR-1310 cost the given consume legs capitalized, via
-    /// the ledger's read-only facts-sum endpoint. The
-    /// `finance.inventory.transferred` / `inventory_consume` facts each
-    /// carry `total_cost_cents = qty × avg_cost_at_consume`.
-    async fn ledger_transferred_sum(&self, source_ids: &[String]) -> Result<i64, HandlerError> {
+    /// Sum the real DR-1310 cost the given facts capitalized into WIP,
+    /// via the ledger's read-only facts-sum endpoint. Both the raw
+    /// `finance.inventory.transferred` / `inventory_consume` legs (each
+    /// `total_cost_cents = qty × avg_cost_at_consume`) and the absorbed
+    /// `finance.inventory.transferred` / `ledger_labor_absorbed`
+    /// overhead drivers are summed this way — only the `source_table`
+    /// and the source-id shape differ.
+    async fn ledger_transferred_sum(
+        &self,
+        source_table: &str,
+        source_ids: &[String],
+    ) -> Result<i64, HandlerError> {
         if source_ids.is_empty() {
             return Ok(0);
         }
@@ -203,7 +241,7 @@ impl ProductsProduce {
             .post(&url)
             .json(&json!({
                 "kind": "finance.inventory.transferred",
-                "source_table": "inventory_consume",
+                "source_table": source_table,
                 "source_ids": source_ids,
             }))
             .send()
@@ -304,6 +342,39 @@ fn mash_source_ids(steps: &[Value], this_step_id: &str) -> Vec<String> {
         if let Some(md) = s.get("metadata").and_then(|v| v.as_object()) {
             for (sku, _qty) in legs_from_meta_map(md) {
                 ids.push(format!("{step_id}:{sku}"));
+            }
+        }
+    }
+    ids
+}
+
+/// The `financial_facts.source_id`s of the production overhead absorbed
+/// at the brew's joint mash steps, relative to the produce step
+/// `this_step_id`. The mash-step selection mirrors `mash_source_ids`
+/// (every non-producing step but this one), but the ids reconstruct the
+/// `overhead_absorbed` drivers (direct labor, process utilities,
+/// production depreciation) the `inventory.parts.consume` side effect
+/// capitalized — each keyed `labor-absorbed@{step_id}:{credit_account}`
+/// (the absorption endpoint's source_id), under
+/// `source_table=ledger_labor_absorbed`. Summed into the mash cost so the
+/// absorbed overhead drains WIP → FG → COGS alongside the raw materials
+/// instead of stranding in WIP.
+fn overhead_source_ids(steps: &[Value], this_step_id: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for s in steps {
+        let step_id = s.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if step_id == this_step_id || produces_products(s) {
+            continue;
+        }
+        if let Some(rows) = s
+            .get("metadata")
+            .and_then(|m| m.get("overhead_absorbed"))
+            .and_then(|v| v.as_array())
+        {
+            for r in rows {
+                if let Some(acct) = r.get("credit_account").and_then(|v| v.as_str()) {
+                    ids.push(format!("labor-absorbed@{step_id}:{acct}"));
+                }
             }
         }
     }
@@ -610,6 +681,37 @@ mod tests {
             vec![
                 "mash:ING-HOPS-CASCADE-44".to_string(),
                 "mash:ING-MALT-2ROW-50".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn overhead_ids_reconstruct_absorption_keys_for_mash_steps_only() {
+        let steps = vec![
+            json!({ "id": "mash", "kind": "production-consume", "metadata": {
+                "ingredients_consumed": [{ "part_sku": "ING-MALT-2ROW-50", "qty": 196 }],
+                "overhead_absorbed": [
+                    { "amount_cents": 578_280, "credit_account": "6100" },
+                    { "amount_cents": 88_480,  "credit_account": "6300" },
+                    { "amount_cents": 135_880, "credit_account": "6900" }
+                ]
+            }}),
+            json!({ "id": "pkg-half", "kind": "production-produce", "metadata": {
+                "produces_products": [{ "sku": "FP-PALE-1-2-BBL", "qty": 210 }],
+                // A producing step's own absorption (if any) is the
+                // produce step's to drain — never a joint mash leg.
+                "overhead_absorbed": [{ "amount_cents": 999, "credit_account": "6100" }]
+            }}),
+        ];
+        // Keys mirror the absorption endpoint's source_id, mash steps only.
+        let mut ids = overhead_source_ids(&steps, "pkg-half");
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "labor-absorbed@mash:6100".to_string(),
+                "labor-absorbed@mash:6300".to_string(),
+                "labor-absorbed@mash:6900".to_string(),
             ]
         );
     }
