@@ -827,14 +827,22 @@ pub mod live {
         /// via `with_api_activity`.
         api_activity: ApiActivity,
         /// The actor attributed to the call currently in flight, as
-        /// `(kind, rollup label)`. Set by `emit_event` (from its `source`)
-        /// and at the top of `end_of_day` (Environment / materialization);
-        /// read by the send helpers when they record on the ack. These calls
-        /// are counterparty chains + materialization — single processes, not
-        /// per-Subject actors — so they carry no distinct-actor id in the
-        /// chain model (the workforce path is the only per-actor source;
-        /// per-Subject counterparty actors are a later step).
-        current_actor: (ActorKind, String),
+        /// `(kind, rollup label, distinct id)`. Set by `emit_event` (from its
+        /// `source`), at the top of `end_of_day` (Environment /
+        /// materialization), and per-job in `emit_job_json` (the buying
+        /// Account); read by the send helpers when they record on the ack.
+        /// The distinct id is the concrete acting identity behind the rollup
+        /// — an account id under its class row — so the cockpit can count how
+        /// many accounts a class represents (empty for materialization).
+        current_actor: (ActorKind, String, String),
+        /// account id → class (rollup label) for the tenant's external
+        /// accounts, e.g. every `acc-bigseed-*` → `wholesale-customer`. Lets
+        /// `emit_job_json` roll an order create up under the account's CLASS
+        /// (one row per class, N distinct accounts) instead of a row per
+        /// account — the customer analogue of the employee-by-role rollup.
+        /// Injected by the daemon via `with_account_classes`; empty → each
+        /// account rolls up by its own id.
+        account_classes: std::collections::HashMap<String, String>,
     }
 
     impl LiveApiOutput {
@@ -934,7 +942,12 @@ pub mod live {
                 },
                 current_sim_day: None,
                 api_activity: api_activity::new_handle(),
-                current_actor: (ActorKind::Environment, "materialization".to_string()),
+                current_actor: (
+                    ActorKind::Environment,
+                    "materialization".to_string(),
+                    String::new(),
+                ),
+                account_classes: std::collections::HashMap::new(),
             }
         }
 
@@ -946,17 +959,30 @@ pub mod live {
             self
         }
 
+        /// Inject the account id → class map so `emit_job_json` rolls each
+        /// customer order up under the buying account's CLASS (the
+        /// customer-demand analogue of employee-by-role). The daemon builds
+        /// this from the tenant's seeded accounts.
+        pub fn with_account_classes(
+            mut self,
+            classes: std::collections::HashMap<String, String>,
+        ) -> Self {
+            self.account_classes = classes;
+            self
+        }
+
         /// Record one outbound call **on its ack**, attributed to the
         /// actor currently in flight (`current_actor`) + the templated
         /// endpoint. `ok = status.is_success()`.
         fn record_call(&self, method: &str, path: &str, ok: bool) {
-            let (kind, label) = &self.current_actor;
+            let (kind, label, actor_id) = &self.current_actor;
             let endpoint = api_activity::endpoint_label(method, path);
-            // Empty actor id: counterparty + materialization calls are single
-            // processes in the chain model, not per-Subject actors, so they
-            // contribute nothing to a rollup's distinct-actor count (only the
-            // workforce, with a real employee id, does).
-            api_activity::record(&self.api_activity, *kind, label, &endpoint, ok, "");
+            // `actor_id` is the concrete acting identity behind the rollup —
+            // an account id under its class row — so a class row counts its
+            // distinct accounts. Empty for materialization / counterparty
+            // chains (single processes, no per-Subject id), which then
+            // contribute nothing to the distinct-actor count.
+            api_activity::record(&self.api_activity, *kind, label, &endpoint, ok, actor_id);
         }
 
         /// Inject step durations (kind → hours) so end_of_day can
@@ -1334,7 +1360,17 @@ pub mod live {
             // mis-attributed to this Account.
             let prev = self.current_actor.clone();
             if let Some(account_id) = account_subject(body) {
-                self.current_actor = (ActorKind::Account, account_id);
+                // Roll the order up under the buying account's CLASS (one row
+                // per class, with a distinct-account count) — the customer
+                // analogue of the employee-by-role rollup. An account with no
+                // class mapped falls back to a generic "account" row rather
+                // than sprawling one row per id.
+                let class = self
+                    .account_classes
+                    .get(&account_id)
+                    .cloned()
+                    .unwrap_or_else(|| "account".to_string());
+                self.current_actor = (ActorKind::Account, class, account_id);
             }
             if self.post_individual("/api/jobs", body) {
                 self.stats.jobs += 1;
@@ -1471,8 +1507,12 @@ pub mod live {
             // Attribute the resulting HTTP call to the acting party (the
             // send helpers read `current_actor` when they record on ack).
             self.current_actor = match source {
-                Some((kind, label)) => (kind, label.to_string()),
-                None => (ActorKind::Environment, "uncategorized".to_string()),
+                Some((kind, label)) => (kind, label.to_string(), String::new()),
+                None => (
+                    ActorKind::Environment,
+                    "uncategorized".to_string(),
+                    String::new(),
+                ),
             };
             let route = match self.lookup_route(topic) {
                 Some(r) => EventRoute {
@@ -1557,7 +1597,11 @@ pub mod live {
             // world (new jobs/orders, invoices, POs, …) — attribute to the
             // Environment actor. A specific `emit_event` overrides this for
             // the duration of its own call.
-            self.current_actor = (ActorKind::Environment, "materialization".to_string());
+            self.current_actor = (
+                ActorKind::Environment,
+                "materialization".to_string(),
+                String::new(),
+            );
 
             // --- Device events (batch) ---
             // Each section gets a realistic time-of-day anchor so

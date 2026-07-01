@@ -493,8 +493,31 @@ async fn main() -> Result<()> {
     // written by both the workforce + the live output, snapshotted into
     // telemetry each tick.
     let api_activity = boss_sim::api_activity::new_handle();
+    // Account id → class, so the cockpit rolls each customer order up under
+    // the buying account's CLASS (one row per class + a distinct-account
+    // count) rather than one row per account — the customer analogue of the
+    // employee-by-role rollup. Interim tenant classification pending the
+    // account_type Class registry (see examples/brewery/seeds/tenant.toml).
+    let account_classes: HashMap<String, String> = {
+        let guard = engine.lock().expect("engine mutex poisoned");
+        let mut m: HashMap<String, String> = guard
+            .state
+            .subjects
+            .get("account")
+            .into_iter()
+            .flatten()
+            .map(|id| (id.clone(), brewery_account_class(id)))
+            .collect();
+        // The storefront / taproom aggregate account is hardcoded in the
+        // order JobKinds' metadata, not sampled from the demand pool.
+        m.entry("acc-direct-shop".to_string())
+            .or_insert_with(|| "retail".to_string());
+        m
+    };
     let output = Arc::new(Mutex::new({
-        let mut o = LiveApiOutput::new(&api_base).with_api_activity(api_activity.clone());
+        let mut o = LiveApiOutput::new(&api_base)
+            .with_api_activity(api_activity.clone())
+            .with_account_classes(account_classes);
         register_default_event_routes(&mut o);
         o
     }));
@@ -820,6 +843,21 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Class (cockpit rollup label) for a brewery Account id. The synthetic
+/// demand pool `acc-bigseed-*` are wholesale (B2B) customers; the
+/// storefront / taproom aggregate account is retail; anything else rolls up
+/// generically. Interim tenant classification pending the account_type Class
+/// registry (see examples/brewery/seeds/tenant.toml).
+fn brewery_account_class(account_id: &str) -> String {
+    if account_id.starts_with("acc-bigseed") {
+        "wholesale-customer".to_string()
+    } else if account_id == "acc-direct-shop" {
+        "retail".to_string()
+    } else {
+        "account".to_string()
+    }
+}
+
 /// Decide which sim-days to run this pass, given `cursor` (the last day
 /// the daemon already ran) and `target` (the clock's current day).
 /// Forward-only, each day exactly once — the daemon never re-runs a day
@@ -962,6 +1000,22 @@ mod day_cursor_tests {
             days_to_run(cursor_after_clock(stale, epoch_start), epoch_start, 31),
             vec![epoch_start]
         );
+    }
+
+    #[test]
+    fn account_class_buckets_the_brewery_pools() {
+        // The acc-bigseed-* demand pool rolls up as one B2B/wholesale class;
+        // the storefront/taproom account is retail; anything else is generic.
+        assert_eq!(
+            brewery_account_class("acc-bigseed-0000"),
+            "wholesale-customer"
+        );
+        assert_eq!(
+            brewery_account_class("acc-bigseed-0049"),
+            "wholesale-customer"
+        );
+        assert_eq!(brewery_account_class("acc-direct-shop"), "retail");
+        assert_eq!(brewery_account_class("acc-mystery"), "account");
     }
 }
 

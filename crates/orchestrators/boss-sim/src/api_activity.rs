@@ -302,4 +302,42 @@ mod tests {
         assert_eq!(snap[0].calls, 1);
         assert_eq!(snap[0].distinct, 0, "no identity attributed");
     }
+
+    #[test]
+    fn accounts_roll_up_by_class_with_a_distinct_account_count() {
+        // External accounts collapse into ONE row per class (label = class,
+        // actor_id = account id) — the customer analogue of employee-by-role.
+        // Two wholesale accounts placing three orders → one
+        // `wholesale-customer` row, 3 calls, 2 distinct accounts; retail is a
+        // separate class → its own row.
+        let act = new_handle();
+        for id in ["acc-bigseed-0000", "acc-bigseed-0000", "acc-bigseed-0041"] {
+            record(
+                &act,
+                ActorKind::Account,
+                "wholesale-customer",
+                "POST /api/jobs",
+                true,
+                id,
+            );
+        }
+        record(
+            &act,
+            ActorKind::Account,
+            "retail",
+            "POST /api/jobs",
+            true,
+            "acc-direct-shop",
+        );
+        let snap = snapshot(&act);
+        let wholesale = snap
+            .iter()
+            .find(|a| a.label == "wholesale-customer")
+            .unwrap();
+        assert_eq!(wholesale.kind, ActorKind::Account);
+        assert_eq!(wholesale.calls, 3, "three keg orders");
+        assert_eq!(wholesale.distinct, 2, "from two distinct accounts");
+        let retail = snap.iter().find(|a| a.label == "retail").unwrap();
+        assert_eq!(retail.distinct, 1);
+    }
 }
