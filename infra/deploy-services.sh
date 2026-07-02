@@ -144,6 +144,7 @@ TIMERS=(
     "boss-messages-events-purge:."
     "boss-audit-integrity-check:."
     "boss-ledger-recognize:."
+    "boss-ledger-replay-check:."
     "boss-ml-inference-batch:ml"
     "boss-conservation-invariants:lint"
     "boss-files-gc:."

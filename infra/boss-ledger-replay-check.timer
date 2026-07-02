@@ -1,0 +1,16 @@
+[Unit]
+Description=Daily ledger deep reconstruction integrity check
+
+[Timer]
+# Fires at 03:00 local daily — after the 02:00 ledger recognition sweep
+# (so the day's revenue schedules have posted) and before the 03:30
+# audit_log integrity scan + 04:00 backup, so a divergence pages oncall
+# on the same clean, quiescent window.
+OnCalendar=*-*-* 03:00:00
+# Cover host-down windows: if the box was off at 03:00, fire once on next
+# boot. A missed night delays detection, not detection itself.
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
