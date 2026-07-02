@@ -119,17 +119,13 @@ pub(super) async fn upsert_vendor_invoice<R: InventoryRepository + 'static>(
                 // duplicate-on-re-upsert case so the fact log stays
                 // 1:1 with the underlying state transition.
                 if let Some(approved_on) = invoice.approved_on {
+                    // Same shared helper as the in-tx fact write
+                    // (types::bill_approved_payload) so the event and the
+                    // live fact are byte-identical on rebuild.
                     pub_.emit_with_actor_at(
                         crate::events::VENDOR_INVOICE_APPROVED,
                         actor.clone(),
-                        serde_json::json!({
-                            "vendor_invoice_id": invoice.id,
-                            "po_id": invoice.po_id,
-                            "vendor": invoice.vendor,
-                            "amount_cents": invoice.amount_cents,
-                            "currency": invoice.currency,
-                            "approved_on": approved_on,
-                        }),
+                        crate::types::bill_approved_payload(&invoice, approved_on),
                         now,
                     )
                     .await;
@@ -138,14 +134,7 @@ pub(super) async fn upsert_vendor_invoice<R: InventoryRepository + 'static>(
                     pub_.emit_with_actor_at(
                         crate::events::VENDOR_INVOICE_PAID,
                         actor.clone(),
-                        serde_json::json!({
-                            "vendor_invoice_id": invoice.id,
-                            "po_id": invoice.po_id,
-                            "vendor": invoice.vendor,
-                            "amount_cents": invoice.amount_cents,
-                            "currency": invoice.currency,
-                            "paid_on": paid_on,
-                        }),
+                        crate::types::bill_paid_payload(&invoice, paid_on),
                         now,
                     )
                     .await;

@@ -144,7 +144,7 @@ pub fn project_event(
         fact_id,
         fact_kind: rule.fact_kind.clone(),
         happened_on,
-        payload: event_payload.clone(),
+        payload: strip_envelope(event_payload),
         source_table: rule.source_table.clone(),
         source_id,
         created_by,
@@ -362,13 +362,17 @@ async fn rebuild_inert_received_facts_in_tx(
             .unwrap_or_else(|| timestamp.date_naive());
 
         let fact_id = derive_fact_id(event_id, RECEIVE_FACT_KIND);
+        // Match the in-tx live fact, which never carries the publisher's
+        // `_actor`/`_simulated` envelope keys (same reason as the registry
+        // pass — see `strip_envelope`).
+        let fact_payload = strip_envelope(&payload);
         record_fact_in_tx(
             tx,
             FactWrite {
                 fact_id,
                 kind: RECEIVE_FACT_KIND,
                 happened_on,
-                payload: &payload,
+                payload: &fact_payload,
                 source_table: Some(RECEIVE_SOURCE_TABLE),
                 source_id: Some(&source_id),
                 // Matches the `created_by` the in-tx `insert_dedup_fact`
@@ -407,6 +411,27 @@ async fn load_rules_in_tx(
         out.insert(rule.event_kind.clone(), rule);
     }
     Ok(out)
+}
+
+/// Strip the publisher-injected event-envelope keys (`_actor`,
+/// `_simulated`) from a payload so a rebuilt fact matches the live in-tx
+/// fact, which never carries them. `DomainPublisher::emit_with_actor_at`
+/// stamps `_actor` onto every event payload (and `_simulated` under a
+/// SimulatedProbe) for provenance and sim-filtering — that is envelope
+/// metadata, not domain-fact data, so it must not leak into
+/// `financial_facts.payload` (doing so makes the rebuilt fact diverge
+/// from the live one and breaks the fact-level replay-check).
+/// Non-object payloads (arrays, scalars) pass through unchanged.
+fn strip_envelope(payload: &Value) -> Value {
+    match payload {
+        Value::Object(map) => {
+            let mut out = map.clone();
+            out.remove("_actor");
+            out.remove("_simulated");
+            Value::Object(out)
+        }
+        other => other.clone(),
+    }
 }
 
 fn pointer_string(value: &Value, path: &str) -> Option<String> {
@@ -458,6 +483,49 @@ mod tests {
         assert_eq!(projected.happened_on.to_string(), "2026-04-01");
         assert_eq!(projected.created_by, "commerce");
         assert_eq!(projected.payload, payload);
+    }
+
+    #[test]
+    fn strips_envelope_keys_from_projected_payload() {
+        // The publisher injects `_actor`/`_simulated` into every event
+        // payload; the live in-tx fact never has them, so the projection
+        // must drop them or the fact-level replay-check diverges.
+        let r = rule("commerce.invoice.created", "finance.invoice.issued");
+        let payload = serde_json::json!({
+            "id": "inv-9",
+            "issued_on": "2026-05-01",
+            "amount_cents": 12345,
+            "_actor": "sim:workforce",
+            "_simulated": true,
+        });
+        let projected =
+            project_event(&r, Uuid::new_v4(), Utc::now(), "commerce", &payload).unwrap();
+        assert_eq!(
+            projected.payload,
+            serde_json::json!({
+                "id": "inv-9",
+                "issued_on": "2026-05-01",
+                "amount_cents": 12345,
+            })
+        );
+        // source_id is still extracted from the (pre-strip) event payload.
+        assert_eq!(projected.source_id, "inv-9");
+    }
+
+    #[test]
+    fn strip_envelope_passes_through_clean_and_non_object_payloads() {
+        assert_eq!(
+            strip_envelope(&serde_json::json!({"a": 1})),
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(
+            strip_envelope(&serde_json::json!([1, 2])),
+            serde_json::json!([1, 2])
+        );
+        assert_eq!(
+            strip_envelope(&serde_json::json!("x")),
+            serde_json::json!("x")
+        );
     }
 
     #[test]

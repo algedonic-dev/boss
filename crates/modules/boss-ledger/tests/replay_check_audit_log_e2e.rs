@@ -100,6 +100,66 @@ async fn deep_check_passes_when_audit_log_facts_and_entries_agree() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn deep_check_passes_when_audit_event_carries_publisher_envelope() {
+    // Regression guard for the fact-payload divergence class. The
+    // publisher (`DomainPublisher::emit_with_actor_at`) stamps `_actor`
+    // (always) and `_simulated` (sim runs) onto EVERY event payload; the
+    // live in-tx fact never carries them. `rebuild_facts` must strip those
+    // envelope keys (see `rebuild_facts::strip_envelope`) so the rebuilt
+    // fact is byte-identical to the live one. Without the strip this is a
+    // guaranteed `FactDivergence::Mismatch` — and the shipped entry-level
+    // replay-check never catches it (posting rules ignore the extra keys).
+    let db = TestDb::new().await;
+    ensure_open_period(&db, 2026, 8).await;
+
+    // The exact clean domain payload the live commerce writer persists.
+    let domain = serde_json::json!({
+        "id": "inv-ENV-1",
+        "issued_on": "2026-08-12",
+        "amount_cents": 30000,
+        "account_id": "acct-E",
+        "currency": "USD",
+        "line_items": [
+            {"description": "Setup", "amount_cents": 30000, "category": "service"},
+        ],
+    });
+
+    // Live fact: clean domain payload, no envelope keys.
+    let fact_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO financial_facts (id, kind, happened_on, payload, source_table, source_id, created_by) \
+         VALUES ($1, 'finance.invoice.issued', '2026-08-12', $2, 'invoices', 'inv-ENV-1', 'commerce')",
+    )
+    .bind(fact_id)
+    .bind(&domain)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // Audit event: the SAME domain payload PLUS the publisher's envelope,
+    // exactly as it lands in `audit_log` in production.
+    let mut enveloped = domain.clone();
+    enveloped["_actor"] = serde_json::json!("sim:workforce");
+    enveloped["_simulated"] = serde_json::json!(true);
+    insert_audit_event(
+        &db,
+        "commerce.invoice.created",
+        "2026-08-12T12:00:00Z".parse().unwrap(),
+        "commerce",
+        &enveloped,
+    )
+    .await;
+
+    let report = replay_check_from_audit_log(&db.pool).await.unwrap();
+
+    assert!(
+        report.fact_divergences.is_empty(),
+        "envelope keys must be stripped so the rebuilt fact matches the live one; got {:?}",
+        report.fact_divergences,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn deep_check_does_not_mutate_live_state() {
     let db = TestDb::new().await;
     ensure_open_period(&db, 2026, 5).await;

@@ -200,6 +200,11 @@ impl InventoryRepository for PgInventory {
         // through consume (perpetual inventory).
         let total_cost_cents = item.avg_cost_cents.saturating_mul(qty as i64);
         if total_cost_cents > 0 {
+            // Payload MUST match the `inventory.transferred` event emitted
+            // in http/items.rs (incl. `source_id` + `consumed_on`) so the
+            // rebuilt fact is byte-identical to this live one — the
+            // fact-level replay-check compares payloads. See
+            // rebuild_facts::strip_envelope for the envelope half.
             let payload = serde_json::json!({
                 "total_cost_cents": total_cost_cents,
                 "debit_account": "1310",
@@ -213,6 +218,8 @@ impl InventoryRepository for PgInventory {
                 "part_sku": part_sku,
                 "qty": qty,
                 "unit_cost_cents": item.avg_cost_cents,
+                "source_id": source_id,
+                "consumed_on": now.date_naive(),
             });
             insert_fact(
                 &mut tx,
@@ -814,22 +821,11 @@ impl InventoryRepository for PgInventory {
         // Idempotent via the unique (kind, source) index — replays and
         // repeated upserts on an already-approved/paid invoice are no-ops.
         if let Some(approved_on) = invoice.approved_on {
-            let mut payload = serde_json::json!({
-                "vendor_invoice_id": invoice.id,
-                "po_id": invoice.po_id,
-                "vendor": invoice.vendor,
-                "amount_cents": invoice.amount_cents,
-                "currency": invoice.currency,
-                "approved_on": approved_on,
-            });
-            // Bill the GL from the per-SKU breakdown when the
-            // caller supplied one. The `bill_approved` rule sums
-            // qty × unit_cost across `lines` and rejects any
-            // disagreement with `amount_cents` — making the line
-            // breakdown the authoritative source.
-            if !invoice.lines.is_empty() {
-                payload["lines"] = serde_json::to_value(&invoice.lines).unwrap_or_default();
-            }
+            // Shared helper so this in-tx fact and the emitted
+            // `inventory.vendor_invoice.approved` event (http/vendor_invoices.rs)
+            // are byte-identical on rebuild. `lines` (when present) is the
+            // authoritative source for the `bill_approved` JE amount.
+            let payload = bill_approved_payload(invoice, approved_on);
             insert_fact(
                 &mut tx,
                 "finance.bill.approved",
@@ -841,14 +837,7 @@ impl InventoryRepository for PgInventory {
             .await?;
         }
         if let Some(paid_on) = invoice.paid_on {
-            let payload = serde_json::json!({
-                "vendor_invoice_id": invoice.id,
-                "po_id": invoice.po_id,
-                "vendor": invoice.vendor,
-                "amount_cents": invoice.amount_cents,
-                "currency": invoice.currency,
-                "paid_on": paid_on,
-            });
+            let payload = bill_paid_payload(invoice, paid_on);
             insert_fact(
                 &mut tx,
                 "finance.bill.paid",
