@@ -120,7 +120,7 @@ impl InventoryRepository for InMemoryInventory {
         Ok(uuid::Uuid::new_v4())
     }
 
-    async fn record_labor_absorbed(
+    async fn record_overhead_absorbed(
         &self,
         _total_cost_cents: i64,
         _debit_account: &str,

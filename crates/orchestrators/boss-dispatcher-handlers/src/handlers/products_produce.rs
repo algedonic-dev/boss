@@ -165,15 +165,15 @@ impl ProductsProduce {
             }
         };
         // Absorbed production overhead at the mash steps — keyed
-        // `labor-absorbed@{step}:{credit_account}` (the absorption
-        // endpoint's source_id), `source_table=ledger_labor_absorbed`. A
+        // `overhead-absorbed@{step}:{credit_account}` (the absorption
+        // endpoint's source_id), `source_table=ledger_overhead_absorbed`. A
         // failed read drains raw only this run (the overhead stays in WIP,
         // recoverable on rebuild) rather than breaking production.
         let mut overhead_ids = overhead_source_ids(steps, step.step_id);
         overhead_ids.sort();
         overhead_ids.dedup();
         let overhead_cost = self
-            .ledger_transferred_sum("ledger_labor_absorbed", &overhead_ids)
+            .ledger_transferred_sum("ledger_overhead_absorbed", &overhead_ids)
             .await
             .unwrap_or_else(|e| {
                 tracing::warn!(
@@ -221,7 +221,7 @@ impl ProductsProduce {
     /// via the ledger's read-only facts-sum endpoint. Both the raw
     /// `finance.inventory.transferred` / `inventory_consume` legs (each
     /// `total_cost_cents = qty × avg_cost_at_consume`) and the absorbed
-    /// `finance.inventory.transferred` / `ledger_labor_absorbed`
+    /// `finance.inventory.transferred` / `ledger_overhead_absorbed`
     /// overhead drivers are summed this way — only the `source_table`
     /// and the source-id shape differ.
     async fn ledger_transferred_sum(
@@ -354,9 +354,9 @@ fn mash_source_ids(steps: &[Value], this_step_id: &str) -> Vec<String> {
 /// (every non-producing step but this one), but the ids reconstruct the
 /// `overhead_absorbed` drivers (direct labor, process utilities,
 /// production depreciation) the `inventory.parts.consume` side effect
-/// capitalized — each keyed `labor-absorbed@{step_id}:{credit_account}`
+/// capitalized — each keyed `overhead-absorbed@{step_id}:{credit_account}`
 /// (the absorption endpoint's source_id), under
-/// `source_table=ledger_labor_absorbed`. Summed into the mash cost so the
+/// `source_table=ledger_overhead_absorbed`. Summed into the mash cost so the
 /// absorbed overhead drains WIP → FG → COGS alongside the raw materials
 /// instead of stranding in WIP.
 fn overhead_source_ids(steps: &[Value], this_step_id: &str) -> Vec<String> {
@@ -373,7 +373,7 @@ fn overhead_source_ids(steps: &[Value], this_step_id: &str) -> Vec<String> {
         {
             for r in rows {
                 if let Some(acct) = r.get("credit_account").and_then(|v| v.as_str()) {
-                    ids.push(format!("labor-absorbed@{step_id}:{acct}"));
+                    ids.push(format!("overhead-absorbed@{step_id}:{acct}"));
                 }
             }
         }
@@ -664,9 +664,9 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "labor-absorbed@mash:6100".to_string(),
-                "labor-absorbed@mash:6300".to_string(),
-                "labor-absorbed@mash:6900".to_string(),
+                "overhead-absorbed@mash:6100".to_string(),
+                "overhead-absorbed@mash:6300".to_string(),
+                "overhead-absorbed@mash:6900".to_string(),
             ]
         );
     }

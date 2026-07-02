@@ -98,7 +98,7 @@ pub trait InventoryRepository: Send + Sync {
         part_sku: &str,
     ) -> Result<Option<String>, InventoryError>;
 
-    /// Record labor + overhead being capitalized into WIP at
+    /// Record one production-overhead driver being capitalized into WIP at
     /// production-consume time. Two writes in one tx:
     ///   1. `finance.inventory.transferred` financial_fact +
     ///      journal entry (DR `debit_account` / CR `credit_account`).
@@ -111,7 +111,7 @@ pub trait InventoryRepository: Send + Sync {
     /// timestamp fallback; the `(kind, source_table, source_id)`
     /// unique index makes the insert idempotent across rebuild
     /// replays.
-    async fn record_labor_absorbed(
+    async fn record_overhead_absorbed(
         &self,
         total_cost_cents: i64,
         debit_account: &str,

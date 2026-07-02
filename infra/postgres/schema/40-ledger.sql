@@ -376,13 +376,13 @@ INSERT INTO gl_fact_projection_rules (event_kind, fact_kind, source_table, sourc
     -- boss-ledger/src/rules.rs maps that to DR 6700 Bad Debt Expense
     -- / CR 1100 A/R, dropping the receivable from the books.
     ('commerce.invoice.written_off',       'finance.invoice.written_off','invoices',          '/id',                 '/issued_on', NULL),
-    -- Burden absorption: labor + overhead capitalized into WIP at
-    -- production-consume time. The bridge emits inventory.labor.absorbed
+    -- Burden absorption: production overhead capitalized into WIP at
+    -- production-consume time. The bridge emits inventory.overhead.absorbed
     -- (which inventory-api writes to audit_log + financial_facts), and on
     -- rebuild this rule re-creates the matching
     -- finance.inventory.transferred fact from audit_log alone — so the
     -- WIP balance stays correct through a TRUNCATE-then-replay rebuild.
-    ('inventory.labor.absorbed',           'finance.inventory.transferred', 'ledger_labor_absorbed', '/source_id',       '/happened_on', NULL),
+    ('inventory.overhead.absorbed',           'finance.inventory.transferred', 'ledger_overhead_absorbed', '/source_id',       '/happened_on', NULL),
     -- WIP→FG cost transfer + FG→COGS recognition: products-api
     -- writes the live financial_facts row inside the same tx as
     -- the inventory delta, then emits products.produced /

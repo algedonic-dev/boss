@@ -1,5 +1,5 @@
 //! Inventory-item handlers: stock reads, consume/receive, batch upsert,
-//! labor absorption, and the dispatcher lookup helpers.
+//! overhead absorption, and the dispatcher lookup helpers.
 
 use std::sync::Arc;
 
@@ -475,19 +475,21 @@ pub(super) async fn receive_part_handler<R: InventoryRepository + 'static>(
 }
 
 #[derive(Deserialize)]
-pub(super) struct LaborAbsorbedRequest {
-    /// Amount of labor + overhead being capitalized into WIP, in cents.
-    /// The journal entry will be DR `debit_account` / CR `credit_account`
-    /// for this amount.
+pub(super) struct OverheadAbsorbedRequest {
+    /// Amount of one production-overhead driver being capitalized into
+    /// WIP, in cents. The journal entry will be DR `debit_account` /
+    /// CR `credit_account` for this amount. One POST per driver.
     total_cost_cents: i64,
     /// WIP inventory account (1310 in the canonical brewery chart).
     debit_account: String,
-    /// Payroll / Manufacturing-overhead account being credited
-    /// (6100 in the canonical brewery chart). The credit reduces the
-    /// period expense by what gets absorbed into inventory.
+    /// Expense account this driver credits — the account IS the driver
+    /// key (direct labor → 6100, process utilities → 6300, production
+    /// depreciation → 6900 in the canonical brewery chart). The credit
+    /// reduces the period expense by what gets absorbed into inventory,
+    /// and uniquely keys the fact's `source_id` per (step, driver).
     credit_account: String,
     /// Free-form annotation surfaced on the GL entry. Defaults to a
-    /// generic "Labor + overhead absorbed into WIP" string.
+    /// generic "Production overhead absorbed into WIP" string.
     #[serde(default)]
     memo: Option<String>,
     /// Provenance: the production-consume step that triggered this.
@@ -500,27 +502,28 @@ pub(super) struct LaborAbsorbedRequest {
     happened_on: Option<chrono::NaiveDate>,
 }
 
-/// POST `/api/inventory/labor-absorbed` — record labor + overhead being
-/// capitalized into WIP at production-consume time. Balances burden
+/// POST `/api/inventory/overhead-absorbed` — record one production-overhead
+/// driver (direct labor, process utilities, production depreciation, …)
+/// being capitalized into WIP at production-consume time. Balances burden
 /// absorption: production-produce credits 1310 WIP for the full FG cost
 /// basis, so production-consume must debit it for both raw materials
-/// (the raw → WIP transfer) and the labor + overhead booked here.
+/// (the raw → WIP transfer) and the overhead drivers booked here.
 ///
 /// Two writes in one tx:
-///   1. `inventory.labor.absorbed` event published to audit_log via
+///   1. `inventory.overhead.absorbed` event published to audit_log via
 ///      the NATS publisher — provenance + replay material.
 ///   2. `finance.inventory.transferred` financial_fact inserted
 ///      directly + journal entry posted via the ledger's
 ///      `post_fact_in_tx` (same shape as the raw → WIP transfer fact,
 ///      with a different debit/credit pair).
 ///
-/// On rebuild from audit_log alone, the `inventory.labor.absorbed` →
+/// On rebuild from audit_log alone, the `inventory.overhead.absorbed` →
 /// `finance.inventory.transferred` projection rule re-creates the
 /// fact; the matching journal entry follows from `post_fact_in_tx`.
-pub(super) async fn labor_absorbed_handler<R: InventoryRepository + 'static>(
+pub(super) async fn overhead_absorbed_handler<R: InventoryRepository + 'static>(
     State(state): State<Arc<InventoryApiState<R>>>,
     CurrentUser(user): CurrentUser,
-    Json(body): Json<LaborAbsorbedRequest>,
+    Json(body): Json<OverheadAbsorbedRequest>,
 ) -> Response {
     if body.total_cost_cents <= 0 {
         return (
@@ -534,12 +537,12 @@ pub(super) async fn labor_absorbed_handler<R: InventoryRepository + 'static>(
     let memo = body
         .memo
         .clone()
-        .unwrap_or_else(|| "Labor + overhead absorbed into WIP".to_string());
+        .unwrap_or_else(|| "Production overhead absorbed into WIP".to_string());
     let step_id = body.step_id.clone();
 
     // Source-id strategy: when a step_id is supplied (the typical
     // production-consume case), key on
-    // `labor-absorbed@<step_id>:<credit_account>`. Folding in the
+    // `overhead-absorbed@<step_id>:<credit_account>`. Folding in the
     // credit account makes the id unique *per driver*, so a step that
     // absorbs several granular drivers (direct labor → 6100, process
     // utilities → 6300, production depreciation → 6900) lands one fact
@@ -550,15 +553,15 @@ pub(super) async fn labor_absorbed_handler<R: InventoryRepository + 'static>(
     // step_id we fall back to the timestamp — best-effort idempotency
     // for ad-hoc absorption posts.
     let source_id = match &step_id {
-        Some(s) => format!("labor-absorbed@{s}:{}", body.credit_account),
-        None => format!("labor-absorbed@{}", now.to_rfc3339()),
+        Some(s) => format!("overhead-absorbed@{s}:{}", body.credit_account),
+        None => format!("overhead-absorbed@{}", now.to_rfc3339()),
     };
 
-    // Keys MUST match the live fact built in `record_labor_absorbed`
+    // Keys MUST match the live fact built in `record_overhead_absorbed`
     // (postgres.rs) so the rebuilt fact is byte-identical to the live one
     // (the fact-level replay-check compares payloads). `step_id` is NOT a
     // payload field: it is already encoded in `source_id`
-    // (`labor-absorbed@<step_id>:<account>`), which is what the projection
+    // (`overhead-absorbed@<step_id>:<account>`), which is what the projection
     // rule and the `drain-actual-wip` basis key on — a payload copy would
     // only make the event diverge from the fact.
     let payload = serde_json::json!({
@@ -575,7 +578,7 @@ pub(super) async fn labor_absorbed_handler<R: InventoryRepository + 'static>(
     //    adapter handles the tx + boss_ledger::post_fact_in_tx call.
     let canonical_fact_id = match state
         .inventory
-        .record_labor_absorbed(
+        .record_overhead_absorbed(
             body.total_cost_cents,
             &body.debit_account,
             &body.credit_account,
@@ -592,14 +595,14 @@ pub(super) async fn labor_absorbed_handler<R: InventoryRepository + 'static>(
     // 2. Audit-log publish — runs after the GL tx commits so a
     //    posting failure doesn't leak a phantom event. Replay
     //    material: the gl_fact_projection_rules row
-    //    `inventory.labor.absorbed → finance.inventory.transferred`
+    //    `inventory.overhead.absorbed → finance.inventory.transferred`
     //    reconstructs the fact from this event on rebuild.
     if let Some(pub_) = &state.publisher {
         let actor = user
             .ambient_actor()
             .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
         pub_.emit_with_actor_at(
-            crate::events::INVENTORY_LABOR_ABSORBED,
+            crate::events::INVENTORY_OVERHEAD_ABSORBED,
             actor,
             payload.clone(),
             now,

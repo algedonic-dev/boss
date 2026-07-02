@@ -148,7 +148,7 @@ impl Handler for InventoryPartsConsume {
         // (see the endpoint's source_id) so multiple drivers on one
         // step don't collide on idempotency.
         let absorb_url = format!(
-            "{}/api/inventory/labor-absorbed",
+            "{}/api/inventory/overhead-absorbed",
             self.inventory_base.trim_end_matches('/')
         );
         for ab in overhead_absorbed(step.metadata) {

@@ -140,7 +140,7 @@ pub fn run_ticks_with_handlers(
         // header on every outbound POST/PUT for the rest of the
         // day, so financial_facts written by in-day side effects
         // (products.consume → COGS, products.produce → WIP→FG,
-        // inventory.labor.absorbed) get the sim date rather than
+        // inventory.overhead.absorbed) get the sim date rather than
         // wall-clock. Test outputs no-op.
         output.start_of_day(day)?;
 

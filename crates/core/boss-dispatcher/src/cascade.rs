@@ -33,7 +33,7 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
     BTreeMap::from([
         (
             "inventory.parts.consume",
-            vec!["inventory.item.consumed", "inventory.labor.absorbed"],
+            vec!["inventory.item.consumed", "inventory.overhead.absorbed"],
         ),
         ("commerce.invoice.issue", vec!["commerce.invoice.created"]),
         (

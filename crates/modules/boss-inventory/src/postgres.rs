@@ -348,7 +348,7 @@ impl InventoryRepository for PgInventory {
         Ok(row.map(|(v,)| v))
     }
 
-    async fn record_labor_absorbed(
+    async fn record_overhead_absorbed(
         &self,
         total_cost_cents: i64,
         debit_account: &str,
@@ -382,7 +382,7 @@ impl InventoryRepository for PgInventory {
             "finance.inventory.transferred",
             happened_on,
             &payload,
-            "ledger_labor_absorbed",
+            "ledger_overhead_absorbed",
             source_id,
         )
         .await?;
@@ -394,7 +394,7 @@ impl InventoryRepository for PgInventory {
             "SELECT id FROM financial_facts              WHERE kind = $1 AND source_table = $2 AND source_id = $3",
         )
         .bind("finance.inventory.transferred")
-        .bind("ledger_labor_absorbed")
+        .bind("ledger_overhead_absorbed")
         .bind(source_id)
         .fetch_one(&mut *tx)
         .await
