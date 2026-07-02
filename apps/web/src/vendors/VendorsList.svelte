@@ -9,6 +9,7 @@
   import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
   import SearchInput from '@boss/web-kit/ui/SearchInput.svelte';
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import { formatMoney } from '@boss/web-kit/ui/money';
   import type { PurchaseOrder, Vendor, VendorInvoice } from './types';
 
   let vendors = $state<Vendor[]>([]);
@@ -102,7 +103,7 @@
   <PageHeader
     eyebrow="Know"
     title={`${vendors.length} vendors`}
-    subtitle={`${totalOpenPos} open PO${totalOpenPos === 1 ? '' : 's'} · $${(totalOutstandingCents / 100).toLocaleString()} outstanding across all vendors`}
+    subtitle={`${totalOpenPos} open PO${totalOpenPos === 1 ? '' : 's'} · ${formatMoney({ amount_cents: totalOutstandingCents, currency: 'USD' })} outstanding across all vendors`}
   />
 
   <div class="catalog-layout">
@@ -179,7 +180,7 @@
                 </td>
                 <td class="num">
                   {#if r.outstandingCents > 0}
-                    ${(r.outstandingCents / 100).toLocaleString()}
+                    {formatMoney({ amount_cents: r.outstandingCents, currency: 'USD' })}
                   {:else}
                     <span style="color:#a8a29e">—</span>
                   {/if}

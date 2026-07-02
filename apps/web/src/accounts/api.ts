@@ -18,6 +18,7 @@ import type {
 } from './types';
 import { href } from '../router';
 import { entityHref } from '@boss/web-kit/ui/entity-href';
+import { formatMoney } from '@boss/web-kit/ui/money';
 import { fetchPaged, type Paged } from '../data/paginated';
 import {
   AccountListSchema,
@@ -154,7 +155,7 @@ export async function loadTimeline(
         id: `inv-issued-${inv.id}`,
         date: inv.issued_on,
         icon: '💰',
-        title: `Invoice ${inv.id} issued — $${(inv.amount_cents / 100).toLocaleString()}`,
+        title: `Invoice ${inv.id} issued — ${formatMoney({ amount_cents: inv.amount_cents, currency: inv.currency })}`,
         detail: inv.status,
         link: entityHref('invoice', inv.id),
       });
@@ -164,7 +165,7 @@ export async function loadTimeline(
         id: `inv-paid-${inv.id}`,
         date: inv.paid_on,
         icon: '✅',
-        title: `Invoice ${inv.id} paid — $${(inv.amount_cents / 100).toLocaleString()}`,
+        title: `Invoice ${inv.id} paid — ${formatMoney({ amount_cents: inv.amount_cents, currency: inv.currency })}`,
         link: entityHref('invoice', inv.id),
       });
     }

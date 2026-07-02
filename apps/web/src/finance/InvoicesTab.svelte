@@ -59,8 +59,14 @@
   });
 
   let truncated = $derived(totalCount > invoices.length);
-  let unpaid = $derived(invoices.filter((i) => i.status !== 'paid'));
+  // "Unpaid" = genuinely awaiting collection (outstanding + past-due).
+  // Written-off invoices are uncollectable, not unpaid — they get their own
+  // bucket so the operator sees real receivables vs historical write-offs.
+  let unpaid = $derived(
+    invoices.filter((i) => i.status !== 'paid' && i.status !== 'written-off'),
+  );
   let pastDue = $derived(invoices.filter((i) => i.status === 'past-due'));
+  let writtenOff = $derived(invoices.filter((i) => i.status === 'written-off'));
 
   let methodCounts = $derived.by(() => {
     const counts: Record<PaymentMethod | 'all', number> = {
@@ -78,7 +84,11 @@
 
   let visible = $derived(
     invoices.filter((i) => {
-      if (statusFilter === 'unpaid' && i.status === 'paid') return false;
+      if (
+        statusFilter === 'unpaid' &&
+        (i.status === 'paid' || i.status === 'written-off')
+      )
+        return false;
       if (
         statusFilter !== 'all' &&
         statusFilter !== 'unpaid' &&
@@ -117,8 +127,16 @@
           Past due ({pastDue.length})
         </FilterButton>
         <FilterButton active={statusFilter === 'paid'} onclick={() => (statusFilter = 'paid')}>
-          Paid ({invoices.length - unpaid.length})
+          Paid ({invoices.filter((i) => i.status === 'paid').length})
         </FilterButton>
+        {#if writtenOff.length > 0}
+          <FilterButton
+            active={statusFilter === 'written-off'}
+            onclick={() => (statusFilter = 'written-off')}
+          >
+            Written off ({writtenOff.length})
+          </FilterButton>
+        {/if}
     </FilterGroup>
     <FilterGroup label="Method">
         {#each METHOD_FILTERS as m (m)}

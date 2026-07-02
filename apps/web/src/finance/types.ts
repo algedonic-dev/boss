@@ -2,7 +2,7 @@
 
 import { getLabel } from '@boss/web-kit/session/manifest.svelte';
 
-export type InvoiceStatus = 'paid' | 'outstanding' | 'past-due';
+export type InvoiceStatus = 'paid' | 'outstanding' | 'past-due' | 'written-off';
 
 // Open string — tenants extend categories as data, not as code
 // changes. The server-side type (`boss-commerce`'s
@@ -62,6 +62,7 @@ export const INVOICE_STATUS_LABEL: Record<InvoiceStatus, string> = {
   paid: 'Paid',
   outstanding: 'Outstanding',
   'past-due': 'Past due',
+  'written-off': 'Written off',
 };
 
 export const PAYMENT_METHOD_LABEL: Record<PaymentMethod, string> = {
