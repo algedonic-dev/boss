@@ -554,7 +554,14 @@ pub(super) async fn labor_absorbed_handler<R: InventoryRepository + 'static>(
         None => format!("labor-absorbed@{}", now.to_rfc3339()),
     };
 
-    let mut payload = serde_json::json!({
+    // Keys MUST match the live fact built in `record_labor_absorbed`
+    // (postgres.rs) so the rebuilt fact is byte-identical to the live one
+    // (the fact-level replay-check compares payloads). `step_id` is NOT a
+    // payload field: it is already encoded in `source_id`
+    // (`labor-absorbed@<step_id>:<account>`), which is what the projection
+    // rule and the `drain-actual-wip` basis key on — a payload copy would
+    // only make the event diverge from the fact.
+    let payload = serde_json::json!({
         "total_cost_cents": body.total_cost_cents,
         "debit_account": body.debit_account,
         "credit_account": body.credit_account,
@@ -562,9 +569,6 @@ pub(super) async fn labor_absorbed_handler<R: InventoryRepository + 'static>(
         "happened_on": happened_on,
         "source_id": source_id,
     });
-    if let Some(s) = &step_id {
-        payload["step_id"] = serde_json::Value::String(s.clone());
-    }
 
     // 1. Live posting — financial_fact + journal entry via the
     //    repository. Same pattern as consume_part_at: the postgres

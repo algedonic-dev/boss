@@ -440,6 +440,15 @@ async fn post_inventory_movement(
         )
             .into_response();
     }
+    // Fold source_table/source_id/happened_on INTO the payload so the
+    // in-tx fact and the emitted `ledger.inventory.transferred` event are
+    // byte-identical on rebuild: the projection rule extracts these from
+    // the event, so the live fact payload must already carry them.
+    // (Previously they were injected into the event ONLY, so the rebuilt
+    // fact carried 3 keys the live fact lacked.)
+    payload["source_table"] = serde_json::Value::String(source_table.clone());
+    payload["source_id"] = serde_json::Value::String(source_id.clone());
+    payload["happened_on"] = serde_json::Value::String(posted_on.to_string());
 
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
@@ -494,12 +503,12 @@ async fn post_inventory_movement(
         let actor = user
             .ambient_actor()
             .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-        let mut event_payload = payload.clone();
-        event_payload["source_table"] = serde_json::Value::String(source_table.clone());
-        event_payload["source_id"] = serde_json::Value::String(source_id.clone());
-        event_payload["happened_on"] = serde_json::Value::String(posted_on.to_string());
+        // `payload` already carries source_table/source_id/happened_on
+        // (folded in above) — emit it verbatim so the event matches the
+        // live fact byte-for-byte (modulo the publisher's envelope keys,
+        // which rebuild_facts::strip_envelope removes on the way back in).
         let now = boss_clock_client::now_from(&state.clock).await;
-        pub_.emit_with_actor_at(event_kind, actor, event_payload, now)
+        pub_.emit_with_actor_at(event_kind, actor, payload.clone(), now)
             .await;
     }
     Json(InventoryTransferredResponse {

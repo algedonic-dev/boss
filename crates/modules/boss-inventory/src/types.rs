@@ -366,6 +366,45 @@ pub struct BillLine {
     pub unit_cost_cents: i64,
 }
 
+/// Fact/event payload for a vendor invoice's `finance.bill.approved`
+/// transition, built in ONE place so the in-tx fact
+/// (`postgres.rs::upsert_vendor_invoice_at`) and the emitted
+/// `inventory.vendor_invoice.approved` event
+/// (`http/vendor_invoices.rs`) are byte-identical — the fact-level
+/// replay-check compares payloads, and a hand-built copy on each side
+/// drifts (it did: the event was missing `lines`). `lines` is included
+/// only when present because the `bill_approved` posting rule sums
+/// `qty × unit_cost_cents` across them (authoritative over
+/// `amount_cents`); a lines-less invoice falls back to the lump.
+pub fn bill_approved_payload(invoice: &VendorInvoice, approved_on: NaiveDate) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "vendor_invoice_id": invoice.id,
+        "po_id": invoice.po_id,
+        "vendor": invoice.vendor,
+        "amount_cents": invoice.amount_cents,
+        "currency": invoice.currency,
+        "approved_on": approved_on,
+    });
+    if !invoice.lines.is_empty() {
+        payload["lines"] = serde_json::to_value(&invoice.lines).unwrap_or_default();
+    }
+    payload
+}
+
+/// Companion to [`bill_approved_payload`] for the `finance.bill.paid`
+/// transition — same single-source-of-truth rationale (the paid fact
+/// carries no `lines`).
+pub fn bill_paid_payload(invoice: &VendorInvoice, paid_on: NaiveDate) -> serde_json::Value {
+    serde_json::json!({
+        "vendor_invoice_id": invoice.id,
+        "po_id": invoice.po_id,
+        "vendor": invoice.vendor,
+        "amount_cents": invoice.amount_cents,
+        "currency": invoice.currency,
+        "paid_on": paid_on,
+    })
+}
+
 #[cfg(test)]
 mod behavior_tests {
     use super::*;
