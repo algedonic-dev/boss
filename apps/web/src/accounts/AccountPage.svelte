@@ -13,6 +13,8 @@
   import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import { appNow } from '@boss/web-kit/sim-clock';
+  import { formatMoney } from '@boss/web-kit/ui/money';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import FileAttachments from '../content/FileAttachments.svelte';
   import Link from '@boss/web-kit/ui/Link.svelte';
@@ -129,7 +131,7 @@
   }
 
   function dollars(cents: number): string {
-    return `$${(cents / 100).toLocaleString()}`;
+    return formatMoney({ amount_cents: cents, currency: 'USD' });
   }
 </script>
 
@@ -174,7 +176,10 @@
     if (t.id === 'shipments') return shipments.length > 0;
     return true;
   })}
-  {@const ytdRevCents = invoices.filter((i) => i.status === 'paid').reduce((s, i) => s + i.amount_cents, 0)}
+  {@const ytdStart = `${appNow().getFullYear()}-01-01`}
+  {@const ytdRevCents = invoices
+    .filter((i) => i.status === 'paid' && (i.paid_on ?? '') >= ytdStart)
+    .reduce((s, i) => s + i.amount_cents, 0)}
   {@const pastDueCents = invoices.filter((i) => i.status === 'past-due').reduce((s, i) => s + i.amount_cents, 0)}
   {@const openJobs = jobs.filter((j) => j.status !== 'closed' && j.status !== 'cancelled').length}
   {@const bySku = (() => {

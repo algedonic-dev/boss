@@ -5,6 +5,7 @@
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import Meta from '@boss/web-kit/ui/Meta.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
+  import { formatMoney } from '@boss/web-kit/ui/money';
   import type { PurchaseOrder } from '../parts/types';
   import type { VendorInvoice } from '../vendors/types';
   import { href } from '../router';
@@ -91,11 +92,11 @@
         <div class="detail-meta">
           <Meta label="Lines">{lines.length}</Meta>
           <Meta label="Total">
-            ${(totalCents / 100).toLocaleString()} {currency}
+            {formatMoney({ amount_cents: totalCents, currency })}
           </Meta>
           <Meta label="Bills">{bills.length}</Meta>
           <Meta label="Billed">
-            ${(billedCents / 100).toLocaleString()}
+            {formatMoney({ amount_cents: billedCents, currency })}
           </Meta>
         </div>
       </div>
@@ -131,8 +132,8 @@
                   <tr>
                     <td class="mono"><EntityLink kind="part" id={l.part_sku} /></td>
                     <td class="num">{l.qty}</td>
-                    <td class="num">${(l.unit_cost_cents / 100).toLocaleString()}</td>
-                    <td class="num">${((l.qty * l.unit_cost_cents) / 100).toLocaleString()}</td>
+                    <td class="num">{formatMoney({ amount_cents: l.unit_cost_cents, currency: l.currency })}</td>
+                    <td class="num">{formatMoney({ amount_cents: l.qty * l.unit_cost_cents, currency: l.currency })}</td>
                   </tr>
                 {/each}
               </tbody>
@@ -160,10 +161,10 @@
                     <td class="mono"><EntityLink kind="vendor-invoice" id={vi.id} label={vi.vendor_invoice_no} /></td>
                     <td>{vi.received_on}</td>
                     <td>{vi.status}</td>
-                    <td class="num">${(vi.amount_cents / 100).toLocaleString()}</td>
+                    <td class="num">{formatMoney({ amount_cents: vi.amount_cents, currency: vi.currency })}</td>
                     <td>
                       {#if vi.discrepancy_kind}
-                        {vi.discrepancy_kind}{vi.discrepancy_cents ? ` · $${(vi.discrepancy_cents / 100).toLocaleString()}` : ''}
+                        {vi.discrepancy_kind}{vi.discrepancy_cents ? ` · ${formatMoney({ amount_cents: vi.discrepancy_cents, currency: vi.currency })}` : ''}
                       {:else}
                         —
                       {/if}

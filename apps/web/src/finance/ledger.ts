@@ -103,6 +103,10 @@ export type CashFlowStatement = {
   from: string;
   to: string;
   net_income_cents: number;
+  // GL-attribution operating breakdown (the AR/AP/inventory/tax/revenue
+  // offsets that drove operating cash). Working-capital / non-cash ship
+  // empty on this path — the detail lives here.
+  operating_activities: ReadonlyArray<StatementLine>;
   working_capital_adjustments: ReadonlyArray<StatementLine>;
   non_cash_adjustments: ReadonlyArray<StatementLine>;
   cash_from_operations_cents: number;
