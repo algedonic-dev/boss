@@ -7,7 +7,6 @@ use axum::response::{IntoResponse, Response};
 use boss_policy_client::CurrentUser;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use super::*;
 
@@ -56,13 +55,14 @@ async fn record_and_post_bill_fact(
     let live_fact_id = crate::events::record_fact_in_tx(
         tx,
         crate::events::FactWrite {
-            fact_id: Uuid::new_v4(),
             kind: fact_kind,
             happened_on,
             payload,
             source_table: Some("ledger_bills"),
             source_id: Some(bill_id),
-            created_by: "ledger_bills",
+            // Matches the event source ("ledger") — the projection's
+            // created_by fallback — so rebuilt facts match live ones.
+            created_by: "ledger",
         },
     )
     .await

@@ -7,7 +7,6 @@ use axum::response::{IntoResponse, Response};
 use boss_policy_client::CurrentUser;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use super::*;
 
@@ -146,13 +145,14 @@ pub(super) async fn create_payroll_run(
     let live_fact_id = match crate::events::record_fact_in_tx(
         &mut tx,
         crate::events::FactWrite {
-            fact_id: Uuid::new_v4(),
             kind: "finance.payroll.run",
             happened_on: run.run_date,
             payload: &payload,
             source_table: Some("payroll_runs"),
             source_id: Some(&run.id),
-            created_by: "payroll_runs",
+            // Matches the event source ("ledger") — the projection's
+            // created_by fallback — so rebuilt facts match live ones.
+            created_by: "ledger",
         },
     )
     .await
@@ -364,13 +364,14 @@ pub(super) async fn synthesize_payroll_run(
     let live_fact_id = match crate::events::record_fact_in_tx(
         &mut tx,
         crate::events::FactWrite {
-            fact_id: Uuid::new_v4(),
             kind: "finance.payroll.run",
             happened_on: run.run_date,
             payload: &payload,
             source_table: Some("payroll_runs"),
             source_id: Some(&run.id),
-            created_by: "payroll_runs",
+            // Matches the event source ("ledger") — the projection's
+            // created_by fallback — so rebuilt facts match live ones.
+            created_by: "ledger",
         },
     )
     .await

@@ -8,7 +8,6 @@ use boss_policy_client::CurrentUser;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
-use uuid::Uuid;
 
 use super::*;
 
@@ -111,7 +110,6 @@ pub(super) async fn create_bank_settlement(
         Err(e) => return storage_err(e),
     };
 
-    let fact_id = Uuid::new_v4();
     let payload = serde_json::json!({
         "invoice_id": body.invoice_id,
         "account_id": body.account_id,
@@ -124,13 +122,15 @@ pub(super) async fn create_bank_settlement(
     let live_fact_id = match crate::events::record_fact_in_tx(
         &mut tx,
         crate::events::FactWrite {
-            fact_id,
             kind: "finance.payment.received",
             happened_on: body.received_on,
             payload: &payload,
             source_table: Some("bank_settlements"),
             source_id: Some(&body.id),
-            created_by: "bank_settlements",
+            // Matches the emitting service's event source ("ledger") —
+            // the projection's created_by fallback — so rebuilt facts
+            // are byte-identical to live ones.
+            created_by: "ledger",
         },
     )
     .await
@@ -400,13 +400,12 @@ async fn settle_one(
     let live_fact_id = crate::events::record_fact_in_tx(
         &mut tx,
         crate::events::FactWrite {
-            fact_id: Uuid::new_v4(),
             kind: "finance.payment.settled",
             happened_on: on,
             payload: &payload,
             source_table: Some("bank_settlements"),
             source_id: Some(&settled.id),
-            created_by: "bank_settlements",
+            created_by: "ledger",
         },
     )
     .await

@@ -87,4 +87,4 @@ pub use supersede::{
 };
 
 #[cfg(feature = "postgres")]
-pub use events::{FactWrite, emit_after_commit, record_fact_in_tx};
+pub use events::{FactWrite, deterministic_fact_id, emit_after_commit, record_fact_in_tx};
