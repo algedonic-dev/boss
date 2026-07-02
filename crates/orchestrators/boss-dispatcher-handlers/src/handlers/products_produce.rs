@@ -325,60 +325,68 @@ fn produces_products(step: &Value) -> bool {
         .is_some_and(|a| !a.is_empty())
 }
 
-/// The `financial_facts.source_id`s of the brew's **joint** consume legs,
-/// relative to the produce step `this_step_id`: every leg consumed on a
-/// step that yields **no** finished goods (the shared mash). A step that
-/// produces goods drains its own consumed inputs — this step's packaging
-/// is valued separately, and a sibling produce step's packaging is the
-/// sibling's to drain. Each consume leg's fact is keyed
-/// `"{step_id}:{part_sku}"` (the consume side effect's idempotency key).
-fn mash_source_ids(steps: &[Value], this_step_id: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    for s in steps {
+/// The brew's **joint** (shared-mash) steps relative to the produce step
+/// `this_step_id`: every completed step that yields no finished goods,
+/// except this step itself. This one predicate IS the definition of a
+/// joint mash leg — `mash_source_ids` and `overhead_source_ids` both
+/// derive from it, so raw materials and absorbed overhead always drain
+/// over the same step set. Only completed steps count: a pending or
+/// skipped consume step has fired no side effects, so it has no facts
+/// to drain — and expecting its facts would wedge the drain's
+/// matched-count check against rows that never come.
+fn joint_mash_steps<'a>(
+    steps: &'a [Value],
+    this_step_id: &'a str,
+) -> impl Iterator<Item = (&'a str, &'a serde_json::Map<String, Value>)> {
+    steps.iter().filter_map(move |s| {
         let step_id = s.get("id").and_then(|v| v.as_str()).unwrap_or("");
         if step_id == this_step_id || produces_products(s) {
-            continue;
+            return None;
         }
-        if let Some(md) = s.get("metadata").and_then(|v| v.as_object()) {
-            for (sku, _qty) in legs_from_meta_map(md) {
-                ids.push(format!("{step_id}:{sku}"));
-            }
+        if s.get("status").and_then(|v| v.as_str()) != Some("completed") {
+            return None;
         }
-    }
-    ids
+        s.get("metadata")
+            .and_then(|v| v.as_object())
+            .map(|md| (step_id, md))
+    })
+}
+
+/// The `financial_facts.source_id`s of the brew's **joint** consume legs,
+/// relative to the produce step `this_step_id`: every leg consumed on a
+/// joint mash step (see `joint_mash_steps`). A step that produces goods
+/// drains its own consumed inputs — this step's packaging is valued
+/// separately, and a sibling produce step's packaging is the sibling's
+/// to drain. Each consume leg's fact is keyed `"{step_id}:{part_sku}"`
+/// (the consume side effect's idempotency key).
+fn mash_source_ids(steps: &[Value], this_step_id: &str) -> Vec<String> {
+    joint_mash_steps(steps, this_step_id)
+        .flat_map(|(step_id, md)| {
+            legs_from_meta_map(md)
+                .into_iter()
+                .map(move |(sku, _qty)| format!("{step_id}:{sku}"))
+        })
+        .collect()
 }
 
 /// The `financial_facts.source_id`s of the production overhead absorbed
-/// at the brew's joint mash steps, relative to the produce step
-/// `this_step_id`. The mash-step selection mirrors `mash_source_ids`
-/// (every non-producing step but this one), but the ids reconstruct the
-/// `overhead_absorbed` drivers (direct labor, process utilities,
-/// production depreciation) the `inventory.parts.consume` side effect
-/// capitalized — each keyed `overhead-absorbed@{step_id}:{credit_account}`
-/// (the absorption endpoint's source_id), under
-/// `source_table=ledger_overhead_absorbed`. Summed into the mash cost so the
-/// absorbed overhead drains WIP → FG → COGS alongside the raw materials
-/// instead of stranding in WIP.
+/// at the brew's joint mash steps (see `joint_mash_steps`), relative to
+/// the produce step `this_step_id`. The ids reconstruct the
+/// `overhead_absorbed` drivers the `inventory.parts.consume` side effect
+/// capitalized — derived from the SAME parse the absorb side posts from
+/// (`common::overhead_absorbed`, aggregation and all) and keyed by
+/// `common::overhead_source_id`, under
+/// `source_table=ledger_overhead_absorbed`. Summed into the mash cost so
+/// the absorbed overhead drains WIP → FG → COGS alongside the raw
+/// materials instead of stranding in WIP.
 fn overhead_source_ids(steps: &[Value], this_step_id: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    for s in steps {
-        let step_id = s.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if step_id == this_step_id || produces_products(s) {
-            continue;
-        }
-        if let Some(rows) = s
-            .get("metadata")
-            .and_then(|m| m.get("overhead_absorbed"))
-            .and_then(|v| v.as_array())
-        {
-            for r in rows {
-                if let Some(acct) = r.get("credit_account").and_then(|v| v.as_str()) {
-                    ids.push(format!("overhead-absorbed@{step_id}:{acct}"));
-                }
-            }
-        }
-    }
-    ids
+    joint_mash_steps(steps, this_step_id)
+        .flat_map(|(step_id, md)| {
+            common::overhead_absorbed(md, step_id)
+                .into_iter()
+                .map(move |ab| common::overhead_source_id(step_id, &ab.credit_account))
+        })
+        .collect()
 }
 
 /// Volume in BBL for a finished-product keg SKU like `FP-PALE-1-2-BBL`
@@ -643,7 +651,7 @@ mod tests {
     #[test]
     fn overhead_ids_reconstruct_absorption_keys_for_mash_steps_only() {
         let steps = vec![
-            json!({ "id": "mash", "kind": "production-consume", "metadata": {
+            json!({ "id": "mash", "kind": "production-consume", "status": "completed", "metadata": {
                 "ingredients_consumed": [{ "part_sku": "ING-MALT-2ROW-50", "qty": 196 }],
                 "overhead_absorbed": [
                     { "amount_cents": 578_280, "credit_account": "6100" },
@@ -651,10 +659,11 @@ mod tests {
                     { "amount_cents": 135_880, "credit_account": "6900" }
                 ]
             }}),
-            json!({ "id": "pkg-half", "kind": "production-produce", "metadata": {
+            json!({ "id": "pkg-half", "kind": "production-produce", "status": "active", "metadata": {
                 "produces_products": [{ "sku": "FP-PALE-1-2-BBL", "qty": 210 }],
-                // A producing step's own absorption (if any) is the
-                // produce step's to drain — never a joint mash leg.
+                // A producing step's own absorption is the produce
+                // step's to drain (added into own_cost) — never a
+                // joint mash leg.
                 "overhead_absorbed": [{ "amount_cents": 999, "credit_account": "6100" }]
             }}),
         ];
@@ -668,6 +677,32 @@ mod tests {
                 "overhead-absorbed@mash:6300".to_string(),
                 "overhead-absorbed@mash:6900".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn joint_mash_excludes_steps_that_have_not_completed() {
+        // A pending/skipped consume step has fired no side effects, so
+        // it has no facts to drain — including it would make the drain
+        // expect facts that never land (and wedge the matched-count
+        // check). Only completed steps are joint mash legs.
+        let steps = vec![
+            json!({ "id": "mash", "kind": "production-consume", "status": "completed", "metadata": {
+                "ingredients_consumed": [{ "part_sku": "ING-A", "qty": 5 }],
+                "overhead_absorbed": [{ "amount_cents": 100, "credit_account": "6100" }]
+            }}),
+            json!({ "id": "late-adds", "kind": "production-consume", "status": "pending", "metadata": {
+                "ingredients_consumed": [{ "part_sku": "ING-B", "qty": 2 }],
+                "overhead_absorbed": [{ "amount_cents": 50, "credit_account": "6300" }]
+            }}),
+            json!({ "id": "pkg", "kind": "production-produce", "status": "active", "metadata": {
+                "produces_products": [{ "sku": "FP-PALE-1-2-BBL", "qty": 210 }]
+            }}),
+        ];
+        assert_eq!(mash_source_ids(&steps, "pkg"), vec!["mash:ING-A".to_string()]);
+        assert_eq!(
+            overhead_source_ids(&steps, "pkg"),
+            vec!["overhead-absorbed@mash:6100".to_string()]
         );
     }
 
