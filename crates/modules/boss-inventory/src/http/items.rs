@@ -550,11 +550,19 @@ pub(super) async fn overhead_absorbed_handler<R: InventoryRepository + 'static>(
     // unique key; re-emits for the same (step, account) — e.g. rebuild
     // replays — still collapse. The drain's `drain-actual-wip` basis
     // reconstructs the same key to sum what was capitalized. Without a
-    // step_id we fall back to the timestamp — best-effort idempotency
-    // for ad-hoc absorption posts.
+    // step_id we fall back to timestamp:account — best-effort
+    // idempotency for ad-hoc absorption posts. The account suffix is
+    // load-bearing there too: `now` is sim-time quantized and cached
+    // ~100ms by the clock client, so back-to-back multi-driver posts
+    // share one timestamp, and without the suffix the later drivers
+    // would silently collapse onto the first's fact.
     let source_id = match &step_id {
         Some(s) => format!("overhead-absorbed@{s}:{}", body.credit_account),
-        None => format!("overhead-absorbed@{}", now.to_rfc3339()),
+        None => format!(
+            "overhead-absorbed@{}:{}",
+            now.to_rfc3339(),
+            body.credit_account
+        ),
     };
 
     // Keys MUST match the live fact built in `record_overhead_absorbed`
@@ -589,6 +597,14 @@ pub(super) async fn overhead_absorbed_handler<R: InventoryRepository + 'static>(
         .await
     {
         Ok(id) => id,
+        // Deterministic request-data error (unknown account code) → 422,
+        // so a seed typo reads as a client error with the offending code
+        // in the body, not as service trouble. The dispatcher still NAKs
+        // (it can't tell permanent from transient), but the redelivery
+        // warns and the eventual dead-letter carry the precise cause.
+        Err(e @ InventoryError::InvalidAccount(_)) => {
+            return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response();
+        }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 

@@ -15,6 +15,12 @@ pub enum InventoryError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    /// A caller-supplied GL account code that the chart doesn't hold —
+    /// deterministic request-data error (a seed/authoring typo), not a
+    /// storage failure. The HTTP layer maps this to 422 so it reads as
+    /// a client error, distinct from real 5xx storage trouble.
+    #[error("invalid account: {0}")]
+    InvalidAccount(String),
 }
 
 /// Persistence port for inventory tables.

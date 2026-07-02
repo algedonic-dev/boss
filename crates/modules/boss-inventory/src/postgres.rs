@@ -408,7 +408,17 @@ impl InventoryRepository for PgInventory {
         };
         boss_ledger::post_fact_in_tx(&mut tx, &fact_ref)
             .await
-            .map_err(|e| InventoryError::Storage(format!("ledger post: {e}")))?;
+            .map_err(|e| match e {
+                // A bad account code is request data, not storage: the
+                // step author (or seed) named an account the chart
+                // doesn't hold. Surfaced as InvalidAccount so the HTTP
+                // layer answers 422 with the offending code instead of
+                // a generic 500.
+                boss_ledger::LedgerError::UnknownAccount(code) => InventoryError::InvalidAccount(
+                    format!("GL account code `{code}` is not in the chart of accounts"),
+                ),
+                e => InventoryError::Storage(format!("ledger post: {e}")),
+            })?;
 
         tx.commit()
             .await
