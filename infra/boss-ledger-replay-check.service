@@ -1,0 +1,18 @@
+[Unit]
+Description=Boss ledger deep reconstruction integrity check (financial_facts + journal)
+After=postgresql.service
+
+[Service]
+Type=oneshot
+# Reprojects financial_facts from audit_log and the journal from the facts,
+# inside an aborted transaction, and diffs BOTH against the live projection
+# (--deep). Catches live-vs-rebuild fact-payload drift that the entry-level
+# check can't see — the class the shared-projection-shape work eliminated.
+# Read-only: rolls the replay tx back, live state untouched. Exit code 1 →
+# divergence → systemctl is-failed → OnFailure hook fires the alert.
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/boss-ledger-replay-check --deep --config /etc/boss-ledger-api.toml
+# Runs as root to match the boss-audit-integrity-check timer pattern. The
+# check authenticates to Postgres via the `boss` role in postgres_url, not
+# the Linux user. Tighten to a dedicated service user once Boss adopts
+# per-service Linux UIDs system-wide.
