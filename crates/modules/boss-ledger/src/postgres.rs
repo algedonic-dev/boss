@@ -250,6 +250,20 @@ pub async fn insert_closing_entry(
     .await
 }
 
+/// Resolve a draft line's account code to its chart UUID. `resolve_account_codes`
+/// populates the map from this same draft, so a miss is a chart/resolve bug —
+/// but a library surfaces it as an error, never a panic mid-transaction (the
+/// prior `account_ids[code]` index would crash the tick loop).
+fn account_uuid(
+    account_ids: &std::collections::HashMap<String, Uuid>,
+    code: &str,
+) -> Result<Uuid, LedgerError> {
+    account_ids
+        .get(code)
+        .copied()
+        .ok_or_else(|| LedgerError::Storage(format!("account code {code} not in resolved chart")))
+}
+
 async fn insert_entry(
     tx: &mut Transaction<'_, Postgres>,
     fact_id: Uuid,
@@ -276,7 +290,7 @@ async fn insert_entry(
     .map_err(|e| LedgerError::Storage(e.to_string()))?;
 
     for line in &draft.lines {
-        let account_id = account_ids[line.account_code.as_ref()];
+        let account_id = account_uuid(account_ids, line.account_code.as_ref())?;
         sqlx::query(
             "INSERT INTO gl_journal_lines \
                 (id, journal_entry_id, account_id, debit_cents, credit_cents, currency, memo, sort_order) \
@@ -315,7 +329,7 @@ async fn upsert_daily_rollup(
     // (debit, credit, cash_flow) delta per account for this entry.
     let mut deltas: HashMap<Uuid, (i64, i64, i64)> = HashMap::new();
     for line in &draft.lines {
-        let aid = account_ids[line.account_code.as_ref()];
+        let aid = account_uuid(account_ids, line.account_code.as_ref())?;
         let e = deltas.entry(aid).or_insert((0, 0, 0));
         e.0 += line.debit_cents;
         e.1 += line.credit_cents;
@@ -336,7 +350,7 @@ async fn upsert_daily_rollup(
             .iter()
             .filter(|l| !CASH_POOL.contains(&l.account_code.as_ref()))
         {
-            let aid = account_ids[line.account_code.as_ref()];
+            let aid = account_uuid(account_ids, line.account_code.as_ref())?;
             *offsets.entry(aid).or_insert(0) += line.credit_cents - line.debit_cents;
         }
         let offset_total_cr: i64 = offsets.values().copied().sum();

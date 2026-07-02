@@ -6,6 +6,7 @@
   import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
   import SearchInput from '@boss/web-kit/ui/SearchInput.svelte';
   import Link from '@boss/web-kit/ui/Link.svelte';
+  import { formatMoney } from '@boss/web-kit/ui/money';
   import {
     CATEGORY_LABEL,
     type DeviceModel,
@@ -130,7 +131,7 @@
                 <div class="catalog-card-tagline">{d.commerce.tagline}</div>
                 <div class="catalog-card-meta">
                   <span class="catalog-card-price">
-                    ${(d.commerce.list_price_new_cents / 100).toLocaleString()}
+                    {formatMoney({ amount_cents: d.commerce.list_price_new_cents, currency: d.commerce.currency })}
                   </span>
                   <span class="catalog-card-year">{d.model_year}</span>
                 </div>
