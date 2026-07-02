@@ -75,6 +75,16 @@ sleep 2
 # a plain `systemctl restart boss-brewery-sim` still keeps the queue.)
 rm -f "${BOSS_SIM_STATE_DIR:-/var/lib/boss-sim}/counterparty-queue.json"
 
+# Same principle for the JetStream delivery buffer: BOSS_EVENTS retains the
+# old world's events (millions of them across epochs), and the dispatcher's
+# durable consumers would replay them against the just-reset database —
+# every old-world step effect 404s, churns the redelivery budget, and
+# dead-letters as noise. The regen path (validate-brewery-sim.sh) already
+# clears it; this host-level reset must too. Services are stopped, so the
+# drop-and-recreate is race-free.
+"$REPO_ROOT/target/release/boss-dispatcher" --reset-stream \
+    || echo "    warning: BOSS_EVENTS stream reset failed (is NATS down?); old events may replay"
+
 echo "==> [2/9] dropping + recreating boss DB"
 # --force terminates any straggler connection (a timer mid-run, or a service
 # missing from the stop-list) so the drop can't be blocked.
