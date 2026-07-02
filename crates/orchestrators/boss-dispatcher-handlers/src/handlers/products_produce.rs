@@ -26,8 +26,10 @@
 //!
 //! So the `drain-actual-wip` basis values this produce step's drain as:
 //!   - its **own packaging legs** (consumed on this step) at current
-//!     `avg_cost` — exactly what the sibling `inventory.parts.consume`
-//!     side effect will debit moments later, so they net to zero; plus
+//!     `avg_cost`, plus its **own absorbed overhead** (if stamped) at the
+//!     stamped amounts — exactly what the sibling
+//!     `inventory.parts.consume` side effect will debit moments later,
+//!     so they net to zero; plus
 //!   - its **share of the joint mash**, `mash × (this format's packaged
 //!     volume / Σ volume of every format that packages)`, where `mash` is
 //!     the real DR-1310 cost the mash-in legs capitalized — **raw
@@ -45,8 +47,13 @@
 //! The basis is **selected by data** (the `cost_basis` arg in
 //! `infra/dispatcher/rules.toml`); code provides the named bases. The
 //! legacy `current-avg-cost` basis (whole-Job inputs at current avg) stays
-//! reachable and is also the fallback if the ledger read fails, so
-//! production never breaks.
+//! reachable as a data-selected basis. A failed **or partial** ledger
+//! read is NOT silently degraded around: the handler errs, the event
+//! NAKs, and the drain retries once the facts land. Draining short would
+//! bake the shortfall into the FG cost basis permanently — rebuild
+//! replays the recorded produce fact verbatim and never re-runs this
+//! computation — so a loud retry (dead-letter if the facts never come)
+//! is the only path that conserves WIP.
 
 use super::common::{self, StepEvent};
 use async_trait::async_trait;
@@ -117,10 +124,15 @@ impl ProductsProduce {
     }
 
     /// `drain-actual-wip` (default). The WIP this produce step should
-    /// drain: its own packaging at current `avg_cost` + its volume-share
-    /// of the brew's real capitalized mash cost (read from the ledger).
-    /// Returns `None` to signal "fall back to the current-avg basis" (the
-    /// ledger read failed), so production never breaks.
+    /// drain: its own packaging at current `avg_cost` + its own absorbed
+    /// overhead (if stamped) + its volume-share of the brew's real
+    /// capitalized mash cost (read from the ledger). Returns `None` only
+    /// when the job carries no steps to reconstruct from — the caller
+    /// then falls back to the current-avg basis. Ledger-read failures
+    /// propagate `Err` so the event NAKs and retries: draining short
+    /// would bake the shortfall into the FG cost basis permanently,
+    /// because rebuild replays the recorded produce fact verbatim and
+    /// never re-runs this computation.
     async fn drain_actual_wip_cents(
         &self,
         step: &StepEvent<'_>,
@@ -140,56 +152,54 @@ impl ProductsProduce {
             own_cost =
                 own_cost.saturating_add(self.avg_cost_cents(&sku).await?.saturating_mul(qty));
         }
+        // This step's OWN absorbed overhead (e.g. packaging labor stamped
+        // on a produce step) — the produce step's to drain, exactly like
+        // its own packaging legs. Valued from the same metadata rows the
+        // sibling parts-consume side effect absorbs moments later on this
+        // same event (it runs after this handler in the rule's do-list),
+        // so the two net to zero. The ledger can't be asked here: those
+        // facts land after this drain computes.
+        for ab in common::overhead_absorbed(step.metadata, step.step_id) {
+            own_cost = own_cost.saturating_add(ab.amount_cents);
+        }
 
         // Shared mash: the real DR-1310 cost its consume legs capitalized
         // — raw materials plus any production overhead absorbed at those
         // same mash steps (direct labor / utilities / depreciation
         // drivers). Both are DR-1310 facts; summing both is what drains
         // the *full* WIP a brew capitalized, so the drivers reach FG/COGS
-        // instead of stranding in WIP.
-        let mut mash_ids = mash_source_ids(steps, step.step_id);
-        mash_ids.sort();
-        mash_ids.dedup();
-        let raw_mash_cost = match self
-            .ledger_transferred_sum("inventory_consume", &mash_ids)
-            .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    "products.produce drain-actual-wip: ledger sum failed for job {} ({e}); \
-                     falling back to current avg_cost basis",
-                    step.job_id
-                );
-                return Ok(None);
-            }
+        // instead of stranding in WIP. The two sums are independent
+        // read-only aggregates — issue them concurrently.
+        //
+        // Failure policy: a failed OR partial read (see the matched-count
+        // check in `ledger_transferred_sum`) propagates `Err` → NAK →
+        // redelivery, converging once the facts land. Both sums run
+        // before any side effect, so the retry is clean. The old
+        // behavior — draining raw-only when the overhead read failed —
+        // permanently understated the FG basis and stranded the absorbed
+        // overhead in 1310: rebuild replays recorded facts, it never
+        // re-runs this drain, so nothing downstream could heal it.
+        let mash_ids = mash_source_ids(steps, step.step_id);
+        let overhead_ids = overhead_source_ids(steps, step.step_id);
+        let (raw_mash_cost, overhead_cost) = {
+            let (raw, overhead) = tokio::join!(
+                self.ledger_transferred_sum("inventory_consume", mash_ids),
+                self.ledger_transferred_sum("ledger_overhead_absorbed", overhead_ids),
+            );
+            (raw?, overhead?)
         };
-        // Absorbed production overhead at the mash steps — keyed
-        // `labor-absorbed@{step}:{credit_account}` (the absorption
-        // endpoint's source_id), `source_table=ledger_labor_absorbed`. A
-        // failed read drains raw only this run (the overhead stays in WIP,
-        // recoverable on rebuild) rather than breaking production.
-        let mut overhead_ids = overhead_source_ids(steps, step.step_id);
-        overhead_ids.sort();
-        overhead_ids.dedup();
-        let overhead_cost = self
-            .ledger_transferred_sum("ledger_labor_absorbed", &overhead_ids)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    "products.produce drain-actual-wip: overhead sum failed for job {} ({e}); \
-                     draining raw mash only this run",
-                    step.job_id
-                );
-                0
-            });
         let mash_cost = raw_mash_cost.saturating_add(overhead_cost);
 
-        // This format's share of the joint mash, spread across every
-        // format that actually packages.
-        let this_vol = this_step_volume(steps, step.step_id);
-        let denom = packaged_volume_denominator(steps);
-        let mash_share = mash_share_cents(mash_cost, this_vol, denom);
+        // This format's share of the joint mash, split exactly across
+        // every format that actually packages. Every sibling produce
+        // event computes the same deterministic allocation from the same
+        // job snapshot and picks out its own entry, so the shares sum to
+        // mash_cost to the cent (see `mash_share_allocation`).
+        let mash_share = mash_share_allocation(steps, mash_cost)
+            .into_iter()
+            .find(|(id, _)| id == step.step_id)
+            .map(|(_, share)| share)
+            .unwrap_or(0);
 
         Ok(Some(own_cost.saturating_add(mash_share)))
     }
@@ -221,14 +231,27 @@ impl ProductsProduce {
     /// via the ledger's read-only facts-sum endpoint. Both the raw
     /// `finance.inventory.transferred` / `inventory_consume` legs (each
     /// `total_cost_cents = qty × avg_cost_at_consume`) and the absorbed
-    /// `finance.inventory.transferred` / `ledger_labor_absorbed`
+    /// `finance.inventory.transferred` / `ledger_overhead_absorbed`
     /// overhead drivers are summed this way — only the `source_table`
     /// and the source-id shape differ.
+    ///
+    /// Every requested leg must have landed: the endpoint's `matched`
+    /// count is compared against the (deduped) request, and a shortfall
+    /// is an error, not a smaller sum. A short match means the step
+    /// metadata names facts the ledger doesn't hold yet — typically the
+    /// consume/absorb side effect is still in NAK-redelivery — and
+    /// summing anyway would silently under-drain WIP into a cost basis
+    /// that rebuild then reproduces forever. Err → NAK → retry converges
+    /// once the facts land; a fact that never lands dead-letters loudly.
     async fn ledger_transferred_sum(
         &self,
         source_table: &str,
-        source_ids: &[String],
+        mut source_ids: Vec<String>,
     ) -> Result<i64, HandlerError> {
+        // Unique ids: `source_id = ANY(..)` can't double-count rows, and
+        // `matched` (a row count) is compared against the request set.
+        source_ids.sort();
+        source_ids.dedup();
         if source_ids.is_empty() {
             return Ok(0);
         }
@@ -243,6 +266,7 @@ impl ProductsProduce {
                 "kind": "finance.inventory.transferred",
                 "source_table": source_table,
                 "source_ids": source_ids,
+                "debit_account": "1310",
             }))
             .send()
             .await
@@ -258,6 +282,14 @@ impl ProductsProduce {
             .json()
             .await
             .map_err(|e| HandlerError::Downstream(format!("POST {url} not JSON: {e}")))?;
+        let matched = v.get("matched").and_then(|x| x.as_i64()).unwrap_or(-1);
+        if matched != source_ids.len() as i64 {
+            return Err(HandlerError::Downstream(format!(
+                "POST {url}: {matched} of {} requested {source_table} facts matched — \
+                 refusing to drain short (facts not landed yet, or source-id drift)",
+                source_ids.len()
+            )));
+        }
         Ok(v.get("total_cost_cents")
             .and_then(|x| x.as_i64())
             .unwrap_or(0))
@@ -325,60 +357,68 @@ fn produces_products(step: &Value) -> bool {
         .is_some_and(|a| !a.is_empty())
 }
 
-/// The `financial_facts.source_id`s of the brew's **joint** consume legs,
-/// relative to the produce step `this_step_id`: every leg consumed on a
-/// step that yields **no** finished goods (the shared mash). A step that
-/// produces goods drains its own consumed inputs — this step's packaging
-/// is valued separately, and a sibling produce step's packaging is the
-/// sibling's to drain. Each consume leg's fact is keyed
-/// `"{step_id}:{part_sku}"` (the consume side effect's idempotency key).
-fn mash_source_ids(steps: &[Value], this_step_id: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    for s in steps {
+/// The brew's **joint** (shared-mash) steps relative to the produce step
+/// `this_step_id`: every completed step that yields no finished goods,
+/// except this step itself. This one predicate IS the definition of a
+/// joint mash leg — `mash_source_ids` and `overhead_source_ids` both
+/// derive from it, so raw materials and absorbed overhead always drain
+/// over the same step set. Only completed steps count: a pending or
+/// skipped consume step has fired no side effects, so it has no facts
+/// to drain — and expecting its facts would wedge the drain's
+/// matched-count check against rows that never come.
+fn joint_mash_steps<'a>(
+    steps: &'a [Value],
+    this_step_id: &'a str,
+) -> impl Iterator<Item = (&'a str, &'a serde_json::Map<String, Value>)> {
+    steps.iter().filter_map(move |s| {
         let step_id = s.get("id").and_then(|v| v.as_str()).unwrap_or("");
         if step_id == this_step_id || produces_products(s) {
-            continue;
+            return None;
         }
-        if let Some(md) = s.get("metadata").and_then(|v| v.as_object()) {
-            for (sku, _qty) in legs_from_meta_map(md) {
-                ids.push(format!("{step_id}:{sku}"));
-            }
+        if s.get("status").and_then(|v| v.as_str()) != Some("completed") {
+            return None;
         }
-    }
-    ids
+        s.get("metadata")
+            .and_then(|v| v.as_object())
+            .map(|md| (step_id, md))
+    })
+}
+
+/// The `financial_facts.source_id`s of the brew's **joint** consume legs,
+/// relative to the produce step `this_step_id`: every leg consumed on a
+/// joint mash step (see `joint_mash_steps`). A step that produces goods
+/// drains its own consumed inputs — this step's packaging is valued
+/// separately, and a sibling produce step's packaging is the sibling's
+/// to drain. Each consume leg's fact is keyed `"{step_id}:{part_sku}"`
+/// (the consume side effect's idempotency key).
+fn mash_source_ids(steps: &[Value], this_step_id: &str) -> Vec<String> {
+    joint_mash_steps(steps, this_step_id)
+        .flat_map(|(step_id, md)| {
+            legs_from_meta_map(md)
+                .into_iter()
+                .map(move |(sku, _qty)| format!("{step_id}:{sku}"))
+        })
+        .collect()
 }
 
 /// The `financial_facts.source_id`s of the production overhead absorbed
-/// at the brew's joint mash steps, relative to the produce step
-/// `this_step_id`. The mash-step selection mirrors `mash_source_ids`
-/// (every non-producing step but this one), but the ids reconstruct the
-/// `overhead_absorbed` drivers (direct labor, process utilities,
-/// production depreciation) the `inventory.parts.consume` side effect
-/// capitalized — each keyed `labor-absorbed@{step_id}:{credit_account}`
-/// (the absorption endpoint's source_id), under
-/// `source_table=ledger_labor_absorbed`. Summed into the mash cost so the
-/// absorbed overhead drains WIP → FG → COGS alongside the raw materials
-/// instead of stranding in WIP.
+/// at the brew's joint mash steps (see `joint_mash_steps`), relative to
+/// the produce step `this_step_id`. The ids reconstruct the
+/// `overhead_absorbed` drivers the `inventory.parts.consume` side effect
+/// capitalized — derived from the SAME parse the absorb side posts from
+/// (`common::overhead_absorbed`, aggregation and all) and keyed by
+/// `common::overhead_source_id`, under
+/// `source_table=ledger_overhead_absorbed`. Summed into the mash cost so
+/// the absorbed overhead drains WIP → FG → COGS alongside the raw
+/// materials instead of stranding in WIP.
 fn overhead_source_ids(steps: &[Value], this_step_id: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    for s in steps {
-        let step_id = s.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if step_id == this_step_id || produces_products(s) {
-            continue;
-        }
-        if let Some(rows) = s
-            .get("metadata")
-            .and_then(|m| m.get("overhead_absorbed"))
-            .and_then(|v| v.as_array())
-        {
-            for r in rows {
-                if let Some(acct) = r.get("credit_account").and_then(|v| v.as_str()) {
-                    ids.push(format!("labor-absorbed@{step_id}:{acct}"));
-                }
-            }
-        }
-    }
-    ids
+    joint_mash_steps(steps, this_step_id)
+        .flat_map(|(step_id, md)| {
+            common::overhead_absorbed(md, step_id)
+                .into_iter()
+                .map(move |ab| common::overhead_source_id(step_id, &ab.credit_account))
+        })
+        .collect()
 }
 
 /// Volume in BBL for a finished-product keg SKU like `FP-PALE-1-2-BBL`
@@ -415,39 +455,67 @@ fn produce_step_volume(step: &Value) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// The packaged volume of the produce step `this_step_id`.
-fn this_step_volume(steps: &[Value], this_step_id: &str) -> f64 {
-    steps
-        .iter()
-        .find(|s| s.get("id").and_then(|v| v.as_str()) == Some(this_step_id))
-        .map(produce_step_volume)
-        .unwrap_or(0.0)
-}
-
-/// Total packaged BBL the joint mash spreads across: the summed allocated
-/// volume of every produce step. `packaging.allocate` writes each format's
-/// packaged keg qty onto its produce step — INCLUDING a 0 for a format it
-/// skipped — so a skipped format contributes 0 volume and drops out of the
-/// denominator, and the packaged formats absorb its mash share into their
-/// COGS. Non-producing steps carry no `produces_products` and contribute 0.
+/// Split the joint mash cost across every step with packaged volume,
+/// exactly: floor each volume-proportional share, then hand the
+/// remaining cents to the largest fractional remainders (largest-
+/// remainder method; ties break by step-id order). Deterministic — every
+/// sibling produce event computes this same allocation independently
+/// from the same job snapshot and picks out its own entry — and exact:
+/// the shares sum to `mash_cost` to the cent. Independent per-format
+/// `round()` (the old form) could gain or lose a cent per brew: 1310
+/// WIP residue no source_id owns, which an exact conservation check or
+/// WIP reconciliation can never zero out.
 ///
-/// This reads the allocated quantities directly (data), replacing the old
-/// coupling to a per-format demand-gate's `outcome` — which broke once the
-/// packaging split moved to the single allocation step, and which the
-/// lagging-`status` variant of got wrong (under-draining WIP when a skipped
-/// format hadn't flipped to `skipped` yet).
-fn packaged_volume_denominator(steps: &[Value]) -> f64 {
-    steps.iter().map(produce_step_volume).sum()
-}
-
-/// This format's share of the joint mash cost: `mash × this_vol /
-/// denom_vol`, rounded to cents. Zero when there's no packaged volume
-/// (never divides by zero).
-fn mash_share_cents(mash_cost: i64, this_vol: f64, denom_vol: f64) -> i64 {
-    if denom_vol <= 0.0 {
-        return 0;
+/// `packaging.allocate` writes each format's packaged keg qty onto its
+/// produce step — INCLUDING a 0 for a format it skipped — so a skipped
+/// format carries 0 volume, drops out of the allocation, and the
+/// packaged formats absorb its mash share into their COGS. Non-producing
+/// steps carry no `produces_products` and never appear.
+fn mash_share_allocation(steps: &[Value], mash_cost: i64) -> Vec<(String, i64)> {
+    let mut formats: Vec<(String, f64)> = steps
+        .iter()
+        .filter_map(|s| {
+            let id = s.get("id").and_then(|v| v.as_str())?;
+            let vol = produce_step_volume(s);
+            (vol > 0.0).then(|| (id.to_string(), vol))
+        })
+        .collect();
+    // Stable id order: the base order remainder ties resolve in, the
+    // same on every sibling's independently-computed allocation.
+    formats.sort_by(|a, b| a.0.cmp(&b.0));
+    let denom: f64 = formats.iter().map(|(_, v)| v).sum();
+    if denom <= 0.0 || mash_cost <= 0 {
+        return formats.into_iter().map(|(id, _)| (id, 0)).collect();
     }
-    ((mash_cost as f64) * this_vol / denom_vol).round() as i64
+    let mut shares: Vec<(String, i64, f64)> = formats
+        .into_iter()
+        .map(|(id, vol)| {
+            let exact = mash_cost as f64 * vol / denom;
+            let floor = exact.floor() as i64;
+            (id, floor, exact - exact.floor())
+        })
+        .collect();
+    let assigned: i64 = shares.iter().map(|(_, cents, _)| cents).sum();
+    let mut leftover = mash_cost.saturating_sub(assigned);
+    let mut by_remainder: Vec<usize> = (0..shares.len()).collect();
+    // Stable sort: equal remainders keep id order.
+    by_remainder.sort_by(|&a, &b| {
+        shares[b]
+            .2
+            .partial_cmp(&shares[a].2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for idx in by_remainder {
+        if leftover <= 0 {
+            break;
+        }
+        shares[idx].1 += 1;
+        leftover -= 1;
+    }
+    shares
+        .into_iter()
+        .map(|(id, cents, _)| (id, cents))
+        .collect()
 }
 
 #[async_trait]
@@ -481,8 +549,9 @@ impl Handler for ProductsProduce {
         let cost = match basis {
             "current-avg-cost" => self.current_avg_brew_cost(&job).await?,
             // drain-actual-wip (default): drain exactly what consume
-            // capitalized; fall back to the current-avg basis on a failed
-            // ledger read so production never breaks.
+            // capitalized. A failed/partial ledger read propagates Err
+            // (NAK → retry once the facts land); the current-avg
+            // fallback below covers only the structural no-steps case.
             _ => match self.drain_actual_wip_cents(&step, &job).await? {
                 Some(c) => Some(c),
                 None => self.current_avg_brew_cost(&job).await?,
@@ -506,6 +575,13 @@ impl Handler for ProductsProduce {
             }
             // Derived unit cost = cost × (this keg's volume / total
             // volume) ÷ qty, i.e. cost × unit_volume / total_volume.
+            // KNOWN RESIDUAL: unit_cost is an integer, so the posted
+            // drain (qty × unit_cost) can differ from this step's exact
+            // share by up to ~qty/2 cents per line. Exact per-line
+            // conservation needs the produce endpoint to accept a line
+            // total instead of a unit cost — deferred to the WIP-
+            // reconciliation workstream, which owns sweeping the
+            // bounded remainder.
             let unit_cost = match cost {
                 Some(c) if total_volume > 0.0 => {
                     Some(((c as f64) * keg_volume_bbl(&it.sku) / total_volume).round() as i64)
@@ -589,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn denominator_excludes_zero_qty_skipped_formats() {
+    fn allocation_excludes_zero_qty_skipped_formats() {
         // packaging.allocate stamps qty 0 on a format it skips, so that produce
         // step contributes 0 volume — the packaged format absorbs the whole
         // batch's WIP. Read straight from the allocated quantities: no
@@ -600,12 +676,22 @@ mod tests {
             json!({ "id": "pkg-sixtel", "kind": "production-produce",
                     "metadata": { "produces_products": [{ "sku": "FP-PALE-1-6-BBL", "qty": 0 }] } }), // skipped → 0
         ];
-        assert!((packaged_volume_denominator(&steps) - 105.0).abs() < 1e-6);
-        // Both packaged → both counted (the demand-driven split).
+        // Skipped format doesn't appear; the packaged one takes it all.
+        assert_eq!(
+            mash_share_allocation(&steps, 1_000),
+            vec![("pkg-half".to_string(), 1_000)]
+        );
+        // Both packaged → split by volume (105 vs 52.5 → 2:1).
         let mut both = steps.clone();
         both[1] = json!({ "id": "pkg-sixtel", "kind": "production-produce",
                           "metadata": { "produces_products": [{ "sku": "FP-PALE-1-6-BBL", "qty": 315 }] } }); // 52.5
-        assert!((packaged_volume_denominator(&both) - 157.5).abs() < 1e-6); // 105 + 52.5
+        assert_eq!(
+            mash_share_allocation(&both, 1_500),
+            vec![
+                ("pkg-half".to_string(), 1_000),
+                ("pkg-sixtel".to_string(), 500)
+            ]
+        );
     }
 
     #[test]
@@ -643,7 +729,7 @@ mod tests {
     #[test]
     fn overhead_ids_reconstruct_absorption_keys_for_mash_steps_only() {
         let steps = vec![
-            json!({ "id": "mash", "kind": "production-consume", "metadata": {
+            json!({ "id": "mash", "kind": "production-consume", "status": "completed", "metadata": {
                 "ingredients_consumed": [{ "part_sku": "ING-MALT-2ROW-50", "qty": 196 }],
                 "overhead_absorbed": [
                     { "amount_cents": 578_280, "credit_account": "6100" },
@@ -651,10 +737,11 @@ mod tests {
                     { "amount_cents": 135_880, "credit_account": "6900" }
                 ]
             }}),
-            json!({ "id": "pkg-half", "kind": "production-produce", "metadata": {
+            json!({ "id": "pkg-half", "kind": "production-produce", "status": "active", "metadata": {
                 "produces_products": [{ "sku": "FP-PALE-1-2-BBL", "qty": 210 }],
-                // A producing step's own absorption (if any) is the
-                // produce step's to drain — never a joint mash leg.
+                // A producing step's own absorption is the produce
+                // step's to drain (added into own_cost) — never a
+                // joint mash leg.
                 "overhead_absorbed": [{ "amount_cents": 999, "credit_account": "6100" }]
             }}),
         ];
@@ -664,20 +751,80 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "labor-absorbed@mash:6100".to_string(),
-                "labor-absorbed@mash:6300".to_string(),
-                "labor-absorbed@mash:6900".to_string(),
+                "overhead-absorbed@mash:6100".to_string(),
+                "overhead-absorbed@mash:6300".to_string(),
+                "overhead-absorbed@mash:6900".to_string(),
             ]
         );
     }
 
     #[test]
-    fn mash_share_splits_then_absorbs_on_skip() {
-        // Two formats both packaging equal volume → split 50/50.
-        assert_eq!(mash_share_cents(1000, 105.0, 210.0), 500);
-        // Sibling skipped → denom = this format only → absorbs 100%.
-        assert_eq!(mash_share_cents(1000, 105.0, 105.0), 1000);
-        // Guard: zero packaged volume → no share (never divides by zero).
-        assert_eq!(mash_share_cents(1000, 0.0, 0.0), 0);
+    fn joint_mash_excludes_steps_that_have_not_completed() {
+        // A pending/skipped consume step has fired no side effects, so
+        // it has no facts to drain — including it would make the drain
+        // expect facts that never land (and wedge the matched-count
+        // check). Only completed steps are joint mash legs.
+        let steps = vec![
+            json!({ "id": "mash", "kind": "production-consume", "status": "completed", "metadata": {
+                "ingredients_consumed": [{ "part_sku": "ING-A", "qty": 5 }],
+                "overhead_absorbed": [{ "amount_cents": 100, "credit_account": "6100" }]
+            }}),
+            json!({ "id": "late-adds", "kind": "production-consume", "status": "pending", "metadata": {
+                "ingredients_consumed": [{ "part_sku": "ING-B", "qty": 2 }],
+                "overhead_absorbed": [{ "amount_cents": 50, "credit_account": "6300" }]
+            }}),
+            json!({ "id": "pkg", "kind": "production-produce", "status": "active", "metadata": {
+                "produces_products": [{ "sku": "FP-PALE-1-2-BBL", "qty": 210 }]
+            }}),
+        ];
+        assert_eq!(
+            mash_source_ids(&steps, "pkg"),
+            vec!["mash:ING-A".to_string()]
+        );
+        assert_eq!(
+            overhead_source_ids(&steps, "pkg"),
+            vec!["overhead-absorbed@mash:6100".to_string()]
+        );
+    }
+
+    #[test]
+    fn mash_share_allocation_is_exact_to_the_cent() {
+        let steps = |half_qty: i64, sixtel_qty: i64| {
+            vec![
+                json!({ "id": "pkg-half", "kind": "production-produce",
+                        "metadata": { "produces_products": [{ "sku": "FP-PALE-1-2-BBL", "qty": half_qty }] } }),
+                json!({ "id": "pkg-sixtel", "kind": "production-produce",
+                        "metadata": { "produces_products": [{ "sku": "FP-PALE-1-6-BBL", "qty": sixtel_qty }] } }),
+            ]
+        };
+        // Equal volume → 50/50.
+        let equal = steps(210, 630); // 105 bbl each
+        assert_eq!(
+            mash_share_allocation(&equal, 1_000),
+            vec![
+                ("pkg-half".to_string(), 500),
+                ("pkg-sixtel".to_string(), 500)
+            ]
+        );
+        // Odd cent: independent rounding would post 501 + 501 = 1,002
+        // (a phantom cent of WIP drained that consume never
+        // capitalized). Largest-remainder hands the leftover cent to
+        // exactly one format — equal remainders tie-break by id order —
+        // and the shares sum to the input.
+        let split = mash_share_allocation(&equal, 1_001);
+        assert_eq!(
+            split,
+            vec![
+                ("pkg-half".to_string(), 501),
+                ("pkg-sixtel".to_string(), 500)
+            ]
+        );
+        assert_eq!(split.iter().map(|(_, c)| c).sum::<i64>(), 1_001);
+        // Uneven volumes, awkward total: still exact.
+        let uneven = steps(210, 315); // 105 vs 52.5 bbl
+        let alloc = mash_share_allocation(&uneven, 1_000_003);
+        assert_eq!(alloc.iter().map(|(_, c)| c).sum::<i64>(), 1_000_003);
+        // Guard: no packaged volume → no shares (never divides by zero).
+        assert!(mash_share_allocation(&steps(0, 0), 1_000).is_empty());
     }
 }

@@ -39,6 +39,16 @@ pub const MAX_DELIVER: i64 = 8;
 /// How long the server waits for an ACK before assuming the consumer died
 /// and redelivering. The consumers NAK explicitly on handler failure, so
 /// this is the crash-safety backstop, not the normal retry path.
+///
+/// This only holds if no `backoff` schedule is set on the consumer: the
+/// server treats a backoff list as the per-attempt ack deadline, so a
+/// schedule starting at 1s silently shrank the effective ack_wait to 1s
+/// — any event whose queue-wait + handler time crossed 1s was redelivered
+/// while its first delivery was still succeeding, and every side effect
+/// ran twice with no NAK anywhere in the logs (facts/JEs survived on
+/// idempotency keys; unconditional audit-event emits doubled). Retry
+/// pacing therefore lives in [`settle`]'s explicit NAK delay, never in
+/// the consumer config.
 const ACK_WAIT: Duration = Duration::from_secs(30);
 
 /// Subjects the stream captures. Scoped to exactly the families the
@@ -57,6 +67,12 @@ pub fn stream_subjects() -> Vec<String> {
 /// `i+2` (delivery 1 is the original). The schedule widens so a transient
 /// condition has time to clear, and the tail repeats at 30s until
 /// [`MAX_DELIVER`] is hit.
+///
+/// Supplied per-NAK via [`redelivery_delay`] — NEVER configured as the
+/// consumer's server-side `backoff`, because a backoff schedule replaces
+/// `ack_wait` as the per-attempt ack deadline and silently redelivers
+/// slow-but-healthy deliveries (see [`ACK_WAIT`]). An explicit NAK delay
+/// paces only genuine failures.
 fn redelivery_backoff() -> Vec<Duration> {
     vec![
         Duration::from_secs(1),
@@ -67,6 +83,16 @@ fn redelivery_backoff() -> Vec<Duration> {
         Duration::from_secs(30),
         Duration::from_secs(30),
     ]
+}
+
+/// The NAK delay for a failed delivery, by its (1-based) attempt number:
+/// the [`redelivery_backoff`] schedule, clamped to its 30s tail.
+fn redelivery_delay(delivered: i64) -> Duration {
+    let sched = redelivery_backoff();
+    let idx = usize::try_from(delivered.max(1) - 1)
+        .unwrap_or(0)
+        .min(sched.len() - 1);
+    sched[idx]
 }
 
 /// Errors from the durable layer. Kept stringly-typed so the async-nats
@@ -139,7 +165,10 @@ pub fn consumer_config(durable: &str, filter_subjects: Vec<String>) -> pull::Con
         ack_wait: ACK_WAIT,
         max_deliver: MAX_DELIVER,
         filter_subjects,
-        backoff: redelivery_backoff(),
+        // Deliberately NO `backoff` here: the server would use it as the
+        // per-attempt ack deadline (overriding ack_wait), so backoff[0]=1s
+        // silently duplicated every delivery slower than 1s. The retry
+        // schedule rides each NAK instead (see `settle`).
         ..Default::default()
     }
 }
@@ -162,8 +191,14 @@ pub async fn open_durable(
         .get_stream(stream_name)
         .await
         .map_err(|e| DurableError::Stream(e.to_string()))?;
+    // create-or-UPDATE (not get_or_create): reconciles a persisted
+    // consumer whose config drifted from `consumer_config` — durable
+    // consumers outlive binary deploys, so without the update an old
+    // config (e.g. the server-side `backoff` that used to override
+    // ack_wait) would survive every restart. Update preserves the
+    // consumer's cursor; only the config changes.
     let consumer = stream
-        .get_or_create_consumer(durable, consumer_config(durable, filter_subjects))
+        .create_consumer(consumer_config(durable, filter_subjects))
         .await
         .map_err(|e| DurableError::Consumer(e.to_string()))?;
     consumer
@@ -210,13 +245,18 @@ pub async fn settle<E: std::fmt::Display>(msg: &Message, outcome: Result<(), E>)
                 );
                 let _ = msg.ack_with(AckKind::Term).await;
             } else {
+                // Pacing rides the NAK itself (a bare NAK redelivers
+                // immediately) — the consumer carries no server-side
+                // backoff, which would double as the ack deadline.
+                let delay = redelivery_delay(delivered);
                 warn!(
                     subject = %msg.subject,
                     delivered,
+                    retry_in_secs = delay.as_secs(),
                     error = %err,
                     "handler failed; NAK for redelivery"
                 );
-                let _ = msg.ack_with(AckKind::Nak(None)).await;
+                let _ = msg.ack_with(AckKind::Nak(Some(delay))).await;
             }
         }
     }
@@ -270,14 +310,34 @@ mod tests {
         assert!(matches!(c.ack_policy, AckPolicy::Explicit));
         assert_eq!(c.max_deliver, MAX_DELIVER);
         assert_eq!(c.filter_subjects, vec!["step.>".to_string()]);
+        // A server-side backoff schedule REPLACES ack_wait as the
+        // per-attempt ack deadline — backoff[0]=1s silently redelivered
+        // every event slower than 1s and ran its side effects twice.
+        // Retry pacing must ride the NAK (redelivery_delay), never the
+        // consumer config.
         assert!(
-            !c.backoff.is_empty(),
-            "a backoff schedule is what lets a transient clear before retry"
+            c.backoff.is_empty(),
+            "consumer backoff overrides ack_wait; pacing belongs on the NAK"
         );
         assert_eq!(
-            c.backoff.len() as i64,
+            c.ack_wait, ACK_WAIT,
+            "ack_wait is the crash backstop and must survive intact"
+        );
+    }
+
+    #[test]
+    fn redelivery_delay_walks_the_schedule_and_clamps_to_the_tail() {
+        assert_eq!(redelivery_delay(1), Duration::from_secs(1));
+        assert_eq!(redelivery_delay(2), Duration::from_secs(2));
+        assert_eq!(redelivery_delay(3), Duration::from_secs(5));
+        // Beyond the schedule (and any nonsense attempt number) → 30s tail.
+        assert_eq!(redelivery_delay(7), Duration::from_secs(30));
+        assert_eq!(redelivery_delay(100), Duration::from_secs(30));
+        assert_eq!(redelivery_delay(0), Duration::from_secs(1));
+        assert_eq!(
+            redelivery_backoff().len() as i64,
             MAX_DELIVER - 1,
-            "one backoff gap per redelivery (deliveries = attempts; gaps = attempts-1)"
+            "one gap per redelivery (deliveries = attempts; gaps = attempts-1)"
         );
     }
 

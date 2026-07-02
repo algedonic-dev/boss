@@ -100,7 +100,7 @@ pub const INVENTORY_TRANSFERRED: &str = "inventory.transferred";
 /// transferred. Closes the WIP-balance gap: without this event,
 /// burden absorption lives only in financial_facts and vanishes when
 /// the audit_log-only seed bundle is exported + reimported.
-pub const INVENTORY_LABOR_ABSORBED: &str = "inventory.labor.absorbed";
+pub const INVENTORY_OVERHEAD_ABSORBED: &str = "inventory.overhead.absorbed";
 
 // Vendor CRM (procurement). Four entity families, all upsert-shaped
 // (handlers use ON CONFLICT DO UPDATE so create + update collapse

@@ -400,6 +400,9 @@ fn err(e: InventoryError) -> Response {
             format!("insufficient stock: {sku} has {on_hand}, need {need}"),
         )
             .into_response(),
+        e @ InventoryError::InvalidAccount(_) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response()
+        }
         InventoryError::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
     }
 }

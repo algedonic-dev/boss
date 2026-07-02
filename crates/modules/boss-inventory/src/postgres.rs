@@ -348,7 +348,7 @@ impl InventoryRepository for PgInventory {
         Ok(row.map(|(v,)| v))
     }
 
-    async fn record_labor_absorbed(
+    async fn record_overhead_absorbed(
         &self,
         total_cost_cents: i64,
         debit_account: &str,
@@ -382,7 +382,7 @@ impl InventoryRepository for PgInventory {
             "finance.inventory.transferred",
             happened_on,
             &payload,
-            "ledger_labor_absorbed",
+            "ledger_overhead_absorbed",
             source_id,
         )
         .await?;
@@ -394,7 +394,7 @@ impl InventoryRepository for PgInventory {
             "SELECT id FROM financial_facts              WHERE kind = $1 AND source_table = $2 AND source_id = $3",
         )
         .bind("finance.inventory.transferred")
-        .bind("ledger_labor_absorbed")
+        .bind("ledger_overhead_absorbed")
         .bind(source_id)
         .fetch_one(&mut *tx)
         .await
@@ -408,7 +408,17 @@ impl InventoryRepository for PgInventory {
         };
         boss_ledger::post_fact_in_tx(&mut tx, &fact_ref)
             .await
-            .map_err(|e| InventoryError::Storage(format!("ledger post: {e}")))?;
+            .map_err(|e| match e {
+                // A bad account code is request data, not storage: the
+                // step author (or seed) named an account the chart
+                // doesn't hold. Surfaced as InvalidAccount so the HTTP
+                // layer answers 422 with the offending code instead of
+                // a generic 500.
+                boss_ledger::LedgerError::UnknownAccount(code) => InventoryError::InvalidAccount(
+                    format!("GL account code `{code}` is not in the chart of accounts"),
+                ),
+                e => InventoryError::Storage(format!("ledger post: {e}")),
+            })?;
 
         tx.commit()
             .await

@@ -15,6 +15,12 @@ pub enum InventoryError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    /// A caller-supplied GL account code that the chart doesn't hold —
+    /// deterministic request-data error (a seed/authoring typo), not a
+    /// storage failure. The HTTP layer maps this to 422 so it reads as
+    /// a client error, distinct from real 5xx storage trouble.
+    #[error("invalid account: {0}")]
+    InvalidAccount(String),
 }
 
 /// Persistence port for inventory tables.
@@ -98,7 +104,7 @@ pub trait InventoryRepository: Send + Sync {
         part_sku: &str,
     ) -> Result<Option<String>, InventoryError>;
 
-    /// Record labor + overhead being capitalized into WIP at
+    /// Record one production-overhead driver being capitalized into WIP at
     /// production-consume time. Two writes in one tx:
     ///   1. `finance.inventory.transferred` financial_fact +
     ///      journal entry (DR `debit_account` / CR `credit_account`).
@@ -111,7 +117,7 @@ pub trait InventoryRepository: Send + Sync {
     /// timestamp fallback; the `(kind, source_table, source_id)`
     /// unique index makes the insert idempotent across rebuild
     /// replays.
-    async fn record_labor_absorbed(
+    async fn record_overhead_absorbed(
         &self,
         total_cost_cents: i64,
         debit_account: &str,

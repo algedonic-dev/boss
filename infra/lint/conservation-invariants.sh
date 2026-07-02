@@ -312,10 +312,10 @@ SQL
 # hold in Model B as written. parts.consume credits 1300 / debits
 # 1310 at *material* cost (cheap raw ingredients), while
 # products.produce debits 1320 / credits 1310 at *standard* FG
-# cost (which bakes in expected labor + overhead). The gap is
-# real production value-add that lives in labor + overhead,
+# cost (which bakes in expected production overhead). The gap is
+# real production value-add that lives in overhead drivers,
 # expected to be absorbed via a paired "burden applied" JE
-# (DR 1310 / CR labor + overhead) on every brew step. Until
+# (DR 1310 / CR expense per driver) on every brew step. Until
 # that absorption rule lands, 1310 runs structurally negative
 # in proportion to throughput.
 #
@@ -418,7 +418,7 @@ SQL
 # ---- Q. WIP balance roughly zero (burden absorption closes the gap) ----
 # Tolerance ±$500k. A materially negative balance means
 # production-produce credited 1310 WIP without a matching
-# consume + labor-absorbed pair on the debit side. Catches the
+# consume + overhead-absorbed pair on the debit side. Catches the
 # pre-burden-absorption pathology that left WIP at −$87.9M.
 #
 # Tolerance bumped 2026-05-29 from $50k → $500k. The residual
@@ -434,7 +434,7 @@ WITH wip AS (
         WHERE a.code = '1310'
      )
 SELECT 'wip_1310=' || bal
-     || ' — production-produce credits 1310 outpaced consume + labor-absorbed debits;'
+     || ' — production-produce credits 1310 outpaced consume + overhead-absorbed debits;'
      || ' burden absorption is missing or under-calibrated'
   FROM wip
  WHERE abs(bal) > 50000000  -- >$500k of unmatched WIP flow

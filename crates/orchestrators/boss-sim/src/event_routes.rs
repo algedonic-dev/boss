@@ -119,15 +119,15 @@ pub fn register_default_event_routes(out: &mut LiveApiOutput) {
         "/api/ledger/inventory-transferred",
         EventHttpMethod::Post,
     );
-    // Burden absorption — labor + overhead capitalized into WIP at
+    // Burden absorption — production overhead capitalized into WIP at
     // production-consume time. Routed to inventory-api (not ledger-api)
-    // so the canonical inventory.labor.absorbed audit_log event lands
+    // so the canonical inventory.overhead.absorbed audit_log event lands
     // alongside the ITEM_CONSUMED / INVENTORY_TRANSFERRED siblings.
     // The handler in inventory-api writes the financial_fact +
     // journal entry too — same dual-write shape as consume_part.
     out.register_event_route(
-        "inventory.labor.absorbed",
-        "/api/inventory/labor-absorbed",
+        "inventory.overhead.absorbed",
+        "/api/inventory/overhead-absorbed",
         EventHttpMethod::Post,
     );
     out.register_event_route(

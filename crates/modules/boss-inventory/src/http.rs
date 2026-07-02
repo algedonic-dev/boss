@@ -73,8 +73,8 @@ pub fn router<R: InventoryRepository + 'static>(state: InventoryApiState<R>) -> 
             get(primary_vendor_for_sku::<R>),
         )
         .route(
-            "/api/inventory/labor-absorbed",
-            post(labor_absorbed_handler::<R>),
+            "/api/inventory/overhead-absorbed",
+            post(overhead_absorbed_handler::<R>),
         )
         .route(
             "/api/inventory/items/{part_sku}/receive",

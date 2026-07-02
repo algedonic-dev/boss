@@ -698,6 +698,13 @@ pub(super) struct FactsSumBody {
     source_table: String,
     #[serde(default)]
     source_ids: Vec<String>,
+    /// Optional payload filter: only count/sum facts whose
+    /// `payload.debit_account` equals this. The drain-actual-wip caller
+    /// passes `1310` so a fact posted under a matching source id but
+    /// debiting some other account (the absorption endpoint accepts a
+    /// caller-supplied `debit_account`) can't be drained out of WIP.
+    #[serde(default)]
+    debit_account: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -729,11 +736,13 @@ pub(super) async fn financial_facts_sum_handler(
          FROM financial_facts \
          WHERE kind = $1 AND source_table = $2 \
            AND source_id = ANY($3) \
-           AND supersede_reason IS NULL",
+           AND supersede_reason IS NULL \
+           AND ($4::text IS NULL OR payload->>'debit_account' = $4)",
     )
     .bind(&body.kind)
     .bind(&body.source_table)
     .bind(&body.source_ids)
+    .bind(&body.debit_account)
     .fetch_one(&state.pool)
     .await;
     match row {

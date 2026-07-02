@@ -80,9 +80,16 @@ REPO_ROOT="/opt/boss"
 # you edit it directly. The 7060/7250 collision (commits `bb60c58`
 # + `8bf0f0a`) was caused by exactly this kind of hand-sync drift.
 PORTS_BIN="$REPO_ROOT/target/release/boss-ports-list"
+# `sim-control` is in the port registry for the boss-simulator proxy's
+# benefit, but it is NOT a deployable unit — it's the brewery-sim
+# daemon's embedded control/telemetry server, alive only while the
+# daemon runs. Filter it at the source so none of the deploy loops
+# (unit planning, TO_DEPLOY, health probes) trip on it. If the
+# registry grows more embedded ports, consider a `deployable` flag on
+# boss_ports::PortSpec instead of extending this filter.
 if [[ -x "$PORTS_BIN" ]]; then
     mapfile -t PAIRED_SERVICES < <("$PORTS_BIN" --paired)
-    mapfile -t SOLO_SERVICES   < <("$PORTS_BIN" --solo)
+    mapfile -t SOLO_SERVICES   < <("$PORTS_BIN" --solo | grep -v '^sim-control:')
 else
     echo "warning: $PORTS_BIN not built; using fallback snapshot" >&2
     PAIRED_SERVICES=(
