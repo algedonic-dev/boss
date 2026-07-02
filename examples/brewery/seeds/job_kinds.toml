@@ -685,15 +685,24 @@ title_template = "Brew full batch (mash in — drain ingredients)"
 # `parts_consumed`, ensures it is both consumed AND counted into the
 # derived FG cost, preserving WIP symmetry):
 #   8×$25 2-row + 3×$30 Munich + 2×$300 Cascade (dry-hop) +
-#   1×$15 yeast + 1×$25 CO2 = $930 → $18.60/case derived FG cost
-#   (50 × 1860¢ = 93,000¢ = the BOM total exactly, so the WIP→FG
-#   credit equals the raw→WIP debit and 1310 nets to zero).
+#   1×$15 yeast + 1×$25 CO2 = $930 raw BOM.
+#
+# overhead_absorbed: the same three per-bbl production drivers the
+# morning-brew mash-ins carry (see the pale-ale mash-in for the full
+# rate derivation), × this batch's 4 bbl (the package step's
+# excise_bbl). Without the stamp, seasonal beer would cost out
+# materials-only while the house styles carry $50.80/bbl of burden —
+# two silently different costing bases in one P&L.
 metadata_defaults = { mash_temp_f = 150, mash_minutes = 75, ingredients_consumed = [
     { part_sku = "ING-MALT-2ROW-50", qty = 8 },
     { part_sku = "ING-MALT-MUNICH-50", qty = 3 },
     { part_sku = "ING-HOPS-CASCADE-44", qty = 2 },
     { part_sku = "ING-YEAST-CALI-1L", qty = 1 },
     { part_sku = "PKG-CO2-50LB", qty = 1 },
+], overhead_absorbed = [
+    { amount_cents = 14640, credit_account = "6100", memo = "Direct labor — 4 bbl × $36.60/bbl" },
+    { amount_cents = 2240, credit_account = "6300", memo = "Process utilities — 4 bbl × $5.60/bbl" },
+    { amount_cents = 3440, credit_account = "6900", memo = "Production depreciation — 4 bbl × $8.60/bbl" },
 ] }
 
 [[job_kind.step]]
@@ -711,13 +720,15 @@ authority_role = "packaging-tech"
 # FG cost basis is DERIVED at runtime by products.produce from this
 # brew's real consumed inputs (the brew-full-batch
 # `ingredients_consumed` above, each at its real inventory avg_cost)
-# — matching the WIP that step debited, so 1310 nets to zero per
-# release instead of draining. COGS therefore comes from real
-# purchases, not a percentage-of-price plug. `unit_cost_cents` is
-# only a fallback if the real cost can't be resolved; it matches the
-# $18.60/case the BOM derives ($930 ÷ 50 cases).
+# PLUS its absorbed overhead drivers — matching the WIP that step
+# debited, within the per-unit rounding quantum, so 1310 nets to
+# ~zero per release instead of draining. COGS therefore comes from
+# real purchases + stamped burden, not a percentage-of-price plug.
+# `unit_cost_cents` is only a fallback if the real cost can't be
+# resolved; it matches the ($930 BOM + $203.20 overhead) ÷ 50 cases
+# ≈ $22.66/case the drain derives.
 metadata_defaults = { batch_id = "", excise_bbl = 4, produces_products = [
-    { sku = "FP-SEASONAL-12OZ-CS", qty = 50, location_id = "loc-brewery-brewhouse", unit_cost_cents = 1860 },
+    { sku = "FP-SEASONAL-12OZ-CS", qty = 50, location_id = "loc-brewery-brewhouse", unit_cost_cents = 2266 },
 ] }
 
 [[job_kind.step]]

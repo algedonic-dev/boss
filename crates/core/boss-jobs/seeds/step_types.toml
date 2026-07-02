@@ -1041,6 +1041,12 @@ required_roles = ["production-tech", "production-lead", "brewer", "head-brewer"]
   description = "Drawdowns [{part_sku, qty}]; the inventory side-effect decrements each"
 
   [[step_type.fields]]
+  name = "overhead_absorbed"
+  field_type = "array"
+  required = false
+  description = "Production drivers capitalized into WIP [{amount_cents, credit_account, memo?}] — one DR 1310 / CR <expense> fact per driver; drained back out by the Job's products.produce step"
+
+  [[step_type.fields]]
   name = "batch_id"
   field_type = "string"
   required = false
@@ -1062,6 +1068,12 @@ required_roles = ["production-tech", "production-lead", "packaging-tech", "brewe
   field_type = "array"
   required = true
   description = "Outputs [{sku, qty, location_id}]; the products side-effect increments each via POST /api/products/{sku}/inventory/produce"
+
+  [[step_type.fields]]
+  name = "overhead_absorbed"
+  field_type = "array"
+  required = false
+  description = "This step's OWN production drivers capitalized into WIP [{amount_cents, credit_account, memo?}] (e.g. packaging labor) — absorbed by the sibling parts-consume side effect and drained by this step's own produce"
 
   [[step_type.fields]]
   name = "batch_id"
