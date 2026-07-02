@@ -190,11 +190,16 @@ impl ProductsProduce {
         };
         let mash_cost = raw_mash_cost.saturating_add(overhead_cost);
 
-        // This format's share of the joint mash, spread across every
-        // format that actually packages.
-        let this_vol = this_step_volume(steps, step.step_id);
-        let denom = packaged_volume_denominator(steps);
-        let mash_share = mash_share_cents(mash_cost, this_vol, denom);
+        // This format's share of the joint mash, split exactly across
+        // every format that actually packages. Every sibling produce
+        // event computes the same deterministic allocation from the same
+        // job snapshot and picks out its own entry, so the shares sum to
+        // mash_cost to the cent (see `mash_share_allocation`).
+        let mash_share = mash_share_allocation(steps, mash_cost)
+            .into_iter()
+            .find(|(id, _)| id == step.step_id)
+            .map(|(_, share)| share)
+            .unwrap_or(0);
 
         Ok(Some(own_cost.saturating_add(mash_share)))
     }
@@ -450,39 +455,67 @@ fn produce_step_volume(step: &Value) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// The packaged volume of the produce step `this_step_id`.
-fn this_step_volume(steps: &[Value], this_step_id: &str) -> f64 {
-    steps
-        .iter()
-        .find(|s| s.get("id").and_then(|v| v.as_str()) == Some(this_step_id))
-        .map(produce_step_volume)
-        .unwrap_or(0.0)
-}
-
-/// Total packaged BBL the joint mash spreads across: the summed allocated
-/// volume of every produce step. `packaging.allocate` writes each format's
-/// packaged keg qty onto its produce step — INCLUDING a 0 for a format it
-/// skipped — so a skipped format contributes 0 volume and drops out of the
-/// denominator, and the packaged formats absorb its mash share into their
-/// COGS. Non-producing steps carry no `produces_products` and contribute 0.
+/// Split the joint mash cost across every step with packaged volume,
+/// exactly: floor each volume-proportional share, then hand the
+/// remaining cents to the largest fractional remainders (largest-
+/// remainder method; ties break by step-id order). Deterministic — every
+/// sibling produce event computes this same allocation independently
+/// from the same job snapshot and picks out its own entry — and exact:
+/// the shares sum to `mash_cost` to the cent. Independent per-format
+/// `round()` (the old form) could gain or lose a cent per brew: 1310
+/// WIP residue no source_id owns, which an exact conservation check or
+/// WIP reconciliation can never zero out.
 ///
-/// This reads the allocated quantities directly (data), replacing the old
-/// coupling to a per-format demand-gate's `outcome` — which broke once the
-/// packaging split moved to the single allocation step, and which the
-/// lagging-`status` variant of got wrong (under-draining WIP when a skipped
-/// format hadn't flipped to `skipped` yet).
-fn packaged_volume_denominator(steps: &[Value]) -> f64 {
-    steps.iter().map(produce_step_volume).sum()
-}
-
-/// This format's share of the joint mash cost: `mash × this_vol /
-/// denom_vol`, rounded to cents. Zero when there's no packaged volume
-/// (never divides by zero).
-fn mash_share_cents(mash_cost: i64, this_vol: f64, denom_vol: f64) -> i64 {
-    if denom_vol <= 0.0 {
-        return 0;
+/// `packaging.allocate` writes each format's packaged keg qty onto its
+/// produce step — INCLUDING a 0 for a format it skipped — so a skipped
+/// format carries 0 volume, drops out of the allocation, and the
+/// packaged formats absorb its mash share into their COGS. Non-producing
+/// steps carry no `produces_products` and never appear.
+fn mash_share_allocation(steps: &[Value], mash_cost: i64) -> Vec<(String, i64)> {
+    let mut formats: Vec<(String, f64)> = steps
+        .iter()
+        .filter_map(|s| {
+            let id = s.get("id").and_then(|v| v.as_str())?;
+            let vol = produce_step_volume(s);
+            (vol > 0.0).then(|| (id.to_string(), vol))
+        })
+        .collect();
+    // Stable id order: the base order remainder ties resolve in, the
+    // same on every sibling's independently-computed allocation.
+    formats.sort_by(|a, b| a.0.cmp(&b.0));
+    let denom: f64 = formats.iter().map(|(_, v)| v).sum();
+    if denom <= 0.0 || mash_cost <= 0 {
+        return formats.into_iter().map(|(id, _)| (id, 0)).collect();
     }
-    ((mash_cost as f64) * this_vol / denom_vol).round() as i64
+    let mut shares: Vec<(String, i64, f64)> = formats
+        .into_iter()
+        .map(|(id, vol)| {
+            let exact = mash_cost as f64 * vol / denom;
+            let floor = exact.floor() as i64;
+            (id, floor, exact - exact.floor())
+        })
+        .collect();
+    let assigned: i64 = shares.iter().map(|(_, cents, _)| cents).sum();
+    let mut leftover = mash_cost.saturating_sub(assigned);
+    let mut by_remainder: Vec<usize> = (0..shares.len()).collect();
+    // Stable sort: equal remainders keep id order.
+    by_remainder.sort_by(|&a, &b| {
+        shares[b]
+            .2
+            .partial_cmp(&shares[a].2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for idx in by_remainder {
+        if leftover <= 0 {
+            break;
+        }
+        shares[idx].1 += 1;
+        leftover -= 1;
+    }
+    shares
+        .into_iter()
+        .map(|(id, cents, _)| (id, cents))
+        .collect()
 }
 
 #[async_trait]
@@ -542,6 +575,13 @@ impl Handler for ProductsProduce {
             }
             // Derived unit cost = cost × (this keg's volume / total
             // volume) ÷ qty, i.e. cost × unit_volume / total_volume.
+            // KNOWN RESIDUAL: unit_cost is an integer, so the posted
+            // drain (qty × unit_cost) can differ from this step's exact
+            // share by up to ~qty/2 cents per line. Exact per-line
+            // conservation needs the produce endpoint to accept a line
+            // total instead of a unit cost — deferred to the WIP-
+            // reconciliation workstream, which owns sweeping the
+            // bounded remainder.
             let unit_cost = match cost {
                 Some(c) if total_volume > 0.0 => {
                     Some(((c as f64) * keg_volume_bbl(&it.sku) / total_volume).round() as i64)
@@ -625,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn denominator_excludes_zero_qty_skipped_formats() {
+    fn allocation_excludes_zero_qty_skipped_formats() {
         // packaging.allocate stamps qty 0 on a format it skips, so that produce
         // step contributes 0 volume — the packaged format absorbs the whole
         // batch's WIP. Read straight from the allocated quantities: no
@@ -636,12 +676,22 @@ mod tests {
             json!({ "id": "pkg-sixtel", "kind": "production-produce",
                     "metadata": { "produces_products": [{ "sku": "FP-PALE-1-6-BBL", "qty": 0 }] } }), // skipped → 0
         ];
-        assert!((packaged_volume_denominator(&steps) - 105.0).abs() < 1e-6);
-        // Both packaged → both counted (the demand-driven split).
+        // Skipped format doesn't appear; the packaged one takes it all.
+        assert_eq!(
+            mash_share_allocation(&steps, 1_000),
+            vec![("pkg-half".to_string(), 1_000)]
+        );
+        // Both packaged → split by volume (105 vs 52.5 → 2:1).
         let mut both = steps.clone();
         both[1] = json!({ "id": "pkg-sixtel", "kind": "production-produce",
                           "metadata": { "produces_products": [{ "sku": "FP-PALE-1-6-BBL", "qty": 315 }] } }); // 52.5
-        assert!((packaged_volume_denominator(&both) - 157.5).abs() < 1e-6); // 105 + 52.5
+        assert_eq!(
+            mash_share_allocation(&both, 1_500),
+            vec![
+                ("pkg-half".to_string(), 1_000),
+                ("pkg-sixtel".to_string(), 500)
+            ]
+        );
     }
 
     #[test]
@@ -735,12 +785,43 @@ mod tests {
     }
 
     #[test]
-    fn mash_share_splits_then_absorbs_on_skip() {
-        // Two formats both packaging equal volume → split 50/50.
-        assert_eq!(mash_share_cents(1000, 105.0, 210.0), 500);
-        // Sibling skipped → denom = this format only → absorbs 100%.
-        assert_eq!(mash_share_cents(1000, 105.0, 105.0), 1000);
-        // Guard: zero packaged volume → no share (never divides by zero).
-        assert_eq!(mash_share_cents(1000, 0.0, 0.0), 0);
+    fn mash_share_allocation_is_exact_to_the_cent() {
+        let steps = |half_qty: i64, sixtel_qty: i64| {
+            vec![
+                json!({ "id": "pkg-half", "kind": "production-produce",
+                        "metadata": { "produces_products": [{ "sku": "FP-PALE-1-2-BBL", "qty": half_qty }] } }),
+                json!({ "id": "pkg-sixtel", "kind": "production-produce",
+                        "metadata": { "produces_products": [{ "sku": "FP-PALE-1-6-BBL", "qty": sixtel_qty }] } }),
+            ]
+        };
+        // Equal volume → 50/50.
+        let equal = steps(210, 630); // 105 bbl each
+        assert_eq!(
+            mash_share_allocation(&equal, 1_000),
+            vec![
+                ("pkg-half".to_string(), 500),
+                ("pkg-sixtel".to_string(), 500)
+            ]
+        );
+        // Odd cent: independent rounding would post 501 + 501 = 1,002
+        // (a phantom cent of WIP drained that consume never
+        // capitalized). Largest-remainder hands the leftover cent to
+        // exactly one format — equal remainders tie-break by id order —
+        // and the shares sum to the input.
+        let split = mash_share_allocation(&equal, 1_001);
+        assert_eq!(
+            split,
+            vec![
+                ("pkg-half".to_string(), 501),
+                ("pkg-sixtel".to_string(), 500)
+            ]
+        );
+        assert_eq!(split.iter().map(|(_, c)| c).sum::<i64>(), 1_001);
+        // Uneven volumes, awkward total: still exact.
+        let uneven = steps(210, 315); // 105 vs 52.5 bbl
+        let alloc = mash_share_allocation(&uneven, 1_000_003);
+        assert_eq!(alloc.iter().map(|(_, c)| c).sum::<i64>(), 1_000_003);
+        // Guard: no packaged volume → no shares (never divides by zero).
+        assert!(mash_share_allocation(&steps(0, 0), 1_000).is_empty());
     }
 }
