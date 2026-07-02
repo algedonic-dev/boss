@@ -138,12 +138,20 @@ fn overhead_absorption_stamps_equal_rate_times_batch_bbl() {
         let batch_bbl: i64 = kind
             .steps
             .iter()
-            .find_map(|s| s.metadata_defaults.get("batch_bbl").and_then(|v| v.as_i64()))
+            .find_map(|s| {
+                s.metadata_defaults
+                    .get("batch_bbl")
+                    .and_then(|v| v.as_i64())
+            })
             .unwrap_or_else(|| {
                 kind.steps
                     .iter()
                     .filter(|s| s.kind == "production-produce")
-                    .filter_map(|s| s.metadata_defaults.get("excise_bbl").and_then(|v| v.as_i64()))
+                    .filter_map(|s| {
+                        s.metadata_defaults
+                            .get("excise_bbl")
+                            .and_then(|v| v.as_i64())
+                    })
                     .sum()
             });
 
@@ -190,7 +198,10 @@ fn overhead_absorption_stamps_equal_rate_times_batch_bbl() {
                             kind.kind, step.title
                         )
                     });
-                let amount = row.get("amount_cents").and_then(|v| v.as_i64()).unwrap_or(0);
+                let amount = row
+                    .get("amount_cents")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
                 assert_eq!(
                     amount,
                     rate * batch_bbl,
@@ -215,12 +226,7 @@ fn overhead_absorption_stamps_equal_rate_times_batch_bbl() {
         // absorption is costing materials-only — a silently different
         // basis from its siblings. Every producing kind with a
         // production-consume step must stamp its drivers.
-        if produces
-            && kind
-                .steps
-                .iter()
-                .any(|s| s.kind == "production-consume")
-        {
+        if produces && kind.steps.iter().any(|s| s.kind == "production-consume") {
             let stamped = kind.steps.iter().any(|s| {
                 s.metadata_defaults
                     .get("overhead_absorbed")

@@ -777,7 +777,10 @@ mod tests {
                 "produces_products": [{ "sku": "FP-PALE-1-2-BBL", "qty": 210 }]
             }}),
         ];
-        assert_eq!(mash_source_ids(&steps, "pkg"), vec!["mash:ING-A".to_string()]);
+        assert_eq!(
+            mash_source_ids(&steps, "pkg"),
+            vec!["mash:ING-A".to_string()]
+        );
         assert_eq!(
             overhead_source_ids(&steps, "pkg"),
             vec!["overhead-absorbed@mash:6100".to_string()]

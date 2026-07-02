@@ -295,7 +295,10 @@ mod tests {
         assert_eq!(abs.len(), 2);
         assert_eq!(abs[0].credit_account, "6100");
         assert_eq!(abs[0].amount_cents, 678_280);
-        assert_eq!(abs[0].memo.as_deref(), Some("Brewhouse labor; Cellar labor"));
+        assert_eq!(
+            abs[0].memo.as_deref(),
+            Some("Brewhouse labor; Cellar labor")
+        );
         assert_eq!(abs[1].credit_account, "6300");
     }
 
