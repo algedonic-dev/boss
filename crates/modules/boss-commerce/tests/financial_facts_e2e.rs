@@ -99,12 +99,73 @@ async fn create_invoice_emits_issued_fact() {
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(payload["invoice_id"], "inv-ff-1");
+    // The live fact now carries the full Invoice struct (same shape the
+    // commerce.invoice.created event emits) so it rebuilds byte-identically:
+    // top-level `id` (not `invoice_id`), line items keyed `revenue_category`.
+    assert_eq!(payload["id"], "inv-ff-1");
     assert_eq!(payload["account_id"], "account-ff-1");
     assert_eq!(payload["amount_cents"], 1_200_000);
     assert_eq!(payload["currency"], "USD");
-    assert_eq!(payload["line_items"][0]["category"], "new-sales");
+    assert_eq!(payload["line_items"][0]["revenue_category"], "new-sales");
     assert_eq!(payload["line_items"][0]["amount_cents"], 1_200_000);
+}
+
+/// The commerce-alignment invariant: the live in-tx `finance.invoice.issued`
+/// fact must be byte-identical to the fact rebuilt from the
+/// `commerce.invoice.created` event (which the publisher stamps with
+/// `_actor`/`_simulated`). Drives the REAL create path, emits the event the
+/// handler would (same `invoice_created_payload` off the same enriched
+/// invoice) plus the envelope, rebuilds, and asserts the payloads match.
+#[tokio::test(flavor = "multi_thread")]
+async fn issued_fact_is_byte_identical_to_rebuild_from_event() {
+    let db = TestDb::new().await;
+    let commerce = PgCommerce::new(db.pool.clone());
+
+    let enriched = commerce
+        .create_invoice(&invoice(
+            "inv-parity-1",
+            InvoiceStatus::OUTSTANDING.into(),
+            None,
+        ))
+        .await
+        .unwrap();
+
+    // Snapshot the live fact payload before the rebuild's TRUNCATE wipes it.
+    let live: Value = sqlx::query_scalar(
+        "SELECT payload FROM financial_facts \
+         WHERE source_id = 'inv-parity-1' AND kind = 'finance.invoice.issued'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    // The event exactly as the handler emits it, plus the publisher envelope.
+    let mut event_payload = boss_commerce::events::invoice_created_payload(&enriched);
+    event_payload["_actor"] = serde_json::json!("sim:workforce");
+    event_payload["_simulated"] = serde_json::json!(true);
+    sqlx::query(
+        "INSERT INTO audit_log (event_id, timestamp, source, kind, payload) \
+         VALUES (gen_random_uuid(), now(), 'commerce', 'commerce.invoice.created', $1)",
+    )
+    .bind(&event_payload)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    boss_ledger::rebuild_facts(&db.pool).await.unwrap();
+
+    let rebuilt: Value = sqlx::query_scalar(
+        "SELECT payload FROM financial_facts \
+         WHERE source_id = 'inv-parity-1' AND kind = 'finance.invoice.issued'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        live, rebuilt,
+        "live invoice.issued fact must equal the envelope-stripped rebuild from the event"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -50,6 +50,28 @@ pub fn tax_lines_for(tax_cents: i64, tax_jurisdiction: Option<&str>) -> Option<s
     }
 }
 
+/// Full `commerce.invoice.created` / `finance.invoice.issued` payload:
+/// the serialized `Invoice` (header + line_items) plus the derived
+/// `tax_lines`. SINGLE SOURCE OF TRUTH — the live in-tx fact
+/// (`postgres.rs::create_invoice_at`) and the emitted
+/// `commerce.invoice.created` event (`http.rs`) both build the payload
+/// from this, off the SAME enriched invoice, so the live fact and the
+/// fact rebuilt from the event are byte-identical (modulo the publisher
+/// envelope, which `rebuild_facts::strip_envelope` removes). The event
+/// must carry the full struct because it ALSO rebuilds the `invoices`
+/// projection (`rebuild.rs` `from_value::<Invoice>`), so the fact grows
+/// to match it rather than the event shrinking.
+pub fn invoice_created_payload(inv: &crate::types::Invoice) -> serde_json::Value {
+    let mut payload = serde_json::to_value(inv).unwrap_or_default();
+    if let (Some(obj), Some(tax_lines)) = (
+        payload.as_object_mut(),
+        tax_lines_for(inv.tax_cents, inv.tax_jurisdiction.as_deref()),
+    ) {
+        obj.insert("tax_lines".into(), tax_lines);
+    }
+    payload
+}
+
 /// Service agreement upserted (POST /api/commerce/agreements).
 /// Payload mirrors the full `ServiceAgreement` row state. Status
 /// changes ride on the same event kind via the handler's

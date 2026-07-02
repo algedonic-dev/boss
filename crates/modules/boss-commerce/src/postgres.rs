@@ -388,57 +388,17 @@ impl CommerceRepository for PgCommerce {
             enriched_lines.push(enriched);
         }
 
-        // Emit the invoice.issued financial fact in the same tx. Idempotent
-        // via the unique (kind, source) index — replay re-emission is a no-op.
-        // tax_lines is omitted entirely on zero-tax invoices so the payload
-        // stays clean.
-        let mut payload_map = serde_json::Map::new();
-        payload_map.insert("invoice_id".into(), serde_json::json!(inv.id));
-        payload_map.insert("account_id".into(), serde_json::json!(inv.account_id));
-        payload_map.insert("amount_cents".into(), serde_json::json!(inv.amount_cents));
-        payload_map.insert("currency".into(), serde_json::json!(inv.currency));
-        payload_map.insert("issued_on".into(), serde_json::json!(inv.issued_on));
-        payload_map.insert(
-            "line_items".into(),
-            serde_json::json!(
-                enriched_lines
-                    .iter()
-                    .map(|l| {
-                        let mut m = serde_json::Map::new();
-                        m.insert(
-                            "category".into(),
-                            serde_json::Value::String(l.revenue_category.as_str().to_string()),
-                        );
-                        m.insert("amount_cents".into(), serde_json::json!(l.amount_cents));
-                        m.insert(
-                            "currency".into(),
-                            serde_json::Value::String(l.currency.clone()),
-                        );
-                        // Pass through SKU/qty/cost_basis so the
-                        // `invoice_issued` posting rule can draw COGS.
-                        if let Some(sku) = &l.sku {
-                            m.insert("sku".into(), serde_json::Value::String(sku.clone()));
-                        }
-                        if let Some(qty) = l.qty {
-                            m.insert("qty".into(), serde_json::json!(qty));
-                        }
-                        if let Some(cb) = l.cost_basis_cents {
-                            m.insert("cost_basis_cents".into(), serde_json::json!(cb));
-                        }
-                        serde_json::Value::Object(m)
-                    })
-                    .collect::<Vec<_>>()
-            ),
-        );
-        // tax_lines via the shared helper so the live fact and the
-        // commerce.invoice.created audit event (http.rs) can't drift —
-        // both feed the ledger `invoice_issued` rule's CR 2300.
-        if let Some(tax_lines) =
-            crate::events::tax_lines_for(inv.tax_cents, inv.tax_jurisdiction.as_deref())
-        {
-            payload_map.insert("tax_lines".into(), tax_lines);
-        }
-        let issued_payload = serde_json::Value::Object(payload_map);
+        // Assemble the enriched invoice (line_items now carry the FG
+        // cost_basis_cents observed during drawdown), then build the
+        // finance.invoice.issued fact from the SAME shared helper the
+        // commerce.invoice.created event uses (events::invoice_created_payload),
+        // off this SAME value — so the live fact and the fact rebuilt from
+        // the event are byte-identical (the event carries the full Invoice
+        // struct because it also rebuilds the invoices projection). Idempotent
+        // via the unique (kind, source) index; replay re-emission is a no-op.
+        let mut enriched_invoice = inv.clone();
+        enriched_invoice.line_items = enriched_lines;
+        let issued_payload = crate::events::invoice_created_payload(&enriched_invoice);
         insert_fact(
             &mut tx,
             "finance.invoice.issued",
@@ -484,13 +444,11 @@ impl CommerceRepository for PgCommerce {
             .await
             .map_err(|e| CommerceError::Storage(e.to_string()))?;
 
-        // Return the enriched invoice (line_items now carry the
-        // FG cost_basis_cents observed during drawdown) so callers
-        // can emit the audit event with the same shape the
-        // financial_fact persists. Without this, audit_log replay
-        // can't reconstruct COGS legs.
-        let mut enriched_invoice = inv.clone();
-        enriched_invoice.line_items = enriched_lines;
+        // enriched_invoice (assembled above, before the fact write) is
+        // exactly what the handler emits as the commerce.invoice.created
+        // event — the same shape the finance.invoice.issued fact persists,
+        // so audit_log replay reconstructs the identical fact (incl. COGS
+        // legs).
         Ok(enriched_invoice)
     }
 
@@ -584,31 +542,44 @@ impl CommerceRepository for PgCommerce {
             .begin()
             .await
             .map_err(|e| CommerceError::Storage(e.to_string()))?;
-        let row: Option<(i64, String, String, chrono::NaiveDate)> = sqlx::query_as(
-            "UPDATE invoices SET status = 'written-off' WHERE id = $1 \
-             RETURNING amount_cents, account_id, currency, issued_on",
+        let updated = sqlx::query("UPDATE invoices SET status = 'written-off' WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CommerceError::Storage(e.to_string()))?;
+        if updated.rows_affected() == 0 {
+            return Err(CommerceError::NotFound(format!("invoice {id}")));
+        }
+        // Fetch the full written-off invoice in-tx so the live fact payload
+        // is byte-identical to the commerce.invoice.written_off event the
+        // handler emits (`to_value` of the same invoice fetched post-flip).
+        // The write-off rule reads only amount_cents, but the event must
+        // carry the full Invoice (rebuild.rs `from_value::<Invoice>` flips
+        // the invoices projection), so the fact grows to match it.
+        let row: InvoiceRow = sqlx::query_as("SELECT * FROM invoices WHERE id = $1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| CommerceError::Storage(e.to_string()))?;
+        let mut invoice = row.into_invoice();
+        let lines: Vec<LineItemRow> = sqlx::query_as(
+            "SELECT id, invoice_id, revenue_category, amount_cents, currency, description, ref_id, \
+                    sku, qty, cost_basis_cents \
+             FROM invoice_line_items WHERE invoice_id = $1 ORDER BY id",
         )
         .bind(id)
-        .fetch_optional(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| CommerceError::Storage(e.to_string()))?;
-        let Some((amount_cents, account_id, currency, issued_on)) = row else {
-            return Err(CommerceError::NotFound(format!("invoice {id}")));
-        };
-        let payload = serde_json::json!({
-            "invoice_id": id,
-            "account_id": account_id,
-            "amount_cents": amount_cents,
-            "currency": currency,
-            "issued_on": issued_on,
-        });
+        invoice.line_items = lines.into_iter().map(|l| l.into_line_item()).collect();
+        let payload = serde_json::to_value(&invoice).unwrap_or_default();
         insert_fact(
             &mut tx,
             "finance.invoice.written_off",
-            issued_on,
+            invoice.issued_on,
             &payload,
             "invoices",
-            id,
+            &invoice.id,
         )
         .await?;
         tx.commit()

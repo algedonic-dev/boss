@@ -29,26 +29,6 @@ fn error_response(err: CommerceError) -> Response {
 const DEFAULT_LIMIT: i64 = 100;
 const MAX_LIMIT: i64 = 1000;
 
-/// Build the `commerce.invoice.created` audit payload from the enriched
-/// invoice. The `Invoice` struct serializes to header + line_items but
-/// NOT the `tax_lines` array — that lives only on the live
-/// `finance.invoice.issued` fact (postgres.rs). The rebuild's
-/// `commerce.invoice.created → finance.invoice.issued` projection rule
-/// copies this payload verbatim, so without `tax_lines` here the
-/// rebuilt fact loses 2300 Sales Tax Payable. Inject the SAME
-/// `tax_lines` the live fact gets (shared `events::tax_lines_for`
-/// helper) so live + rebuild stay byte-for-byte identical.
-fn invoice_created_payload(inv: &crate::types::Invoice) -> serde_json::Value {
-    let mut payload = serde_json::to_value(inv).unwrap_or_default();
-    if let (Some(obj), Some(tax_lines)) = (
-        payload.as_object_mut(),
-        crate::events::tax_lines_for(inv.tax_cents, inv.tax_jurisdiction.as_deref()),
-    ) {
-        obj.insert("tax_lines".into(), tax_lines);
-    }
-    payload
-}
-
 #[derive(Deserialize)]
 struct ListFilter {
     limit: Option<i64>,
@@ -276,7 +256,7 @@ async fn create_invoice<R: CommerceRepository + 'static>(
                 pub_.emit_with_actor_at(
                     crate::events::INVOICE_CREATED,
                     actor,
-                    invoice_created_payload(&enriched),
+                    crate::events::invoice_created_payload(&enriched),
                     now,
                 )
                 .await;
@@ -346,7 +326,7 @@ async fn batch_invoices<R: CommerceRepository + 'static>(
                     pub_.emit_with_actor_at(
                         crate::events::INVOICE_CREATED,
                         actor.clone(),
-                        invoice_created_payload(&enriched),
+                        crate::events::invoice_created_payload(&enriched),
                         now,
                     )
                     .await;
@@ -544,7 +524,7 @@ mod tests {
 
     #[test]
     fn invoice_created_payload_omits_tax_lines_when_untaxed() {
-        let payload = invoice_created_payload(&test_invoice("inv-notax"));
+        let payload = crate::events::invoice_created_payload(&test_invoice("inv-notax"));
         assert!(
             payload.get("tax_lines").is_none(),
             "zero-tax invoice must not carry tax_lines in the audit payload"
@@ -563,7 +543,7 @@ mod tests {
         inv.tax_cents = 100_000;
         inv.tax_jurisdiction = Some("US-CA".to_string());
 
-        let payload = invoice_created_payload(&inv);
+        let payload = crate::events::invoice_created_payload(&inv);
         let tax_lines = payload
             .get("tax_lines")
             .and_then(|v| v.as_array())
