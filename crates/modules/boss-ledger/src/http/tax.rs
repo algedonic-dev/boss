@@ -274,10 +274,10 @@ pub(super) async fn create_tax_filing(
                     COALESCE(SUM(CASE WHEN a.kind='revenue' \
                                       THEN l.credit_cents - l.debit_cents \
                                       ELSE 0 END), 0)::bigint AS revenue, \
-                    COALESCE(SUM(CASE WHEN a.kind='cogs' \
+                    COALESCE(SUM(CASE WHEN a.code LIKE '5%' \
                                       THEN l.debit_cents - l.credit_cents \
                                       ELSE 0 END), 0)::bigint AS cogs, \
-                    COALESCE(SUM(CASE WHEN a.kind='expense' \
+                    COALESCE(SUM(CASE WHEN a.kind='expense' AND a.code NOT LIKE '5%' \
                                       THEN l.debit_cents - l.credit_cents \
                                       ELSE 0 END), 0)::bigint AS opex \
                  FROM gl_journal_lines l \
