@@ -426,3 +426,108 @@ if a contributor wants them.
       Small SPA change (~1 hour). Pair with the existing past-due
       display so the same view shows: outstanding (current) /
       outstanding (past-due) / written-off (uncollectable).
+
+## Coherence audit backlog (2026-07-01)
+
+A read-only coherence audit (4 parallel agents: financial/ledger, frontend,
+projections/rebuild, cross-boundary contracts) found the core sound
+(double-entry enforced at 3 layers, WIP→FG→COGS reconciles, projections
+mostly deterministic) but surfaced these edge / display / latent issues.
+Grouped by priority; the display cluster is being tackled first.
+
+### Display — user-visible wrong/wonky numbers (frontend)
+
+- [ ] **Account-class rollup count isn't rendered in the cockpit.** The
+      Rust sends a per-class `distinct` account count, but
+      `apps/simulator/src/CockpitPage.svelte` has `DISTINCT_NOUN.account =
+      ''`, so `distinctLabel('account', n)` returns `''` and "N accounts"
+      never shows. Set `account` (and `vendor`) to a real noun. Completes the
+      account-class rollup PR (its Rust half). *(→ folded into that PR.)*
+- [ ] **"Paid YTD" is actually lifetime-paid.**
+      `apps/web/src/accounts/AccountPage.svelte:177` sums all paid invoices
+      with no year filter; overstates for any account with history. Filter
+      `paid_on >= startOfYear`, or relabel.
+- [ ] **~20 sites format money as `$${(cents/100).toLocaleString()}` and
+      drop cents** ($42.50→"$42.5", $42.00→"$42"). PoPage, VendorPage,
+      VendorInvoicePage, VendorsList, PartPage, AccountPage, RepairSurface,
+      DevicePage, CatalogBrowser. Sweep to web-kit `formatMoney`/`formatUsd`.
+- [ ] **Indirect cash-flow shows the subtotal but zero operating line
+      items.** Rust moved the breakdown to a new `operating_activities`
+      field (`boss-ledger/src/http/statements.rs:679,688`); the TS
+      `CashFlowStatement` + `CashFlowTab` still render the now-always-empty
+      `working_capital_adjustments`/`non_cash_adjustments`. Add + render
+      `operating_activities`.
+- [ ] **`written-off` invoices render a blank status chip.** TS
+      `InvoiceStatus` union (`apps/web/src/finance/types.ts:5`) is missing
+      `'written-off'` (a real terminal state) → `INVOICE_STATUS_LABEL[status]`
+      is `undefined`; `InvoicesTab` also miscounts them as "unpaid". Add to
+      union + label + chip variant. *(Overlaps the A/R-aging polish item above.)*
+
+### Correctness — numbers that don't add up under the hood
+
+- [ ] **`financial_facts` payloads diverge live-vs-rebuilt.** The publisher
+      injects `_actor`/`_simulated` into the event payload
+      (`boss-core/src/publisher.rs:123-140`) but the in-tx fact omits them
+      (`boss-inventory/http/items.rs:239-252`, `boss-products/http.rs`), so
+      `rebuild_facts` reconstructs a different payload. Masked because the
+      shipped gate (`boss_ledger_replay_check.rs`) only diffs journal *lines*.
+      Build the in-tx fact payload from the post-injection value (or strip the
+      injected keys in `rebuild_facts`).
+- [ ] **Message ages are nonsense on some messages.** `boss-messages/http.rs`
+      stamps `sent_at` with sim-time on one path (:344) and `Utc::now()` on
+      another (:394); the frontend ages against sim-time. Stamp sim-time on
+      both send paths.
+- [ ] **Income-tax net-income sums a dead `kind='cogs'` bucket** (always 0 —
+      the chart has no `'cogs'` kind, COGS is `'expense'`).
+      `boss-ledger/src/http/tax.rs:277-295`. Total is right by accident;
+      switch to `code LIKE '5%'` and align with the income statement.
+- [ ] **`gl_account_daily` panics on a missing account code.**
+      `boss-ledger/src/postgres.rs:318,339` `account_ids[line.account_code]`
+      indexes a HashMap (no-panic-in-library violation). Use a checked lookup
+      → `LedgerError`. Also add `gl_account_daily` to a replay-check (live
+      i128 vs rebuild SQL `trunc` parity is correct-but-unverified).
+- [ ] **Shipping status roll-up is replay-order-dependent.**
+      `boss-shipping/src/rebuild.rs:164-195` sets status from tracking scans in
+      `id` order with no advance-only gate → live-vs-rebuilt `status`/`shipped_on`
+      divergence on out-of-order delivery. Gate on `stage_index` monotonicity.
+- [ ] **Inconsistent replay `ORDER BY` across rebuilders** (`id` vs
+      `(timestamp, event_id)`). Under sim-time many events share a timestamp →
+      tie-break on a random UUID. Order-invariant for pure upserts today;
+      standardize on `ORDER BY id`.
+
+### Latent / low
+
+- [ ] **Cash-attribution split loses cents on 3+-line cash JEs.**
+      `upsert_daily_rollup` (`boss-ledger/postgres.rs:344`) truncates the
+      proportional split and never redistributes the remainder → surfaces as
+      `reconciliation_gap_cents`. Give the largest-share offset the residual.
+- [ ] **Cash-flow "indirect" branch is actually the direct method** (header
+      comment inverted) and the **investing section is always empty** —
+      equipment cash is attributed to 2100 A/P → classified operating.
+      `boss-ledger/src/http/statements.rs:439+`.
+- [ ] **`post_inventory_movement` hardcodes the FactRef kind**
+      (`boss-ledger/src/http/facts.rs:465`) ignoring its `fact_kind` param.
+      Latent (both kinds share a rule today).
+- [ ] **New-invoice header total ≠ line-item sum on sub-cent inputs**
+      (`apps/web/src/finance/NewInvoicePage.svelte:164` rounds the summed
+      float; lines round independently) → trips the "line sum ≠ header"
+      warning on a just-created invoice.
+- [ ] **Zero-cost stock mutations double-apply on NAK-redelivery.** When
+      `avg_cost == 0` no proof-fact is written, so the idempotency guard has
+      nothing to check (`boss-products/postgres.rs:210`, `boss-inventory/
+      postgres.rs:150`). Self-heals on rebuild. Write a zero-amount proof-fact.
+- [ ] **Schedule-triggered dispatcher rules break the cascade graph.** TS
+      `DispatcherRule.on_event` is non-optional; a scheduled rule omits it →
+      `EVT(undefined)` node (`apps/web/src/dispatcher/cascadeToGraph.ts`).
+      Latent — 0 scheduled rules today.
+- [ ] **Messages `archived` rebuild overwrites `kind` + drops `archived_at`**
+      (`boss-messages/src/rebuild.rs:179`). Projection-fidelity gap.
+- [ ] **Commerce status-flip rebuild skips line items** if the `created` event
+      is outside the audit slice (`boss-commerce/src/rebuild.rs:109`). Edge.
+- [ ] **`AccountPage` `kFmt` always renders "$…K"** → $400 shows "$0K". Reuse
+      the tiered `ExecPage` formatter.
+- [ ] **Cockpit cadence label shows the per-pass batch cap as "per tick"**
+      (`CockpitPage.svelte:209`) — overstates granularity at hourly ticks.
+- [ ] **(unverified) `TaxFiling` TS unions narrower than the Rust `String`**
+      (`liability_account`/`kind`) — mis-narrows if a new code is added
+      server-side.
