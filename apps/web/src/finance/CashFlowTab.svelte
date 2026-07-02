@@ -98,6 +98,7 @@
       }));
     const rows: Row[] = [
       { section: 'Operating activities', account_code: '', account_name: 'Net income', amount_cents: d.net_income_cents },
+      ...flatten('Operating activities', d.operating_activities),
       ...flatten('Operating activities — working capital', d.working_capital_adjustments),
       ...flatten('Operating activities — non-cash', d.non_cash_adjustments),
       { section: 'Operating activities', account_code: '', account_name: 'Cash from operating activities', amount_cents: d.cash_from_operations_cents },
@@ -234,6 +235,22 @@
                 <td style="padding-left:12px; font-weight:600">Net income</td>
                 <td style="text-align:right; font-weight:600">{formatUsd(d.net_income_cents)}</td>
               </tr>
+              {#if d.operating_activities.length > 0}
+                <tr>
+                  <td colspan="2" style="padding-left:12px; color:#78716c; font-style:italic; font-size:12px">
+                    Cash from operating activities (by source):
+                  </td>
+                </tr>
+                {#each d.operating_activities as l (l.account_code)}
+                  <tr>
+                    <td style="padding-left:24px">
+                      <span class="mono" style="margin-right:8px; color:#78716c">{l.account_code}</span>
+                      {l.account_name}
+                    </td>
+                    <td style="text-align:right">{formatUsd(l.amount_cents)}</td>
+                  </tr>
+                {/each}
+              {/if}
               {#if d.working_capital_adjustments.length > 0}
                 <tr>
                   <td colspan="2" style="padding-left:12px; color:#78716c; font-style:italic; font-size:12px">

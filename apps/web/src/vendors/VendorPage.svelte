@@ -14,6 +14,7 @@
   import Meta from '@boss/web-kit/ui/Meta.svelte';
   import ProvenanceBadge from '@boss/web-kit/ui/ProvenanceBadge.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
+  import { formatMoney } from '@boss/web-kit/ui/money';
   import {
     loadVendorAccountTeam,
     loadVendorContacts,
@@ -214,9 +215,9 @@
           <Meta label="Open POs">{openPos.length}</Meta>
           <Meta label="POs lifetime">{vendorPos.length}</Meta>
           <Meta label="Unpaid bills">{unpaidBills.length}</Meta>
-          <Meta label="Outstanding">${(outstandingCents / 100).toLocaleString()}</Meta>
-          <Meta label="Spend lifetime">${(lifetimeSpendCents / 100).toLocaleString()}</Meta>
-          <Meta label="Paid lifetime">${(lifetimePaidCents / 100).toLocaleString()}</Meta>
+          <Meta label="Outstanding">{formatMoney({ amount_cents: outstandingCents, currency: 'USD' })}</Meta>
+          <Meta label="Spend lifetime">{formatMoney({ amount_cents: lifetimeSpendCents, currency: 'USD' })}</Meta>
+          <Meta label="Paid lifetime">{formatMoney({ amount_cents: lifetimePaidCents, currency: 'USD' })}</Meta>
           <Meta label="Last PO">{lastPoDate ?? '—'}</Meta>
           <Meta label="Last bill">{lastBillDate ?? '—'}</Meta>
           <Meta label="Lead time">{vendor.lead_time_days} days</Meta>
@@ -472,7 +473,7 @@
                   <td class="mono"><EntityLink kind="po" id={vi.po_id} /></td>
                   <td>{vi.received_on}</td>
                   <td>{vi.status}</td>
-                  <td class="num">${(vi.amount_cents / 100).toLocaleString()}</td>
+                  <td class="num">{formatMoney({ amount_cents: vi.amount_cents, currency: vi.currency })}</td>
                 </tr>
               {/each}
             </tbody>

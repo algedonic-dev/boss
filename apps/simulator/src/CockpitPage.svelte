@@ -72,8 +72,8 @@
   // sourced per-Subject from the model. Empty noun = no label shown.
   const DISTINCT_NOUN: Record<ActorActivity['kind'], string> = {
     employee: 'person',
-    account: '',
-    vendor: '',
+    account: 'account',
+    vendor: 'vendor',
     bank: '',
     environment: '',
   };
