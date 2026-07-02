@@ -26,8 +26,10 @@
 //!
 //! So the `drain-actual-wip` basis values this produce step's drain as:
 //!   - its **own packaging legs** (consumed on this step) at current
-//!     `avg_cost` — exactly what the sibling `inventory.parts.consume`
-//!     side effect will debit moments later, so they net to zero; plus
+//!     `avg_cost`, plus its **own absorbed overhead** (if stamped) at the
+//!     stamped amounts — exactly what the sibling
+//!     `inventory.parts.consume` side effect will debit moments later,
+//!     so they net to zero; plus
 //!   - its **share of the joint mash**, `mash × (this format's packaged
 //!     volume / Σ volume of every format that packages)`, where `mash` is
 //!     the real DR-1310 cost the mash-in legs capitalized — **raw
@@ -45,8 +47,13 @@
 //! The basis is **selected by data** (the `cost_basis` arg in
 //! `infra/dispatcher/rules.toml`); code provides the named bases. The
 //! legacy `current-avg-cost` basis (whole-Job inputs at current avg) stays
-//! reachable and is also the fallback if the ledger read fails, so
-//! production never breaks.
+//! reachable as a data-selected basis. A failed **or partial** ledger
+//! read is NOT silently degraded around: the handler errs, the event
+//! NAKs, and the drain retries once the facts land. Draining short would
+//! bake the shortfall into the FG cost basis permanently — rebuild
+//! replays the recorded produce fact verbatim and never re-runs this
+//! computation — so a loud retry (dead-letter if the facts never come)
+//! is the only path that conserves WIP.
 
 use super::common::{self, StepEvent};
 use async_trait::async_trait;
@@ -117,10 +124,15 @@ impl ProductsProduce {
     }
 
     /// `drain-actual-wip` (default). The WIP this produce step should
-    /// drain: its own packaging at current `avg_cost` + its volume-share
-    /// of the brew's real capitalized mash cost (read from the ledger).
-    /// Returns `None` to signal "fall back to the current-avg basis" (the
-    /// ledger read failed), so production never breaks.
+    /// drain: its own packaging at current `avg_cost` + its own absorbed
+    /// overhead (if stamped) + its volume-share of the brew's real
+    /// capitalized mash cost (read from the ledger). Returns `None` only
+    /// when the job carries no steps to reconstruct from — the caller
+    /// then falls back to the current-avg basis. Ledger-read failures
+    /// propagate `Err` so the event NAKs and retries: draining short
+    /// would bake the shortfall into the FG cost basis permanently,
+    /// because rebuild replays the recorded produce fact verbatim and
+    /// never re-runs this computation.
     async fn drain_actual_wip_cents(
         &self,
         step: &StepEvent<'_>,
@@ -140,49 +152,42 @@ impl ProductsProduce {
             own_cost =
                 own_cost.saturating_add(self.avg_cost_cents(&sku).await?.saturating_mul(qty));
         }
+        // This step's OWN absorbed overhead (e.g. packaging labor stamped
+        // on a produce step) — the produce step's to drain, exactly like
+        // its own packaging legs. Valued from the same metadata rows the
+        // sibling parts-consume side effect absorbs moments later on this
+        // same event (it runs after this handler in the rule's do-list),
+        // so the two net to zero. The ledger can't be asked here: those
+        // facts land after this drain computes.
+        for ab in common::overhead_absorbed(step.metadata, step.step_id) {
+            own_cost = own_cost.saturating_add(ab.amount_cents);
+        }
 
         // Shared mash: the real DR-1310 cost its consume legs capitalized
         // — raw materials plus any production overhead absorbed at those
         // same mash steps (direct labor / utilities / depreciation
         // drivers). Both are DR-1310 facts; summing both is what drains
         // the *full* WIP a brew capitalized, so the drivers reach FG/COGS
-        // instead of stranding in WIP.
-        let mut mash_ids = mash_source_ids(steps, step.step_id);
-        mash_ids.sort();
-        mash_ids.dedup();
-        let raw_mash_cost = match self
-            .ledger_transferred_sum("inventory_consume", &mash_ids)
-            .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    "products.produce drain-actual-wip: ledger sum failed for job {} ({e}); \
-                     falling back to current avg_cost basis",
-                    step.job_id
-                );
-                return Ok(None);
-            }
+        // instead of stranding in WIP. The two sums are independent
+        // read-only aggregates — issue them concurrently.
+        //
+        // Failure policy: a failed OR partial read (see the matched-count
+        // check in `ledger_transferred_sum`) propagates `Err` → NAK →
+        // redelivery, converging once the facts land. Both sums run
+        // before any side effect, so the retry is clean. The old
+        // behavior — draining raw-only when the overhead read failed —
+        // permanently understated the FG basis and stranded the absorbed
+        // overhead in 1310: rebuild replays recorded facts, it never
+        // re-runs this drain, so nothing downstream could heal it.
+        let mash_ids = mash_source_ids(steps, step.step_id);
+        let overhead_ids = overhead_source_ids(steps, step.step_id);
+        let (raw_mash_cost, overhead_cost) = {
+            let (raw, overhead) = tokio::join!(
+                self.ledger_transferred_sum("inventory_consume", mash_ids),
+                self.ledger_transferred_sum("ledger_overhead_absorbed", overhead_ids),
+            );
+            (raw?, overhead?)
         };
-        // Absorbed production overhead at the mash steps — keyed
-        // `overhead-absorbed@{step}:{credit_account}` (the absorption
-        // endpoint's source_id), `source_table=ledger_overhead_absorbed`. A
-        // failed read drains raw only this run (the overhead stays in WIP,
-        // recoverable on rebuild) rather than breaking production.
-        let mut overhead_ids = overhead_source_ids(steps, step.step_id);
-        overhead_ids.sort();
-        overhead_ids.dedup();
-        let overhead_cost = self
-            .ledger_transferred_sum("ledger_overhead_absorbed", &overhead_ids)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    "products.produce drain-actual-wip: overhead sum failed for job {} ({e}); \
-                     draining raw mash only this run",
-                    step.job_id
-                );
-                0
-            });
         let mash_cost = raw_mash_cost.saturating_add(overhead_cost);
 
         // This format's share of the joint mash, spread across every
@@ -224,11 +229,24 @@ impl ProductsProduce {
     /// `finance.inventory.transferred` / `ledger_overhead_absorbed`
     /// overhead drivers are summed this way — only the `source_table`
     /// and the source-id shape differ.
+    ///
+    /// Every requested leg must have landed: the endpoint's `matched`
+    /// count is compared against the (deduped) request, and a shortfall
+    /// is an error, not a smaller sum. A short match means the step
+    /// metadata names facts the ledger doesn't hold yet — typically the
+    /// consume/absorb side effect is still in NAK-redelivery — and
+    /// summing anyway would silently under-drain WIP into a cost basis
+    /// that rebuild then reproduces forever. Err → NAK → retry converges
+    /// once the facts land; a fact that never lands dead-letters loudly.
     async fn ledger_transferred_sum(
         &self,
         source_table: &str,
-        source_ids: &[String],
+        mut source_ids: Vec<String>,
     ) -> Result<i64, HandlerError> {
+        // Unique ids: `source_id = ANY(..)` can't double-count rows, and
+        // `matched` (a row count) is compared against the request set.
+        source_ids.sort();
+        source_ids.dedup();
         if source_ids.is_empty() {
             return Ok(0);
         }
@@ -243,6 +261,7 @@ impl ProductsProduce {
                 "kind": "finance.inventory.transferred",
                 "source_table": source_table,
                 "source_ids": source_ids,
+                "debit_account": "1310",
             }))
             .send()
             .await
@@ -258,6 +277,14 @@ impl ProductsProduce {
             .json()
             .await
             .map_err(|e| HandlerError::Downstream(format!("POST {url} not JSON: {e}")))?;
+        let matched = v.get("matched").and_then(|x| x.as_i64()).unwrap_or(-1);
+        if matched != source_ids.len() as i64 {
+            return Err(HandlerError::Downstream(format!(
+                "POST {url}: {matched} of {} requested {source_table} facts matched — \
+                 refusing to drain short (facts not landed yet, or source-id drift)",
+                source_ids.len()
+            )));
+        }
         Ok(v.get("total_cost_cents")
             .and_then(|x| x.as_i64())
             .unwrap_or(0))
@@ -489,8 +516,9 @@ impl Handler for ProductsProduce {
         let cost = match basis {
             "current-avg-cost" => self.current_avg_brew_cost(&job).await?,
             // drain-actual-wip (default): drain exactly what consume
-            // capitalized; fall back to the current-avg basis on a failed
-            // ledger read so production never breaks.
+            // capitalized. A failed/partial ledger read propagates Err
+            // (NAK → retry once the facts land); the current-avg
+            // fallback below covers only the structural no-steps case.
             _ => match self.drain_actual_wip_cents(&step, &job).await? {
                 Some(c) => Some(c),
                 None => self.current_avg_brew_cost(&job).await?,
