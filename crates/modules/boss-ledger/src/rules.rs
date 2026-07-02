@@ -1027,8 +1027,14 @@ fn cents_from_payload(v: Option<&serde_json::Value>) -> Option<i64> {
 }
 
 fn invoice_memo(fact: &FactRef<'_>, verb: &str) -> Option<String> {
+    // Live commerce facts now carry the full Invoice struct, whose id
+    // serializes as `id`; the older minimal shape (and the live-only
+    // finance.invoice.paid fact) use `invoice_id`. Accept either so the
+    // memo — and thus the journal entry — is identical for the live fact
+    // and the fact rebuilt from the event.
     fact.payload
         .get("invoice_id")
+        .or_else(|| fact.payload.get("id"))
         .and_then(|v| v.as_str())
         .map(|id| format!("{verb}: {id}"))
 }
