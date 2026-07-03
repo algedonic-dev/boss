@@ -93,7 +93,6 @@ pub(super) async fn create_manual_entry(
         .posted_on
         .unwrap_or(boss_clock_client::now_from(&state.clock).await.date_naive());
     let created_by = body.created_by.unwrap_or_else(|| "admin".to_string());
-    let fact_id = Uuid::new_v4();
 
     let lines_json: Vec<serde_json::Value> = body
         .lines
@@ -107,7 +106,10 @@ pub(super) async fn create_manual_entry(
             })
         })
         .collect();
-    let entry_natural_id = fact_id.to_string();
+    // Each manual-entry POST is a fresh entry: mint its natural id here
+    // (it keys the fact's source_id + the payload's entry_id; the fact
+    // ROW id derives from it inside record_fact_in_tx).
+    let entry_natural_id = Uuid::new_v4().to_string();
     let payload = serde_json::json!({
         "entry_id": entry_natural_id,
         "posted_on": posted_on,
@@ -124,7 +126,6 @@ pub(super) async fn create_manual_entry(
     let fact_id = match crate::events::record_fact_in_tx(
         &mut tx,
         crate::events::FactWrite {
-            fact_id,
             kind: "finance.manual.entry",
             happened_on: posted_on,
             payload: &payload,
@@ -246,7 +247,6 @@ pub(super) async fn cogs_recognized_handler(
         .happened_on
         .unwrap_or(boss_clock_client::now_from(&state.clock).await.date_naive());
     let created_by = body.created_by.unwrap_or_else(|| "ledger".to_string());
-    let fact_id = Uuid::new_v4();
     let cogs_account = body.cogs_account.unwrap_or_else(|| "5100".to_string());
     let inventory_account = body.inventory_account.unwrap_or_else(|| "1300".to_string());
 
@@ -280,7 +280,6 @@ pub(super) async fn cogs_recognized_handler(
     let fact_id = match crate::events::record_fact_in_tx(
         &mut tx,
         crate::events::FactWrite {
-            fact_id,
             kind: "finance.cogs.recognized",
             happened_on: posted_on,
             payload: &payload,
@@ -348,8 +347,6 @@ pub(super) struct InventoryTransferredBody {
     /// (a provenance violation, correctness-protocol §1).
     source_table: String,
     source_id: String,
-    #[serde(default)]
-    created_by: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -420,8 +417,11 @@ async fn post_inventory_movement(
     let posted_on = body
         .happened_on
         .unwrap_or(boss_clock_client::now_from(&state.clock).await.date_naive());
-    let created_by = body.created_by.unwrap_or_else(|| "ledger".to_string());
-    let fact_id = Uuid::new_v4();
+    // Pinned, not caller-supplied: the projection rules for these
+    // event kinds carry no created_by_path, so the rebuild always
+    // stamps the event source ("ledger") — a caller override would
+    // diverge from its own rebuild by construction.
+    let created_by = "ledger";
     let mut payload = serde_json::json!({
         "total_cost_cents": body.total_cost_cents,
         "debit_account": body.debit_account,
@@ -457,13 +457,12 @@ async fn post_inventory_movement(
     let fact_id = match crate::events::record_fact_in_tx(
         &mut tx,
         crate::events::FactWrite {
-            fact_id,
             kind: fact_kind,
             happened_on: posted_on,
             payload: &payload,
             source_table: Some(&source_table),
             source_id: Some(&source_id),
-            created_by: &created_by,
+            created_by,
         },
     )
     .await

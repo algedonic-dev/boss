@@ -124,8 +124,11 @@ async fn deep_check_passes_when_audit_event_carries_publisher_envelope() {
         ],
     });
 
-    // Live fact: clean domain payload, no envelope keys.
-    let fact_id = Uuid::new_v4();
+    // Live fact: clean domain payload, no envelope keys. Id derived the
+    // way every live writer derives it (natural key), so the entry diff
+    // could key-match if entries existed.
+    let fact_id =
+        boss_ledger::deterministic_fact_id("finance.invoice.issued", "invoices", "inv-ENV-1");
     sqlx::query(
         "INSERT INTO financial_facts (id, kind, happened_on, payload, source_table, source_id, created_by) \
          VALUES ($1, 'finance.invoice.issued', '2026-08-12', $2, 'invoices', 'inv-ENV-1', 'commerce')",
@@ -224,7 +227,8 @@ async fn deep_check_flags_fact_only_in_live_when_audit_log_lacks_event() {
 
     // Write a fact directly, no audit_log event. The replay would
     // produce zero facts; live has one. Expect OnlyInLive.
-    let fact_id = Uuid::new_v4();
+    let fact_id =
+        boss_ledger::deterministic_fact_id("finance.invoice.issued", "invoices", "inv-DRIFT-1");
     let payload = serde_json::json!({
         "id": "inv-DRIFT-1",
         "issued_on": "2026-06-01",
@@ -306,4 +310,85 @@ async fn deep_check_flags_fact_only_in_replay_when_live_was_wiped() {
         .count();
     assert_eq!(only_in_replay, 1);
     assert_eq!(report.events_scanned, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deep_check_entries_match_when_live_fact_written_by_the_real_writer_path() {
+    // The entry diff keys on (fact_id, rule_version_id). Live writers
+    // used to mint random v4 ids while the rebuild derived v5 over
+    // (event_id, kind), so a live-written fact's entries could never
+    // key-match their replayed twins — every JE double-reported as
+    // only-in-live + only-in-replay. Both sides now derive the id from
+    // the natural key inside record_fact_in_tx; this test drives the
+    // REAL writer path (fact + JE in one tx, then the audit event) and
+    // requires the whole deep check green, entries included.
+    let db = TestDb::new().await;
+    ensure_open_period(&db, 2026, 9).await;
+
+    let payload = serde_json::json!({
+        "id": "inv-IDPAR-1",
+        "issued_on": "2026-09-03",
+        "amount_cents": 42000,
+        "account_id": "acct-P",
+        "currency": "USD",
+        "line_items": [
+            {"description": "Setup", "amount_cents": 42000, "category": "service"},
+        ],
+    });
+    let happened_on: chrono::NaiveDate = "2026-09-03".parse().unwrap();
+
+    let mut tx = db.pool.begin().await.unwrap();
+    let fact_id = boss_ledger::record_fact_in_tx(
+        &mut tx,
+        boss_ledger::FactWrite {
+            kind: "finance.invoice.issued",
+            happened_on,
+            payload: &payload,
+            source_table: Some("invoices"),
+            source_id: Some("inv-IDPAR-1"),
+            created_by: "commerce",
+        },
+    )
+    .await
+    .unwrap();
+    boss_ledger::post_fact_in_tx(
+        &mut tx,
+        &boss_ledger::FactRef {
+            id: fact_id,
+            kind: "finance.invoice.issued",
+            happened_on,
+            payload: &payload,
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // The matching audit event, publisher envelope and all.
+    let mut enveloped = payload.clone();
+    enveloped["_actor"] = serde_json::json!("sim:workforce");
+    insert_audit_event(
+        &db,
+        "commerce.invoice.created",
+        "2026-09-03T09:00:00Z".parse().unwrap(),
+        "commerce",
+        &enveloped,
+    )
+    .await;
+
+    let report = replay_check_from_audit_log(&db.pool).await.unwrap();
+    assert!(
+        report.is_ok(),
+        "the live writer path must reproduce under replay, entries included — got {} fact / {} entry divergences: {:?} {:?}",
+        report.fact_divergences.len(),
+        report.entry_divergences.len(),
+        report.fact_divergences,
+        report.entry_divergences,
+    );
+    // The id IS the natural-key derivation — pinned so a future writer
+    // that drifts from record_fact_in_tx fails here.
+    assert_eq!(
+        fact_id,
+        boss_ledger::deterministic_fact_id("finance.invoice.issued", "invoices", "inv-IDPAR-1")
+    );
 }

@@ -8,10 +8,12 @@
 //! upserts via `record_fact_in_tx` — idempotent on the natural key
 //! `(kind, source_table, source_id)`.
 //!
-//! Determinism: `fact_id` is UUIDv5 over `(event_id, fact_kind)` so
-//! the same audit_log event always produces the same fact UUID.
-//! UUIDs aren't load-bearing for equality (the natural key is) but
-//! determinism makes diffs cheaper for the replay-check.
+//! Determinism: `fact_id` derivation lives in `record_fact_in_tx`
+//! (UUIDv5 over the natural key — see
+//! `events::deterministic_fact_id`), shared with every live writer,
+//! so a rebuilt fact carries the SAME id as its live twin and the
+//! deep replay-check can compare journal entries keyed on
+//! `(fact_id, rule_version_id)` across live and replay.
 //!
 //! v1 ships UPSERT-only semantics. Operators who want a clean
 //! rebuild truncate `financial_facts` (cascading through
@@ -23,7 +25,6 @@ use std::collections::HashMap;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
-use uuid::Uuid;
 
 use crate::error::LedgerError;
 use crate::events::{FactWrite, record_fact_in_tx};
@@ -33,11 +34,6 @@ use crate::supersede::replay_supersede_events_in_tx;
 /// name. Serializes concurrent fact-rebuilds the same way `rebuild`
 /// serializes concurrent ledger-rebuilds.
 const REBUILD_FACTS_LOCK_KEY: i64 = boss_core::rebuild::lock_key("ledger-facts");
-
-/// Namespace UUID for deterministic `fact_id` derivation. UUIDv5 over
-/// `(event_id, fact_kind)` under this namespace gives a stable,
-/// repeatable id per (audit_log row, projected fact kind).
-const FACT_ID_NAMESPACE: Uuid = Uuid::from_u128(0x71004230_67f0_5fac_70ad_d11a51141a6c);
 
 #[derive(Debug, Clone)]
 pub struct ProjectionRule {
@@ -97,7 +93,6 @@ pub enum ProjectionError {
 /// caller-side filtered already, but the check is cheap).
 pub fn project_event(
     rule: &ProjectionRule,
-    event_id: Uuid,
     event_timestamp: DateTime<Utc>,
     event_source: &str,
     event_payload: &Value,
@@ -138,10 +133,7 @@ pub fn project_event(
         None => event_source.to_string(),
     };
 
-    let fact_id = derive_fact_id(event_id, &rule.fact_kind);
-
     Ok(ProjectedFact {
-        fact_id,
         fact_kind: rule.fact_kind.clone(),
         happened_on,
         payload: strip_envelope(event_payload),
@@ -153,10 +145,11 @@ pub fn project_event(
 
 /// Owned form of a projection result. The lifetime-bearing
 /// `FactWrite` shape is too painful to thread out of an inner loop;
-/// callers convert this to a `FactWrite` at the insertion site.
+/// callers convert this to a `FactWrite` at the insertion site. The
+/// fact id is not part of the projection: `record_fact_in_tx` derives
+/// it from the natural key, identically for live writes and replays.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectedFact {
-    pub fact_id: Uuid,
     pub fact_kind: String,
     pub happened_on: NaiveDate,
     pub payload: Value,
@@ -168,7 +161,6 @@ pub struct ProjectedFact {
 impl ProjectedFact {
     pub fn as_write(&self) -> FactWrite<'_> {
         FactWrite {
-            fact_id: self.fact_id,
             kind: &self.fact_kind,
             happened_on: self.happened_on,
             payload: &self.payload,
@@ -254,7 +246,6 @@ pub async fn rebuild_facts_in_tx(
 
     for row in &event_rows {
         events_scanned += 1;
-        let event_id: Uuid = row.get("event_id");
         let timestamp: DateTime<Utc> = row.get("timestamp");
         let source: String = row.get("source");
         let kind: String = row.get("kind");
@@ -264,7 +255,7 @@ pub async fn rebuild_facts_in_tx(
             continue;
         };
 
-        let projected = match project_event(rule, event_id, timestamp, &source, &payload) {
+        let projected = match project_event(rule, timestamp, &source, &payload) {
             Ok(p) => p,
             Err(ProjectionError::MissingField { .. }) => {
                 events_skipped_missing_field += 1;
@@ -344,7 +335,6 @@ async fn rebuild_inert_received_facts_in_tx(
 
     let mut written: u64 = 0;
     for row in &rows {
-        let event_id: Uuid = row.get("event_id");
         let timestamp: DateTime<Utc> = row.get("timestamp");
         let payload: Value = row.get("payload");
 
@@ -361,7 +351,6 @@ async fn rebuild_inert_received_facts_in_tx(
             .and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
             .unwrap_or_else(|| timestamp.date_naive());
 
-        let fact_id = derive_fact_id(event_id, RECEIVE_FACT_KIND);
         // Match the in-tx live fact, which never carries the publisher's
         // `_actor`/`_simulated` envelope keys (same reason as the registry
         // pass — see `strip_envelope`).
@@ -369,7 +358,6 @@ async fn rebuild_inert_received_facts_in_tx(
         record_fact_in_tx(
             tx,
             FactWrite {
-                fact_id,
                 kind: RECEIVE_FACT_KIND,
                 happened_on,
                 payload: &fact_payload,
@@ -444,14 +432,6 @@ fn pointer_string(value: &Value, path: &str) -> Option<String> {
     }
 }
 
-fn derive_fact_id(event_id: Uuid, fact_kind: &str) -> Uuid {
-    let mut input = Vec::with_capacity(16 + fact_kind.len() + 1);
-    input.extend_from_slice(event_id.as_bytes());
-    input.push(0);
-    input.extend_from_slice(fact_kind.as_bytes());
-    Uuid::new_v5(&FACT_ID_NAMESPACE, &input)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,14 +450,13 @@ mod tests {
     #[test]
     fn projects_invoice_created_to_invoice_issued() {
         let r = rule("commerce.invoice.created", "finance.invoice.issued");
-        let event_id = Uuid::new_v4();
         let ts: DateTime<Utc> = "2026-04-01T12:00:00Z".parse().unwrap();
         let payload = serde_json::json!({
             "id": "inv-123",
             "issued_on": "2026-04-01",
             "amount_cents": 50000,
         });
-        let projected = project_event(&r, event_id, ts, "commerce", &payload).unwrap();
+        let projected = project_event(&r, ts, "commerce", &payload).unwrap();
         assert_eq!(projected.fact_kind, "finance.invoice.issued");
         assert_eq!(projected.source_id, "inv-123");
         assert_eq!(projected.happened_on.to_string(), "2026-04-01");
@@ -498,8 +477,7 @@ mod tests {
             "_actor": "sim:workforce",
             "_simulated": true,
         });
-        let projected =
-            project_event(&r, Uuid::new_v4(), Utc::now(), "commerce", &payload).unwrap();
+        let projected = project_event(&r, Utc::now(), "commerce", &payload).unwrap();
         assert_eq!(
             projected.payload,
             serde_json::json!({
@@ -532,7 +510,7 @@ mod tests {
     fn missing_source_id_field_is_an_error() {
         let r = rule("commerce.invoice.created", "finance.invoice.issued");
         let payload = serde_json::json!({"issued_on": "2026-04-01"});
-        let result = project_event(&r, Uuid::new_v4(), Utc::now(), "commerce", &payload);
+        let result = project_event(&r, Utc::now(), "commerce", &payload);
         assert!(matches!(result, Err(ProjectionError::MissingField { .. })));
     }
 
@@ -540,7 +518,7 @@ mod tests {
     fn missing_happened_on_field_is_an_error() {
         let r = rule("commerce.invoice.created", "finance.invoice.issued");
         let payload = serde_json::json!({"id": "inv-123"});
-        let result = project_event(&r, Uuid::new_v4(), Utc::now(), "commerce", &payload);
+        let result = project_event(&r, Utc::now(), "commerce", &payload);
         assert!(matches!(result, Err(ProjectionError::MissingField { .. })));
     }
 
@@ -552,7 +530,7 @@ mod tests {
         };
         let ts: DateTime<Utc> = "2026-04-01T15:30:00Z".parse().unwrap();
         let payload = serde_json::json!({"id": "ent-1"});
-        let projected = project_event(&r, Uuid::new_v4(), ts, "ledger", &payload).unwrap();
+        let projected = project_event(&r, ts, "ledger", &payload).unwrap();
         assert_eq!(projected.happened_on.to_string(), "2026-04-01");
     }
 
@@ -560,31 +538,7 @@ mod tests {
     fn null_created_by_path_falls_back_to_event_source() {
         let r = rule("commerce.invoice.created", "finance.invoice.issued");
         let payload = serde_json::json!({"id": "inv-1", "issued_on": "2026-01-01"});
-        let projected =
-            project_event(&r, Uuid::new_v4(), Utc::now(), "commerce", &payload).unwrap();
+        let projected = project_event(&r, Utc::now(), "commerce", &payload).unwrap();
         assert_eq!(projected.created_by, "commerce");
-    }
-
-    #[test]
-    fn fact_id_is_deterministic_for_same_event_and_kind() {
-        let event_id = Uuid::new_v4();
-        let a = derive_fact_id(event_id, "finance.invoice.issued");
-        let b = derive_fact_id(event_id, "finance.invoice.issued");
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn fact_id_differs_per_event() {
-        let a = derive_fact_id(Uuid::new_v4(), "finance.invoice.issued");
-        let b = derive_fact_id(Uuid::new_v4(), "finance.invoice.issued");
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn fact_id_differs_per_kind() {
-        let event_id = Uuid::new_v4();
-        let a = derive_fact_id(event_id, "finance.invoice.issued");
-        let b = derive_fact_id(event_id, "finance.invoice.paid");
-        assert_ne!(a, b);
     }
 }

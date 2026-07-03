@@ -54,13 +54,37 @@ pub async fn emit_after_commit(
     }
 }
 
+/// Namespace UUID for deterministic fact ids — UUIDv5 over the natural
+/// key `(kind, source_table, source_id)`, the same identity the unique
+/// index enforces.
+pub const FACT_ID_NAMESPACE: Uuid = Uuid::from_u128(0x71004230_67f0_5fac_70ad_d11a51141a6c);
+
+/// The one fact-id derivation, shared by every live writer (via
+/// `record_fact_in_tx` and the cross-crate insert paths in
+/// boss-inventory / boss-commerce / boss-products) AND the audit-log
+/// rebuild. A rebuilt fact therefore carries the SAME id as its live
+/// twin: journal entries keyed `(fact_id, rule_version_id)` compare
+/// across live and replay, and any reference to a fact id survives a
+/// rebuild. The previous split — live writers minting random v4, the
+/// rebuild deriving v5 over `(event_id, fact_kind)` — made the deep
+/// replay-check's entry diff structurally unmatchable for live-written
+/// facts.
+pub fn deterministic_fact_id(kind: &str, source_table: &str, source_id: &str) -> Uuid {
+    let mut input = Vec::with_capacity(kind.len() + source_table.len() + source_id.len() + 2);
+    input.extend_from_slice(kind.as_bytes());
+    input.push(0);
+    input.extend_from_slice(source_table.as_bytes());
+    input.push(0);
+    input.extend_from_slice(source_id.as_bytes());
+    Uuid::new_v5(&FACT_ID_NAMESPACE, &input)
+}
+
 /// Input shape for `record_fact_in_tx`. `source_table` / `source_id`
 /// are `Option` so manual entries (which carry no source row) don't
-/// have to thread sentinel strings.
+/// have to thread sentinel strings. The fact id is NOT a caller input:
+/// it is derived from the natural key inside `record_fact_in_tx`
+/// (see [`deterministic_fact_id`]) so live and rebuilt ids can't drift.
 pub struct FactWrite<'a> {
-    /// UUID hint. Used if we insert; ignored if a row already exists
-    /// for `(kind, source_table, source_id)`.
-    pub fact_id: Uuid,
     pub kind: &'a str,
     pub happened_on: NaiveDate,
     pub payload: &'a Value,
@@ -77,6 +101,13 @@ pub async fn record_fact_in_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     params: FactWrite<'_>,
 ) -> Result<Uuid, LedgerError> {
+    let fact_id = match (params.source_table, params.source_id) {
+        (Some(t), Some(s)) => deterministic_fact_id(params.kind, t, s),
+        // A NULL-key fact has no natural identity to derive from (and
+        // no idempotency — NULLs are distinct in the unique index), so
+        // each insert mints a fresh random id.
+        _ => Uuid::new_v4(),
+    };
     let inserted: Option<(Uuid,)> = sqlx::query_as(
         "INSERT INTO financial_facts \
             (id, kind, happened_on, payload, source_table, source_id, created_by) \
@@ -84,7 +115,7 @@ pub async fn record_fact_in_tx(
          ON CONFLICT (kind, source_table, source_id) DO NOTHING \
          RETURNING id",
     )
-    .bind(params.fact_id)
+    .bind(fact_id)
     .bind(params.kind)
     .bind(params.happened_on)
     .bind(params.payload)
@@ -115,5 +146,43 @@ pub async fn record_fact_in_tx(
             .map_err(|e| LedgerError::Storage(e.to_string()))?;
             Ok(id)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fact_id_is_deterministic_over_the_natural_key() {
+        let a = deterministic_fact_id("finance.tax.accrued", "tax_accruals", "excise-1");
+        let b = deterministic_fact_id("finance.tax.accrued", "tax_accruals", "excise-1");
+        assert_eq!(a, b);
+        // This is the whole point: a live write and an audit-log replay
+        // of the same natural key land on the same id, so entries keyed
+        // (fact_id, rule_version_id) compare across live and rebuild.
+    }
+
+    #[test]
+    fn fact_id_differs_when_any_key_component_differs() {
+        let base = deterministic_fact_id("finance.tax.accrued", "tax_accruals", "excise-1");
+        assert_ne!(
+            base,
+            deterministic_fact_id("finance.tax.remitted", "tax_accruals", "excise-1")
+        );
+        assert_ne!(
+            base,
+            deterministic_fact_id("finance.tax.accrued", "tax_filings", "excise-1")
+        );
+        assert_ne!(
+            base,
+            deterministic_fact_id("finance.tax.accrued", "tax_accruals", "excise-2")
+        );
+        // The NUL separator keeps concatenation unambiguous: ("a","bc")
+        // must not collide with ("ab","c").
+        assert_ne!(
+            deterministic_fact_id("k", "a", "bc"),
+            deterministic_fact_id("k", "ab", "c")
+        );
     }
 }

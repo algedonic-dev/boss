@@ -20,16 +20,14 @@
 //! schedule + period is a no-op. The cursor advance happens in the same
 //! transaction as the fact insert, so either both land or neither does.
 
+#[cfg(feature = "postgres")]
+#[cfg(feature = "postgres")]
+use crate::error::LedgerError;
 use chrono::{Datelike, Months, NaiveDate};
 #[cfg(feature = "postgres")]
 use sqlx::{PgPool, Postgres, Transaction};
 #[cfg(feature = "postgres")]
 use tracing::{info, warn};
-#[cfg(feature = "postgres")]
-use uuid::Uuid;
-
-#[cfg(feature = "postgres")]
-use crate::error::LedgerError;
 
 /// Recognition cadence. Matches the DB-level CHECK constraint on
 /// `revenue_schedules.frequency`.
@@ -350,7 +348,6 @@ async fn advance_one_schedule(
 
     // Insert the fact first (serves as the idempotency anchor via the
     // unique index on (kind, source_table, source_id)).
-    let fact_id = Uuid::new_v4();
     let period_start = post_date;
     let period_end = period_end_for(post_date, row.frequency);
     let source_id_for_fact = format!("{}::{}", row.id, post_date);
@@ -368,13 +365,15 @@ async fn advance_one_schedule(
     let actual_fact_id = crate::events::record_fact_in_tx(
         &mut tx,
         crate::events::FactWrite {
-            fact_id,
             kind: "finance.revenue.recognized",
             happened_on: post_date,
             payload: &payload,
             source_table: Some("revenue_schedules"),
             source_id: Some(&source_id_for_fact),
-            created_by: "boss-ledger-recognize",
+            // The recognize bin publishes its events with source
+            // "ledger"; created_by must match or the rebuilt fact
+            // diverges (the projection falls back to event.source).
+            created_by: "ledger",
         },
     )
     .await?;

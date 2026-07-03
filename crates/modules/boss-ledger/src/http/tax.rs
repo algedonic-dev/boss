@@ -8,7 +8,6 @@ use boss_policy_client::CurrentUser;
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use uuid::Uuid;
 
 use super::*;
 
@@ -408,13 +407,14 @@ async fn post_accrual_entry(
     let live_fact_id = crate::events::record_fact_in_tx(
         &mut tx,
         crate::events::FactWrite {
-            fact_id: Uuid::new_v4(),
             kind: "finance.tax.accrued",
             happened_on: posted_on,
             payload: &payload,
             source_table: Some("tax_filings"),
             source_id: Some(&filing.id),
-            created_by: "tax_filings",
+            // Matches the event source ("ledger") — the projection's
+            // created_by fallback — so rebuilt facts match live ones.
+            created_by: "ledger",
         },
     )
     .await
@@ -497,13 +497,12 @@ pub(super) async fn create_tax_accrual(
     let live_fact_id = match crate::events::record_fact_in_tx(
         &mut tx,
         crate::events::FactWrite {
-            fact_id: Uuid::new_v4(),
             kind: "finance.tax.accrued",
             happened_on: body.posted_on,
             payload: &payload,
             source_table: Some("tax_accruals"),
             source_id: Some(&body.id),
-            created_by: "tax_accruals",
+            created_by: "ledger",
         },
     )
     .await
@@ -636,13 +635,12 @@ pub(super) async fn remit_tax_filing(
     let live_fact_id = match crate::events::record_fact_in_tx(
         &mut tx,
         crate::events::FactWrite {
-            fact_id: Uuid::new_v4(),
             kind: "finance.tax.remitted",
             happened_on: filed_on,
             payload: &payload,
             source_table: Some("tax_filings"),
             source_id: Some(&existing.id),
-            created_by: "tax_filings",
+            created_by: "ledger",
         },
     )
     .await

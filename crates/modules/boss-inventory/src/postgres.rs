@@ -1138,7 +1138,11 @@ async fn insert_dedup_fact(
          VALUES ($1, $2, $3, $4, $5, $6, 'inventory') \
          ON CONFLICT (kind, source_table, source_id) DO NOTHING",
     )
-    .bind(Uuid::new_v4())
+    .bind(boss_ledger::deterministic_fact_id(
+        kind,
+        source_table,
+        source_id,
+    ))
     .bind(kind)
     .bind(happened_on)
     .bind(payload)
@@ -1168,7 +1172,11 @@ async fn insert_fact(
          VALUES ($1, $2, $3, $4, $5, $6, 'inventory') \
          ON CONFLICT (kind, source_table, source_id) DO NOTHING",
     )
-    .bind(Uuid::new_v4())
+    .bind(boss_ledger::deterministic_fact_id(
+        kind,
+        source_table,
+        source_id,
+    ))
     .bind(kind)
     .bind(happened_on)
     .bind(payload)

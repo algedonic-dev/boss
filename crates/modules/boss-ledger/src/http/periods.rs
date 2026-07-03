@@ -360,7 +360,6 @@ pub(super) async fn close_period_handler(
         .map(|(code, _, bal)| serde_json::json!({ "account_code": code, "balance_cents": bal }))
         .collect();
 
-    let fact_id = Uuid::new_v4();
     let payload = serde_json::json!({
         "period_id": id,
         "period_end": ends_on,
@@ -380,7 +379,6 @@ pub(super) async fn close_period_handler(
     let fact_id = match crate::events::record_fact_in_tx(
         &mut tx,
         crate::events::FactWrite {
-            fact_id,
             kind: "finance.period.closed",
             happened_on: ends_on,
             payload: &payload,
