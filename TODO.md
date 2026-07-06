@@ -28,6 +28,51 @@ blocked on a decision before they land; **post-release strategic**
 
 ---
 
+## Near-term queue (2026-07-03)
+
+The active workstream order after the costing-fidelity arc (#51–#63),
+the overhead-absorption review cleanup (#73), and the deep-gate
+first-contact fixes (#74). Sorted by dependency, not size.
+
+- [ ] **Full-year regen validation of #73 + #74.** Neither has had the
+      365-day from-empty run (ephemeral machine + all conservation
+      gates). Both changed year-scale behavior: #73's drain now NAKs on
+      failed/partial ledger reads (the matched-count tripwire must
+      *converge* across ~2,500 brews at warp, not dead-letter), and #74
+      changed fact-id derivation for every fact plus the rebuild path
+      (the determinism guard + end-of-year deep check exercise it at
+      scale). Also produces the first steady-state gross-margin read
+      with all the new mechanics (~77% at day 117 live; the full year
+      with FG turnover settles it).
+- [ ] **Costing PR 6 — WIP reconciliation.** The consume-side ~$421K
+      residual isolated by the GR-IR work (moving-average/WIP costing:
+      gl_1300 > physical), plus the per-line drain rounding sweep #73
+      documented at the produce handler's unit-cost derivation (exact
+      per-line conservation needs the produce endpoint to accept a line
+      total instead of a unit cost).
+- [ ] **Overhead rates as dispatcher rule args × the step's bbl.** The
+      excise-accrual pattern (`ledger.tax.accrue`: rate as a rule arg,
+      multiplied by the step's actual metadata at runtime), applied to
+      absorption — retires the 15 hand-multiplied `amount_cents`
+      constants in the brewery seed. The seed test pinning
+      amount == rate × batch_bbl holds the contract until then.
+- [ ] **`HandlerError::Permanent` — immediate-Term for deterministic
+      data errors.** A 422 (e.g. unknown account code from a seed typo)
+      burns the full 8-NAK redelivery budget before dead-lettering.
+      Needs care: classification must be per-call-site, not blanket-4xx
+      (the consume path's 409 insufficient-stock is 4xx-but-convergent
+      — a restock can land mid-retry).
+- [ ] **Dedup audit-event emits on redelivery, house-wide.** Endpoints
+      emit their audit event unconditionally after an ON-CONFLICT no-op
+      write, so a NAK re-run appends duplicate events for a business
+      occurrence that happened once (facts/JEs/stock are exactly-once
+      on their idempotency keys; the event log carries the noise).
+      `record_fact_in_tx`-style inserted-flags exist — gate the emits
+      on them everywhere, in one pass, not per-endpoint.
+- [ ] **Costing PR 7 — BOM expansion** where defensible: water, real
+      packaging materials (cans/lids/labels), ingredient variety only
+      where the inputs can be sourced. Incomplete > wrong.
+
 ## Open questions — back-compat cleanup
 
 The pre-release back-compat audit found vestigial code preserving
