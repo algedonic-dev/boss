@@ -61,6 +61,23 @@ if ! sudo -u postgres psql -d postgres -tc "SELECT 1 FROM pg_roles WHERE rolname
     sudo -u postgres psql -d postgres -c \
         "CREATE ROLE boss WITH LOGIN SUPERUSER PASSWORD 'boss'"
 fi
+
+# The ~24 API services each run an sqlx pool (default max 10 connections),
+# so the cluster needs well above Postgres's default max_connections=100 —
+# at 100 the pools saturate it ("FATAL: sorry, too many clients already")
+# and burst load (a warp-2000 regen, JetStream redelivery) starves accepts
+# until requests fail at the connection level. 400 matches bootstrap-local.sh,
+# the docker quickstart, and the documented playground setting (see
+# infra/deploy-services.sh). Needs a full restart, so it runs here — before
+# any service connects.
+CURRENT_MAXCONN=$(sudo -u postgres psql -tAc "SHOW max_connections" 2>/dev/null || echo 0)
+if [[ "${CURRENT_MAXCONN:-0}" -lt 400 ]]; then
+    log "raising Postgres max_connections ($CURRENT_MAXCONN -> 400) for the service stack"
+    sudo -u postgres psql -c "ALTER SYSTEM SET max_connections = 400" >/dev/null
+    systemctl restart postgresql
+    for _ in $(seq 1 30); do pg_isready -h 127.0.0.1 -p 5432 -q && break; sleep 1; done
+fi
+
 "$REPO_ROOT/infra/postgres/bootstrap-boss.sh"
 "$REPO_ROOT/infra/postgres/bootstrap-scratch.sh"
 
