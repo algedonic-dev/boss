@@ -1,9 +1,9 @@
 <script lang="ts">
   // /it/design — design-doc review surface.
   //
-  // Lists every design doc indexed by boss-docs-api with the parsed
-  // pending_count (open questions not yet decided) + the in-flight
-  // design-doc-review Job if one exists. Opens a fresh
+  // Lists every design doc indexed by boss-docs-api with its live
+  // open-question count + pending (recorded-but-unflushed) decisions
+  // + the in-flight design-doc-review Job if one exists. Opens a fresh
   // design-doc-review Job on demand for any doc that doesn't already
   // have an open one.
   //
@@ -22,6 +22,9 @@
     path: string;
     title: string;
     status: string;
+    /// Questions currently parsed from the doc's ## Open questions.
+    open_questions: number;
+    /// Decisions recorded in review but not yet flushed to git.
     pending_count: number;
     word_count: number;
     last_modified: string;
@@ -172,6 +175,7 @@
           <th>Doc</th>
           <th>Status</th>
           <th>Open Qs</th>
+          <th>Pending decisions</th>
           <th>Last modified</th>
           <th>Review</th>
         </tr>
@@ -185,6 +189,7 @@
               <div class="design-path">{doc.path}</div>
             </td>
             <td>{doc.status}</td>
+            <td>{doc.open_questions}</td>
             <td>{doc.pending_count}</td>
             <td>{relTime(doc.last_modified)}</td>
             <td>

@@ -126,6 +126,18 @@
           h('span', { className: 'step-review-path' }, ` — ${doc.path}`),
         ),
       );
+      // The doc itself — the review is unreadable without it. Server-
+      // rendered HTML (pulldown_cmark over the repo-committed markdown;
+      // same trust domain as this bundle), collapsible so the questions
+      // stay reachable on long docs.
+      if (doc.content_html) {
+        const details = h('details', { className: 'step-review-doc', open: true });
+        details.appendChild(h('summary', null, `Read the doc (${doc.word_count || '—'} words)`));
+        const docBody = h('div', { className: 'step-review-doc-body' });
+        docBody.innerHTML = doc.content_html;
+        details.appendChild(docBody);
+        bodyDiv.appendChild(details);
+      }
       if (questions.length === 0) {
         bodyDiv.appendChild(
           h(
@@ -155,9 +167,19 @@
             h('span', { className: 'step-review-question-anchor' }, q.anchor),
             h('span', { className: 'step-review-question-title' }, q.title),
           ),
-          q.body_md
-            ? h('pre', { className: 'step-review-question-body' }, q.body_md)
-            : null,
+          // body_html is rendered server-side with the doc pipeline;
+          // the <pre> of raw markdown stays only as the fallback for an
+          // old docs-api.
+          (() => {
+            if (q.body_html) {
+              const b = h('div', { className: 'step-review-question-body' });
+              b.innerHTML = q.body_html;
+              return b;
+            }
+            return q.body_md
+              ? h('pre', { className: 'step-review-question-body' }, q.body_md)
+              : null;
+          })(),
           h('label', { className: 'step-review-resolution-label' }, 'Resolution'),
           ta,
         );
