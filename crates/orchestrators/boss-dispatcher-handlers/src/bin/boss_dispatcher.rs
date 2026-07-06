@@ -19,6 +19,7 @@ use boss_dispatcher::rules::schedule_runner::{DEFAULT_CATCHUP_CAP, ScheduleRunne
 use boss_dispatcher_handlers::handlers::{
     bill_payment_batch::BillPaymentBatch, commerce_invoice_issue::CommerceInvoiceIssue,
     gate_resolve::GateResolve, inventory_bill_approve::InventoryBillApprove,
+    inventory_overhead_absorb::InventoryOverheadAbsorb,
     inventory_parts_consume::InventoryPartsConsume, inventory_parts_produce::InventoryPartsProduce,
     inventory_po_place::InventoryPoPlace, inventory_receive::InventoryReceive,
     jobs_complete_step::JobsCompleteStep, jobs_subjob_resolve::JobsSubjobResolve,
@@ -159,6 +160,15 @@ async fn main() -> Result<()> {
                 "/api/inventory/vendor-invoices/batch-pay",
             ));
             handlers.register(InventoryPartsConsume::new(cfg.inventory_api_url.clone()));
+            // Production-overhead absorption (DR 1310 / CR <driver
+            // expense>) sized rate_cents_per_bbl × batch bbl at runtime —
+            // the rate rides the rule args, the batch size the job's own
+            // data, so the seed stamps no amounts. Needs the jobs API for
+            // the batch-bbl read.
+            handlers.register(InventoryOverheadAbsorb::new(
+                cfg.jobs_api_url.clone(),
+                cfg.inventory_api_url.clone(),
+            ));
             handlers.register(InventoryPartsProduce::new(cfg.inventory_api_url.clone()));
             // FG cost basis is derived from the brew's real consumed-input
             // cost, not a plug. The drain-actual-wip basis drains exactly
