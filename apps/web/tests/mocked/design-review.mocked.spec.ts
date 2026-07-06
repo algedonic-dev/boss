@@ -46,6 +46,53 @@ test.beforeEach(async ({ page }) => {
   );
 });
 
+// The POST contract the page must satisfy: jobs-api deserializes the
+// identity-first Subject ({subject_kind, id}) — the retired
+// {custom_kind, ref_id} shape 422s with "missing field `id`", which is
+// exactly how this page's button silently died in production. The mock
+// enforces the shape so the regression fails in CI, not on the box.
+async function installJobCreateMock(page: import('@playwright/test').Page) {
+  await page.route('**/api/jobs', async (route) => {
+    if (route.request().method() !== 'POST') return route.fallback();
+    const body = route.request().postDataJSON() as {
+      kind: string;
+      subject?: { subject_kind?: string; id?: string };
+    };
+    if (!body.subject?.id || !body.subject?.subject_kind) {
+      return route.fulfill({
+        status: 422,
+        body: 'invalid job body: missing field `id`',
+      });
+    }
+    return route.fulfill({
+      json: {
+        id: 'job-review-1',
+        kind: body.kind,
+        status: 'open',
+        title: 'Review',
+        subject: body.subject,
+        steps: [],
+      },
+    });
+  });
+  await page.route('**/api/jobs/job-review-1', (route) =>
+    route.fulfill({
+      json: {
+        id: 'job-review-1',
+        status: 'open',
+        steps: [
+          { id: 'step-1', kind: 'review-design', status: 'pending', metadata: {} },
+        ],
+      },
+    }),
+  );
+  await page.route('**/api/jobs/job-review-1/steps/step-1', (route) =>
+    route.fulfill({
+      json: { id: 'step-1', kind: 'review-design', status: 'pending', metadata: {} },
+    }),
+  );
+}
+
 test.describe('Design review list', () => {
   test('shows live open-question counts, not pending decisions', async ({
     page,
@@ -71,5 +118,21 @@ test.describe('Design review list', () => {
     const buttons = page.getByRole('button', { name: /open review job/i });
     await expect(buttons.first()).toBeVisible({ timeout: 10_000 });
     await expect(buttons).toHaveCount(DOCS.length);
+  });
+
+  test('Open review Job posts the identity-first subject shape', async ({
+    page,
+  }) => {
+    await installJobCreateMock(page);
+    await mountPage(page, '/system/design', { titleMatch: /design review/i });
+    const row = page.locator('tr', {
+      hasText: 'Inventory value conservation',
+    });
+    await row.getByRole('button', { name: /open review job/i }).click();
+    // A 422 from the shape-enforcing mock surfaces as the page error
+    // banner; success re-loads the list. Assert no error rendered.
+    await expect(page.locator('.empty', { hasText: /HTTP 422/ })).toHaveCount(
+      0,
+    );
   });
 });

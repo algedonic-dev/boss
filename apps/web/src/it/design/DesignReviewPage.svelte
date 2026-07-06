@@ -61,9 +61,9 @@
       if (!docsResp.ok) throw new Error(`docs: HTTP ${docsResp.status}`);
       docs = (await docsResp.json()) as DesignDoc[];
 
-      // Look up open design-doc-review Jobs. Subject is
-      // custom/design-doc/<doc-path>; jobs-api supports
-      // ?kind= + ?status= filters.
+      // Look up open design-doc-review Jobs. Subject is the
+      // identity-first {subject_kind: 'custom', id: <doc-path>};
+      // jobs-api supports ?kind= + ?status= filters.
       const jobsResp = await fetch(
         '/api/jobs?kind=design-doc-review&status=open&limit=200',
       );
@@ -74,11 +74,11 @@
         title: string;
         status: string;
         opened_on: string;
-        subject: { ref_id?: string };
+        subject: { id?: string };
       }> = Array.isArray(jobsBody) ? jobsBody : (jobsBody.data ?? []);
       const byPath: Record<string, OpenReviewJob> = {};
       for (const j of jobs) {
-        const p = j.subject?.ref_id;
+        const p = j.subject?.id;
         if (!p) continue;
         byPath[p] = { id: j.id, status: j.status, opened_on: j.opened_on, title: j.title };
       }
@@ -93,10 +93,13 @@
   async function openReview(doc: DesignDoc): Promise<void> {
     const body = {
       kind: 'design-doc-review',
+      // Identity-first Subject: the doc path IS the subject id. The
+      // pre-2026-06-13 {custom_kind, ref_id} shape 422s ("missing
+      // field `id`") — this page shipped before that migration and
+      // the button was dead until 2026-07-06.
       subject: {
         subject_kind: 'custom',
-        custom_kind: 'design-doc',
-        ref_id: doc.path,
+        id: doc.path,
       },
       title: `Review: ${doc.title}`,
       owner_id: 'system',
@@ -122,7 +125,7 @@
       // After the Job is created, its review-design step needs
       // doc_path stamped on its metadata. Materialization defaults
       // it to "" — fill it in by PUTting the step. (Future: the
-      // dispatcher should do this from the Job's subject.ref_id.)
+      // dispatcher should do this from the Job's subject.id.)
       const detailResp = await fetch(`/api/jobs/${created.id}`);
       if (detailResp.ok) {
         const detail = await detailResp.json();
