@@ -1,83 +1,55 @@
-// Design docs index + detail. Index page exposes a Reindex
-// button + Hide-completed checkbox; detail page hosts the
-// decision-flow buttons (Accept / Override / Prev / Next /
-// Batch-accept / Flush) + the override-modal Cancel/Save.
+// Design review surface (/system/design) against the live stack: the
+// docs-api index must present every design doc with a real title,
+// status, and live open-question count, and offer (or link) a review
+// Job per doc. Replaces the pre-2026-05-03 spec for the retired
+// /design decision-tracker surface (Refresh-from-git / Flush-to-git /
+// Accept-Override buttons), which no longer exists.
 //
-// The decision-flow buttons only render when the doc has
-// `pending_count > 0`. Current seed has no pending decisions, so
-// the in-flow assertions skip cleanly. Index + nav are always
-// exercisable.
+// Presentation depth (question anchors, body rendering) is guarded in
+// CI by the boss-docs corpus test (docs_corpus_presents.rs) and the
+// mocked design-review spec; this live spec asserts the deployed
+// stack serves the same shape end to end.
 
 import { test, expect } from '@playwright/test';
 import { mountPage } from './_helpers';
 
-test.describe('Design docs index (/design)', () => {
-  test('Refresh-from-git button + hide-completed checkbox render', async ({
+test.describe('Design review (/system/design)', () => {
+  test('index lists the design-doc corpus with live question counts', async ({
     page,
   }) => {
-    await mountPage(page, '/design');
-    await expect(
-      page.getByRole('button', { name: /refresh from git/i }),
-    ).toBeVisible({ timeout: 10_000 });
-    await expect(page.locator('input[type="checkbox"]').first()).toBeVisible();
+    await mountPage(page, '/system/design', { titleMatch: /design review/i });
+
+    const rows = page.locator('.design-table tbody tr');
+    // The repo ships a multi-doc corpus; an empty table means the
+    // docs-api index is stale or the reindex never ran.
+    await expect(rows.first()).toBeVisible({ timeout: 10_000 });
+    expect(await rows.count()).toBeGreaterThanOrEqual(5);
+
+    // Every row presents a non-empty title + a numeric Open-Qs cell.
+    const first = rows.first();
+    await expect(first.locator('td').first().locator('strong')).not.toHaveText(
+      '',
+    );
+    await expect(first.locator('td').nth(2)).toHaveText(/^\d+$/);
   });
 
-  test('Hide-completed checkbox toggles list size', async ({ page }) => {
-    await mountPage(page, '/design');
-    const checkbox = page.locator('input[type="checkbox"]').first();
-    await expect(checkbox).toBeVisible({ timeout: 10_000 });
-    const initialChecked = await checkbox.isChecked();
-    // Toggle off: completed docs come back into the list — count
-    // grows or stays the same.
-    await checkbox.click();
-    await expect(checkbox).toBeChecked({ checked: !initialChecked });
-    // Toggle back to original.
-    await checkbox.click();
-    await expect(checkbox).toBeChecked({ checked: initialChecked });
-  });
-
-  test('clicking a doc link navigates to /design/{path}', async ({ page }) => {
-    await mountPage(page, '/design');
-    const docLink = page.locator('a[href*="/design/"]').first();
-    if ((await docLink.count()) === 0) {
-      test.skip(true, 'no design docs in index');
+  test('every doc offers a review entry point (button or open Job link)', async ({
+    page,
+  }) => {
+    await mountPage(page, '/system/design', { titleMatch: /design review/i });
+    const rows = page.locator('.design-table tbody tr');
+    await expect(rows.first()).toBeVisible({ timeout: 10_000 });
+    const n = await rows.count();
+    for (let i = 0; i < n; i++) {
+      const cell = rows.nth(i).locator('td').last();
+      const hasButton = await cell
+        .getByRole('button', { name: /open review job/i })
+        .count();
+      const hasLink = await cell.locator('a').count();
+      expect(
+        hasButton + hasLink,
+        `row ${i} has neither a review button nor an open-review link`,
+      ).toBeGreaterThan(0);
     }
-    await Promise.all([
-      page.waitForURL(/\/design\/[^/]+/, { timeout: 10_000 }),
-      docLink.click(),
-    ]);
-  });
-});
-
-test.describe('Design doc detail (/design/{path})', () => {
-  test('page mounts with content header', async ({ page }) => {
-    await mountPage(page, '/design/docs/design/extending-boss.md');
-    // Title comes from frontmatter; just assert h1 renders.
-    await expect(page.locator('h1').first()).toBeVisible({ timeout: 10_000 });
-  });
-
-  test('Flush-to-git button is visible (always rendered on detail)', async ({
-    page,
-  }) => {
-    await mountPage(page, '/design/docs/design/extending-boss.md');
-    const flush = page.getByRole('button', { name: /flush to git/i });
-    await expect(flush).toBeVisible({ timeout: 10_000 });
-    // Disabled when pending count is zero — and in the current
-    // seed every doc is pending=0.
-    await expect(flush).toBeDisabled();
-  });
-
-  test('decision-flow buttons render when doc has pending questions', async ({
-    page,
-  }) => {
-    await mountPage(page, '/design/docs/design/extending-boss.md');
-    const accept = page.getByRole('button', { name: /accept proposal/i });
-    if ((await accept.count()) === 0) {
-      test.skip(true, 'doc has no pending decisions in current seed');
-    }
-    await expect(accept).toBeVisible();
-    await expect(page.getByRole('button', { name: /override/i })).toBeVisible();
-    await expect(page.getByRole('button', { name: /prev/i })).toBeVisible();
-    await expect(page.getByRole('button', { name: /next/i })).toBeVisible();
   });
 });

@@ -90,20 +90,58 @@ async fn health() -> Json<boss_core::startup::HealthResponse> {
 
 // ----- GET /api/design/docs -----
 
+/// A docs-list row: the cached doc plus its live open-question count.
+/// The list's job is "what needs review" — `pending_count` (decisions
+/// clicked but not yet flushed) can't answer that, and the SPA
+/// mislabeling it "Open Qs" showed 0 for a doc with three live
+/// questions.
+#[derive(Serialize)]
+struct DocListRow {
+    #[serde(flatten)]
+    doc: DesignDoc,
+    open_questions: usize,
+}
+
 async fn list_docs(State(state): State<Arc<DocsApiState>>) -> Response {
-    match state.repo.all_docs().await {
-        Ok(docs) => Json(docs).into_response(),
-        Err(e) => err_to_response(e),
+    let docs = match state.repo.all_docs().await {
+        Ok(docs) => docs,
+        Err(e) => return err_to_response(e),
+    };
+    // One count read per doc — the corpus is a handful of files by
+    // design (docs/design/*.md), so a join-shaped repo method isn't
+    // worth the port churn yet.
+    let mut rows = Vec::with_capacity(docs.len());
+    for doc in docs {
+        let open_questions = match state.repo.questions_for_doc(&doc.path).await {
+            Ok(qs) => qs.len(),
+            Err(e) => return err_to_response(e),
+        };
+        rows.push(DocListRow {
+            doc,
+            open_questions,
+        });
     }
+    Json(rows).into_response()
 }
 
 // ----- GET /api/design/docs/{path} -----
+
+/// A question as the review surfaces consume it: the parsed fields
+/// plus `body_html`, rendered server-side with the same pipeline as
+/// the doc body so the two can't drift. The step plugin used to show
+/// raw markdown in a <pre>.
+#[derive(Serialize)]
+struct QuestionDetail {
+    #[serde(flatten)]
+    question: DesignQuestion,
+    body_html: String,
+}
 
 #[derive(Serialize)]
 struct DocDetail {
     #[serde(flatten)]
     doc: DesignDoc,
-    questions: Vec<DesignQuestion>,
+    questions: Vec<QuestionDetail>,
 }
 
 async fn get_doc(State(state): State<Arc<DocsApiState>>, Path(path): Path<String>) -> Response {
@@ -111,7 +149,19 @@ async fn get_doc(State(state): State<Arc<DocsApiState>>, Path(path): Path<String
     let path = path.trim_start_matches('/').to_string();
     match state.repo.doc_by_path(&path).await {
         Ok(Some(doc)) => match state.repo.questions_for_doc(&path).await {
-            Ok(questions) => Json(DocDetail { doc, questions }).into_response(),
+            Ok(questions) => {
+                let questions = questions
+                    .into_iter()
+                    .map(|q| {
+                        let body_html = crate::parser::render_html(&q.body_md);
+                        QuestionDetail {
+                            question: q,
+                            body_html,
+                        }
+                    })
+                    .collect();
+                Json(DocDetail { doc, questions }).into_response()
+            }
             Err(e) => err_to_response(e),
         },
         Ok(None) => (StatusCode::NOT_FOUND, format!("no doc at {path}")).into_response(),
@@ -457,6 +507,74 @@ mod tests {
             content_html: "<h1>Test</h1>".to_string(),
         };
         state.repo.upsert_doc(&doc, &[]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_counts_open_questions_and_detail_renders_bodies() {
+        // The review surfaces need (a) a real open-question count on the
+        // list — pending_count is unflushed decisions, not questions —
+        // and (b) per-question body_html rendered with the same pipeline
+        // as the doc, so the step plugin never shows raw markdown.
+        let state = test_state();
+        let now = chrono::Utc::now();
+        let doc = DesignDoc {
+            path: "docs/design/x.md".to_string(),
+            title: "X".to_string(),
+            status: crate::types::DocStatus::InReview,
+            pending_count: 0,
+            word_count: 10,
+            last_modified: now,
+            last_author: "alice".to_string(),
+            last_indexed_at: now,
+            last_commit_sha: "abc".to_string(),
+            content_html: "<h1>X</h1>".to_string(),
+        };
+        let q = crate::types::DesignQuestion {
+            id: "docs/design/x.md#Q1".to_string(),
+            doc_path: "docs/design/x.md".to_string(),
+            anchor: "Q1".to_string(),
+            ordinal: 0,
+            title: "Which way?".to_string(),
+            body_md: "Prefer **value-primary** rows.".to_string(),
+            proposal: None,
+            context_md: None,
+        };
+        state.repo.upsert_doc(&doc, &[q]).await.unwrap();
+        let app = router(state);
+
+        let list = body_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/design/docs")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(list[0]["open_questions"], serde_json::json!(1));
+        assert_eq!(list[0]["pending_count"], serde_json::json!(0));
+
+        let detail = body_json(
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/design/docs/docs/design/x.md")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        let body_html = detail["questions"][0]["body_html"].as_str().unwrap();
+        assert!(
+            body_html.contains("<strong>value-primary</strong>"),
+            "question body renders as HTML, got: {body_html}"
+        );
+        // The parsed fields still flatten alongside the rendered body.
+        assert_eq!(detail["questions"][0]["anchor"], "Q1");
     }
 
     #[tokio::test]

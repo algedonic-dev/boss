@@ -99,7 +99,9 @@ pub fn extract_unresolved_question_titles(markdown: &str) -> Vec<String> {
     unresolved
 }
 
-fn render_html(markdown: &str) -> String {
+/// Markdown → HTML with the doc pipeline's options — one renderer for
+/// whole docs and per-question bodies, so the two can't drift.
+pub(crate) fn render_html(markdown: &str) -> String {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
