@@ -17,10 +17,16 @@ balance(1320) == Σ finished_product_inventory.value   (FG)
 This is the conservation property of the correctness protocol applied
 to stock value. Today neither side stores a value — both store a
 per-unit average cost and multiply — and four mechanisms each break
-the equality independently. The #51-era regen measured the raw-side
-residual at ~$421K over a year; the playground shows the FG side
-drifting by ~$190K in a quarter. These are not exotic bugs; they are
-the arithmetic of integer-cent averages at industrial quantities.
+the equality independently.
+
+Year-scale measurement (2026-07-06 regen, below) sizes the classes
+honestly: the raw side now reconciles **exactly** — the #51-era ~$421K
+consume-side residual is gone under current main (GR-IR + the #57–#73
+costing arc fixed it) — and the surviving truncation leak is the FG
+side at ~$6.6K/year. The mechanisms below are still real (and the
+opening-JE and two-COGS-writer ones are structural, not rounding), but
+the argument for value-primary storage is closure of the class plus a
+conservation gate, not a headline dollar figure.
 
 ## What breaks it today
 
@@ -98,9 +104,38 @@ class should never be findable by hand again.
 
 ## Year-scale evidence
 
-_Pending: the 365-day ephemeral-VM regen of main@b094dcc0 (running
-2026-07-06) freezes a full year; its end-state GL-vs-physical numbers
-land here before this doc merges._
+From the 365-day from-empty regen of main@b094dcc0 on an ephemeral VM
+(2026-07-06; all gates green — zero sim errors, rebuild determinism,
+integrity, deep replay-check 74,461 facts / 74,423 entries with 0
+divergences):
+
+| Account | GL balance | Physical | Divergence |
+|---|---|---|---|
+| 1300 raw | $1,413,386.00 | $1,413,386.00 (162,348 units) | **$0.00 — exact** |
+| 1310 WIP | $12,210.98 | (in-flight brews at cutoff) | legitimate standing WIP |
+| 1320 FG | $2,970,541.40 | $2,977,139.17 (91,430 units) | **physical +$6,597.77** |
+
+- **Raw conservation holds to the cent over a full year.** The
+  consume-side residual this workstream was named for is already fixed
+  on main; what PR 6 buys on the raw side is a *guarantee* (structure
+  + gate), not a repair.
+- **The FG +$6.6K is the integer-cent truncation class** (mechanisms
+  1–2): real, bounded, and the piece the produce line-total change +
+  value-primary rows close.
+- **The consume path posted zero COGS all year** — 0
+  `products.consumed` events, 0 `finance.cogs.recognized` facts from
+  `products_consume` in 365 days. The load-bearing flow is
+  commerce's invoice-issue, which **UPDATEs
+  `finished_product_inventory` directly** (boss-commerce
+  `postgres.rs` — a cross-module write into products' projection,
+  not a call through the products port) at invoice-time
+  `production_cost_cents`. That's why physical tracks GL within the
+  truncation residual, and why the products consume path is dead
+  code on the brewery. Q2 therefore also carries an architecture
+  decision: whichever flow owns COGS, the FG decrement should go
+  through the products surface, not another module's SQL.
+- Context: full-year revenue $8,506,488, COGS $1,987,430 (GM 76.6%),
+  net −$837,903 (under-absorption at ~65% of design volume — honest).
 
 ## Open questions
 
