@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 
-use crate::types::{ApAging, InventoryItem, PurchaseOrder, Vendor, VendorInvoice};
+use crate::types::{ApAging, ConsumeApplied, InventoryItem, PurchaseOrder, Vendor, VendorInvoice};
 
 #[derive(Debug, thiserror::Error)]
 pub enum InventoryError {
@@ -55,7 +55,7 @@ pub trait InventoryRepository: Send + Sync {
         &self,
         part_sku: &str,
         qty: u32,
-    ) -> Result<InventoryItem, InventoryError> {
+    ) -> Result<ConsumeApplied, InventoryError> {
         let source_id = format!("{}@{}", part_sku, uuid::Uuid::new_v4());
         self.consume_part_at(part_sku, qty, Utc::now(), &source_id)
             .await
@@ -75,7 +75,7 @@ pub trait InventoryRepository: Send + Sync {
         qty: u32,
         now: DateTime<Utc>,
         source_id: &str,
-    ) -> Result<InventoryItem, InventoryError>;
+    ) -> Result<ConsumeApplied, InventoryError>;
 
     /// Sum of `expected_qty - received_qty` across every open
     /// ingredient-restock Job's not-yet-completed receiving step

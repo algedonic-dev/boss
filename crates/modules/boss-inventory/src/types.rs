@@ -16,10 +16,17 @@ pub struct InventoryItem {
     pub reorder_point: u32,
     pub reorder_qty: u32,
     pub trailing_90d_usage: u32,
-    /// Weighted moving-average unit cost in cents. Updated on
-    /// each receive (see `port::receive_part_at`). Consumed by
-    /// `PartsConsumeEmitter` to compute the COGS amount when
-    /// ingredients are drawn down in production.
+    /// The row's total stock value in cents — the stored, CONSERVED
+    /// quantity (costing PR 6a, Q1: value-primary). Receives add exact
+    /// line totals; consumes drain the proportional share with the
+    /// final unit absorbing the remainder, so zero `on_hand` forces
+    /// zero value. Every GL amount posted for the row IS a value
+    /// delta. Design: docs/design/inventory-value-conservation.md.
+    #[serde(default)]
+    pub value_cents: i64,
+    /// Display-only unit cost (`value / on_hand`), derived by the
+    /// database (generated column) — read-side convenience, ignored
+    /// on writes, never an input to a GL amount.
     #[serde(default)]
     pub avg_cost_cents: i64,
     /// The supplier's agreed unit price in cents — what the vendor
@@ -38,6 +45,21 @@ pub struct InventoryItem {
     /// declare no category (resolution then yields no vendor).
     #[serde(default)]
     pub vendor_category: Option<String>,
+}
+
+/// Result of a consume: the post-consume row plus the exact
+/// `finance.inventory.transferred` payload the repository wrote in-tx
+/// (`None` when the drain was zero — no fact, no GL — or when the
+/// consume was an idempotent replay). The HTTP layer emits the audit
+/// event from THIS value verbatim: one construction feeds both the
+/// live fact and the rebuild source, so byte-parity can't drift — and
+/// a replayed consume emits nothing, closing the duplicate-audit-emit
+/// hole the old handler had (it recomputed and re-emitted on every
+/// delivery).
+#[derive(Debug, Clone)]
+pub struct ConsumeApplied {
+    pub item: InventoryItem,
+    pub fact_payload: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

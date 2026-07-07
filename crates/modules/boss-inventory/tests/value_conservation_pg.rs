@@ -36,6 +36,8 @@ fn item(sku: &str, on_hand: u32, value_cents: i64) -> InventoryItem {
         reorder_qty: 0,
         trailing_90d_usage: 0,
         value_cents,
+        // Derived display — ignored on writes.
+        avg_cost_cents: 0,
         vendor_price_cents: None,
         vendor_category: None,
     }
@@ -49,7 +51,7 @@ async fn posted_consume_total(db: &TestDb, sku: &str) -> i64 {
          FROM financial_facts \
          WHERE kind = 'finance.inventory.transferred' \
            AND source_table = 'inventory_consume' \
-           AND payload->>'sku' = $1",
+           AND payload->>'part_sku' = $1",
     )
     .bind(sku)
     .fetch_one(&db.pool)
@@ -72,10 +74,10 @@ async fn mixed_price_receives_then_full_drain_conserves_value_exactly() {
 
     // Receive 7,919 more (prime, guarantees ugly division) at 41¢ —
     // the exact line total lands on the row, nothing is re-averaged.
-    inv.receive_part_at(sku, 7_919, Some(41), Utc::now(), "recv:t1".into())
+    inv.receive_part_at(sku, 7_919, Some(41), Utc::now(), "recv:t1")
         .await
         .unwrap();
-    let after_recv = inv.item(sku).await.unwrap().unwrap();
+    let after_recv = inv.item_by_sku(sku).await.unwrap().unwrap();
     assert_eq!(after_recv.on_hand, 17_919);
     assert_eq!(after_recv.value_cents, 333_333 + 7_919 * 41);
 
@@ -85,11 +87,11 @@ async fn mixed_price_receives_then_full_drain_conserves_value_exactly() {
     let total_value = after_recv.value_cents;
     let mut drained = 0_i64;
     for (i, qty) in [5_000_u32, 9_999, 2_920].into_iter().enumerate() {
-        let before = inv.item(sku).await.unwrap().unwrap();
-        inv.consume_part_at(sku, qty, "test", Utc::now(), format!("cons:t{i}"))
+        let before = inv.item_by_sku(sku).await.unwrap().unwrap();
+        inv.consume_part_at(sku, qty, Utc::now(), &format!("cons:t{i}"))
             .await
             .unwrap();
-        let after = inv.item(sku).await.unwrap().unwrap();
+        let after = inv.item_by_sku(sku).await.unwrap().unwrap();
         let delta = before.value_cents - after.value_cents;
         assert!(delta >= 0, "consume must never add value");
         drained += delta;
@@ -100,7 +102,7 @@ async fn mixed_price_receives_then_full_drain_conserves_value_exactly() {
             "posted GL total diverged from the drained value at step {i}"
         );
     }
-    let empty = inv.item(sku).await.unwrap().unwrap();
+    let empty = inv.item_by_sku(sku).await.unwrap().unwrap();
     assert_eq!(empty.on_hand, 0);
     assert_eq!(
         empty.value_cents, 0,
@@ -117,10 +119,10 @@ async fn derived_avg_cost_is_value_over_on_hand() {
     let sku = "ING-HOPS-CASCADE-44";
 
     inv.upsert_item_at(&item(sku, 0, 0), Utc::now()).await.unwrap();
-    inv.receive_part_at(sku, 3, Some(1_000), Utc::now(), "recv:a".into())
+    inv.receive_part_at(sku, 3, Some(1_000), Utc::now(), "recv:a")
         .await
         .unwrap();
-    let row = inv.item(sku).await.unwrap().unwrap();
+    let row = inv.item_by_sku(sku).await.unwrap().unwrap();
     assert_eq!(row.value_cents, 3_000);
     // Display average comes from the derived column, never a stored
     // input: 3000 / 3 = 1000.

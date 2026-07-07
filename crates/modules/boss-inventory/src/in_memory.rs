@@ -5,10 +5,8 @@ use async_trait::async_trait;
 use std::sync::RwLock;
 
 use crate::port::{InventoryError, InventoryRepository};
-use crate::types::{
-    ApAging, ApAgingBucket, InventoryItem, PurchaseOrder, Vendor, VendorInvoice,
-    VendorInvoiceStatus,
-};
+use crate::types::{ConsumeApplied, ApAging, ApAgingBucket, InventoryItem, PurchaseOrder, Vendor, VendorInvoice,
+    VendorInvoiceStatus,};
 
 pub struct InMemoryInventory {
     items: Vec<InventoryItem>,
@@ -86,11 +84,17 @@ impl InventoryRepository for InMemoryInventory {
         _qty: u32,
         _now: chrono::DateTime<chrono::Utc>,
         _source_id: &str,
-    ) -> Result<InventoryItem, InventoryError> {
-        // In-memory: no mutation support, just return the item.
-        self.item_by_sku(part_sku)
+    ) -> Result<ConsumeApplied, InventoryError> {
+        // In-memory: no mutation support, just return the item (no
+        // fact written → no payload to emit).
+        let item = self
+            .item_by_sku(part_sku)
             .await?
-            .ok_or_else(|| InventoryError::NotFound(part_sku.to_string()))
+            .ok_or_else(|| InventoryError::NotFound(part_sku.to_string()))?;
+        Ok(ConsumeApplied {
+            item,
+            fact_payload: None,
+        })
     }
     async fn inbound_reserved_for_part(&self, _part_sku: &str) -> Result<i64, InventoryError> {
         // In-memory adapter has no Job/step state to project across;
@@ -350,6 +354,7 @@ mod tests {
             reorder_point: 20,
             reorder_qty: 100,
             trailing_90d_usage: 30,
+            value_cents: 0,
             avg_cost_cents: 0,
             vendor_price_cents: None,
             vendor_category: None,

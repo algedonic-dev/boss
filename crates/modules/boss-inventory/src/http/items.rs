@@ -123,12 +123,12 @@ pub(super) async fn consume_part<R: InventoryRepository + 'static>(
         .idempotency_key
         .clone()
         .unwrap_or_else(|| format!("{}@{}", part_sku, uuid::Uuid::new_v4()));
-    let item = match state
+    let applied = match state
         .inventory
         .consume_part_at(&part_sku, body.qty, now, &consume_source_id)
         .await
     {
-        Ok(item) => item,
+        Ok(applied) => applied,
         Err(InventoryError::InsufficientStock(sku, have, need)) => {
             // Auto-restock is not spawned inline. The 409 stands; the
             // boss-dispatcher rule registry consumes the
@@ -152,6 +152,7 @@ pub(super) async fn consume_part<R: InventoryRepository + 'static>(
         }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    let crate::types::ConsumeApplied { item, fact_payload } = applied;
 
     // Check if stock dropped below reorder threshold. The threshold
     // counts (on_hand - allocated + inbound reservations) — Jobs whose
@@ -218,38 +219,16 @@ pub(super) async fn consume_part<R: InventoryRepository + 'static>(
             now,
         )
         .await;
-        // COGS recognition event — paired with the in-tx financial_fact
-        // insert in consume_part_at. Carries the full COGS payload so
-        // the ledger-facts rebuilder can reconstruct
-        // `finance.cogs.recognized` from audit_log alone. avg_cost_cents
-        // stays put through consume, so the post-consume
-        // `item.avg_cost_cents` equals the rate the in-tx fact was sized
-        // against.
-        let total_cost = item.avg_cost_cents.saturating_mul(body.qty as i64);
-        if total_cost > 0 {
-            // `source_id` mirrors what consume_part_at writes in-tx so
-            // the (kind, source_table, source_id) key matches on rebuild
-            // → idempotent. `consumed_on` is a NaiveDate so the
-            // gl_fact_projection_rules row (happened_on_path =
-            // "/consumed_on") can read it directly when rebuilding from
-            // audit_log. Value moves raw → WIP, not raw → COGS.
+        // Transfer event — the EXACT payload consume_part_at wrote as
+        // the in-tx fact, emitted verbatim. One construction feeds the
+        // live fact and the rebuild source, so byte-parity can\'t
+        // drift; and a replayed consume returns no payload, so a
+        // redelivery appends no duplicate event.
+        if let Some(payload) = fact_payload {
             pub_.emit_with_actor_at(
                 crate::events::INVENTORY_TRANSFERRED,
                 actor.clone(),
-                serde_json::json!({
-                    "source_id": consume_source_id,
-                    "total_cost_cents": total_cost,
-                    "debit_account": "1310",
-                    "credit_account": "1300",
-                    "memo": format!(
-                        "Production — consumed {} × {} @ {}¢/unit (raw → WIP)",
-                        body.qty, part_sku, item.avg_cost_cents
-                    ),
-                    "part_sku": part_sku,
-                    "qty": body.qty,
-                    "unit_cost_cents": item.avg_cost_cents,
-                    "consumed_on": now.date_naive(),
-                }),
+                payload,
                 now,
             )
             .await;

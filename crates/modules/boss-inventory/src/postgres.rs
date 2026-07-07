@@ -51,7 +51,7 @@ impl InventoryRepository for PgInventory {
         sqlx::query(
             "INSERT INTO inventory_items \
                 (part_sku, bin, on_hand, allocated, reorder_point, reorder_qty, \
-                 trailing_90d_usage, avg_cost_cents, vendor_price_cents, vendor_category, updated_at) \
+                 trailing_90d_usage, value_cents, vendor_price_cents, vendor_category, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
              ON CONFLICT (part_sku) DO UPDATE SET \
                 bin = EXCLUDED.bin, \
@@ -60,7 +60,7 @@ impl InventoryRepository for PgInventory {
                 reorder_point = EXCLUDED.reorder_point, \
                 reorder_qty = EXCLUDED.reorder_qty, \
                 trailing_90d_usage = EXCLUDED.trailing_90d_usage, \
-                avg_cost_cents = EXCLUDED.avg_cost_cents, \
+                value_cents = EXCLUDED.value_cents, \
                 vendor_price_cents = EXCLUDED.vendor_price_cents, \
                 vendor_category = EXCLUDED.vendor_category, \
                 updated_at = EXCLUDED.updated_at",
@@ -72,7 +72,7 @@ impl InventoryRepository for PgInventory {
         .bind(item.reorder_point as i32)
         .bind(item.reorder_qty as i32)
         .bind(item.trailing_90d_usage as i32)
-        .bind(item.avg_cost_cents)
+        .bind(item.value_cents)
         .bind(item.vendor_price_cents)
         .bind(&item.vendor_category)
         .bind(now)
@@ -120,16 +120,14 @@ impl InventoryRepository for PgInventory {
         qty: u32,
         now: chrono::DateTime<chrono::Utc>,
         source_id: &str,
-    ) -> Result<InventoryItem, InventoryError> {
-        // One tx wraps: (1) the on_hand decrement, (2) the
-        // `finance.cogs.recognized` financial_fact insert sized at
-        // `qty × avg_cost_cents`, (3) the ledger projection. The
-        // three steps land atomically — a consume is *always*
-        // paired with a matching COGS JE in the GL. This is the
-        // "definitional must-match" enforcement for inventory
-        // consumption: there is no code path that decrements
-        // raw inventory without recognizing COGS at the same
-        // moment in the same tx.
+    ) -> Result<ConsumeApplied, InventoryError> {
+        // One tx wraps: (1) the proportional value drain + on_hand
+        // decrement, (2) the `finance.inventory.transferred` fact
+        // sized at exactly the drained value. The two land atomically
+        // — there is no code path that decrements raw inventory
+        // without moving the same cents raw → WIP in the same tx, so
+        // balance(1300) == Σ value_cents holds by construction
+        // (costing PR 6a; docs/design/inventory-value-conservation.md).
         let mut tx = self
             .pool
             .begin()
@@ -141,12 +139,13 @@ impl InventoryRepository for PgInventory {
         // would double-decrement. The financial_fact this consume writes
         // is the proof-of-application — if one with this source_id already
         // exists, the consume committed on a prior delivery, so skip it
-        // and return the current row unchanged. (Also dodges a spurious
-        // InsufficientStock on replay once stock has since fallen below
-        // qty.) Sound when the consume carries a cost (the only case that
-        // writes a fact); a zero-avg-cost part writes none and isn't
-        // guarded — but those have no GL impact and don't occur in the
-        // seeded brewery (every part has a cost basis).
+        // and return the current row unchanged, with NO fact payload: the
+        // caller then emits no audit event, so a replay appends nothing.
+        // (Also dodges a spurious InsufficientStock on replay once stock
+        // has since fallen below qty.) Sound when the consume drains value
+        // (the only case that writes a fact); a zero-value row writes none
+        // and isn't guarded — no GL impact, and the seeded brewery gives
+        // every part an opening value.
         if fact_exists(
             &mut tx,
             "finance.inventory.transferred",
@@ -156,68 +155,90 @@ impl InventoryRepository for PgInventory {
         .await?
         {
             drop(tx);
-            return self
+            let item = self
                 .item_by_sku(part_sku)
                 .await?
-                .ok_or_else(|| InventoryError::NotFound(part_sku.to_string()));
+                .ok_or_else(|| InventoryError::NotFound(part_sku.to_string()))?;
+            return Ok(ConsumeApplied {
+                item,
+                fact_payload: None,
+            });
         }
 
+        // Read the row under lock, compute the exact drain in one
+        // place, then apply it. The drain is the proportional share
+        // round-half-up(value × qty / on_hand); consuming the last
+        // unit takes the whole remaining value, so zero on_hand
+        // forces zero value — nothing strands.
+        let before: Option<(i32, i64)> = sqlx::query_as(
+            "SELECT on_hand, value_cents FROM inventory_items \
+             WHERE part_sku = $1 FOR UPDATE",
+        )
+        .bind(part_sku)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| InventoryError::Storage(e.to_string()))?;
+        let Some((on_hand_before, value_before)) = before else {
+            drop(tx);
+            return Err(InventoryError::NotFound(part_sku.to_string()));
+        };
+        if (on_hand_before as u32) < qty {
+            drop(tx);
+            return Err(InventoryError::InsufficientStock(
+                part_sku.to_string(),
+                on_hand_before as u32,
+                qty,
+            ));
+        }
+        let drained_cents = if on_hand_before as u32 == qty {
+            value_before
+        } else {
+            // i128 keeps value × qty exact for any realistic row.
+            (((value_before as i128) * (qty as i128) + (on_hand_before as i128) / 2)
+                / (on_hand_before as i128)) as i64
+        };
+
         let row: Option<InventoryItemRow> = sqlx::query_as(
-            "UPDATE inventory_items SET on_hand = on_hand - $2, updated_at = $3 \
-             WHERE part_sku = $1 AND on_hand >= $2 RETURNING *",
+            "UPDATE inventory_items SET \
+                on_hand = on_hand - $2, \
+                value_cents = value_cents - $3, \
+                updated_at = $4 \
+             WHERE part_sku = $1 RETURNING *",
         )
         .bind(part_sku)
         .bind(qty as i32)
+        .bind(drained_cents)
         .bind(now)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| InventoryError::Storage(e.to_string()))?;
-
         let item = match row {
             Some(r) => r.into_item(),
             None => {
-                // Roll back the tx and check what's actually wrong.
                 drop(tx);
-                let exists = self.item_by_sku(part_sku).await?;
-                return match exists {
-                    Some(item) => Err(InventoryError::InsufficientStock(
-                        part_sku.to_string(),
-                        item.on_hand,
-                        qty,
-                    )),
-                    None => Err(InventoryError::NotFound(part_sku.to_string())),
-                };
+                return Err(InventoryError::NotFound(part_sku.to_string()));
             }
         };
 
-        // Model B: ingredient consumption moves value raw → WIP,
-        // not raw → COGS. The transfer fact lands in the same tx
-        // as the on_hand decrement: every dollar leaving 1300
-        // Raw arrives in 1310 WIP and waits for the matching
-        // packaging step (`products.produce`) to roll it forward
-        // to 1320 Finished Goods. COGS is recognized later, at
-        // sale time, against 1320. avg_cost_cents stays put
-        // through consume (perpetual inventory).
-        let total_cost_cents = item.avg_cost_cents.saturating_mul(qty as i64);
-        if total_cost_cents > 0 {
-            // Payload MUST match the `inventory.transferred` event emitted
-            // in http/items.rs (incl. `source_id` + `consumed_on`) so the
-            // rebuilt fact is byte-identical to this live one — the
-            // fact-level replay-check compares payloads. See
-            // rebuild_facts::strip_envelope for the envelope half.
+        // Model B: ingredient consumption moves value raw → WIP, not
+        // raw → COGS: every drained cent leaving 1300 Raw arrives in
+        // 1310 WIP and waits for the packaging step
+        // (`products.produce`) to roll it forward to 1320. COGS is
+        // recognized later, at sale time, against 1320. This payload
+        // is the ONE construction — the caller emits the audit event
+        // from the returned copy verbatim, so the rebuilt fact is
+        // byte-identical to this live one (the fact-level
+        // replay-check compares payloads).
+        let fact_payload = if drained_cents > 0 {
             let payload = serde_json::json!({
-                "total_cost_cents": total_cost_cents,
+                "total_cost_cents": drained_cents,
                 "debit_account": "1310",
                 "credit_account": "1300",
                 "memo": format!(
-                    "Production — consumed {} × {} @ {}¢/unit (raw → WIP)",
-                    qty,
-                    part_sku,
-                    item.avg_cost_cents
+                    "Production — consumed {qty} × {part_sku} (raw → WIP, value drain)",
                 ),
                 "part_sku": part_sku,
                 "qty": qty,
-                "unit_cost_cents": item.avg_cost_cents,
                 "source_id": source_id,
                 "consumed_on": now.date_naive(),
             });
@@ -230,12 +251,15 @@ impl InventoryRepository for PgInventory {
                 source_id,
             )
             .await?;
-        }
+            Some(payload)
+        } else {
+            None
+        };
 
         tx.commit()
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
-        Ok(item)
+        Ok(ConsumeApplied { item, fact_payload })
     }
 
     async fn inbound_reserved_for_part(&self, part_sku: &str) -> Result<i64, InventoryError> {
@@ -541,24 +565,19 @@ impl InventoryRepository for PgInventory {
                 .ok_or_else(|| InventoryError::NotFound(part_sku.to_string()));
         }
 
-        // Weighted moving average on the cost basis. The SQL is a
-        // single UPDATE so concurrent receives can't race the
-        // arithmetic — Postgres serializes on the row lock that the
-        // UPDATE acquires. When the caller passes None (no cost data
-        // — manual replenishment), avg_cost_cents is left alone and
-        // only on_hand moves.
-        //
-        // Edge case: old_on_hand = 0 with old_avg = 0 → new_avg
-        // equals unit_cost (init from first receive). Edge case:
-        // old_on_hand + qty = 0 is impossible here because qty > 0.
+        // Value-primary receive: the exact line total (qty × the PO
+        // unit price) lands on the row — no re-averaging arithmetic
+        // exists on the add side, so nothing truncates. The single
+        // UPDATE serializes concurrent receives on the row lock.
+        // When the caller passes None (no cost data — manual
+        // replenishment), only on_hand moves and the row's value is
+        // untouched (the honest reading of "we don't know what this
+        // cost"; the derived display average dilutes accordingly).
         let row: Option<InventoryItemRow> = match unit_cost_cents {
             Some(unit_cost) if unit_cost > 0 => sqlx::query_as(
                 "UPDATE inventory_items SET \
                     on_hand = on_hand + $2, \
-                    avg_cost_cents = CASE \
-                        WHEN on_hand + $2 = 0 THEN 0 \
-                        ELSE (avg_cost_cents * on_hand + $3 * $2) / (on_hand + $2) \
-                    END, \
+                    value_cents = value_cents + ($3::bigint * $2), \
                     updated_at = $4 \
                  WHERE part_sku = $1 RETURNING *",
             )
@@ -1000,6 +1019,7 @@ struct InventoryItemRow {
     reorder_point: i32,
     reorder_qty: i32,
     trailing_90d_usage: i32,
+    value_cents: i64,
     avg_cost_cents: i64,
     vendor_price_cents: Option<i64>,
     vendor_category: Option<String>,
@@ -1015,6 +1035,7 @@ impl InventoryItemRow {
             reorder_point: self.reorder_point as u32,
             reorder_qty: self.reorder_qty as u32,
             trailing_90d_usage: self.trailing_90d_usage as u32,
+            value_cents: self.value_cents,
             avg_cost_cents: self.avg_cost_cents,
             vendor_price_cents: self.vendor_price_cents,
             vendor_category: self.vendor_category,

@@ -15,18 +15,23 @@ CREATE TABLE IF NOT EXISTS inventory_items (
     reorder_point       INTEGER NOT NULL DEFAULT 0,
     reorder_qty         INTEGER NOT NULL DEFAULT 0,
     trailing_90d_usage  INTEGER NOT NULL DEFAULT 0,
-    -- Weighted moving-average unit cost in cents. Updated on every
-    -- receive (`PgInventory::receive_part_at`):
-    --   new_avg = (old_avg × old_on_hand + recv_unit_cost × recv_qty)
-    --             / (old_on_hand + recv_qty)
-    -- Consumed by `PartsConsumeEmitter` to compute the
-    -- `finance.cogs.recognized` total when ingredients are drawn
-    -- down in production. The brewery's GL conservation guarantee
-    -- (ingredients bought = ingredients consumed, in value terms)
-    -- depends on this field being kept current with every receive.
-    -- Pre-seeded by `boss-brewery-data-seed` from per-SKU rates so
-    -- the first consume after deploy has a non-zero cost basis.
-    avg_cost_cents      BIGINT NOT NULL DEFAULT 0,
+    -- The row's total stock value in cents — the stored, CONSERVED
+    -- quantity (costing PR 6a, Q1: value-primary). Receives add the
+    -- exact line total (qty × PO unit price); consumes drain the
+    -- proportional share round(value × qty / on_hand), the final
+    -- unit absorbing the remainder so zero on_hand forces zero
+    -- value. Every GL amount posted for this row IS a value delta,
+    -- so balance(1300) == Σ value_cents cannot drift — the old
+    -- integer-cent weighted average leaked a truncated cent per
+    -- receive, a $100–$200 valuation step at 10–20K-unit scale.
+    -- Design + decisions: docs/design/inventory-value-conservation.md.
+    value_cents         BIGINT NOT NULL DEFAULT 0,
+    -- Display-only unit cost, derived — never an input to a GL
+    -- amount, never writable (a stale writer that still tries to
+    -- INSERT/UPDATE it fails loudly here instead of silently
+    -- re-averaging).
+    avg_cost_cents      BIGINT GENERATED ALWAYS AS
+        (CASE WHEN on_hand > 0 THEN value_cents / on_hand ELSE 0 END) STORED,
     -- The supplier's agreed unit price in cents — what the vendor
     -- charges us, set as data (parts.toml / operator edit), never
     -- computed. PO lines are priced from this at placement;
