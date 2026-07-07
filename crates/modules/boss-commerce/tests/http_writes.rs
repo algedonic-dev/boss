@@ -86,6 +86,7 @@ async fn post_invoice_with_multiple_line_items_accepts_and_sum_matches() {
                 sku: None,
                 qty: None,
                 cost_basis_cents: None,
+                cost_total_cents: None,
             },
             InvoiceLineItem {
                 id: "inv-multi-1-L2".to_string(),
@@ -98,6 +99,7 @@ async fn post_invoice_with_multiple_line_items_accepts_and_sum_matches() {
                 sku: None,
                 qty: None,
                 cost_basis_cents: None,
+                cost_total_cents: None,
             },
             InvoiceLineItem {
                 id: "inv-multi-1-L3".to_string(),
@@ -110,6 +112,7 @@ async fn post_invoice_with_multiple_line_items_accepts_and_sum_matches() {
                 sku: None,
                 qty: None,
                 cost_basis_cents: None,
+                cost_total_cents: None,
             },
         ],
     };
@@ -150,6 +153,7 @@ async fn post_invoice_with_mismatched_sum_rejected() {
             sku: None,
             qty: None,
             cost_basis_cents: None,
+            cost_total_cents: None,
         }],
     };
 

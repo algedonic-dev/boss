@@ -141,14 +141,22 @@ pub struct InvoiceLineItem {
     /// COGS computation.
     #[serde(default)]
     pub qty: Option<i32>,
-    /// Per-unit production cost basis at invoice-creation time.
-    /// Stamped by the commerce HTTP handler from the FG row's
-    /// weighted moving average. Carried on the line so
-    /// the posting rule has everything it needs without doing
-    /// a DB lookup (rules are pure data → JE transformations).
-    /// `None` for non-FG lines.
+    /// Per-unit production cost basis at invoice-creation time —
+    /// display only under value-primary costing (derived
+    /// drain / qty, rounded). The exact COGS amount is
+    /// `cost_total_cents`; the posting rule prefers it. `None`
+    /// for non-FG lines.
     #[serde(default)]
     pub cost_basis_cents: Option<i64>,
+    /// The line's EXACT COGS total in cents — the value this
+    /// invoice's FG drawdown drained from the row (PR 6a,
+    /// value-primary). The `invoice_issued` posting rule sizes the
+    /// DR 5100 / CR 1320 leg from this, so the GL credit equals the
+    /// physical value delta to the cent (qty × per-unit rounding
+    /// re-introduced the leak this workstream closes). `None` for
+    /// non-FG lines.
+    #[serde(default)]
+    pub cost_total_cents: Option<i64>,
 }
 
 impl From<&InvoiceLineItem> for boss_core::primitives::Part {
@@ -294,6 +302,7 @@ mod part_conversion_tests {
             sku: None,
             qty: None,
             cost_basis_cents: None,
+            cost_total_cents: None,
         };
         let part: Part = (&line).into();
         match part {

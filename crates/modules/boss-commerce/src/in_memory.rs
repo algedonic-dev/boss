@@ -167,6 +167,7 @@ mod tests {
                 sku: None,
                 qty: None,
                 cost_basis_cents: None,
+                cost_total_cents: None,
             }],
         }
     }

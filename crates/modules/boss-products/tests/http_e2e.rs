@@ -89,6 +89,7 @@ async fn detail_rolls_up_inventory_across_locations() {
         location_id: "loc-brewhouse".into(),
         on_hand: 145,
         reserved: 0,
+        value_cents: 0,
         production_cost_cents: 0,
         updated_at: None,
     })
@@ -99,6 +100,7 @@ async fn detail_rolls_up_inventory_across_locations() {
         location_id: "loc-taproom".into(),
         on_hand: 12,
         reserved: 0,
+        value_cents: 0,
         production_cost_cents: 0,
         updated_at: None,
     })

@@ -83,7 +83,7 @@ impl ProductsRepository for InMemoryProducts {
         sku: &str,
         location_id: &str,
         qty: i32,
-        unit_cost_cents: Option<i64>,
+        total_cost_cents: Option<i64>,
         _now: chrono::DateTime<chrono::Utc>,
         _source_id: String,
     ) -> Result<InventoryDeltaResult, ProductsError> {
@@ -99,22 +99,22 @@ impl ProductsRepository for InMemoryProducts {
             location_id: location_id.to_string(),
             on_hand: 0,
             reserved: 0,
+            value_cents: 0,
             production_cost_cents: 0,
             updated_at: None,
         });
-        // Weighted moving-average update for the cost basis.
-        if let Some(unit_cost) = unit_cost_cents
-            && unit_cost > 0
+        // Value-primary: the exact line total lands on the row.
+        if let Some(total) = total_cost_cents
+            && total > 0
         {
-            let new_total = row.on_hand as i64 + qty as i64;
-            row.production_cost_cents = if new_total <= 0 {
-                0
-            } else {
-                (row.production_cost_cents * row.on_hand as i64 + unit_cost * qty as i64)
-                    / new_total
-            };
+            row.value_cents += total;
         }
         row.on_hand += qty;
+        row.production_cost_cents = if row.on_hand > 0 {
+            row.value_cents / row.on_hand as i64
+        } else {
+            0
+        };
         // In-memory adapter doesn't carry a GL — tests that need to
         // assert the GL move drive the Postgres adapter directly.
         Ok(InventoryDeltaResult {
@@ -141,7 +141,22 @@ impl ProductsRepository for InMemoryProducts {
         let key = (sku.to_string(), location_id.to_string());
         match map.get_mut(&key) {
             Some(row) if row.on_hand >= qty => {
+                // Proportional drain, final unit takes the remainder —
+                // mirrors the Postgres adapter.
+                let drained = if row.on_hand == qty {
+                    row.value_cents
+                } else {
+                    (((row.value_cents as i128) * (qty as i128)
+                        + (row.on_hand as i128) / 2)
+                        / (row.on_hand as i128)) as i64
+                };
                 row.on_hand -= qty;
+                row.value_cents -= drained;
+                row.production_cost_cents = if row.on_hand > 0 {
+                    row.value_cents / row.on_hand as i64
+                } else {
+                    0
+                };
                 Ok(InventoryDeltaResult {
                     inventory: row.clone(),
                     gl_move: None,

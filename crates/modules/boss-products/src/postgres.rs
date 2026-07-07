@@ -80,7 +80,7 @@ impl ProductsRepository for PgProducts {
     async fn inventory_for(&self, sku: &str) -> Result<Vec<ProductInventory>, ProductsError> {
         let rows: Vec<InventoryRow> = sqlx::query_as(
             "SELECT product_sku, location_id, on_hand, reserved, \
-                    production_cost_cents, updated_at \
+                    value_cents, production_cost_cents, updated_at \
              FROM finished_product_inventory WHERE product_sku = $1 \
              ORDER BY location_id",
         )
@@ -94,19 +94,19 @@ impl ProductsRepository for PgProducts {
     async fn upsert_inventory(&self, row: &ProductInventory) -> Result<(), ProductsError> {
         sqlx::query(
             "INSERT INTO finished_product_inventory \
-                (product_sku, location_id, on_hand, reserved, production_cost_cents) \
+                (product_sku, location_id, on_hand, reserved, value_cents) \
              VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (product_sku, location_id) DO UPDATE SET \
                 on_hand = EXCLUDED.on_hand, \
                 reserved = EXCLUDED.reserved, \
-                production_cost_cents = EXCLUDED.production_cost_cents, \
+                value_cents = EXCLUDED.value_cents, \
                 updated_at = NOW()",
         )
         .bind(&row.product_sku)
         .bind(&row.location_id)
         .bind(row.on_hand)
         .bind(row.reserved)
-        .bind(row.production_cost_cents)
+        .bind(row.value_cents)
         .execute(&self.pool)
         .await
         .map_err(|e| ProductsError::Storage(e.to_string()))?;
@@ -180,7 +180,7 @@ impl ProductsRepository for PgProducts {
         sku: &str,
         location_id: &str,
         qty: i32,
-        unit_cost_cents: Option<i64>,
+        total_cost_cents: Option<i64>,
         now: chrono::DateTime<chrono::Utc>,
         source_id: String,
     ) -> Result<InventoryDeltaResult, ProductsError> {
@@ -189,11 +189,14 @@ impl ProductsRepository for PgProducts {
                 "produce qty must be positive, got {qty}"
             )));
         }
-        // One tx wraps: (1) on_hand increment + weighted-avg
-        // production_cost_cents update, (2) the matching
-        // `finance.inventory.transferred` financial_fact insert
-        // sized at `qty × unit_cost_cents` (DR 1320 FG / CR 1310
-        // WIP) when the caller supplies a cost. Model B's WIP→FG
+        // One tx wraps: (1) on_hand increment + the EXACT line total
+        // landing on value_cents, (2) the matching
+        // `finance.inventory.transferred` financial_fact sized at the
+        // same total (DR 1320 FG / CR 1310 WIP) when the caller
+        // supplies a cost. The caller passes a line TOTAL, not a unit
+        // cost — the WIP drain allocated exact largest-remainder
+        // shares, and posting them un-rounded is what retires the
+        // ~qty/2-cents-per-line residual (#73). Model B's WIP→FG
         // half-step lands atomically with the physical move.
         let mut tx = self
             .pool
@@ -222,28 +225,23 @@ impl ProductsRepository for PgProducts {
             });
         }
 
-        let row: InventoryRow = match unit_cost_cents {
-            Some(unit_cost) if unit_cost > 0 => sqlx::query_as(
+        let row: InventoryRow = match total_cost_cents {
+            Some(total) if total > 0 => sqlx::query_as(
                 "INSERT INTO finished_product_inventory \
-                    (product_sku, location_id, on_hand, reserved, production_cost_cents) \
+                    (product_sku, location_id, on_hand, reserved, value_cents) \
                  VALUES ($1, $2, $3, 0, $4) \
                  ON CONFLICT (product_sku, location_id) DO UPDATE SET \
                     on_hand = finished_product_inventory.on_hand + EXCLUDED.on_hand, \
-                    production_cost_cents = CASE \
-                        WHEN finished_product_inventory.on_hand + EXCLUDED.on_hand = 0 THEN 0 \
-                        ELSE (finished_product_inventory.production_cost_cents \
-                              * finished_product_inventory.on_hand \
-                              + $4 * EXCLUDED.on_hand) \
-                             / (finished_product_inventory.on_hand + EXCLUDED.on_hand) \
-                    END, \
+                    value_cents = finished_product_inventory.value_cents \
+                                  + EXCLUDED.value_cents, \
                     updated_at = NOW() \
                  RETURNING product_sku, location_id, on_hand, reserved, \
-                           production_cost_cents, updated_at",
+                           value_cents, production_cost_cents, updated_at",
             )
             .bind(sku)
             .bind(location_id)
             .bind(qty)
-            .bind(unit_cost),
+            .bind(total),
             _ => sqlx::query_as(
                 "INSERT INTO finished_product_inventory \
                     (product_sku, location_id, on_hand, reserved) \
@@ -252,7 +250,7 @@ impl ProductsRepository for PgProducts {
                     on_hand = finished_product_inventory.on_hand + EXCLUDED.on_hand, \
                     updated_at = NOW() \
                  RETURNING product_sku, location_id, on_hand, reserved, \
-                           production_cost_cents, updated_at",
+                           value_cents, production_cost_cents, updated_at",
             )
             .bind(sku)
             .bind(location_id)
@@ -266,26 +264,24 @@ impl ProductsRepository for PgProducts {
         // standard cost per unit. When unit_cost_cents is None, FG
         // gets the units but the GL doesn't move — same shape as
         // a manual on_hand correction without a cost basis.
-        let gl_move = if let Some(unit_cost) = unit_cost_cents
-            && unit_cost > 0
+        let gl_move = if let Some(total) = total_cost_cents
+            && total > 0
         {
             let happened_on = now.date_naive();
-            let total_cost = (qty as i64).saturating_mul(unit_cost);
             // `source_id` + `happened_on` go INTO the payload so
             // the projection rule's `/source_id` + `/happened_on`
             // pointers find them on rebuild. Bundle export +
             // re-import lands an identical `financial_facts` row.
             let payload = serde_json::json!({
-                "total_cost_cents": total_cost,
+                "total_cost_cents": total,
                 "debit_account": "1320",
                 "credit_account": "1310",
                 "memo": format!(
-                    "Production — produced {qty} × {sku} @ {unit_cost}¢/unit (WIP → FG)"
+                    "Production — produced {qty} × {sku} (WIP → FG, exact line total)"
                 ),
                 "sku": sku,
                 "location_id": location_id,
                 "qty": qty,
-                "unit_cost_cents": unit_cost,
                 "source_id": source_id,
                 "happened_on": happened_on.to_string(),
             });
@@ -330,12 +326,15 @@ impl ProductsRepository for PgProducts {
                 "consume qty must be positive, got {qty}"
             )));
         }
-        // One tx wraps: (1) on_hand decrement, (2) the matching
-        // `finance.cogs.recognized` JE sized at
-        // `qty × production_cost_cents` (DR 5100 COGS / CR 1320
-        // FG). Every finished keg leaving inventory traces back
-        // to a real COGS recognition at the cost it was produced
-        // at — no shortcut, no decoupling.
+        // One tx wraps: (1) the proportional value drain + on_hand
+        // decrement, (2) the matching `finance.cogs.recognized` JE
+        // sized at exactly the drained value (DR 5100 COGS / CR 1320
+        // FG). Every finished keg leaving inventory traces back to a
+        // real COGS recognition at the cost it was produced at — now
+        // to the cent: the drain is round(value × qty / on_hand) with
+        // the final unit taking the remainder, so zero on_hand forces
+        // zero value and balance(1320) == Σ value_cents holds by
+        // construction.
         // Tag the payload with `revenue_category` when supplied so
         // the finance margin rollups can sum COGS by category
         // directly instead of pro-rating against the period revenue
@@ -369,29 +368,57 @@ impl ProductsRepository for PgProducts {
             });
         }
 
+        // Read under lock, compute the exact drain once, apply it.
+        let before: Option<(i32, i64)> = sqlx::query_as(
+            "SELECT on_hand, value_cents FROM finished_product_inventory \
+             WHERE product_sku = $1 AND location_id = $2 FOR UPDATE",
+        )
+        .bind(sku)
+        .bind(location_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        let drained_cents = match before {
+            Some((on_hand_before, value_before)) if on_hand_before >= qty => {
+                if on_hand_before == qty {
+                    value_before
+                } else {
+                    (((value_before as i128) * (qty as i128)
+                        + (on_hand_before as i128) / 2)
+                        / (on_hand_before as i128)) as i64
+                }
+            }
+            _ => {
+                drop(tx);
+                return Err(ProductsError::Invalid(format!(
+                    "consume failed: row missing or on_hand < {qty} for {sku} @ {location_id}"
+                )));
+            }
+        };
         let updated: Option<InventoryRow> = sqlx::query_as(
             "UPDATE finished_product_inventory \
-                SET on_hand = on_hand - $3, updated_at = NOW() \
+                SET on_hand = on_hand - $3, \
+                    value_cents = value_cents - $4, \
+                    updated_at = NOW() \
               WHERE product_sku = $1 AND location_id = $2 \
-                AND on_hand >= $3 \
               RETURNING product_sku, location_id, on_hand, reserved, \
-                        production_cost_cents, updated_at",
+                        value_cents, production_cost_cents, updated_at",
         )
         .bind(sku)
         .bind(location_id)
         .bind(qty)
+        .bind(drained_cents)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| ProductsError::Storage(e.to_string()))?;
         match updated {
             Some(row) => {
-                // COGS recognition. Skip when production_cost is
-                // zero — the FG row was seeded without a cost
-                // basis (the early-day starter inventory case).
-                // The on_hand still moved so the physical-side
-                // story is intact; books absorb the gap until
-                // the next produce lands a real cost basis.
-                let total_cost = (qty as i64).saturating_mul(row.production_cost_cents);
+                // COGS recognition. Skip when the drain is zero — the
+                // FG row was seeded without a cost basis (the
+                // early-day starter inventory case). The on_hand still
+                // moved so the physical-side story is intact; books
+                // absorb the gap until the next produce lands value.
+                let total_cost = drained_cents;
                 let gl_move = if total_cost > 0 {
                     let happened_on = now.date_naive();
                     let mut payload = serde_json::json!({
@@ -399,13 +426,11 @@ impl ProductsRepository for PgProducts {
                         "cogs_account": "5100",
                         "inventory_account": "1320",
                         "memo": format!(
-                            "COGS — sold {qty} × {sku} @ {}¢/unit",
-                            row.production_cost_cents
+                            "COGS — sold {qty} × {sku} (value drain)"
                         ),
                         "sku": sku,
                         "location_id": location_id,
                         "qty": qty,
-                        "unit_cost_cents": row.production_cost_cents,
                         "source_id": source_id,
                         "happened_on": happened_on.to_string(),
                     });
@@ -476,7 +501,7 @@ async fn current_inventory_row(
 ) -> Result<Option<InventoryRow>, ProductsError> {
     sqlx::query_as(
         "SELECT product_sku, location_id, on_hand, reserved, \
-                production_cost_cents, updated_at \
+                value_cents, production_cost_cents, updated_at \
          FROM finished_product_inventory \
          WHERE product_sku = $1 AND location_id = $2",
     )
@@ -574,6 +599,7 @@ struct InventoryRow {
     location_id: String,
     on_hand: i32,
     reserved: i32,
+    value_cents: i64,
     production_cost_cents: i64,
     updated_at: DateTime<Utc>,
 }
@@ -585,6 +611,7 @@ impl From<InventoryRow> for ProductInventory {
             location_id: r.location_id,
             on_hand: r.on_hand,
             reserved: r.reserved,
+            value_cents: r.value_cents,
             production_cost_cents: r.production_cost_cents,
             updated_at: Some(r.updated_at),
         }
