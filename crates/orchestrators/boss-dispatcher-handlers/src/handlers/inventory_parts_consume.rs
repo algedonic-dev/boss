@@ -1,23 +1,16 @@
 //! `inventory.parts.consume` — per-item POST to
-//! `/api/inventory/items/{sku}/consume`. Also fires the
-//! overhead-absorbed JEs for steps that carry an `overhead_absorbed`
-//! array — one DR 1310 / CR <expense> entry per granular production
-//! driver (direct labor → 6100, process utilities → 6300, production
-//! depreciation → 6900, …).
+//! `/api/inventory/items/{sku}/consume`.
 //!
 //! Tolerant of missing/empty consumption arrays — shipment steps
 //! bind this handler alongside `products.consume` and only one of
 //! them lights up depending on whether the step's metadata names
-//! parts vs products. The two halves are independent: absorption runs
-//! whether or not the step names materials, so a step can model pure
-//! burden (e.g. fermentation labor) without a consumption array.
+//! parts vs products.
 //!
-//! Contract note: absorbed overhead is drained back out of WIP only by
-//! a `products.produce` step in the same Job — the joint mash legs by
-//! every packaging format's share, a producing step's own stamps by
-//! that step's own drain. Stamping `overhead_absorbed` on steps of a
-//! Job with no producing step (repair, shipment) capitalizes WIP that
-//! nothing ever drains — don't.
+//! Production-overhead absorption used to ride here off amounts
+//! stamped in step metadata; it is now its own handler
+//! (`inventory.overhead.absorb`), sized `rate_cents_per_bbl ×
+//! batch bbl` from rule args — see that module for the
+//! capitalize/drain contract.
 
 use super::common::{self, StepEvent};
 use async_trait::async_trait;
@@ -63,11 +56,9 @@ impl Handler for InventoryPartsConsume {
             .unwrap_or("production")
             .to_string();
 
-        // --- Consumption legs ------------------------------------------
         // Try ingredients_consumed → parts_consumed → consumed aliases.
         // A missing array is fine (shipment steps bind multiple consume
-        // handlers and only one matches) — but it only skips this half;
-        // overhead absorption below runs regardless.
+        // handlers and only one matches).
         let items: Vec<ConsumedPart> = match step
             .metadata
             .get("ingredients_consumed")
@@ -125,47 +116,6 @@ impl Handler for InventoryPartsConsume {
             });
             async move { common::post_json(&self.client, &url, &body, &ctx.rule_name).await }
         }))
-        .await?;
-
-        // --- Production overhead absorption ------------------------------
-        // Closes the balance-sheet identity gap between consume (raw
-        // cost) and produce (FG cost basis). Each entry capitalizes one
-        // granular driver DR 1310 / CR <credit_account> (direct labor →
-        // 6100, process utilities → 6300, production depreciation →
-        // 6900, …), so the driver flows WIP → FG → COGS at sale instead
-        // of staying in period OpEx. Data-driven: only the entries the
-        // step author stamped in `overhead_absorbed` fire, each keyed by
-        // its credit account (see the endpoint's source_id) so multiple
-        // drivers on one step don't collide on idempotency. The shared
-        // parser (common::overhead_absorbed) aggregates same-account
-        // rows and is the same parse the drain side reconstructs fact
-        // ids from, so what gets capitalized and what gets drained
-        // agree. Drivers are independent facts — posted concurrently.
-        let absorb_url = format!(
-            "{}/api/inventory/overhead-absorbed",
-            self.inventory_base.trim_end_matches('/')
-        );
-        futures::future::try_join_all(
-            common::overhead_absorbed(step.metadata, step.step_id)
-                .into_iter()
-                .map(|ab| {
-                    let memo = ab.memo.unwrap_or_else(|| {
-                        format!(
-                            "Production overhead absorbed into WIP — CR {} (step:{})",
-                            ab.credit_account, step.step_id
-                        )
-                    });
-                    let body = json!({
-                        "total_cost_cents": ab.amount_cents,
-                        "debit_account": "1310",
-                        "credit_account": ab.credit_account,
-                        "memo": memo,
-                        "step_id": step.step_id,
-                    });
-                    let url = &absorb_url;
-                    async move { common::post_json(&self.client, url, &body, &ctx.rule_name).await }
-                }),
-        )
         .await?;
         Ok(())
     }

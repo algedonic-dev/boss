@@ -18,6 +18,7 @@ pub mod commerce_invoice_issue;
 pub mod common;
 pub mod gate_resolve;
 pub mod inventory_bill_approve;
+pub mod inventory_overhead_absorb;
 pub mod inventory_parts_consume;
 pub mod inventory_parts_produce;
 pub mod inventory_po_place;

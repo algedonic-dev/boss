@@ -31,9 +31,10 @@ use std::collections::BTreeMap;
 /// An empty list is a pure sink (notifier / webhook — emits nothing).
 pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
     BTreeMap::from([
+        ("inventory.parts.consume", vec!["inventory.item.consumed"]),
         (
-            "inventory.parts.consume",
-            vec!["inventory.item.consumed", "inventory.overhead.absorbed"],
+            "inventory.overhead.absorb",
+            vec!["inventory.overhead.absorbed"],
         ),
         ("commerce.invoice.issue", vec!["commerce.invoice.created"]),
         (

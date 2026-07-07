@@ -138,6 +138,29 @@ on_event = "step.done.production-consume"
 [[rule.do]]
 handler = "inventory.parts.consume"
 args = { reason = "\"morning-brew\"" }
+# Production-overhead absorption — the excise pattern applied to burden:
+# each do capitalizes one granular driver DR 1310 / CR <expense>, sized
+# `rate_cents_per_bbl × batch bbl` at runtime (batch bbl from the job's
+# own data: a step's `batch_bbl`, else the summed `excise_bbl` of its
+# produce steps). PREDETERMINED per-bbl rates pinned to the model's own
+# inputs at the ~262k-bbl/yr expected volume (derivations in the
+# pale-ale mash-in comment, examples/brewery/seeds/job_kinds.toml):
+#   • Direct labor  $36.60/bbl — $9.59M/yr gross production payroll ÷ 262k
+#   • Process utilities $5.60/bbl — 70% of the $2.1M/yr utilities bill ÷ 262k
+#   • Production depreciation $8.60/bbl — 80% of $2.82M/yr depreciation ÷ 262k
+# Absorption nets each expense to its over/under-absorption variance.
+# The produce rule's `overhead_accounts` below names the same accounts —
+# capitalize-set == drain-set, asserted by the brewery seed test
+# (`overhead_absorption_rules_agree`).
+[[rule.do]]
+handler = "inventory.overhead.absorb"
+args = { rate_cents_per_bbl = "3660", credit_account = "\"6100\"", driver = "\"Direct labor\"" }
+[[rule.do]]
+handler = "inventory.overhead.absorb"
+args = { rate_cents_per_bbl = "560", credit_account = "\"6300\"", driver = "\"Process utilities\"" }
+[[rule.do]]
+handler = "inventory.overhead.absorb"
+args = { rate_cents_per_bbl = "860", credit_account = "\"6900\"", driver = "\"Production depreciation\"" }
 
 [[rule]]
 name = "products-produce-on-production-produce-step-done"
@@ -152,7 +175,10 @@ handler = "products.produce"
 # re-deriving the drain from current avg_cost double-drained the shared
 # mash and drifted with restock prices). Code provides the named bases;
 # `current-avg-cost` stays reachable as the legacy basis + the fallback.
-args = { cost_basis = "\"drain-actual-wip\"" }
+# `overhead_accounts` is the drain-set half of the absorption contract:
+# the mash-step facts to reconstruct are keyed by these credit accounts —
+# the same accounts the `inventory.overhead.absorb` dos above capitalize.
+args = { cost_basis = "\"drain-actual-wip\"", overhead_accounts = "\"6100,6300,6900\"" }
 [[rule.do]]
 handler = "inventory.parts.consume"
 args = { reason = "\"morning-brew-packaging\"" }

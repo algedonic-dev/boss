@@ -90,9 +90,9 @@ pub const INVENTORY_TRANSFERRED: &str = "inventory.transferred";
 
 /// Burden absorption marker — a production-overhead driver capitalized
 /// into WIP at production-consume time. Fires alongside the raw → WIP
-/// `INVENTORY_TRANSFERRED` event once per entry in the production-consume
-/// step's `overhead_absorbed` array (direct labor, process utilities,
-/// production depreciation, …). Payload mirrors
+/// `INVENTORY_TRANSFERRED` event once per `inventory.overhead.absorb`
+/// rule do (direct labor, process utilities, production
+/// depreciation, …), sized rate × batch bbl. Payload mirrors
 /// the financial-fact shape (total_cost_cents, debit_account,
 /// credit_account, memo) so the projection rule can map it 1:1 into
 /// a `finance.inventory.transferred` fact on rebuild without a

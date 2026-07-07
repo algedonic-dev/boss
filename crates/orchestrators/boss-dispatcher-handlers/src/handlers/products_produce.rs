@@ -26,15 +26,14 @@
 //!
 //! So the `drain-actual-wip` basis values this produce step's drain as:
 //!   - its **own packaging legs** (consumed on this step) at current
-//!     `avg_cost`, plus its **own absorbed overhead** (if stamped) at the
-//!     stamped amounts — exactly what the sibling
-//!     `inventory.parts.consume` side effect will debit moments later,
-//!     so they net to zero; plus
+//!     `avg_cost` — exactly what the sibling `inventory.parts.consume`
+//!     side effect will debit moments later, so they net to zero; plus
 //!   - its **share of the joint mash**, `mash × (this format's packaged
 //!     volume / Σ volume of every format that packages)`, where `mash` is
 //!     the real DR-1310 cost the mash-in legs capitalized — **raw
-//!     materials plus any production overhead absorbed at the mash step**
-//!     (direct labor, process utilities, production depreciation; see
+//!     materials plus the production overhead absorbed at the mash step**
+//!     (direct labor, process utilities, production depreciation — the
+//!     drivers named by this rule's `overhead_accounts` arg; see
 //!     `overhead_source_ids`) — summed from the ledger. A format that
 //!     skips (oversupplied) is excluded from the denominator, so the
 //!     packaged formats absorb its mash share.
@@ -124,19 +123,19 @@ impl ProductsProduce {
     }
 
     /// `drain-actual-wip` (default). The WIP this produce step should
-    /// drain: its own packaging at current `avg_cost` + its own absorbed
-    /// overhead (if stamped) + its volume-share of the brew's real
-    /// capitalized mash cost (read from the ledger). Returns `None` only
-    /// when the job carries no steps to reconstruct from — the caller
-    /// then falls back to the current-avg basis. Ledger-read failures
-    /// propagate `Err` so the event NAKs and retries: draining short
-    /// would bake the shortfall into the FG cost basis permanently,
-    /// because rebuild replays the recorded produce fact verbatim and
-    /// never re-runs this computation.
+    /// drain: its own packaging at current `avg_cost` + its volume-share
+    /// of the brew's real capitalized mash cost (read from the ledger).
+    /// Returns `None` only when the job carries no steps to reconstruct
+    /// from — the caller then falls back to the current-avg basis.
+    /// Ledger-read failures propagate `Err` so the event NAKs and
+    /// retries: draining short would bake the shortfall into the FG cost
+    /// basis permanently, because rebuild replays the recorded produce
+    /// fact verbatim and never re-runs this computation.
     async fn drain_actual_wip_cents(
         &self,
         step: &StepEvent<'_>,
         job: &Value,
+        overhead_accounts: &[String],
     ) -> Result<Option<i64>, HandlerError> {
         let steps = match job.get("steps").and_then(|v| v.as_array()) {
             Some(s) => s.as_slice(),
@@ -152,24 +151,16 @@ impl ProductsProduce {
             own_cost =
                 own_cost.saturating_add(self.avg_cost_cents(&sku).await?.saturating_mul(qty));
         }
-        // This step's OWN absorbed overhead (e.g. packaging labor stamped
-        // on a produce step) — the produce step's to drain, exactly like
-        // its own packaging legs. Valued from the same metadata rows the
-        // sibling parts-consume side effect absorbs moments later on this
-        // same event (it runs after this handler in the rule's do-list),
-        // so the two net to zero. The ledger can't be asked here: those
-        // facts land after this drain computes.
-        for ab in common::overhead_absorbed(step.metadata, step.step_id) {
-            own_cost = own_cost.saturating_add(ab.amount_cents);
-        }
 
         // Shared mash: the real DR-1310 cost its consume legs capitalized
-        // — raw materials plus any production overhead absorbed at those
-        // same mash steps (direct labor / utilities / depreciation
-        // drivers). Both are DR-1310 facts; summing both is what drains
-        // the *full* WIP a brew capitalized, so the drivers reach FG/COGS
-        // instead of stranding in WIP. The two sums are independent
-        // read-only aggregates — issue them concurrently.
+        // — raw materials plus the production overhead the
+        // `inventory.overhead.absorb` dos capitalized at those same mash
+        // steps (direct labor / utilities / depreciation drivers, named
+        // by this rule's `overhead_accounts` arg). Both are DR-1310
+        // facts; summing both is what drains the *full* WIP a brew
+        // capitalized, so the drivers reach FG/COGS instead of stranding
+        // in WIP. The two sums are independent read-only aggregates —
+        // issue them concurrently.
         //
         // Failure policy: a failed OR partial read (see the matched-count
         // check in `ledger_transferred_sum`) propagates `Err` → NAK →
@@ -180,7 +171,7 @@ impl ProductsProduce {
         // overhead in 1310: rebuild replays recorded facts, it never
         // re-runs this drain, so nothing downstream could heal it.
         let mash_ids = mash_source_ids(steps, step.step_id);
-        let overhead_ids = overhead_source_ids(steps, step.step_id);
+        let overhead_ids = overhead_source_ids(steps, step.step_id, overhead_accounts);
         let (raw_mash_cost, overhead_cost) = {
             let (raw, overhead) = tokio::join!(
                 self.ledger_transferred_sum("inventory_consume", mash_ids),
@@ -403,20 +394,25 @@ fn mash_source_ids(steps: &[Value], this_step_id: &str) -> Vec<String> {
 
 /// The `financial_facts.source_id`s of the production overhead absorbed
 /// at the brew's joint mash steps (see `joint_mash_steps`), relative to
-/// the produce step `this_step_id`. The ids reconstruct the
-/// `overhead_absorbed` drivers the `inventory.parts.consume` side effect
-/// capitalized — derived from the SAME parse the absorb side posts from
-/// (`common::overhead_absorbed`, aggregation and all) and keyed by
-/// `common::overhead_source_id`, under
-/// `source_table=ledger_overhead_absorbed`. Summed into the mash cost so
-/// the absorbed overhead drains WIP → FG → COGS alongside the raw
-/// materials instead of stranding in WIP.
-fn overhead_source_ids(steps: &[Value], this_step_id: &str) -> Vec<String> {
+/// the produce step `this_step_id`. The ids reconstruct the drivers the
+/// `inventory.overhead.absorb` dos capitalized on the same mash-step
+/// events — one per (mash step × account in the produce rule's
+/// `overhead_accounts` arg), keyed by `common::overhead_source_id`
+/// under `source_table=ledger_overhead_absorbed`. Summed into the mash
+/// cost so the absorbed overhead drains WIP → FG → COGS alongside the
+/// raw materials instead of stranding in WIP. Capitalize-set and
+/// drain-set are both rules data; the brewery seed test asserts they
+/// agree.
+fn overhead_source_ids(
+    steps: &[Value],
+    this_step_id: &str,
+    overhead_accounts: &[String],
+) -> Vec<String> {
     joint_mash_steps(steps, this_step_id)
-        .flat_map(|(step_id, md)| {
-            common::overhead_absorbed(md, step_id)
-                .into_iter()
-                .map(move |ab| common::overhead_source_id(step_id, &ab.credit_account))
+        .flat_map(|(step_id, _md)| {
+            overhead_accounts
+                .iter()
+                .map(move |account| common::overhead_source_id(step_id, account))
         })
         .collect()
 }
@@ -542,6 +538,19 @@ impl Handler for ProductsProduce {
         // Cost basis is selected by data (rules.toml `cost_basis` arg);
         // code provides the named bases. Default is drain-actual-wip.
         let basis = arg_string(args, "cost_basis").unwrap_or("drain-actual-wip");
+        // The overhead drivers capitalized at the mash steps, as GL
+        // account codes (comma-separated) — the drain-set half of the
+        // absorption contract. Must name the same accounts the
+        // `inventory.overhead.absorb` dos credit (the brewery seed test
+        // asserts the two rule sets agree). Empty = the tenant absorbs
+        // no overhead.
+        let overhead_accounts: Vec<String> = arg_string(args, "overhead_accounts")
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
 
         // Fetch the Job once — both bases read its steps' consumed inputs.
         let job = self.fetch_job(step.job_id).await?;
@@ -552,7 +561,10 @@ impl Handler for ProductsProduce {
             // capitalized. A failed/partial ledger read propagates Err
             // (NAK → retry once the facts land); the current-avg
             // fallback below covers only the structural no-steps case.
-            _ => match self.drain_actual_wip_cents(&step, &job).await? {
+            _ => match self
+                .drain_actual_wip_cents(&step, &job, &overhead_accounts)
+                .await?
+            {
                 Some(c) => Some(c),
                 None => self.current_avg_brew_cost(&job).await?,
             },
@@ -728,25 +740,20 @@ mod tests {
 
     #[test]
     fn overhead_ids_reconstruct_absorption_keys_for_mash_steps_only() {
+        // The drain-set comes from the produce rule's `overhead_accounts`
+        // arg — one id per (joint mash step × account). The produce step
+        // itself is never a joint mash leg.
         let steps = vec![
             json!({ "id": "mash", "kind": "production-consume", "status": "completed", "metadata": {
-                "ingredients_consumed": [{ "part_sku": "ING-MALT-2ROW-50", "qty": 196 }],
-                "overhead_absorbed": [
-                    { "amount_cents": 578_280, "credit_account": "6100" },
-                    { "amount_cents": 88_480,  "credit_account": "6300" },
-                    { "amount_cents": 135_880, "credit_account": "6900" }
-                ]
+                "ingredients_consumed": [{ "part_sku": "ING-MALT-2ROW-50", "qty": 196 }]
             }}),
             json!({ "id": "pkg-half", "kind": "production-produce", "status": "active", "metadata": {
-                "produces_products": [{ "sku": "FP-PALE-1-2-BBL", "qty": 210 }],
-                // A producing step's own absorption is the produce
-                // step's to drain (added into own_cost) — never a
-                // joint mash leg.
-                "overhead_absorbed": [{ "amount_cents": 999, "credit_account": "6100" }]
+                "produces_products": [{ "sku": "FP-PALE-1-2-BBL", "qty": 210 }]
             }}),
         ];
+        let accounts = vec!["6100".to_string(), "6300".to_string(), "6900".to_string()];
         // Keys mirror the absorption endpoint's source_id, mash steps only.
-        let mut ids = overhead_source_ids(&steps, "pkg-half");
+        let mut ids = overhead_source_ids(&steps, "pkg-half", &accounts);
         ids.sort();
         assert_eq!(
             ids,
@@ -756,6 +763,8 @@ mod tests {
                 "overhead-absorbed@mash:6900".to_string(),
             ]
         );
+        // No accounts configured → nothing to reconstruct.
+        assert!(overhead_source_ids(&steps, "pkg-half", &[]).is_empty());
     }
 
     #[test]
@@ -766,12 +775,10 @@ mod tests {
         // check). Only completed steps are joint mash legs.
         let steps = vec![
             json!({ "id": "mash", "kind": "production-consume", "status": "completed", "metadata": {
-                "ingredients_consumed": [{ "part_sku": "ING-A", "qty": 5 }],
-                "overhead_absorbed": [{ "amount_cents": 100, "credit_account": "6100" }]
+                "ingredients_consumed": [{ "part_sku": "ING-A", "qty": 5 }]
             }}),
             json!({ "id": "late-adds", "kind": "production-consume", "status": "pending", "metadata": {
-                "ingredients_consumed": [{ "part_sku": "ING-B", "qty": 2 }],
-                "overhead_absorbed": [{ "amount_cents": 50, "credit_account": "6300" }]
+                "ingredients_consumed": [{ "part_sku": "ING-B", "qty": 2 }]
             }}),
             json!({ "id": "pkg", "kind": "production-produce", "status": "active", "metadata": {
                 "produces_products": [{ "sku": "FP-PALE-1-2-BBL", "qty": 210 }]
@@ -782,7 +789,7 @@ mod tests {
             vec!["mash:ING-A".to_string()]
         );
         assert_eq!(
-            overhead_source_ids(&steps, "pkg"),
+            overhead_source_ids(&steps, "pkg", &["6100".to_string()]),
             vec!["overhead-absorbed@mash:6100".to_string()]
         );
     }
