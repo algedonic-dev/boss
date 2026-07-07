@@ -126,6 +126,18 @@
           h('span', { className: 'step-review-path' }, ` — ${doc.path}`),
         ),
       );
+      // The doc itself — the review is unreadable without it. Server-
+      // rendered HTML (pulldown_cmark over the repo-committed markdown;
+      // same trust domain as this bundle), collapsible so the questions
+      // stay reachable on long docs.
+      if (doc.content_html) {
+        const details = h('details', { className: 'step-review-doc', open: true });
+        details.appendChild(h('summary', null, `Read the doc (${doc.word_count || '—'} words)`));
+        const docBody = h('div', { className: 'step-review-doc-body' });
+        docBody.innerHTML = doc.content_html;
+        details.appendChild(docBody);
+        bodyDiv.appendChild(details);
+      }
       if (questions.length === 0) {
         bodyDiv.appendChild(
           h(
@@ -155,9 +167,19 @@
             h('span', { className: 'step-review-question-anchor' }, q.anchor),
             h('span', { className: 'step-review-question-title' }, q.title),
           ),
-          q.body_md
-            ? h('pre', { className: 'step-review-question-body' }, q.body_md)
-            : null,
+          // body_html is rendered server-side with the doc pipeline;
+          // the <pre> of raw markdown stays only as the fallback for an
+          // old docs-api.
+          (() => {
+            if (q.body_html) {
+              const b = h('div', { className: 'step-review-question-body' });
+              b.innerHTML = q.body_html;
+              return b;
+            }
+            return q.body_md
+              ? h('pre', { className: 'step-review-question-body' }, q.body_md)
+              : null;
+          })(),
           h('label', { className: 'step-review-resolution-label' }, 'Resolution'),
           ta,
         );
@@ -200,6 +222,11 @@
       // Mirror each non-empty resolution to /api/design/pending-decisions
       // so the existing flush-jobs path can extract them to ADRs. We
       // POST one at a time — the endpoint is upsert-style.
+      // PendingDecisionInput wants {doc_path, anchor, kind, resolution}.
+      // The reviewer types free-text decisions here (there's no parsed
+      // proposal being accepted), so every row is an Override. The old
+      // body sent `proposal` with no kind — a 422 this catch swallowed,
+      // so flush-jobs always saw zero pending decisions.
       const writes = resolutions
         .filter((r) => r.decision.trim().length > 0)
         .map((r) =>
@@ -209,7 +236,8 @@
             body: JSON.stringify({
               doc_path: docPath,
               anchor: r.anchor,
-              proposal: r.decision,
+              kind: 'override',
+              resolution: r.decision,
             }),
           }),
         );
