@@ -297,14 +297,16 @@ pub(super) async fn batch_upsert_items<R: InventoryRepository + 'static>(
             )
             .await;
         }
-        // Atomic opening-balance JE. When a batch upsert lands non-zero
-        // on_hand at a positive avg_cost, post DR 1300 / CR 3000 sized at
-        // on_hand × avg_cost so the GL reflects the asset that just
-        // appeared in the projection. Idempotent on `(source_table,
-        // source_id)` so re-runs of the same seed bundle no-op. Posting
-        // the JE atomically at the API layer closes the hole for every
-        // batch caller, not just brewery-engine.
-        let total_cost = (item.on_hand as i64).saturating_mul(item.avg_cost_cents);
+        // Atomic opening-balance JE. When a batch upsert lands a row
+        // carrying value, post DR 1300 / CR 3000 sized at exactly
+        // value_cents — the conserved quantity the row now holds, so
+        // the GL and the projection agree by construction (PR 6a;
+        // avg_cost_cents is derived display and never sizes a JE).
+        // Idempotent on `(source_table, source_id)` so re-runs of the
+        // same seed bundle no-op. Posting the JE atomically at the API
+        // layer closes the hole for every batch caller, not just
+        // brewery-engine.
+        let total_cost = item.value_cents;
         if total_cost > 0 {
             let memo = format!(
                 "Opening balance — {} × {} (raw materials ← retained earnings)",

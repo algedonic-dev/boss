@@ -1973,7 +1973,9 @@ fn ensure_raw_inventory_opening_balances(
     let je_url = format!("{ledger_base}/api/ledger/inventory-transferred");
     let mut posted = 0u64;
     for part in &parts {
-        let total_cost_cents = (part.on_hand as i64).saturating_mul(part.avg_cost_cents);
+        // The exact conserved value load_parts derived — the JE and the
+        // row can't disagree because they are the same number.
+        let total_cost_cents = part.value_cents;
         if total_cost_cents <= 0 {
             continue;
         }
