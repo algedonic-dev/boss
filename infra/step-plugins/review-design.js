@@ -222,6 +222,11 @@
       // Mirror each non-empty resolution to /api/design/pending-decisions
       // so the existing flush-jobs path can extract them to ADRs. We
       // POST one at a time — the endpoint is upsert-style.
+      // PendingDecisionInput wants {doc_path, anchor, kind, resolution}.
+      // The reviewer types free-text decisions here (there's no parsed
+      // proposal being accepted), so every row is an Override. The old
+      // body sent `proposal` with no kind — a 422 this catch swallowed,
+      // so flush-jobs always saw zero pending decisions.
       const writes = resolutions
         .filter((r) => r.decision.trim().length > 0)
         .map((r) =>
@@ -231,7 +236,8 @@
             body: JSON.stringify({
               doc_path: docPath,
               anchor: r.anchor,
-              proposal: r.decision,
+              kind: 'override',
+              resolution: r.decision,
             }),
           }),
         );
