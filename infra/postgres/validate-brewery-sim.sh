@@ -77,6 +77,40 @@ echo "==> validating brewery sim: $DAYS days from $START"
 echo "    repo:  $REPO_ROOT"
 echo
 
+# -- Step 0: clock-api must be up in sim mode ------------------
+# Every write in the run is stamped through clock-api, so the whole
+# script depends on a sim-mode clock (`POST /configure` is sim-only —
+# a wall-mode clock 405s it). deploy-services.sh installs the clock
+# with BOSS_CLOCK_MODE=wall (the prod default), so a fresh
+# bootstrap-vm.sh box fails here until the mode is flipped; the
+# playground carries the sim-mode drop-in already. Probe /configure
+# up front — before the DB drop — so a wall-mode box fails in
+# seconds with the remediation, not minutes in with a half-reset DB.
+# In sim mode the probe doubles as an early epoch prime; step 2.4
+# re-primes after the DB recreate (idempotent rebase, same epoch).
+echo "==> [0/10] checking clock-api is up in sim mode"
+PROBE_CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 3 -X POST \
+    -H "Content-Type: application/json" \
+    -d "{\"epoch_start\": \"${START}\"}" \
+    "http://127.0.0.1:7060/api/clock/configure" || echo 000)
+if [[ "$PROBE_CODE" != "200" && "$PROBE_CODE" != "201" ]]; then
+    cat >&2 <<EOF
+ERROR: clock-api /configure returned HTTP $PROBE_CODE — the regen needs a
+sim-mode clock (405 = wall mode; 000 = clock-api not running). Flip the
+deployed unit to sim mode and re-run:
+
+  sudo mkdir -p /etc/systemd/system/boss-clock-api.service.d
+  printf '[Service]\nEnvironment=BOSS_CLOCK_MODE=sim\n' |
+      sudo tee /etc/systemd/system/boss-clock-api.service.d/override.conf
+  sudo systemctl daemon-reload && sudo systemctl restart boss-clock-api
+
+(The drop-in survives deploy-services.sh re-runs; see the clock section
+there for why wall is the install default.)
+EOF
+    exit 1
+fi
+echo "    clock-api sim mode confirmed (epoch primed to ${START})"
+
 # -- Step 1: drop + recreate live boss DB ----------------------
 echo "==> [1/10] dropping + recreating boss DB"
 # Stop every boss service that holds a connection to the boss DB.
