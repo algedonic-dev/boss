@@ -139,33 +139,33 @@ divergences):
 
 ## Open questions
 
-### Q1: Value-primary rows, or higher-precision stored averages?
+All 3 open questions were resolved 2026-07-07 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-Value-primary (recommended): eliminates the truncation class outright
-and makes conservation structural. The alternative — storing averages
-at milli-cent precision — shrinks each leak but keeps the class, and
-still needs the drain-side rounding rules defined. Is there a reason
-to prefer keeping a stored average (e.g. tenant-visible standard
-costing) that outweighs structural conservation?
+---
 
-### Q2: Which flow owns the COGS recognition (the 1320 credit)?
 
-Today both the invoice-issue rule (at `cost_basis_cents`, order-time)
-and the products consume path (at ship-time average) post it, and on
-the playground only the invoice side ever fires — FG physical never
-decrements. Proposed: the **consume** (the physical event) owns
-DR 5100 / CR 1320, priced by the proportional-value drain; the
-invoice JE keeps revenue/AR/tax legs and drops its COGS leg; every
-sale flow (wholesale shipment steps AND taproom close) must then
-drive a consume. Alternative: invoice owns COGS and the consume posts
-no GL (but then physical and GL price the same drain differently and
-reconciliation needs a bridging account). Which way?
+## Decisions
 
-### Q3: One PR or two?
+### Q1: Value-primary rows, or higher-precision stored averages? (resolved)
 
-Proposed split: **6a** = value-primary storage + line-total
-produce/receive/consume + the reconciliation gate (mechanical
-conservation, no modeling change); **6b** = COGS ownership per Q2
-(touches the invoice rule, shipment/taproom step wiring, and the sim
-drive). 6a is safe to land alone and makes 6b's effect measurable.
-Agree with the split?
+Resolved 2026-07-07 — override.
+
+Value-primary is right
+
+
+### Q2: Which flow owns the COGS recognition (the 1320 credit)? (resolved)
+
+Resolved 2026-07-07 — override.
+
+Consume should own
+
+
+### Q3: One PR or two? (resolved)
+
+Resolved 2026-07-07 — override.
+
+Sounds good
