@@ -114,11 +114,12 @@ async fn reindex_one(
         .map_err(|e| DocsError::Storage(format!("reading {rel_path}: {e}")))?;
     let parsed = parse_doc(rel_path, &markdown);
 
-    // A Shipped or Superseded doc must not carry live questions.
+    // A Shipped, Superseded, or Living doc must not carry live
+    // questions — those statuses assert there is no open discussion.
     // The author has to either mark them `(resolved)` or move the
     // doc to `reopened` — we force the choice at reindex time so
     // new questions don't silently disappear from the tracker.
-    if parsed.status.is_terminal() && !parsed.unresolved_questions.is_empty() {
+    if parsed.status.forbids_open_questions() && !parsed.unresolved_questions.is_empty() {
         return Err(DocsError::BadRequest(format!(
             "{rel_path}: status is `{status}` but {n} unresolved question{plural} found ({titles}). \
              Mark each with `(resolved)` in the heading, or change the doc status to `reopened`.",

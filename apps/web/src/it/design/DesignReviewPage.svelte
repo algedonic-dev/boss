@@ -152,6 +152,26 @@
     void load();
   });
 
+  // David's distinction (2026-07-08): a doc is "in review & discussion"
+  // when its status says so OR anything actionable is attached (parsed
+  // open questions, unflushed decisions, an open review Job). Everything
+  // else — living references, approved/shipped/superseded designs — is
+  // settled: nobody is acting on it, and showing it as in-review was a
+  // lie the old status parser told (living → in-review collapse).
+  function underReview(doc: DesignDoc): boolean {
+    return (
+      doc.status === 'draft' ||
+      doc.status === 'in-review' ||
+      doc.status === 'reopened' ||
+      doc.open_questions > 0 ||
+      doc.pending_count > 0 ||
+      openReviewsByPath[doc.path] !== undefined
+    );
+  }
+
+  const reviewing = $derived(docs.filter(underReview));
+  const settled = $derived(docs.filter((d) => !underReview(d)));
+
   function relTime(iso: string): string {
     const d = new Date(iso);
     const now = new Date();
@@ -171,47 +191,63 @@
 {:else if error}
   <p class="empty">Error: {error}</p>
 {:else}
-  <Section title={`Design docs (${docs.length})`} wide>
-    <table class="design-table">
-      <thead>
-        <tr>
-          <th>Doc</th>
-          <th>Status</th>
-          <th>Open Qs</th>
-          <th>Pending decisions</th>
-          <th>Last modified</th>
-          <th>Review</th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each docs as doc (doc.path)}
-          {@const review = openReviewsByPath[doc.path]}
-          <tr>
-            <td>
-              <strong>{doc.title}</strong>
-              <div class="design-path">{doc.path}</div>
-            </td>
-            <td>{doc.status}</td>
-            <td>{doc.open_questions}</td>
-            <td>{doc.pending_count}</td>
-            <td>{relTime(doc.last_modified)}</td>
-            <td>
-              {#if review}
-                <Link to={`/service/${review.id}`}>
-                  In review — {review.status}
-                </Link>
-              {:else}
-                <button class="wb-btn" type="button" onclick={() => openReview(doc)}>
-                  Open review Job
-                </button>
-              {/if}
-            </td>
-          </tr>
-        {/each}
-      </tbody>
-    </table>
+  <Section title={`In review & discussion (${reviewing.length})`} wide>
+    {#if reviewing.length === 0}
+      <p class="empty">
+        Nothing under discussion — every design doc is a settled
+        reference. New questions land here when a doc adds
+        <code>### Qn:</code> headings (status → reopened).
+      </p>
+    {:else}
+      {@render docTable(reviewing, 'Open review Job')}
+    {/if}
+  </Section>
+
+  <Section title={`Living references & settled (${settled.length})`} wide>
+    {@render docTable(settled, 'Reopen discussion')}
   </Section>
 {/if}
+
+{#snippet docTable(rows: ReadonlyArray<DesignDoc>, buttonLabel: string)}
+  <table class="design-table">
+    <thead>
+      <tr>
+        <th>Doc</th>
+        <th>Status</th>
+        <th>Open Qs</th>
+        <th>Pending decisions</th>
+        <th>Last modified</th>
+        <th>Review</th>
+      </tr>
+    </thead>
+    <tbody>
+      {#each rows as doc (doc.path)}
+        {@const review = openReviewsByPath[doc.path]}
+        <tr>
+          <td>
+            <strong>{doc.title}</strong>
+            <div class="design-path">{doc.path}</div>
+          </td>
+          <td>{doc.status}</td>
+          <td>{doc.open_questions}</td>
+          <td>{doc.pending_count}</td>
+          <td>{relTime(doc.last_modified)}</td>
+          <td>
+            {#if review}
+              <Link to={`/service/${review.id}`}>
+                In review — {review.status}
+              </Link>
+            {:else}
+              <button class="wb-btn" type="button" onclick={() => openReview(doc)}>
+                {buttonLabel}
+              </button>
+            {/if}
+          </td>
+        </tr>
+      {/each}
+    </tbody>
+  </table>
+{/snippet}
 
 <style>
   .design-table {

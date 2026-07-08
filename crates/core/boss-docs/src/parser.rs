@@ -744,7 +744,7 @@ These are unresolved.
         let md = "# Foo\n\n**Status**: reopened — original scope shipped 2026-04-18; new proposal pending\n";
         let parsed = parse_doc("docs/design/foo.md", md);
         assert_eq!(parsed.status, DocStatus::Reopened);
-        assert!(!parsed.status.is_terminal());
+        assert!(!parsed.status.forbids_open_questions());
     }
 
     #[test]

@@ -1,7 +1,9 @@
 # Inventory value conservation (costing PR 6)
 
-**Status:** open — design for the WIP-reconciliation item in TODO.md's
-near-term queue. Decision questions at the bottom feed the tracker.
+**Status:** shipped — implemented as PR 6a (#84, value-primary storage +
+exact conservation gates) and PR 6b (#85, the consume owns COGS).
+Decisions live in the Decision-history below; settled material folds
+into docs/architecture-decisions.md at the next release.
 
 ## The invariant
 

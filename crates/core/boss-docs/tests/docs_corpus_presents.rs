@@ -44,6 +44,24 @@ fn every_design_doc_presents_sensibly() {
             "{name}: rendered to empty HTML"
         );
         assert!(
+            markdown.lines().take(30).any(|l| {
+                let t = l.trim_start().trim_start_matches("- ");
+                t.starts_with("**Status**") || t.starts_with("**Status:**")
+            }),
+            "{name}: no `**Status**:` line in the first 30 lines — the doc \
+             defaults to in-review and reads as under active discussion \
+             (declare `living` for a settled reference)"
+        );
+        if parsed.status.forbids_open_questions() {
+            assert!(
+                parsed.questions.is_empty(),
+                "{name}: status `{}` asserts no open discussion but the doc \
+                 has {} open question(s) — flip to `reopened` first",
+                parsed.status.as_str(),
+                parsed.questions.len()
+            );
+        }
+        assert!(
             !parsed.used_fallback_anchors,
             "{name}: open questions use positional fallback anchors — author them as \
              `### Qn: <title>` subheadings (CLAUDE.md §Design docs) or reordering \
