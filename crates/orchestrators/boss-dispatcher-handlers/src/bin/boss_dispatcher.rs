@@ -27,8 +27,8 @@ use boss_dispatcher_handlers::handlers::{
     ledger_tax_accrue::LedgerTaxAccrue, ledger_tax_remit::LedgerTaxRemit,
     messages_notify::MessagesNotify, packaging_allocate::PackagingAllocate,
     people_hire::PeopleHire, people_terminate::PeopleTerminate, products_consume::ProductsConsume,
-    products_produce::ProductsProduce, shipping_create::ShippingCreate,
-    webhook_notify::WebhookNotify,
+    products_consume_from_invoice::ProductsConsumeFromInvoice, products_produce::ProductsProduce,
+    shipping_create::ShippingCreate, webhook_notify::WebhookNotify,
 };
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -181,6 +181,13 @@ async fn main() -> Result<()> {
                 cfg.ledger_api_url.clone(),
             ));
             handlers.register(ProductsConsume::new(cfg.products_api_url.clone()));
+            // Q2 (inventory-value-conservation): the consume owns COGS.
+            // Every issued invoice's FG lines drain stock + recognize
+            // COGS through the products surface, replacing commerce's
+            // in-tx cross-module UPDATE + the invoice JE's COGS leg.
+            handlers.register(ProductsConsumeFromInvoice::new(
+                cfg.products_api_url.clone(),
+            ));
             handlers.register(CommerceInvoiceIssue::new(cfg.commerce_api_url.clone()));
             handlers.register(ShippingCreate::new(cfg.shipping_api_url.clone()));
             // Outbound integration edge: forward matched events to a
