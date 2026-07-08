@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS design_docs (
     path              TEXT PRIMARY KEY,
     title             TEXT NOT NULL,
     status            TEXT NOT NULL CHECK (status IN (
-        'draft', 'in-review', 'approved', 'shipped', 'superseded'
+        'draft', 'in-review', 'approved', 'shipped', 'reopened',
+        'superseded', 'living'
     )),
     pending_count     INTEGER NOT NULL DEFAULT 0,
     word_count        INTEGER NOT NULL DEFAULT 0,
@@ -37,6 +38,18 @@ CREATE TABLE IF NOT EXISTS design_docs (
 
 
 CREATE INDEX IF NOT EXISTS design_docs_status ON design_docs(status);
+
+-- 2026-07-08: widen the CHECK to the full DocStatus vocabulary —
+-- `living` (settled references) and `reopened` were missing, so a
+-- reindex of any doc carrying them failed at the DB layer while the
+-- Rust enum happily produced them. The schema_matches_doc_status_enum
+-- pg test pins the two lists together now. Idempotent swap for
+-- existing databases.
+ALTER TABLE design_docs DROP CONSTRAINT IF EXISTS design_docs_status_check;
+ALTER TABLE design_docs ADD CONSTRAINT design_docs_status_check CHECK (status IN (
+    'draft', 'in-review', 'approved', 'shipped', 'reopened',
+    'superseded', 'living'
+));
 
 CREATE INDEX IF NOT EXISTS design_docs_pending
     ON design_docs(pending_count) WHERE pending_count > 0;

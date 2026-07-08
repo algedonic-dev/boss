@@ -53,6 +53,16 @@ export const PORTS: ReadonlyArray<PortRow> = [
     "scratch": 8900
   },
   {
+    "name": "simulator",
+    "prod": 7010,
+    "scratch": null
+  },
+  {
+    "name": "sim-control",
+    "prod": 7011,
+    "scratch": null
+  },
+  {
     "name": "clock",
     "prod": 7060,
     "scratch": null

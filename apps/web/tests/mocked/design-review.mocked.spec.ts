@@ -25,7 +25,7 @@ const DOCS = [
   {
     path: 'docs/design/correctness-protocol.md',
     title: 'The BOSS correctness protocol',
-    status: 'in-review',
+    status: 'living',
     open_questions: 0,
     pending_count: 0,
     word_count: 1398,
@@ -111,13 +111,44 @@ test.describe('Design review list', () => {
     await expect(settled.locator('td').nth(2)).toHaveText('0');
   });
 
+  test('splits docs under discussion from living references', async ({
+    page,
+  }) => {
+    await mountPage(page, '/system/design', { titleMatch: /design review/i });
+    // The doc with open questions sits in the reviewing section; the
+    // living reference sits below with a reopen affordance — the
+    // pre-2026-07-08 page showed both as "in-review".
+    const reviewing = page
+      .locator('section', { hasText: 'In review & discussion' })
+      .first();
+    await expect(
+      reviewing.locator('tr', { hasText: 'Inventory value conservation' }),
+    ).toBeVisible({ timeout: 10_000 });
+    const settled = page
+      .locator('section', { hasText: 'Living references & settled' })
+      .first();
+    await expect(
+      settled.locator('tr', { hasText: 'correctness protocol' }),
+    ).toBeVisible();
+    await expect(settled.locator('td', { hasText: 'living' })).toBeVisible();
+    await expect(
+      settled.getByRole('button', { name: /reopen discussion/i }),
+    ).toBeVisible();
+  });
+
   test('docs without an open review offer the review-Job entry point', async ({
     page,
   }) => {
     await mountPage(page, '/system/design', { titleMatch: /design review/i });
-    const buttons = page.getByRole('button', { name: /open review job/i });
-    await expect(buttons.first()).toBeVisible({ timeout: 10_000 });
-    await expect(buttons).toHaveCount(DOCS.length);
+    // One doc is under discussion ("Open review Job"), one is a living
+    // reference ("Reopen discussion") — every doc gets exactly one
+    // affordance, worded for its state.
+    await expect(
+      page.getByRole('button', { name: /open review job/i }),
+    ).toHaveCount(1);
+    await expect(
+      page.getByRole('button', { name: /reopen discussion/i }),
+    ).toHaveCount(1);
   });
 
   test('Open review Job posts the identity-first subject shape', async ({

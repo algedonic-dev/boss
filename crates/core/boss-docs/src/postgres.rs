@@ -28,13 +28,9 @@ fn doc_from_row(row: &PgRow) -> Result<DesignDoc, DocsError> {
     let status_str: String = row
         .try_get("status")
         .map_err(|e| DocsError::Storage(e.to_string()))?;
-    let status = match status_str.as_str() {
-        "draft" => DocStatus::Draft,
-        "in-review" => DocStatus::InReview,
-        "approved" => DocStatus::Approved,
-        "shipped" => DocStatus::Shipped,
-        "superseded" => DocStatus::Superseded,
-        other => return Err(DocsError::Storage(format!("unknown status {other}"))),
+    let status = match DocStatus::from_db_str(&status_str) {
+        Some(s) => s,
+        None => return Err(DocsError::Storage(format!("unknown status {status_str}"))),
     };
     Ok(DesignDoc {
         path: row.try_get("path").map_err(storage)?,

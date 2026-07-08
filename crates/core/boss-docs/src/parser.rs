@@ -149,7 +149,15 @@ fn extract_status(markdown: &str) -> DocStatus {
             .trim_start_matches("- ")
             .trim_start_matches("* ")
             .trim_start();
-        if let Some(rest) = stripped.strip_prefix("**status**:") {
+        // Both bold forms appear in the corpus: `**Status**: value`
+        // (colon outside) and `**Status:** value` (colon inside). The
+        // parser recognized only the first, so six of ten real docs
+        // silently fell through to the InReview default — the very
+        // collapse the Living status exists to fix.
+        if let Some(rest) = stripped
+            .strip_prefix("**status**:")
+            .or_else(|| stripped.strip_prefix("**status:**"))
+        {
             return DocStatus::from_status_line(rest.trim());
         }
         if let Some(rest) = stripped.strip_prefix("status:") {
@@ -591,6 +599,16 @@ fn first_sentence_outside_code(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn status_line_parses_both_bold_colon_forms() {
+        // `**Status**: living` (colon outside) and `**Status:** living`
+        // (colon inside) both appear in the shipped corpus.
+        let outside = "# T\n\n**Status**: living guidance\n\nbody";
+        let inside = "# T\n\n**Status:** living guidance\n\nbody";
+        assert_eq!(parse_doc("d.md", outside).status, DocStatus::Living);
+        assert_eq!(parse_doc("d.md", inside).status, DocStatus::Living);
+    }
+
     use super::*;
 
     #[test]
@@ -744,7 +762,7 @@ These are unresolved.
         let md = "# Foo\n\n**Status**: reopened — original scope shipped 2026-04-18; new proposal pending\n";
         let parsed = parse_doc("docs/design/foo.md", md);
         assert_eq!(parsed.status, DocStatus::Reopened);
-        assert!(!parsed.status.is_terminal());
+        assert!(!parsed.status.forbids_open_questions());
     }
 
     #[test]
