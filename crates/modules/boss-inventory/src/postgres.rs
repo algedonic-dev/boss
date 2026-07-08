@@ -380,7 +380,7 @@ impl InventoryRepository for PgInventory {
         memo: &str,
         source_id: &str,
         happened_on: chrono::NaiveDate,
-    ) -> Result<uuid::Uuid, InventoryError> {
+    ) -> Result<(uuid::Uuid, bool), InventoryError> {
         if total_cost_cents <= 0 {
             return Err(InventoryError::Storage(
                 "total_cost_cents must be positive".to_string(),
@@ -401,7 +401,7 @@ impl InventoryRepository for PgInventory {
             "source_id": source_id,
         });
 
-        insert_fact(
+        let inserted = insert_fact(
             &mut tx,
             "finance.inventory.transferred",
             happened_on,
@@ -447,7 +447,7 @@ impl InventoryRepository for PgInventory {
         tx.commit()
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
-        Ok(fact_id)
+        Ok((fact_id, inserted))
     }
 
     async fn record_inventory_je(
@@ -524,7 +524,7 @@ impl InventoryRepository for PgInventory {
         unit_cost_cents: Option<i64>,
         now: chrono::DateTime<chrono::Utc>,
         source_id: &str,
-    ) -> Result<InventoryItem, InventoryError> {
+    ) -> Result<ReceiveApplied, InventoryError> {
         // One tx wraps: (1) the idempotency check, (2) the on_hand
         // increment (+ weighted-avg-cost update), (3) the
         // `finance.inventory.received` proof-fact insert. The fact is
@@ -559,10 +559,14 @@ impl InventoryRepository for PgInventory {
         .await?
         {
             drop(tx);
-            return self
+            let item = self
                 .item_by_sku(part_sku)
                 .await?
-                .ok_or_else(|| InventoryError::NotFound(part_sku.to_string()));
+                .ok_or_else(|| InventoryError::NotFound(part_sku.to_string()))?;
+            return Ok(ReceiveApplied {
+                item,
+                receipt_payload: None,
+            });
         }
 
         // Value-primary receive: the exact line total (qty × the PO
@@ -612,7 +616,10 @@ impl InventoryRepository for PgInventory {
         // (kind, source_table, source_id) index; written in the SAME
         // tx as the increment so the guard above and the on_hand
         // mutation commit atomically. GL-inert by construction — no
-        // ledger post here.
+        // ledger post here. The payload is the ONE construction: the
+        // caller emits ITEM_RECEIVED from the returned copy verbatim,
+        // so the fact rebuilt from the event is byte-identical — and a
+        // replay (guard above) returns None and emits nothing.
         let payload = serde_json::json!({
             "part_sku": part_sku,
             "qty": qty,
@@ -633,7 +640,10 @@ impl InventoryRepository for PgInventory {
         tx.commit()
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
-        Ok(item)
+        Ok(ReceiveApplied {
+            item,
+            receipt_payload: Some(payload),
+        })
     }
 
     async fn create_purchase_order_at(
@@ -1179,6 +1189,9 @@ async fn insert_dedup_fact(
 /// synchronously to the ledger. Idempotent — replay of the same fact is a
 /// no-op for both the fact row (unique index) and the journal entry
 /// (unique (fact_id, rule_version_id)).
+/// Insert the fact idempotently; `Ok(true)` = this call inserted it,
+/// `Ok(false)` = the (kind, source_table, source_id) key already
+/// existed (replay). Callers gate occurrence-event emits on the flag.
 async fn insert_fact(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     kind: &str,
@@ -1186,8 +1199,8 @@ async fn insert_fact(
     payload: &serde_json::Value,
     source_table: &str,
     source_id: &str,
-) -> Result<(), InventoryError> {
-    sqlx::query(
+) -> Result<bool, InventoryError> {
+    let result = sqlx::query(
         "INSERT INTO financial_facts \
             (id, kind, happened_on, payload, source_table, source_id, created_by) \
          VALUES ($1, $2, $3, $4, $5, $6, 'inventory') \
@@ -1227,7 +1240,7 @@ async fn insert_fact(
     boss_ledger::post_fact_in_tx(tx, &fact_ref)
         .await
         .map_err(|e| InventoryError::Storage(format!("ledger post failed: {e}")))?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 pub(crate) fn po_status_str(s: &PoStatus) -> &'static str {

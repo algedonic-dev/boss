@@ -418,7 +418,8 @@ async fn post_accrual_entry(
         },
     )
     .await
-    .map_err(ledger_err)?;
+    .map_err(ledger_err)?
+    .id;
 
     let fact = crate::types::FactRef {
         id: live_fact_id,
@@ -507,7 +508,7 @@ pub(super) async fn create_tax_accrual(
     )
     .await
     {
-        Ok(id) => id,
+        Ok(rec) => rec.id,
         Err(e) => return ledger_err(e),
     };
 
@@ -645,7 +646,7 @@ pub(super) async fn remit_tax_filing(
     )
     .await
     {
-        Ok(id) => id,
+        Ok(rec) => rec.id,
         Err(e) => return ledger_err(e),
     };
 

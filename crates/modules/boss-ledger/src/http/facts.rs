@@ -123,7 +123,7 @@ pub(super) async fn create_manual_entry(
         Err(e) => return storage_err(e),
     };
 
-    let fact_id = match crate::events::record_fact_in_tx(
+    let recorded = match crate::events::record_fact_in_tx(
         &mut tx,
         crate::events::FactWrite {
             kind: "finance.manual.entry",
@@ -136,9 +136,10 @@ pub(super) async fn create_manual_entry(
     )
     .await
     {
-        Ok(id) => id,
+        Ok(rec) => rec,
         Err(e) => return ledger_err(e),
     };
+    let fact_id = recorded.id;
 
     let fact = crate::types::FactRef {
         id: fact_id,
@@ -164,13 +165,18 @@ pub(super) async fn create_manual_entry(
         return storage_err(e);
     }
 
-    crate::events::emit_after_commit(
-        &state.publisher,
-        "ledger.manual_entry.submitted",
-        payload.clone(),
-        boss_clock_client::now_from(&state.clock).await,
-    )
-    .await;
+    // Occurrence event, gated on THIS call having inserted the fact —
+    // an idempotent replay (same natural id) appends nothing to the
+    // log (queue item: dedup audit-event emits on redelivery).
+    if recorded.inserted {
+        crate::events::emit_after_commit(
+            &state.publisher,
+            "ledger.manual_entry.submitted",
+            payload.clone(),
+            boss_clock_client::now_from(&state.clock).await,
+        )
+        .await;
+    }
 
     Json(ManualEntryResponse {
         fact_id,
@@ -290,7 +296,7 @@ pub(super) async fn cogs_recognized_handler(
     )
     .await
     {
-        Ok(id) => id,
+        Ok(rec) => rec.id,
         Err(e) => return ledger_err(e),
     };
 
@@ -454,7 +460,7 @@ async fn post_inventory_movement(
         Ok(tx) => tx,
         Err(e) => return storage_err(e),
     };
-    let fact_id = match crate::events::record_fact_in_tx(
+    let recorded = match crate::events::record_fact_in_tx(
         &mut tx,
         crate::events::FactWrite {
             kind: fact_kind,
@@ -467,9 +473,10 @@ async fn post_inventory_movement(
     )
     .await
     {
-        Ok(id) => id,
+        Ok(rec) => rec,
         Err(e) => return ledger_err(e),
     };
+    let fact_id = recorded.id;
     let fact = crate::types::FactRef {
         id: fact_id,
         kind: "finance.inventory.transferred",
@@ -498,7 +505,16 @@ async fn post_inventory_movement(
     // re-project from). Brewery's opening balance JEs route here
     // via the seed_parts path; this audit event is what lets them
     // survive an epoch-loop restart.
-    if let Some(pub_) = &state.publisher {
+    // Gated on THIS call having inserted the fact: the inserting
+    // delivery emits the rebuild source exactly once; an idempotent
+    // replay (same source key) appends nothing (queue item: dedup
+    // audit-event emits on redelivery). The post-commit-crash window
+    // (fact committed, emit lost) is the same accepted exposure as
+    // the consume path — the deep replay-check surfaces it as a
+    // live-fact-without-event divergence.
+    if recorded.inserted
+        && let Some(pub_) = &state.publisher
+    {
         let actor = user
             .ambient_actor()
             .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));

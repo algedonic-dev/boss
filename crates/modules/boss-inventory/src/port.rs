@@ -3,7 +3,9 @@
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 
-use crate::types::{ApAging, ConsumeApplied, InventoryItem, PurchaseOrder, Vendor, VendorInvoice};
+use crate::types::{
+    ApAging, ConsumeApplied, InventoryItem, PurchaseOrder, ReceiveApplied, Vendor, VendorInvoice,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum InventoryError {
@@ -125,7 +127,7 @@ pub trait InventoryRepository: Send + Sync {
         memo: &str,
         source_id: &str,
         happened_on: NaiveDate,
-    ) -> Result<uuid::Uuid, InventoryError>;
+    ) -> Result<(uuid::Uuid, bool), InventoryError>;
 
     /// Atomic opening-balance / adjustment JE for inventory
     /// changes that don't already pair with a consume / receive
@@ -179,7 +181,7 @@ pub trait InventoryRepository: Send + Sync {
         qty: u32,
         unit_cost_cents: Option<i64>,
         source_id: &str,
-    ) -> Result<InventoryItem, InventoryError> {
+    ) -> Result<ReceiveApplied, InventoryError> {
         self.receive_part_at(part_sku, qty, unit_cost_cents, Utc::now(), source_id)
             .await
     }
@@ -190,7 +192,7 @@ pub trait InventoryRepository: Send + Sync {
         unit_cost_cents: Option<i64>,
         now: DateTime<Utc>,
         source_id: &str,
-    ) -> Result<InventoryItem, InventoryError>;
+    ) -> Result<ReceiveApplied, InventoryError>;
     async fn create_purchase_order(&self, po: &PurchaseOrder) -> Result<(), InventoryError> {
         self.create_purchase_order_at(po, Utc::now()).await
     }

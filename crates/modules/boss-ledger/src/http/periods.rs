@@ -389,7 +389,7 @@ pub(super) async fn close_period_handler(
     )
     .await
     {
-        Ok(id) => id,
+        Ok(rec) => rec.id,
         Err(e) => return ledger_err(e),
     };
 

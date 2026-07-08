@@ -97,10 +97,22 @@ pub struct FactWrite<'a> {
 /// canonical `fact_id` (either the just-inserted UUID or the
 /// pre-existing row's UUID — callers thread this into `FactRef` for
 /// `post_fact_in_tx`).
+/// Outcome of a fact write: the canonical row id plus whether THIS
+/// call inserted it (`false` = the (kind, source_table, source_id)
+/// key already existed — an idempotent replay). Callers that emit an
+/// audit event for the occurrence gate it on `inserted`, so a NAK
+/// redelivery appends nothing (queue item: dedup audit-event emits on
+/// redelivery). The fact table stays exactly-once either way.
+#[derive(Debug, Clone, Copy)]
+pub struct FactRecorded {
+    pub id: Uuid,
+    pub inserted: bool,
+}
+
 pub async fn record_fact_in_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     params: FactWrite<'_>,
-) -> Result<Uuid, LedgerError> {
+) -> Result<FactRecorded, LedgerError> {
     let fact_id = match (params.source_table, params.source_id) {
         (Some(t), Some(s)) => deterministic_fact_id(params.kind, t, s),
         // A NULL-key fact has no natural identity to derive from (and
@@ -127,7 +139,7 @@ pub async fn record_fact_in_tx(
     .map_err(|e| LedgerError::Storage(e.to_string()))?;
 
     match inserted {
-        Some((id,)) => Ok(id),
+        Some((id,)) => Ok(FactRecorded { id, inserted: true }),
         None => {
             // Conflict triggered → resolve the canonical id of the
             // pre-existing row. The conflict only fires when
@@ -144,7 +156,10 @@ pub async fn record_fact_in_tx(
             .fetch_one(&mut **tx)
             .await
             .map_err(|e| LedgerError::Storage(e.to_string()))?;
-            Ok(id)
+            Ok(FactRecorded {
+                id,
+                inserted: false,
+            })
         }
     }
 }
