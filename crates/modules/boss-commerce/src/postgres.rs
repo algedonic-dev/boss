@@ -262,132 +262,22 @@ impl CommerceRepository for PgCommerce {
             .await
             .map_err(|e| CommerceError::Storage(e.to_string()))?;
 
-        // FG drawdown loop. When a line item names a SKU (FG sale),
-        // look up the current weighted cost basis + decrement on_hand
-        // in the same tx as the invoice insert.
-        // The cost basis we observed gets stamped onto the line
-        // so the `invoice_issued` posting rule can emit matching
-        // COGS lines (DR 5100 / CR 1320) in the same JE without
-        // doing a DB lookup of its own (rules are pure functions
-        // of the event payload).
-        //
-        // Insufficient stock fails the tx — invoices for goods we
-        // don't have are not a real sale. Surfacing the 409 here
-        // mirrors the inventory.consume contract and stops the model
-        // from posting fictive revenue.
-        //
-        // Idempotency guard for the relative FG `on_hand -= qty`. The
-        // `finance.invoice.issued` fact this tx writes (deterministic
-        // source_id = inv.id = `inv-step-{step_id}`) is the invoice's
-        // proof-of-issuance. If it already exists, a prior delivery of the
-        // same `step.done` event (JetStream at-least-once) already drew the
-        // FG stock down — re-applying the relative decrement would double-
-        // draw, decoupling GL 1320 from physical FG. So on replay we still
-        // re-look-up the cost basis (to re-stamp it onto the line items for
-        // the COGS leg) but SKIP the decrement. The fact itself is reused —
-        // `insert_fact` below is the same idempotent ON CONFLICT no-op.
-        let already_issued =
-            fact_exists(&mut tx, "finance.invoice.issued", "invoices", &inv.id).await?;
-
-        // `enriched_lines` is the post-FG-lookup view we use for
-        // both the invoice_line_items insert AND the
-        // finance.invoice.issued event payload.
-        let mut enriched_lines: Vec<InvoiceLineItem> = Vec::with_capacity(inv.line_items.len());
-        // Deadlock prevention: take the FG `FOR UPDATE` row locks in a
-        // deterministic (SKU-sorted) order so two concurrent invoice txs
-        // sharing SKUs acquire them in the same global order and queue
-        // instead of deadlocking. Line-item read order is unaffected
-        // (projections read ORDER BY id) and the per-SKU drawdown math is
-        // order-independent, so reordering the loop is semantically inert.
-        let mut ordered: Vec<&InvoiceLineItem> = inv.line_items.iter().collect();
-        ordered.sort_by(|a, b| a.sku.cmp(&b.sku));
-        for line in ordered {
-            let mut enriched = line.clone();
-            if let (Some(sku), Some(qty)) = (line.sku.as_deref(), line.qty)
-                && qty > 0
-            {
-                // Look up FG row (+ decrement on first issuance only).
-                let row: Option<(i32, i64)> = sqlx::query_as(
-                    "SELECT on_hand, value_cents \
-                     FROM finished_product_inventory \
-                     WHERE product_sku = $1 \
-                     ORDER BY on_hand DESC \
-                     LIMIT 1 FOR UPDATE",
-                )
-                .bind(sku)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| CommerceError::Storage(e.to_string()))?;
-                match row {
-                    // First issuance: stock is sufficient → draw it down,
-                    // draining the proportional VALUE share (final unit
-                    // takes the remainder) so GL 1320 and physical FG
-                    // move by the same cents. NB (6b): this whole
-                    // cross-module write moves behind the products
-                    // consume surface once consume owns COGS (Q2).
-                    Some((on_hand, value_before)) if !already_issued && on_hand >= qty => {
-                        let drained = if on_hand == qty {
-                            value_before
-                        } else {
-                            (((value_before as i128) * (qty as i128) + (on_hand as i128) / 2)
-                                / (on_hand as i128)) as i64
-                        };
-                        sqlx::query(
-                            "UPDATE finished_product_inventory \
-                             SET on_hand = on_hand - $2, \
-                                 value_cents = value_cents - $3, \
-                                 updated_at = NOW() \
-                             WHERE product_sku = $1 AND on_hand >= $2",
-                        )
-                        .bind(sku)
-                        .bind(qty)
-                        .bind(drained)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| CommerceError::Storage(e.to_string()))?;
-                        // Display per-unit basis (derived); the exact
-                        // COGS total the posting rule uses.
-                        enriched.cost_basis_cents = Some(drained / qty as i64);
-                        enriched.cost_total_cents = Some(drained);
-                    }
-                    // Redelivery: the drawdown already happened on the prior
-                    // delivery (the issued fact exists). Re-stamp cost_basis
-                    // for the COGS leg, but do NOT decrement again. Note the
-                    // current on_hand may now be < qty (the stock left on the
-                    // first delivery) — that's expected, not a shortage.
-                    //
-                    // CAVEAT: this re-stamps the CURRENT FG standard cost. If
-                    // the SKU is re-standardized between the two deliveries,
-                    // the line-item projection (last-write-wins on
-                    // commerce.invoice.created) takes the new basis while the
-                    // COGS JE (first-write-wins, ON CONFLICT DO NOTHING) keeps
-                    // the original — a cosmetic line-item-vs-GL cost drift on
-                    // that one invoice, NOT a GL/physical decouple (physical
-                    // was drawn once; the GL stays internally balanced). Needs
-                    // a redelivery straddling a re-standardization, so rare.
-                    Some((on_hand, value_now)) if already_issued => {
-                        let unit_now = if on_hand > 0 {
-                            value_now / on_hand as i64
-                        } else {
-                            0
-                        };
-                        enriched.cost_basis_cents = Some(unit_now);
-                        enriched.cost_total_cents = Some(unit_now.saturating_mul(qty as i64));
-                    }
-                    Some((on_hand, _)) => {
-                        return Err(CommerceError::Storage(format!(
-                            "invoice {} line {sku}: insufficient FG stock — on_hand={on_hand}, need={qty}",
-                            inv.id
-                        )));
-                    }
-                    None => {
-                        // No FG row at all — treat as a service / non-FG
-                        // line that happened to carry an SKU. Skip the
-                        // drawdown; cost_basis stays None; rule emits
-                        // revenue only.
-                    }
-                }
-            }
+        // The FG drawdown + COGS moved OUT of the invoice tx (Q2,
+        // docs/design/inventory-value-conservation.md, 6b): the
+        // dispatcher's `products-consume-on-invoice-created` rule
+        // reacts to the `commerce.invoice.created` event this issue
+        // emits and drives `/api/products/{sku}/inventory/consume` per
+        // FG line — the consume drains the row's conserved value and
+        // posts `finance.cogs.recognized` at exactly the drained
+        // cents. Commerce posts revenue / AR / tax only; it no longer
+        // touches another module's projection, and an invoice no
+        // longer 409s on insufficient FG (the consume NAKs until
+        // production lands — a visible backorder, not a blocked sale).
+        // Lines keep sku + qty (the consume rule reads them);
+        // cost_basis/cost_total stay NULL — per-category margin comes
+        // from the consume's tagged COGS facts.
+        let enriched_lines: Vec<InvoiceLineItem> = inv.line_items.to_vec();
+        for enriched in &enriched_lines {
             sqlx::query(
                 "INSERT INTO invoice_line_items \
                     (id, invoice_id, revenue_category, amount_cents, currency, description, ref_id, \
@@ -409,11 +299,10 @@ impl CommerceRepository for PgCommerce {
             .execute(&mut *tx)
             .await
             .map_err(|e| CommerceError::Storage(e.to_string()))?;
-            enriched_lines.push(enriched);
         }
 
-        // Assemble the enriched invoice (line_items now carry the FG
-        // cost_basis_cents observed during drawdown), then build the
+        // Assemble the invoice (line_items carry sku + qty for the
+        // consume rule; no cost stamping — see above), then build the
         // finance.invoice.issued fact from the SAME shared helper the
         // commerce.invoice.created event uses (events::invoice_created_payload),
         // off this SAME value — so the live fact and the fact rebuilt from
@@ -879,40 +768,6 @@ impl CommerceRepository for PgCommerce {
             currency: "USD".to_string(),
         })
     }
-}
-
-/// COGS percentages by revenue category. Mirrors the rates the old
-/// client-side `deriveMargins` in `apps/web/src/seed/api.tsx` used.
-/// New and used device sales carry different COGS — used devices are
-/// cheaper to acquire, which is why used-sales margin is higher.
-/// Insert a financial fact inside an existing transaction, then post it
-/// synchronously to the ledger. Idempotent — replay of the same fact is a
-/// no-op for both the fact row (unique index) and the journal entry
-/// (unique (fact_id, rule_version_id)).
-/// Does a financial_fact with this natural key already exist? Used to
-/// gate the relative FG `on_hand -= qty` drawdown in `create_invoice_at`
-/// against a redelivered `step.done` event (JetStream at-least-once):
-/// the `finance.invoice.issued` fact this invoice writes in-tx is its
-/// proof-of-issuance, so its prior existence means the drawdown already
-/// applied on an earlier delivery — skip it. Mirrors the
-/// `fact_exists` guard `consume_part_at` uses on the inventory side.
-async fn fact_exists(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    kind: &str,
-    source_table: &str,
-    source_id: &str,
-) -> Result<bool, CommerceError> {
-    let row: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM financial_facts \
-         WHERE kind = $1 AND source_table = $2 AND source_id = $3",
-    )
-    .bind(kind)
-    .bind(source_table)
-    .bind(source_id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|e| CommerceError::Storage(e.to_string()))?;
-    Ok(row.is_some())
 }
 
 async fn insert_fact(

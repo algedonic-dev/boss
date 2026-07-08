@@ -34,6 +34,7 @@ pub mod packaging_allocate;
 pub mod people_hire;
 pub mod people_terminate;
 pub mod products_consume;
+pub mod products_consume_from_invoice;
 pub mod products_produce;
 pub mod shipping_create;
 pub mod webhook_notify;

@@ -46,6 +46,10 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
             vec!["products.consumed", "products.inventory.upserted"],
         ),
         (
+            "products.consume_from_invoice",
+            vec!["products.consumed", "products.inventory.upserted"],
+        ),
+        (
             "inventory.po.place",
             vec!["inventory.purchase_order.upserted"],
         ),

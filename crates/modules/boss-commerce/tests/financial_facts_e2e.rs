@@ -355,24 +355,24 @@ async fn fg_on_hand(db: &TestDb, sku: &str) -> i32 {
         .unwrap()
 }
 
-/// Fix #2: the FG `on_hand -= qty` drawdown in `create_invoice_at` is a
-/// relative mutation. A redelivered `step.done` event (JetStream
-/// at-least-once) re-runs the same invoice issuance; without a guard the
-/// drawdown double-applies and GL 1320 decouples from physical FG. The
-/// guard reuses the `finance.invoice.issued` fact written in the same tx
-/// (deterministic source_id = inv.id = `inv-step-{step_id}`): on replay,
-/// that fact already exists, so the decrement is skipped. Issuing the
-/// same invoice twice must decrement FG on_hand exactly ONCE and write
-/// exactly one issued fact.
+/// Q2 (inventory-value-conservation): the consume owns the FG
+/// drawdown + COGS. Issuing an invoice — even twice, even for more
+/// units than exist — must NOT touch finished_product_inventory and
+/// must write exactly one issued fact. The physical drain rides the
+/// dispatcher's products-consume-on-invoice-created rule through the
+/// products surface, outside this tx.
 #[tokio::test(flavor = "multi_thread")]
-async fn issuing_same_invoice_twice_decrements_fg_once() {
+async fn issuing_never_touches_fg_and_shortage_does_not_block() {
     let db = TestDb::new().await;
     let commerce = PgCommerce::new(db.pool.clone());
 
     let sku = "BEER-IPA-HALF-BBL";
-    seed_fg(&db, sku, 1000, 8000).await;
+    seed_fg(&db, sku, 5, 8000).await;
 
-    // FG invoice: one line for 10 units of the seeded SKU.
+    // FG invoice for MORE units than on hand — under invoice-owned
+    // COGS this 409'd ("fictive revenue"); under consume-owned COGS
+    // revenue posts and the consume NAKs until stock lands (a visible
+    // backorder, not a blocked sale).
     let inv = Invoice {
         id: "inv-step-abc".to_string(),
         account_id: "account-fg-1".to_string(),
@@ -400,34 +400,23 @@ async fn issuing_same_invoice_twice_decrements_fg_once() {
         }],
     };
 
-    // First delivery: draws FG down 1000 → 990.
-    commerce.create_invoice(&inv).await.unwrap();
-    assert_eq!(fg_on_hand(&db, sku).await, 990, "first issue draws down 10");
-    assert_eq!(
-        fact_count(&db, "finance.invoice.issued", "inv-step-abc").await,
-        1
-    );
-
-    // Redelivery: the issued fact already exists, so the relative
-    // decrement is skipped. on_hand stays 990 (NOT 980), and no second
-    // issued fact is written (the existing one is reused).
     commerce.create_invoice(&inv).await.unwrap();
     assert_eq!(
         fg_on_hand(&db, sku).await,
-        990,
-        "redelivery must NOT decrement FG again"
+        5,
+        "issuing must not touch finished_product_inventory"
     );
     assert_eq!(
         fact_count(&db, "finance.invoice.issued", "inv-step-abc").await,
-        1,
-        "redelivery reuses the existing issued fact — no new one"
+        1
     );
 
-    // The COGS leg still reconciles: exactly one issued JE references the
-    // (single) fact, and the FG cost_basis was re-stamped on the replay's
-    // line items so the JE keeps its DR 5100 / CR 1320 pair.
+    // Redelivery: still no FG mutation, still exactly one fact.
+    commerce.create_invoice(&inv).await.unwrap();
+    assert_eq!(fg_on_hand(&db, sku).await, 5);
     assert_eq!(
-        entry_count_for(&db, "inv-step-abc", "finance.invoice.issued").await,
-        1
+        fact_count(&db, "finance.invoice.issued", "inv-step-abc").await,
+        1,
+        "redelivery reuses the issued fact"
     );
 }

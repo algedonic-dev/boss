@@ -1135,22 +1135,15 @@ fn invoice_issued(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> 
         std::collections::BTreeMap::new();
     let mut deferred_by_category: std::collections::BTreeMap<String, i64> =
         std::collections::BTreeMap::new();
-    // Per-line COGS recognition. When an invoice line carries
-    // sku + qty + cost_basis_cents, the rule emits matching
-    // DR 5100 (COGS) / CR 1320 (FG) lines in the same JE. The
-    // commerce HTTP handler does the FG drawdown + cost-basis
-    // lookup in the same tx as the invoice insert (see
-    // commerce/postgres.rs:create_invoice_at), so by
-    // the time the fact reaches us the cost basis is already
-    // stamped on each line. This makes revenue + COGS structurally
-    // inseparable for FG sales: the same fact emits both, the
-    // same posting rule generates both, the same JE persists
-    // both.
-    //
-    // Lines without sku/qty/cost_basis_cents are non-FG
-    // (services, contracts, reimbursements) — revenue without
-    // COGS is the correct shape there.
-    let mut cogs_total: i64 = 0;
+    // COGS is NOT part of the invoice JE. Per Q2
+    // (docs/design/inventory-value-conservation.md, resolved
+    // 2026-07-07) the consume owns it: the dispatcher's
+    // `products-consume-on-invoice-created` rule drives
+    // `/api/products/{sku}/inventory/consume` per FG line, which
+    // drains the row's conserved value and posts
+    // `finance.cogs.recognized` (DR 5100 / CR 1320) at exactly the
+    // drained cents, tagged with the line's revenue_category. The
+    // invoice JE carries revenue / AR / tax only.
     for li in items {
         // Accept either `category` (live path: commerce-postgres translates
         // `revenue_category` -> `category` when building the fact directly)
@@ -1193,24 +1186,6 @@ fn invoice_issued(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> 
                     "recognition_pattern=milestone not yet supported (v3)",
                 ));
             }
-        }
-        // Accumulate COGS from FG line items. Prefer the line's exact
-        // total (`cost_total_cents` — the value the drawdown actually
-        // drained, PR 6a value-primary); qty × per-unit stays as the
-        // fallback for payloads that predate the field.
-        if let Some(total) = li
-            .get("cost_total_cents")
-            .and_then(|v| v.as_i64())
-            .filter(|t| *t > 0)
-        {
-            cogs_total = cogs_total.saturating_add(total);
-        } else if let (Some(qty), Some(cost_basis)) = (
-            li.get("qty").and_then(|v| v.as_i64()),
-            li.get("cost_basis_cents").and_then(|v| v.as_i64()),
-        ) && qty > 0
-            && cost_basis > 0
-        {
-            cogs_total = cogs_total.saturating_add(qty.saturating_mul(cost_basis));
         }
     }
 
@@ -1256,18 +1231,9 @@ fn invoice_issued(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> 
         tax_credits.push((account.to_string(), amount, jurisdiction));
     }
 
-    // COGS recognition lives ON the invoice path. The invoice line
-    // carries the SKU + qty + cost_basis_cents (stamped by the
-    // commerce handler at create-tx time after the FG drawdown), so
-    // the rule emits DR 5100 (COGS) / CR 1320 (FG) for the cogs_total
-    // accumulated above. Revenue and COGS are siamese in a single JE
-    // — the model cannot generate one without the other for an FG
-    // sale, which is what keeps a category margin honest (no revenue
-    // without its matching COGS).
-
     let ar_total = revenue_total + deferred_total + tax_total;
     let mut lines = Vec::with_capacity(
-        1 + immediate_by_category.len() + deferred_by_category.len() + tax_credits.len() + 2, // COGS DR + FG CR
+        1 + immediate_by_category.len() + deferred_by_category.len() + tax_credits.len(),
     );
     lines.push(JournalLineDraft::debit("1100", ar_total, 0));
 
@@ -1302,18 +1268,6 @@ fn invoice_issued(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> 
             sort_order: sort,
         });
         sort += 1;
-    }
-
-    // COGS pair for FG line items. Emitted as a single
-    // aggregate DR 5100 / CR 1320 sized at sum(qty × cost_basis)
-    // across all FG lines on the invoice. Per-line breakdown
-    // lives in the source fact's line_items array and the
-    // invoice_line_items projection; the JE keeps one debit and
-    // one credit for clean trial-balance reads.
-    if cogs_total > 0 {
-        lines.push(JournalLineDraft::debit("5100", cogs_total, sort));
-        sort += 1;
-        lines.push(JournalLineDraft::credit("1320", cogs_total, sort));
     }
 
     Ok(JournalEntryDraft {

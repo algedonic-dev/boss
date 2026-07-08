@@ -221,7 +221,7 @@ pub(super) async fn consume_part<R: InventoryRepository + 'static>(
         .await;
         // Transfer event — the EXACT payload consume_part_at wrote as
         // the in-tx fact, emitted verbatim. One construction feeds the
-        // live fact and the rebuild source, so byte-parity can\'t
+        // live fact and the rebuild source, so byte-parity cannot
         // drift; and a replayed consume returns no payload, so a
         // redelivery appends no duplicate event.
         if let Some(payload) = fact_payload {
