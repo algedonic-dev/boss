@@ -146,8 +146,7 @@ impl ProductsRepository for InMemoryProducts {
                 let drained = if row.on_hand == qty {
                     row.value_cents
                 } else {
-                    (((row.value_cents as i128) * (qty as i128)
-                        + (row.on_hand as i128) / 2)
+                    (((row.value_cents as i128) * (qty as i128) + (row.on_hand as i128) / 2)
                         / (row.on_hand as i128)) as i64
                 };
                 row.on_hand -= qty;

@@ -329,8 +329,7 @@ impl CommerceRepository for PgCommerce {
                         let drained = if on_hand == qty {
                             value_before
                         } else {
-                            (((value_before as i128) * (qty as i128)
-                                + (on_hand as i128) / 2)
+                            (((value_before as i128) * (qty as i128) + (on_hand as i128) / 2)
                                 / (on_hand as i128)) as i64
                         };
                         sqlx::query(
@@ -373,8 +372,7 @@ impl CommerceRepository for PgCommerce {
                             0
                         };
                         enriched.cost_basis_cents = Some(unit_now);
-                        enriched.cost_total_cents =
-                            Some(unit_now.saturating_mul(qty as i64));
+                        enriched.cost_total_cents = Some(unit_now.saturating_mul(qty as i64));
                     }
                     Some((on_hand, _)) => {
                         return Err(CommerceError::Storage(format!(

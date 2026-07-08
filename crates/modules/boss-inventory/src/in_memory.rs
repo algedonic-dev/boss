@@ -5,8 +5,10 @@ use async_trait::async_trait;
 use std::sync::RwLock;
 
 use crate::port::{InventoryError, InventoryRepository};
-use crate::types::{ConsumeApplied, ApAging, ApAgingBucket, InventoryItem, PurchaseOrder, Vendor, VendorInvoice,
-    VendorInvoiceStatus,};
+use crate::types::{
+    ApAging, ApAgingBucket, ConsumeApplied, InventoryItem, PurchaseOrder, Vendor, VendorInvoice,
+    VendorInvoiceStatus,
+};
 
 pub struct InMemoryInventory {
     items: Vec<InventoryItem>,

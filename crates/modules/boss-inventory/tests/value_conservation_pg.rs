@@ -109,7 +109,10 @@ async fn mixed_price_receives_then_full_drain_conserves_value_exactly() {
         "zero on_hand must force zero value — {} cents stranded",
         empty.value_cents
     );
-    assert_eq!(drained, total_value, "drains must sum to the exact value received");
+    assert_eq!(
+        drained, total_value,
+        "drains must sum to the exact value received"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -118,7 +121,9 @@ async fn derived_avg_cost_is_value_over_on_hand() {
     let inv = PgInventory::new(db.pool.clone());
     let sku = "ING-HOPS-CASCADE-44";
 
-    inv.upsert_item_at(&item(sku, 0, 0), Utc::now()).await.unwrap();
+    inv.upsert_item_at(&item(sku, 0, 0), Utc::now())
+        .await
+        .unwrap();
     inv.receive_part_at(sku, 3, Some(1_000), Utc::now(), "recv:a")
         .await
         .unwrap();
@@ -126,12 +131,11 @@ async fn derived_avg_cost_is_value_over_on_hand() {
     assert_eq!(row.value_cents, 3_000);
     // Display average comes from the derived column, never a stored
     // input: 3000 / 3 = 1000.
-    let avg: i64 = sqlx::query_scalar(
-        "SELECT avg_cost_cents FROM inventory_items WHERE part_sku = $1",
-    )
-    .bind(sku)
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
+    let avg: i64 =
+        sqlx::query_scalar("SELECT avg_cost_cents FROM inventory_items WHERE part_sku = $1")
+            .bind(sku)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
     assert_eq!(avg, 1_000);
 }

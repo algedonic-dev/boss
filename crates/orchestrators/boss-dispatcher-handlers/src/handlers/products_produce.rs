@@ -676,8 +676,18 @@ mod tests {
     #[test]
     fn line_totals_sum_exactly_and_weight_by_volume() {
         let items = vec![
-            ProducedProduct { sku: "FP-PALE-1-2-BBL".into(), qty: 210, location_id: "l".into(), unit_cost_cents: None },
-            ProducedProduct { sku: "FP-PALE-1-6-BBL".into(), qty: 315, location_id: "l".into(), unit_cost_cents: None },
+            ProducedProduct {
+                sku: "FP-PALE-1-2-BBL".into(),
+                qty: 210,
+                location_id: "l".into(),
+                unit_cost_cents: None,
+            },
+            ProducedProduct {
+                sku: "FP-PALE-1-6-BBL".into(),
+                qty: 315,
+                location_id: "l".into(),
+                unit_cost_cents: None,
+            },
         ];
         // A prime total that cannot split evenly: shares must still sum
         // exactly (largest remainder), no per-unit rounding anywhere.

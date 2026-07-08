@@ -383,8 +383,7 @@ impl ProductsRepository for PgProducts {
                 if on_hand_before == qty {
                     value_before
                 } else {
-                    (((value_before as i128) * (qty as i128)
-                        + (on_hand_before as i128) / 2)
+                    (((value_before as i128) * (qty as i128) + (on_hand_before as i128) / 2)
                         / (on_hand_before as i128)) as i64
                 }
             }
