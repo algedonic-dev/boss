@@ -1194,8 +1194,17 @@ fn invoice_issued(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> 
                 ));
             }
         }
-        // Accumulate COGS from FG line items.
-        if let (Some(qty), Some(cost_basis)) = (
+        // Accumulate COGS from FG line items. Prefer the line's exact
+        // total (`cost_total_cents` — the value the drawdown actually
+        // drained, PR 6a value-primary); qty × per-unit stays as the
+        // fallback for payloads that predate the field.
+        if let Some(total) = li
+            .get("cost_total_cents")
+            .and_then(|v| v.as_i64())
+            .filter(|t| *t > 0)
+        {
+            cogs_total = cogs_total.saturating_add(total);
+        } else if let (Some(qty), Some(cost_basis)) = (
             li.get("qty").and_then(|v| v.as_i64()),
             li.get("cost_basis_cents").and_then(|v| v.as_i64()),
         ) && qty > 0

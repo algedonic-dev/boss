@@ -82,6 +82,7 @@ fn fixture(id: &str, account: &str, lines: Vec<(RevenueCategory, i64, &str)>) ->
                 sku: None,
                 qty: None,
                 cost_basis_cents: None,
+                cost_total_cents: None,
             })
             .collect(),
     }

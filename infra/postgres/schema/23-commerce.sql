@@ -109,6 +109,10 @@ ALTER TABLE invoice_line_items ADD COLUMN IF NOT EXISTS sku TEXT;
 ALTER TABLE invoice_line_items ADD COLUMN IF NOT EXISTS qty INTEGER;
 
 ALTER TABLE invoice_line_items ADD COLUMN IF NOT EXISTS cost_basis_cents BIGINT;
+-- The line's EXACT COGS total (the FG value drained) — PR 6a
+-- value-primary; the posting rule sizes COGS from this, per-unit
+-- cost_basis_cents is display.
+ALTER TABLE invoice_line_items ADD COLUMN IF NOT EXISTS cost_total_cents BIGINT;
 
 
 CREATE INDEX IF NOT EXISTS invoice_line_items_invoice ON invoice_line_items(invoice_id);

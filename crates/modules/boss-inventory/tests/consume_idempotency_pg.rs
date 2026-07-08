@@ -13,7 +13,7 @@ use boss_inventory::types::InventoryItem;
 use boss_testing::TestDb;
 use chrono::Utc;
 
-fn item(sku: &str, on_hand: u32, avg_cost_cents: i64) -> InventoryItem {
+fn item(sku: &str, on_hand: u32, unit_cost_cents: i64) -> InventoryItem {
     InventoryItem {
         part_sku: sku.into(),
         bin: "A-01".into(),
@@ -22,7 +22,8 @@ fn item(sku: &str, on_hand: u32, avg_cost_cents: i64) -> InventoryItem {
         reorder_point: 0,
         reorder_qty: 0,
         trailing_90d_usage: 0,
-        avg_cost_cents,
+        value_cents: on_hand as i64 * unit_cost_cents,
+        avg_cost_cents: 0, // derived display — ignored on writes
         vendor_price_cents: None,
         vendor_category: None,
     }
@@ -57,7 +58,7 @@ async fn consume_is_idempotent_on_source_id() {
         .consume_part_at("ING-MALT-2ROW-50", 200, Utc::now(), key)
         .await
         .unwrap();
-    assert_eq!(replay.on_hand, 800, "replay must not double-decrement");
+    assert_eq!(replay.item.on_hand, 800, "replay must not double-decrement");
     assert_eq!(
         inv.item_by_sku("ING-MALT-2ROW-50")
             .await
@@ -113,5 +114,5 @@ async fn replay_after_stock_fell_below_qty_is_still_a_noop() {
         .consume_part_at("ING-HOPS-CASCADE-44", 80, Utc::now(), key)
         .await
         .expect("replay must succeed as a no-op, not InsufficientStock");
-    assert_eq!(replay.on_hand, 5);
+    assert_eq!(replay.item.on_hand, 5);
 }

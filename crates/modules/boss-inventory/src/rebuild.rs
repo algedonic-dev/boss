@@ -493,7 +493,7 @@ async fn upsert_inventory_item(
     // recurring.
     sqlx::query(
         "INSERT INTO inventory_items (part_sku, bin, on_hand, allocated, reorder_point, \
-                                       reorder_qty, trailing_90d_usage, avg_cost_cents, \
+                                       reorder_qty, trailing_90d_usage, value_cents, \
                                        vendor_price_cents, vendor_category, updated_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
          ON CONFLICT (part_sku) DO UPDATE SET \
@@ -503,7 +503,7 @@ async fn upsert_inventory_item(
              reorder_point = EXCLUDED.reorder_point, \
              reorder_qty = EXCLUDED.reorder_qty, \
              trailing_90d_usage = EXCLUDED.trailing_90d_usage, \
-             avg_cost_cents = EXCLUDED.avg_cost_cents, \
+             value_cents = EXCLUDED.value_cents, \
              vendor_price_cents = EXCLUDED.vendor_price_cents, \
              vendor_category = EXCLUDED.vendor_category, \
              updated_at = EXCLUDED.updated_at",
@@ -515,7 +515,7 @@ async fn upsert_inventory_item(
     .bind(item.reorder_point as i32)
     .bind(item.reorder_qty as i32)
     .bind(item.trailing_90d_usage as i32)
-    .bind(item.avg_cost_cents)
+    .bind(item.value_cents)
     .bind(item.vendor_price_cents)
     .bind(&item.vendor_category)
     .bind(ts)

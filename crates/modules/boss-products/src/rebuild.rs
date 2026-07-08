@@ -139,19 +139,19 @@ async fn upsert_inventory_row(
 ) -> Result<(), RebuildError> {
     sqlx::query(
         "INSERT INTO finished_product_inventory \
-            (product_sku, location_id, on_hand, reserved, production_cost_cents) \
+            (product_sku, location_id, on_hand, reserved, value_cents) \
          VALUES ($1, $2, $3, $4, $5) \
          ON CONFLICT (product_sku, location_id) DO UPDATE SET \
             on_hand = EXCLUDED.on_hand, \
             reserved = EXCLUDED.reserved, \
-            production_cost_cents = EXCLUDED.production_cost_cents, \
+            value_cents = EXCLUDED.value_cents, \
             updated_at = NOW()",
     )
     .bind(&row.product_sku)
     .bind(&row.location_id)
     .bind(row.on_hand)
     .bind(row.reserved)
-    .bind(row.production_cost_cents)
+    .bind(row.value_cents)
     .execute(&mut *tx)
     .await
     .map_err(|e| RebuildError::Storage(e.to_string()))?;

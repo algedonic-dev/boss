@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use crate::types::{Product, ProductInventory};
 
 /// GL leg an inventory delta produced — `None` when the call had
-/// no cost basis (zero-cost row, missing `unit_cost_cents`, etc.).
+/// no cost basis (zero-cost row, missing `total_cost_cents`, etc.).
 /// The HTTP handler emits a NATS event whose payload IS this value,
 /// so the `gl_fact_projection_rules` row reproduces the same
 /// `(source_table, source_id)` financial_facts row on rebuild.
@@ -86,20 +86,20 @@ pub trait ProductsRepository: Send + Sync {
     /// Returns the new absolute on_hand so the caller can echo it
     /// in audit_log.
     ///
-    /// When `unit_cost_cents` is `Some(_)`, the adapter folds it
-    /// into the row's weighted moving-average `production_cost_cents`:
-    ///   new_avg = (old_avg × old_on_hand + unit_cost × qty)
-    ///             / (old_on_hand + qty)
-    /// `None` leaves the cost basis unchanged — used by callers
-    /// that don't yet carry cost data. Model B's WIP→FG cost
-    /// transfer relies on `unit_cost_cents` being present so the
-    /// FG row's cost basis stays current.
+    /// When `total_cost_cents` is `Some(_)`, the adapter adds the
+    /// EXACT line total onto the row's conserved `value_cents` and
+    /// posts the same number as the WIP→FG transfer — the caller
+    /// (the produce handler) allocated largest-remainder shares, and
+    /// posting them un-rounded is what makes 1310 drain to zero
+    /// (PR 6a). `None` leaves value unchanged — callers that don't
+    /// carry cost data move units only. The display
+    /// `production_cost_cents` is derived (value / on_hand).
     async fn produce(
         &self,
         sku: &str,
         location_id: &str,
         qty: i32,
-        unit_cost_cents: Option<i64>,
+        total_cost_cents: Option<i64>,
         now: chrono::DateTime<chrono::Utc>,
         source_id: String,
     ) -> Result<InventoryDeltaResult, ProductsError>;

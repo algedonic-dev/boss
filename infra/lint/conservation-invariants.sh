@@ -347,22 +347,17 @@ HAVING coalesce(sum(jl.debit_cents), 0)
 SQL
 )"
 
-# ---- P. Finished-goods GL balance ≡ Σ(on_hand × production_cost_cents) ----
-# The closure property of Model B: account 1320's net debit balance
-# must equal the at-cost value of every row in
-# finished_product_inventory. Divergence means either (a) a
-# products.produce/consume call mutated on_hand without emitting
-# the paired finance.inventory.transferred / finance.cogs.recognized
-# fact, or (b) the FG row's production_cost_cents drifted out of
-# sync with the cost basis the JE was posted at.
-#
-# Tolerance: $100. The produce-side JE credits 1320 at the input
-# unit_cost_cents × qty, but the row's running average uses
-# integer division — so each produce can shed up to 1¢ × on_hand
-# of rounding to the average. Across a year of brews this
-# accumulates; the threshold gives a buffer below which we trust
-# the rounding model and above which we suspect a missing fact.
-run_invariant "P. FG GL balance ≡ Σ(on_hand × production_cost_cents)" "$(cat <<'SQL'
+# ---- P. Finished-goods GL balance ≡ Σ value_cents — EXACT ----
+# The closure property of Model B, now structural (PR 6a,
+# value-primary): 1320's net debit balance must equal the summed
+# conserved value of every finished_product_inventory row, to the
+# cent. Every write path (produce line totals, proportional-drain
+# consume, the invoice-issue drawdown stamping cost_total_cents)
+# posts exactly the value delta, so the pre-6a $100 rounding band
+# is ZERO. Any cent of divergence is a mutation that missed its JE
+# or a JE that missed its mutation.
+# Design: docs/design/inventory-value-conservation.md.
+run_invariant "P. FG GL balance ≡ Σ value_cents (exact)" "$(cat <<'SQL'
 WITH gl_1320 AS (
        SELECT coalesce(sum(jl.debit_cents - jl.credit_cents), 0) AS bal
          FROM gl_accounts a
@@ -370,15 +365,15 @@ WITH gl_1320 AS (
         WHERE a.code = '1320'
      ),
      phys_1320 AS (
-       SELECT coalesce(sum(on_hand::bigint * production_cost_cents), 0) AS bal
+       SELECT coalesce(sum(value_cents), 0) AS bal
          FROM finished_product_inventory
      )
 SELECT 'gl_1320=' || gl_1320.bal
      || ' phys_1320=' || phys_1320.bal
      || ' diff=' || (gl_1320.bal - phys_1320.bal)
-     || ' — finished-goods GL diverged from inventory-at-cost'
+     || ' — finished-goods GL diverged from conserved value'
   FROM gl_1320, phys_1320
- WHERE abs(gl_1320.bal - phys_1320.bal) > 10000
+ WHERE gl_1320.bal <> phys_1320.bal
 SQL
 )"
 
@@ -476,16 +471,15 @@ SELECT 'orphan_batch=' || p.batch_id
 SQL
 )"
 
-# ---- N. Raw inventory GL balance ≡ Σ(on_hand × avg_cost_cents) ----
-# Sibling to invariant P (FG GL ≡ phys). When account 1300 drifts
-# from the physical inventory-at-cost projection, somebody
-# changed inventory_items without posting a matching ledger
-# entry (the original 2026-05-29 negative-1300 finding: brewery
-# seeds raw items with on_hand > 0 but no DR 1300 / CR 3000
-# opening JE; consumes credit 1300 without a matching prior
-# debit, walking the account net-negative). Tolerance ±$50k
-# covers weighted-avg drift over 12-month runs.
-run_invariant "N. Raw inventory GL balance ≡ Σ(on_hand × avg_cost_cents)" "$(cat <<'SQL'
+# ---- N. Raw inventory GL balance ≡ Σ value_cents — EXACT ----
+# Sibling to invariant P (FG GL ≡ phys). Value-primary rows (PR 6a)
+# make this structural: every GL amount posted for a row IS its
+# value delta, so any divergence — a single cent — means a code
+# path mutated inventory_items without posting the matching JE (or
+# vice versa). The pre-6a ±$50k tolerance absorbed weighted-average
+# truncation drift; that class no longer exists, so the band is
+# ZERO. Design: docs/design/inventory-value-conservation.md.
+run_invariant "N. Raw inventory GL balance ≡ Σ value_cents (exact)" "$(cat <<'SQL'
 WITH gl_1300 AS (
        SELECT coalesce(sum(jl.debit_cents - jl.credit_cents), 0) AS bal
          FROM gl_accounts a
@@ -493,15 +487,15 @@ WITH gl_1300 AS (
         WHERE a.code = '1300'
      ),
      phys AS (
-       SELECT coalesce(sum(on_hand::bigint * avg_cost_cents), 0) AS at_cost
+       SELECT coalesce(sum(value_cents), 0) AS at_cost
          FROM inventory_items
      )
 SELECT 'gl_1300=' || g.bal
      || ' phys_1300=' || p.at_cost
      || ' diff=' || (g.bal - p.at_cost)
-     || ' — raw GL diverged from inventory-at-cost (likely a missing opening or upsert JE)'
+     || ' — raw GL diverged from conserved value (a mutation missed its JE, or a JE missed its mutation)'
   FROM gl_1300 g, phys p
- WHERE abs(g.bal - p.at_cost) > 5000000  -- >$50k drift
+ WHERE g.bal <> p.at_cost
 SQL
 )"
 

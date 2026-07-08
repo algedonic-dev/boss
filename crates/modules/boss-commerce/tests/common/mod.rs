@@ -93,6 +93,7 @@ pub fn invoice_fixture(id: &str) -> Invoice {
             sku: None,
             qty: None,
             cost_basis_cents: None,
+            cost_total_cents: None,
         }],
     }
 }

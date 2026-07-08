@@ -38,6 +38,7 @@ fn invoice(id: &str, status: InvoiceStatus, paid_on: Option<NaiveDate>) -> Invoi
             sku: None,
             qty: None,
             cost_basis_cents: None,
+            cost_total_cents: None,
         }],
     }
 }
@@ -335,8 +336,8 @@ async fn seed_fg(db: &TestDb, sku: &str, on_hand: i32, cost_cents: i64) {
     .unwrap();
     sqlx::query(
         "INSERT INTO finished_product_inventory \
-            (product_sku, location_id, on_hand, production_cost_cents) \
-         VALUES ($1, 'loc-fg-1', $2, $3)",
+            (product_sku, location_id, on_hand, value_cents) \
+         VALUES ($1, 'loc-fg-1', $2, $3::bigint * $2)",
     )
     .bind(sku)
     .bind(on_hand)
@@ -395,6 +396,7 @@ async fn issuing_same_invoice_twice_decrements_fg_once() {
             sku: Some(sku.to_string()),
             qty: Some(10),
             cost_basis_cents: None,
+            cost_total_cents: None,
         }],
     };
 

@@ -180,21 +180,22 @@ async fn put_inventory<R: ProductsRepository + 'static>(
                 )
                 .await;
             }
-            // Atomic opening-balance JE. When
-            // PUT lands non-zero on_hand at a positive cost
-            // basis, post DR 1320 (FG) / CR 3000 (Retained
-            // Earnings) sized at on_hand × production_cost so
-            // the BS reflects the asset that just appeared in
-            // the projection. Idempotent on
-            // (kind, source_table, source_id) — the brewery_data_seed
-            // external `opening-fg-{sku}` JE collides cleanly
-            // with this atomic post, so re-runs no-op.
+            // Atomic opening-balance JE. When PUT lands a row
+            // carrying value, post DR 1320 (FG) / CR 3000 (Retained
+            // Earnings) sized at exactly value_cents — the conserved
+            // quantity the row now holds, so the BS and the
+            // projection agree by construction (PR 6a;
+            // production_cost_cents is derived display and never
+            // sizes a JE). Idempotent on (kind, source_table,
+            // source_id) — the brewery_data_seed external
+            // `opening-fg-{sku}` JE collides cleanly with this atomic
+            // post, so re-runs no-op.
             //
-            // Sibling to InventoryRepository::record_inventory_je
-            // wired into batch_upsert_items for raw materials.
-            // Together they keep accounts 1300 / 1320 reconciled with
-            // physical inventory across seed-time + manual adjustments.
-            let total_cost = (row.on_hand as i64).saturating_mul(row.production_cost_cents);
+            // Sibling to the batch-upsert opening JE for raw
+            // materials. Together they keep 1300 / 1320 reconciled
+            // with physical inventory across seed-time + manual
+            // adjustments.
+            let total_cost = row.value_cents;
             if total_cost > 0 {
                 let memo = format!(
                     "Opening balance — {} × {} (FG ← retained earnings)",
@@ -231,12 +232,13 @@ async fn put_inventory<R: ProductsRepository + 'static>(
 struct DeltaBody {
     location_id: String,
     qty: i32,
-    /// Standard production cost per unit (cents). Only used by
-    /// `produce`; `consume` reads the cost from the FG row's
-    /// running weighted moving average. None = no cost basis
-    /// update + no GL JE for this call.
+    /// The line's TOTAL cost in cents — the exact WIP share this
+    /// produce drains (PR 6a: line totals, not unit costs, so the
+    /// largest-remainder allocation posts un-rounded). Only used by
+    /// `produce`; `consume` drains the row's conserved value
+    /// proportionally. None = no value added + no GL JE.
     #[serde(default)]
-    unit_cost_cents: Option<i64>,
+    total_cost_cents: Option<i64>,
     /// Optional revenue category tag for consume — passed through
     /// to the emitted `finance.cogs.recognized` payload so per-
     /// category gross margin rolls up exactly rather than via
@@ -269,7 +271,7 @@ async fn post_produce<R: ProductsRepository + 'static>(
             &sku,
             &body.location_id,
             body.qty,
-            body.unit_cost_cents,
+            body.total_cost_cents,
             now,
             source_id,
         )

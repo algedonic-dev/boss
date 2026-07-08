@@ -267,6 +267,7 @@ mod tests {
             reorder_point,
             reorder_qty: 100,
             trailing_90d_usage: 30,
+            value_cents: 0,
             avg_cost_cents: 0,
             vendor_price_cents: None,
             vendor_category: None,
@@ -514,7 +515,8 @@ mod tests {
                 reorder_point,
                 reorder_qty: 100,
                 trailing_90d_usage: 30,
-                avg_cost_cents: 0,
+                value_cents: 0,
+            avg_cost_cents: 0,
                 vendor_price_cents: None,
                 vendor_category: None,
             }

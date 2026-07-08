@@ -570,14 +570,6 @@ impl Handler for ProductsProduce {
             },
         };
 
-        // Allocate the drain across the produced FG by keg volume. `cost`
-        // is None only when no inputs resolved (then each line keeps its
-        // declared fallback `unit_cost_cents`).
-        let total_volume: f64 = items
-            .iter()
-            .map(|it| keg_volume_bbl(&it.sku) * it.qty as f64)
-            .sum();
-
         for it in &items {
             if it.qty <= 0 {
                 return Err(HandlerError::Downstream(format!(
@@ -585,21 +577,27 @@ impl Handler for ProductsProduce {
                     it.sku
                 )));
             }
-            // Derived unit cost = cost × (this keg's volume / total
-            // volume) ÷ qty, i.e. cost × unit_volume / total_volume.
-            // KNOWN RESIDUAL: unit_cost is an integer, so the posted
-            // drain (qty × unit_cost) can differ from this step's exact
-            // share by up to ~qty/2 cents per line. Exact per-line
-            // conservation needs the produce endpoint to accept a line
-            // total instead of a unit cost — deferred to the WIP-
-            // reconciliation workstream, which owns sweeping the
-            // bounded remainder.
-            let unit_cost = match cost {
-                Some(c) if total_volume > 0.0 => {
-                    Some(((c as f64) * keg_volume_bbl(&it.sku) / total_volume).round() as i64)
-                }
-                _ => it.unit_cost_cents,
-            };
+        }
+        // Allocate the drain across the produced FG lines by keg
+        // volume, EXACTLY: largest-remainder shares that sum to `cost`
+        // to the cent (same idiom as `mash_share_allocation`). The
+        // produce endpoint takes each line's TOTAL, so nothing is
+        // rounded per unit — this retires the old ~qty/2-cents-per-line
+        // residual (#73) and lets 1310 drain to zero. `cost` is None
+        // only when no inputs resolved; each line then falls back to
+        // its declared `unit_cost_cents × qty`.
+        let line_totals: Vec<Option<i64>> = match cost {
+            Some(c) => line_total_allocation(&items, c)
+                .into_iter()
+                .map(Some)
+                .collect(),
+            None => items
+                .iter()
+                .map(|it| it.unit_cost_cents.map(|u| u.saturating_mul(it.qty as i64)))
+                .collect(),
+        };
+
+        for (it, line_total) in items.iter().zip(line_totals) {
             let mut body = json!({
                 "sku": it.sku,
                 "location_id": it.location_id,
@@ -608,8 +606,8 @@ impl Handler for ProductsProduce {
                 // relative on_hand increment exactly once.
                 "idempotency_key": format!("{}:{}", step.step_id, it.sku),
             });
-            if let Some(c) = unit_cost {
-                body["unit_cost_cents"] = json!(c);
+            if let Some(total) = line_total {
+                body["total_cost_cents"] = json!(total);
             }
             let url = format!(
                 "{}/api/products/{}/inventory/produce",
@@ -620,6 +618,46 @@ impl Handler for ProductsProduce {
         }
         Ok(())
     }
+}
+
+/// Exact largest-remainder allocation of `cost` across the produced
+/// lines, weighted by keg volume × qty. Shares sum to `cost` to the
+/// cent; ties resolve in item order (stable). Mirrors
+/// `mash_share_allocation`, which does the same across sibling steps.
+fn line_total_allocation(items: &[ProducedProduct], cost: i64) -> Vec<i64> {
+    let weights: Vec<f64> = items
+        .iter()
+        .map(|it| keg_volume_bbl(&it.sku) * it.qty as f64)
+        .collect();
+    let denom: f64 = weights.iter().sum();
+    if denom <= 0.0 || cost <= 0 {
+        return vec![0; items.len()];
+    }
+    let mut shares: Vec<(i64, f64)> = weights
+        .iter()
+        .map(|w| {
+            let exact = cost as f64 * w / denom;
+            let floor = exact.floor() as i64;
+            (floor, exact - exact.floor())
+        })
+        .collect();
+    let assigned: i64 = shares.iter().map(|(cents, _)| cents).sum();
+    let mut leftover = cost.saturating_sub(assigned);
+    let mut by_remainder: Vec<usize> = (0..shares.len()).collect();
+    by_remainder.sort_by(|&a, &b| {
+        shares[b]
+            .1
+            .partial_cmp(&shares[a].1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for idx in by_remainder {
+        if leftover <= 0 {
+            break;
+        }
+        shares[idx].0 += 1;
+        leftover -= 1;
+    }
+    shares.into_iter().map(|(cents, _)| cents).collect()
 }
 
 #[cfg(test)]
@@ -633,6 +671,32 @@ mod tests {
         // Non-keg (case pack) → weight 1.0.
         assert!((keg_volume_bbl("FP-SEASONAL-12OZ-CS") - 1.0).abs() < 1e-9);
         assert!((keg_volume_bbl("weird") - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn line_totals_sum_exactly_and_weight_by_volume() {
+        let items = vec![
+            ProducedProduct {
+                sku: "FP-PALE-1-2-BBL".into(),
+                qty: 210,
+                location_id: "l".into(),
+                unit_cost_cents: None,
+            },
+            ProducedProduct {
+                sku: "FP-PALE-1-6-BBL".into(),
+                qty: 315,
+                location_id: "l".into(),
+                unit_cost_cents: None,
+            },
+        ];
+        // A prime total that cannot split evenly: shares must still sum
+        // exactly (largest remainder), no per-unit rounding anywhere.
+        let totals = line_total_allocation(&items, 1_000_003);
+        assert_eq!(totals.iter().sum::<i64>(), 1_000_003);
+        // Volumes: 210×0.5 = 105 vs 315×(1/6) = 52.5 → 2:1 split.
+        assert!((totals[0] - 2 * totals[1]).abs() <= 1);
+        // Degenerate cases: zero cost / zero volume.
+        assert_eq!(line_total_allocation(&items, 0), vec![0, 0]);
     }
 
     #[test]

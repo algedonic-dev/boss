@@ -1849,17 +1849,19 @@ fn ensure_finished_product_inventory(
         ),
     ];
     for (sku, qty, unit_cost_cents) in seeds {
-        // Step 2a: upsert the FG row with on_hand + cost basis.
-        // production_cost_cents seeds the weighted moving average
-        // the products.consume side effect reads at sale to
-        // recognize COGS (Model B: DR 5100 / CR 1320).
+        // Step 2a: upsert the FG row with on_hand + the row's exact
+        // conserved value (qty × the authored unit cost — PR 6a,
+        // value-primary). products.consume drains this value
+        // proportionally at sale to recognize COGS (Model B:
+        // DR 5100 / CR 1320); the display per-unit cost is derived.
+        let value_cents = qty.saturating_mul(*unit_cost_cents);
         let url = format!("{api_base}/api/products/{sku}/inventory");
         let body = serde_json::json!({
             "product_sku": sku,
             "location_id": location,
             "on_hand": qty,
             "allocated": 0,
-            "production_cost_cents": unit_cost_cents,
+            "value_cents": value_cents,
         });
         let resp = client
             .put(&url)
@@ -1888,7 +1890,9 @@ fn ensure_finished_product_inventory(
         // owned these kegs on day 1." Idempotent via the deterministic
         // source_id; rerunning the seed against an existing DB
         // collides cleanly on the financial_facts unique key.
-        let total_cost_cents = qty.saturating_mul(*unit_cost_cents);
+        // The SAME number the row now carries — the JE and physical
+        // can't disagree because they are one derivation.
+        let total_cost_cents = value_cents;
         let je_url = format!("{ledger_base}/api/ledger/inventory-transferred");
         let je_body = serde_json::json!({
             "total_cost_cents": total_cost_cents,
@@ -1973,7 +1977,9 @@ fn ensure_raw_inventory_opening_balances(
     let je_url = format!("{ledger_base}/api/ledger/inventory-transferred");
     let mut posted = 0u64;
     for part in &parts {
-        let total_cost_cents = (part.on_hand as i64).saturating_mul(part.avg_cost_cents);
+        // The exact conserved value load_parts derived — the JE and the
+        // row can't disagree because they are the same number.
+        let total_cost_cents = part.value_cents;
         if total_cost_cents <= 0 {
             continue;
         }

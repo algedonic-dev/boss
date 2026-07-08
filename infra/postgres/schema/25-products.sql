@@ -45,14 +45,20 @@ CREATE TABLE IF NOT EXISTS finished_product_inventory (
     location_id     TEXT NOT NULL,
     on_hand         INTEGER NOT NULL DEFAULT 0,
     reserved        INTEGER NOT NULL DEFAULT 0,             -- earmarked for an open Job (wholesale-keg-order in flight, etc.)
-    -- Weighted moving-average production cost per unit. Set on
-    -- `products.produce` from the JobKind's `unit_cost_cents`;
-    -- `products.consume` reads it to size the `finance.cogs.
-    -- recognized` JE (DR 5100 / CR 1320 FG). This is how Model B
-    -- COGS recognizes at sale time at actual standard cost, not
-    -- a percentage shortcut. See docs/design/correctness-
-    -- protocol.md.
-    production_cost_cents BIGINT NOT NULL DEFAULT 0,
+    -- The row's total stock value in cents — the stored, CONSERVED
+    -- quantity (costing PR 6a, Q1: value-primary). `products.produce`
+    -- adds the exact line total the WIP drain allocated;
+    -- `products.consume` drains the proportional share
+    -- round(value × qty / on_hand) to size the `finance.cogs.
+    -- recognized` JE (DR 5100 / CR 1320 FG), the final unit taking
+    -- the remainder so zero on_hand forces zero value. Model B COGS
+    -- still recognizes at sale time at actual cost — now exactly.
+    -- Design: docs/design/inventory-value-conservation.md.
+    value_cents     BIGINT NOT NULL DEFAULT 0,
+    -- Display-only per-unit cost, derived — never an input to a GL
+    -- amount, never writable (stale writers fail loudly here).
+    production_cost_cents BIGINT GENERATED ALWAYS AS
+        (CASE WHEN on_hand > 0 THEN value_cents / on_hand ELSE 0 END) STORED,
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (product_sku, location_id)
 );

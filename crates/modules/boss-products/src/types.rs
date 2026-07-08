@@ -42,10 +42,17 @@ pub struct ProductInventory {
     pub on_hand: i32,
     #[serde(default)]
     pub reserved: i32,
-    /// Per-unit production cost in cents. Set on `produce` from
-    /// the JobKind's authored `unit_cost_cents`; read on `consume`
-    /// to size the `finance.cogs.recognized` JE. Weighted moving
-    /// average — see `port::produce` for the formula.
+    /// The row's total stock value in cents — the stored, CONSERVED
+    /// quantity (costing PR 6a, Q1: value-primary). `produce` adds the
+    /// exact line total the WIP drain allocated; `consume` drains the
+    /// proportional share to size the `finance.cogs.recognized` JE,
+    /// the final unit taking the remainder so zero on_hand forces
+    /// zero value. Design: docs/design/inventory-value-conservation.md.
+    #[serde(default)]
+    pub value_cents: i64,
+    /// Display-only per-unit cost (`value / on_hand`), derived by the
+    /// database (generated column) — read-side convenience, ignored on
+    /// writes, never an input to a GL amount.
     #[serde(default)]
     pub production_cost_cents: i64,
     #[serde(default)]

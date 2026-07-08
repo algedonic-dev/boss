@@ -80,8 +80,16 @@ pub fn load_parts(seeds: &Path) -> Result<Vec<InventoryItem>> {
     }
     let body =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let bundle: PartsBundle =
+    let mut bundle: PartsBundle =
         toml::from_str(&body).with_context(|| format!("parsing {}", path.display()))?;
+    // parts.toml authors a per-unit cost (the natural authoring shape);
+    // the conserved row quantity is value_cents (PR 6a, value-primary).
+    // Derive it ONCE here so every consumer — the batch upsert, the
+    // opening JE, tests — sees the same exact total and the GL equals
+    // physical from the first event.
+    for part in &mut bundle.parts {
+        part.value_cents = part.on_hand as i64 * part.avg_cost_cents;
+    }
     Ok(bundle.parts)
 }
 

@@ -37,6 +37,7 @@ fn item(sku: &str, vendor_category: Option<&str>) -> InventoryItem {
         reorder_point: 10,
         reorder_qty: 50,
         trailing_90d_usage: 30,
+        value_cents: 0,
         avg_cost_cents: 0,
         vendor_price_cents: None,
         vendor_category: vendor_category.map(str::to_string),

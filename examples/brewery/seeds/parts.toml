@@ -35,8 +35,11 @@
 # untouched — restocks just fire ~2 weeks earlier, so this is
 # balance-neutral cash↔inventory, no COGS/margin change.
 
-# `avg_cost_cents` seeds the weighted moving-average that
-# `inventory_items` tracks per SKU. Values reflect ~industrial
+# `avg_cost_cents` is the authored PER-UNIT opening cost; the loader
+# derives the row's conserved `value_cents` (on_hand × this) from it,
+# and the opening JE posts that exact total (PR 6a, value-primary —
+# the live average is thereafter derived, never stored). Values
+# reflect ~industrial
 # craft-brewery procurement (USD wholesale, 2025):
 #   - 50-lb malt sack: $25-30
 #   - 44-lb hops pellet box: $300 (Cascade specialty)

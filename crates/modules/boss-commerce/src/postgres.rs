@@ -29,7 +29,7 @@ impl PgCommerce {
         let ids: Vec<String> = invoices.iter().map(|i| i.id.clone()).collect();
         let lines: Vec<LineItemRow> = sqlx::query_as(
             "SELECT id, invoice_id, revenue_category, amount_cents, currency, description, ref_id, \
-                    sku, qty, cost_basis_cents \
+                    sku, qty, cost_basis_cents, cost_total_cents \
              FROM invoice_line_items WHERE invoice_id = ANY($1) ORDER BY id",
         )
         .bind(&ids)
@@ -152,7 +152,7 @@ impl CommerceRepository for PgCommerce {
         let mut invoice = row.into_invoice();
         let lines: Vec<LineItemRow> = sqlx::query_as(
             "SELECT id, invoice_id, revenue_category, amount_cents, currency, description, ref_id, \
-                    sku, qty, cost_basis_cents \
+                    sku, qty, cost_basis_cents, cost_total_cents \
              FROM invoice_line_items WHERE invoice_id = $1 ORDER BY id",
         )
         .bind(&invoice.id)
@@ -308,7 +308,7 @@ impl CommerceRepository for PgCommerce {
             {
                 // Look up FG row (+ decrement on first issuance only).
                 let row: Option<(i32, i64)> = sqlx::query_as(
-                    "SELECT on_hand, production_cost_cents \
+                    "SELECT on_hand, value_cents \
                      FROM finished_product_inventory \
                      WHERE product_sku = $1 \
                      ORDER BY on_hand DESC \
@@ -319,19 +319,36 @@ impl CommerceRepository for PgCommerce {
                 .await
                 .map_err(|e| CommerceError::Storage(e.to_string()))?;
                 match row {
-                    // First issuance: stock is sufficient → draw it down.
-                    Some((on_hand, cost_basis)) if !already_issued && on_hand >= qty => {
+                    // First issuance: stock is sufficient → draw it down,
+                    // draining the proportional VALUE share (final unit
+                    // takes the remainder) so GL 1320 and physical FG
+                    // move by the same cents. NB (6b): this whole
+                    // cross-module write moves behind the products
+                    // consume surface once consume owns COGS (Q2).
+                    Some((on_hand, value_before)) if !already_issued && on_hand >= qty => {
+                        let drained = if on_hand == qty {
+                            value_before
+                        } else {
+                            (((value_before as i128) * (qty as i128) + (on_hand as i128) / 2)
+                                / (on_hand as i128)) as i64
+                        };
                         sqlx::query(
                             "UPDATE finished_product_inventory \
-                             SET on_hand = on_hand - $2, updated_at = NOW() \
+                             SET on_hand = on_hand - $2, \
+                                 value_cents = value_cents - $3, \
+                                 updated_at = NOW() \
                              WHERE product_sku = $1 AND on_hand >= $2",
                         )
                         .bind(sku)
                         .bind(qty)
+                        .bind(drained)
                         .execute(&mut *tx)
                         .await
                         .map_err(|e| CommerceError::Storage(e.to_string()))?;
-                        enriched.cost_basis_cents = Some(cost_basis);
+                        // Display per-unit basis (derived); the exact
+                        // COGS total the posting rule uses.
+                        enriched.cost_basis_cents = Some(drained / qty as i64);
+                        enriched.cost_total_cents = Some(drained);
                     }
                     // Redelivery: the drawdown already happened on the prior
                     // delivery (the issued fact exists). Re-stamp cost_basis
@@ -348,8 +365,14 @@ impl CommerceRepository for PgCommerce {
                     // that one invoice, NOT a GL/physical decouple (physical
                     // was drawn once; the GL stays internally balanced). Needs
                     // a redelivery straddling a re-standardization, so rare.
-                    Some((_on_hand, cost_basis)) if already_issued => {
-                        enriched.cost_basis_cents = Some(cost_basis);
+                    Some((on_hand, value_now)) if already_issued => {
+                        let unit_now = if on_hand > 0 {
+                            value_now / on_hand as i64
+                        } else {
+                            0
+                        };
+                        enriched.cost_basis_cents = Some(unit_now);
+                        enriched.cost_total_cents = Some(unit_now.saturating_mul(qty as i64));
                     }
                     Some((on_hand, _)) => {
                         return Err(CommerceError::Storage(format!(
@@ -368,8 +391,8 @@ impl CommerceRepository for PgCommerce {
             sqlx::query(
                 "INSERT INTO invoice_line_items \
                     (id, invoice_id, revenue_category, amount_cents, currency, description, ref_id, \
-                     sku, qty, cost_basis_cents, created_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                     sku, qty, cost_basis_cents, cost_total_cents, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             )
             .bind(&enriched.id)
             .bind(&inv.id)
@@ -381,6 +404,7 @@ impl CommerceRepository for PgCommerce {
             .bind(&enriched.sku)
             .bind(enriched.qty)
             .bind(enriched.cost_basis_cents)
+            .bind(enriched.cost_total_cents)
             .bind(now)
             .execute(&mut *tx)
             .await
@@ -564,7 +588,7 @@ impl CommerceRepository for PgCommerce {
         let mut invoice = row.into_invoice();
         let lines: Vec<LineItemRow> = sqlx::query_as(
             "SELECT id, invoice_id, revenue_category, amount_cents, currency, description, ref_id, \
-                    sku, qty, cost_basis_cents \
+                    sku, qty, cost_basis_cents, cost_total_cents \
              FROM invoice_line_items WHERE invoice_id = $1 ORDER BY id",
         )
         .bind(id)
@@ -1004,6 +1028,7 @@ struct LineItemRow {
     sku: Option<String>,
     qty: Option<i32>,
     cost_basis_cents: Option<i64>,
+    cost_total_cents: Option<i64>,
 }
 
 impl LineItemRow {
@@ -1019,6 +1044,7 @@ impl LineItemRow {
             sku: self.sku,
             qty: self.qty,
             cost_basis_cents: self.cost_basis_cents,
+            cost_total_cents: self.cost_total_cents,
         }
     }
 }

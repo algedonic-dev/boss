@@ -21,7 +21,7 @@ use boss_inventory::types::InventoryItem;
 use boss_testing::TestDb;
 use chrono::Utc;
 
-fn item(sku: &str, on_hand: u32, avg_cost_cents: i64) -> InventoryItem {
+fn item(sku: &str, on_hand: u32, unit_cost_cents: i64) -> InventoryItem {
     InventoryItem {
         part_sku: sku.into(),
         bin: "A-01".into(),
@@ -30,7 +30,8 @@ fn item(sku: &str, on_hand: u32, avg_cost_cents: i64) -> InventoryItem {
         reorder_point: 0,
         reorder_qty: 0,
         trailing_90d_usage: 0,
-        avg_cost_cents,
+        value_cents: on_hand as i64 * unit_cost_cents,
+        avg_cost_cents: 0, // derived display — ignored on writes
         vendor_price_cents: None,
         vendor_category: None,
     }
