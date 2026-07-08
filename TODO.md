@@ -56,12 +56,18 @@ first-contact fixes (#74). Sorted by dependency, not size.
       absorption — retires the 15 hand-multiplied `amount_cents`
       constants in the brewery seed. The seed test pinning
       amount == rate × batch_bbl holds the contract until then.
-- [ ] **`HandlerError::Permanent` — immediate-Term for deterministic
-      data errors.** A 422 (e.g. unknown account code from a seed typo)
-      burns the full 8-NAK redelivery budget before dead-lettering.
-      Needs care: classification must be per-call-site, not blanket-4xx
-      (the consume path's 409 insufficient-stock is 4xx-but-convergent
-      — a restock can land mid-retry).
+- [x] **`HandlerError::Permanent`** — done. The house contract does
+      the classification: services answer **422** for deterministic
+      request-data errors (seed typos, malformed bodies), and the
+      shared post/get helpers map exactly that status to `Permanent`;
+      409 (convergent conflicts, e.g. insufficient stock — load-bearing
+      for the 6b backorder path) and 404 (not-yet-projected) stay
+      retryable, as do all 5xx. The runner Terms an event only when
+      EVERY failed handler is deterministic (Permanent/MissingArg/
+      BadArgType); any transient in the mix NAKs so the idempotent
+      re-run converges it. Permanent Terms log the same `DEAD-LETTER:`
+      pattern with `class=permanent`, so gates and operators keep one
+      vocabulary.
 - [x] **Dedup audit-event emits on redelivery** — done for the
       fact-backed occurrence events (`record_fact_in_tx` returns
       `FactRecorded { id, inserted }`; ledger manual-entry +
