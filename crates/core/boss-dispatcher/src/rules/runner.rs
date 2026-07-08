@@ -128,12 +128,15 @@ impl RulesRunner {
                         .to_string();
                     let payload = envelope.get("payload").cloned().unwrap_or(envelope);
                     let outcome = self.handle(&subject, &event_id, &payload).await;
-                    // ACK on success; NAK (→ redeliver) on failure; dead-letter
-                    // once the redelivery budget is spent. `settle` does the
-                    // failure logging (deliberately NOT phrased as the
-                    // health-gate's permanent-failure pattern — a transient NAK
-                    // that self-heals is not a defect; only a dead-letter is).
-                    boss_nats::durable::settle(&msg, outcome).await;
+                    // ACK on success; NAK (→ redeliver) on transient failure —
+                    // dead-letter once the budget is spent; immediate Term on a
+                    // permanent failure (deterministic data error — every
+                    // redelivery fails identically, so the budget is noise).
+                    // `settle_classified` does the failure logging
+                    // (deliberately NOT phrased as the health-gate pattern for
+                    // NAKs — a transient that self-heals is not a defect; only
+                    // a dead-letter is, and permanent failures log as one).
+                    boss_nats::durable::settle_classified(&msg, outcome).await;
                     live.record_rules();
                 }
             })
@@ -143,15 +146,28 @@ impl RulesRunner {
         Ok(())
     }
 
-    async fn handle(&self, topic: &str, event_id: &str, payload: &Value) -> Result<()> {
-        let matched = registry::match_event(&self.registry, topic, payload, self.helpers.as_ref())
-            .with_context(|| format!("matching event on {topic}"))?;
+    async fn handle(
+        &self,
+        topic: &str,
+        event_id: &str,
+        payload: &Value,
+    ) -> boss_nats::durable::Settle {
+        use boss_nats::durable::Settle;
+        let matched =
+            match registry::match_event(&self.registry, topic, payload, self.helpers.as_ref()) {
+                Ok(m) => m,
+                Err(e) => return Settle::Retry(format!("matching event on {topic}: {e}")),
+            };
         if matched.is_empty() {
-            return Ok(());
+            return Settle::Ack;
         }
-        let results = handler::dispatch(&matched, &self.handlers, event_id, topic, payload)
-            .await
-            .with_context(|| format!("dispatching matched rules for {topic}"))?;
+        let results =
+            match handler::dispatch(&matched, &self.handlers, event_id, topic, payload).await {
+                Ok(r) => r,
+                Err(e) => {
+                    return Settle::Retry(format!("dispatching matched rules for {topic}: {e}"));
+                }
+            };
         // Collect handler failures and propagate them: a failed handler must
         // surface as an `Err` here so the caller NAKs the message and the
         // server redelivers it. The previous version logged failures but
@@ -164,6 +180,7 @@ impl RulesRunner {
         // the handlers must therefore be idempotent on their source key, or
         // a partial failure double-applies the survivors on retry.
         let mut failures = Vec::new();
+        let mut all_permanent = true;
         for r in results {
             match &r.outcome {
                 Ok(()) => {
@@ -179,18 +196,31 @@ impl RulesRunner {
                     );
                 }
                 Err(e) => {
+                    if !e.is_permanent() {
+                        all_permanent = false;
+                    }
                     failures.push(format!("{}/{}: {}", r.rule_name, r.handler, e));
                 }
             }
         }
         if !failures.is_empty() {
-            anyhow::bail!(
+            let msg = format!(
                 "{} handler(s) failed on {topic}: {}",
                 failures.len(),
                 failures.join("; ")
             );
+            // Term only when EVERY failure is deterministic: if any
+            // transient failure is present, NAK — the idempotent re-run
+            // lets the transients converge, and the ride-along permanent
+            // failures re-fail harmlessly until the event either fully
+            // converges or Terms on a later all-permanent pass.
+            return if all_permanent {
+                boss_nats::durable::Settle::Permanent(msg)
+            } else {
+                boss_nats::durable::Settle::Retry(msg)
+            };
         }
-        Ok(())
+        boss_nats::durable::Settle::Ack
     }
 }
 
@@ -270,11 +300,14 @@ handler = "boom"
             "job_id": "j1", "step_id": "s1", "kind": "billing"
         });
         let res = runner.handle("step.done.billing", "evt-1", &payload).await;
-        let err = res.expect_err("a failed handler must propagate as Err so the message NAKs");
-        assert!(
-            err.to_string().contains("boom"),
-            "the propagated error should name the failed handler: {err}"
-        );
+        // A transient failure must surface as Retry so the message NAKs.
+        match res {
+            boss_nats::durable::Settle::Retry(msg) => assert!(
+                msg.contains("boom"),
+                "the propagated error should name the failed handler: {msg}"
+            ),
+            other => panic!("expected Retry, got {}", settle_name(&other)),
+        }
     }
 
     #[tokio::test]
@@ -289,6 +322,133 @@ handler = "boom"
         let res = runner
             .handle("step.done.unmatched", "evt", &serde_json::json!({}))
             .await;
-        assert!(res.is_ok(), "an unmatched event must be Ok (ACK), not Err");
+        assert!(
+            matches!(res, boss_nats::durable::Settle::Ack),
+            "an unmatched event must ACK, not retry"
+        );
+    }
+
+    struct FixedHandler {
+        name: &'static str,
+        result: fn() -> Result<(), crate::rules::handler::HandlerError>,
+    }
+    #[async_trait::async_trait]
+    impl crate::rules::handler::Handler for FixedHandler {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        async fn invoke(
+            &self,
+            _args: &[(String, crate::rules::expr::Value)],
+            _ctx: &crate::rules::handler::InvocationContext,
+        ) -> Result<(), crate::rules::handler::HandlerError> {
+            (self.result)()
+        }
+    }
+
+    fn runner_with(
+        handlers: Vec<(
+            &'static str,
+            fn() -> Result<(), crate::rules::handler::HandlerError>,
+        )>,
+        rules_toml: &str,
+    ) -> RulesRunner {
+        let mut reg = HandlerRegistry::new();
+        for (name, result) in handlers {
+            reg.register(std::sync::Arc::new(FixedHandler { name, result }));
+        }
+        RulesRunner {
+            registry: Registry::from_toml(rules_toml).unwrap(),
+            handlers: reg,
+            helpers: Arc::new(NoHelpers),
+        }
+    }
+
+    const TWO_HANDLER_RULES: &str = r#"
+[[rule]]
+name = "r-perm"
+on_event = "step.done.x"
+[[rule.do]]
+handler = "h.perm"
+[[rule]]
+name = "r-trans"
+on_event = "step.done.x"
+[[rule.do]]
+handler = "h.trans"
+"#;
+
+    /// Queue item 4 (HandlerError::Permanent): all-deterministic
+    /// failures Term immediately; ANY transient in the mix NAKs so the
+    /// idempotent re-run can converge the transients.
+    #[tokio::test]
+    async fn all_permanent_failures_term_immediately() {
+        use crate::rules::handler::HandlerError;
+        let runner = runner_with(
+            vec![
+                ("h.perm", || {
+                    Err(HandlerError::Permanent("422 seed typo".into()))
+                }),
+                ("h.trans", || {
+                    Err(HandlerError::Permanent("422 second typo".into()))
+                }),
+            ],
+            TWO_HANDLER_RULES,
+        );
+        match runner
+            .handle("step.done.x", "e1", &serde_json::json!({}))
+            .await
+        {
+            boss_nats::durable::Settle::Permanent(msg) => {
+                assert!(msg.contains("seed typo"), "{msg}");
+            }
+            other => panic!("expected Permanent, got {}", settle_name(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn any_transient_failure_naks_for_redelivery() {
+        use crate::rules::handler::HandlerError;
+        let runner = runner_with(
+            vec![
+                ("h.perm", || {
+                    Err(HandlerError::Permanent("422 seed typo".into()))
+                }),
+                ("h.trans", || {
+                    Err(HandlerError::Downstream("503 not yet".into()))
+                }),
+            ],
+            TWO_HANDLER_RULES,
+        );
+        match runner
+            .handle("step.done.x", "e1", &serde_json::json!({}))
+            .await
+        {
+            boss_nats::durable::Settle::Retry(msg) => {
+                assert!(msg.contains("2 handler(s) failed"), "{msg}");
+            }
+            other => panic!("expected Retry, got {}", settle_name(&other)),
+        }
+    }
+
+    #[tokio::test]
+    async fn success_acks() {
+        let runner = runner_with(
+            vec![("h.perm", || Ok(())), ("h.trans", || Ok(()))],
+            TWO_HANDLER_RULES,
+        );
+        assert!(matches!(
+            runner
+                .handle("step.done.x", "e1", &serde_json::json!({}))
+                .await,
+            boss_nats::durable::Settle::Ack
+        ));
+    }
+
+    fn settle_name(s: &boss_nats::durable::Settle) -> &'static str {
+        match s {
+            boss_nats::durable::Settle::Ack => "Ack",
+            boss_nats::durable::Settle::Retry(_) => "Retry",
+            boss_nats::durable::Settle::Permanent(_) => "Permanent",
+        }
     }
 }
