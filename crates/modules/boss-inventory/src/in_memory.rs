@@ -6,8 +6,8 @@ use std::sync::RwLock;
 
 use crate::port::{InventoryError, InventoryRepository};
 use crate::types::{
-    ApAging, ApAgingBucket, ConsumeApplied, InventoryItem, PurchaseOrder, Vendor, VendorInvoice,
-    VendorInvoiceStatus,
+    ApAging, ApAgingBucket, ConsumeApplied, InventoryItem, PurchaseOrder, ReceiveApplied, Vendor,
+    VendorInvoice, VendorInvoiceStatus,
 };
 
 pub struct InMemoryInventory {
@@ -134,11 +134,11 @@ impl InventoryRepository for InMemoryInventory {
         _memo: &str,
         _source_id: &str,
         _happened_on: chrono::NaiveDate,
-    ) -> Result<uuid::Uuid, InventoryError> {
+    ) -> Result<(uuid::Uuid, bool), InventoryError> {
         // No ledger / financial_facts in the in-memory adapter — tests
         // that exercise burden absorption use the postgres adapter.
         // Returning a fresh UUID keeps the trait contract intact.
-        Ok(uuid::Uuid::new_v4())
+        Ok((uuid::Uuid::new_v4(), true))
     }
 
     async fn receive_part_at(
@@ -148,11 +148,17 @@ impl InventoryRepository for InMemoryInventory {
         _unit_cost_cents: Option<i64>,
         _now: chrono::DateTime<chrono::Utc>,
         _source_id: &str,
-    ) -> Result<InventoryItem, InventoryError> {
-        // In-memory: no mutation support, just return the item.
-        self.item_by_sku(part_sku)
+    ) -> Result<ReceiveApplied, InventoryError> {
+        // In-memory: no mutation support, just return the item (no
+        // fact written → no payload → caller emits nothing).
+        let item = self
+            .item_by_sku(part_sku)
             .await?
-            .ok_or_else(|| InventoryError::NotFound(part_sku.to_string()))
+            .ok_or_else(|| InventoryError::NotFound(part_sku.to_string()))?;
+        Ok(ReceiveApplied {
+            item,
+            receipt_payload: None,
+        })
     }
 
     async fn create_purchase_order_at(

@@ -62,6 +62,18 @@ pub struct ConsumeApplied {
     pub fact_payload: Option<serde_json::Value>,
 }
 
+/// Result of a receive: the post-receive row plus the exact
+/// `finance.inventory.received` proof-fact payload written in-tx
+/// (`None` on an idempotent replay). Same contract as
+/// [`ConsumeApplied`]: the HTTP layer emits ITEM_RECEIVED from this
+/// verbatim, so a redelivery appends nothing and the event stays
+/// byte-identical to the fact it rebuilds.
+#[derive(Debug, Clone)]
+pub struct ReceiveApplied {
+    pub item: InventoryItem,
+    pub receipt_payload: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Vendor {
     pub id: String,

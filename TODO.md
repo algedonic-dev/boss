@@ -62,13 +62,19 @@ first-contact fixes (#74). Sorted by dependency, not size.
       Needs care: classification must be per-call-site, not blanket-4xx
       (the consume path's 409 insufficient-stock is 4xx-but-convergent
       — a restock can land mid-retry).
-- [ ] **Dedup audit-event emits on redelivery, house-wide.** Endpoints
-      emit their audit event unconditionally after an ON-CONFLICT no-op
-      write, so a NAK re-run appends duplicate events for a business
-      occurrence that happened once (facts/JEs/stock are exactly-once
-      on their idempotency keys; the event log carries the noise).
-      `record_fact_in_tx`-style inserted-flags exist — gate the emits
-      on them everywhere, in one pass, not per-endpoint.
+- [x] **Dedup audit-event emits on redelivery** — done for the
+      fact-backed occurrence events (`record_fact_in_tx` returns
+      `FactRecorded { id, inserted }`; ledger manual-entry +
+      inventory-movement, inventory receive (`ReceiveApplied`) and
+      overhead-absorbed all gate their emits; consume/produce were
+      already gated). DELIBERATELY left at-least-once: state-snapshot
+      events (`ITEM_UPSERTED`, `PRODUCT_INVENTORY_UPSERTED`,
+      `INVOICE_CREATED`, …) — they are the last-write-wins rebuild
+      sources, so gating them would turn projection recovery into
+      at-most-once; a duplicate snapshot is harmless by design. The
+      CRUD surfaces (vendors/contacts/accounts-team) emit per client
+      call and sit outside the NAK-redelivery path — revisit only if
+      client retries show up in the log.
 - [ ] **Costing PR 7 — BOM expansion** where defensible: water, real
       packaging materials (cans/lids/labels), ingredient variety only
       where the inputs can be sourced. Incomplete > wrong.
