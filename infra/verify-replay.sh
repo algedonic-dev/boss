@@ -113,7 +113,10 @@ section "2. Core API endpoints return projected data"
 # (1 row each) so any deployment with seeded data passes.
 check_api_count "kb models"        "http://127.0.0.1:7750/api/catalog/models"           "len(d)"     1
 check_api_count "employees"        "http://127.0.0.1:7500/api/people"                   "len(d) if isinstance(d, list) else d.get('total', 0)" 1
-check_api_count "accounts"         "http://127.0.0.1:7500/api/people/accounts"          "len(d) if isinstance(d, list) else d.get('total', 0)" 1
+# NB: /api/people/accounts is served by accounts-api (7550), NOT
+# people-api (7500) — 7500 reads "accounts" as an employee id and
+# 404s, which failed this gate on every box after the accounts split.
+check_api_count "accounts"         "http://127.0.0.1:7550/api/people/accounts"          "len(d) if isinstance(d, list) else d.get('total', 0)" 1
 check_api_count "vendors"          "http://127.0.0.1:7300/api/inventory/vendors"        "len(d)"     1
 check_api_count "assets"    "http://127.0.0.1:7600/api/assets?limit=1"    "d.get('total', 0)"      1
 check_api_count "jobs"             "http://127.0.0.1:7900/api/jobs?limit=1"             "d.get('total', 0)"      1
@@ -122,14 +125,14 @@ check_api_count "JobKinds"         "http://127.0.0.1:7900/api/jobs/kinds"       
 # ---------------------------------------------------------------------------
 if (( STRICT )); then
     section "3. Brewery 365-day sim floors (Algedonic Ales)"
-    # Calibrated against the 2026-05-23 regen baseline:
-    #   605,354 audit_log rows · ~700 employees · ~50 accounts ·
-    #   ~10 vendors · ~thousands of invoices / shipments / jobs.
+    # Calibrated against the 2026-07-06 365d regen baseline:
+    #   410 employees (the slimmed seed roster) · ~50 accounts ·
+    #   ~20 vendors · 25,675 jobs · 22,704 invoices.
     # Floors set well below the baseline so a healthy regen clears
     # them with margin; a regression that drops the count by an
     # order of magnitude trips the gate.
-    check_api_count "brewery employees"    "http://127.0.0.1:7500/api/people"                  "len(d) if isinstance(d, list) else d.get('total', 0)"  500
-    check_api_count "brewery accounts"     "http://127.0.0.1:7500/api/people/accounts"         "len(d) if isinstance(d, list) else d.get('total', 0)"   30
+    check_api_count "brewery employees"    "http://127.0.0.1:7500/api/people"                  "len(d) if isinstance(d, list) else d.get('total', 0)"  300
+    check_api_count "brewery accounts"     "http://127.0.0.1:7550/api/people/accounts"         "len(d) if isinstance(d, list) else d.get('total', 0)"   30
     check_api_count "brewery vendors"      "http://127.0.0.1:7300/api/inventory/vendors"        "len(d)"               5
     check_api_count "brewery jobs"         "http://127.0.0.1:7900/api/jobs?limit=1"             "d.get('total', 0)"  500
     check_api_count "brewery invoices"     "http://127.0.0.1:7400/api/commerce/invoices?limit=1" "d.get('total', 0)" 100
@@ -148,6 +151,12 @@ plugins_json=$(curl -sf -m 5 -H "x-boss-user: $BOSS_USER" \
     "http://127.0.0.1:7900/api/jobs/step-plugins" 2>/dev/null || echo "")
 if [[ -z "$plugins_json" ]]; then
     warn "step-plugins registry unreachable — skipping bundle check"
+elif [[ ! -d /var/lib/boss/step-plugins ]]; then
+    # bootstrap-vm.sh installs the API stack only (no deploy-web.sh),
+    # so a headless regen box legitimately has no bundles — that's a
+    # deploy shape, not a deploy gap. The FAIL stays for boxes that
+    # HAVE the dir but are missing files (the 2026-05-25 class).
+    warn "no /var/lib/boss/step-plugins on this box (headless install) — skipping bundle check"
 else
     # gateway serves /plugins/* on its public port (4443) — check via
     # localhost loopback to avoid the CF Access redirect.
