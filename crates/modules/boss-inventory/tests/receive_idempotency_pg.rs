@@ -68,7 +68,11 @@ async fn receive_is_idempotent_on_source_id() {
         .receive_part_at("ING-MALT-2ROW-50", 200, Some(50), Utc::now(), key)
         .await
         .unwrap();
-    assert_eq!(first.on_hand, 1200);
+    assert_eq!(first.item.on_hand, 1200);
+    assert!(
+        first.receipt_payload.is_some(),
+        "first delivery carries the proof-fact payload to emit"
+    );
     assert_eq!(
         inv.item_by_sku("ING-MALT-2ROW-50")
             .await
@@ -90,7 +94,14 @@ async fn receive_is_idempotent_on_source_id() {
         .receive_part_at("ING-MALT-2ROW-50", 200, Some(50), Utc::now(), key)
         .await
         .unwrap();
-    assert_eq!(replay.on_hand, 1200, "replay must not double-increment");
+    assert_eq!(
+        replay.item.on_hand, 1200,
+        "replay must not double-increment"
+    );
+    assert!(
+        replay.receipt_payload.is_none(),
+        "replay returns no payload — the caller emits no duplicate ITEM_RECEIVED"
+    );
     assert_eq!(
         inv.item_by_sku("ING-MALT-2ROW-50")
             .await

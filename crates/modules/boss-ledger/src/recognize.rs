@@ -376,7 +376,8 @@ async fn advance_one_schedule(
             created_by: "ledger",
         },
     )
-    .await?;
+    .await?
+    .id;
 
     // Post via the normal ruleset path — BossRuleSet handles the
     // finance.revenue.recognized kind (deferred-revenue recognition).

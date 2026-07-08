@@ -135,7 +135,7 @@ pub(super) async fn create_bank_settlement(
     )
     .await
     {
-        Ok(id) => id,
+        Ok(rec) => rec.id,
         Err(e) => return ledger_err(e),
     };
 
@@ -409,7 +409,8 @@ async fn settle_one(
         },
     )
     .await
-    .map_err(SettleFailure::Ledger)?;
+    .map_err(SettleFailure::Ledger)?
+    .id;
 
     let fact = crate::types::FactRef {
         id: live_fact_id,

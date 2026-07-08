@@ -394,7 +394,7 @@ pub(super) async fn receive_part_handler<R: InventoryRepository + 'static>(
         .idempotency_key
         .clone()
         .unwrap_or_else(|| format!("{}@{}", part_sku, uuid::Uuid::new_v4()));
-    let item = match state
+    let applied = match state
         .inventory
         .receive_part_at(
             &part_sku,
@@ -405,12 +405,16 @@ pub(super) async fn receive_part_handler<R: InventoryRepository + 'static>(
         )
         .await
     {
-        Ok(item) => item,
+        Ok(applied) => applied,
         Err(InventoryError::NotFound(sku)) => {
             return (StatusCode::NOT_FOUND, format!("part not found: {sku}")).into_response();
         }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    let crate::types::ReceiveApplied {
+        item,
+        receipt_payload,
+    } = applied;
 
     if let Some(pub_) = &state.publisher {
         // State event — full post-receive row state. Rebuild treats this
@@ -426,26 +430,22 @@ pub(super) async fn receive_part_handler<R: InventoryRepository + 'static>(
             now,
         )
         .await;
-        // Goods-receipt log marker — carries the SAME source_id +
-        // received_on that `receive_part_at` wrote into the in-tx
-        // `finance.inventory.received` dedup-fact, so the ledger-facts
-        // rebuilder reconstructs a byte-identical fact from audit_log
-        // alone (mirrors ITEM_CONSUMED → INVENTORY_TRANSFERRED). The fact
-        // is GL-INERT: no gl_fact_projection_rules row + no RuleSet arm =
-        // zero journal lines. The DR-1300 rides the bill-approval path.
-        pub_.emit_with_actor_at(
-            crate::events::ITEM_RECEIVED,
-            actor,
-            serde_json::json!({
-                "source_id": receive_source_id,
-                "part_sku": part_sku,
-                "qty": body.qty,
-                "unit_cost_cents": body.unit_cost_cents,
-                "received_on": now.date_naive(),
-            }),
-            now,
-        )
-        .await;
+        // Goods-receipt log marker — the EXACT proof-fact payload
+        // `receive_part_at` wrote in-tx, emitted verbatim (one
+        // construction: the ledger-facts rebuilder reconstructs a
+        // byte-identical `finance.inventory.received` from audit_log
+        // alone, mirroring ITEM_CONSUMED → INVENTORY_TRANSFERRED). The
+        // fact is GL-INERT: no gl_fact_projection_rules row + no
+        // RuleSet arm = zero journal lines; DR-1300 rides the
+        // bill-approval path. Gated: an idempotent replay returns no
+        // payload and appends nothing (queue item: dedup audit-event
+        // emits on redelivery). ITEM_UPSERTED above deliberately stays
+        // at-least-once — it is the last-write-wins rebuild source for
+        // the stock row, and a duplicate snapshot is harmless.
+        if let Some(payload) = receipt_payload {
+            pub_.emit_with_actor_at(crate::events::ITEM_RECEIVED, actor, payload, now)
+                .await;
+        }
     }
 
     (
@@ -577,7 +577,7 @@ pub(super) async fn overhead_absorbed_handler<R: InventoryRepository + 'static>(
         )
         .await
     {
-        Ok(id) => id,
+        Ok(outcome) => outcome,
         // Deterministic request-data error (unknown account code) → 422,
         // so a seed typo reads as a client error with the offending code
         // in the body, not as service trouble. The dispatcher still NAKs
@@ -588,13 +588,17 @@ pub(super) async fn overhead_absorbed_handler<R: InventoryRepository + 'static>(
         }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    let (canonical_fact_id, fact_inserted) = canonical_fact_id;
 
     // 2. Audit-log publish — runs after the GL tx commits so a
     //    posting failure doesn't leak a phantom event. Replay
     //    material: the gl_fact_projection_rules row
     //    `inventory.overhead.absorbed → finance.inventory.transferred`
-    //    reconstructs the fact from this event on rebuild.
-    if let Some(pub_) = &state.publisher {
+    //    reconstructs the fact from this event on rebuild. Gated on
+    //    THIS call having inserted the fact — an idempotent replay
+    //    appends nothing (queue item: dedup audit-event emits on
+    //    redelivery).
+    if fact_inserted && let Some(pub_) = &state.publisher {
         let actor = user
             .ambient_actor()
             .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));

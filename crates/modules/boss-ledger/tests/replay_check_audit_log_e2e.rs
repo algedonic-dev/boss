@@ -350,7 +350,8 @@ async fn deep_check_entries_match_when_live_fact_written_by_the_real_writer_path
         },
     )
     .await
-    .unwrap();
+    .unwrap()
+    .id;
     boss_ledger::post_fact_in_tx(
         &mut tx,
         &boss_ledger::FactRef {

@@ -66,7 +66,8 @@ async fn record_and_post_bill_fact(
         },
     )
     .await
-    .map_err(ledger_err)?;
+    .map_err(ledger_err)?
+    .id;
 
     let fact = crate::types::FactRef {
         id: live_fact_id,

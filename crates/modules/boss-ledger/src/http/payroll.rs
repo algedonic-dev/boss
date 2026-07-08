@@ -157,7 +157,7 @@ pub(super) async fn create_payroll_run(
     )
     .await
     {
-        Ok(id) => id,
+        Ok(rec) => rec.id,
         Err(e) => return ledger_err(e),
     };
 
@@ -376,7 +376,7 @@ pub(super) async fn synthesize_payroll_run(
     )
     .await
     {
-        Ok(id) => id,
+        Ok(rec) => rec.id,
         Err(e) => return ledger_err(e),
     };
 
