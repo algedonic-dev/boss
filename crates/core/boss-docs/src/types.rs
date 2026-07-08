@@ -119,6 +119,25 @@ impl DocStatus {
         }
     }
 
+    /// Strict inverse of [`Self::as_str`] — for DB round-trips, where
+    /// the value was written by `as_str` and anything else is storage
+    /// corruption (unlike [`Self::from_status_line`], which parses
+    /// human prose). Adding an enum variant without extending `as_str`
+    /// fails here loudly; the schema CHECK + the
+    /// `schema_matches_doc_status_enum` pg test pin the DB side.
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        match s {
+            "draft" => Some(Self::Draft),
+            "in-review" => Some(Self::InReview),
+            "approved" => Some(Self::Approved),
+            "shipped" => Some(Self::Shipped),
+            "reopened" => Some(Self::Reopened),
+            "superseded" => Some(Self::Superseded),
+            "living" => Some(Self::Living),
+            _ => None,
+        }
+    }
+
     /// Does this status assert there is no open discussion? Shipped +
     /// Superseded (the work completed) and Living (a settled
     /// reference). A doc in any of these states must have zero
