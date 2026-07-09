@@ -71,6 +71,26 @@ pub enum HandlerError {
     },
     #[error("downstream call failed: {0}")]
     Downstream(String),
+    /// A deterministic request-data error — the call will fail
+    /// identically on every redelivery (HTTP 422 by house contract:
+    /// services answer 422 for semantic validation failures like an
+    /// unknown account code from a seed typo; convergent conflicts use
+    /// 409 and not-yet-projected reads 404, both of which stay
+    /// retryable). The runner terminates the event immediately instead
+    /// of burning the redelivery budget on the same failure.
+    #[error("permanent: {0}")]
+    Permanent(String),
+}
+
+impl HandlerError {
+    /// Errors that cannot change on redelivery: bad rule authoring
+    /// (missing/mistyped args) and downstream-declared data errors.
+    pub fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            Self::Permanent(_) | Self::MissingArg(_) | Self::BadArgType { .. }
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

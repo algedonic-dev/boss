@@ -150,6 +150,16 @@ pub(crate) async fn post_json(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        // House contract: 422 = deterministic request-data error (a
+        // seed typo, a malformed body) — identical on every redelivery,
+        // so the runner Terms immediately instead of burning the NAK
+        // budget. Convergent conflicts (409 insufficient-stock, 404
+        // not-yet-projected) stay retryable.
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            return Err(HandlerError::Permanent(format!(
+                "POST {url} returned {status}: {body}"
+            )));
+        }
         return Err(HandlerError::Downstream(format!(
             "POST {url} returned {status}: {body}"
         )));
@@ -175,6 +185,12 @@ pub(crate) async fn get_json(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        // Same 422 contract as post_json.
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            return Err(HandlerError::Permanent(format!(
+                "GET {url} returned {status}: {body}"
+            )));
+        }
         return Err(HandlerError::Downstream(format!(
             "GET {url} returned {status}: {body}"
         )));

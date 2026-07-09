@@ -223,6 +223,43 @@ pub fn is_dead_letter(delivered: i64) -> bool {
 ///
 /// Generic over the error type so callers can pass their own (`anyhow`,
 /// `&str`, …) without this crate depending on it.
+/// Three-way settle outcome. `Retry` NAKs for redelivery (converges
+/// once the transient cause clears, dead-letters after the budget);
+/// `Permanent` skips the budget entirely: a deterministic data error
+/// (a seed typo, a malformed body) fails identically on every
+/// redelivery, so the 8 NAKs it used to burn were pure noise and a
+/// multi-minute delay before the SAME dead-letter. The log line is the
+/// same `DEAD-LETTER:` pattern either way — the health gates and
+/// operators see one vocabulary, with `class=permanent` marking the
+/// fast path.
+pub enum Settle {
+    Ack,
+    Retry(String),
+    Permanent(String),
+}
+
+pub async fn settle_classified(msg: &Message, outcome: Settle) {
+    match outcome {
+        Settle::Ack => {
+            if let Err(e) = msg.ack().await {
+                warn!(subject = %msg.subject, error = %e, "JetStream ACK failed; message will redeliver");
+            }
+        }
+        Settle::Permanent(err) => {
+            let delivered = msg.info().map(|i| i.delivered).unwrap_or(MAX_DELIVER);
+            error!(
+                subject = %msg.subject,
+                delivered,
+                class = "permanent",
+                error = %err,
+                "DEAD-LETTER: deterministic data error; terminating without redelivery (source recoverable from audit_log)"
+            );
+            let _ = msg.ack_with(AckKind::Term).await;
+        }
+        Settle::Retry(err) => settle(msg, Err::<(), _>(err)).await,
+    }
+}
+
 pub async fn settle<E: std::fmt::Display>(msg: &Message, outcome: Result<(), E>) {
     match outcome {
         Ok(()) => {
