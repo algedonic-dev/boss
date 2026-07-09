@@ -101,6 +101,13 @@ sudo -u "$DEV_USER" -i bash -lc "cd $REPO_ROOT && cargo build --release \
 
 log "== 6 — install binaries =="
 cd "$REPO_ROOT/target/release"
+# Stamp every built bin as current — same reasoning as build-release.sh:
+# after a clean build every binary IS up to date (cargo rebuilt or
+# verified it), but cargo leaves a skipped bin's mtime untouched, and a
+# re-checkout refreshes every SOURCE mtime — so the deploy freshness
+# guard false-flags untouched binaries as stale on the second run of
+# this script (bit the 2026-07-08 regen-VM rerun).
+find . -maxdepth 1 -type f -executable -name 'boss-*' -exec touch {} +
 install -m 755 -t /usr/local/bin/ $(ls boss-* | grep -v '\.d$')
 
 log "== 7 — re-seed registries =="

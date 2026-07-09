@@ -408,8 +408,31 @@ fn overhead_source_ids(
     this_step_id: &str,
     overhead_accounts: &[String],
 ) -> Vec<String> {
-    joint_mash_steps(steps, this_step_id)
-        .flat_map(|(step_id, _md)| {
+    // ONLY production-consume steps: the `inventory.overhead.absorb`
+    // dos fire on `step.done.production-consume`, so those are the
+    // only steps facts can exist for. The kind filter is load-bearing
+    // — `joint_mash_steps` includes every completed non-producing
+    // step (tasks, scheduling, gates), which was harmless when the
+    // drain parsed stamped metadata (unstamped steps contributed no
+    // ids) but starved every drain once ids were generated from the
+    // rule args: 10-ish joint steps × 3 accounts expected, one mash
+    // step's 3 facts present → refuse-to-drain-short → the entire
+    // year's produce side dead-lettered (caught by the 2026-07-08
+    // 365d regen's step-7a gate; CI's install-smoke treats
+    // dead-letters as informational and slid past it).
+    steps
+        .iter()
+        .filter_map(|s| {
+            let step_id = s.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if step_id == this_step_id
+                || s.get("kind").and_then(|v| v.as_str()) != Some("production-consume")
+                || s.get("status").and_then(|v| v.as_str()) != Some("completed")
+            {
+                return None;
+            }
+            Some(step_id)
+        })
+        .flat_map(|step_id| {
             overhead_accounts
                 .iter()
                 .map(move |account| common::overhead_source_id(step_id, account))
@@ -829,6 +852,37 @@ mod tests {
         );
         // No accounts configured → nothing to reconstruct.
         assert!(overhead_source_ids(&steps, "pkg-half", &[]).is_empty());
+    }
+
+    #[test]
+    fn overhead_ids_ignore_completed_non_consume_steps() {
+        // The 2026-07-08 365d-regen regression: a brew job carries many
+        // completed task/scheduling/gate steps; absorption only ever
+        // fires on production-consume, so expecting facts for the
+        // others starved every drain (10-ish steps × 3 accounts
+        // expected, 3 present) and dead-lettered the year's produce
+        // side. Kind is the filter, not "completed and non-producing".
+        let steps = vec![
+            json!({ "id": "trigger", "kind": "trigger", "status": "completed", "metadata": {} }),
+            json!({ "id": "sched", "kind": "scheduling", "status": "completed", "metadata": {} }),
+            json!({ "id": "boil", "kind": "task", "status": "completed", "metadata": {} }),
+            json!({ "id": "gate", "kind": "demand-gate", "status": "completed", "metadata": {} }),
+            json!({ "id": "alloc", "kind": "packaging-allocate", "status": "completed", "metadata": {} }),
+            json!({ "id": "mash", "kind": "production-consume", "status": "completed", "metadata": {} }),
+            json!({ "id": "pkg", "kind": "production-produce", "status": "active", "metadata": {} }),
+        ];
+        let accounts = vec!["6100".to_string(), "6300".to_string(), "6900".to_string()];
+        let mut ids = overhead_source_ids(&steps, "pkg", &accounts);
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "overhead-absorbed@mash:6100".to_string(),
+                "overhead-absorbed@mash:6300".to_string(),
+                "overhead-absorbed@mash:6900".to_string(),
+            ],
+            "only the production-consume step may contribute expected fact ids"
+        );
     }
 
     #[test]
