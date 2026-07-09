@@ -182,9 +182,29 @@ async fn process_job(
 
     run_git(root, &["add", &job.payload.doc_path])?;
     run_git(root, &["commit", "-m", &commit_msg])?;
-    // Push is best-effort — if the branch is behind, let the human fix it.
-    if let Err(e) = run_git(root, &["push", "origin", "HEAD"]) {
-        return Err(anyhow!("commit succeeded but push failed: {e}"));
+    // Where to push is deployment-shaped: the playground works on a
+    // fork (pushes to `origin` = the protected upstream are denied),
+    // and a review box may want commit-only with a human carrying the
+    // branch. BOSS_DOCS_FLUSH_REMOTE overrides the remote;
+    // BOSS_DOCS_FLUSH_NO_PUSH=1 skips the push entirely (the commit —
+    // the durable half — still lands and the job succeeds with its
+    // sha). A failed push still fails the job, with the sha in the
+    // error so the human can push by hand.
+    let no_push = std::env::var("BOSS_DOCS_FLUSH_NO_PUSH").is_ok_and(|v| v == "1");
+    if no_push {
+        eprintln!("  (BOSS_DOCS_FLUSH_NO_PUSH=1 — commit made, push skipped)");
+    } else {
+        let remote =
+            std::env::var("BOSS_DOCS_FLUSH_REMOTE").unwrap_or_else(|_| "origin".to_string());
+        if let Err(e) = run_git(root, &["push", &remote, "HEAD"]) {
+            let sha = run_git_capture(root, &["rev-parse", "HEAD"])
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| "unknown".into());
+            return Err(anyhow!(
+                "commit {sha} succeeded but push to `{remote}` failed \
+                 (set BOSS_DOCS_FLUSH_REMOTE or BOSS_DOCS_FLUSH_NO_PUSH=1): {e}"
+            ));
+        }
     }
 
     let sha = run_git_capture(root, &["rev-parse", "HEAD"])?;
