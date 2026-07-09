@@ -245,10 +245,19 @@ async fn upsert_invoice(
         .await
         .map_err(|e| RebuildError::Storage(e.to_string()))?;
     for line in &inv.line_items {
+        // Every column the live insert writes (postgres.rs
+        // create_invoice_at) replays here — this list drifting behind
+        // the live one silently nulled sku/qty/cost on every rebuild,
+        // the same two-hand-written-column-lists trap the inventory
+        // rebuilder documents. sku + qty matter operationally: the
+        // products-consume-on-invoice-created rule reads them from the
+        // EVENT (unaffected), but the projection is what operators and
+        // margin views read back.
         sqlx::query(
             "INSERT INTO invoice_line_items \
-                (id, invoice_id, revenue_category, amount_cents, currency, description, ref_id, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                (id, invoice_id, revenue_category, amount_cents, currency, description, ref_id, \
+                 sku, qty, cost_basis_cents, cost_total_cents, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(&line.id)
         .bind(&inv.id)
@@ -257,6 +266,10 @@ async fn upsert_invoice(
         .bind(&line.currency)
         .bind(&line.description)
         .bind(&line.ref_id)
+        .bind(&line.sku)
+        .bind(line.qty)
+        .bind(line.cost_basis_cents)
+        .bind(line.cost_total_cents)
         .bind(ts)
         .execute(&mut **tx)
         .await
