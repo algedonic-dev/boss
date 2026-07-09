@@ -87,16 +87,25 @@ jobs:
             -e PGHOST=127.0.0.1 -e PGUSER=boss -e PGPASSWORD=boss -e PGDATABASE=boss \
             postgres bash /tmp/ord.sh
 
-      - name: Report dispatcher dead-letters (informational)
-        if: always()
-        # Informational, not a gate: a short window can show transient
-        # dead-letters (e.g. an invoice billed before production catches
-        # up on FG stock) that a full regen clears. Surfaced so a
-        # regression in the count is visible in the log.
+      - name: Gate on dispatcher dead-letters
+        # A GATE since 2026-07-09 — the informational version let a
+        # drain regression (#88: every produce side-effect starving,
+        # 4,491 dead-letters over a full year) ride through CI, because
+        # only the year-scale regen hard-failed on the count. The
+        # tolerance exists for the honest transient: a short smoke
+        # window can dead-letter a handful of events whose convergence
+        # (production catching up to an early invoice) takes longer
+        # than the redelivery budget. A systemic regression fires
+        # hundreds — the threshold separates the two regimes; the
+        # per-line tail below names the culprits when it trips.
         run: |
           n=$(docker compose logs boss-services 2>&1 | grep -c 'DEAD-LETTER' || true)
           echo "dispatcher dead-letters observed: ${n}"
-          docker compose logs boss-services 2>&1 | grep 'DEAD-LETTER' | tail -5 || true
+          docker compose logs boss-services 2>&1 | grep 'DEAD-LETTER' | tail -10 || true
+          if [ "${n:-0}" -gt 20 ]; then
+            echo "::error::${n} dispatcher dead-letters (threshold 20) — a side-effect class is failing systemically, not transiently"
+            exit 1
+          fi
 
       - name: Tear down
         if: always()
