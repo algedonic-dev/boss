@@ -8,8 +8,12 @@ Type=oneshot
 # inside an aborted transaction, and diffs BOTH against the live projection
 # (--deep). Catches live-vs-rebuild fact-payload drift that the entry-level
 # check can't see — the class the shared-projection-shape work eliminated.
-# Read-only: rolls the replay tx back, live state untouched. Exit code 1 →
-# divergence → systemctl is-failed → OnFailure hook fires the alert.
+# Read-only AND lock-free for writers: the replay runs against TEMP
+# shadow clones under snapshot isolation and rolls back — live tables
+# are never locked or written (pre-2026-07-10 the in-tx TRUNCATE held
+# an ACCESS EXCLUSIVE lock for the check's full runtime, stalling
+# every fact write nightly). Exit code 1 → divergence →
+# systemctl is-failed → OnFailure hook fires the alert.
 Environment=RUST_LOG=info
 ExecStart=/usr/local/bin/boss-ledger-replay-check --deep --config /etc/boss-ledger-api.toml
 # Runs as root to match the boss-audit-integrity-check timer pattern. The

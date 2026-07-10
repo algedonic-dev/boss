@@ -103,6 +103,18 @@ pub async fn replay_check_from_audit_log(
         .await
         .map_err(|e| LedgerError::Storage(e.to_string()))?;
 
+    // One consistent snapshot for every read in this tx. With the
+    // shadow tables below, live writers keep writing DURING the check
+    // — under READ COMMITTED a fact committed between the live
+    // snapshot and the audit_log scan would appear in the replay but
+    // not in "live", a false OnlyInReplay divergence. (The old
+    // exclusive TRUNCATE lock froze the world instead; snapshot
+    // isolation is the honest replacement.) Must precede any query.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| LedgerError::Storage(e.to_string()))?;
+
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(REBUILD_LOCK_KEY)
         .execute(&mut *tx)
@@ -118,17 +130,15 @@ pub async fn replay_check_from_audit_log(
     let live_facts = load_facts_for_periods(&mut tx, &open_period_ids).await?;
     let live_entries = load_entries_for_periods(&mut tx, &open_period_ids).await?;
 
-    // `rebuild_facts_in_tx` opens with `TRUNCATE financial_facts
-    // CASCADE`, which wipes `financial_facts`, `gl_journal_entries`,
-    // and `gl_journal_lines` in one statement before re-projecting
-    // from `audit_log`. We must NOT issue our own period-scoped
-    // DELETEs against those tables first: the `gl_journal_lines`
-    // balance check is a `DEFERRABLE INITIALLY DEFERRED` CONSTRAINT
-    // TRIGGER, so a DELETE here queues pending trigger events and
-    // Postgres then refuses the downstream TRUNCATE ("cannot TRUNCATE
-    // … because it has pending trigger events"). Letting the TRUNCATE
-    // do the wiping is both correct and consistent with the plain
-    // `rebuild_facts` path's all-rows semantics.
+    // Shadow the mutable tables — every unqualified reference below
+    // (including `rebuild_facts_in_tx`'s opening `TRUNCATE
+    // financial_facts CASCADE`) now resolves to the session-private
+    // clones, so the live tables are never locked and never written.
+    // The old pending-trigger-events TRUNCATE hazard is gone with the
+    // trigger (LIKE doesn't copy it); the CASCADE degrades to a plain
+    // truncate of the already-empty clone, which is exactly right.
+    create_replay_shadows(&mut tx, true).await?;
+
     let rebuild_report = rebuild_facts_in_tx(&mut tx).await?;
 
     // Now project facts → entries, scoped to open periods (mirrors
@@ -357,11 +367,58 @@ impl ReplayCheckReport {
     }
 }
 
+/// Shadow the mutable ledger tables with session-private TEMP clones
+/// for the rest of the transaction. Postgres resolves unqualified
+/// names through `pg_temp` first, so the ENTIRE existing replay path
+/// (`rebuild_facts_in_tx`, `post_fact_in_tx`, the supersede replay)
+/// writes into the shadows untouched, while reads of reference tables
+/// (audit_log, gl_accounts, gl_periods, gl_fact_projection_rules)
+/// fall through to the live schema. `LIKE … INCLUDING ALL` copies the
+/// PKs, unique keys (the ON CONFLICT targets), defaults and CHECKs —
+/// deliberately NOT the FKs or the deferred balance trigger (LIKE
+/// never copies either): the replay needs no FK enforcement, and
+/// balance is guaranteed by the ruleset's balanced-draft construction
+/// plus the diff itself.
+///
+/// This is what makes the check LOCK-FREE for live writers: before
+/// 2026-07-10 the deep path's `TRUNCATE financial_facts` took an
+/// ACCESS EXCLUSIVE lock on the live table for the check's full
+/// runtime (~2 min at year scale — every fact write stalled behind it
+/// nightly, and a concurrently-running regen hard-failed on a 30s
+/// client timeout), and the entry path's open-period DELETE held row
+/// locks that blocked concurrent journal posts. The temp clones are
+/// dropped with the ROLLBACK.
+async fn create_replay_shadows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    shadow_financial_facts: bool,
+) -> Result<(), LedgerError> {
+    let mut tables = vec!["gl_journal_entries", "gl_journal_lines", "gl_account_daily"];
+    if shadow_financial_facts {
+        tables.insert(0, "financial_facts");
+    }
+    for t in tables {
+        sqlx::query(&format!(
+            "CREATE TEMP TABLE {t} (LIKE public.{t} INCLUDING ALL) ON COMMIT DROP"
+        ))
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| LedgerError::Storage(format!("shadowing {t}: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Run the verifier. Read-only — opens a transaction, replays into it,
 /// compares, then ROLLBACK.
 pub async fn replay_check(pool: &PgPool) -> Result<ReplayCheckReport, LedgerError> {
     let mut tx = pool
         .begin()
+        .await
+        .map_err(|e| LedgerError::Storage(e.to_string()))?;
+
+    // Same snapshot-isolation reasoning as the deep check: shadows let
+    // writers proceed, so the tx must see one consistent moment.
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
         .await
         .map_err(|e| LedgerError::Storage(e.to_string()))?;
 
@@ -379,11 +436,12 @@ pub async fn replay_check(pool: &PgPool) -> Result<ReplayCheckReport, LedgerErro
 
     let live = load_entries_for_periods(&mut tx, &open_period_ids).await?;
 
-    sqlx::query("DELETE FROM gl_journal_entries WHERE period_id = ANY($1)")
-        .bind(&open_period_ids)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| LedgerError::Storage(e.to_string()))?;
+    // Shadow the journal tables (facts stay LIVE — the entry-level
+    // check replays entries FROM live facts). The clones start empty,
+    // which replaces the old open-period DELETE — the row locks it
+    // held on live entries blocked concurrent journal posts for the
+    // check's duration.
+    create_replay_shadows(&mut tx, false).await?;
 
     let fact_rows = sqlx::query(
         "SELECT f.id, f.kind, f.happened_on, f.payload \
