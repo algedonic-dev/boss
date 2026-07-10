@@ -721,10 +721,15 @@ authority_role = "packaging-tech"
 # ~zero per release instead of draining. COGS therefore comes from
 # real purchases + stamped burden, not a percentage-of-price plug.
 # `unit_cost_cents` is only a fallback if the real cost can't be
-# resolved; it matches the ($930 BOM + $203.20 overhead) ÷ 50 cases
-# ≈ $22.66/case the drain derives.
+# resolved; it matches the ($930 brew BOM + $190 case packaging +
+# $203.20 overhead) ÷ 50 cases ≈ $26.46/case the drain derives.
+# The cans consume on THIS step (the produce step's own legs), so
+# the case format finally pays for its cans — before PR 7 the
+# packaging was free and case COGS understated by ~17%.
 metadata_defaults = { batch_id = "", excise_bbl = 4, produces_products = [
-    { sku = "FP-SEASONAL-12OZ-CS", qty = 50, location_id = "loc-brewery-brewhouse", unit_cost_cents = 2266 },
+    { sku = "FP-SEASONAL-12OZ-CS", qty = 50, location_id = "loc-brewery-brewhouse", unit_cost_cents = 2646 },
+], parts_consumed = [
+    { part_sku = "PKG-CAN-12OZ-CS24", qty = 50 },
 ] }
 
 [[job_kind.step]]
@@ -1772,7 +1777,8 @@ authority_role = "brewer"
 metadata_defaults = { mash_temp_f = 150, mash_minutes = 60, ingredients_consumed = [
     { part_sku = "ING-MALT-2ROW-50", qty = 160 },
     { part_sku = "ING-MALT-MUNICH-50", qty = 12 },
-    { part_sku = "ING-HOPS-CASCADE-44", qty = 6 },
+    { part_sku = "ING-HOPS-CASCADE-44", qty = 3 },
+    { part_sku = "ING-HOPS-CITRA-44", qty = 4 },
     { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
 ] }
 
@@ -1963,8 +1969,9 @@ authority_role = "brewer"
 # style's 110-bbl batch, from the packaging-allocate batch_bbl). See
 # the pale-ale mash-in for the full rate derivation.
 metadata_defaults = { mash_temp_f = 154, mash_minutes = 60, ingredients_consumed = [
-    { part_sku = "ING-MALT-2ROW-50", qty = 150 },
-    { part_sku = "ING-MALT-MUNICH-50", qty = 25 },
+    { part_sku = "ING-MALT-2ROW-50", qty = 140 },
+    { part_sku = "ING-MALT-MUNICH-50", qty = 20 },
+    { part_sku = "ING-MALT-ROAST-50", qty = 12 },
     { part_sku = "ING-HOPS-CASCADE-44", qty = 4 },
     { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
 ] }
@@ -2153,9 +2160,9 @@ authority_role = "brewer"
 # style's 133-bbl batch, from the packaging-allocate batch_bbl). See
 # the pale-ale mash-in for the full rate derivation.
 metadata_defaults = { mash_temp_f = 148, mash_minutes = 90, ingredients_consumed = [
-    { part_sku = "ING-MALT-2ROW-50", qty = 160 },
+    { part_sku = "ING-MALT-PILSNER-50", qty = 160 },
     { part_sku = "ING-HOPS-CASCADE-44", qty = 3 },
-    { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
+    { part_sku = "ING-YEAST-LAGER-1L", qty = 6 },
 ] }
 
 [[job_kind.step]]
@@ -2343,9 +2350,10 @@ authority_role = "brewer"
 # style's 107-bbl batch, from the packaging-allocate batch_bbl). See
 # the pale-ale mash-in for the full rate derivation.
 metadata_defaults = { mash_temp_f = 156, mash_minutes = 60, ingredients_consumed = [
-    { part_sku = "ING-MALT-2ROW-50", qty = 130 },
+    { part_sku = "ING-MALT-2ROW-50", qty = 110 },
+    { part_sku = "ING-WHEAT-FLAKED-50", qty = 20 },
     { part_sku = "ING-MALT-MUNICH-50", qty = 15 },
-    { part_sku = "ING-HOPS-CASCADE-44", qty = 8 },
+    { part_sku = "ING-HOPS-CITRA-44", qty = 8 },
     { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
 ] }
 
