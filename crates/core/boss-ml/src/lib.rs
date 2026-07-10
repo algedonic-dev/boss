@@ -10,7 +10,6 @@
 pub mod bootstrap;
 pub mod config;
 #[cfg(feature = "postgres")]
-pub mod generators;
 pub mod http;
 pub mod in_memory;
 pub mod inference;
