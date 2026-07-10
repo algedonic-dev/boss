@@ -150,6 +150,37 @@ SERVICES=(
 for svc in "${SERVICES[@]}"; do
     sudo systemctl stop "$svc" 2>/dev/null || true
 done
+# Quiesce the maintenance timers for the run's duration. The nightly
+# deep replay-check runs its reprojection inside a transaction that
+# TRUNCATEs financial_facts — an ACCESS EXCLUSIVE lock held for the
+# check's full runtime, which stalls every fact write behind it. In
+# steady-state prod that's a ~2-minute window the JetStream NAK layer
+# rides out; mid-regen it times out the sim's synchronous ledger calls
+# and hard-fails the run (2026-07-10: the 03:00 timer killed a year
+# run at sim-day 133 — a 29.99s INSERT wait, a 30s client timeout).
+# The validate pipeline runs its own integrity checks at steps 8-9;
+# the timers resume at the end of this script.
+MAINT_TIMERS=(
+    boss-ledger-replay-check.timer
+    boss-audit-integrity-check.timer
+    boss-conservation-invariants.timer
+    boss-ledger-recognize.timer
+    boss-backup.timer
+    boss-files-gc.timer
+    boss-messages-events-purge.timer
+    boss-ml-inference-batch.timer
+)
+for tmr in "${MAINT_TIMERS[@]}"; do
+    sudo systemctl stop "$tmr" 2>/dev/null || true
+done
+# Resume them on ANY exit — a failed run must not leave the box
+# without its nightly integrity net.
+resume_timers() {
+    for tmr in "${MAINT_TIMERS[@]}"; do
+        sudo systemctl start "$tmr" 2>/dev/null || true
+    done
+}
+trap resume_timers EXIT
 # bootstrap-db.sh without --init does the idempotent drop+recreate
 # (--init mode is the inverse: skip if DB already exists). --no-seed
 # skips the embedded data dump; we'll repopulate via the meta-Job
