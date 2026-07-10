@@ -27,3 +27,9 @@ pub const PRODUCT_PRODUCED: &str = "products.produced";
 /// running cost basis. Symmetric to [`PRODUCT_PRODUCED`] — same
 /// projection-rule mechanism, lands as `finance.cogs.recognized`.
 pub const PRODUCT_CONSUMED: &str = "products.consumed";
+
+/// Manual/atomic inventory value movement — the SAME kind the ledger
+/// movement endpoint emits (same projection rule on rebuild). Emitted
+/// by put_inventory when its atomic FG opening JE actually inserts
+/// the fact (payload verbatim).
+pub const LEDGER_INVENTORY_TRANSFERRED: &str = "ledger.inventory.transferred";

@@ -202,7 +202,8 @@ async fn put_inventory<R: ProductsRepository + 'static>(
                     row.on_hand, row.product_sku
                 );
                 let source_id = format!("opening-fg-{}", row.product_sku);
-                if let Err(e) = state
+                let now = boss_clock_client::now_from(&state.clock).await;
+                match state
                     .products
                     .record_inventory_je(
                         total_cost,
@@ -211,15 +212,33 @@ async fn put_inventory<R: ProductsRepository + 'static>(
                         &memo,
                         "brewery_seed_opening_balance",
                         &source_id,
-                        boss_clock_client::now_from(&state.clock).await.date_naive(),
+                        now.date_naive(),
                     )
                     .await
                 {
-                    tracing::warn!(
-                        sku = %row.product_sku,
-                        error = %e,
-                        "put_inventory: opening JE post failed (row upserted)"
-                    );
+                    // The fact's WRITER owns its rebuild source: emit
+                    // the in-tx payload verbatim, only when THIS call
+                    // inserted it (see the inventory batch-upsert twin
+                    // for the 2026-07-09 regression this closes).
+                    Ok(je) => {
+                        if je.inserted
+                            && let Some(pub_) = &state.publisher
+                        {
+                            pub_.emit_at(
+                                crate::events::LEDGER_INVENTORY_TRANSFERRED,
+                                je.payload,
+                                now,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            sku = %row.product_sku,
+                            error = %e,
+                            "put_inventory: opening JE post failed (row upserted)"
+                        );
+                    }
                 }
             }
             Json(row).into_response()

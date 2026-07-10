@@ -133,11 +133,27 @@ pub fn project_event(
         None => event_source.to_string(),
     };
 
+    // Payload-authoritative source_table. The ledger movement
+    // endpoints fold the caller's source_table INTO the payload
+    // precisely so rebuild can reproduce the original provenance tag
+    // (the 40-ledger.sql rule comments have claimed this since #51) —
+    // but until 2026-07-09 the code always took the rule's fixed
+    // value, so a live 'brewery_seed_opening_balance' fact rebuilt as
+    // 'manual_inventory_transferred': a different natural key, a
+    // different deterministic fact id, a live-vs-replay divergence on
+    // every fresh (never-rebuilt) deployment. Events that don't carry
+    // the key (produce/consume/absorb/invoice) fall back to the rule.
+    let source_table = event_payload
+        .get("source_table")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| rule.source_table.clone());
+
     Ok(ProjectedFact {
         fact_kind: rule.fact_kind.clone(),
         happened_on,
         payload: strip_envelope(event_payload),
-        source_table: rule.source_table.clone(),
+        source_table,
         source_id,
         created_by,
     })
@@ -209,10 +225,11 @@ pub async fn rebuild_facts_in_tx(
     // trace back to an event. The gl_journal_entries FK references
     // financial_facts.id so the CASCADE drops the JE rows in the
     // same step (the ledger-journal rebuild step in rebuild-all
-    // re-projects them right after). Opening balances are emitted
-    // as `seed.opening_balance.recorded` audit events at seed time
-    // so they survive the truncate via re-projection, NOT via
-    // source_table-scoped exclusion.
+    // re-projects them right after). Opening balances survive the
+    // truncate the same way everything else does: the endpoint or
+    // in-process writer that records the fact emits the matching
+    // `ledger.inventory.transferred` event, and this replay
+    // re-projects it — never via source_table-scoped exclusion.
     sqlx::query("TRUNCATE financial_facts CASCADE")
         .execute(&mut **tx)
         .await
@@ -462,6 +479,35 @@ mod tests {
         assert_eq!(projected.happened_on.to_string(), "2026-04-01");
         assert_eq!(projected.created_by, "commerce");
         assert_eq!(projected.payload, payload);
+    }
+
+    #[test]
+    fn payload_source_table_overrides_the_rule_fixed_value() {
+        // The ledger movement endpoints (and the atomic opening-JE
+        // writers) fold the caller\'s source_table into the payload so
+        // rebuild reproduces the original provenance tag. Before
+        // 2026-07-09 the rule\'s fixed value always won: a live
+        // \'brewery_seed_opening_balance\' fact rebuilt as
+        // \'manual_inventory_transferred\' — a different natural key and
+        // deterministic fact id, i.e. a live-vs-replay divergence on
+        // any never-rebuilt deployment.
+        let r = rule(
+            "ledger.inventory.transferred",
+            "finance.inventory.transferred",
+        );
+        let ts: DateTime<Utc> = "2025-04-01T00:00:00Z".parse().unwrap();
+        let payload = serde_json::json!({
+            "id": "opening-raw-ING-MALT-2ROW-50",
+            "issued_on": "2025-04-01",
+            "source_table": "brewery_seed_opening_balance",
+            "total_cost_cents": 490_000,
+        });
+        let projected = project_event(&r, ts, "inventory", &payload).unwrap();
+        assert_eq!(projected.source_table, "brewery_seed_opening_balance");
+        // Events that don\'t carry the key keep the rule\'s value.
+        let bare = serde_json::json!({ "id": "x-1", "issued_on": "2025-04-01" });
+        let projected = project_event(&r, ts, "inventory", &bare).unwrap();
+        assert_eq!(projected.source_table, "invoices");
     }
 
     #[test]
