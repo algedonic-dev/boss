@@ -81,9 +81,18 @@ first-contact fixes (#74). Sorted by dependency, not size.
       CRUD surfaces (vendors/contacts/accounts-team) emit per client
       call and sit outside the NAK-redelivery path — revisit only if
       client retries show up in the log.
-- [ ] **Costing PR 7 — BOM expansion** where defensible: water, real
-      packaging materials (cans/lids/labels), ingredient variety only
-      where the inputs can be sourced. Incomplete > wrong.
+- [x] **Costing PR 7 — BOM expansion** — done where defensible:
+      per-style ingredient variety (pilsner base + lager yeast for the
+      lager; roasted barley for the stout; flaked wheat + Citra for
+      the hazy; Cascade/Citra split for the IPA — six new sourceable
+      SKUs at 2025 wholesale) and real case packaging
+      (PKG-CAN-12OZ-CS24, ~$3.80/case bundle — the 12oz format's cans
+      were free before, understating its COGS ~17%). Water is
+      DELIBERATELY not a part: it is already costed inside the 6300
+      process-utilities absorption driver, so a water BOM line would
+      double-count (documented in parts.toml). Everything flows
+      through drain-actual-wip automatically — no stamped amounts
+      anywhere (per #77).
 
 ## Open questions — back-compat cleanup
 
