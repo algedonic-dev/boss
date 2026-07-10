@@ -48,6 +48,13 @@
 # Recognize at consumption time via PartsConsumeEmitter →
 # finance.cogs.recognized → DR 5100 / CR 1300. Labor + overhead
 # stay in 6xxx OPEX; ingredient COGS is only ingredients.
+#
+# Deliberately NOT a part: brewing water. It is already costed —
+# the 6300 process-utilities absorption driver ($5.60/bbl) is
+# derived as "variable energy + brewing water" (see the pale-ale
+# mash-in derivation), so a water BOM line would double-count the
+# same cost into 1310. Metered utilities absorb; discrete goods
+# consume. Incomplete > wrong, and double-counted is wrong.
 
 [[parts]]
 part_sku = "ING-MALT-2ROW-50"
@@ -98,6 +105,85 @@ allocated = 0
 reorder_point = 750
 reorder_qty = 1000
 trailing_90d_usage = 1000
+avg_cost_cents = 1500
+vendor_price_cents = 1500
+
+[[parts]]
+# Pilsner malt — the lager's base grain (swapped for 2-row, not
+# stacked on it). Continental pilsner ~$28/50-lb sack (2025).
+# Lager-only draw (~160 sacks/brew, ~1 gated brew slot): usage
+# scales like Munich × 1.6.
+part_sku = "ING-MALT-PILSNER-50"
+vendor_category = "grain-supplier"
+bin = "D-01-03"
+on_hand = 4800
+allocated = 0
+# 2600 lead-time cover + ~2wk safety (4400 × 14/90 ≈ 680) = 3300.
+reorder_point = 3300
+reorder_qty = 4400
+trailing_90d_usage = 4400
+avg_cost_cents = 2800
+vendor_price_cents = 2800
+
+[[parts]]
+# Roasted barley — the stout's color/roast charge. Specialty dark
+# malt ~$38/50-lb sack. Stout-only, ~12 sacks/brew.
+part_sku = "ING-MALT-ROAST-50"
+vendor_category = "grain-supplier"
+bin = "D-01-04"
+on_hand = 500
+allocated = 0
+# 270 lead-time cover + ~2wk safety (450 × 14/90 = 70) = 340.
+reorder_point = 340
+reorder_qty = 450
+trailing_90d_usage = 450
+avg_cost_cents = 3800
+vendor_price_cents = 3800
+
+[[parts]]
+# Flaked wheat — the hazy's body/haze grain. ~$32/50-lb sack.
+# Hazy-only, ~20 sacks/brew.
+part_sku = "ING-WHEAT-FLAKED-50"
+vendor_category = "grain-supplier"
+bin = "D-01-05"
+on_hand = 650
+allocated = 0
+# 330 lead-time cover + ~2wk safety (550 × 14/90 ≈ 90) = 420.
+reorder_point = 420
+reorder_qty = 550
+trailing_90d_usage = 550
+avg_cost_cents = 3200
+vendor_price_cents = 3200
+
+[[parts]]
+# Citra pellets — the modern-IPA/hazy hop. Premium aroma variety,
+# ~$420/44-lb box (vs Cascade's $300). Draws from the hazy (whole
+# charge) + the IPA (split charge alongside Cascade).
+part_sku = "ING-HOPS-CITRA-44"
+vendor_category = "hops-supplier"
+bin = "B-02-02"
+on_hand = 1000
+allocated = 0
+# 540 lead-time cover + ~2wk safety (900 × 14/90 = 140) = 680 → 700.
+reorder_point = 700
+reorder_qty = 900
+trailing_90d_usage = 900
+avg_cost_cents = 42000
+vendor_price_cents = 42000
+
+[[parts]]
+# Lager yeast (34/70-style) — cold-fermenting strain the lager
+# actually needs; the California ale strain stays on everything
+# else. Same 1L pitch price point.
+part_sku = "ING-YEAST-LAGER-1L"
+vendor_category = "yeast-bank"
+bin = "A-03-02"
+on_hand = 200
+allocated = 0
+# 100 lead-time cover + ~2wk safety (160 × 14/90 ≈ 25) = 125 → 130.
+reorder_point = 130
+reorder_qty = 170
+trailing_90d_usage = 160
 avg_cost_cents = 1500
 vendor_price_cents = 1500
 
@@ -155,6 +241,25 @@ reorder_qty = 34200
 trailing_90d_usage = 34200
 avg_cost_cents = 120
 vendor_price_cents = 120
+
+[[parts]]
+# Case packaging bundle for the 12oz retail format: 24 cans + lids
+# + PakTech carrier + label set, ~$3.80/case at 2025 wholesale
+# (~$0.11/can + $0.55 carrier + labels). Before this SKU the
+# seasonal case format consumed only CO2 — the cans were free and
+# its COGS understated by ~17%. Seasonal-only today (~4 releases/yr
+# × 50 cases), so the buffer is small.
+part_sku = "PKG-CAN-12OZ-CS24"
+vendor_category = "packaging"
+bin = "E-03-01"
+on_hand = 150
+allocated = 0
+# 40 lead-time cover + ~2wk safety (60 × 14/90 ≈ 10) = 50.
+reorder_point = 50
+reorder_qty = 120
+trailing_90d_usage = 60
+avg_cost_cents = 380
+vendor_price_cents = 380
 
 # ---------------------------------------------------------------------------
 
