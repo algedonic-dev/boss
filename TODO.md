@@ -100,12 +100,15 @@ The pre-release back-compat audit found vestigial code preserving
 compatibility with implementations that no longer exist after the
 public cut. Each removal needs a small decision before landing.
 
-- [ ] **BC2: `StepStatus` `parse_step_status` fallback.** The serde
-      `alias = "pending"/"done"/"waived"` attributes are already
-      removed; what remains is the `parse_step_status` fallback in
-      `boss-jobs/src/postgres.rs` (+ any SPA helpers). **Question:**
-      confirm no DB row / fixture still relies on the fallback arms,
-      then collapse to the canonical parse.
+- [x] **BC2: `StepStatus` `parse_step_status` fallback** — collapsed
+      2026-07-10. Confirmed: the alias arms were already gone, the
+      live DB carries only the five canonical values, zero
+      done/waived rows exist, the schema CHECK pins the column to the
+      vocabulary, and no SPA helper maps legacy statuses. What
+      remained was a silent `_ => Pending` catch-all — a storage-
+      corruption masker (garbage rows reanimated as pending steps).
+      Now strict: `Option` + a Storage error naming the offending
+      value, threaded through the row mappers.
 
 - [ ] **BC20: `account_risk_scores` legacy module.** ~600 LoC
       across `boss-accounts/src/account_risk_scores.rs` +
