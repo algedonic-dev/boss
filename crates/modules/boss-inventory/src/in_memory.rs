@@ -6,8 +6,8 @@ use std::sync::RwLock;
 
 use crate::port::{InventoryError, InventoryRepository};
 use crate::types::{
-    ApAging, ApAgingBucket, ConsumeApplied, InventoryItem, PurchaseOrder, ReceiveApplied, Vendor,
-    VendorInvoice, VendorInvoiceStatus,
+    ApAging, ApAgingBucket, ConsumeApplied, InventoryItem, JeRecorded, PurchaseOrder,
+    ReceiveApplied, Vendor, VendorInvoice, VendorInvoiceStatus,
 };
 
 pub struct InMemoryInventory {
@@ -122,8 +122,12 @@ impl InventoryRepository for InMemoryInventory {
         _source_table: &str,
         _source_id: &str,
         _happened_on: chrono::NaiveDate,
-    ) -> Result<uuid::Uuid, InventoryError> {
-        Ok(uuid::Uuid::new_v4())
+    ) -> Result<JeRecorded, InventoryError> {
+        Ok(JeRecorded {
+            fact_id: uuid::Uuid::new_v4(),
+            inserted: true,
+            payload: serde_json::Value::Null,
+        })
     }
 
     async fn record_overhead_absorbed(

@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::port::{GlMove, InventoryDeltaResult, ProductsError, ProductsRepository};
-use crate::types::{Product, ProductInventory};
+use crate::types::{JeRecorded, Product, ProductInventory};
 
 pub struct PgProducts {
     pool: PgPool,
@@ -122,7 +122,7 @@ impl ProductsRepository for PgProducts {
         source_table: &str,
         source_id: &str,
         happened_on: chrono::NaiveDate,
-    ) -> Result<uuid::Uuid, ProductsError> {
+    ) -> Result<JeRecorded, ProductsError> {
         if total_cost_cents <= 0 {
             return Err(ProductsError::Invalid(
                 "total_cost_cents must be positive".to_string(),
@@ -134,16 +134,20 @@ impl ProductsRepository for PgProducts {
             .await
             .map_err(|e| ProductsError::Storage(e.to_string()))?;
 
+        // source_table folded in like the ledger movement endpoints do:
+        // the emitted event must let rebuild reproduce the original
+        // provenance tag (payload-authoritative source_table).
         let payload = serde_json::json!({
             "total_cost_cents": total_cost_cents,
             "debit_account": debit_account,
             "credit_account": credit_account,
             "memo": memo,
             "happened_on": happened_on.to_string(),
+            "source_table": source_table,
             "source_id": source_id,
         });
 
-        insert_fact(
+        let inserted = insert_fact(
             &mut tx,
             "finance.inventory.transferred",
             happened_on,
@@ -172,7 +176,11 @@ impl ProductsRepository for PgProducts {
         tx.commit()
             .await
             .map_err(|e| ProductsError::Storage(e.to_string()))?;
-        Ok(fact_id)
+        Ok(JeRecorded {
+            fact_id,
+            inserted,
+            payload,
+        })
     }
 
     async fn produce(
@@ -523,8 +531,8 @@ async fn insert_fact(
     payload: &serde_json::Value,
     source_table: &str,
     source_id: &str,
-) -> Result<(), ProductsError> {
-    sqlx::query(
+) -> Result<bool, ProductsError> {
+    let result = sqlx::query(
         "INSERT INTO financial_facts \
             (id, kind, happened_on, payload, source_table, source_id, created_by) \
          VALUES ($1, $2, $3, $4, $5, $6, 'products') \
@@ -564,7 +572,7 @@ async fn insert_fact(
     boss_ledger::post_fact_in_tx(tx, &fact_ref)
         .await
         .map_err(|e| ProductsError::Storage(format!("ledger post failed: {e}")))?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 #[derive(sqlx::FromRow)]

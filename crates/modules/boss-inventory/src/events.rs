@@ -137,3 +137,10 @@ pub const VENDOR_TEAM_UNASSIGNED: &str = "inventory.vendor_team.unassigned";
 /// Vendor contract upserted (draft / active / terminated lifecycle).
 /// Payload: full `VendorContract` row state.
 pub const VENDOR_CONTRACT_UPSERTED: &str = "inventory.vendor_contract.upserted";
+
+/// Manual/atomic inventory value movement — the SAME kind the ledger
+/// movement endpoint emits, because it re-projects through the SAME
+/// `gl_fact_projection_rules` row. Emitted by the batch-upsert
+/// handler when its atomic opening JE actually inserts the fact
+/// (payload verbatim; payload-authoritative source_table on rebuild).
+pub const LEDGER_INVENTORY_TRANSFERRED: &str = "ledger.inventory.transferred";

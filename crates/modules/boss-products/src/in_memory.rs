@@ -74,8 +74,12 @@ impl ProductsRepository for InMemoryProducts {
         _source_table: &str,
         _source_id: &str,
         _happened_on: chrono::NaiveDate,
-    ) -> Result<uuid::Uuid, ProductsError> {
-        Ok(uuid::Uuid::new_v4())
+    ) -> Result<crate::types::JeRecorded, ProductsError> {
+        Ok(crate::types::JeRecorded {
+            fact_id: uuid::Uuid::new_v4(),
+            inserted: true,
+            payload: serde_json::Value::Null,
+        })
     }
 
     async fn produce(

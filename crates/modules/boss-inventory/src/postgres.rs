@@ -459,7 +459,7 @@ impl InventoryRepository for PgInventory {
         source_table: &str,
         source_id: &str,
         happened_on: chrono::NaiveDate,
-    ) -> Result<uuid::Uuid, InventoryError> {
+    ) -> Result<JeRecorded, InventoryError> {
         if total_cost_cents <= 0 {
             return Err(InventoryError::Storage(
                 "total_cost_cents must be positive".to_string(),
@@ -471,16 +471,20 @@ impl InventoryRepository for PgInventory {
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
 
+        // source_table folded in like the ledger movement endpoints do:
+        // the emitted event must let rebuild reproduce the original
+        // provenance tag (payload-authoritative source_table).
         let payload = serde_json::json!({
             "total_cost_cents": total_cost_cents,
             "debit_account": debit_account,
             "credit_account": credit_account,
             "memo": memo,
-            "happened_on": happened_on,
+            "happened_on": happened_on.to_string(),
+            "source_table": source_table,
             "source_id": source_id,
         });
 
-        insert_fact(
+        let inserted = insert_fact(
             &mut tx,
             "finance.inventory.transferred",
             happened_on,
@@ -514,7 +518,11 @@ impl InventoryRepository for PgInventory {
         tx.commit()
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
-        Ok(fact_id)
+        Ok(JeRecorded {
+            fact_id,
+            inserted,
+            payload,
+        })
     }
 
     async fn receive_part_at(

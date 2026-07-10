@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::types::{
-    ApAging, ConsumeApplied, InventoryItem, PurchaseOrder, ReceiveApplied, Vendor, VendorInvoice,
+    ApAging, ConsumeApplied, InventoryItem, JeRecorded, PurchaseOrder, ReceiveApplied, Vendor,
+    VendorInvoice,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -148,7 +149,7 @@ pub trait InventoryRepository: Send + Sync {
         source_table: &str,
         source_id: &str,
         happened_on: NaiveDate,
-    ) -> Result<uuid::Uuid, InventoryError>;
+    ) -> Result<JeRecorded, InventoryError>;
     /// Receive a part — increments `on_hand` by `qty`. Used by
     /// the `receiving` StepType's side effect when a goods-receipt
     /// step completes against a PO. Returns the post-receive row

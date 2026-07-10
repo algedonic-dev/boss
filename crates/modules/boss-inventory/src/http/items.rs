@@ -313,7 +313,7 @@ pub(super) async fn batch_upsert_items<R: InventoryRepository + 'static>(
                 item.on_hand, item.part_sku
             );
             let source_id = format!("opening-raw-{}", item.part_sku);
-            if let Err(e) = state
+            match state
                 .inventory
                 .record_inventory_je(
                     total_cost,
@@ -326,13 +326,33 @@ pub(super) async fn batch_upsert_items<R: InventoryRepository + 'static>(
                 )
                 .await
             {
-                tracing::warn!(
-                    sku = %item.part_sku,
-                    error = %e,
-                    "batch_upsert: opening JE post failed (row upserted)"
-                );
-            } else {
-                opening_jes += 1;
+                Ok(je) => {
+                    opening_jes += 1;
+                    // The fact's WRITER owns its rebuild source: emit
+                    // the in-tx payload verbatim, only when THIS call
+                    // inserted it. (2026-07-09 regression: the seed's
+                    // second, conflicting writer owned this emit, and
+                    // #86's inserted-gating correctly muted it — every
+                    // opening then vanished on rebuild.)
+                    if je.inserted
+                        && let Some(pub_) = &state.publisher
+                    {
+                        pub_.emit_with_actor_at(
+                            crate::events::LEDGER_INVENTORY_TRANSFERRED,
+                            actor.clone(),
+                            je.payload,
+                            now,
+                        )
+                        .await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        sku = %item.part_sku,
+                        error = %e,
+                        "batch_upsert: opening JE post failed (row upserted)"
+                    );
+                }
             }
         }
         inserted += 1;
