@@ -144,15 +144,16 @@ public cut. Each removal needs a small decision before landing.
 
 ---
 
-- [ ] **Deep replay-check write-stall window.** The nightly
-      `boss-ledger-replay-check --deep` reprojects inside a transaction
-      that `TRUNCATE financial_facts` — an ACCESS EXCLUSIVE lock held
-      for the check's full runtime (~2 min on a year-scale DB). Every
-      fact write stalls behind it; the JetStream NAK layer rides it out
-      in prod, but writers see 30s+ latencies nightly, and a regen
-      running concurrently hard-fails (2026-07-10; validate now
-      quiesces the timers for its duration). Fix shape: replay into a
-      scratch schema/table and diff, instead of locking the live one.
+- [x] **Deep replay-check write-stall window** — fixed: both replay
+      checks now shadow the mutable ledger tables with TEMP clones
+      (`pg_temp` name resolution carries the whole existing replay
+      path unchanged) under REPEATABLE READ, so live tables are never
+      locked or written and concurrent writers see one consistent
+      snapshot instead of a frozen world. The entry-level check's
+      open-period DELETE row-locks went with it. Lock-freedom is
+      pinned by a race test (concurrent writer with a 2s statement
+      timeout across both the mechanism and the real deep check).
+      #95's timer quiescence stays as belt-and-braces for regens.
 
 ## Post-release — strategic
 
