@@ -78,7 +78,7 @@ pub trait ProductsRepository: Send + Sync {
         source_table: &str,
         source_id: &str,
         happened_on: chrono::NaiveDate,
-    ) -> Result<uuid::Uuid, ProductsError>;
+    ) -> Result<crate::types::JeRecorded, ProductsError>;
 
     /// Increment on_hand for (sku, location) by `qty`. Inserts the
     /// row if missing (starting from `on_hand = qty`). Used by

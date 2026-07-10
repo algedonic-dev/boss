@@ -68,3 +68,15 @@ pub struct ProductDetail {
     pub inventory: Vec<ProductInventory>,
     pub total_on_hand: i32,
 }
+
+/// Result of an atomic products JE (FG opening balances): the
+/// canonical fact id, whether THIS call inserted it, and the exact
+/// in-tx fact payload — the caller emits the audit event from it
+/// verbatim when `inserted` (the fact's writer owns its rebuild
+/// source; see the inventory twin for the 2026-07-09 regression).
+#[derive(Debug, Clone)]
+pub struct JeRecorded {
+    pub fact_id: uuid::Uuid,
+    pub inserted: bool,
+    pub payload: serde_json::Value,
+}

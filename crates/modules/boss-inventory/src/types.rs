@@ -68,6 +68,20 @@ pub struct ConsumeApplied {
 /// [`ConsumeApplied`]: the HTTP layer emits ITEM_RECEIVED from this
 /// verbatim, so a redelivery appends nothing and the event stays
 /// byte-identical to the fact it rebuilds.
+/// Result of an atomic inventory JE (opening balances etc.): the
+/// canonical fact id, whether THIS call inserted it, and the exact
+/// in-tx fact payload. The writer's HTTP caller emits the
+/// `ledger.inventory.transferred` audit event from `payload` verbatim
+/// when `inserted` — the fact's writer owns its rebuild source (the
+/// 2026-07-09 opening-JE regression: the second, conflicting writer
+/// owned the emit, and gating it on inserted muted the only event).
+#[derive(Debug, Clone)]
+pub struct JeRecorded {
+    pub fact_id: uuid::Uuid,
+    pub inserted: bool,
+    pub payload: serde_json::Value,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReceiveApplied {
     pub item: InventoryItem,

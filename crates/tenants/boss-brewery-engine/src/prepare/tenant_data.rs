@@ -379,7 +379,7 @@ pub fn seed_tenant_data(
     }
 
     if base_reachable(&client, &bases.products, "/api/products/health") {
-        ensure_finished_product_inventory(&client, &bases.products, &bases.ledger, &headers)?;
+        ensure_finished_product_inventory(&client, &bases.products, &headers)?;
     } else {
         info!(base = %bases.products, "products base unreachable — skipping finished-product inventory seed");
     }
@@ -399,13 +399,7 @@ pub fn seed_tenant_data(
     if base_reachable(&client, &bases.inventory, "/api/inventory/health")
         && base_reachable(&client, &bases.ledger, "/api/ledger/health")
     {
-        ensure_raw_inventory_opening_balances(
-            &client,
-            &bases.inventory,
-            &bases.ledger,
-            &headers,
-            seeds_dir,
-        )?;
+        ensure_raw_inventory_opening_balances(&client, &bases.inventory, &headers, seeds_dir)?;
         // Cash opening balance — the brewery doesn't open its
         // doors with $0 in the bank. Without an opening JE,
         // every payroll run + tax payment + vendor settlement
@@ -1741,7 +1735,6 @@ fn ensure_brewhouse_assets(
 fn ensure_finished_product_inventory(
     client: &Client,
     api_base: &str,
-    ledger_base: &str,
     headers: &reqwest::header::HeaderMap,
 ) -> Result<()> {
     // Step 1: ensure the brewery's finished-product catalog exists.
@@ -1882,43 +1875,14 @@ fn ensure_finished_product_inventory(
             "finished-product starter inventory upserted",
         );
 
-        // Step 2b: balance the opening FG asset on the GL. Without
-        // this the FG inventory rows have qty × cost worth of
-        // assets but 1320 reads zero — the balance sheet won't
-        // tie out. The opening-balance JE credits 3000 Retained
-        // Earnings against 1320, modeling "the brewery already
-        // owned these kegs on day 1." Idempotent via the deterministic
-        // source_id; rerunning the seed against an existing DB
-        // collides cleanly on the financial_facts unique key.
-        // The SAME number the row now carries — the JE and physical
-        // can't disagree because they are one derivation.
-        let total_cost_cents = value_cents;
-        let je_url = format!("{ledger_base}/api/ledger/inventory-transferred");
-        let je_body = serde_json::json!({
-            "total_cost_cents": total_cost_cents,
-            "debit_account": "1320",
-            "credit_account": "3000",
-            "memo": format!("Opening balance — {} × {} (FG ← retained earnings)", qty, sku),
-            "source_table": "brewery_seed_opening_balance",
-            "source_id": format!("opening-fg-{}", sku),
-            "created_by": "boss-brewery-data-seed",
-        });
-        let je_resp = client
-            .post(&je_url)
-            .headers(headers.clone())
-            .json(&je_body)
-            .send()
-            .with_context(|| format!("POST {je_url}"))?;
-        let je_status = je_resp.status();
-        if !je_status.is_success() {
-            let body = je_resp.text().unwrap_or_default();
-            anyhow::bail!("POST {je_url} returned {je_status}: {body}");
-        }
-        info!(
-            sku = %sku,
-            total_cost_cents = total_cost_cents,
-            "opening-balance JE posted (DR 1320 FG / CR 3000 Retained Earnings)",
-        );
+        // The opening FG asset's GL leg is owned by the products API:
+        // the PUT above posts the atomic DR 1320 / CR 3000 JE (sized
+        // at exactly the row's conserved value) AND emits the
+        // ledger.inventory.transferred event rebuild re-projects it
+        // from. The explicit second post this seed used to make
+        // conflicted on the same opening-fg-{sku} key and — once
+        // emits were gated on inserted (#86) — muted the only rebuild
+        // source. One writer owns the fact and its event.
     }
     Ok(())
 }
@@ -1933,17 +1897,15 @@ fn ensure_finished_product_inventory(
 ///      `on_hand` + reorder points exist. WITHOUT THIS every brew's
 ///      `production-consume` defers forever on short-ingredients and the
 ///      brewery never brews — the live-from-empty demo's production stall.
-///   2. GL: one DR 1300 / CR 3000 opening JE per part to
-///      `/api/ledger/inventory-transferred` so 1300 doesn't walk
-///      net-negative on the first consume. Idempotent `source_id`
-///      `opening-raw-{sku}` collides cleanly on re-seed.
+///   2. GL: the batch endpoint itself posts the atomic DR 1300 /
+///      CR 3000 opening JE per part and emits its rebuild event —
+///      idempotent on `opening-raw-{sku}`, one writer.
 ///
 /// Consolidated here from the offline engine's `seed_parts` so ONE seed
 /// path owns raw materials for both the live demo and the CI regen.
 fn ensure_raw_inventory_opening_balances(
     client: &Client,
     inventory_base: &str,
-    ledger_base: &str,
     headers: &reqwest::header::HeaderMap,
     seeds_dir: &std::path::Path,
 ) -> Result<()> {
@@ -1973,50 +1935,14 @@ fn ensure_raw_inventory_opening_balances(
         "seeded physical raw inventory (on_hand + reorder points)"
     );
 
-    // 2. GL opening balance per part (DR 1300 / CR 3000).
-    let je_url = format!("{ledger_base}/api/ledger/inventory-transferred");
-    let mut posted = 0u64;
-    for part in &parts {
-        // The exact conserved value load_parts derived — the JE and the
-        // row can't disagree because they are the same number.
-        let total_cost_cents = part.value_cents;
-        if total_cost_cents <= 0 {
-            continue;
-        }
-        let body = serde_json::json!({
-            "total_cost_cents": total_cost_cents,
-            "debit_account": "1300",
-            "credit_account": "3000",
-            "memo": format!(
-                "Opening balance — {} × {} (raw materials ← retained earnings)",
-                part.on_hand, part.part_sku
-            ),
-            "source_table": "brewery_seed_opening_balance",
-            "source_id": format!("opening-raw-{}", part.part_sku),
-            "created_by": "boss-brewery-data-seed",
-        });
-        let resp = client
-            .post(&je_url)
-            .headers(headers.clone())
-            .json(&body)
-            .send()
-            .with_context(|| format!("POST {je_url}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().unwrap_or_default();
-            anyhow::bail!("POST {je_url} returned {status}: {body}");
-        }
-        info!(
-            sku = %part.part_sku,
-            total_cost_cents = total_cost_cents,
-            "raw opening-balance JE posted (DR 1300 / CR 3000 Retained Earnings)",
-        );
-        posted += 1;
-    }
-    info!(
-        raw_opening_jes_posted = posted,
-        "raw-material opening-balance JEs complete"
-    );
+    // The raw opening-balance GL legs are owned by the inventory API:
+    // the batch upsert above posts one atomic DR 1300 / CR 3000 JE per
+    // part (sized at exactly the row's conserved value_cents) AND
+    // emits the ledger.inventory.transferred event rebuild re-projects
+    // each from. The explicit per-part second post this seed used to
+    // make conflicted on the same opening-raw-{sku} keys and — once
+    // emits were gated on inserted (#86) — muted the only rebuild
+    // source. One writer owns the fact and its event.
     Ok(())
 }
 

@@ -44,7 +44,7 @@ async fn mint_demo_session(mut req: Request<Body>, next: Next, state: &AppState)
     session.role = Some("audit-readonly".to_string());
     let cookie_value = session.encode(&state.session_key);
 
-    let injected = format!("{}={}", session::COOKIE_NAME, &cookie_value);
+    let injected = format!("{}={}", session::COOKIE_NAME, cookie_value);
     let merged_cookie = match req
         .headers()
         .get(header::COOKIE)
