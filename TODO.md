@@ -135,6 +135,16 @@ public cut. Each removal needs a small decision before landing.
 
 ---
 
+- [ ] **Deep replay-check write-stall window.** The nightly
+      `boss-ledger-replay-check --deep` reprojects inside a transaction
+      that `TRUNCATE financial_facts` — an ACCESS EXCLUSIVE lock held
+      for the check's full runtime (~2 min on a year-scale DB). Every
+      fact write stalls behind it; the JetStream NAK layer rides it out
+      in prod, but writers see 30s+ latencies nightly, and a regen
+      running concurrently hard-fails (2026-07-10; validate now
+      quiesces the timers for its duration). Fix shape: replay into a
+      scratch schema/table and diff, instead of locking the live one.
+
 ## Post-release — strategic
 
 Big-shape work pulled out of the launch path on purpose. None of
