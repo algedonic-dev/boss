@@ -51,13 +51,22 @@ pub const MAX_DELIVER: i64 = 8;
 /// the consumer config.
 const ACK_WAIT: Duration = Duration::from_secs(30);
 
-/// Subjects the stream captures. Scoped to exactly the families the
-/// dispatcher durably consumes — the job/step lifecycle plus the inventory
-/// signals its rules react to — so the buffer stays small. Every other
-/// domain event (`ledger.*`, `commerce.*`, …) still flows over core NATS
-/// to its live subscribers; nothing durably consumes those.
+/// Subjects the stream captures. MUST cover every family the rule
+/// registry references: a durable consumer's filter may legally name
+/// subjects the stream doesn't ingest, and the result is zero
+/// deliveries with zero errors — perfectly silent dead air. That is
+/// exactly how 6b's `commerce.invoice.created` rule (the consume that
+/// owns COGS) fired zero times across a full year run while every
+/// gate stayed green (2026-07-10): the filter accepted the topic, the
+/// stream never stored the messages. The
+/// `stream_covers_every_rule_topic` test in boss-dispatcher pins this
+/// list against the shipped rules.toml — and writing that test
+/// immediately surfaced a SECOND casualty: the tax-filing webhook
+/// forward (`ledger.tax_filing_filed`) had been dead air the same
+/// way. Domain families with no rule topic still flow over core NATS
+/// only; the test starts failing the moment a rule consumes one.
 pub fn stream_subjects() -> Vec<String> {
-    ["jobs.>", "step.>", "inventory.>"]
+    ["jobs.>", "step.>", "inventory.>", "commerce.>", "ledger.>"]
         .iter()
         .map(|s| s.to_string())
         .collect()
@@ -135,9 +144,28 @@ pub fn stream_config() -> stream::Config {
 /// Idempotently ensure the [`STREAM_NAME`] stream exists. Safe to call from
 /// every connecting service; the first creates it, the rest no-op.
 pub async fn ensure_stream(ctx: &Context) -> Result<(), DurableError> {
-    ctx.get_or_create_stream(stream_config())
+    let mut stream = ctx
+        .get_or_create_stream(stream_config())
         .await
         .map_err(|e| DurableError::Stream(e.to_string()))?;
+    // get_or_create returns an EXISTING stream verbatim — a deployed
+    // box keeps its old subject list forever unless someone updates
+    // it. That drift is how a code-side subjects change silently
+    // doesn't apply in prod: the consumer filters accept the new
+    // topic, the stream never ingests it. Reconcile on every start.
+    let info = stream
+        .info()
+        .await
+        .map_err(|e| DurableError::Stream(e.to_string()))?;
+    let mut have = info.config.subjects.clone();
+    let mut want = stream_subjects();
+    have.sort();
+    want.sort();
+    if have != want {
+        ctx.update_stream(stream_config())
+            .await
+            .map_err(|e| DurableError::Stream(format!("updating stream subjects: {e}")))?;
+    }
     Ok(())
 }
 
@@ -333,7 +361,10 @@ mod tests {
     fn stream_config_is_a_bounded_file_buffer() {
         let c = stream_config();
         assert_eq!(c.name, "BOSS_EVENTS");
-        assert_eq!(c.subjects, vec!["jobs.>", "step.>", "inventory.>"]);
+        assert_eq!(
+            c.subjects,
+            vec!["jobs.>", "step.>", "inventory.>", "commerce.>", "ledger.>"]
+        );
         assert_eq!(c.retention, stream::RetentionPolicy::Limits);
         assert_eq!(c.storage, stream::StorageType::File);
         assert!(c.max_bytes > 0, "byte cap must bound the buffer");

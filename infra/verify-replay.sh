@@ -136,6 +136,40 @@ if (( STRICT )); then
     check_api_count "brewery vendors"      "http://127.0.0.1:7300/api/inventory/vendors"        "len(d)"               5
     check_api_count "brewery jobs"         "http://127.0.0.1:7900/api/jobs?limit=1"             "d.get('total', 0)"  500
     check_api_count "brewery invoices"     "http://127.0.0.1:7400/api/commerce/invoices?limit=1" "d.get('total', 0)" 100
+
+    # COGS floor + gross-margin sanity band. The 2026-07-10 year run
+    # passed EVERY structural gate (conservation exact, determinism,
+    # deep replay 0/0) with COGS = $0 and GM = 100%: the consume rule's
+    # events weren't captured by the JetStream stream, so the flow was
+    # dead air — no errors, no dead-letters, nothing moved on either
+    # side of any invariant. Conservation cannot see a flow that never
+    # fires; only a magnitude floor can. Floors sit far below the
+    # healthy year (~$2M COGS, ~77% GM) so honest model drift clears
+    # them while a dead flow trips loudly.
+    IS_JSON=$(curl -sf -m 10 -H "x-boss-user: $BOSS_USER"         "http://127.0.0.1:7080/api/ledger/income-statement?from=2025-04-01&to=2026-03-31" 2>/dev/null || echo "")
+    if [[ -z "$IS_JSON" ]]; then
+        fail "income statement unreachable (ledger 7080)"
+    else
+        COGS_CENTS=$(printf '%s' "$IS_JSON" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(sum(r.get('amount_cents',0) for r in d.get('cogs',[])))" 2>/dev/null || echo 0)
+        REV_CENTS=$(printf '%s' "$IS_JSON" | python3 -c "
+import json,sys; print(json.load(sys.stdin).get('total_revenue_cents',0))" 2>/dev/null || echo 0)
+        if (( COGS_CENTS >= 50000000 )); then
+            ok "full-year COGS: \$$((COGS_CENTS / 100)) (>= \$500,000 floor)"
+        else
+            fail "full-year COGS \$$((COGS_CENTS / 100)) below the \$500,000 floor — a COGS flow is dead (recognition rule not firing?)"
+        fi
+        if (( REV_CENTS > 0 )); then
+            GM_PCT=$(( (REV_CENTS - COGS_CENTS) * 100 / REV_CENTS ))
+            if (( GM_PCT >= 40 && GM_PCT <= 95 )); then
+                ok "gross margin ${GM_PCT}% (sanity band 40-95%)"
+            else
+                fail "gross margin ${GM_PCT}% outside the 40-95% sanity band — COGS or revenue flow is broken"
+            fi
+        fi
+    fi
 fi
 
 # ---------------------------------------------------------------------------

@@ -47,3 +47,38 @@ async fn dispatcher_rules_seed_matches_toml() {
          regenerate with `python3 infra/dispatcher/gen-seed.py`"
     );
 }
+
+/// Every rule topic must be CAPTURED by the durable stream, not just
+/// accepted by the consumer filter. A filter naming a subject the
+/// stream doesn't ingest is legal JetStream — and delivers nothing,
+/// silently: the 2026-07-10 year run shipped a rule on
+/// `commerce.invoice.created` whose events were never stored, so the
+/// COGS-owning consume fired zero times while every gate stayed
+/// green. This test is the missing tripwire: add a rule on a new
+/// topic family and the build fails until `stream_subjects()` covers
+/// it.
+#[test]
+fn stream_covers_every_rule_topic() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../infra/dispatcher/rules.toml"
+    );
+    let src = std::fs::read_to_string(path).unwrap();
+    let raw = boss_dispatcher::rules::registry::parse_raw(&src).expect("parse rules.toml");
+    let subjects = boss_nats::durable::stream_subjects();
+    for rule in &raw.rules {
+        // Scheduled rules have no topic — nothing to cover.
+        let Some(topic) = rule.on_event.as_deref() else {
+            continue;
+        };
+        let covered = subjects.iter().any(|s| {
+            let family = s.trim_end_matches('>').trim_end_matches('.');
+            topic == family || topic.starts_with(&format!("{family}."))
+        });
+        assert!(
+            covered,
+            "rule {:?} listens on {topic:?}, which no stream subject captures              ({subjects:?}) — the consumer filter would accept it and deliver              NOTHING, silently; extend boss_nats::durable::stream_subjects()",
+            rule.name
+        );
+    }
+}
