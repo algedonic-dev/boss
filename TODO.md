@@ -110,14 +110,18 @@ public cut. Each removal needs a small decision before landing.
       Now strict: `Option` + a Storage error naming the offending
       value, threaded through the row mappers.
 
-- [ ] **BC20: `account_risk_scores` legacy module.** ~600 LoC
-      across `boss-accounts/src/account_risk_scores.rs` +
-      `boss-ml::generators` churn block. The plugin in
-      `boss-ml-plugins::account_churn_risk_v1` is the canonical
-      post-cutover home. **Question:** confirm the Phase 2 cutover
-      landed (the comment says it did) — if so, delete legacy
-      module + the duplicate ml-generator code + the
-      `/api/people/accounts/risk-scores` route.
+- [x] **BC20: legacy churn-risk duplication** — resolved 2026-07-10,
+      with a corrected finding: `boss-accounts/src/account_risk_scores.rs`
+      is NOT legacy — it is the post-cutover READ endpoint (it serves
+      `/api/people/accounts/risk-scores` straight from `ml_predictions`
+      written by the `account-churn-risk-composite-v1` plugin, and two
+      SPA pages consume it), so module + route STAY. The actual dead
+      duplicate was `boss-ml::generators` + the `boss-ml-generate` bin:
+      a parallel churn/mtbf/win-prob scorer referenced by no timer, no
+      deploy list, and no consumer (the deployed path is
+      boss-ml-inference-batch.timer → infer-batch → plugin registry).
+      Deleted (~500 LoC). The mtbf/win-prob model registry rows stay —
+      declared phase-two catalog candidates, plugin-less by design.
 
 - [ ] **BC-tail: remaining safe-delete items deferred for bulky
       callsite work.** Each is mechanical but touches enough call

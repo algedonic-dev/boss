@@ -4,9 +4,6 @@ description = "ML platform — models + predictions infrastructure (Phase 1 scaf
 version.workspace = true
 edition.workspace = true
 
-[[bin]]
-name = "boss-ml-generate"
-path = "src/bin/boss_ml_generate.rs"
 required-features = ["postgres"]
 
 [features]
