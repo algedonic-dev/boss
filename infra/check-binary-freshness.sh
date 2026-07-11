@@ -59,7 +59,7 @@ crate_for_binary() {
         boss-cli|boss)
             echo "crates/orchestrators/boss-cli"
             ;;
-        boss-ml-api|boss-ml-generate)
+        boss-ml-api)
             echo "crates/orchestrators/boss-ml-api"
             ;;
         boss-auth)
