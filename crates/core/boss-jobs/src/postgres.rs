@@ -110,14 +110,14 @@ fn row_to_job(r: JobRow) -> Job {
     }
 }
 
-fn row_to_step(r: StepRow) -> Step {
-    Step {
+fn row_to_step(r: StepRow) -> Result<Step, JobsError> {
+    Ok(Step {
         id: StepId::from_uuid(r.id),
         job_id: JobId::from_uuid(r.job_id),
         kind: r.kind,
         title: r.title,
         assignee_id: r.assignee_id,
-        status: parse_step_status(&r.status),
+        status: parse_step_status(&r.status).ok_or_else(|| step_status_err(&r.status))?,
         sort_order: r.sort_order,
         blocked_by: r.blocked_by.into_iter().map(StepId::from_uuid).collect(),
         sign_offs_required: serde_json::from_value(r.sign_offs_required).unwrap_or_default(),
@@ -128,7 +128,7 @@ fn row_to_step(r: StepRow) -> Step {
         notes: r.notes,
         step_plugin_version: r.step_plugin_version,
         embedded_job: r.embedded_job.map(JobId::from_uuid),
-    }
+    })
 }
 
 /// Outbound serializer — Subject → `(subject_kind, subject_id)`
@@ -199,15 +199,28 @@ pub(crate) fn priority_str(p: Priority) -> &'static str {
     }
 }
 
-fn parse_step_status(s: &str) -> StepStatus {
+/// Strict inverse of [`step_status_str`] — for DB round-trips, where
+/// the value was written by it and the schema CHECK pins the column
+/// to exactly these five. `None` means storage corruption (or a
+/// schema/enum drift), which callers surface as a Storage error —
+/// the old silent `_ => Pending` catch-all (BC2) quietly reanimated
+/// any garbage row as a pending step.
+fn parse_step_status(s: &str) -> Option<StepStatus> {
     match s {
-        "pending" => StepStatus::Pending,
-        "ready" => StepStatus::Ready,
-        "active" => StepStatus::Active,
-        "completed" => StepStatus::Completed,
-        "skipped" => StepStatus::Skipped,
-        _ => StepStatus::Pending,
+        "pending" => Some(StepStatus::Pending),
+        "ready" => Some(StepStatus::Ready),
+        "active" => Some(StepStatus::Active),
+        "completed" => Some(StepStatus::Completed),
+        "skipped" => Some(StepStatus::Skipped),
+        _ => None,
     }
+}
+
+fn step_status_err(s: &str) -> JobsError {
+    JobsError::Storage(format!(
+        "steps.status holds {s:?} — outside the schema CHECK vocabulary; \
+         storage corruption or a schema/enum drift"
+    ))
 }
 
 pub(crate) fn step_status_str(s: StepStatus) -> &'static str {
@@ -503,7 +516,7 @@ impl JobsRepository for PgJobs {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
-        Ok(row.map(row_to_step))
+        row.map(row_to_step).transpose()
     }
 
     async fn update_step_at(
@@ -589,7 +602,7 @@ impl JobsRepository for PgJobs {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
-        Ok(rows.into_iter().map(row_to_step).collect())
+        rows.into_iter().map(row_to_step).collect()
     }
 
     async fn list_assignments(
@@ -626,17 +639,18 @@ impl JobsRepository for PgJobs {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|r| AssignmentRow {
-                job_id: JobId::from_uuid(r.step.job_id),
-                job_kind: r.job_kind,
-                subject_kind: r.subject_kind,
-                subject_id: r.subject_id,
-                priority: parse_priority(&r.priority),
-                step: row_to_step(r.step),
+        rows.into_iter()
+            .map(|r| {
+                Ok(AssignmentRow {
+                    job_id: JobId::from_uuid(r.step.job_id),
+                    job_kind: r.job_kind,
+                    subject_kind: r.subject_kind,
+                    subject_id: r.subject_id,
+                    priority: parse_priority(&r.priority),
+                    step: row_to_step(r.step)?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     async fn list_assigned_workable(&self, limit: i64) -> Result<Vec<AssignmentRow>, JobsError> {
@@ -662,17 +676,18 @@ impl JobsRepository for PgJobs {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|r| AssignmentRow {
-                job_id: JobId::from_uuid(r.step.job_id),
-                job_kind: r.job_kind,
-                subject_kind: r.subject_kind,
-                subject_id: r.subject_id,
-                priority: parse_priority(&r.priority),
-                step: row_to_step(r.step),
+        rows.into_iter()
+            .map(|r| {
+                Ok(AssignmentRow {
+                    job_id: JobId::from_uuid(r.step.job_id),
+                    job_kind: r.job_kind,
+                    subject_kind: r.subject_kind,
+                    subject_id: r.subject_id,
+                    priority: parse_priority(&r.priority),
+                    step: row_to_step(r.step)?,
+                })
             })
-            .collect())
+            .collect()
     }
 
     async fn count_in_flight_steps_by_kind(&self, step_kind: &str) -> Result<i64, JobsError> {
@@ -857,10 +872,13 @@ impl JobsRepository for PgJobs {
                 .await
                 .map_err(|e| JobsError::Storage(e.to_string()))?;
 
-        Ok(rows
-            .into_iter()
-            .map(|r| (StepId::from_uuid(r.id), parse_step_status(&r.status)))
-            .collect())
+        rows.into_iter()
+            .map(|r| {
+                let status =
+                    parse_step_status(&r.status).ok_or_else(|| step_status_err(&r.status))?;
+                Ok((StepId::from_uuid(r.id), status))
+            })
+            .collect()
     }
 
     async fn sim_clock_state(&self) -> Result<Option<crate::port::SimClockState>, JobsError> {
