@@ -75,13 +75,19 @@ pub trait CommerceRepository: Send + Sync {
     /// net-30-ish delay — never both, never neither.
     async fn mark_invoice_past_due(&self, id: &str) -> Result<(), CommerceError>;
 
-    /// Flip an invoice to `written-off` status. Idempotent — re-running
-    /// against an already-written-off row is a no-op. The receivable
-    /// stops counting toward A/R on the GL via the
-    /// `finance.invoice.written_off` posting rule (DR 6700 / CR 1100).
+    /// Flip an invoice to the terminal `written-off` status and record
+    /// the bad-debt fact (DR 6700 / CR 1100 via the
+    /// `finance.invoice.written_off` posting rule). Returns `true` when
+    /// THIS call performed the flip, `false` when the row was already
+    /// written off — the drive legitimately arrives once per past-due
+    /// copy (the counterparty chain + the system webhook copy), so
+    /// callers gate their event emit on `true` to keep the double
+    /// delivery convergent. Writing off a `paid` invoice is a
+    /// `Conflict`: the paid and past-due counterparty branches are
+    /// mutually exclusive, so that drive means model drift, not a race.
     /// See the brewery `[counterparty.bad-debt-writeoff]` for the
     /// 60-day-after-past-due trigger that drives this in sim.
-    async fn mark_invoice_written_off(&self, id: &str) -> Result<(), CommerceError>;
+    async fn mark_invoice_written_off(&self, id: &str) -> Result<bool, CommerceError>;
 
     /// Aggregated financial summary for the Finance dashboard.
     /// SQL-aggregated server-side so the UI renders correct totals

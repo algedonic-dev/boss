@@ -816,7 +816,9 @@ emit_probability = 0.97
 # the system lacks today; tracked as a POST-RELEASE model-polish feature.
 #
 # Routed in `register_default_event_routes`:
-#   commerce.invoice.written_off → PUT .../write-off (DR 6700 Bad Debt / CR 1100 A/R)
+#   commerce.invoice.written_off → POST .../invoices/write-off/from-past-due
+#   (DR 6700 Bad Debt / CR 1100 A/R; the adapter resolves both drive
+#   shapes and converges the double delivery — see boss-commerce http)
 [counterparty.bad-debt-writeoff]
 actor_kind = "account"
 listens_to = "commerce.invoice.past_due"
