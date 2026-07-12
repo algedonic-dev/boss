@@ -94,8 +94,8 @@ pub fn run_days(
 /// queue drain + the periodic.job_requested fanout) only fire
 /// on the first tick of each sim-day.
 ///
-/// At `ticks_per_day = 1` this is bit-for-bit equivalent to
-/// `run_days_with_handlers` — used as the wrapper above. At
+/// At `ticks_per_day = 1` this is bit-for-bit the day-tick path
+/// — [`run_days`] above is exactly this call. At
 /// `ticks_per_day = 24` a sim-day is split into 24 hourly ticks;
 /// per-day expected Job volume + step completion + subject birth
 /// stay invariant (see `engines::tick::Tick` for the math).
