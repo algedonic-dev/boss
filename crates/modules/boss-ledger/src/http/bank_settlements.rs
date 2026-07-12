@@ -197,23 +197,44 @@ pub(super) async fn create_bank_settlement_from_paid_invoice(
     user: CurrentUser,
     Json(body): Json<FromPaidInvoiceBody>,
 ) -> Response {
-    // Walk through the nested trigger chain to find step_id.
-    // ar-aging's emit carries `trigger = <step.done.billing>`;
-    // bank-ach's emit then carries `trigger = <ar-aging emit>`.
-    // So step_id lives at `trigger.trigger.step_id`.
-    let step_id = body
+    // Two legitimate drive shapes converge here, and the
+    // deterministic `bs-{invoice_id}` below makes their double
+    // delivery idempotent:
+    //
+    // 1. The sim-internal chain: ar-aging's emit carries
+    //    `trigger = <step.done.billing>`; bank-ach's emit then
+    //    carries `trigger = <ar-aging emit>` — step_id lives at
+    //    `trigger.trigger.step_id`.
+    // 2. The system webhook copy: #100 put `commerce.>` into the
+    //    durable stream, which woke the (previously dead-air)
+    //    forward-invoice-paid-to-webhook rule — the counterparty now
+    //    ALSO receives the enriched invoice row itself, whose
+    //    top-level `id` IS the invoice id and which carries no
+    //    trigger lineage. Rejecting that shape 400'd the first
+    //    post-#100 year run at sim-day 37.
+    let invoice_id = if let Some(step_id) = body
         .trigger
         .get("trigger")
         .and_then(|t| t.get("step_id"))
-        .and_then(|v| v.as_str());
-    let Some(step_id) = step_id else {
+        .and_then(|v| v.as_str())
+    {
+        format!("inv-step-{step_id}")
+    } else if let Some(id) = body
+        .trigger
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|id| id.starts_with("inv-"))
+    {
+        id.to_string()
+    } else {
         return (
             StatusCode::BAD_REQUEST,
-            "trigger.trigger.step_id missing".to_string(),
+            "trigger carries neither trigger.step_id (counterparty chain) \
+             nor an inv-* id (invoice-paid webhook copy)"
+                .to_string(),
         )
             .into_response();
     };
-    let invoice_id = format!("inv-step-{step_id}");
 
     // Read account_id / amount_cents / currency from the
     // invoices projection. The commerce-sim-bridge already
