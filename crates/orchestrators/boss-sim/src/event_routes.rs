@@ -166,14 +166,19 @@ pub fn register_default_event_routes(out: &mut LiveApiOutput) {
     );
     // Write-off — brewery's `[counterparty.bad-debt-writeoff]` listens
     // on `commerce.invoice.past_due` and re-fires this topic ~60
-    // business days later. The chained trigger carries the original
-    // past-due payload, which itself wraps the billing-step's
-    // step_id, so the deterministic `inv-step-{step_id}` invoice id
-    // path template resolves the same row.
+    // business days later. Post-#100 the counterparty receives TWO
+    // past-due copies per invoice — ar-aging's sim-internal emission
+    // (step_id buried at `trigger.trigger.step_id`) and the system's
+    // webhook copy (the enriched invoice row, no trigger lineage) —
+    // so a fixed path template can't resolve both drives. The
+    // adapter endpoint resolves either shape (chain step_id →
+    // `inv-step-{id}`; webhook copy → its own `inv-*` id) and
+    // converges the double delivery on the single terminal flip.
+    // Same class as from-paid-invoice (#102).
     out.register_event_route(
         "commerce.invoice.written_off",
-        "/api/commerce/invoices/inv-step-{trigger.trigger.step_id}/write-off",
-        EventHttpMethod::Put,
+        "/api/commerce/invoices/write-off/from-past-due",
+        EventHttpMethod::Post,
     );
     // Tax filings fire as JobKinds (sales-tax-filing,
     // payroll-941-filing, income-tax-filing, excise-tax-filing) whose

@@ -12,9 +12,10 @@
 // to get the envelope, `isCapped` to decide whether to render an
 // overflow banner.
 //
-// Some older endpoints return a bare array. `fetchPaged` normalises
-// both shapes; for the bare-array case `total` falls back to
-// `data.length` and `isCapped` returns false (nothing to surface).
+// The envelope is the only accepted shape. A bare-array response is
+// a contract violation and normalises to an empty page, so the
+// regression shows up as a visibly empty list rather than an
+// unnoticed uncapped one.
 
 export type Paged<T> = Readonly<{
   data: ReadonlyArray<T>;
@@ -35,11 +36,7 @@ export async function fetchPaged<T>(url: string): Promise<Paged<T> | null> {
 }
 
 export function normalise<T>(body: unknown): Paged<T> {
-  if (Array.isArray(body)) {
-    const data = body as T[];
-    return { data, total: data.length, limit: data.length, offset: 0 };
-  }
-  if (body && typeof body === 'object') {
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
     const obj = body as {
       data?: unknown;
       total?: unknown;

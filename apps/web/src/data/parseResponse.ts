@@ -79,9 +79,9 @@ export async function fetchValidated<T>(
 }
 
 /** Validated variant of `fetchPaged` — fetches a list endpoint
- *  that may return either a `{data, total, limit, offset}` envelope
- *  or a bare array, normalises to the envelope, and runs `itemSchema`
- *  against each row.
+ *  returning the `{data, total, limit, offset}` envelope and runs
+ *  `itemSchema` against each row. Any other body shape (including a
+ *  bare array) is a parse failure.
  *
  *  Returns the same `ParseResult` discriminated union as
  *  `fetchValidated`. Use this instead of `fetchPaged` from
@@ -101,24 +101,15 @@ export async function fetchPagedValidated<T>(
   itemSchema: ZodType<T>,
   init?: RequestInit,
 ): Promise<ParseResult<PagedData<T>>> {
-  const envelope = z
-    .object({
-      data: z.array(itemSchema),
-      total: z.number().optional(),
-      limit: z.number().optional(),
-      offset: z.number().optional(),
-    })
-    .or(z.array(itemSchema));
+  const envelope = z.object({
+    data: z.array(itemSchema),
+    total: z.number().optional(),
+    limit: z.number().optional(),
+    offset: z.number().optional(),
+  });
   const result = await fetchValidated(url, envelope, init);
   if (result.kind !== 'ok') return result;
   const body = result.data;
-  if (Array.isArray(body)) {
-    const data = body as T[];
-    return {
-      kind: 'ok',
-      data: { data, total: data.length, limit: data.length, offset: 0 },
-    };
-  }
   return {
     kind: 'ok',
     data: {

@@ -1,6 +1,6 @@
 //! Shape-driven smoke test for the used-device-shop tenant: proves
 //! the `boss-used-device-shop-engine` crate runs the tenant through
-//! `run_days_with_handlers` end-to-end without hitting unknown
+//! `run_days` end-to-end without hitting unknown
 //! kinds, missing subjects, or panics.
 
 use std::path::PathBuf;
