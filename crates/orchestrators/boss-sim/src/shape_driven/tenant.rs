@@ -680,10 +680,18 @@ pub struct SubjectCadence {
 }
 
 impl SubjectCadence {
-    /// True iff this cadence row fires on `today` (day-granularity
-    /// check). [`fires_on_tick`] calls this as its first gate, then
-    /// layers hour-of-day filtering on top.
-    pub fn fires_on(&self, today: chrono::NaiveDate) -> bool {
+    /// True iff this cadence row fires on `today` AND the
+    /// configured hour-of-day falls within `tick`'s window.
+    /// Phase B-2 — sub-day cadence anchoring.
+    ///
+    /// Day-granularity gates run first (weekday match + biweekly
+    /// parity — cheap). At day-tick granularity every
+    /// `time_of_day` lands inside the day's `[0, 24)` window, so
+    /// the hour-check is identity. At hourly ticks the row fires
+    /// once per matching weekday at the right hour.
+    /// `time_of_day = None` (the common case) anchors at midnight
+    /// — the day's first tick.
+    pub fn fires_on_tick(&self, today: chrono::NaiveDate, tick: &crate::engines::Tick) -> bool {
         use chrono::{Datelike, Weekday};
         let want = match self.weekday.to_lowercase().as_str() {
             "mon" | "monday" => Weekday::Mon,
@@ -700,28 +708,12 @@ impl SubjectCadence {
         }
         if let Some(offset) = self.biweekly_offset {
             let week = today.iso_week().week();
-            return week % 2 == offset % 2;
-        }
-        true
-    }
-
-    /// True iff this cadence row fires on `today` AND the
-    /// configured hour-of-day falls within `tick`'s window.
-    /// Phase B-2 — sub-day cadence anchoring.
-    ///
-    /// Day-only check first (cheap). At day-tick granularity
-    /// every `time_of_day` lands inside the day's `[0, 24)`
-    /// window, so the hour-check is identity → bit-for-bit
-    /// equivalent to `fires_on` at day ticks. At hourly ticks
-    /// the row fires once per matching weekday at the right
-    /// hour. Defaults `time_of_day = None` → midnight (tick 0)
-    /// for back-compat with pre-B-2 tenant.tomls.
-    pub fn fires_on_tick(&self, today: chrono::NaiveDate, tick: &crate::engines::Tick) -> bool {
-        if !self.fires_on(today) {
-            return false;
+            if week % 2 != offset % 2 {
+                return false;
+            }
         }
         let target_hour = match self.time_of_day.as_deref() {
-            None => 0.0, // legacy default — fire at midnight tick
+            None => 0.0,
             Some(s) => crate::engines::parse_hh_mm(s).unwrap_or(0.0),
         };
         tick.covers_hour(target_hour)
@@ -1106,6 +1098,7 @@ mod tests {
 
     #[test]
     fn subject_cadence_fires_on_matching_weekday() {
+        use crate::engines::Tick;
         // 2026-01-06 is a Tuesday.
         let tue = NaiveDate::from_ymd_opt(2026, 1, 6).unwrap();
         let mon = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
@@ -1115,12 +1108,13 @@ mod tests {
             biweekly_offset: None,
             time_of_day: None,
         };
-        assert!(c.fires_on(tue));
-        assert!(!c.fires_on(mon));
+        assert!(c.fires_on_tick(tue, &Tick::day()));
+        assert!(!c.fires_on_tick(mon, &Tick::day()));
     }
 
     #[test]
     fn subject_cadence_weekday_is_case_insensitive() {
+        use crate::engines::Tick;
         let tue = NaiveDate::from_ymd_opt(2026, 1, 6).unwrap();
         for label in ["tue", "TUE", "Tuesday", "tuesday", "Tues"] {
             let c = SubjectCadence {
@@ -1129,12 +1123,16 @@ mod tests {
                 biweekly_offset: None,
                 time_of_day: None,
             };
-            assert!(c.fires_on(tue), "{label} should match Tuesday");
+            assert!(
+                c.fires_on_tick(tue, &Tick::day()),
+                "{label} should match Tuesday"
+            );
         }
     }
 
     #[test]
     fn subject_cadence_unknown_weekday_never_fires() {
+        use crate::engines::Tick;
         let any = NaiveDate::from_ymd_opt(2026, 1, 6).unwrap();
         let c = SubjectCadence {
             subject_id: "acc-1".into(),
@@ -1142,11 +1140,12 @@ mod tests {
             biweekly_offset: None,
             time_of_day: None,
         };
-        assert!(!c.fires_on(any));
+        assert!(!c.fires_on_tick(any, &Tick::day()));
     }
 
     #[test]
     fn subject_cadence_biweekly_alternates_weeks() {
+        use crate::engines::Tick;
         // 2026-01-05 is in ISO week 2 (even); 2026-01-12 is week 3 (odd).
         let week_2 = NaiveDate::from_ymd_opt(2026, 1, 5).unwrap();
         let week_3 = NaiveDate::from_ymd_opt(2026, 1, 12).unwrap();
@@ -1162,10 +1161,10 @@ mod tests {
             biweekly_offset: Some(1),
             time_of_day: None,
         };
-        assert!(even.fires_on(week_2));
-        assert!(!even.fires_on(week_3));
-        assert!(!odd.fires_on(week_2));
-        assert!(odd.fires_on(week_3));
+        assert!(even.fires_on_tick(week_2, &Tick::day()));
+        assert!(!even.fires_on_tick(week_3, &Tick::day()));
+        assert!(!odd.fires_on_tick(week_2, &Tick::day()));
+        assert!(odd.fires_on_tick(week_3, &Tick::day()));
     }
 
     /// Phase B-2 — `time_of_day` anchors a cadence row to a

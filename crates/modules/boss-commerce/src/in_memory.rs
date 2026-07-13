@@ -8,6 +8,10 @@ use crate::types::{Invoice, InvoiceSummary, RevenueLine};
 pub struct InMemoryCommerce {
     invoices: Vec<Invoice>,
     revenue: Vec<RevenueLine>,
+    /// Ids flipped by `mark_invoice_written_off` — enough state for
+    /// HTTP tests to exercise the converge-on-double-delivery
+    /// contract (the transactional flip itself is pg-pinned).
+    written_off: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl InMemoryCommerce {
@@ -15,6 +19,7 @@ impl InMemoryCommerce {
         Self {
             invoices,
             revenue: Vec::new(),
+            written_off: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -58,7 +63,19 @@ impl CommerceRepository for InMemoryCommerce {
     }
 
     async fn invoice_by_id(&self, id: &str) -> Result<Option<Invoice>, CommerceError> {
-        Ok(self.invoices.iter().find(|i| i.id == id).cloned())
+        let mut inv = self.invoices.iter().find(|i| i.id == id).cloned();
+        // Overlay the write-off flip so post-flip reads (the event
+        // emit path) see the terminal status, matching pg.
+        if let Some(inv) = inv.as_mut()
+            && self
+                .written_off
+                .lock()
+                .map_err(|e| CommerceError::Storage(format!("written_off lock: {e}")))?
+                .contains(id)
+        {
+            inv.status = crate::types::InvoiceStatus::WRITTEN_OFF.into();
+        }
+        Ok(inv)
     }
 
     async fn create_invoice_at(
@@ -113,11 +130,26 @@ impl CommerceRepository for InMemoryCommerce {
         Ok(())
     }
 
-    async fn mark_invoice_written_off(&self, id: &str) -> Result<(), CommerceError> {
-        if !self.invoices.iter().any(|i| i.id == id) {
+    async fn mark_invoice_written_off(&self, id: &str) -> Result<bool, CommerceError> {
+        use crate::types::InvoiceStatus;
+        let Some(inv) = self.invoices.iter().find(|i| i.id == id) else {
             return Err(CommerceError::NotFound(format!("invoice {id}")));
+        };
+        if inv.status.as_str() == InvoiceStatus::PAID {
+            return Err(CommerceError::Conflict(format!(
+                "invoice {id} is 'paid': only outstanding or past-due \
+                 invoices write off"
+            )));
         }
-        Ok(())
+        let mut flipped = self
+            .written_off
+            .lock()
+            .map_err(|e| CommerceError::Storage(format!("written_off lock: {e}")))?;
+        if inv.status.as_str() == InvoiceStatus::WRITTEN_OFF || flipped.contains(id) {
+            return Ok(false);
+        }
+        flipped.insert(id.to_string());
+        Ok(true)
     }
 
     async fn invoice_summary(

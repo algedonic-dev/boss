@@ -434,7 +434,7 @@ impl CommerceRepository for PgCommerce {
         Ok(())
     }
 
-    async fn mark_invoice_written_off(&self, id: &str) -> Result<(), CommerceError> {
+    async fn mark_invoice_written_off(&self, id: &str) -> Result<bool, CommerceError> {
         // Flip to terminal `written-off` AND record the
         // `finance.invoice.written_off` fact that posts DR 6700 Bad Debt
         // Expense / CR 1100 A/R. The fact is written LIVE here — exactly
@@ -450,18 +450,40 @@ impl CommerceRepository for PgCommerce {
         // projection rule's `/issued_on` happened_on path, so the live
         // and rebuilt postings land on the same date and reconcile to
         // the cent.
+        //
+        // The transition gate makes double delivery converge: the
+        // write-off drive arrives once per past-due copy the
+        // counterparty received, and only the copy that wins the
+        // UPDATE writes the fact — the row lock serializes the rest
+        // into the 0-rows branch below.
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| CommerceError::Storage(e.to_string()))?;
-        let updated = sqlx::query("UPDATE invoices SET status = 'written-off' WHERE id = $1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| CommerceError::Storage(e.to_string()))?;
+        let updated = sqlx::query(
+            "UPDATE invoices SET status = 'written-off' \
+             WHERE id = $1 AND status IN ('outstanding', 'past-due')",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CommerceError::Storage(e.to_string()))?;
         if updated.rows_affected() == 0 {
-            return Err(CommerceError::NotFound(format!("invoice {id}")));
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM invoices WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| CommerceError::Storage(e.to_string()))?;
+            return match status.as_deref() {
+                None => Err(CommerceError::NotFound(format!("invoice {id}"))),
+                Some("written-off") => Ok(false),
+                Some(other) => Err(CommerceError::Conflict(format!(
+                    "invoice {id} is '{other}': only outstanding or past-due \
+                     invoices write off"
+                ))),
+            };
         }
         // Fetch the full written-off invoice in-tx so the live fact payload
         // is byte-identical to the commerce.invoice.written_off event the
@@ -498,7 +520,7 @@ impl CommerceRepository for PgCommerce {
         tx.commit()
             .await
             .map_err(|e| CommerceError::Storage(e.to_string()))?;
-        Ok(())
+        Ok(true)
     }
 
     async fn invoice_summary(

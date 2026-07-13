@@ -100,6 +100,10 @@ pub fn router<R: CommerceRepository + 'static>(state: CommerceApiState<R>) -> Ro
             "/api/commerce/invoices/{id}/write-off",
             put(mark_invoice_written_off::<R>),
         )
+        .route(
+            "/api/commerce/invoices/write-off/from-past-due",
+            post(write_off_invoice_from_past_due::<R>),
+        )
         .with_state(shared)
 }
 
@@ -440,6 +444,30 @@ async fn mark_invoice_past_due<R: CommerceRepository + 'static>(
     }
 }
 
+/// Read back the post-flip invoice and emit
+/// `commerce.invoice.written_off` with full row state (rebuild
+/// consumes the payload via `from_value::<Invoice>` to flip the
+/// projection). Callers gate this on the flip actually happening,
+/// so converged double deliveries emit exactly once.
+async fn emit_invoice_written_off<R: CommerceRepository + 'static>(
+    state: &CommerceApiState<R>,
+    actor: boss_core::actor::ActorId,
+    id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    if let Some(pub_) = &state.publisher
+        && let Ok(Some(inv)) = state.commerce.invoice_by_id(id).await
+    {
+        pub_.emit_with_actor_at(
+            crate::events::INVOICE_WRITTEN_OFF,
+            actor,
+            serde_json::to_value(&inv).unwrap_or_default(),
+            now,
+        )
+        .await;
+    }
+}
+
 async fn mark_invoice_written_off<R: CommerceRepository + 'static>(
     State(state): State<Arc<CommerceApiState<R>>>,
     Path(id): Path<String>,
@@ -447,22 +475,81 @@ async fn mark_invoice_written_off<R: CommerceRepository + 'static>(
 ) -> Response {
     let now = boss_clock_client::now_from(&state.clock).await;
     match state.commerce.mark_invoice_written_off(&id).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher
-                && let Ok(Some(inv)) = state.commerce.invoice_by_id(&id).await
-            {
+        Ok(newly) => {
+            if newly {
                 let actor = user
                     .ambient_actor()
                     .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                pub_.emit_with_actor_at(
-                    crate::events::INVOICE_WRITTEN_OFF,
-                    actor,
-                    serde_json::to_value(&inv).unwrap_or_default(),
-                    now,
-                )
-                .await;
+                emit_invoice_written_off(&state, actor, &id, now).await;
             }
             StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => error_response(e),
+    }
+}
+
+/// Adapter for the `[counterparty.bad-debt-writeoff]` drive. The
+/// counterparty fires once per `commerce.invoice.past_due` copy it
+/// receives, and post-#100 there are TWO per invoice: ar-aging's
+/// sim-internal emission (trigger = the `step.done.billing` payload,
+/// so step_id sits at `trigger.trigger.step_id`) and the system's
+/// webhook copy (the enriched invoice row — its own `id`, no trigger
+/// lineage). A path template can resolve only one of those, which is
+/// how the first post-#102 year run hard-failed at sim-day ~119.
+/// Mirrors from-paid-invoice (#102): resolve either shape to the
+/// invoice id, then let the transition-gated flip converge the
+/// double delivery — the event emits only on the actual flip.
+#[derive(Deserialize)]
+struct FromPastDueBody {
+    trigger: serde_json::Value,
+}
+
+async fn write_off_invoice_from_past_due<R: CommerceRepository + 'static>(
+    State(state): State<Arc<CommerceApiState<R>>>,
+    CurrentUser(user): CurrentUser,
+    Json(body): Json<FromPastDueBody>,
+) -> Response {
+    let invoice_id = if let Some(step_id) = body
+        .trigger
+        .get("trigger")
+        .and_then(|t| t.get("step_id"))
+        .and_then(|v| v.as_str())
+    {
+        format!("inv-step-{step_id}")
+    } else if let Some(id) = body
+        .trigger
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|id| id.starts_with("inv-"))
+    {
+        id.to_string()
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "trigger carries neither trigger.step_id (counterparty chain) \
+             nor an inv-* id (invoice-past-due webhook copy)"
+                .to_string(),
+        )
+            .into_response();
+    };
+
+    let now = boss_clock_client::now_from(&state.clock).await;
+    match state.commerce.mark_invoice_written_off(&invoice_id).await {
+        Ok(newly) => {
+            if newly {
+                let actor = user
+                    .ambient_actor()
+                    .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+                emit_invoice_written_off(&state, actor, &invoice_id, now).await;
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "invoice_id": invoice_id,
+                    "written_off": newly,
+                })),
+            )
+                .into_response()
         }
         Err(e) => error_response(e),
     }

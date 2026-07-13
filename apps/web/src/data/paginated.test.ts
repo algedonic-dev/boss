@@ -10,14 +10,15 @@ describe('normalise', () => {
     expect(p.offset).toBe(6);
   });
 
-  it('falls back to data.length for legacy bare-array responses', () => {
+  it('rejects bare arrays — every list endpoint returns the envelope', () => {
+    // A bare-array response is a contract violation; surfacing it as
+    // an empty page makes the regression visible instead of silently
+    // presenting an uncapped list.
     const p = normalise<number>([1, 2, 3]);
-    expect(p.data).toEqual([1, 2, 3]);
-    expect(p.total).toBe(3);
-    expect(p.limit).toBe(3);
+    expect(p).toEqual({ data: [], total: 0, limit: 0, offset: 0 });
   });
 
-  it('treats missing total as data.length so legacy callers do not see fake caps', () => {
+  it('treats missing total as data.length so callers do not see fake caps', () => {
     const p = normalise<number>({ data: [1, 2, 3] });
     expect(p.total).toBe(3);
   });

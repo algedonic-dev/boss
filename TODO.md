@@ -168,39 +168,36 @@ Big-shape work pulled out of the launch path on purpose. None of
 this gates the release; reopen once a real tenant's needs steer
 which one matters first.
 
-- [ ] **Edge-strip hardening for the gateway trust boundary.**
-      `boss-gateway` injects `x-boss-user` when a valid session
-      exists but does not strip a client-supplied one at the edge;
-      backend services trust the header verbatim. The deployment
-      model (gateway is sole ingress; backends bound to `127.0.0.1`
-      or firewalled) is now documented in
-      [SECURITY.md](SECURITY.md) §Deployment trust model. The
-      code-level hardening — unconditionally strip inbound
-      `x-boss-*` at the gateway edge and re-inject only trusted
-      values, plus bind backends to `127.0.0.1` in
-      `infra/deploy-services.sh` and fail-closed on the
-      `change-me` bootstrap-admin default — folds into **Integrated
-      IAM** below, but the edge-strip is worth doing on its own
-      before real auth lands.
+- [x] **Edge-strip hardening for the gateway trust boundary** —
+      done 2026-07-13 for the two code-level pieces: the gateway
+      now unconditionally strips inbound `x-boss-*` at its edge
+      before injecting session-derived identity (strip-then-inject
+      ordering pinned by middleware probe tests), and
+      `infra/deploy-services.sh` emits `http_bind = 127.0.0.1` for
+      every backend. [SECURITY.md](SECURITY.md) §Deployment trust
+      model updated: a front proxy's header stripping is
+      defense-in-depth now, not load-bearing. Deliberately NOT
+      done here: fail-closed on the `change-me` bootstrap-admin
+      default — the public demo baseline signs in with it, so the
+      fail-closed shape (refuse to start? force first-login
+      rotation? demo-mode exemption?) needs a product call; it
+      stays bundled in **Integrated IAM** below.
 
-- [ ] **`boss-rebuild-all --audit-log-seed` pipe deadlock on slow
-      disk.** Surfaced on a bare-metal install test on an
-      HDD-backed VM. The mode shells out `gzip -d -c <bundle>` and
-      reads from gzip's stdout via a pipe; on slow disk the
-      read-loop can't drain the pipe faster than gzip fills it, and
-      the process hangs:
-        - gzip blocked in `anon_pipe_write` (pipe full)
-        - rebuild-all blocked in `wait4(gzip)`
-      SSD-backed deployments (docker quickstart, bare-metal on
-      SSD) drain the pipe fast enough that the deadlock never
-      manifests; we hit it only on HDD-backed VMs.
-      Workaround (proven on the test VM): two-step load —
-      `gunzip -c <bundle> | psql ...` to load audit_log, then
-      `boss-rebuild-all` WITHOUT `--audit-log-seed` to project.
-      Fix shape: rewrite the `--audit-log-seed` reader in
-      rebuild-all/src to drain the pipe in a non-blocking task
-      (tokio::process::Command + AsyncRead) instead of the
-      current blocking pattern.
+- [x] **`boss-rebuild-all --audit-log-seed` pipe deadlock on slow
+      disk** — resolved 2026-07-12, with a corrected finding: the
+      loader in the public tree already streams gunzip→psql (the
+      `wait4(gzip)`-while-pipe-full order the HDD VM hit predates
+      the cut), so the async rewrite the original note proposed
+      would have replaced a sound pattern. What the slow-disk
+      report actually needed: the pump is now extracted and
+      test-pinned (backpressure completes; the reap-only-after-
+      the-read-end-drops order is structural), a psql death
+      mid-load reports its exit status instead of the misleading
+      `broken pipe`, progress logs every 256 MiB so a multi-hour
+      HDD load is distinguishable from a hang, and the non-gz
+      branch's pointless whole-file `read_to_end` (an OOM
+      candidate on multi-GB dumps) is gone. The two-step manual
+      load stays a valid operator workaround on old binaries.
 
 - [ ] **Income statement + cash flow report aggregation
       audits.** The balance-sheet endpoint fix closed one shape of

@@ -50,6 +50,8 @@ path = "src/bin/boss_auth.rs"
 
 [dev-dependencies]
 tempfile = "3"
+# oneshot() for the role-header middleware probe tests.
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true
