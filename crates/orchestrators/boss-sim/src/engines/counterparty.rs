@@ -301,9 +301,19 @@ pub struct QueuedEmission {
 /// queued future emission — AR collections scheduled 30 days out
 /// vanish, vendor invoices queued at delay-snap never fire, and
 /// the brewery's collected-cash projection collapses.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CounterpartyState {
     pub queue: BTreeMap<NaiveDate, Vec<QueuedEmission>>,
+    /// Sim-date the checkpoint was taken on. Epoch fingerprint: the
+    /// demo rewinds its epoch to day one every few wall-hours, and a
+    /// checkpoint stamped in the sim FUTURE was saved by a previous
+    /// epoch — its queue references invoices/accounts the epoch reset
+    /// wiped, so restoring it emits phantom settlements (the
+    /// replay-divergence class, 2026-07-13). `None` = pre-stamp file
+    /// format, same verdict. Warp-agnostic on purpose: wall-clock
+    /// anchors move on warp changes, sim-dates don't.
+    #[serde(default)]
+    pub saved_on: Option<NaiveDate>,
 }
 
 impl CounterpartyState {
@@ -331,6 +341,19 @@ impl CounterpartyState {
 
     pub fn pending_count(&self) -> usize {
         self.queue.values().map(|v| v.len()).sum()
+    }
+
+    /// True when this checkpoint cannot belong to the current epoch:
+    /// stamped after `today` (the sim clock rewound beneath it — an
+    /// epoch restart), or not stamped at all (pre-stamp format, so its
+    /// provenance is unknowable). Callers discard stale checkpoints
+    /// instead of restoring them; the queued emissions reference
+    /// entities the epoch reset wiped. Residual accepted: a checkpoint
+    /// from a previous epoch whose stamp the NEW epoch has already
+    /// re-reached (daemon down for hours at high warp) reads as fresh —
+    /// bounded, and the emissions 404 against the reset projections.
+    pub fn stale_for(&self, today: NaiveDate) -> bool {
+        self.saved_on.is_none_or(|d| d > today)
     }
 
     /// Persist the queue to a JSON file at `path`. Atomic via
@@ -393,6 +416,17 @@ impl CounterpartyEngine {
             state: CounterpartyState::new(),
             calendars,
             root_actor_kinds,
+        }
+    }
+
+    /// Snapshot the pending queue for persistence, stamped with the
+    /// sim-date of the checkpoint so a later boot can tell whether the
+    /// file belongs to the current epoch (see
+    /// [`CounterpartyState::stale_for`]).
+    pub fn checkpoint(&self, saved_on: NaiveDate) -> CounterpartyState {
+        CounterpartyState {
+            queue: self.state.queue.clone(),
+            saved_on: Some(saved_on),
         }
     }
 
@@ -1446,6 +1480,71 @@ mod tests {
             &mut rng2,
         );
         assert_eq!(engine_shocked.pending(), 0, "3x delay drains at day+6");
+    }
+
+    // --- checkpoint epoch-staleness ------------------------------------
+    //
+    // The demo rewinds its epoch every ~9 wall-hours (warp 1000): the DB
+    // resets to baseline but the daemon's on-disk checkpoint used to
+    // survive and re-import the PREVIOUS epoch's pending settlements —
+    // emissions against invoices the reset wiped (the phantom-account /
+    // replay-divergence class, 2026-07-13). A checkpoint therefore
+    // carries the sim-date it was saved on; a stamp in the sim FUTURE
+    // (or missing — pre-stamp format) marks it as another epoch's.
+
+    #[test]
+    fn checkpoint_stamps_saved_on_and_roundtrips() {
+        let mut engine = CounterpartyEngine::new(vec![ach_spec()], CalendarRegistry::for_tests());
+        let mut rng = Rng::new(0x5eedu32);
+        let day = d(2026, 5, 4);
+        let trigger = SimBusEvent::new(
+            "ledger.payment_instructed".to_string(),
+            "test".to_string(),
+            json!({"amount": 100}),
+        );
+        let _ = step_engine_with_event(&mut engine, day, &mut rng, trigger);
+        assert_eq!(engine.pending(), 1);
+
+        let snapshot = engine.checkpoint(day);
+        assert_eq!(snapshot.saved_on, Some(day));
+        assert_eq!(snapshot.pending_count(), 1);
+
+        let dir = std::env::temp_dir().join(format!("cp-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("queue.json");
+        snapshot.save_to_file(&path).unwrap();
+        let loaded = CounterpartyState::load_from_file(&path).unwrap();
+        assert_eq!(loaded.saved_on, Some(day));
+        assert_eq!(loaded.pending_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkpoint_from_the_sim_future_is_stale() {
+        // Saved late in the previous epoch; the new epoch rewound the
+        // clock beneath it.
+        let mut st = CounterpartyState::new();
+        st.saved_on = Some(d(2026, 1, 15));
+        assert!(st.stale_for(d(2025, 3, 31)));
+    }
+
+    #[test]
+    fn checkpoint_saved_today_or_earlier_is_fresh() {
+        // Mid-epoch daemon restart (deploy): the checkpoint predates or
+        // equals the clock — keep it.
+        let mut st = CounterpartyState::new();
+        st.saved_on = Some(d(2025, 6, 1));
+        assert!(!st.stale_for(d(2025, 6, 1)));
+        assert!(!st.stale_for(d(2025, 6, 2)));
+    }
+
+    #[test]
+    fn unstamped_checkpoint_is_stale() {
+        // Pre-stamp file format: provenance unknown → treat as another
+        // epoch's rather than risk phantom settlements.
+        let st = CounterpartyState::new();
+        assert_eq!(st.saved_on, None);
+        assert!(st.stale_for(d(2025, 6, 1)));
     }
 
     /// A shock targeting a different counterparty leaves this spec's
