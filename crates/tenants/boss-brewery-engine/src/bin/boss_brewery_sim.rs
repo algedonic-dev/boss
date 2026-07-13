@@ -453,17 +453,53 @@ async fn main() -> Result<()> {
     }
     match boss_sim::engines::CounterpartyState::load_from_file(&state_path) {
         Ok(loaded) if loaded.pending_count() > 0 => {
+            // Epoch-staleness gate. The rewind path deletes this file
+            // before its restart, but an epoch restart that happens
+            // while the daemon is DOWN leaves no rewind signal at the
+            // next boot — the checkpoint's own sim-date stamp is the
+            // only provenance. A stamp in the sim future (or missing)
+            // marks the previous epoch's queue: emissions against
+            // invoices the reset wiped. Clock readiness is guaranteed
+            // by wait_until_ready above, so an unreadable clock here is
+            // exceptional — fail closed (discard) rather than risk
+            // phantom settlements.
             let pending = loaded.pending_count();
-            engine
-                .lock()
-                .expect("engine mutex poisoned")
-                .counterparty
-                .restore_state(loaded);
-            info!(
-                state_path = %state_path.display(),
-                pending,
-                "restored counterparty pending queue from disk"
-            );
+            match read_clock().await {
+                Ok(clock) if !loaded.stale_for(clock.current_sim_date) => {
+                    engine
+                        .lock()
+                        .expect("engine mutex poisoned")
+                        .counterparty
+                        .restore_state(loaded);
+                    info!(
+                        state_path = %state_path.display(),
+                        pending,
+                        "restored counterparty pending queue from disk"
+                    );
+                }
+                Ok(clock) => {
+                    warn!(
+                        state_path = %state_path.display(),
+                        saved_on = ?loaded.saved_on,
+                        sim_today = %clock.current_sim_date,
+                        pending,
+                        "counterparty checkpoint is from a previous epoch — discarding it"
+                    );
+                    if let Err(e) = cleanup_for_epoch_rewind(&state_path) {
+                        warn!(error = %e, "could not remove stale checkpoint file");
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        pending,
+                        "clock unreadable at checkpoint load — discarding checkpoint (fail closed: a stale queue writes phantom settlements)"
+                    );
+                    if let Err(e) = cleanup_for_epoch_rewind(&state_path) {
+                        warn!(error = %e, "could not remove unverifiable checkpoint file");
+                    }
+                }
+            }
         }
         Ok(_) => info!(
             state_path = %state_path.display(),
@@ -721,12 +757,31 @@ async fn main() -> Result<()> {
         // a full year back to it (the post-auto-restart stall).
         let rewound = cursor_after_clock(cursor, clock.current_sim_date);
         if rewound != cursor {
+            // Epoch rewind: the DB was reset to baseline, but THIS
+            // process still holds the previous epoch's world in memory —
+            // account/vendor rosters, counterparty pending queue,
+            // half-filled day buffers, workforce claims. Driving the new
+            // epoch with that state manufactures work for subjects the
+            // reset wiped (the phantom-account / replay-divergence class,
+            // 2026-07-13). Resetting every carrier in place is fragile —
+            // the boot path already rebuilds all of it from seeds + the
+            // API, so restart the process instead: drop the stale on-disk
+            // checkpoint (boot would reload it) and exit 75, the same
+            // deliberate-restart contract the config-apply path uses
+            // (systemd Restart=on-failure brings us back in ~2s).
             info!(
                 stale_cursor = ?cursor,
                 current_sim_date = %clock.current_sim_date,
-                "epoch rewind detected; resetting day cursor so the new epoch runs from day one"
+                "epoch rewind detected; discarding previous epoch's checkpoint and exiting for a clean restart"
             );
-            cursor = rewound;
+            if let Err(e) = cleanup_for_epoch_rewind(&state_path) {
+                warn!(
+                    path = %state_path.display(),
+                    error = %e,
+                    "could not remove stale counterparty checkpoint; the boot-time staleness gate will discard it instead"
+                );
+            }
+            std::process::exit(75);
         }
 
         let days = days_to_run(
@@ -772,11 +827,13 @@ async fn main() -> Result<()> {
                     break;
                 }
                 // Checkpoint the counterparty queue to disk after
-                // each sim-day flush. Best-effort; a failed write
-                // logs but doesn't break the tick (the next day
-                // will retry the checkpoint).
+                // each sim-day flush, stamped with the sim-day so a
+                // later boot can tell this epoch's checkpoint from a
+                // previous one's. Best-effort; a failed write logs
+                // but doesn't break the tick (the next day will
+                // retry the checkpoint).
                 if let Ok(guard) = engine.lock() {
-                    let snapshot = guard.counterparty.state();
+                    let snapshot = guard.counterparty.checkpoint(day);
                     if let Err(e) = snapshot.save_to_file(&state_path) {
                         warn!(
                             day = %day,
@@ -915,12 +972,36 @@ fn cursor_after_clock(cursor: Option<NaiveDate>, current: NaiveDate) -> Option<N
     }
 }
 
+/// Remove the previous epoch's counterparty checkpoint before the
+/// rewind restart. Missing file is success — there may simply have
+/// been no end-of-day checkpoint yet this epoch.
+fn cleanup_for_epoch_rewind(state_path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(state_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod day_cursor_tests {
     use super::*;
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn epoch_rewind_cleanup_removes_checkpoint() {
+        let dir = std::env::temp_dir().join(format!("rewind-cleanup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("counterparty-queue.json");
+        std::fs::write(&path, "{}").unwrap();
+        cleanup_for_epoch_rewind(&path).unwrap();
+        assert!(!path.exists(), "stale checkpoint must be removed");
+        // Missing file is success — no checkpoint yet this epoch.
+        cleanup_for_epoch_rewind(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -989,8 +1070,11 @@ mod day_cursor_tests {
     fn cursor_resets_on_epoch_rewind_so_the_new_epoch_runs() {
         // The stall: after a restart-epoch, current_sim_date rewinds to
         // epoch_start while the cursor still holds the last day of the
-        // finished epoch (a year ahead). Without the reset days_to_run
-        // idles for a full year; with it the new epoch runs from day one.
+        // finished epoch (a year ahead). Without the detection days_to_run
+        // idles for a full year. `cursor_after_clock` is now the rewind
+        // DETECTOR — the daemon exits(75) on it for a clean-state restart
+        // (the fresh process boots with cursor None and runs from day
+        // one, the second assertion below).
         let stale = Some(d(2026, 3, 31)); // last day of the finished epoch
         let epoch_start = d(2025, 4, 1); // clock rewound here
         assert_eq!(cursor_after_clock(stale, epoch_start), None);
