@@ -2036,6 +2036,135 @@ async fn close_yearly_period_posts_closing_entries_and_locks() {
     assert_eq!(status2, StatusCode::OK);
     assert_eq!(body2["status"], "locked");
     assert_eq!(body2["checksum"], body["checksum"]);
+
+    // No WIP activity was seeded, so the close reports a clean WIP.
+    assert_eq!(body["wip_variance_cents"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn close_yearly_period_writes_off_wip_variance() {
+    // The capstone-year shape in miniature: the year's production
+    // flow leaves a residual balance on WIP (1310) that the close
+    // must write off to retained earnings — 1310 ends the year at
+    // zero, and the drained COGS account is NOT re-inflated.
+    let db = TestDb::new().await;
+
+    // Revenue $5,000 (issued + collected so cash is funded).
+    let invoice_payload = json!({
+        "invoice_id": "inv-wip-close-1",
+        "amount_cents": 5_000,
+        "line_items": [{ "category": "new-sales", "amount_cents": 5_000 }],
+    });
+    seed_entry(
+        &db,
+        "finance.invoice.issued",
+        NaiveDate::from_ymd_opt(2026, 6, 15).unwrap(),
+        &invoice_payload,
+        "inv-wip-close-1",
+    )
+    .await;
+    seed_entry(
+        &db,
+        "finance.invoice.paid",
+        NaiveDate::from_ymd_opt(2026, 6, 15).unwrap(),
+        &json!({ "invoice_id": "inv-wip-close-1", "amount_cents": 5_000 }),
+        "inv-wip-close-1",
+    )
+    .await;
+
+    // Expense $2,000 (manual rent JE against the funded cash).
+    let r = router(LedgerApiState {
+        pool: db.pool.clone(),
+        publisher: None,
+        clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
+    });
+    let (status, body) = post_json(
+        r,
+        "/api/ledger/journal-entries",
+        json!({
+            "posted_on": "2026-06-15",
+            "memo": "Rent expense",
+            "lines": [
+                { "account_code": "6200", "debit_cents": 2_000, "credit_cents": 0, "memo": "rent" },
+                { "account_code": "1000", "debit_cents": 0, "credit_cents": 2_000, "memo": "cash out" },
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "rent entry body={body:?}");
+
+    // Residual WIP: $250 sitting on 1310 at year-end (opening-WIP
+    // shape — DR 1310 / CR 3000, no cash guard involved).
+    let r = router(LedgerApiState {
+        pool: db.pool.clone(),
+        publisher: None,
+        clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
+    });
+    let (status, body) = post_json(
+        r,
+        "/api/ledger/journal-entries",
+        json!({
+            "posted_on": "2026-11-30",
+            "memo": "Opening WIP",
+            "lines": [
+                { "account_code": "1310", "debit_cents": 250, "credit_cents": 0, "memo": "wip residual" },
+                { "account_code": "3000", "debit_cents": 0, "credit_cents": 250, "memo": "equity seed" },
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "wip entry body={body:?}");
+
+    // Create + close FY 2026 (default body → wip_account 1310).
+    let r = router(LedgerApiState {
+        pool: db.pool.clone(),
+        publisher: None,
+        clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
+    });
+    let (status, body) = post_json(r, "/api/ledger/periods", json!({"year": 2026})).await;
+    assert_eq!(status, StatusCode::OK, "create period body={body:?}");
+    let period_id = body["id"].as_str().unwrap().to_string();
+
+    let r = router(LedgerApiState {
+        pool: db.pool.clone(),
+        publisher: None,
+        clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
+    });
+    let path = format!("/api/ledger/periods/{period_id}/close");
+    let (status, body) = post_json(r, &path, json!({"closed_by": "emp-wip-close"})).await;
+    assert_eq!(status, StatusCode::OK, "close body={body:?}");
+    assert_eq!(body["status"], "locked");
+    assert_eq!(body["net_income_cents"], 3_000);
+    assert_eq!(body["wip_variance_cents"], 250);
+
+    // Trial balance as-of Dec 31: WIP zeroed, P&L accounts zeroed,
+    // RE = opening 250 + net income 3,000 − write-off 250 = 3,000.
+    let r = router(LedgerApiState {
+        pool: db.pool.clone(),
+        publisher: None,
+        clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
+    });
+    let (_, tb) = get(r, "/api/ledger/trial-balance?as_of=2026-12-31").await;
+    let rows = tb["rows"].as_array().unwrap();
+    let balance = |code: &str| -> i64 {
+        rows.iter()
+            .find(|r| r["account_code"] == code)
+            .and_then(|r| r["balance_cents"].as_i64())
+            .unwrap_or(0)
+    };
+    assert_eq!(balance("1310"), 0, "WIP written off at close");
+    assert_eq!(balance("4100"), 0, "revenue closed");
+    assert_eq!(balance("6200"), 0, "expense closed");
+    assert_eq!(
+        balance("5100"),
+        0,
+        "COGS not re-inflated by the WIP write-off"
+    );
+    assert_eq!(
+        balance("3000"),
+        3_000,
+        "RE = NI; the WIP residual moved through, not into, RE"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

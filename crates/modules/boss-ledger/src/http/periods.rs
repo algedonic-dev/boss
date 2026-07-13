@@ -201,7 +201,9 @@ pub(super) async fn create_period_handler(
 /// `POST /api/ledger/periods/{id}/close` — the year-end close.
 ///
 /// Computes per-account revenue + expense balances as of the period's
-/// `ends_on`, emits a `finance.period.closed` fact with those
+/// `ends_on`, plus the residual WIP balance (`wip_account`, default
+/// `1310`) that writes off to retained earnings so WIP starts the new
+/// year at zero. Emits a `finance.period.closed` fact with those
 /// balances, posts the resulting closing journal entry into the
 /// yearly period (bypassing the monthly auto-assignment so the
 /// closing entries don't conflate with December's real activity),
@@ -217,6 +219,13 @@ pub(super) struct CloseBody {
     /// operator renamed/repointed the account.
     #[serde(default)]
     retained_earnings_account: Option<String>,
+    /// WIP account whose residual balance the close writes off to
+    /// retained earnings (so WIP starts the new year at zero without
+    /// re-inflating the drained COGS account). Defaults to `1310`
+    /// (starter chart). Same override contract as
+    /// `retained_earnings_account`.
+    #[serde(default)]
+    wip_account: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -230,6 +239,9 @@ struct ClosePeriodResponse {
     revenue_closed_cents: i64,
     expense_closed_cents: i64,
     net_income_cents: i64,
+    /// Residual WIP balance the close wrote off to retained
+    /// earnings (0 = WIP was already clean).
+    wip_variance_cents: i64,
 }
 
 pub(super) async fn close_period_handler(
@@ -244,11 +256,13 @@ pub(super) async fn close_period_handler(
     let body = body.map(|b| b.0).unwrap_or(CloseBody {
         closed_by: None,
         retained_earnings_account: None,
+        wip_account: None,
     });
     let closed_by = body.closed_by.unwrap_or_else(|| "ledger".to_string());
     let retained_earnings = body
         .retained_earnings_account
         .unwrap_or_else(|| "3000".to_string());
+    let wip_account = body.wip_account.unwrap_or_else(|| "1310".to_string());
 
     // Load the period.
     let period: Result<Option<(String, NaiveDate, NaiveDate, String)>, _> =
@@ -351,6 +365,29 @@ pub(super) async fn close_period_handler(
     let expense_total: i64 = expense_rows.iter().map(|r| r.2).sum();
     let net_income = revenue_total - expense_total;
 
+    // Residual WIP balance as of the close. Cumulative through
+    // ends_on — an asset account's balance, not a period flow like
+    // the revenue/expense windows above (those zero at every close;
+    // WIP carries whatever prior closes + the year's activity left
+    // on it). A tenant whose chart has no such account sums zero
+    // rows → 0 → the close-out is a no-op.
+    let wip_variance: Result<(i64,), _> = sqlx::query_as(
+        "SELECT COALESCE(SUM(l.debit_cents - l.credit_cents), 0)::bigint \
+         FROM gl_accounts a \
+         JOIN gl_journal_lines l ON l.account_id = a.id \
+         JOIN gl_journal_entries e ON e.id = l.journal_entry_id \
+         WHERE a.code = $1 \
+           AND e.posted_on <= $2",
+    )
+    .bind(&wip_account)
+    .bind(ends_on)
+    .fetch_one(&state.pool)
+    .await;
+    let wip_variance = match wip_variance {
+        Ok((v,)) => v,
+        Err(e) => return storage_err(e),
+    };
+
     let revenue_lines: Vec<serde_json::Value> = revenue_rows
         .iter()
         .map(|(code, _, bal)| serde_json::json!({ "account_code": code, "balance_cents": bal }))
@@ -360,12 +397,17 @@ pub(super) async fn close_period_handler(
         .map(|(code, _, bal)| serde_json::json!({ "account_code": code, "balance_cents": bal }))
         .collect();
 
+    // wip fields are stamped even at zero variance (the rule no-ops
+    // on 0): the fact then records that the close *checked* WIP, not
+    // that the field didn't exist yet.
     let payload = serde_json::json!({
         "period_id": id,
         "period_end": ends_on,
         "retained_earnings_account": retained_earnings,
         "revenue_lines": revenue_lines,
         "expense_lines": expense_lines,
+        "wip_variance_cents": wip_variance,
+        "wip_account": wip_account,
     });
 
     // Transactional section: insert fact + post entry into the yearly
@@ -464,6 +506,7 @@ pub(super) async fn close_period_handler(
         revenue_closed_cents: revenue_total,
         expense_closed_cents: expense_total,
         net_income_cents: net_income,
+        wip_variance_cents: wip_variance,
     })
     .into_response()
 }

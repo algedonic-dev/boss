@@ -264,20 +264,23 @@ which one matters first.
       terminal step that POSTs to
       `/api/ledger/periods/{id}/close`.
 
-- [ ] **Ledger: WIP-variance year-end close.** The
-      `finance.period.closed` rule (`boss-ledger/src/rules.rs`)
-      closes revenue/expense to retained earnings but does not yet
-      handle a `wip_variance_cents` payload field — the residual
-      WIP (1310) balance that should write off at year-end via a
-      DR retained-earnings / CR 1310 adjustment so 1310 closes to 0
-      without re-inflating the drained expense account. The test
-      `period_closed_writes_wip_variance_to_retained_earnings` is
-      `#[ignore]`d pending this; un-ignore it when the posting
-      lands. Decide whether the WIP account (1310) is hardcoded or
-      payload-driven before implementing. Concrete case from the
-      2026-07-13 capstone year run: the Dec-31 close left
-      $42,859.20 sitting on 1310 — exactly the balance this
-      close-out should write off.
+- [x] **Ledger: WIP-variance year-end close** — done: the close
+      endpoint computes the residual WIP balance (cumulative
+      through `ends_on`) and stamps `wip_variance_cents` +
+      `wip_account` into the `finance.period.closed` fact; the rule
+      posts DR RE / CR wip (mirror for an over-absorbed credit
+      residual) as separate lines from the net-income roll, so WIP
+      closes to 0 without re-inflating the drained expense account.
+      The account decision landed payload-driven: the rule stays
+      chart-agnostic, the endpoint owns the starter-chart `1310`
+      default via a `wip_account` body param — the
+      `retained_earnings_account` contract exactly. The pinned test
+      is un-ignored (+ negative/zero/missing-account siblings + an
+      e2e through trial balance). Concrete case that motivated it:
+      the 2026-07-13 capstone run's Dec-31 close left $42,859.20
+      sitting on 1310; the next year regen's close should write it
+      off and leave 1310 at in-flight-brews-only (invariant Q
+      tightens accordingly).
 
 - [x] **Conservation-P: finished-goods cost-basis reconciliation
       (consume-side)** — resolved by the value-primary costing arc,
