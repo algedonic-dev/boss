@@ -217,7 +217,6 @@ fn parse_count(debug_str: &str, field: &str) -> u64 {
 }
 
 fn load_audit_log_seed(database_url: &str, seed_path: &std::path::Path) -> Result<()> {
-    use std::io::{Read, Write};
     use std::process::{Command, Stdio};
 
     let path_str = seed_path
@@ -236,52 +235,181 @@ fn load_audit_log_seed(database_url: &str, seed_path: &std::path::Path) -> Resul
     const ESCAPE_PREFIX: &[u8] = b"SET audit_log.ref_check = 'off';\n";
 
     let is_gz = path_str.ends_with(".gz");
-    let mut psql = Command::new("psql");
-    psql.arg(database_url).arg("--quiet").stdin(Stdio::piped());
+    let mut psql_cmd = Command::new("psql");
+    psql_cmd
+        .arg(database_url)
+        .arg("--quiet")
+        .stdin(Stdio::piped());
+    let mut psql = psql_cmd.spawn().with_context(|| "spawning psql")?;
 
     if is_gz {
         // Stream: prefix + gunzip-stdout → psql-stdin. We own the
         // psql pipe end so the SET statement goes in before the
-        // decompressed dump.
+        // decompressed dump. gunzip is reaped only AFTER the pump
+        // returns — the pump owns (and drops) the read end of
+        // gunzip's stdout, so by then gunzip has either finished or
+        // taken SIGPIPE. Waiting on it while its stdout still had an
+        // open, undrained pipe is the order that deadlocks.
         let mut gz = Command::new("gunzip")
             .arg("-c")
             .arg(seed_path)
             .stdout(Stdio::piped())
             .spawn()
             .with_context(|| format!("spawning gunzip for {}", path_str))?;
-        let mut gz_stdout = gz.stdout.take().expect("gunzip stdout");
-        let mut child = psql.spawn().with_context(|| "spawning psql")?;
-        let mut stdin = child.stdin.take().expect("psql stdin");
-        stdin
-            .write_all(ESCAPE_PREFIX)
-            .with_context(|| "writing trigger-disable prefix to psql")?;
-        std::io::copy(&mut gz_stdout, &mut stdin).with_context(|| "piping gunzip to psql")?;
-        drop(stdin);
-        let psql_status = child.wait().with_context(|| "waiting for psql")?;
+        let gz_stdout = gz.stdout.take().expect("gunzip stdout");
+        let pumped = pump_into_psql(&mut psql, ESCAPE_PREFIX, gz_stdout, path_str);
         let gz_status = gz.wait().with_context(|| "waiting for gunzip")?;
+        pumped?;
         if !gz_status.success() {
-            anyhow::bail!("gunzip exited {}", gz_status);
-        }
-        if !psql_status.success() {
-            anyhow::bail!("psql exited {}", psql_status);
+            anyhow::bail!("gunzip exited {} for {}", gz_status, path_str);
         }
     } else {
-        let mut child = psql.spawn().with_context(|| "spawning psql")?;
-        let mut file =
+        let file =
             std::fs::File::open(seed_path).with_context(|| format!("opening {}", path_str))?;
-        let mut stdin = child.stdin.take().expect("psql stdin");
-        stdin
-            .write_all(ESCAPE_PREFIX)
-            .with_context(|| "writing trigger-disable prefix to psql")?;
-        std::io::copy(&mut file, &mut stdin).with_context(|| "piping seed to psql")?;
-        // Force EOF before waiting.
-        drop(stdin);
-        let mut buf = Vec::new();
-        let _ = file.read_to_end(&mut buf);
-        let status = child.wait().with_context(|| "waiting for psql")?;
-        if !status.success() {
-            anyhow::bail!("psql exited {}", status);
-        }
+        pump_into_psql(&mut psql, ESCAPE_PREFIX, file, path_str)?;
     }
     Ok(())
+}
+
+/// How often the seed pump logs progress. A multi-GB dump on a slow
+/// disk takes long enough that silence reads as a hang.
+const SEED_PROGRESS_EVERY: u64 = 256 * 1024 * 1024;
+
+/// Stream `reader` into psql's stdin behind the trigger-disable
+/// prefix, then reap psql. Backpressure is expected — on a slow disk
+/// psql consumes slower than the reader produces, and the writes
+/// block until it catches up; that is throttling, not a hang.
+///
+/// psql's exit status is the primary diagnosis: when psql dies
+/// mid-load, the pipe write surfaces as a broken-pipe error that
+/// says nothing about WHY, so a non-zero exit outranks the copy
+/// error in the report.
+fn pump_into_psql(
+    psql: &mut std::process::Child,
+    prefix: &[u8],
+    mut reader: impl std::io::Read,
+    label: &str,
+) -> Result<()> {
+    use std::io::Write;
+
+    let mut stdin = psql.stdin.take().expect("psql stdin");
+    let copied: std::io::Result<u64> = (|| {
+        stdin.write_all(prefix)?;
+        let mut buf = vec![0u8; 8 * 1024 * 1024];
+        let mut total: u64 = 0;
+        let mut next_mark = SEED_PROGRESS_EVERY;
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            stdin.write_all(&buf[..n])?;
+            total += n as u64;
+            if total >= next_mark {
+                info!(
+                    loaded_mib = total / (1024 * 1024),
+                    seed = label,
+                    "audit_log seed streaming"
+                );
+                next_mark += SEED_PROGRESS_EVERY;
+            }
+        }
+        Ok(total)
+    })();
+    // EOF to psql before reaping — waiting on a child while still
+    // holding its stdin open is the other order that hangs.
+    drop(stdin);
+    let status = psql.wait().with_context(|| "waiting for psql")?;
+    match (copied, status.success()) {
+        (Ok(total), true) => {
+            info!(
+                loaded_mib = total / (1024 * 1024),
+                seed = label,
+                "audit_log seed loaded"
+            );
+            Ok(())
+        }
+        (_, false) => anyhow::bail!("psql exited {} while loading {}", status, label),
+        (Err(e), true) => {
+            Err(e).with_context(|| format!("piping {} to psql (psql itself exited 0)", label))
+        }
+    }
+}
+
+#[cfg(test)]
+mod seed_pump_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    fn consumer(script: &str) -> std::process::Child {
+        Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn sh consumer")
+    }
+
+    /// 16 MiB through a consumer that stalls before draining — far
+    /// past any kernel pipe buffer, so the writer must block on
+    /// backpressure and then resume. This is the slow-disk shape:
+    /// completion, not a hang and not an error.
+    #[test]
+    fn pump_survives_a_slow_consumer_via_backpressure() {
+        let mut child = consumer("sleep 1; cat > /dev/null");
+        let data = std::io::Cursor::new(vec![b'x'; 16 * 1024 * 1024]);
+        pump_into_psql(&mut child, b"prefix\n", data, "test-slow").expect("pump completes");
+    }
+
+    /// The consumer dies early with a distinct status: the report
+    /// must carry that exit status — the actual diagnosis — not the
+    /// broken-pipe error the writer saw as a consequence.
+    #[test]
+    fn pump_reports_the_consumer_exit_status_not_the_pipe_error() {
+        let mut child = consumer("head -c 4096 > /dev/null; exit 3");
+        let data = std::io::Cursor::new(vec![b'x'; 16 * 1024 * 1024]);
+        let err =
+            pump_into_psql(&mut child, b"prefix\n", data, "test-dead").expect_err("psql died");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("exit status: 3"),
+            "want the consumer's exit status in the report, got: {msg}"
+        );
+    }
+
+    struct FailingReader {
+        left: usize,
+    }
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.left == 0 {
+                return Err(std::io::Error::other("seed read failed"));
+            }
+            let n = self.left.min(buf.len());
+            buf[..n].fill(b'x');
+            self.left -= n;
+            Ok(n)
+        }
+    }
+
+    /// The reader fails midway while the consumer stays healthy: the
+    /// reader's error is the diagnosis (psql exits 0 on the
+    /// truncated-but-valid prefix it received).
+    #[test]
+    fn pump_reports_a_reader_failure_when_the_consumer_is_clean() {
+        let mut child = consumer("cat > /dev/null");
+        let err = pump_into_psql(
+            &mut child,
+            b"prefix\n",
+            FailingReader { left: 1024 },
+            "test-reader",
+        )
+        .expect_err("reader failed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("seed read failed"),
+            "want the reader error in the report, got: {msg}"
+        );
+    }
 }
