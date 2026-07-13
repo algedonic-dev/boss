@@ -168,20 +168,20 @@ Big-shape work pulled out of the launch path on purpose. None of
 this gates the release; reopen once a real tenant's needs steer
 which one matters first.
 
-- [ ] **Edge-strip hardening for the gateway trust boundary.**
-      `boss-gateway` injects `x-boss-user` when a valid session
-      exists but does not strip a client-supplied one at the edge;
-      backend services trust the header verbatim. The deployment
-      model (gateway is sole ingress; backends bound to `127.0.0.1`
-      or firewalled) is now documented in
-      [SECURITY.md](SECURITY.md) §Deployment trust model. The
-      code-level hardening — unconditionally strip inbound
-      `x-boss-*` at the gateway edge and re-inject only trusted
-      values, plus bind backends to `127.0.0.1` in
-      `infra/deploy-services.sh` and fail-closed on the
-      `change-me` bootstrap-admin default — folds into **Integrated
-      IAM** below, but the edge-strip is worth doing on its own
-      before real auth lands.
+- [x] **Edge-strip hardening for the gateway trust boundary** —
+      done 2026-07-13 for the two code-level pieces: the gateway
+      now unconditionally strips inbound `x-boss-*` at its edge
+      before injecting session-derived identity (strip-then-inject
+      ordering pinned by middleware probe tests), and
+      `infra/deploy-services.sh` emits `http_bind = 127.0.0.1` for
+      every backend. [SECURITY.md](SECURITY.md) §Deployment trust
+      model updated: a front proxy's header stripping is
+      defense-in-depth now, not load-bearing. Deliberately NOT
+      done here: fail-closed on the `change-me` bootstrap-admin
+      default — the public demo baseline signs in with it, so the
+      fail-closed shape (refuse to start? force first-login
+      rotation? demo-mode exemption?) needs a product call; it
+      stays bundled in **Integrated IAM** below.
 
 - [ ] **`boss-rebuild-all --audit-log-seed` pipe deadlock on slow
       disk.** Surfaced on a bare-metal install test on an
