@@ -1322,7 +1322,6 @@ fn run_regen(
     println!("agreements:         {}", output.stats.agreements);
     println!("jobs:               {}", output.stats.jobs);
     println!("purchase_orders:    {}", output.stats.purchase_orders);
-    println!("messages:           {}", output.stats.messages);
     println!("account_notes:      {}", output.stats.account_notes);
     println!("tax_filings:        {}", output.stats.tax_filings);
     println!("bank_settlements:   {}", output.stats.bank_settlements);

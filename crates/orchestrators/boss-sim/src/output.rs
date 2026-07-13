@@ -61,7 +61,6 @@ pub trait SimOutput {
     fn emit_shipment(&mut self, shipment: &Shipment) -> anyhow::Result<()>;
     fn emit_agreement(&mut self, agreement: &ActiveAgreement) -> anyhow::Result<()>;
     fn emit_purchase_order(&mut self, po: &PurchaseOrderSnapshot) -> anyhow::Result<()>;
-    fn emit_message(&mut self, msg: &MessageSnapshot) -> anyhow::Result<()>;
     fn emit_account_note(&mut self, note: &AccountNoteSnapshot) -> anyhow::Result<()>;
 
     /// Tax filing accrual + remit emitted by the tax-authorities generator.
@@ -263,7 +262,6 @@ pub struct InMemoryOutput {
     pub shipments: Vec<Shipment>,
     pub agreements: Vec<AgreementSnapshot>,
     pub purchase_orders: Vec<PurchaseOrderSnapshot>,
-    pub messages: Vec<MessageSnapshot>,
     pub account_notes: Vec<AccountNoteSnapshot>,
     pub tax_filings: Vec<TaxFilingSnapshot>,
     pub bank_settlements: Vec<BankSettlementSnapshot>,
@@ -303,21 +301,6 @@ pub struct AccountNoteSnapshot {
     pub kind: &'static str,
     pub body: String,
     pub occurred_at: chrono::DateTime<chrono::Utc>,
-}
-
-/// Flat snapshot of a message for output collection. Dates are carried
-/// as UTC datetimes so the replay can backdate them.
-#[derive(Debug, Clone)]
-pub struct MessageSnapshot {
-    pub id: String,
-    pub sender_id: String,
-    pub recipient_id: String,
-    pub subject: String,
-    pub body: String,
-    pub kind: &'static str,
-    pub entity_type: Option<String>,
-    pub entity_id: Option<String>,
-    pub sent_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Flat snapshot of a purchase order for output collection.
@@ -485,11 +468,6 @@ impl SimOutput for InMemoryOutput {
 
     fn emit_purchase_order(&mut self, po: &PurchaseOrderSnapshot) -> anyhow::Result<()> {
         self.purchase_orders.push(po.clone());
-        Ok(())
-    }
-
-    fn emit_message(&mut self, msg: &MessageSnapshot) -> anyhow::Result<()> {
-        self.messages.push(msg.clone());
         Ok(())
     }
 
@@ -678,7 +656,6 @@ pub mod live {
         pub agreements: u64,
         pub jobs: u64,
         pub purchase_orders: u64,
-        pub messages: u64,
         pub account_notes: u64,
         pub tax_filings: u64,
         pub bank_settlements: u64,
@@ -768,7 +745,6 @@ pub mod live {
         day_shipments: Vec<Shipment>,
         day_agreements: Vec<serde_json::Value>,
         day_purchase_orders: Vec<PurchaseOrderSnapshot>,
-        day_messages: Vec<MessageSnapshot>,
         day_account_notes: Vec<AccountNoteSnapshot>,
         day_tax_filings: Vec<TaxFilingSnapshot>,
         day_bank_settlements: Vec<BankSettlementSnapshot>,
@@ -906,7 +882,6 @@ pub mod live {
                 day_shipments: Vec::new(),
                 day_agreements: Vec::new(),
                 day_purchase_orders: Vec::new(),
-                day_messages: Vec::new(),
                 day_account_notes: Vec::new(),
                 day_tax_filings: Vec::new(),
                 day_bank_settlements: Vec::new(),
@@ -931,7 +906,6 @@ pub mod live {
                     agreements: 0,
                     jobs: 0,
                     purchase_orders: 0,
-                    messages: 0,
                     account_notes: 0,
                     tax_filings: 0,
                     bank_settlements: 0,
@@ -1416,11 +1390,6 @@ pub mod live {
 
         fn emit_purchase_order(&mut self, po: &PurchaseOrderSnapshot) -> anyhow::Result<()> {
             self.day_purchase_orders.push(po.clone());
-            Ok(())
-        }
-
-        fn emit_message(&mut self, msg: &MessageSnapshot) -> anyhow::Result<()> {
-            self.day_messages.push(msg.clone());
             Ok(())
         }
 
@@ -1983,35 +1952,6 @@ pub mod live {
                 self.stats.purchase_orders += n;
             }
 
-            // --- Messages (batch) ---
-            if !self.day_messages.is_empty() {
-                let drained_msgs: Vec<_> = self.day_messages.drain(..).collect();
-                let msgs: Vec<serde_json::Value> = drained_msgs
-                    .into_iter()
-                    .map(|m| {
-                        let entity_ref = match (&m.entity_type, &m.entity_id) {
-                            (Some(t), Some(id)) => {
-                                Some(serde_json::json!({"entity_type": t, "entity_id": id}))
-                            }
-                            _ => None,
-                        };
-                        serde_json::json!({
-                            "id": m.id,
-                            "sender_id": m.sender_id,
-                            "recipient_id": m.recipient_id,
-                            "subject": m.subject,
-                            "body": m.body,
-                            "entity_ref": entity_ref,
-                            "kind": m.kind,
-                            "sent_at": m.sent_at.to_rfc3339(),
-                            "read_at": null,
-                        })
-                    })
-                    .collect();
-                let n = self.post_batch("/api/messages/batch", &msgs, 1000);
-                self.stats.messages += n;
-            }
-
             // --- Account notes (one POST per note to the single,
             // registry-gated create endpoint) ---
             // The batch write path was removed: every note now goes
@@ -2246,7 +2186,6 @@ pub mod live {
                     events = self.stats.asset_events,
                     invoices = self.stats.invoices_created,
                     jobs = self.stats.jobs,
-                    msgs = self.stats.messages,
                     errors = self.stats.errors,
                     "live replay progress"
                 );
@@ -2271,10 +2210,7 @@ pub mod live {
 
         fn flush(&mut self) -> anyhow::Result<()> {
             // Flush any remaining items from the last day.
-            if !self.day_events.is_empty()
-                || !self.day_invoices.is_empty()
-                || !self.day_messages.is_empty()
-            {
+            if !self.day_events.is_empty() || !self.day_invoices.is_empty() {
                 let today = chrono::Utc::now().date_naive();
                 self.end_of_day(today)?;
             }
@@ -2286,7 +2222,6 @@ pub mod live {
                 agreements = self.stats.agreements,
                 jobs = self.stats.jobs,
                 purchase_orders = self.stats.purchase_orders,
-                messages = self.stats.messages,
                 account_notes = self.stats.account_notes,
                 scheduled_assignments = self.stats.scheduled_assignments,
                 errors = self.stats.errors,

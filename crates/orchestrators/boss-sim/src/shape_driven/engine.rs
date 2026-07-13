@@ -2060,9 +2060,6 @@ mod tests {
         ) -> anyhow::Result<()> {
             self.inner.emit_purchase_order(p)
         }
-        fn emit_message(&mut self, m: &crate::output::MessageSnapshot) -> anyhow::Result<()> {
-            self.inner.emit_message(m)
-        }
         fn emit_account_note(
             &mut self,
             n: &crate::output::AccountNoteSnapshot,
