@@ -2,7 +2,7 @@
 //!
 //! Example:
 //! ```toml
-//! bind = "0.0.0.0:7800"
+//! bind = "127.0.0.1:7880"  # loopback — the gateway proxies; widen deliberately
 //! nats_url = "nats://os-manager-1:4222"
 //! static_dir = "/var/lib/boss-observability/web"
 //!

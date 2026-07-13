@@ -258,8 +258,11 @@ async fn main() -> Result<()> {
         .compact()
         .init();
 
+    // Loopback default: reached through the gateway's /simulator
+    // proxy, never directly (SECURITY.md §Deployment trust model).
+    // BOSS_SIM_BIND widens deliberately.
     let bind = std::env::var("BOSS_SIM_BIND")
-        .unwrap_or_else(|_| format!("0.0.0.0:{}", boss_ports::prod("simulator")));
+        .unwrap_or_else(|_| format!("127.0.0.1:{}", boss_ports::prod("simulator")));
     let static_dir = std::env::var("BOSS_SIM_STATIC_DIR")
         .unwrap_or_else(|_| "/var/lib/boss-simulator/dist".to_string());
 

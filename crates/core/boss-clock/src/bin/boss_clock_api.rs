@@ -58,7 +58,10 @@ struct Cli {
 }
 
 fn default_bind() -> String {
-    format!("0.0.0.0:{}", boss_ports::prod("clock"))
+    // Loopback by default: the gateway is the sole trust boundary
+    // and every deployment co-locates it (SECURITY.md §Deployment
+    // trust model). Pass --http-bind to widen deliberately.
+    format!("127.0.0.1:{}", boss_ports::prod("clock"))
 }
 
 #[tokio::main]
