@@ -56,7 +56,11 @@
         const includeJobs = supportOn;
         const [pResp, dPaged, jPaged, iPaged] = await Promise.all([
           fetch('/api/people/accounts'),
-          fetchPaged<Asset>('/api/assets/systems?limit=1000'),
+          // `/api/assets` — `/api/assets/systems` was the fleet-era
+          // path; it has no route and fell through to
+          // `/api/assets/{asset_id}` → 404, so this list rendered
+          // empty since the rename.
+          fetchPaged<Asset>('/api/assets?limit=1000'),
           includeJobs
             ? fetchPaged<Job>('/api/jobs?kind=field-service&limit=5000')
             : Promise.resolve(null),

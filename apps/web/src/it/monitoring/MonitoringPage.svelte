@@ -170,7 +170,10 @@
           fetch('/api/people/accounts'),
           fetch('/api/catalog/models'),
           fetch('/api/people'),
-          fetch('/api/assets/systems?limit=1'),
+          // `limit=1` on purpose: only `total` is read below. (Was
+          // the routeless fleet-era `/api/assets/systems` → 404 →
+          // the tile showed 0 since the rename.)
+          fetch('/api/assets?limit=1'),
           fetch('/api/jobs/summary?kind=field-service&status=open'),
         ]);
         if (!cancelled) {
