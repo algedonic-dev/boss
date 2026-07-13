@@ -865,6 +865,26 @@ fn manual_entry(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> {
 /// profitable, debit when it was a loss. When the year is exactly
 /// break-even the RE line is omitted (zero-amount lines are spec
 /// noise) and the entry is balanced by construction.
+///
+/// Optional WIP-variance close-out: when the payload carries a
+/// non-zero `wip_variance_cents` (the residual balance on the WIP
+/// account as of the close — materials + absorption capitalized in,
+/// produce-drains out), the entry also writes that residual off
+/// against retained earnings so WIP starts the new year at zero:
+///
+/// ```json
+/// { "wip_variance_cents": 25000, "wip_account": "1310" }
+/// ```
+///
+/// A debit residual (under-drained WIP) posts DR RE / CR wip; a
+/// credit residual (over-absorbed) posts the mirror. Deliberately a
+/// separate RE line from the net-income roll — and NOT a posting to
+/// the drained COGS/expense account, which would re-inflate it right
+/// after its own zero line. `wip_account` rides in the payload (the
+/// close endpoint owns the starter-chart "1310" default) so this
+/// rule stays chart-agnostic, same contract as
+/// `retained_earnings_account`; a non-zero variance without an
+/// account is a malformed fact and is refused.
 #[allow(unused_assignments)] // running sort_order counter; final increment intentionally unread
 fn period_closed(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> {
     let retained_earnings = fact
@@ -978,6 +998,64 @@ fn period_closed(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> {
             sort_order: sort,
         });
         sort += 1;
+    }
+
+    // WIP-variance close-out (see the doc comment): absent field →
+    // old fact, nothing to do; present but unparseable → malformed,
+    // refuse rather than silently skip a write-off.
+    let wip_variance = match fact.payload.get("wip_variance_cents") {
+        None => 0,
+        Some(v) => cents_from_payload(Some(v))
+            .ok_or_else(|| payload_err(fact.kind, "wip_variance_cents must be integer cents"))?,
+    };
+    if wip_variance != 0 {
+        let wip_account = fact
+            .payload
+            .get("wip_account")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| payload_err(fact.kind, "wip_variance_cents without wip_account"))?;
+        if wip_variance > 0 {
+            lines.push(JournalLineDraft {
+                account_code: retained_earnings.to_string().into(),
+                debit_cents: wip_variance,
+                credit_cents: 0,
+                memo: Some(format!(
+                    "Year-end close: WIP variance write-off ({wip_account})"
+                )),
+                sort_order: sort,
+            });
+            sort += 1;
+            lines.push(JournalLineDraft {
+                account_code: wip_account.to_string().into(),
+                debit_cents: 0,
+                credit_cents: wip_variance,
+                memo: Some(format!("Year-end close: zero out {wip_account} residual")),
+                sort_order: sort,
+            });
+            sort += 1;
+        } else {
+            // Credit residual (over-absorbed WIP) → mirror image.
+            lines.push(JournalLineDraft {
+                account_code: wip_account.to_string().into(),
+                debit_cents: -wip_variance,
+                credit_cents: 0,
+                memo: Some(format!(
+                    "Year-end close: zero out {wip_account} residual (was credit-balance)"
+                )),
+                sort_order: sort,
+            });
+            sort += 1;
+            lines.push(JournalLineDraft {
+                account_code: retained_earnings.to_string().into(),
+                debit_cents: 0,
+                credit_cents: -wip_variance,
+                memo: Some(format!(
+                    "Year-end close: WIP over-absorption to retained earnings ({wip_account})"
+                )),
+                sort_order: sort,
+            });
+            sort += 1;
+        }
     }
 
     if lines.is_empty() {
@@ -1592,12 +1670,17 @@ mod v2_tests {
     }
 
     #[test]
-    #[ignore = "wip_variance_cents period-close posting not yet implemented in period_closed(); see TODO.md (Ledger: WIP-variance year-end close)"]
     fn period_closed_writes_wip_variance_to_retained_earnings() {
         // Residual 1310 balance writes off via a
         // year-end RE adjustment so 1310 closes to 0 AND 5100
         // still closes clean (posting to 5100 inside the same JE
         // would inflate it after the expense-zero line drained it).
+        //
+        // The WIP account rides in the payload (`wip_account`), not
+        // hardcoded in the rule — same contract as
+        // `retained_earnings_account`: the rule is chart-agnostic,
+        // and the close endpoint owns the starter-chart default
+        // ("1310").
         let id = uuid::Uuid::new_v4();
         let payload = serde_json::json!({
             "period_id": "c0000000-0000-0000-0000-000000000010",
@@ -1606,6 +1689,7 @@ mod v2_tests {
             "revenue_lines": [{ "account_code": "4100", "balance_cents": 100_000 }],
             "expense_lines": [{ "account_code": "5100", "balance_cents": 60_000 }],
             "wip_variance_cents": 25_000,
+            "wip_account": "1310",
         });
         let fact_ref = FactRef {
             id,
@@ -1638,6 +1722,109 @@ mod v2_tests {
             "5100 should have one close line (the expense zero), not a WIP variance line"
         );
         assert_eq!(cogs_lines[0].credit_cents, 60_000);
+    }
+
+    #[test]
+    fn period_closed_negative_wip_variance_debits_wip_credits_re() {
+        // Over-absorption leaves 1310 with a CREDIT balance
+        // (variance negative): zeroing it needs the mirror JE —
+        // DR 1310 / CR RE.
+        let id = uuid::Uuid::new_v4();
+        let payload = serde_json::json!({
+            "period_id": "c0000000-0000-0000-0000-000000000011",
+            "period_end": "2026-12-31",
+            "retained_earnings_account": "3000",
+            "revenue_lines": [{ "account_code": "4100", "balance_cents": 100_000 }],
+            "expense_lines": [{ "account_code": "5100", "balance_cents": 60_000 }],
+            "wip_variance_cents": -7_000,
+            "wip_account": "1310",
+        });
+        let fact_ref = FactRef {
+            id,
+            kind: "finance.period.closed",
+            happened_on: chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+            payload: &payload,
+        };
+        let draft = evaluate(&BossRuleSet, &fact_ref).unwrap();
+        assert!(draft.is_balanced());
+        // DR 4100 100k + DR 1310 7k = 107k total debits.
+        assert_eq!(draft.total_debits(), 107_000);
+        let wip = draft
+            .lines
+            .iter()
+            .find(|l| l.account_code.as_ref() == "1310")
+            .expect("1310 line missing");
+        assert_eq!(wip.debit_cents, 7_000);
+        assert_eq!(wip.credit_cents, 0);
+        // RE carries two lines: the net-income CR 40k and the
+        // variance CR 7k — separate memos, separate close-out
+        // semantics, deliberately not netted.
+        let re_credit_total: i64 = draft
+            .lines
+            .iter()
+            .filter(|l| l.account_code.as_ref() == "3000")
+            .map(|l| l.credit_cents)
+            .sum();
+        assert_eq!(re_credit_total, 47_000);
+    }
+
+    #[test]
+    fn period_closed_zero_wip_variance_adds_no_lines() {
+        // wip_variance_cents: 0 (the endpoint always stamps the
+        // field) must behave exactly like the field being absent.
+        let id = uuid::Uuid::new_v4();
+        let payload = serde_json::json!({
+            "period_id": "c0000000-0000-0000-0000-000000000012",
+            "period_end": "2026-12-31",
+            "retained_earnings_account": "3000",
+            "revenue_lines": [{ "account_code": "4100", "balance_cents": 100_000 }],
+            "expense_lines": [{ "account_code": "5100", "balance_cents": 60_000 }],
+            "wip_variance_cents": 0,
+            "wip_account": "1310",
+        });
+        let fact_ref = FactRef {
+            id,
+            kind: "finance.period.closed",
+            happened_on: chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+            payload: &payload,
+        };
+        let draft = evaluate(&BossRuleSet, &fact_ref).unwrap();
+        assert!(draft.is_balanced());
+        // DR 4100, CR 5100, CR RE — no 1310 line.
+        assert_eq!(draft.lines.len(), 3);
+        assert!(
+            !draft
+                .lines
+                .iter()
+                .any(|l| l.account_code.as_ref() == "1310"),
+            "zero variance must not emit a WIP line"
+        );
+    }
+
+    #[test]
+    fn period_closed_wip_variance_without_account_is_rejected() {
+        // A non-zero variance with no wip_account is a malformed
+        // fact — refuse rather than guess at the chart.
+        let id = uuid::Uuid::new_v4();
+        let payload = serde_json::json!({
+            "period_id": "c0000000-0000-0000-0000-000000000013",
+            "period_end": "2026-12-31",
+            "retained_earnings_account": "3000",
+            "revenue_lines": [{ "account_code": "4100", "balance_cents": 100_000 }],
+            "expense_lines": [{ "account_code": "5100", "balance_cents": 60_000 }],
+            "wip_variance_cents": 25_000,
+        });
+        let fact_ref = FactRef {
+            id,
+            kind: "finance.period.closed",
+            happened_on: chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+            payload: &payload,
+        };
+        let err = evaluate(&BossRuleSet, &fact_ref).unwrap_err();
+        assert!(
+            matches!(err, LedgerError::InvalidPayload { .. }),
+            "expected InvalidPayload, got {err:?}"
+        );
     }
 
     #[test]
