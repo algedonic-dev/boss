@@ -143,10 +143,22 @@ if (( STRICT )); then
     # events weren't captured by the JetStream stream, so the flow was
     # dead air — no errors, no dead-letters, nothing moved on either
     # side of any invariant. Conservation cannot see a flow that never
-    # fires; only a magnitude floor can. Floors sit far below the
-    # healthy year (~$2M COGS, ~77% GM) so honest model drift clears
-    # them while a dead flow trips loudly.
-    IS_JSON=$(curl -sf -m 10 -H "x-boss-user: $BOSS_USER"         "http://127.0.0.1:7080/api/ledger/income-statement?from=2025-04-01&to=2026-03-31" 2>/dev/null || echo "")
+    # fires; only a magnitude floor can.
+    #
+    # OPEN PERIOD, not full year. A year-end close posts closing
+    # entries that net every prior-year 4xxx/5xxx account to zero, so
+    # any window containing a close silently reads only post-close
+    # activity — the 2026-07-13 capstone run read $2.1M from the old
+    # fixed window here while true full-year COGS was ~$10.5M. Calling
+    # the endpoint with NO params makes the honest read the contract:
+    # the ledger defaults to Jan-1-of-the-sim-clock-year → sim-today,
+    # i.e. the open period. Floor calibration assumes the epoch leaves
+    # a material open tail — the Apr→Mar epoch ends with a full open
+    # quarter (~$2.1M COGS vs the $500K floor). An epoch ending within
+    # days of a Dec-31 close would need a lower floor, not a wider
+    # window (a wider window just re-nets to zero through the close).
+    IS_JSON=$(curl -sf -m 10 -H "x-boss-user: $BOSS_USER" \
+        "http://127.0.0.1:7080/api/ledger/income-statement" 2>/dev/null || echo "")
     if [[ -z "$IS_JSON" ]]; then
         fail "income statement unreachable (ledger 7080)"
     else
@@ -157,16 +169,16 @@ print(sum(r.get('amount_cents',0) for r in d.get('cogs',[])))" 2>/dev/null || ec
         REV_CENTS=$(printf '%s' "$IS_JSON" | python3 -c "
 import json,sys; print(json.load(sys.stdin).get('total_revenue_cents',0))" 2>/dev/null || echo 0)
         if (( COGS_CENTS >= 50000000 )); then
-            ok "full-year COGS: \$$((COGS_CENTS / 100)) (>= \$500,000 floor)"
+            ok "open-period COGS: \$$((COGS_CENTS / 100)) (>= \$500,000 floor)"
         else
-            fail "full-year COGS \$$((COGS_CENTS / 100)) below the \$500,000 floor — a COGS flow is dead (recognition rule not firing?)"
+            fail "open-period COGS \$$((COGS_CENTS / 100)) below the \$500,000 floor — a COGS flow is dead (recognition rule not firing?)"
         fi
         if (( REV_CENTS > 0 )); then
             GM_PCT=$(( (REV_CENTS - COGS_CENTS) * 100 / REV_CENTS ))
             if (( GM_PCT >= 40 && GM_PCT <= 95 )); then
-                ok "gross margin ${GM_PCT}% (sanity band 40-95%)"
+                ok "open-period gross margin ${GM_PCT}% (sanity band 40-95%)"
             else
-                fail "gross margin ${GM_PCT}% outside the 40-95% sanity band — COGS or revenue flow is broken"
+                fail "open-period gross margin ${GM_PCT}% outside the 40-95% sanity band — COGS or revenue flow is broken"
             fi
         fi
     fi
