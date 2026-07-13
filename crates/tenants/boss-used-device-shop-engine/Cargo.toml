@@ -1,6 +1,6 @@
 [package]
 name = "boss-used-device-shop-engine"
-description = "Used-device-shop operating-engine library. Sister crate to boss-brewery-engine — loads the used-device-shop seed bundle (tenant.toml + job_kinds.toml + employees.json), registers every bridge crate's default SideEffectHandlers, and drives the day-loop via run_days_with_handlers."
+description = "Used-device-shop operating-engine library. Sister crate to boss-brewery-engine — loads the used-device-shop seed bundle (tenant.toml + job_kinds.toml + employees.json), registers every bridge crate's default SideEffectHandlers, and drives the day-loop via run_days."
 version.workspace = true
 edition.workspace = true
 

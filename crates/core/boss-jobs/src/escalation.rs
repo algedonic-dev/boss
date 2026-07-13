@@ -290,7 +290,11 @@ async fn send_signal(
         "subject": subject,
         "body": body,
         "kind": "signal",
-        "entity_ref": { "entity_type": "job", "entity_id": job_id },
+        "entity_ref": {
+            "entity_type": "job",
+            "entity_id": job_id,
+            "entity_path": format!("/jobs/{job_id}"),
+        },
     });
     let resp = client
         .post(&url)

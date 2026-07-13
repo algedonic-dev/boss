@@ -227,3 +227,122 @@ async fn get_invoice_after_seeded_returns_same_data() {
     assert_eq!(fetched.id, inv.id);
     assert_eq!(fetched.amount_cents, inv.amount_cents);
 }
+
+// ---------------------------------------------------------------------------
+// POST /api/commerce/invoices/write-off/from-past-due
+//
+// The bad-debt-writeoff counterparty drive. Fires once per
+// `commerce.invoice.past_due` copy the sim receives — ar-aging's
+// internal emission (trigger = the billing step payload) AND the
+// system's webhook copy (the enriched invoice row) — so the adapter
+// resolves either shape and the double delivery converges on one
+// flip + one emitted event. Mirrors from-paid-invoice (#102).
+// ---------------------------------------------------------------------------
+
+fn past_due_fixture(id: &str) -> boss_commerce::types::Invoice {
+    let mut inv = invoice_fixture(id);
+    inv.status = boss_commerce::types::InvoiceStatus::PAST_DUE.into();
+    inv
+}
+
+#[tokio::test]
+async fn write_off_from_past_due_resolves_the_counterparty_chain_shape() {
+    let app = CommerceTestApp::with_invoices(vec![past_due_fixture("inv-step-chain-1")]);
+
+    let resp = TestRequest::post("/api/commerce/invoices/write-off/from-past-due")
+        .json(&serde_json::json!({
+            "trigger": {
+                "trigger": { "step_id": "chain-1", "job_id": "job-77" },
+                "channel": "collections",
+            },
+        }))
+        .send(&app.router)
+        .await;
+
+    resp.assert_status(StatusCode::OK);
+    let event = app.bus.assert_event_emitted("commerce.invoice.written_off");
+    assert_eq!(
+        event.payload.get("id").and_then(|v| v.as_str()),
+        Some("inv-step-chain-1"),
+    );
+}
+
+#[tokio::test]
+async fn write_off_from_past_due_resolves_the_webhook_copy_shape() {
+    let app = CommerceTestApp::with_invoices(vec![past_due_fixture("inv-step-web-1")]);
+
+    let resp = TestRequest::post("/api/commerce/invoices/write-off/from-past-due")
+        .json(&serde_json::json!({
+            "trigger": {
+                "id": "inv-step-web-1",
+                "status": "past-due",
+                "amount_cents": 1_200_000,
+            },
+        }))
+        .send(&app.router)
+        .await;
+
+    resp.assert_status(StatusCode::OK);
+    app.bus.assert_event_emitted("commerce.invoice.written_off");
+}
+
+#[tokio::test]
+async fn write_off_from_past_due_double_delivery_emits_one_event() {
+    let app = CommerceTestApp::with_invoices(vec![past_due_fixture("inv-step-dd-1")]);
+
+    TestRequest::post("/api/commerce/invoices/write-off/from-past-due")
+        .json(&serde_json::json!({
+            "trigger": { "trigger": { "step_id": "dd-1" } },
+        }))
+        .send(&app.router)
+        .await
+        .assert_status(StatusCode::OK);
+
+    TestRequest::post("/api/commerce/invoices/write-off/from-past-due")
+        .json(&serde_json::json!({
+            "trigger": { "id": "inv-step-dd-1", "status": "past-due" },
+        }))
+        .send(&app.router)
+        .await
+        .assert_status(StatusCode::OK);
+
+    assert_eq!(
+        app.bus.events_by_kind("commerce.invoice.written_off").len(),
+        1,
+        "the second drive converges without a duplicate event"
+    );
+}
+
+#[tokio::test]
+async fn write_off_from_past_due_unresolvable_shape_400s() {
+    let app = CommerceTestApp::with_invoices(vec![past_due_fixture("inv-step-x-1")]);
+
+    let resp = TestRequest::post("/api/commerce/invoices/write-off/from-past-due")
+        .json(&serde_json::json!({
+            "trigger": { "note": "no lineage, no id" },
+        }))
+        .send(&app.router)
+        .await;
+
+    resp.assert_status(StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn put_write_off_second_call_converges_without_duplicate_event() {
+    let app = CommerceTestApp::with_invoices(vec![past_due_fixture("inv-step-put-1")]);
+
+    TestRequest::put("/api/commerce/invoices/inv-step-put-1/write-off")
+        .send(&app.router)
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    TestRequest::put("/api/commerce/invoices/inv-step-put-1/write-off")
+        .send(&app.router)
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    assert_eq!(
+        app.bus.events_by_kind("commerce.invoice.written_off").len(),
+        1,
+        "repeat PUT is a converged no-op"
+    );
+}
