@@ -247,17 +247,30 @@ vendor_price_cents = 120
 # + PakTech carrier + label set, ~$3.80/case at 2025 wholesale
 # (~$0.11/can + $0.55 carrier + labels). Before this SKU the
 # seasonal case format consumed only CO2 — the cans were free and
-# its COGS understated by ~17%. Seasonal-only today (~4 releases/yr
-# × 50 cases), so the buffer is small.
+# its COGS understated by ~17%.
+#
+# Demand comes from `[job_rates.seasonal-release]` (tenant.toml):
+# ~30 releases/yr × 50 cases/release ≈ 1,500/yr → ~370 per 90d. An
+# earlier revision sized this off "~4 releases/yr" — 7× under the
+# tenant model — and its reorder_point (50) equaled exactly ONE
+# release's draw, so back-to-back releases raced each 120-case PO
+# and the loser starved past the dispatcher's redelivery budget
+# (3 dead-letters in the first full-year run to reach this SKU;
+# that year saw 34 releases, twice 2 on the same day).
+#
+# Unlike the smooth-draw ingredient SKUs above, this one drains in
+# 50-case lumps, so the reorder point takes a lumpy-draw floor:
+# max(lead cover + 2wk safety ≈ 29 + 58 ≈ 87, THREE releases'
+# draws = 150) — covering the observed same-day double plus one
+# more landing inside the ~7-day PO lead.
 part_sku = "PKG-CAN-12OZ-CS24"
 vendor_category = "packaging"
 bin = "E-03-01"
-on_hand = 150
+on_hand = 350
 allocated = 0
-# 40 lead-time cover + ~2wk safety (60 × 14/90 ≈ 10) = 50.
-reorder_point = 50
-reorder_qty = 120
-trailing_90d_usage = 60
+reorder_point = 150
+reorder_qty = 400
+trailing_90d_usage = 370
 avg_cost_cents = 380
 vendor_price_cents = 380
 
