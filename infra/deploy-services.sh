@@ -231,7 +231,10 @@ emit_paired_config() {
     cat <<EOF
 # Managed by infra/deploy-services.sh — edits will be overwritten.
 postgres_url = "$db_url"
-http_bind = "0.0.0.0:$port"
+# Loopback-only: the gateway is the sole trust boundary and is
+# co-located, so backend ports must not be reachable off-host
+# (SECURITY.md §Deployment trust model).
+http_bind = "127.0.0.1:$port"
 nats_url = "$NATS_URL"
 EOF
     case "$name" in
