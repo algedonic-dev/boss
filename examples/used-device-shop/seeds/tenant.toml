@@ -634,6 +634,17 @@ emit_probability = 1.0
   [counterparty.spares-supplier.payload]
   vendor = "spares-distributor"
 
+  # `ap.payment_acknowledged` is DELIBERATELY UNROUTED — an
+  # acknowledgment-only behavior with no system consumer; the sim
+  # drops it (it shows in the unrouted-topics report by design).
+  # NOTE before ever routing it: post-#100 the trigger topic is
+  # dual-delivered (the parent chain's own emission AND the system
+  # webhook copy via forward-vendor-invoice-to-webhook), so this
+  # followup fires ~twice per vendor invoice. Harmless while
+  # unrouted; a future consumer must converge the double drive
+  # first (the from-paid-invoice / write-off adapters are the
+  # pattern). This tenant is a worked example — modeled to be
+  # plausible, not developed further.
   [[counterparty.spares-supplier.followups]]
   name = "spares-ap-pay"
   listens_to = "inventory.vendor_invoice_received"
@@ -648,8 +659,14 @@ emit_probability = 1.0
     [counterparty.spares-supplier.followups.payload]
     method = "ach"
 
-# Tax authority — closes the loop on the tax-filing pipeline.
-# Same shape as brewery's tax-authority.
+# Tax authority — acks the tax-filing pipeline. (The brewery has no
+# tax-authority counterparty — its tax pipeline is JobKind-driven
+# via the tax-remittance step; an earlier comment here claimed
+# otherwise.) `ledger.tax_filing_acked` is DELIBERATELY UNROUTED —
+# acknowledgment-only, no system consumer; the sim drops it and it
+# shows in the unrouted-topics report by design. Single-drive (the
+# trigger arrives only as the system webhook copy). This tenant is
+# a worked example — modeled to be plausible, not developed further.
 [counterparty.tax-authority]
 listens_to = "ledger.tax_filing_filed"
 emits = "ledger.tax_filing_acked"
