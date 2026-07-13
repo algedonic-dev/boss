@@ -110,7 +110,11 @@ impl Default for DispatcherConfig {
                 .unwrap_or_else(|_| boss_ports::url("clock")),
             calendar_api_url: std::env::var("BOSS_CALENDAR_URL")
                 .unwrap_or_else(|_| boss_ports::url("calendar")),
-            http_bind: format!("0.0.0.0:{}", boss_ports::prod("dispatcher")),
+            // Loopback: the gateway is the sole trust boundary and is
+            // co-located in every deployment (SECURITY.md §Deployment
+            // trust model). BOSS_DISPATCHER_BIND widens deliberately.
+            http_bind: std::env::var("BOSS_DISPATCHER_BIND")
+                .unwrap_or_else(|_| format!("127.0.0.1:{}", boss_ports::prod("dispatcher"))),
             postgres_url: std::env::var("BOSS_POSTGRES_URL")
                 .unwrap_or_else(|_| "postgres://boss:boss@127.0.0.1/boss".to_string()),
             webhook_url: std::env::var("BOSS_EVENT_WEBHOOK_URL").ok(),

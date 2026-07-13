@@ -70,7 +70,11 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or_else(|| boss_ports::prod("policy"));
-    let bind = format!("0.0.0.0:{port}");
+    // Loopback: the gateway is the sole trust boundary and is
+    // co-located in every deployment (SECURITY.md §Deployment
+    // trust model). Set BOSS_POLICY_BIND_HOST to widen deliberately.
+    let host = std::env::var("BOSS_POLICY_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let bind = format!("{host}:{port}");
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {
         Ok(l) => l,

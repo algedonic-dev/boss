@@ -319,7 +319,7 @@ emit_solo_config() {
         sim)
             cat <<EOF
 # Managed by infra/deploy-services.sh — edits will be overwritten.
-http_bind = "0.0.0.0:$port"
+http_bind = "127.0.0.1:$port"
 scratch_postgres_url = "$SCRATCH_DB_URL"
 scratch_api_url = "scratch://127.0.0.1"
 repo_root = "$REPO_ROOT"
@@ -329,7 +329,7 @@ EOF
             cat <<EOF
 # Managed by infra/deploy-services.sh — edits will be overwritten.
 postgres_url = "$PROD_DB_URL"
-http_bind = "0.0.0.0:$port"
+http_bind = "127.0.0.1:$port"
 EOF
             ;;
         ledger)
@@ -342,7 +342,7 @@ EOF
             cat <<EOF
 # Managed by infra/deploy-services.sh — edits will be overwritten.
 postgres_url = "$PROD_DB_URL"
-http_bind = "0.0.0.0:$port"
+http_bind = "127.0.0.1:$port"
 nats_url = "$NATS_URL"
 classes_api_url = "http://127.0.0.1:$(port_of classes prod)"
 EOF
@@ -354,7 +354,7 @@ EOF
             cat <<EOF
 # Managed by infra/deploy-services.sh — edits will be overwritten.
 postgres_url = "$PROD_DB_URL"
-http_bind = "0.0.0.0:$port"
+http_bind = "127.0.0.1:$port"
 nats_url = "$NATS_URL"
 EOF
             ;;
@@ -384,7 +384,7 @@ EOF
             cat <<EOF
 # Managed by infra/deploy-services.sh — edits will be overwritten.
 postgres_url = "$PROD_DB_URL"
-http_bind = "0.0.0.0:$port"
+http_bind = "127.0.0.1:$port"
 repo_root = "$REPO_ROOT"
 EOF
             ;;
@@ -397,7 +397,7 @@ EOF
             cat <<EOF
 # Managed by infra/deploy-services.sh — edits will be overwritten.
 postgres_url = "$PROD_DB_URL"
-http_bind = "0.0.0.0:$port"
+http_bind = "127.0.0.1:$port"
 EOF
             ;;
         accounts)
@@ -408,7 +408,7 @@ EOF
             cat <<EOF
 # Managed by infra/deploy-services.sh — edits will be overwritten.
 postgres_url = "$PROD_DB_URL"
-http_bind = "0.0.0.0:$port"
+http_bind = "127.0.0.1:$port"
 nats_url = "$NATS_URL"
 classes_api_url = "http://127.0.0.1:$(port_of classes prod)"
 assets_api_url = "http://127.0.0.1:$(port_of assets prod)"
@@ -422,7 +422,7 @@ EOF
             cat <<EOF
 # Managed by infra/deploy-services.sh — edits will be overwritten.
 postgres_url = "$PROD_DB_URL"
-http_bind = "0.0.0.0:$port"
+http_bind = "127.0.0.1:$port"
 nats_url = "$NATS_URL"
 EOF
             ;;
@@ -448,7 +448,7 @@ EOF
             # remove [demo_agents] — out of scope for v1 single-VM.
             cat <<EOF
 # Managed by infra/deploy-services.sh — edits will be overwritten.
-bind = "0.0.0.0:$port"
+bind = "127.0.0.1:$port"
 nats_url = "$NATS_URL"
 
 [demo_agents]
@@ -875,6 +875,7 @@ probe_one() {
     local url
     case "$name" in
         docs)          url="http://127.0.0.1:${port}/api/design/health" ;;
+        simulator)     url="http://127.0.0.1:${port}/simulator/api/health" ;;
         observability) url="http://127.0.0.1:${port}/api/health" ;;
         *)             url="http://127.0.0.1:${port}/api/${name}/health" ;;
     esac
