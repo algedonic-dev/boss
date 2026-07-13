@@ -34,28 +34,30 @@ The active workstream order after the costing-fidelity arc (#51–#63),
 the overhead-absorption review cleanup (#73), and the deep-gate
 first-contact fixes (#74). Sorted by dependency, not size.
 
-- [ ] **Full-year regen validation of #73 + #74.** Neither has had the
-      365-day from-empty run (ephemeral machine + all conservation
-      gates). Both changed year-scale behavior: #73's drain now NAKs on
-      failed/partial ledger reads (the matched-count tripwire must
-      *converge* across ~2,500 brews at warp, not dead-letter), and #74
-      changed fact-id derivation for every fact plus the rebuild path
-      (the determinism guard + end-of-year deep check exercise it at
-      scale). Also produces the first steady-state gross-margin read
-      with all the new mechanics (~77% at day 117 live; the full year
-      with FG turnover settles it).
-- [ ] **Costing PR 6 — WIP reconciliation.** The consume-side ~$421K
-      residual isolated by the GR-IR work (moving-average/WIP costing:
-      gl_1300 > physical), plus the per-line drain rounding sweep #73
-      documented at the produce handler's unit-cost derivation (exact
-      per-line conservation needs the produce endpoint to accept a line
-      total instead of a unit cost).
-- [ ] **Overhead rates as dispatcher rule args × the step's bbl.** The
-      excise-accrual pattern (`ledger.tax.accrue`: rate as a rule arg,
-      multiplied by the step's actual metadata at runtime), applied to
-      absorption — retires the 15 hand-multiplied `amount_cents`
-      constants in the brewery seed. The seed test pinning
-      amount == rate × batch_bbl holds the contract until then.
+- [x] **Full-year regen validation of #73 + #74** — done 2026-07-13:
+      the capstone 365-day from-empty run (run 3, ephemeral VM)
+      passed every gate. 0 dead-letters + 0 transient redeliveries;
+      determinism live == rebuilt; deep replay 267,209 facts /
+      267,146 entries, 0 divergences; conservation N + P exact to
+      the cent (1300 ≡ raw $3,718,828.00; 1320 ≡ FG $3,019,403.03);
+      full-year P&L rev ~$42.4M / COGS ~$10.5M / GM 75.2%. Runs 1–2
+      surfaced two fixes along the way (#104 write-off dual-shape
+      adapter, #109 case-packaging buffer); evidence posted on both.
+- [x] **Costing PR 6 — WIP reconciliation** — landed as the
+      value-primary costing arc (6a/6b): inventory rows carry the
+      line-total `value_cents` as primary, and the GL reconciles
+      against Σ value_cents exactly on both sides (invariants N +
+      P; run-3 evidence above, to the cent). The remaining 1310
+      balance is the year-end WIP-variance close item below — a
+      close-rule gap, not a costing residual.
+- [x] **Overhead rates as dispatcher rule args × the step's bbl** —
+      done: `infra/dispatcher/rules.toml` carries `rate_cents_per_bbl`
+      args on the three `inventory.overhead.absorb` rules (direct
+      labor → 6100, process utilities → 6300, production
+      depreciation → 6900), multiplied by the step's actual bbl at
+      runtime — the excise pattern. The
+      `overhead_absorption_rules_agree` test pins the absorb-args ↔
+      produce-drain-set contract.
 - [x] **`HandlerError::Permanent`** — done. The house contract does
       the classification: services answer **422** for deterministic
       request-data errors (seed typos, malformed bodies), and the
@@ -123,31 +125,17 @@ public cut. Each removal needs a small decision before landing.
       Deleted (~500 LoC). The mtbf/win-prob model registry rows stay —
       declared phase-two catalog candidates, plugin-less by design.
 
-- [ ] **BC-tail: remaining safe-delete items deferred for bulky
-      callsite work.** Each is mechanical but touches enough call
-      sites that landing the tranche needs a dedicated pass:
-      - **`run_days` shim** in `boss-sim/engines/day_runner.rs`
-        — rename `run_days_with_handlers` → `run_days`, drop the
-        shim + the `run_days_legacy_path_dispatches_nothing`
-        test.
-      - **`SubjectCadence::fires_on(day)`** in
-        `boss-sim/shape_driven/tenant.rs` — inline into
-        `fires_on_tick`, drop the public method, update ~10 test
-        callsites.
-      - **`sku` ↔ `part_sku` serde aliases** across
-        `boss-inventory-sim-bridge` + `boss-shipping` — pick one
-        canonical name.
-      - **`paginated.normalise` bare-array fallback** in
-        `apps/web/src/data/paginated.ts` — confirm every
-        paginated endpoint returns the envelope shape before
-        removing.
-      - **`entity_path` inbox fallback** in `boss-messages` + SPA
-        `InboxPage.svelte` — confirm every emitter sets
-        `entity_path` before dropping the dispatcher.
-      - **`commerce.paid_on` `_day` alias** is currently load-
-        bearing (counterparty trigger uses `inject_day`); keep
-        until the sim retires the `_day` injection path. Not
-        back-compat — leave alone.
+- [x] **BC-tail: remaining safe-delete items** — landed as #103
+      (2026-07-12): `run_days` shim dropped (rename landed),
+      `SubjectCadence::fires_on(day)` inlined into `fires_on_tick`,
+      `sku` ↔ `part_sku` serde aliases dropped (one canonical
+      name), `paginated.normalise` bare-array fallback removed
+      (the envelope is the only accepted shape), `entity_path`
+      emitters fixed + the inbox fallback dropped. One survivor,
+      deliberately: **`commerce.paid_on` `_day` alias** is
+      load-bearing (counterparty trigger uses `inject_day`); keep
+      until the sim retires the `_day` injection path. Not
+      back-compat — leave alone.
 
 ---
 
@@ -225,7 +213,14 @@ which one matters first.
       one of those stamps wallclock `Utc::now()` for the resulting
       `financial_facts.happened_on`, so the live sim's facts would
       collapse onto install-day instead of the sim's timeline and
-      break every date-keyed report.
+      break every date-keyed report. Concrete evidence of the class
+      (2026-07-13): a full-stack service restart left 10 audit rows
+      wall-stamped via the clock-client fallback
+      (`boss-clock-client/src/lib.rs:289`) while clock-api was
+      mid-restart — outside the epoch, wiped at the next reset.
+      Same failure shape, different entry point: time must thread
+      from the triggering event, not be re-fetched (or defaulted)
+      at emit time.
 
 - [ ] **Remaining "synthesized-amount" structural issues in the
       ledger.** Same bug-class as the `invoice_issued` COGS
@@ -279,20 +274,21 @@ which one matters first.
       `period_closed_writes_wip_variance_to_retained_earnings` is
       `#[ignore]`d pending this; un-ignore it when the posting
       lands. Decide whether the WIP account (1310) is hardcoded or
-      payload-driven before implementing.
+      payload-driven before implementing. Concrete case from the
+      2026-07-13 capstone year run: the Dec-31 close left
+      $42,859.20 sitting on 1310 — exactly the balance this
+      close-out should write off.
 
-- [ ] **Conservation-P: finished-goods cost-basis reconciliation
-      (consume-side).** `finished_product_inventory.production_cost_cents`
-      is an integer-rounded moving weighted average
-      (`boss-products/{in_memory,postgres}.rs`) while the GL tracks exact
-      transaction costs, so 1320 can diverge from physical-on-hand-at-cost
-      by a small percentage. Fix shape: per-SKU `GL − (on_hand × cost)`
-      diff on a fresh regen to attribute the drift, then decide whether
-      the basis reconciles to exact cost or the closure check tolerates
-      rounding. **Distinct** from the WIP-variance close above (that's the
-      1310 residual; this is the 1320 cost-basis drift), and **coupled to
-      costing PR4** (production-drivers-into-COGS changes the FG basis) —
-      land after PR4 so the reconciliation targets the final basis.
+- [x] **Conservation-P: finished-goods cost-basis reconciliation
+      (consume-side)** — resolved by the value-primary costing arc,
+      and it settled the open decision the stronger way: the
+      closure is EXACT, not tolerance-based. Invariant P
+      (`infra/lint/conservation-invariants.sh`) asserts GL 1320 ≡
+      Σ `value_cents` over live FG rows — value-primary rows made
+      the physical side an integer sum, so the moving-average
+      rounding class this item described no longer exists. The
+      2026-07-13 capstone year run held it to the cent
+      ($3,019,403.03) across a 267K-fact year.
 
 - [ ] **Sales-tax accrual on retail / taproom invoices.** The
       brewery's wholesale invoices are tax-exempt (resale), but

@@ -57,17 +57,46 @@
 #      Both ≠ 0 with RE = 0 means no period-end close has
 #      rolled income-statement balances to equity, which leaves
 #      the Balance Sheet structurally out of balance.
-#   N. (deferred to v1.1) WIP balance non-negative — would hold
-#      only with a burden-absorption JE that doesn't exist yet.
-#      See the inline note where the invariant body lives.
-#   O. Finished-goods GL balance non-negative — same shape as
-#      G/N but on 1320. A credit balance means COGS recognition
+#   K. Payroll-liability accrual ≥ remittance (account 2150) —
+#      can't remit withholding that was never accrued.
+#   L. Deferred-revenue draw-down ≤ accrual (account 2200) —
+#      recognition can't outrun the deferral it draws from.
+#   M. Bill JE amount equals Σ(line qty × unit_cost) — a bill's
+#      GL posting must reconcile to its own line items.
+#   N. Raw inventory GL balance ≡ Σ value_cents — EXACT closure
+#      between 1300 and the physical inventory_items rows;
+#      value-primary rows (PR 6a) make the band zero. (The old
+#      N — WIP non-negative, deferred pending burden absorption
+#      — became Q's roughly-zero check once absorption shipped;
+#      the letter was reused for this exact closure.)
+#   O. Finished-goods GL balance non-negative — same shape as G
+#      but on 1320. A credit balance means COGS recognition
 #      out-paced the WIP→FG transfers + opening balance.
-#   P. FG GL ≡ Σ(on_hand × production_cost_cents) — closure
-#      between Model B's balance-sheet number (1320) and the
-#      physical inventory rows. Drift = a products.produce or
-#      products.consume call mutated on_hand without emitting
-#      the paired ledger fact.
+#   P. FG GL balance ≡ Σ value_cents — EXACT closure between
+#      1320 and the physical finished_product_inventory rows;
+#      same value-primary contract as N. Drift = a
+#      products.produce or products.consume call mutated
+#      on_hand without emitting the paired ledger fact (or a JE
+#      that missed its mutation).
+#   Q. WIP balance roughly zero — parts.consume capitalizes
+#      material into 1310, the overhead-absorb rules capitalize
+#      burden, produce drains actual WIP; what remains should
+#      be in-flight brews only.
+#   R. Batch consume ⊃ produce — no FG appears without raw
+#      input; every produce leg's batch has matching consume
+#      legs.
+#   S. Balance-sheet endpoint A = L + E — the report's own
+#      aggregation satisfies the accounting equation (HTTP
+#      check, not SQL; JE-level balance is invariant A).
+#   V. Cash GL balance non-negative — cash going negative means
+#      a payment rule posts against 1000 without cover.
+#   W. Expected-opening assets each have a seed JE — every
+#      opening balance the seed promises exists as a real
+#      journal entry.
+#
+#   (T and U are reserved: the income-statement and cash-flow
+#   endpoints' structural audits — the S pattern applied to the
+#   sibling reports. Tracked in TODO.md.)
 #
 # Usage:
 #   PGPASSWORD=boss infra/lint/conservation-invariants.sh
@@ -307,22 +336,15 @@ SELECT 'lines_sum=' || lines_sum || ' lump=' || lump_cents
 SQL
 )"
 
-# ---- N. (intentionally skipped — see header note) ----
-# 2026-05-26: the obvious "1310 WIP non-negative" check can't
-# hold in Model B as written. parts.consume credits 1300 / debits
-# 1310 at *material* cost (cheap raw ingredients), while
-# products.produce debits 1320 / credits 1310 at *standard* FG
-# cost (which bakes in expected production overhead). The gap is
-# real production value-add that lives in overhead drivers,
-# expected to be absorbed via a paired "burden applied" JE
-# (DR 1310 / CR expense per driver) on every brew step. Until
-# that absorption rule lands, 1310 runs structurally negative
-# in proportion to throughput.
-#
-# Tracking as a v1.1 follow-up rather than a v1 blocker; the
-# Model B closure check that actually matters is P (FG GL ≡
-# physical inventory at cost), which DOES hold. Re-enable N
-# once boss-ledger has a `finance.burden.applied` rule.
+# ---- (historical: N's original slot — resolved) ----
+# The "1310 WIP non-negative" check originally deferred here
+# couldn't hold before burden absorption existed: parts.consume
+# capitalizes material cost into WIP while products.produce
+# drains at FG cost, so 1310 ran structurally negative in
+# proportion to throughput. The `inventory.overhead.absorb`
+# rules landed the absorption JEs; the WIP check now lives
+# below as Q (roughly zero), and the letter N was reused for
+# the raw-value closure (1300 ≡ Σ value_cents), also below.
 
 # ---- O. Finished-goods GL (1320) balance non-negative ----
 # Same shape as G/N but on the finished-goods account. A credit
