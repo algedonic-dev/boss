@@ -43,6 +43,15 @@ pub async fn inject_role_headers(
     mut req: Request,
     next: Next,
 ) -> Response {
+    // Edge strip, before anything else: the gateway is the SOLE
+    // authority for `x-boss-*` identity headers — backends trust
+    // them verbatim. Injection alone only overwrites the four
+    // canonical names, and only when a session exists; a
+    // session-less request (or a name the injector doesn't set)
+    // would otherwise carry a client-forged value straight through
+    // the proxy. See SECURITY.md §Deployment trust model.
+    strip_boss_headers(req.headers_mut());
+
     if let Some(session) = extract_session(&req, &state.session_key) {
         // Demo-mode persona override. The SPA writes a `boss-persona`
         // cookie when "View As" picks an employee; we use it as the
@@ -77,6 +86,19 @@ pub async fn inject_role_headers(
     }
 
     next.run(req).await
+}
+
+/// Remove every inbound `x-boss-*` header. HeaderName is always
+/// lowercase in the http crate, so the prefix match is total.
+fn strip_boss_headers(headers: &mut axum::http::HeaderMap) {
+    let inbound: Vec<axum::http::HeaderName> = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with("x-boss-"))
+        .cloned()
+        .collect();
+    for name in inbound {
+        headers.remove(&name);
+    }
 }
 
 const PERSONA_COOKIE: &str = "boss-persona";
@@ -203,5 +225,110 @@ mod tests {
         session.employee_id = Some("emp-001".to_string());
         let json = build_user_json(&session, None);
         assert!(json.contains("\"id\":\"emp-001\""), "got: {json}");
+    }
+
+    #[test]
+    fn strip_boss_headers_removes_every_x_boss_name_only() {
+        let mut headers = axum::http::HeaderMap::new();
+        for (n, v) in [
+            ("x-boss-user", "{\"id\":\"attacker\"}"),
+            ("x-boss-role", "platform-admin"),
+            ("x-boss-not-yet-invented", "1"),
+            ("content-type", "application/json"),
+            ("cookie", "a=b"),
+        ] {
+            headers.insert(n, axum::http::HeaderValue::from_static(v));
+        }
+        strip_boss_headers(&mut headers);
+        assert!(
+            !headers.keys().any(|k| k.as_str().starts_with("x-boss-")),
+            "x-boss-* survived: {headers:?}"
+        );
+        assert!(headers.contains_key("content-type"));
+        assert!(headers.contains_key("cookie"));
+    }
+
+    // --- Middleware-level: the strip-then-inject ordering is the
+    // security property, so pin it through a probe router. ---
+
+    const TEST_KEY: &[u8] = b"role-headers-test-key-0123456789";
+
+    async fn probe(headers: axum::http::HeaderMap) -> String {
+        let mut seen: Vec<String> = headers
+            .iter()
+            .filter(|(n, _)| n.as_str().starts_with("x-boss-"))
+            .map(|(n, v)| format!("{}={}", n, v.to_str().unwrap_or("?")))
+            .collect();
+        seen.sort();
+        if seen.is_empty() {
+            "none".to_string()
+        } else {
+            seen.join(";")
+        }
+    }
+
+    fn probe_app() -> axum::Router {
+        let state = Arc::new(crate::AppState {
+            session_key: TEST_KEY.to_vec(),
+            proxy_client: reqwest::Client::new(),
+            perf: Arc::new(crate::perf::PerfCollector::new()),
+            demo_mode: false,
+        });
+        axum::Router::new()
+            .route("/probe", axum::routing::get(probe))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                inject_role_headers,
+            ))
+    }
+
+    async fn probe_response(app: axum::Router, req: Request<axum::body::Body>) -> String {
+        use tower::ServiceExt;
+        let resp = app.oneshot(req).await.expect("probe request");
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("probe body");
+        String::from_utf8(body.to_vec()).expect("utf8 body")
+    }
+
+    #[tokio::test]
+    async fn forged_identity_headers_do_not_survive_the_edge() {
+        let req = Request::builder()
+            .uri("/probe")
+            .header(
+                "x-boss-user",
+                r#"{"id":"attacker","role":"platform-admin"}"#,
+            )
+            .header("x-boss-role", "platform-admin")
+            .header("x-boss-access-tier", "operator")
+            .header("x-boss-not-yet-invented", "1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let seen = probe_response(probe_app(), req).await;
+        assert_eq!(seen, "none", "forged headers reached the backend: {seen}");
+    }
+
+    #[tokio::test]
+    async fn session_identity_wins_over_forged_headers() {
+        let mut session = Session::new("real@example.com", 3600);
+        session.employee_id = Some("emp-001".to_string());
+        session.role = Some("brewmaster".to_string());
+        let cookie = format!("{}={}", session::COOKIE_NAME, session.encode(TEST_KEY));
+
+        let req = Request::builder()
+            .uri("/probe")
+            .header(header::COOKIE, cookie)
+            .header(
+                "x-boss-user",
+                r#"{"id":"attacker","role":"platform-admin"}"#,
+            )
+            .header("x-boss-employee-id", "emp-attacker")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let seen = probe_response(probe_app(), req).await;
+        assert!(
+            seen.contains("\"id\":\"emp-001\"") && !seen.contains("attacker"),
+            "session identity must replace the forged headers, got: {seen}"
+        );
     }
 }

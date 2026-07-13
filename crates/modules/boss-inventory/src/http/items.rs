@@ -257,7 +257,11 @@ async fn send_low_stock_alert(part_sku: &str, body: &str) -> Result<(), String> 
         "subject": format!("Low stock alert: {part_sku}"),
         "body": body,
         "kind": "signal",
-        "entity_ref": { "entity_type": "part", "entity_id": part_sku },
+        "entity_ref": {
+            "entity_type": "part",
+            "entity_id": part_sku,
+            "entity_path": format!("/parts/{part_sku}"),
+        },
     });
     let resp = client
         .post("http://127.0.0.1:7200/api/messages/send")

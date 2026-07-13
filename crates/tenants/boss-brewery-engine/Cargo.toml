@@ -1,6 +1,6 @@
 [package]
 name = "boss-brewery-engine"
-description = "Brewery operating-engine binary. Loads the brewery seed bundle, registers every bridge crate's default SideEffectHandlers, and drives the day-loop via run_days_with_handlers — the production wire-up that flips the protocol-proofs from `tested` to `running`. See docs/design/correctness-protocol.md."
+description = "Brewery operating-engine binary. Loads the brewery seed bundle, registers every bridge crate's default SideEffectHandlers, and drives the day-loop via run_days — the production wire-up that flips the protocol-proofs from `tested` to `running`. See docs/design/correctness-protocol.md."
 version.workspace = true
 edition.workspace = true
 

@@ -22,7 +22,7 @@ struct LineItemInput {
     description: Option<String>,
     #[serde(default)]
     ref_id: Option<String>,
-    #[serde(default, alias = "sku", alias = "product_sku")]
+    #[serde(default)]
     sku: Option<String>,
     #[serde(default)]
     qty: Option<i32>,

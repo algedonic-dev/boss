@@ -91,51 +91,6 @@
     }
   }
 
-  // Resolve the SPA path for a message's entity reference. The
-  // message payload's `entity_path` is the canonical source of
-  // truth — producers populate it directly. The legacy fallback
-  // dispatch on `entity_type` survives for messages emitted
-  // before producers started populating the field; it's
-  // tenant-agnostic by design but every new tenant kind has to
-  // teach the dispatcher unless its messages carry entity_path.
-  function resolveEntityPath(
-    ref: { entity_type: string; entity_id: string; entity_path?: string | null },
-  ): string | null {
-    if (ref.entity_path) return ref.entity_path;
-    return entityPathFromType(ref.entity_type, ref.entity_id);
-  }
-
-  function entityPathFromType(type: string, id: string): string | null {
-    switch (type) {
-      // Generic across tenants.
-      case 'job':
-        return `/jobs/${encodeURIComponent(id)}`;
-      case 'account':
-        return `/accounts/${encodeURIComponent(id)}`;
-      case 'vendor':
-        return `/vendors/${encodeURIComponent(id)}`;
-      case 'shipment':
-        return `/shipping/${encodeURIComponent(id)}`;
-      case 'employee':
-        return `/people/${encodeURIComponent(id)}`;
-      case 'invoice':
-        return `/finance/invoices/${encodeURIComponent(id)}`;
-      case 'part':
-        return `/parts/${encodeURIComponent(id)}`;
-      case 'opportunity':
-        return `/sales/${encodeURIComponent(id)}`;
-      // Used-device-shop tenant.
-      case 'ticket':
-        return `/service/${encodeURIComponent(id)}`;
-      case 'device':
-        return `/assets/${encodeURIComponent(id)}`;
-      case 'refurb-job':
-        return `/refurb/${encodeURIComponent(id)}`;
-      default:
-        return null;
-    }
-  }
-
   function formatAge(iso: string): string {
     const diff = appNow().getTime() - new Date(iso).getTime();
     const hours = Math.floor(diff / (1000 * 60 * 60));
@@ -305,8 +260,12 @@
                 {m.subject}
               </div>
               <div class="inbox-body">{m.body}</div>
+              <!-- `entity_path` is the producer-owned SPA link: every
+                   emitter that attaches an entity_ref populates it, so
+                   the inbox never has to know tenant route shapes. A
+                   missing path renders as plain text, not a link. -->
               {#if m.entity_ref}
-                {@const path = resolveEntityPath(m.entity_ref)}
+                {@const path = m.entity_ref.entity_path ?? null}
                 <div class="inbox-entity">
                   {#if path}
                     <a

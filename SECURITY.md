@@ -67,21 +67,28 @@ forwards it to backend services as an `x-boss-user` header, which
 the services trust verbatim. Real per-service auth has not landed
 yet (see the *Integrated IAM* item in [`TODO.md`](TODO.md)).
 
-The load-bearing consequence: **the gateway must be the only thing
-that can reach the backend service ports.** A client that can talk
-to a backend port directly can set its own `x-boss-user` and assume
-any identity. So:
+The gateway strips every inbound `x-boss-*` header at its edge
+before injecting the session-derived identity, so a client cannot
+smuggle identity headers *through* the gateway — with or without a
+valid session.
+
+The load-bearing consequence that remains: **the gateway must be
+the only thing that can reach the backend service ports.** A client
+that can talk to a backend port directly can set its own
+`x-boss-user` and assume any identity. So:
 
 - **Do not publish backend ports.** The Docker quickstart already
   does this correctly — only the gateway port (`4443`) is published;
   the backends are reachable only on the internal compose network.
-- **On bare-metal / systemd installs**, bind backends to
-  `127.0.0.1` (the gateway is co-located) or firewall their ports.
-  The sample configs bind `0.0.0.0` for flexibility — tighten this
-  before exposing the host to an untrusted network.
+- **On bare-metal / systemd installs**, backends bind to
+  `127.0.0.1` (the gateway is co-located) — this is what
+  `infra/deploy-services.sh` emits. If you hand-write configs or
+  need a multi-host topology, firewall the backend ports; multi-host
+  gets a real IAM story before it gets `0.0.0.0`.
 - **Front the gateway with a proxy/IDP** (Cloudflare Access,
-  Authelia, etc.) for any internet-facing deployment, and make sure
-  it strips inbound `x-boss-*` headers from clients.
+  Authelia, etc.) for any internet-facing deployment. Its stripping
+  of `x-boss-*` is no longer load-bearing (the gateway strips at its
+  own edge), but keep it on as defense-in-depth.
 
 This is a known, deliberate limitation of the preliminary release,
 not a defect — but mis-deploying around it is the most likely way
