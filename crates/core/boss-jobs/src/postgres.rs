@@ -1128,6 +1128,18 @@ async fn run_restart_epoch_background(
         .begin()
         .await
         .map_err(|e| JobsError::Storage(format!("begin trim tx: {e}")))?;
+    // Outbox first, deliberately: at restart time every outbox row is
+    // the finished epoch's by definition, so pending rows must die
+    // with it rather than relay into the new epoch. TRUNCATE takes
+    // ACCESS EXCLUSIVE, so it queues behind any in-flight relay batch
+    // (its FOR UPDATE row locks) — and any audit rows that batch
+    // committed carry ids ≤ this moment, so the DELETE below removes
+    // them. Ordering the truncate before the audit trim is what makes
+    // a racing relay harmless.
+    sqlx::query("TRUNCATE event_outbox")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(format!("truncate event_outbox: {e}")))?;
     sqlx::query("ALTER TABLE audit_log DISABLE TRIGGER audit_log_reject_row_mutation_trg")
         .execute(&mut *tx)
         .await

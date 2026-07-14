@@ -13,7 +13,7 @@ edition.workspace = true
 # silently skipped.
 default = ["bin"]
 postgres = ["dep:sqlx", "dep:axum", "dep:async-stream", "dep:futures", "dep:tokio-stream"]
-bin = ["postgres", "dep:anyhow", "dep:clap", "dep:tracing-subscriber", "dep:hex"]
+bin = ["postgres", "dep:anyhow", "dep:clap", "dep:tracing-subscriber", "dep:hex", "dep:boss-nats"]
 events-api = ["bin"]
 
 [dependencies]
@@ -37,6 +37,7 @@ clap = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 toml = { version = "0.8" }
 hex = { version = "0.4", optional = true }
+boss-nats = { path = "../boss-nats", optional = true }
 
 [[bin]]
 name = "boss-audit-integrity-check"
@@ -47,6 +48,11 @@ required-features = ["bin"]
 name = "boss-events-api"
 path = "src/bin/boss_events_api.rs"
 required-features = ["events-api"]
+
+[[bin]]
+name = "boss-event-relay"
+path = "src/bin/boss_event_relay.rs"
+required-features = ["bin"]
 
 [dev-dependencies]
 boss-testing = { path = "../boss-testing", features = ["postgres"] }
