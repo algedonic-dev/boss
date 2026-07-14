@@ -10,6 +10,8 @@ pub mod integrity;
 pub mod ledger;
 #[cfg(feature = "postgres")]
 pub mod messages_events_pg;
+#[cfg(feature = "postgres")]
+pub mod outbox;
 pub mod queue;
 pub mod registry;
 #[cfg(feature = "postgres")]

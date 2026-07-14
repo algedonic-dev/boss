@@ -168,7 +168,15 @@ TIMERS=(
 # v1.0.10 F15: boss-step-effects-runner retired — step-completion
 # side effects now route through the dispatcher's rule registry
 # (infra/dispatcher/rules.toml).
-DAEMONS=()
+#
+# boss-event-relay: drains the transactional event outbox into
+# audit_log + NATS (docs/design/transactional-audit-log.md). Inert
+# until an emitter is migrated to record_event_in_tx, but deployed
+# from day one so the pipeline never hits the
+# service-outside-the-deploy-list rot class (cybernetics, 2026-07-13).
+DAEMONS=(
+    "boss-event-relay:events"
+)
 
 port_of() {
     local name="$1" env="$2"

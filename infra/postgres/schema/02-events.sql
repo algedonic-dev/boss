@@ -80,7 +80,15 @@ CREATE INDEX IF NOT EXISTS audit_log_source ON audit_log(source);
 
 CREATE INDEX IF NOT EXISTS audit_log_timestamp ON audit_log(timestamp DESC);
 
-CREATE INDEX IF NOT EXISTS audit_log_event_id ON audit_log(event_id);
+-- UNIQUE: the outbox relay's idempotence backstop — a crash between
+-- its audit INSERT and its outbox mark must not double-insert on
+-- retry (the relay pre-checks with NOT EXISTS; this constraint makes
+-- a race a loud error instead of a silent duplicate). Emitters mint
+-- a fresh UUID per event, so uniqueness holds for every legacy write
+-- path too (verified 0 duplicates on the live playground log,
+-- 2026-07-13). Replaces the earlier non-unique audit_log_event_id.
+DROP INDEX IF EXISTS audit_log_event_id;
+CREATE UNIQUE INDEX IF NOT EXISTS audit_log_event_id_unique ON audit_log(event_id);
 
 
 -- Layer 1 of the immutable-audit-log story
@@ -285,5 +293,51 @@ DROP TRIGGER IF EXISTS audit_log_check_refs_trg ON audit_log;
 
 CREATE TRIGGER audit_log_check_refs_trg
     BEFORE INSERT ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION audit_log_check_refs();
+
+
+-- ---------------------------------------------------------------------------
+-- Transactional event outbox
+-- (docs/design/transactional-audit-log.md — Option B).
+--
+-- A state-changing operation INSERTs its event here INSIDE the same
+-- transaction as the state change, so the durable hand-off is atomic:
+-- either both commit or neither. The single relay
+-- (`boss-event-relay`) drains rows in id order, inserts them into
+-- audit_log (where the chain-hash trigger runs exactly as today —
+-- one writer, no lock contention) and publishes to NATS, then stamps
+-- `delivered_at`. Plain BIGSERIAL — deliberately NO chain trigger and
+-- NO global advisory lock here; holding the chain lock for a domain
+-- transaction's lifetime would serialize every writer in the system.
+CREATE TABLE IF NOT EXISTS event_outbox (
+    id           BIGSERIAL PRIMARY KEY,
+    event_id     UUID NOT NULL UNIQUE,
+    timestamp    TIMESTAMPTZ NOT NULL,
+    source       TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    payload      JSONB NOT NULL DEFAULT '{}',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- NULL = pending; the relay stamps this only after the audit
+    -- INSERT is committed AND the NATS publish succeeded, so a crash
+    -- anywhere retries the row (audit side is idempotent by
+    -- event_id, consumers are idempotent by the NAK-redelivery
+    -- contract).
+    delivered_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS event_outbox_pending
+    ON event_outbox(id) WHERE delivered_at IS NULL;
+
+-- Referential guarding runs HERE, inside the domain transaction —
+-- same rules table, same function as the audit_log trigger. A
+-- payload referencing a missing projection row now ABORTS the whole
+-- domain write (the correct outcome the audit-side trigger could
+-- never deliver post-commit: it punched provenance holes instead —
+-- the 2026-07-13 phantom-account incident). The audit_log-side
+-- trigger stays as belt-and-braces for the relay + legacy writers.
+DROP TRIGGER IF EXISTS event_outbox_check_refs_trg ON event_outbox;
+
+CREATE TRIGGER event_outbox_check_refs_trg
+    BEFORE INSERT ON event_outbox
     FOR EACH ROW EXECUTE FUNCTION audit_log_check_refs();
 
