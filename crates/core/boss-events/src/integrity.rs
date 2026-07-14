@@ -90,11 +90,21 @@ pub struct IntegrityReport {
     pub regressions: Vec<CreatedAtRegression>,
     pub chain_breaks: Vec<ChainBreak>,
     pub dangling_refs: Vec<DanglingForeignRef>,
+    /// The one id gap a demo deployment is ALLOWED to have: the
+    /// epoch-restart trim deletes every row past
+    /// `sim_clock.epoch_baseline_audit_id` while the id sequence
+    /// keeps counting, so the gap that STARTS at the baseline row is
+    /// by-design, every epoch. Reported here — visible, never
+    /// silently dropped — instead of in `gaps`. `None` when there is
+    /// no baseline (non-demo deployments, fresh DBs) or no gap at
+    /// it. Any gap anywhere else stays an anomaly in `gaps`.
+    pub sanctioned_trim_gap: Option<IdGap>,
 }
 
 impl IntegrityReport {
     /// True when no gaps, regressions, chain breaks, or dangling
-    /// foreign refs were observed.
+    /// foreign refs were observed. A `sanctioned_trim_gap` does not
+    /// dirty the report — it is the epoch trim working as designed.
     pub fn is_clean(&self) -> bool {
         self.gaps.is_empty()
             && self.regressions.is_empty()
@@ -129,13 +139,39 @@ pub async fn check_audit_log_integrity(pool: &PgPool) -> Result<IntegrityReport,
     .fetch_all(pool)
     .await?;
 
+    // The epoch baseline, when this deployment has one. The demo's
+    // restart_epoch trims audit_log back to this id every rollover
+    // (boss-jobs restart_epoch), which legitimately leaves ONE gap
+    // starting exactly at the baseline row. `sim_clock` may not
+    // exist at all outside demo/sim deployments — treat an
+    // undefined-table error the same as no baseline rather than
+    // failing the scan.
+    let epoch_baseline: Option<i64> = match sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT epoch_baseline_audit_id FROM sim_clock WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(row) => row.flatten(),
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("42P01") => None,
+        Err(e) => return Err(e),
+    };
+
     let mut gaps = Vec::new();
+    let mut sanctioned_trim_gap = None;
     let mut regressions = Vec::new();
     for (id, prev_id, created_at, prev_created_at) in rows {
         if let Some(prev_id) = prev_id
             && id - prev_id > 1
         {
-            gaps.push(IdGap { prev_id, id });
+            let gap = IdGap { prev_id, id };
+            if epoch_baseline == Some(prev_id) {
+                // At most one gap can start at any given prev_id, so
+                // this arm assigns at most once per scan.
+                sanctioned_trim_gap = Some(gap);
+            } else {
+                gaps.push(gap);
+            }
         }
         if let Some(prev_created_at) = prev_created_at
             && created_at < prev_created_at
@@ -155,6 +191,7 @@ pub async fn check_audit_log_integrity(pool: &PgPool) -> Result<IntegrityReport,
     Ok(IntegrityReport {
         total_rows: total_rows.0,
         gaps,
+        sanctioned_trim_gap,
         regressions,
         chain_breaks,
         dangling_refs,
