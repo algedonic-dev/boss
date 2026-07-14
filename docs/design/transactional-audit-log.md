@@ -148,17 +148,21 @@ control against which A/B are judged.
 **Option B**, phased:
 
 1. **(done)** #115 — failures loud.
-2. Outbox table + `record_event_in_tx(&mut tx, event)` helper
-   mirroring `record_fact_in_tx`; migrate the fact-adjacent
-   emitters first (commerce, ledger, inventory, products — the
-   paths the correctness protocol guards).
-3. The relay (drain → audit INSERT → NATS publish → ack), plus the
-   deep-check watermark.
-4. Move ref-check rules to the outbox trigger; keep the audit-side
-   trigger as belt-and-braces.
-5. Migrate the remaining emitters; `DomainPublisher` keeps its
-   post-commit path only for kinds classified observational (see
-   Q3).
+2. **(done, phase-1 PR)** Foundation, inert until an emitter
+   migrates: `event_outbox` table + ref-check trigger on it (same
+   rules table + function as the audit-side trigger, which stays as
+   belt-and-braces) + `outbox::record_event_in_tx` +
+   `outbox::drain_outbox_once` + the `boss-event-relay` daemon
+   (deployed via the DAEMONS list) + the epoch-trim TRUNCATE
+   ordering (see Q4's resolution).
+3. Migrate the fact-adjacent emitters first (commerce, ledger,
+   inventory, products — the paths the correctness protocol
+   guards), each service a reviewable PR; add the deep-check
+   watermark when the first emitter lands (the check must not read
+   a state/log pair mid-hand-off).
+4. Migrate the remaining rebuild-consumed emitters + the
+   kind-classification lint (Q3's rule); `DomainPublisher` keeps
+   its post-commit path only for observational kinds.
 
 Each phase lands behind the usual gates and a from-empty regen; the
 deep replay-check is the acceptance test throughout — its
@@ -169,13 +173,30 @@ playground's nightly timer).
 
 *(tracker-managed; resolutions land here)*
 
-### Q1: Is the relay a new binary, or does the dispatcher grow the role?
-
-The relay is dispatcher-shaped (consume, act, ack). A separate tiny
-binary keeps the dispatcher's mandate clean ("runs step side-effect
-rules") and lets the relay ship first; folding it into
-boss-dispatcher avoids a fourth daemon on small installs. Leaning
-separate-binary-first, merge-later-if-it-earns-it.
+- **Q1 — relay shape (resolved 2026-07-14, phase-1 PR):** separate
+  binary, `boss-event-relay` (boss-events `bin` feature), wired into
+  `deploy-services.sh`'s DAEMONS list from day one so it never joins
+  the service-outside-the-deploy-list rot class. Folding into
+  boss-dispatcher stays open as a later simplification if a fourth
+  daemon proves annoying on small installs.
+- **Q3 — transactional scope (resolved 2026-07-13, David):** the
+  rebuild-consumed rule — an event kind goes through the outbox iff
+  a projection rebuild consumes it; observational kinds (telemetry,
+  health, docs-flush, cockpit counters) stay post-commit
+  fire-and-forget. The kind-by-kind classification + the lint that
+  keeps it honest land with the phase-2 emitter migrations.
+- **Q4 — epoch trim × outbox (resolved 2026-07-14, phase-1 PR):**
+  the trim transaction TRUNCATEs `event_outbox` *before* the
+  audit_log DELETE. At restart time every outbox row is the finished
+  epoch's by definition; the truncate queues behind any in-flight
+  relay batch (ACCESS EXCLUSIVE vs the batch's row locks), and audit
+  rows that batch committed carry ids ≤ the trim point, so the
+  DELETE removes them. Quiescence does not need to wait for the
+  relay at all.
+- **Q5 — publisher API shape (resolved 2026-07-13, David):**
+  explicit transaction threading — `record_event_in_tx(&mut tx, …)`
+  at each migrated call site, mirroring `record_fact_in_tx`. Honest
+  and grep-able; handlers already carry the tx for facts.
 
 ### Q2: Chain maintenance — does Option B keep insert-time chaining forever?
 
@@ -184,33 +205,6 @@ advisory lock never contends). But if audit write volume ever needs
 a sharded relay, the chain serializes again at the log. Is
 checkpoint-time chaining (Option A's tail-window model) the
 eventual end-state regardless, with B as the bridge?
-
-### Q3: Which event kinds are exempt from the transactional path?
-
-State-snapshot events (`ITEM_UPSERTED`, …) are last-write-wins
-rebuild sources and deliberately at-least-once; pure telemetry
-(health, docs-flush) has no domain tx to join. Proposed rule: an
-event is transactional iff a projection rebuild consumes it.
-Needs a kind-by-kind classification pass and a lint that keeps the
-classification honest as kinds are added.
-
-### Q4: What does the sim/demo trim do with an undrained outbox?
-
-The epoch-restart trim quiesces writers, trims `audit_log` past the
-baseline, and resets projections. With an outbox in the pipeline,
-quiescence must extend to "outbox drained" or the trim must also
-truncate the outbox — otherwise the relay re-imports the previous
-epoch's tail into the fresh epoch (the same class the checkpoint
-stamp in #114 closes for the counterparty queue).
-
-### Q5: Publisher API shape — explicit tx threading or staged emits?
-
-`emit_in_tx(&mut tx, …)` at ~every call site is honest but touches
-hundreds of sites and forces handlers to carry the tx. A staged
-variant (events accumulate on a per-request context, flushed by the
-same helper that commits the tx) hides the plumbing but adds a
-lifecycle to get wrong. Decide before phase 2; the
-`record_fact_in_tx` precedent argues for explicit.
 
 ### Q6: Does the dispatcher eventually consume the log instead of NATS?
 

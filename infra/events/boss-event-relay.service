@@ -1,0 +1,22 @@
+[Unit]
+Description=Boss — transactional event-outbox relay (outbox → audit_log + NATS)
+After=network-online.target postgresql.service nats-server.service
+Wants=network-online.target
+
+[Service]
+# Single mover from event_outbox into audit_log + NATS
+# (docs/design/transactional-audit-log.md, Option B). One instance is
+# the design point — it is what keeps the audit chain-hash trigger
+# uncontended — but a second accidental instance is safe (FOR UPDATE
+# SKIP LOCKED + event_id idempotence), just wasteful.
+#
+# Shares boss-jobs-api's config for postgres_url + nats_url instead of
+# minting another secrets file — the same pattern
+# boss-ledger-replay-check uses with boss-ledger-api.toml.
+ExecStart=/usr/local/bin/boss-event-relay --config /etc/boss-jobs-api.toml
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
