@@ -121,6 +121,93 @@ async fn integrity_scan_is_clean_on_an_empty_log() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn epoch_trim_gap_at_baseline_is_sanctioned_not_an_anomaly() {
+    // The demo's restart_epoch trims audit_log back to
+    // sim_clock.epoch_baseline_audit_id every rollover, so exactly ONE
+    // id gap — the one starting at the baseline row — is by-design.
+    // Pre-fix the nightly timer went red on every epoch for it
+    // (playground, 2026-07-13/14: gap 2405 → first post-trim id).
+    // The scan must report it separately, not as an anomaly, and not
+    // silently drop it either.
+    let db = TestDb::new().await;
+    let writer = PgAuditWriter::new(db.pool.clone());
+    seed_events(&writer, 5).await;
+
+    // The trim, exactly as restart_epoch performs it.
+    sqlx::query("ALTER TABLE audit_log DISABLE TRIGGER audit_log_reject_row_mutation_trg")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM audit_log WHERE id > 2")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE audit_log ENABLE TRIGGER audit_log_reject_row_mutation_trg")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO sim_clock (id, epoch_baseline_audit_id, epoch_start_date, wall_anchor) \
+         VALUES (1, 2, '2025-03-31', NOW())",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // The new epoch writes on; the sequence continues past the trim.
+    seed_events(&writer, 2).await;
+
+    let report = check_audit_log_integrity(&db.pool).await.unwrap();
+    assert!(
+        report.gaps.is_empty(),
+        "the baseline gap must not be an anomaly: {report:?}"
+    );
+    let sanctioned = report
+        .sanctioned_trim_gap
+        .as_ref()
+        .expect("the trim gap must be reported, not dropped");
+    assert_eq!(sanctioned.prev_id, 2);
+    assert_eq!(sanctioned.id, 6);
+    assert!(report.is_clean(), "a by-design trim is clean: {report:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gap_elsewhere_stays_an_anomaly_even_with_a_baseline() {
+    // A baseline sanctions exactly the gap that STARTS at it. Any
+    // other gap is still a trigger-bypass signal.
+    let db = TestDb::new().await;
+    let writer = PgAuditWriter::new(db.pool.clone());
+    seed_events(&writer, 5).await;
+
+    sqlx::query(
+        "INSERT INTO sim_clock (id, epoch_baseline_audit_id, epoch_start_date, wall_anchor) \
+         VALUES (1, 2, '2025-03-31', NOW())",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    sqlx::query("ALTER TABLE audit_log DISABLE TRIGGER audit_log_reject_row_mutation_trg")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM audit_log WHERE id = 4")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE audit_log ENABLE TRIGGER audit_log_reject_row_mutation_trg")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let report = check_audit_log_integrity(&db.pool).await.unwrap();
+    assert_eq!(report.gaps.len(), 1, "{report:?}");
+    assert_eq!(report.gaps[0].prev_id, 3);
+    assert!(report.sanctioned_trim_gap.is_none());
+    assert!(!report.is_clean());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn integrity_scan_detects_an_id_gap() {
     // Simulate the trigger-bypass attack: disable the trigger,
     // delete a row, re-enable. The scan must surface the gap.

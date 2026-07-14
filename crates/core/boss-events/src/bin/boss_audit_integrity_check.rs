@@ -164,8 +164,25 @@ async fn main() -> Result<()> {
                 "foreign_id": r.foreign_id,
                 "expected_parent_kind": r.expected_parent_kind,
             })).collect::<Vec<_>>(),
+            "sanctioned_trim_gap": report.sanctioned_trim_gap.as_ref().map(|g| serde_json::json!({
+                "prev_id": g.prev_id,
+                "id": g.id,
+                "missing_count": g.missing_count(),
+            })),
         });
         println!("{}", serde_json::to_string_pretty(&body)?);
+    }
+
+    // Visible but not an anomaly: the demo's epoch-restart trim
+    // leaves exactly one gap starting at the seed baseline row —
+    // by design, every rollover.
+    if let Some(g) = &report.sanctioned_trim_gap {
+        info!(
+            prev_id = g.prev_id,
+            id = g.id,
+            trimmed_rows = g.missing_count(),
+            "epoch-trim gap at the seed baseline (sanctioned — restart_epoch working as designed)"
+        );
     }
 
     if report.is_clean() {
