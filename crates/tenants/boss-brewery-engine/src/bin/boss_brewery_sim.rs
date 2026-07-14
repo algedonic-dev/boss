@@ -595,9 +595,19 @@ async fn main() -> Result<()> {
         for (emp, role) in &system_emp_roles {
             emp_roles.insert(emp.clone(), role.clone());
         }
+        // Operator identities from the LIVE roster (the bootstrap admin
+        // arrives via the API overlay, not the seed): the sim must never
+        // act as a real login. Extends build_workforce's seed-derived
+        // exclusion set.
+        let operators: Vec<String> = emp_roles
+            .iter()
+            .filter(|(_, role)| role.as_str() == "platform-admin")
+            .map(|(emp, _)| emp.clone())
+            .collect();
         Arc::new(Mutex::new(
             build_workforce(&guard, &api_base)
-                .with_actor_telemetry(api_activity.clone(), emp_roles),
+                .with_actor_telemetry(api_activity.clone(), emp_roles.clone())
+                .with_excluded_assignees(operators),
         ))
     };
     info!("workforce executor constructed; driving assigned steps each tick");

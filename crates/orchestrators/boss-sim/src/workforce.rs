@@ -113,6 +113,10 @@ pub struct WorkforceStats {
     /// Steps left Active because their duration hasn't elapsed yet.
     pub in_progress: u64,
     pub errors: u64,
+    /// Steps assigned to operator identities (real logins) that the
+    /// sim deliberately left Ready for the human — see
+    /// `workable_assignee`.
+    pub operator_skipped: u64,
 }
 
 /// How many steps the workforce drives in parallel per check-in.
@@ -137,6 +141,8 @@ struct StepDelta {
     deferred: u64,
     in_progress: u64,
     errors: u64,
+    /// Assigned to an operator identity — left for the human.
+    operator_skipped: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,6 +172,11 @@ pub struct Workforce {
     /// to the worker's role (sign-offs carry their own role). The workforce
     /// holds no *routing* roster — this is display attribution only.
     emp_roles: HashMap<String, String>,
+    /// Operator identities the sim must never act as (real logins —
+    /// the bootstrap admin, any platform-admin-role identity). Steps
+    /// the dispatcher routes to them stay Ready for the human; see
+    /// `workable_assignee`.
+    excluded_assignees: std::collections::HashSet<String>,
     pub stats: WorkforceStats,
 }
 
@@ -213,6 +224,7 @@ impl Workforce {
             required_fields,
             api_activity: api_activity::new_handle(),
             emp_roles: HashMap::new(),
+            excluded_assignees: Default::default(),
             stats: WorkforceStats::default(),
         }
     }
@@ -227,6 +239,15 @@ impl Workforce {
     ) -> Self {
         self.api_activity = handle;
         self.emp_roles = emp_roles;
+        self
+    }
+
+    /// Mark identities the sim must never act as (extends across calls,
+    /// so the seed roster's operators and the API-discovered ones
+    /// compose). Steps assigned to them are left untouched — Ready for
+    /// the real human.
+    pub fn with_excluded_assignees(mut self, ids: impl IntoIterator<Item = String>) -> Self {
+        self.excluded_assignees.extend(ids);
         self
     }
 
@@ -351,6 +372,7 @@ impl Workforce {
                                     d.completed += sd.completed;
                                     d.deferred += sd.deferred;
                                     d.in_progress += sd.in_progress;
+                                    d.operator_skipped += sd.operator_skipped;
                                 }
                                 Err(e) => {
                                     d.errors += 1;
@@ -373,6 +395,7 @@ impl Workforce {
             self.stats.deferred += d.deferred;
             self.stats.in_progress += d.in_progress;
             self.stats.errors += d.errors;
+            self.stats.operator_skipped += d.operator_skipped;
         }
         Ok(())
     }
@@ -418,10 +441,17 @@ impl Workforce {
         // Execute only ASSIGNED work, attributed to the actual assignee.
         // An unassigned row is someone else's to route (the dispatcher
         // assigns role-bearing steps; the marker handler completes the
-        // no-role markers) — skip it.
-        let emp = match assignee_of(step) {
+        // no-role markers) — skip it. Steps assigned to operator
+        // identities are also skipped (`workable_assignee`): they are
+        // a real human's queue, not the sim's.
+        let emp = match workable_assignee(step, &self.excluded_assignees) {
             Some(e) => e.to_string(),
-            None => return Ok(delta),
+            None => {
+                if assignee_of(step).is_some() {
+                    delta.operator_skipped += 1;
+                }
+                return Ok(delta);
+            }
         };
 
         match status {
@@ -710,6 +740,19 @@ fn assignee_of(step: &Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// `assignee_of`, minus operator identities. The sim workforce simulates
+/// the ROSTER — it must never act as a real person's login. The
+/// dispatcher may legitimately route a step to an operator (an
+/// authority-gated review lands with the platform admin); the workforce
+/// leaves it sitting Ready for the human instead of completing their
+/// work for them at warp speed.
+fn workable_assignee<'a>(
+    step: &'a Value,
+    excluded: &std::collections::HashSet<String>,
+) -> Option<&'a str> {
+    assignee_of(step).filter(|emp| !excluded.contains(*emp))
+}
+
 /// A reasonable value for a required field, by its StepType `field_type` —
 /// what a human executor would put in the box. Type-valid against
 /// `boss_jobs::step_registry::validate_field_type`: dates/times get a real
@@ -777,6 +820,44 @@ mod tests {
         );
         assert_eq!(assignee_of(&json!({ "id": "s3" })), None);
         assert_eq!(assignee_of(&json!({ "id": "s4", "assignee_id": "" })), None);
+    }
+
+    #[test]
+    fn workable_assignee_skips_operator_identities() {
+        // The sim must never impersonate a real operator login. The
+        // dispatcher may legitimately route a step to an operator
+        // (platform-admin authority → emp-bootstrap-admin — the
+        // design-review flow); the workforce's job is to leave it
+        // sitting Ready for the human, not to complete their review
+        // for them at warp speed (the 2026-07-14 incident: the sim
+        // "reviewed" a design doc as emp-bootstrap-admin within
+        // seconds, sealing broken step metadata behind
+        // terminal-immutability).
+        let excluded: std::collections::HashSet<String> =
+            ["emp-bootstrap-admin".to_string()].into_iter().collect();
+
+        let operator_step =
+            json!({ "id": "s1", "assignee_id": "emp-bootstrap-admin", "status": "ready" });
+        assert_eq!(workable_assignee(&operator_step, &excluded), None);
+
+        // Normal roster employees are unaffected.
+        let worker_step = json!({ "id": "s2", "assignee_id": "emp-aa-007", "status": "ready" });
+        assert_eq!(
+            workable_assignee(&worker_step, &excluded),
+            Some("emp-aa-007")
+        );
+
+        // Empty exclusion set = pre-fix behavior, byte for byte.
+        let none: std::collections::HashSet<String> = Default::default();
+        assert_eq!(
+            workable_assignee(&operator_step, &none),
+            Some("emp-bootstrap-admin")
+        );
+        // Unassigned still skips regardless.
+        assert_eq!(
+            workable_assignee(&json!({ "id": "s3", "assignee_id": null }), &excluded),
+            None
+        );
     }
 
     fn fixed_now() -> DateTime<Utc> {

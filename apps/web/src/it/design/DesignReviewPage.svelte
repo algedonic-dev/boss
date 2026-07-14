@@ -121,27 +121,12 @@
         body: JSON.stringify(body),
       });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
-      const created = await resp.json();
-      // After the Job is created, its review-design step needs
-      // doc_path stamped on its metadata. Materialization defaults
-      // it to "" — fill it in by PUTting the step. (Future: the
-      // dispatcher should do this from the Job's subject.id.)
-      const detailResp = await fetch(`/api/jobs/${created.id}`);
-      if (detailResp.ok) {
-        const detail = await detailResp.json();
-        const reviewStep = (detail.steps ?? []).find(
-          (s: { kind: string }) => s.kind === 'review-design',
-        );
-        if (reviewStep) {
-          await fetch(`/api/jobs/${created.id}/steps/${reviewStep.id}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              metadata: { ...reviewStep.metadata, doc_path: doc.path },
-            }),
-          });
-        }
-      }
+      // doc_path is stamped at materialization from the Job's subject
+      // (the JobKind's metadata_defaults template `{subject.id}`) — no
+      // follow-up PUT. The old fill-in write lost read-overlay-write
+      // races against dispatcher assignment and workforce completion,
+      // and terminal-metadata immutability then sealed the empty value
+      // (the 2026-07-14 "doc_path is empty" incident).
       await load();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
