@@ -169,6 +169,25 @@ deep replay-check is the acceptance test throughout — its
 divergence count is the definition of done (zero, sustained, on the
 playground's nightly timer).
 
+## Open questions
+
+### Q2: Chain maintenance — does Option B keep insert-time chaining forever?
+
+B preserves the status quo (single relay writer → the global
+advisory lock never contends). But if audit write volume ever needs
+a sharded relay, the chain serializes again at the log. Is
+checkpoint-time chaining (Option A's tail-window model) the
+eventual end-state regardless, with B as the bridge?
+
+### Q6: Does the dispatcher eventually consume the log instead of NATS?
+
+Once the outbox → log pipeline is ordered and durable, NATS is a
+latency optimization, not a source of truth. A log-tailing consumer
+(cursor per consumer group) would collapse the delivery stack and
+make "the log is the queue" literal — Hickey would approve — but it
+re-plumbs every consumer and JetStream already works. Out of scope
+for this arc; recorded so the endgame stays visible.
+
 ## Decision history
 
 *(tracker-managed; resolutions land here)*
@@ -197,20 +216,3 @@ playground's nightly timer).
   explicit transaction threading — `record_event_in_tx(&mut tx, …)`
   at each migrated call site, mirroring `record_fact_in_tx`. Honest
   and grep-able; handlers already carry the tx for facts.
-
-### Q2: Chain maintenance — does Option B keep insert-time chaining forever?
-
-B preserves the status quo (single relay writer → the global
-advisory lock never contends). But if audit write volume ever needs
-a sharded relay, the chain serializes again at the log. Is
-checkpoint-time chaining (Option A's tail-window model) the
-eventual end-state regardless, with B as the bridge?
-
-### Q6: Does the dispatcher eventually consume the log instead of NATS?
-
-Once the outbox → log pipeline is ordered and durable, NATS is a
-latency optimization, not a source of truth. A log-tailing consumer
-(cursor per consumer group) would collapse the delivery stack and
-make "the log is the queue" literal — Hickey would approve — but it
-re-plumbs every consumer and JetStream already works. Out of scope
-for this arc; recorded so the endgame stays visible.

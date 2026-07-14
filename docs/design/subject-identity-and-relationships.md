@@ -200,9 +200,7 @@ new conservation invariant ("every job subject resolves in
 `subjects`; every declared edge resolves") runs green over a full
 365-day regen and on the playground nightly.
 
-## Decision history
-
-*(tracker-managed; resolutions land here)*
+## Open questions
 
 ### Q1: Is `subjects` write-through, a projection, or both?
 
@@ -271,3 +269,7 @@ informal, or split owner (accountable human/org) from operator
 (executing actor). Touches the executor model — the "agents are
 additional CPUs in the same machine" framing suggests they deserve
 identities too. Park here until R1 lands, then decide.
+
+## Decision history
+
+*(tracker-managed; resolutions land here)*
