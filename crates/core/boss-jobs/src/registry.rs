@@ -353,8 +353,16 @@ fn design_doc_review_spec() -> JobKindSpec {
             ready_when: "steps.open.done".into(),
             title_template: "Review design doc — address open questions".into(),
             authority_role: Some("platform-admin".into()),
+            // doc_path is stamped AT MATERIALIZATION from the Job's
+            // subject (the doc path IS the subject id) — atomically,
+            // in the same write that creates the step. It must never
+            // rely on a follow-up PUT: a second write loses
+            // read-overlay-write races against dispatcher assignment
+            // and workforce completion, and terminal-metadata
+            // immutability then seals the empty value (the
+            // 2026-07-14 "doc_path is empty" incident).
             metadata_defaults: serde_json::json!({
-                "doc_path": "",
+                "doc_path": "{subject.id}",
                 "resolutions": [],
             }),
             ..Default::default()
@@ -2690,6 +2698,47 @@ mod tests {
             .expect("design-doc-review present");
         assert_eq!(review.version, 1);
         assert_eq!(review.status, JobKindStatus::Active);
+    }
+
+    #[test]
+    fn design_doc_review_materializes_doc_path_from_the_subject() {
+        // The review-design step's doc_path must be stamped AT
+        // materialization, atomically, from the Job's subject (the doc
+        // path IS the subject id). The pre-fix seed defaulted it to ""
+        // and left a second SPA PUT to fill it in — which lost a
+        // read-overlay-write race against dispatcher assignment and
+        // the sim workforce's completion, and terminal-metadata
+        // immutability then sealed the empty value forever
+        // ("Failed to load doc: step.metadata.doc_path is empty",
+        // 2026-07-14).
+        let kinds = platform_kinds();
+        let review = kinds
+            .iter()
+            .find(|k| k.kind == "design-doc-review")
+            .expect("design-doc-review present");
+
+        let subject = Subject::new("custom", "docs/design/transactional-audit-log.md");
+        let job_id = JobId::new();
+        let job_metadata = serde_json::Value::Object(Default::default());
+        let mut counter = 0u32;
+        let steps = materialize_steps(review, &subject, job_id, &job_metadata, || {
+            counter += 1;
+            StepId::from_uuid(Uuid::from_u128(counter as u128))
+        });
+
+        // Spec order: open → review → reviewed (positional, matching
+        // the sibling platform-kind step tests).
+        let review_step = &steps[1];
+        assert_eq!(review_step.kind, "review-design");
+        assert_eq!(
+            review_step
+                .metadata
+                .get("doc_path")
+                .and_then(|v| v.as_str()),
+            Some("docs/design/transactional-audit-log.md"),
+            "doc_path must be the subject id at birth, not a later fill-in: {:?}",
+            review_step.metadata
+        );
     }
 
     #[test]

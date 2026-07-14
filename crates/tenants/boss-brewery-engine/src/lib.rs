@@ -809,7 +809,20 @@ pub fn build_workforce(
             (t.kind.to_string(), reqs)
         })
         .collect();
-    Workforce::new(api_base, step_durations, required_fields)
+    // Operator identities (real logins — role `platform-admin`, e.g.
+    // the bootstrap admin) are excluded from sim driving: the
+    // dispatcher may route authority-gated steps to them (a design
+    // review), and those must wait for the human instead of being
+    // completed by the sim at warp within seconds (the 2026-07-14
+    // design-review incident). The daemon extends this set with the
+    // API-discovered roster (see boss_brewery_sim.rs).
+    let operators = engine
+        .state
+        .employees_by_role
+        .get("platform-admin")
+        .cloned()
+        .unwrap_or_default();
+    Workforce::new(api_base, step_durations, required_fields).with_excluded_assignees(operators)
 }
 
 #[allow(clippy::too_many_arguments)]
