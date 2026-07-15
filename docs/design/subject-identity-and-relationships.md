@@ -1,6 +1,7 @@
 # Subject identity & relationships — giving the model a home
 
-**Status:** design review. **Owner:** platform. **Provenance:** the
+**Status:** approved 2026-07-15 (all seven questions resolved via the
+in-app decision tracker). **Owner:** platform. **Provenance:** the
 2026-07-14 subject-model audit (three-track: code map, seed/data map,
 live DB) and the 2026-07-13 phantom-account incident it grew out of.
 
@@ -200,74 +201,95 @@ new conservation invariant ("every job subject resolves in
 `subjects`; every declared edge resolves") runs green over a full
 365-day regen and on the playground nightly.
 
-## Decision history
+## Open questions
 
-*(tracker-managed; resolutions land here)*
+All 7 open questions were resolved 2026-07-15 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-### Q1: Is `subjects` write-through, a projection, or both?
+## Decisions
 
-Write-through (domain services upsert in-tx) gives read-your-write
-existence checks; projection-only (rebuilt from `*.created` events)
-keeps it honest but eventually-consistent behind the relay once
-emitters move to the outbox. Recommended: both — write-through in
-the domain transaction *and* reproducible by the rebuilder, the same
-dual contract `financial_facts` already honors. The deep replay-check
-then owns its correctness.
+### Q1: Is `subjects` write-through, a projection, or both? (resolved)
 
-### Q2: Edge enforcement default — abort or warn?
+Resolved 2026-07-15 — override.
 
-`on_missing = 'abort'` is correct-by-construction and would have
-stopped the phantom-invoice class at the source, but flipping every
-legacy edge to abort on day one risks breaking flows whose data
-predates their rule. Recommended: new edges abort; migrated-legacy
-edges enter as warn + sweep, promoted to abort after one clean
-365-day regen each.
+Both sounds good
 
-### Q3: Do the big soft edges also become composite FKs onto `subjects`?
+**Operationally:** domain services upsert the identity row in the
+domain transaction AND the rebuilder reproduces it from `*.created`
+events — the `financial_facts` dual contract; the deep replay-check
+owns its correctness.
 
-A `(subject_kind, subject_id)` composite FK from `jobs` (and
-`invoices.account_id` → `subjects('account', id)`) would give the
-DB-level guarantee, but couples every domain migration to the
-identity table and forbids identity-before-projection orderings the
-relay introduces. Recommended: trigger + sweep via R2 now; revisit
-FKs per-edge once the outbox migration settles the write ordering.
+### Q2: Edge enforcement default — abort or warn? (resolved)
 
-### Q4: Campaign and customer — identity rows now, crates when?
+Resolved 2026-07-15 — override.
 
-R1 gives both kinds a home without a crate. The question is the bar
-for promoting a kind to a domain module: campaign has live jobs and
-marketing-asset links today (arguably already over the bar);
-customer is gated on the `/shop` OTP decision. Needs a product call
-on each.
+Abort by default. We can afford to fix anything that breaks.
 
-### Q5: What is the asset holder edge?
+**Operationally:** stronger than the doc's phased recommendation —
+`on_missing = 'abort'` for every declared edge from day one, legacy
+included. No prod data; a regen resets anything a newly-declared
+edge breaks, and a loud abort is the point.
 
-`assets.account_id` means "customer account" on the device-shop
-tenant and holds a location id on the brewery. Options: split
-columns (`account_id` + `location_id`, one null), or a typed holder
-pair (`holder_kind`, `holder_id`) validated via R2 — matching the
-reservation-on-Subject precedent (`{kind, id}`, not a closed
-per-kind column). Recommended: the holder pair; custody is a
-subject-valued property, not an account-valued one.
+### Q3: Do the big soft edges also become composite FKs onto `subjects`? (resolved)
 
-### Q6: What subject is org-level work about?
+Resolved 2026-07-15 — override.
 
-Thirteen of twenty-five brewery JobKinds — payroll, all four tax
-filings, AP runs, facility overhead — are "about"
-`loc-brewery-brewhouse` because nothing better exists. Options: an
-`organization` subject kind (one row per tenant), a `custom`
-org subject, or keep location-as-convenience. This decides what the
-event log *means* for company-level work; the cybernetics framing
-(the org as the system being modeled) argues for a first-class
-organization subject.
+Sounds good
 
-### Q7: Do automation actors get identities?
+**Operationally:** the recommendation as written — trigger + sweep
+via R2 now; revisit per-edge composite FKs once the outbox
+migration settles write ordering.
 
-`jobs.owner_id` holds an ActorId union (`emp-*`,
-`automation:<slug>`, `rule:<slug>`) with no registry for the
-automation side and zero human owners in the demo. Options: register
-automation actors as subjects (kind `automation`?), keep the union
-informal, or split owner (accountable human/org) from operator
-(executing actor). Touches the executor model — the "agents are
-additional CPUs in the same machine" framing suggests they deserve
-identities too. Park here until R1 lands, then decide.
+### Q4: Campaign and customer — identity rows now, crates when? (resolved)
+
+Resolved 2026-07-15 — override.
+
+I am fine with both as crates now. This isn't that hard of a decison.
+
+**Operationally:** skip the identity-rows-only interim — build
+`boss-campaigns` and the customer module as real domain crates in
+the R1 workstream (hexagonal shape: domain types + port + HTTP
+surface + rebuilder), with identity rows landing via the same mints.
+
+### Q5: What is the asset holder edge? (resolved)
+
+Resolved 2026-07-15 — override.
+
+Your recommendation is good.
+
+**Operationally:** a typed holder pair (`holder_kind`, `holder_id`)
+validated via R2, replacing the overloaded `assets.account_id`;
+custody is subject-valued (the reservation-on-Subject precedent).
+
+### Q6: What subject is org-level work about? (resolved)
+
+Resolved 2026-07-15 — override.
+
+Can the Company be the Subject?
+
+**Operationally:** yes — that is the answer. A first-class `company`
+subject kind with one row per tenant; the thirteen org-level
+JobKinds (payroll, tax filings, AP runs, facility overhead) get
+`subject = the company` instead of the brewhouse location. The
+cybernetics framing made literal: the organization being modeled is
+itself a Subject in its own event log.
+
+### Q7: Do automation actors get identities? (resolved)
+
+Resolved 2026-07-15 — override.
+
+A job shouldn't be owned by an automation. Only a step should be
+owned by an automation. Automation actors shouldn't need identities
+I think.
+
+**Operationally:** ownership semantics split by level — `jobs.owner`
+is always a human (accountability lives with people); steps may be
+executed/owned by automations; no automation-identity registry.
+Implementation note: every flow that opens Jobs with
+`automation:*`/`rule:*` owners (the sim, dispatcher spawn rules)
+must name a responsible human owner instead — the role-appropriate
+person for the JobKind, which the `company` subject's org structure
+(Q6) can eventually resolve.

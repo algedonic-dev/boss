@@ -57,6 +57,7 @@
     let questions = [];
     let loadError = null;
     let saving = false;
+    let saveError = null;
     const isDone = step.status === 'completed' || step.status === 'done';
 
     const headerDiv = h('div', { className: 'step-surface-header' });
@@ -189,6 +190,15 @@
 
     function renderActions() {
       actionsDiv.replaceChildren();
+      if (saveError) {
+        actionsDiv.appendChild(
+          h(
+            'div',
+            { className: 'step-review-error' },
+            `Save failed: ${saveError}`,
+          ),
+        );
+      }
       if (isDone) return;
       const saveBtn = h(
         'button',
@@ -250,28 +260,58 @@
       }
     }
 
+    async function putStep(status, metadata) {
+      const r = await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...step, job_id: jobId, status, metadata }),
+      });
+      if (!r.ok) throw new Error(`step save HTTP ${r.status}: ${await r.text()}`);
+    }
+
     async function save(autoComplete) {
       saving = true;
+      saveError = null;
       renderActions();
       try {
         await persistPendingDecisions();
-        const nextStatus =
-          autoComplete && (allAnswered() || questions.length === 0)
-            ? 'completed'
-            : step.status === 'pending'
-              ? 'active'
-              : step.status;
-        await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            ...step,
-            job_id: jobId,
-            status: nextStatus,
-            metadata: { ...step.metadata, doc_path: docPath, resolutions },
-          }),
-        });
+        const completing = autoComplete && (allAnswered() || questions.length === 0);
+        const workingStatus = step.status === 'pending' ? 'active' : step.status;
+        const finalMeta = { ...step.metadata, doc_path: docPath, resolutions };
+
+        // 1. Persist the FINAL shape first (title + metadata are what
+        //    sign-off stamps attest — a stamp taken before the last
+        //    metadata write goes stale and the completion 409s).
+        await putStep(workingStatus, finalMeta);
+
+        if (completing) {
+          // 2. Stamp every required sign-off role in the step's now-
+          //    final shape. Policy gates each on `step-signoff:<role>`
+          //    — a 403 here means the signed-in user lacks that
+          //    authority, and we SAY so instead of silently dropping
+          //    it (the pre-fix flow swallowed the completion 409 and
+          //    "Mark reviewed" appeared to do nothing).
+          for (const role of step.sign_offs_required || []) {
+            const r = await fetch(
+              `/api/jobs/${jobId}/steps/${step.id}/sign-offs`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ role }),
+              },
+            );
+            if (!r.ok) {
+              throw new Error(
+                `sign-off as ${role} failed (HTTP ${r.status}): ${await r.text()}`,
+              );
+            }
+          }
+          // 3. Complete with the identical metadata the stamps attest.
+          await putStep('completed', finalMeta);
+        }
         onUpdate();
+      } catch (e) {
+        saveError = e instanceof Error ? e.message : String(e);
       } finally {
         saving = false;
         renderActions();
