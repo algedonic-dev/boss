@@ -44,13 +44,34 @@ jobs:
             /usr/local/lib/android /opt/hostedtoolcache/CodeQL
           df -h /
 
+      - name: Set up Docker Buildx
+        # docker-container driver — required for `cache-to: type=gha`
+        # (the default docker driver cannot export remote cache).
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0 (pinned per OpenSSF Scorecard)
+
       - name: Build the quickstart image
-        run: |
-          cp .env.example .env
-          docker compose build
+        # Replaces `docker compose build` so the image's layers persist
+        # across CI runs in the Actions cache. mode=max exports the
+        # INTERMEDIATE stages too — that's where cargo-chef's cooked
+        # dependency layer lives (see the Dockerfile) — so a warm run
+        # skips straight to compiling workspace crates instead of
+        # rebuilding the ~400-crate dep tree from scratch every time.
+        # `load:` lands the image in the engine under the tag compose
+        # expects (boss:latest); the boot step below runs --no-build so
+        # exactly this image is what smoke tests.
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0 (pinned per OpenSSF Scorecard)
+        with:
+          context: .
+          file: infra/oss-quickstart/Dockerfile
+          tags: boss:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Boot the stack
-        run: docker compose up -d
+        run: |
+          cp .env.example .env
+          docker compose up -d --no-build
 
       - name: Wait for the sim to seed emergent data
         # The live sim runs on boot; poll until it has both closed Jobs
