@@ -93,6 +93,9 @@
 #   W. Expected-opening assets each have a seed JE — every
 #      opening balance the seed promises exists as a real
 #      journal entry.
+#   X. Job subjects resolve in the subjects identity table —
+#      the R1 acceptance invariant: every jobs.subject_id has an
+#      identity row (write-through + rebuilder + uniform gate).
 #
 #   (T and U are reserved: the income-statement and cash-flow
 #   endpoints' structural audits — the S pattern applied to the
@@ -577,6 +580,23 @@ SELECT 'account=' || expected.account_code
      WHERE source_table = 'brewery_seed_opening_balance'
        AND payload->>'debit_account' = expected.account_code
  )
+SQL
+)"
+
+# ---- X. Every Job subject resolves in the subjects identity table ----
+# The R1 acceptance invariant (subject-model design, approved
+# 2026-07-15): jobs.subject_id + kind must have an identity row —
+# write-through mints on create, the rebuilder reproduces from the
+# log, and the uniform existence gate refuses ghosts at the door.
+# A violation here means a mint path was missed or a subject was
+# removed without retiring its identity.
+run_invariant "X. Job subjects resolve in the subjects identity table" "$(cat <<'SQL'
+SELECT j.kind || ': ' || j.subject_id
+  FROM jobs j
+ WHERE NOT EXISTS (
+     SELECT 1 FROM subjects s WHERE s.id = j.subject_id
+ )
+ LIMIT 20
 SQL
 )"
 

@@ -21,6 +21,20 @@ impl PgMarketingAssets {
             serde_json::to_value(&new.linked_account_ids).unwrap_or(serde_json::json!([]));
         let campaigns =
             serde_json::to_value(&new.linked_campaign_ids).unwrap_or(serde_json::json!([]));
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| KbError::Storage(e.to_string()))?;
+        // Identity write-through (subject-model R1, Q1).
+        boss_subject_kinds::subjects::record_subject_in_tx(
+            &mut tx,
+            "marketing-asset",
+            &new.id,
+            Some(&new.title),
+        )
+        .await
+        .map_err(KbError::Storage)?;
         let row = sqlx::query(
             "INSERT INTO marketing_assets \
                 (id, title, kind, description, file_url, tags, \
@@ -56,9 +70,12 @@ impl PgMarketingAssets {
         .bind(new.brand_reviewed_by.as_deref())
         .bind(new.brand_reviewed_at)
         .bind(new.supersedes_id.as_deref())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(store)?;
+        tx.commit()
+            .await
+            .map_err(|e| KbError::Storage(e.to_string()))?;
         Ok(row_to_asset(&row))
     }
 

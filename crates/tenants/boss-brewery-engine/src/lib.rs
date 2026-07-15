@@ -93,6 +93,34 @@ pub fn load_parts(seeds: &Path) -> Result<Vec<InventoryItem>> {
     Ok(bundle.parts)
 }
 
+/// Mint identity rows for the sim's table-less campaign subjects via
+/// `POST /api/subjects/campaign` — the pool's campaign ids must pass
+/// the uniform jobs existence gate before the first tap-launch Job
+/// references them (subject-model R1). Blocking reqwest — call from
+/// spawn_blocking. Idempotent (the endpoint upserts).
+pub fn mint_campaign_identities(campaign_ids: &[String], api_base: &str) {
+    let client = reqwest::blocking::Client::new();
+    let url = if let Some(host) = api_base.strip_prefix("direct://") {
+        format!("http://{host}:7830/api/subjects/campaign")
+    } else {
+        format!("{}/api/subjects/campaign", api_base.trim_end_matches('/'))
+    };
+    for id in campaign_ids {
+        match client
+            .post(&url)
+            .header("x-sim-origin", "true")
+            .json(&serde_json::json!({ "id": id }))
+            .send()
+        {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => {
+                tracing::warn!(id = %id, status = %r.status(), "campaign identity mint refused")
+            }
+            Err(e) => tracing::warn!(id = %id, error = %e, "campaign identity mint failed"),
+        }
+    }
+}
+
 /// Seed the canonical brewery subjects so the JobKinds have
 /// targets to anchor on. Production deployments derive this
 /// from live tables; the standalone runner / test path uses

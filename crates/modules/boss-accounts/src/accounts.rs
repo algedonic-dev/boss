@@ -302,6 +302,19 @@ async fn create_account(
         _ => {}
     }
 
+    // Identity write-through (subject-model R1, Q1): same tx as the
+    // domain row.
+    if let Err(e) = boss_subject_kinds::subjects::record_subject_in_tx(
+        &mut tx,
+        "account",
+        &body.account.id,
+        body.account.name.as_deref(),
+    )
+    .await
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+
     let res = sqlx::query(
         "INSERT INTO accounts (id, name, director, city, state, tier, customer_since, territory_rep_id, account_type) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
@@ -439,6 +452,19 @@ async fn update_account(
         .await
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+
+    // Identity write-through (subject-model R1, Q1): same tx as the
+    // domain row.
+    if let Err(e) = boss_subject_kinds::subjects::record_subject_in_tx(
+        &mut tx,
+        "account",
+        &body.account.id,
+        body.account.name.as_deref(),
+    )
+    .await
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
 
     let res = sqlx::query(

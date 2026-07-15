@@ -17,9 +17,10 @@ required-features = ["postgres"]
 # silently produces an in-memory-only binary. Same fix as boss-docs
 # (postgres → default 2026-05-05).
 default = ["postgres"]
-postgres = ["dep:sqlx", "boss-events/postgres", "boss-ledger/postgres"]
+postgres = ["dep:sqlx", "boss-events/postgres", "boss-ledger/postgres", "dep:boss-subject-kinds"]
 
 [dependencies]
+boss-subject-kinds = { path = "../../core/boss-subject-kinds", features = ["postgres"], optional = true }
 boss-core = { path = "../../core/boss-core" }
 boss-clock-client = { path = "../../core/boss-clock-client" }
 boss-ports = { path = "../../core/boss-ports" }

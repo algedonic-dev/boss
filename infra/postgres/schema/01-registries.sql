@@ -116,6 +116,38 @@ UPDATE subject_kinds
  WHERE kind IN ('employee', 'asset', 'account');
 
 
+-- ---------------------------------------------------------------------------
+-- Subject identity — the home for `(kind, id)`
+-- (docs/design/subject-identity-and-relationships.md, R1 — approved
+-- 2026-07-15).
+--
+-- Deliberately THIN: identity only, no attributes. Attributes stay in
+-- each kind's domain tables and KB views; this row is the minimal
+-- durable fact "this subject exists" — identity-first made literal (a
+-- Subject can exist from its stable id alone, before any domain crate
+-- knows anything else about it; `campaign` is the worked example).
+--
+-- Dual write contract (Q1): domain services upsert the identity row
+-- inside the SAME transaction as their domain row
+-- (`boss_subject_kinds::record_subject_in_tx`), AND the row is
+-- reproducible from audit_log by the subjects rebuilder — the
+-- `financial_facts` contract. The uniform jobs existence gate reads
+-- this table for EVERY kind, replacing the five per-kind HTTP probes
+-- and their fail-open behavior.
+CREATE TABLE IF NOT EXISTS subjects (
+    kind        TEXT NOT NULL REFERENCES subject_kinds(kind),
+    id          TEXT NOT NULL,
+    -- Display convenience only ("Harbor Bottle Shop"); never
+    -- authoritative — the domain row owns naming.
+    label       TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    retired_at  TIMESTAMPTZ,
+    PRIMARY KEY (kind, id)
+);
+
+CREATE INDEX IF NOT EXISTS subjects_kind ON subjects(kind);
+
+
 CREATE TABLE IF NOT EXISTS classes (
     subject_kind     TEXT NOT NULL,
     code             TEXT NOT NULL,
