@@ -11,6 +11,13 @@ on:
 permissions:
   contents: read
 
+# A new push to the same ref supersedes the in-flight run — cancel it
+# instead of paying for both. Same convention install-smoke.yml already
+# uses.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 # Retry transient crates.io download failures (curl / "SSL unexpected eof")
 # rather than failing the whole run on an infra flake — these blips have
 # red-X'd green code mid-clippy. Applies to every job's cargo invocations.
@@ -59,6 +66,18 @@ jobs:
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
+
+      - name: Cache cargo registry + dependency artifacts
+        # Caches ~/.cargo (registry index + crate sources) and the
+        # dependency slice of target/, keyed on Cargo.lock + rustc
+        # version. Workspace-crate artifacts are pruned before saving,
+        # so our own code always rebuilds from source — only the ~400
+        # third-party dependencies stop being recompiled on every run.
+        # cache-on-failure: a red clippy/test run still saves the
+        # dependency build it just paid for.
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1 (pinned per OpenSSF Scorecard)
+        with:
+          cache-on-failure: true
 
       - name: Apply schema
         run: infra/postgres/apply-schema.sh | psql -h localhost -U boss -d boss
