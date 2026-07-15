@@ -12,11 +12,26 @@ name: Install smoke
 # stable, add "smoke" to main's branch-protection required checks so a
 # broken install can't merge.
 
+# Docs-only changes skip the ~25-min stack boot: nothing under docs/
+# and no *.md file is COPY'd into the image or mounted by compose, so
+# they cannot change what this workflow tests. Mixed changes still run
+# (paths-ignore skips only when EVERY changed file matches).
+#
+# ⚠ If smoke is ever promoted to a required status check (the plan
+# above), this must move to a job-level `if:` — a workflow skipped by
+# path filtering leaves a required check in "Expected" forever and
+# blocks the merge, whereas a skipped job counts as passing.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
 
 permissions:
   contents: read
