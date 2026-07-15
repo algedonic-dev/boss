@@ -188,7 +188,7 @@ make "the log is the queue" literal — Hickey would approve — but it
 re-plumbs every consumer and JetStream already works. Out of scope
 for this arc; recorded so the endgame stays visible.
 
-## Decision history
+## Decisions
 
 *(tracker-managed; resolutions land here)*
 
