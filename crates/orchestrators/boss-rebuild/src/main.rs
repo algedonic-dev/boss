@@ -152,6 +152,11 @@ async fn main() -> Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!(e))
     });
+    step!("campaigns", async {
+        boss_campaigns::rebuild::rebuild_campaigns(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+    });
     step!("products", boss_products::rebuild_products(&pool));
     step!("messages", boss_messages::rebuild_messages(&pool));
     step!("people", boss_people::rebuild_people(&pool));

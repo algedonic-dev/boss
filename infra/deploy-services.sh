@@ -130,6 +130,7 @@ else
         "classes:7800"
         "locations:7820"
         "subject-kinds:7830"
+        "campaigns:7845"
         "products:7840"
     )
 fi
@@ -220,6 +221,7 @@ description_of() {
         classes)       echo "Class Registry API" ;;
         locations)     echo "Locations Registry API" ;;
         subject-kinds) echo "Subject Kind Registry API" ;;
+        campaigns)     echo "Marketing Campaigns API" ;;
         products)      echo "Finished Product Catalog API" ;;
         events)        echo "Audit Log Read API (tail / stream / export)" ;;
         accounts)      echo "Accounts API (notes / team / next-actions / risk / cases)" ;;
@@ -432,6 +434,16 @@ EOF
 postgres_url = "$PROD_DB_URL"
 http_bind = "127.0.0.1:$port"
 nats_url = "$NATS_URL"
+EOF
+            ;;
+        campaigns)
+            # Marketing campaigns (Q4 domain home). No nats_url:
+            # campaigns emits via the transactional outbox (#118);
+            # boss-event-relay moves staged events onward.
+            cat <<EOF
+# Managed by infra/deploy-services.sh — edits will be overwritten.
+postgres_url = "$PROD_DB_URL"
+http_bind = "127.0.0.1:$port"
 EOF
             ;;
         dispatcher)

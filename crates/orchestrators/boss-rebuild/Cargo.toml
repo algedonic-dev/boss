@@ -23,6 +23,7 @@ tracing-subscriber = { workspace = true }
 boss-messages = { path = "../../modules/boss-messages", features = ["postgres"] }
 boss-jobs = { path = "../../core/boss-jobs", features = ["postgres"] }
 boss-inventory = { path = "../../modules/boss-inventory", features = ["postgres"] }
+boss-campaigns = { path = "../../modules/boss-campaigns", features = ["postgres"] }
 boss-products = { path = "../../modules/boss-products", features = ["postgres"] }
 boss-accounts = { path = "../../modules/boss-accounts", features = ["postgres"] }
 boss-shipping = { path = "../../modules/boss-shipping", features = ["postgres"] }

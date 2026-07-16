@@ -306,6 +306,7 @@ pub static CALENDAR: ProxyConfig = ProxyConfig::new("calendar");
 /// cybernetics rollup. Port 7880, declared in boss_ports.
 pub static OBSERVABILITY: ProxyConfig = ProxyConfig::new("observability");
 pub static PRODUCTS: ProxyConfig = ProxyConfig::new("products");
+pub static CAMPAIGNS: ProxyConfig = ProxyConfig::new("campaigns");
 /// Simulator UX service — hosts the /simulator SPA bundle + the
 /// /simulator/api/* control+status surface. Port 7010, declared in
 /// boss_ports.

@@ -80,6 +80,11 @@ pub const PAIRED: &[PortSpec] = &[
         scratch: Some(8750),
     },
     PortSpec {
+        name: "campaigns",
+        prod: 7845,
+        scratch: None,
+    },
+    PortSpec {
         name: "calendar",
         prod: 7860,
         scratch: Some(8860),
