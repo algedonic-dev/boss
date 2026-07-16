@@ -45,6 +45,7 @@ members = [
     "crates/core/boss-policy",
     "crates/core/boss-policy-client",
     "crates/modules/boss-campaigns",
+    "crates/modules/boss-customers",
     "crates/modules/boss-products",
     "crates/modules/boss-ledger",
     "crates/core/boss-content",

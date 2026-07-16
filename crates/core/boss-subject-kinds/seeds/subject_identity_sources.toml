@@ -58,3 +58,9 @@ event_kind = "campaigns.campaign.created"
 subject_kind = "campaign"
 id_field = "id"
 label_field = "name"
+
+[[source]]
+event_kind = "customers.customer.created"
+subject_kind = "customer"
+id_field = "id"
+label_field = "name"
