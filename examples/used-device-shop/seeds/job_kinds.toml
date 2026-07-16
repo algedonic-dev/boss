@@ -1817,7 +1817,7 @@ metadata_defaults = { doc_type = "vendor-contract", title = "Renewed vendor cont
 kind = "ad-hoc"
 label = "Ad Hoc"
 category = "operations"
-subject_kinds = ["employee", "account", "vendor", "location", "asset", "purchase_order", "campaign"]
+subject_kinds = ["employee", "account", "vendor", "location", "asset", "purchase_order", "campaign", "company"]
 description = """
 Generic catchall for one-off work. Single task step; the operator
 fills in what the work is via the title + metadata.

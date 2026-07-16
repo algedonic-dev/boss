@@ -925,16 +925,16 @@ anchor_date = "2025-04-02"
 business_calendar = "us-banking"
 action.kind = "open_job"
 action.job_kind = "ap-payment-run"
-action.subject_kind = "location"
-action.subject_id = "loc-brewery-brewhouse"
+action.subject_kind = "company"
+action.subject_id = "brewery"
 
 [periodic.equipment-preventive-maintenance]
 cadence = "monthly"
 anchor_date = "2024-01-15"
 action.kind = "open_job"
 action.job_kind = "equipment-preventive-maintenance"
-action.subject_kind = "location"
-action.subject_id = "loc-brewery-brewhouse"
+action.subject_kind = "company"
+action.subject_id = "brewery"
 
 # Monthly facility overhead — rent + utilities for the brewery facility.
 # Anchored on the 5th (bills due mid-month, not midnight-of-day-1): firing
@@ -951,8 +951,8 @@ cadence = "monthly"
 anchor_date = "2024-01-05"
 action.kind = "open_job"
 action.job_kind = "facility-overhead"
-action.subject_kind = "location"
-action.subject_id = "loc-brewery-brewhouse"
+action.subject_kind = "company"
+action.subject_id = "brewery"
 
 # Each `[periodic.*]` open_job spec MUST set subject_kind +
 # subject_id — `open_job_from_request` silently drops the
@@ -979,8 +979,8 @@ anchor_date = "2024-01-31"
 business_calendar = "us-tax"
 action.kind = "open_job"
 action.job_kind = "sales-tax-filing"
-action.subject_kind = "location"
-action.subject_id = "loc-brewery-brewhouse"
+action.subject_kind = "company"
+action.subject_id = "brewery"
 
 # Biweekly payroll-run. Opens the payroll-run JobKind on
 # Thursdays starting 2024-01-04. Steps walk calculate → review
@@ -995,8 +995,8 @@ anchor_date = "2024-01-04"
 business_calendar = "us-banking"
 action.kind = "open_job"
 action.job_kind = "payroll-run"
-action.subject_kind = "location"
-action.subject_id = "loc-brewery-brewhouse"
+action.subject_kind = "company"
+action.subject_id = "brewery"
 
 # Quarterly federal payroll tax filing (Form 941). One filing
 # per closed quarter. Opens the payroll-941-filing JobKind whose
@@ -1008,8 +1008,8 @@ anchor_date = "2024-01-15"
 business_calendar = "us-banking"
 action.kind = "open_job"
 action.job_kind = "payroll-941-filing"
-action.subject_kind = "location"
-action.subject_id = "loc-brewery-brewhouse"
+action.subject_kind = "company"
+action.subject_id = "brewery"
 
 # Quarterly estimated income tax. Same shape as payroll-941;
 # routes through the income-tax-filing JobKind's tax-remittance
@@ -1020,8 +1020,8 @@ anchor_date = "2024-01-15"
 business_calendar = "us-banking"
 action.kind = "open_job"
 action.job_kind = "income-tax-filing"
-action.subject_kind = "location"
-action.subject_id = "loc-brewery-brewhouse"
+action.subject_kind = "company"
+action.subject_id = "brewery"
 
 # Quarterly federal beer excise tax (TTB). Same shape as payroll-941;
 # routes through the excise-tax-filing JobKind's tax-remittance step,
@@ -1032,8 +1032,8 @@ anchor_date = "2024-01-15"
 business_calendar = "us-banking"
 action.kind = "open_job"
 action.job_kind = "excise-tax-filing"
-action.subject_kind = "location"
-action.subject_id = "loc-brewery-brewhouse"
+action.subject_kind = "company"
+action.subject_id = "brewery"
 
 # ---------------------------------------------------------------------------
 # Batch [batch.*] specs retired 2026-05-06 — see TODO.md

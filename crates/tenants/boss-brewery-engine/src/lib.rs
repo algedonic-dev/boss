@@ -93,30 +93,57 @@ pub fn load_parts(seeds: &Path) -> Result<Vec<InventoryItem>> {
     Ok(bundle.parts)
 }
 
+/// Resolve the kind-scoped subject-mint URL for `api_base` —
+/// `direct://<host>` goes straight at the subject-kinds service port,
+/// anything else is a gateway-style base.
+fn subject_mint_url(api_base: &str, kind: &str) -> String {
+    if let Some(host) = api_base.strip_prefix("direct://") {
+        format!("http://{host}:7830/api/subjects/{kind}")
+    } else {
+        format!("{}/api/subjects/{kind}", api_base.trim_end_matches('/'))
+    }
+}
+
+/// Mint one identity row via `POST /api/subjects/{kind}` — the
+/// generic write-side of identity-first for table-less kinds.
+/// Blocking reqwest — call from spawn_blocking (or a blocking
+/// context like prepare). Idempotent (the endpoint upserts).
+pub fn mint_subject_identity(
+    kind: &str,
+    id: &str,
+    label: Option<&str>,
+    api_base: &str,
+) -> Result<(), String> {
+    let client = reqwest::blocking::Client::new();
+    let url = subject_mint_url(api_base, kind);
+    let body = match label {
+        Some(l) => serde_json::json!({ "id": id, "label": l }),
+        None => serde_json::json!({ "id": id }),
+    };
+    let resp = client
+        .post(&url)
+        .header("x-sim-origin", "true")
+        .json(&body)
+        .send()
+        .map_err(|e| e.to_string())?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("{} {}", url, resp.status()))
+    }
+}
+
 /// Mint identity rows for the sim's table-less campaign subjects via
 /// `POST /api/subjects/campaign` — the pool's campaign ids must pass
 /// the uniform jobs existence gate before the first tap-launch Job
 /// references them (subject-model R1). Blocking reqwest — call from
-/// spawn_blocking. Idempotent (the endpoint upserts).
+/// spawn_blocking. Idempotent (the endpoint upserts). Best-effort per
+/// id: a refused mint logs and moves on (the daemon boot path must
+/// not die on one bad campaign slug).
 pub fn mint_campaign_identities(campaign_ids: &[String], api_base: &str) {
-    let client = reqwest::blocking::Client::new();
-    let url = if let Some(host) = api_base.strip_prefix("direct://") {
-        format!("http://{host}:7830/api/subjects/campaign")
-    } else {
-        format!("{}/api/subjects/campaign", api_base.trim_end_matches('/'))
-    };
     for id in campaign_ids {
-        match client
-            .post(&url)
-            .header("x-sim-origin", "true")
-            .json(&serde_json::json!({ "id": id }))
-            .send()
-        {
-            Ok(r) if r.status().is_success() => {}
-            Ok(r) => {
-                tracing::warn!(id = %id, status = %r.status(), "campaign identity mint refused")
-            }
-            Err(e) => tracing::warn!(id = %id, error = %e, "campaign identity mint failed"),
+        if let Err(e) = mint_subject_identity("campaign", id, None, api_base) {
+            tracing::warn!(id = %id, error = %e, "campaign identity mint failed");
         }
     }
 }
@@ -131,6 +158,11 @@ pub fn seed_brewery_subjects(state: &mut ShapeDrivenState) {
     // parts are seeded into the inventory-api by the binary's
     // `seed_parts`; the workforce executor reads real on-hand back
     // when it gates production-consume / demand-gate steps.
+    // Q6: the organization itself is a Subject — org-level JobKinds
+    // (payroll, tax filings, AP runs, facility overhead, the
+    // production heartbeat) open their Jobs about it. One row per
+    // tenant; the id matches tenant.toml meta.tenant_id.
+    state.seed_subject("company", "brewery");
     state.seed_subject("location", "loc-brewery-brewhouse");
     state.seed_subject("location", "loc-brewery-taproom");
     state.seed_subject("location", "loc-hq");

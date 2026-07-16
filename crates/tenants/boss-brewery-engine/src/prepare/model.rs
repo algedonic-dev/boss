@@ -93,6 +93,27 @@ pub fn prepare_model(gateway_base: Option<&str>, seeds_dir: &Path) -> Result<()>
     //     days from. Like classes: load before anything that consumes them.
     seed_business_calendars(&calendar_base, seeds_dir)?;
 
+    // 1c. The tenant's own identity — Q6: the organization being
+    //     modeled is itself a Subject, one row per tenant. The
+    //     org-level JobKinds (payroll, tax filings, AP runs, facility
+    //     overhead, the production heartbeat) open their Jobs about
+    //     it, so the identity must exist before the periodic engine
+    //     opens the first one. Hard-fail: a missing company identity
+    //     starves every org-level Job at the existence gate.
+    let subjects_base = gateway_base
+        .map(str::to_string)
+        .unwrap_or_else(|| boss_ports::url("subject-kinds"));
+    let tenant = boss_sim::shape_driven::TenantConfig::load(&seeds_dir.join("tenant.toml"))
+        .context("loading tenant.toml for the company identity")?;
+    crate::mint_subject_identity(
+        "company",
+        &tenant.meta.tenant_id,
+        Some(&tenant.meta.display_name),
+        &subjects_base,
+    )
+    .map_err(|e| anyhow::anyhow!("minting the company identity: {e}"))?;
+    info!(company = %tenant.meta.tenant_id, "company identity minted");
+
     // 2. Tenant policy grants — core ships only platform rules; the
     //    brewery org chart's row-level access matrix arrives here. These
     //    grants are capability-level (`resource = "job-kind"`, not a
