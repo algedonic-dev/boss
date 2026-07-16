@@ -1,0 +1,48 @@
+[package]
+name = "boss-campaigns"
+description = "Marketing campaigns / launches / promos — the domain home for the campaign Subject kind (Q4). Thin by design: identity + lifecycle; attributes accrue with the marketing flows."
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "boss-campaigns-api"
+path = "src/bin/boss_campaigns_api.rs"
+required-features = ["postgres"]
+
+[features]
+# `postgres` ships in default so `cargo build --release --workspace`
+# produces /target/release/boss-campaigns-api with the postgres
+# adapter (same reasoning as boss-products / boss-docs).
+default = ["postgres"]
+postgres = ["dep:sqlx", "boss-events/postgres", "dep:boss-subject-kinds"]
+
+[dependencies]
+boss-subject-kinds = { path = "../../core/boss-subject-kinds", features = ["postgres"], optional = true }
+boss-core = { path = "../../core/boss-core" }
+boss-clock-client = { path = "../../core/boss-clock-client" }
+boss-ports = { path = "../../core/boss-ports" }
+boss-events = { path = "../../core/boss-events" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { workspace = true }
+http-body-util = "0.1"
+boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"] }
+
+[lints]
+workspace = true

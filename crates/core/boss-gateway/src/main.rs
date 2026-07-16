@@ -413,6 +413,14 @@ async fn main() -> Result<()> {
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::PRODUCTS)),
         )
         .route(
+            "/api/campaigns",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::CAMPAIGNS)),
+        )
+        .route(
+            "/api/campaigns/{*rest}",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::CAMPAIGNS)),
+        )
+        .route(
             "/api/calendar/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::CALENDAR)),
         )

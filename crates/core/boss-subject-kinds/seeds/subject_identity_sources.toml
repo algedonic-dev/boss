@@ -52,3 +52,9 @@ event_kind = "products.product.upserted"
 subject_kind = "product"
 id_field = "sku"
 label_field = "name"
+
+[[source]]
+event_kind = "campaigns.campaign.created"
+subject_kind = "campaign"
+id_field = "id"
+label_field = "name"

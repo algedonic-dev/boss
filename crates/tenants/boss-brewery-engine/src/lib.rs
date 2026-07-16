@@ -133,17 +133,34 @@ pub fn mint_subject_identity(
     }
 }
 
-/// Mint identity rows for the sim's table-less campaign subjects via
-/// `POST /api/subjects/campaign` — the pool's campaign ids must pass
-/// the uniform jobs existence gate before the first tap-launch Job
-/// references them (subject-model R1). Blocking reqwest — call from
-/// spawn_blocking. Idempotent (the endpoint upserts). Best-effort per
-/// id: a refused mint logs and moves on (the daemon boot path must
-/// not die on one bad campaign slug).
+/// Sync the sim's campaign pool into its domain home via
+/// `POST /api/campaigns` (boss-campaigns, Q4) — one create per pool
+/// slug, so tap-launch Jobs pass the uniform gate AND every pool
+/// campaign is a real domain row with a `campaigns.campaign.created`
+/// event behind it. Idempotent: the endpoint reports 200 (nothing
+/// written, nothing emitted) for ids that already exist. Blocking
+/// reqwest — call from spawn_blocking. Best-effort per id: a refused
+/// create logs and moves on (the daemon boot path must not die on
+/// one bad campaign slug).
 pub fn mint_campaign_identities(campaign_ids: &[String], api_base: &str) {
+    let client = reqwest::blocking::Client::new();
+    let url = if let Some(host) = api_base.strip_prefix("direct://") {
+        format!("http://{host}:7845/api/campaigns")
+    } else {
+        format!("{}/api/campaigns", api_base.trim_end_matches('/'))
+    };
     for id in campaign_ids {
-        if let Err(e) = mint_subject_identity("campaign", id, None, api_base) {
-            tracing::warn!(id = %id, error = %e, "campaign identity mint failed");
+        let sent = client
+            .post(&url)
+            .header("x-sim-origin", "true")
+            .json(&serde_json::json!({ "id": id }))
+            .send();
+        match sent {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => {
+                tracing::warn!(id = %id, status = %r.status(), "campaign create refused")
+            }
+            Err(e) => tracing::warn!(id = %id, error = %e, "campaign create failed"),
         }
     }
 }

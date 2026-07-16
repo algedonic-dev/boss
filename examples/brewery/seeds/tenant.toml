@@ -596,11 +596,10 @@ rate = 0.0
 [subject_rates.campaign]
 # Tap launches + seasonal promos.
 rate = 0.04
-# Audit_log topic for synthesized campaign births. No soft-FK
-# rule yet — campaigns are referenced by `tap-launch` Jobs as
-# Subject, not as a foreign id field — but emitting the event
-# preserves replay parity for any future references.
-created_event_kind = "commerce.campaign.created"
+# Campaign births route to POST /api/campaigns (boss-campaigns,
+# Q4): the domain crate lands the row + identity + the
+# campaigns.campaign.created outbox event in one transaction.
+created_event_kind = "campaigns.campaign.created"
 
 # ---------------------------------------------------------------------------
 # Anomaly probabilities — likelihood that a Step on a given JobKind

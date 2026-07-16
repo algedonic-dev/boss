@@ -166,6 +166,11 @@ pub const SOLO: &[PortSpec] = &[
         scratch: None,
     },
     PortSpec {
+        name: "campaigns",
+        prod: 7845,
+        scratch: None,
+    },
+    PortSpec {
         name: "observability",
         prod: 7880,
         scratch: None,
@@ -242,6 +247,31 @@ pub fn scratch_url(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The list bin classifies by array membership and EXPECTS every
+    /// PAIRED spec to carry a scratch port — a solo-shaped spec
+    /// parked in PAIRED panics `boss-ports-list --paired` mid-stream
+    /// and every consumer (deploy-services, generate-configs) sees a
+    /// truncated table. Exactly this shipped once: campaigns
+    /// (scratch: None) landed in PAIRED and docker's generated
+    /// config rendered `http_bind = "0.0.0.0:"`, wedging the stack.
+    #[test]
+    fn paired_specs_carry_scratch_ports_solo_specs_do_not() {
+        for s in PAIRED {
+            assert!(
+                s.scratch.is_some(),
+                "{} is in PAIRED without a scratch port — move it to SOLO",
+                s.name
+            );
+        }
+        for s in SOLO {
+            assert!(
+                s.scratch.is_none(),
+                "{} is in SOLO with a scratch port — move it to PAIRED",
+                s.name
+            );
+        }
+    }
 
     #[test]
     fn names_are_unique() {
