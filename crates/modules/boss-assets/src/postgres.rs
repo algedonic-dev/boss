@@ -761,6 +761,13 @@ async fn upsert_system(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     state: &AssetCurrentState,
 ) -> Result<(), AssetsError> {
+    // Identity write-through (subject-model R1, Q1): the asset's
+    // identity row rides the same transaction as its current-state
+    // upsert (identity-first — a Registered event with only an id
+    // still lands an identity).
+    boss_subject_kinds::subjects::record_subject_in_tx(tx, "asset", &state.asset_id.0, None)
+        .await
+        .map_err(AssetsError::Storage)?;
     // `sku` is nullable: an identity-first asset is `Registered`
     // before it is identified, so `None` is a valid projection state
     // (it binds SQL NULL). When `Some`, `assets.sku` FKs to

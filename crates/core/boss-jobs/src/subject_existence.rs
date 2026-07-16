@@ -195,6 +195,58 @@ impl SubjectExistenceCheck for ReqwestSubjectExistenceCheck {
     }
 }
 
+/// The uniform adapter (subject-model design R1, approved
+/// 2026-07-15): one indexed lookup against the `subjects` identity
+/// table, for EVERY kind — platform, tenant-defined, and the
+/// previously unreachable ones (vendor, campaign, product, …).
+/// Replaces the five-endpoint HTTP prober: no per-kind URL
+/// templates, no fall-through kinds, no cross-service fan-out.
+/// A storage error maps to `Unavailable`, which the create handler
+/// fails CLOSED on (Q2: abort by default).
+#[cfg(feature = "postgres")]
+pub struct PgSubjectExistence {
+    pool: sqlx::PgPool,
+}
+
+#[cfg(feature = "postgres")]
+impl PgSubjectExistence {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[async_trait]
+impl SubjectExistenceCheck for PgSubjectExistence {
+    async fn check(&self, subject: &Subject) -> Result<(), SubjectExistenceError> {
+        // Birth-by-job kinds (SubjectKind registry rows carrying
+        // `metadata.birth = "job"`: `job-kind`, `custom`) pass without
+        // an identity row — the Job being created IS the subject's
+        // birth record, and `create_job_at` mints the identity inside
+        // the job-create transaction. A registry property, not a gate
+        // bypass: domain kinds stay fail-closed.
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM subjects WHERE kind = $1 AND id = $2) \
+             OR EXISTS(SELECT 1 FROM subject_kinds \
+                        WHERE kind = $1 AND retired_at IS NULL \
+                          AND metadata->>'birth' = 'job')",
+        )
+        .bind(&subject.kind)
+        .bind(&subject.id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| SubjectExistenceError::Unavailable(e.to_string()))?;
+        if exists {
+            Ok(())
+        } else {
+            Err(SubjectExistenceError::NotFound(format!(
+                "{}/{}",
+                subject.kind, subject.id
+            )))
+        }
+    }
+}
+
 #[cfg(test)]
 pub mod test_helpers {
     //! In-memory implementation for unit tests. Pre-populated with

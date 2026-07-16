@@ -252,4 +252,13 @@ pub fn register_default_event_routes(out: &mut LiveApiOutput) {
         "/api/inventory/vendors",
         EventHttpMethod::Post,
     );
+    // Campaign births have no domain table — their identity IS the
+    // row (subject-model R1; identity-first). Route the birth to the
+    // kind-scoped mint so tap-launch Jobs pass the uniform
+    // subject-existence gate.
+    out.register_event_route(
+        "commerce.campaign.created",
+        "/api/subjects/campaign",
+        EventHttpMethod::Post,
+    );
 }

@@ -116,40 +116,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Subject existence validator. None → skip the check (in-memory
-    // / spike paths). Wired when all four upstream URLs are
-    // configured; partial config logs which checks will be live and
-    // which fall through.
-    let subject_existence: Option<Arc<dyn boss_jobs::subject_existence::SubjectExistenceCheck>> = {
-        let people = cfg.people_api_url.as_deref();
-        let assets = cfg.assets_api_url.as_deref();
-        let locations = cfg.locations_api_url.as_deref();
-        let inventory = cfg.inventory_api_url.as_deref();
-        match (people, assets, locations, inventory) {
-            (Some(p), Some(f), Some(l), Some(i)) => {
-                info!(
-                    people_api_url = %p,
-                    assets_api_url = %f,
-                    locations_api_url = %l,
-                    inventory_api_url = %i,
-                    "subject existence checker wired up — ghost-id Job creates rejected"
-                );
-                Some(Arc::new(
-                    boss_jobs::subject_existence::ReqwestSubjectExistenceCheck::new(p, f, l, i),
-                )
-                    as Arc<
-                        dyn boss_jobs::subject_existence::SubjectExistenceCheck,
-                    >)
-            }
-            _ => {
-                info!(
-                    "subject existence checker disabled — set people_api_url + assets_api_url + locations_api_url + inventory_api_url in /etc/boss-jobs-api.toml to enable"
-                );
-                None
-            }
-        }
-    };
-
     // Choose storage backend: Postgres when configured, in-memory otherwise.
     #[cfg(feature = "postgres")]
     if let Some(ref pg_url) = cfg.postgres_url {
@@ -159,6 +125,22 @@ async fn main() -> Result<()> {
             .connect(pg_url)
             .await
             .with_context(|| "connecting to Postgres")?;
+        // Subject existence validator: one indexed lookup against the
+        // `subjects` identity table, uniform for every kind — platform,
+        // tenant-defined, all of them (subject-model design R1, approved
+        // 2026-07-15). Replaces the four-upstream HTTP prober and its
+        // fall-through kinds; the create handler fails CLOSED when the
+        // check is unavailable (Q2: abort by default).
+        let subject_existence: Option<
+            Arc<dyn boss_jobs::subject_existence::SubjectExistenceCheck>,
+        > = {
+            info!("subject existence gate wired to the subjects identity table (all kinds)");
+            Some(
+                Arc::new(boss_jobs::subject_existence::PgSubjectExistence::new(
+                    pool.clone(),
+                )) as Arc<dyn boss_jobs::subject_existence::SubjectExistenceCheck>,
+            )
+        };
         publisher = publisher.with_audit(std::sync::Arc::new(boss_events::PgAuditWriter::new(
             pool.clone(),
         )));
@@ -202,6 +184,10 @@ async fn main() -> Result<()> {
     let plugin_registry: Arc<dyn boss_jobs::StepPluginRegistry> =
         Arc::new(boss_jobs::InMemoryStepPlugins::new());
     reconcile_platform_kinds(kind_registry.as_ref()).await;
+    // No subjects table without Postgres — the in-memory spike path
+    // skips the existence gate, same as before.
+    let subject_existence: Option<Arc<dyn boss_jobs::subject_existence::SubjectExistenceCheck>> =
+        None;
     run_server(
         jobs,
         bus,

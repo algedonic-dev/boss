@@ -13,6 +13,8 @@ pub mod subject_kinds_config;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "postgres")]
+pub mod subjects;
 
 pub use http::{SubjectKindsApiState, router};
 pub use in_memory::InMemorySubjectKinds;

@@ -1,0 +1,54 @@
+# Identity-bearing audit events → subjects rows. The subjects
+# rebuilder walks audit_log and upserts one identity row per matched
+# event (subject-model R1, Q1's projection half). Data, not a match
+# statement — extending coverage is a row append. The R2 relationship
+# registry will eventually subsume this file.
+#
+# `id_field` / `label_field` are payload keys. jobs.job.created is
+# handled structurally in the rebuilder (its subject is a
+# {subject_kind, subject_id} pair — identity-first: a Job about a
+# subject proves the subject existed), so it does not appear here.
+
+[[source]]
+event_kind = "accounts.account.created"
+subject_kind = "account"
+id_field = "id"
+label_field = "name"
+
+[[source]]
+event_kind = "people.employee.created"
+subject_kind = "employee"
+id_field = "id"
+label_field = "name"
+
+[[source]]
+event_kind = "inventory.vendor.created"
+subject_kind = "vendor"
+id_field = "id"
+label_field = "name"
+
+[[source]]
+event_kind = "commerce.invoice.created"
+subject_kind = "invoice"
+id_field = "id"
+
+[[source]]
+event_kind = "inventory.purchase_order.upserted"
+subject_kind = "purchase_order"
+id_field = "id"
+
+[[source]]
+event_kind = "inventory.vendor_invoice.upserted"
+subject_kind = "vendor-invoice"
+id_field = "id"
+
+[[source]]
+event_kind = "shipping.shipment.created"
+subject_kind = "shipment"
+id_field = "id"
+
+[[source]]
+event_kind = "products.product.upserted"
+subject_kind = "product"
+id_field = "sku"
+label_field = "name"

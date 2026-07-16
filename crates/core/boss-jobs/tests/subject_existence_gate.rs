@@ -215,23 +215,25 @@ async fn create_rejected_when_system_does_not_exist() {
 }
 
 #[tokio::test]
-async fn create_fails_open_when_upstream_is_unavailable() {
-    // Flaky upstream returns Unavailable; the handler logs a warning
-    // and still creates the Job. Better than wedging the create-Job
-    // path on every network blip.
+async fn create_fails_closed_when_check_is_unavailable() {
+    // Q2 (subject-model design, resolved 2026-07-15): abort by
+    // default. An unverifiable subject is the phantom class the gate
+    // exists to stop — and with the Pg adapter, "unavailable" means
+    // the same database the create would write to anyway.
     let existence: Arc<dyn SubjectExistenceCheck> = Arc::new(AlwaysUnavailable);
     let (app, jobs) = build_app(Some(existence));
 
     let job = job_with_subject(Subject::new("account", "acc-anything"));
     let resp = post_job(app, &job).await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         jobs.list_jobs(&Default::default(), 100, 0)
             .await
             .unwrap()
             .0
             .len(),
-        1
+        0,
+        "no job may land while the gate cannot verify"
     );
 }
 

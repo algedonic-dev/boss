@@ -672,6 +672,23 @@ impl InventoryRepository for PgInventory {
         // would warn if the value didn't resolve, but in production
         // we want the hard FK doing the work.
         let status_str = po_status_str(&po.status);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| InventoryError::Storage(e.to_string()))?;
+        // Identity write-through (subject-model R1, Q1): the PO's
+        // identity row commits with its header row. (The per-line
+        // INSERTs below keep their pre-existing non-transactional
+        // shape — unchanged here.)
+        boss_subject_kinds::subjects::record_subject_in_tx(
+            &mut tx,
+            "purchase_order",
+            &po.id.to_string(),
+            None,
+        )
+        .await
+        .map_err(InventoryError::Storage)?;
         sqlx::query(
             "INSERT INTO purchase_orders (id, vendor_id, vendor, status, placed_on, expected_on, received_on, created_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
@@ -689,9 +706,12 @@ impl InventoryRepository for PgInventory {
         .bind(po.expected_on)
         .bind(po.received_on)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| InventoryError::Storage(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| InventoryError::Storage(e.to_string()))?;
 
         for line in &po.lines {
             sqlx::query(
@@ -742,6 +762,21 @@ impl InventoryRepository for PgInventory {
         vendor: &Vendor,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<String, InventoryError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| InventoryError::Storage(e.to_string()))?;
+        // Identity write-through (subject-model R1, Q1): same tx as
+        // the domain row.
+        boss_subject_kinds::subjects::record_subject_in_tx(
+            &mut tx,
+            "vendor",
+            &vendor.id,
+            vendor.name.as_deref(),
+        )
+        .await
+        .map_err(InventoryError::Storage)?;
         sqlx::query(
             "INSERT INTO vendors (id, name, contact_name, contact_email, city, state, lead_time_days, payment_terms, category, behavior, created_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
@@ -757,7 +792,7 @@ impl InventoryRepository for PgInventory {
         .bind(&vendor.category)
         .bind(vendor.behavior.as_ref().map(|b| serde_json::to_value(b).unwrap_or_default()))
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             let msg = e.to_string();
@@ -767,6 +802,9 @@ impl InventoryRepository for PgInventory {
                 InventoryError::Storage(msg)
             }
         })?;
+        tx.commit()
+            .await
+            .map_err(|e| InventoryError::Storage(e.to_string()))?;
         Ok(vendor.id.clone())
     }
 

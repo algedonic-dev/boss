@@ -41,12 +41,15 @@ async fn main() -> Result<()> {
     info!(http_bind = %cfg.http_bind, "boss-subject-kinds-api starting");
 
     #[cfg(feature = "postgres")]
+    let subjects_pool: Option<sqlx::PgPool>;
+    #[cfg(feature = "postgres")]
     let subject_kinds: Arc<dyn SubjectKindRepository> = {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(10)
             .connect(&cfg.postgres_url)
             .await
             .with_context(|| "connecting to Postgres")?;
+        subjects_pool = Some(pool.clone());
         Arc::new(boss_subject_kinds::PgSubjectKinds::new(pool))
     };
 
@@ -57,7 +60,13 @@ async fn main() -> Result<()> {
     };
 
     let state = SubjectKindsApiState { subject_kinds };
-    let app = router(state);
+    let mut app = router(state);
+    // The subjects identity surface (R1): mint + existence probe.
+    // Postgres-only — the identity table has no in-memory twin.
+    #[cfg(feature = "postgres")]
+    if let Some(pool) = subjects_pool {
+        app = app.merge(boss_subject_kinds::subjects::subjects_router(pool));
+    }
     // Sim-origin middleware: extract x-sim-origin header and set the
     // per-request task-local so the publisher inherits the sim
     // marker. Closes the gap where a sim chain could trigger a

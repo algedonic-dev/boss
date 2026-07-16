@@ -21,9 +21,10 @@ required-features = ["postgres"]
 
 [features]
 default = []
-postgres = ["dep:sqlx", "boss-events/postgres"]
+postgres = ["dep:sqlx", "boss-events/postgres", "dep:boss-subject-kinds"]
 
 [dependencies]
+boss-subject-kinds = { path = "../../core/boss-subject-kinds", features = ["postgres"], optional = true }
 boss-policy = { path = "../../core/boss-policy" }
 boss-policy-client = { path = "../../core/boss-policy-client" }
 serde = { workspace = true }

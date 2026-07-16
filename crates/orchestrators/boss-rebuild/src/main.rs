@@ -144,6 +144,14 @@ async fn main() -> Result<()> {
     // boss_inventory so any FK-shaped cross-references resolve in
     // the canonical dep order even though products is otherwise
     // independent (it doesn't import inventory types).
+    // Identity table first — reference for the jobs existence gate
+    // (subject-model R1; truncate-and-reproject from the log + the
+    // locations reference pass).
+    step!("subjects", async {
+        boss_subject_kinds::subjects::rebuild_subjects(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+    });
     step!("products", boss_products::rebuild_products(&pool));
     step!("messages", boss_messages::rebuild_messages(&pool));
     step!("people", boss_people::rebuild_people(&pool));

@@ -190,6 +190,16 @@ impl PeopleRepository for PgPeople {
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(|e| PeopleError::Storage(e.to_string()))?;
+        // Identity write-through (subject-model R1, Q1): same tx as
+        // the domain row.
+        boss_subject_kinds::subjects::record_subject_in_tx(
+            &mut tx,
+            "employee",
+            &emp.id,
+            emp.name.as_deref(),
+        )
+        .await
+        .map_err(PeopleError::Storage)?;
         if exists {
             return Err(PeopleError::Conflict(format!(
                 "employee {} already exists",

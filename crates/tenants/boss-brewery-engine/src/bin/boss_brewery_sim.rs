@@ -659,6 +659,26 @@ async fn main() -> Result<()> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(180);
         wait_until_ready(&api_base, timeout_secs).await;
+        // Identity rows for pool campaigns (table-less kind): must
+        // exist before the first tap-launch Job hits the uniform
+        // subject-existence gate.
+        {
+            let api_base = api_base.clone();
+            let campaign_ids: Vec<String> = {
+                let guard = engine.lock().expect("engine mutex poisoned");
+                guard
+                    .state
+                    .subjects
+                    .get("campaign")
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            tokio::task::spawn_blocking(move || {
+                boss_brewery_engine::mint_campaign_identities(&campaign_ids, &api_base)
+            })
+            .await
+            .ok();
+        }
     }
 
     // Main tick loop. Each iteration: read clock, advance one

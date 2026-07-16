@@ -52,6 +52,20 @@ impl ProductsRepository for PgProducts {
     }
 
     async fn upsert_product(&self, product: &Product) -> Result<(), ProductsError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        // Identity write-through (subject-model R1, Q1).
+        boss_subject_kinds::subjects::record_subject_in_tx(
+            &mut tx,
+            "product",
+            &product.sku,
+            Some(&product.name),
+        )
+        .await
+        .map_err(ProductsError::Storage)?;
         sqlx::query(
             "INSERT INTO products (sku, name, product_kind, package_unit, description, metadata, active) \
              VALUES ($1, $2, $3, $4, $5, $6, $7) \
@@ -71,9 +85,12 @@ impl ProductsRepository for PgProducts {
         .bind(&product.description)
         .bind(&product.metadata)
         .bind(product.active)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| ProductsError::Storage(e.to_string()))?;
         Ok(())
     }
 
