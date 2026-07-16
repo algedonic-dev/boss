@@ -356,3 +356,58 @@ fn org_level_kinds_are_about_the_company() {
         "ad-hoc must allow company subjects for org-level one-offs"
     );
 }
+
+/// The shape-driven engine picks a Job's subject_id from the rate's
+/// `subject_distribution` (or `subject_cadence`) but its subject_KIND
+/// from the JobKind's declared `subject_kinds[0]` — two different
+/// files. A distribution still pinning the brewhouse location under a
+/// company-subjected kind builds `(company, loc-brewery-brewhouse)`
+/// pairs, which the existence gate rejected 18 times in Q6's first
+/// live hours (morning brews starved). Every rate under a
+/// company-subjected kind must target the company id.
+#[test]
+fn company_kind_rate_distributions_target_the_company() {
+    use boss_jobs::seed_loader::load_job_kinds_with_owning_team;
+    use std::collections::HashSet;
+
+    let kinds_path = brewery_seeds_dir().join("job_kinds.toml");
+    let kinds = load_job_kinds_with_owning_team(&kinds_path, "brewery").unwrap();
+    let company_kinds: HashSet<&str> = kinds
+        .iter()
+        .filter(|k| k.subject_kinds == vec!["company".to_string()])
+        .map(|k| k.kind.as_str())
+        .collect();
+    assert!(!company_kinds.is_empty());
+
+    let tenant: toml::Value =
+        toml::from_str(&std::fs::read_to_string(brewery_seeds_dir().join("tenant.toml")).unwrap())
+            .unwrap();
+    let Some(rates) = tenant.get("job_rates").and_then(|r| r.as_table()) else {
+        panic!("tenant.toml has no job_rates");
+    };
+    for (kind, rate) in rates {
+        if !company_kinds.contains(kind.as_str()) {
+            continue;
+        }
+        if let Some(dist) = rate.get("subject_distribution").and_then(|d| d.as_table()) {
+            for id in dist.keys() {
+                assert_eq!(
+                    id, "brewery",
+                    "{kind}: subject_distribution pins `{id}` but the kind is company-subjected"
+                );
+            }
+        }
+        if let Some(cadence) = rate.get("subject_cadence").and_then(|c| c.as_array()) {
+            for entry in cadence {
+                let id = entry
+                    .get("subject_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                assert_eq!(
+                    id, "brewery",
+                    "{kind}: subject_cadence pins `{id}` but the kind is company-subjected"
+                );
+            }
+        }
+    }
+}
