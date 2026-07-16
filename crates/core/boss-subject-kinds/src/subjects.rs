@@ -220,10 +220,21 @@ pub async fn rebuild_subjects(pool: &PgPool) -> Result<u64, String> {
             Some(f) => format!("payload->>'{f}'"),
             None => "NULL".to_string(),
         };
+        // One row per subject id, NEWEST event (highest audit id)
+        // winning the label. `*.upserted` kinds emit many events per
+        // id, and a single INSERT … ON CONFLICT DO UPDATE that hits
+        // the same (kind, id) twice aborts the whole rebuild
+        // ("cannot affect row a second time") — dedup must happen
+        // inside the statement.
         let sql = format!(
             "INSERT INTO subjects (kind, id, label) \
-             SELECT $1, payload->>'{id}', {label_expr} \
-             FROM audit_log WHERE kind = $2 AND payload->>'{id}' IS NOT NULL \
+             SELECT $1, ev.subject_id, ev.label FROM ( \
+                 SELECT DISTINCT ON (payload->>'{id}') \
+                        payload->>'{id}' AS subject_id, {label_expr} AS label \
+                   FROM audit_log \
+                  WHERE kind = $2 AND payload->>'{id}' IS NOT NULL \
+                  ORDER BY payload->>'{id}', id DESC \
+             ) ev \
              ON CONFLICT (kind, id) DO UPDATE \
                 SET label = COALESCE(EXCLUDED.label, subjects.label)",
             id = src.id_field,
