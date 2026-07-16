@@ -1,0 +1,117 @@
+//! The `subjects` identity table — R1 of
+//! docs/design/subject-identity-and-relationships.md (approved
+//! 2026-07-15).
+//!
+//! Contract under test:
+//! - `record_subject_in_tx` joins the caller's transaction (the Q1
+//!   write-through half): commit lands the identity row, rollback
+//!   removes it, and an UNREGISTERED kind is rejected by the FK —
+//!   the vocabulary gate enforced at the identity layer.
+//! - Upserts are idempotent; a later label wins, a NULL label never
+//!   erases an earlier one.
+//! - `subject_exists` is the uniform existence probe the jobs gate
+//!   uses for every kind.
+
+#![cfg(feature = "postgres")]
+
+use boss_subject_kinds::subjects::{record_subject_in_tx, subject_exists, upsert_subject};
+use boss_testing::TestDb;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn record_in_tx_commit_lands_rollback_does_not() {
+    let db = TestDb::new().await;
+
+    let mut tx = db.pool.begin().await.unwrap();
+    record_subject_in_tx(&mut tx, "account", "acc-r1-001", Some("R1 Test Account"))
+        .await
+        .expect("record");
+    tx.commit().await.unwrap();
+    assert!(
+        subject_exists(&db.pool, "account", "acc-r1-001")
+            .await
+            .unwrap()
+    );
+
+    let mut tx = db.pool.begin().await.unwrap();
+    record_subject_in_tx(&mut tx, "account", "acc-r1-002", None)
+        .await
+        .expect("record");
+    tx.rollback().await.unwrap();
+    assert!(
+        !subject_exists(&db.pool, "account", "acc-r1-002")
+            .await
+            .unwrap(),
+        "rollback must remove the identity row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unregistered_kind_is_rejected() {
+    // The subjects FK onto subject_kinds is the vocabulary gate made
+    // structural: an identity row cannot exist for a kind the
+    // registry never declared (the `job-kind`-as-subject audit
+    // finding becomes impossible to repeat silently).
+    let db = TestDb::new().await;
+    let mut tx = db.pool.begin().await.unwrap();
+    let err = record_subject_in_tx(&mut tx, "not-a-kind", "x-1", None)
+        .await
+        .expect_err("unregistered kind must be rejected");
+    assert!(
+        err.contains("subjects_kind_fkey") || err.contains("foreign key"),
+        "error should be the FK rejection: {err}"
+    );
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_is_idempotent_and_label_never_regresses() {
+    let db = TestDb::new().await;
+    upsert_subject(&db.pool, "vendor", "vnd-r1-001", Some("Vendor One"))
+        .await
+        .unwrap();
+    // Re-upsert with no label: keeps the old one.
+    upsert_subject(&db.pool, "vendor", "vnd-r1-001", None)
+        .await
+        .unwrap();
+    let label: Option<String> =
+        sqlx::query_scalar("SELECT label FROM subjects WHERE kind='vendor' AND id='vnd-r1-001'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(label.as_deref(), Some("Vendor One"));
+    // A newer non-null label wins.
+    upsert_subject(&db.pool, "vendor", "vnd-r1-001", Some("Vendor One Renamed"))
+        .await
+        .unwrap();
+    let label: Option<String> =
+        sqlx::query_scalar("SELECT label FROM subjects WHERE kind='vendor' AND id='vnd-r1-001'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(label.as_deref(), Some("Vendor One Renamed"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exists_is_false_for_unknown_and_kind_scoped() {
+    let db = TestDb::new().await;
+    upsert_subject(&db.pool, "account", "shared-id", None)
+        .await
+        .unwrap();
+    assert!(
+        subject_exists(&db.pool, "account", "shared-id")
+            .await
+            .unwrap()
+    );
+    // Identity is (kind, id) — the same id under another kind is a
+    // different subject.
+    assert!(
+        !subject_exists(&db.pool, "vendor", "shared-id")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !subject_exists(&db.pool, "account", "missing")
+            .await
+            .unwrap()
+    );
+}

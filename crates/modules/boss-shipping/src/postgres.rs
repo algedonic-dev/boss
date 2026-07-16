@@ -123,6 +123,10 @@ impl ShippingRepository for PgShipping {
         // lifecycle advancement from the shipping generator via the
         // same batch endpoint. Device junction rows use ON CONFLICT
         // DO NOTHING since they don't change across status updates.
+        // Identity write-through (subject-model R1, Q1).
+        boss_subject_kinds::subjects::record_subject_in_tx(&mut tx, "shipment", &shipment.id, None)
+            .await
+            .map_err(ShippingError::Storage)?;
         insert_shipment_row(&mut tx, shipment, now).await?;
         insert_shipment_assets(&mut tx, shipment).await?;
         replace_shipment_line_items(&mut tx, shipment).await?;

@@ -77,6 +77,15 @@ impl MessageRepository for PgMessages {
             None => (None, None, None),
         };
 
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| MessageError::Storage(e.to_string()))?;
+        // Identity write-through (subject-model R1, Q1).
+        boss_subject_kinds::subjects::record_subject_in_tx(&mut tx, "message", &msg.id, None)
+            .await
+            .map_err(MessageError::Storage)?;
         sqlx::query(
             "INSERT INTO messages (id, sender_id, recipient_id, subject, body, entity_type, entity_id, entity_path, kind, sent_at, reply_to) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
@@ -93,9 +102,12 @@ impl MessageRepository for PgMessages {
         .bind(kind_str)
         .bind(msg.sent_at)
         .bind(&msg.reply_to)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| MessageError::Storage(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| MessageError::Storage(e.to_string()))?;
 
         Ok(())
     }

@@ -219,6 +219,12 @@ impl CommerceRepository for PgCommerce {
             .await
             .map_err(|e| CommerceError::Storage(e.to_string()))?;
 
+        // Identity write-through (subject-model R1, Q1): the invoice's
+        // identity row lands in the same transaction as its domain row.
+        boss_subject_kinds::subjects::record_subject_in_tx(&mut tx, "invoice", &inv.id, None)
+            .await
+            .map_err(CommerceError::Storage)?;
+
         sqlx::query(
             "INSERT INTO invoices (id, account_id, issued_on, due_on, paid_on, status, \
                                    amount_cents, currency, tax_cents, tax_jurisdiction, \

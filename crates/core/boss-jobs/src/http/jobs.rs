@@ -467,8 +467,12 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
 
     // When the existence checker is plumbed, ask the upstream service
     // whether the Subject id exists. NotFound → 400; Unavailable →
-    // fail-open (warn + let it through, since a flaky upstream
-    // shouldn't wedge job creation).
+    // fail CLOSED (503). The abort-by-default posture (subject-model
+    // design Q2, resolved 2026-07-15): a Job about an unverifiable
+    // subject is exactly the phantom class the gate exists to stop,
+    // and with the PgSubjectExistence adapter "unavailable" means the
+    // same Postgres this handler is about to write to — nothing
+    // downstream would succeed anyway.
     if let Some(check) = &state.subject_existence {
         match check.check(&job.subject).await {
             Ok(()) => {}
@@ -483,8 +487,13 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
                 tracing::warn!(
                     %msg,
                     job_kind = %job.kind,
-                    "subject existence check upstream unavailable; failing open"
+                    "subject existence check unavailable; failing closed"
                 );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "subject existence check unavailable — retry",
+                )
+                    .into_response();
             }
         }
     }

@@ -94,6 +94,7 @@ INSERT INTO subject_kinds (kind, label, description, owning_team, sort_order, pa
     ('marketing-asset', 'Marketing Asset', 'A marketing content artifact (photo, video, deck, …) under a campaign. Intangible; owns the kind taxonomy.',   'platform', 33, 'intangible'),
     ('invoice',         'Invoice',         'An AR document billed to an account. Workflow-document intangible; owns the status + revenue-category taxonomies.', 'platform', 34, 'intangible'),
     ('message',         'Message',         'An internal message / system signal. Workflow-document intangible; owns the kind taxonomy.',                   'platform', 35, 'intangible'),
+    ('job-kind',        'JobKind',         'A JobKind under design — the subject of the `job-kind-design` meta-Job that authors it. Intangible; identity is the kind code.',        'platform', 36, 'intangible'),
 
     -- Location root has the same kind name; no specialization shipped.
     -- (Tenant Locations get parent_kind='location' once they're added.)
@@ -114,6 +115,52 @@ INSERT INTO subject_kinds (kind, label, description, owning_team, sort_order, pa
 UPDATE subject_kinds
    SET metadata = metadata || '{"calendar_reservable": true}'::jsonb
  WHERE kind IN ('employee', 'asset', 'account');
+
+-- Birth-by-Job is a SubjectKind property (data, not a code path):
+-- for these kinds the first Job ABOUT the subject IS its birth record
+-- — there is no domain table to write through. `job-kind-design` Jobs
+-- birth the kind they design; `design-doc-review` Jobs birth the
+-- `custom` doc-path subject they review. The uniform jobs existence
+-- gate passes these kinds, and `create_job_at` mints the identity row
+-- inside the job-create transaction — the write-side mirror of the
+-- subjects rebuilder's `jobs.job.created` pass, which reproduces
+-- exactly these rows from the log (Q1's dual contract, both halves).
+-- Domain kinds (account, asset, …) stay fail-closed at the gate.
+UPDATE subject_kinds
+   SET metadata = metadata || '{"birth": "job"}'::jsonb
+ WHERE kind IN ('job-kind', 'custom');
+
+
+-- ---------------------------------------------------------------------------
+-- Subject identity — the home for `(kind, id)`
+-- (docs/design/subject-identity-and-relationships.md, R1 — approved
+-- 2026-07-15).
+--
+-- Deliberately THIN: identity only, no attributes. Attributes stay in
+-- each kind's domain tables and KB views; this row is the minimal
+-- durable fact "this subject exists" — identity-first made literal (a
+-- Subject can exist from its stable id alone, before any domain crate
+-- knows anything else about it; `campaign` is the worked example).
+--
+-- Dual write contract (Q1): domain services upsert the identity row
+-- inside the SAME transaction as their domain row
+-- (`boss_subject_kinds::record_subject_in_tx`), AND the row is
+-- reproducible from audit_log by the subjects rebuilder — the
+-- `financial_facts` contract. The uniform jobs existence gate reads
+-- this table for EVERY kind, replacing the five per-kind HTTP probes
+-- and their fail-open behavior.
+CREATE TABLE IF NOT EXISTS subjects (
+    kind        TEXT NOT NULL REFERENCES subject_kinds(kind),
+    id          TEXT NOT NULL,
+    -- Display convenience only ("Harbor Bottle Shop"); never
+    -- authoritative — the domain row owns naming.
+    label       TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    retired_at  TIMESTAMPTZ,
+    PRIMARY KEY (kind, id)
+);
+
+CREATE INDEX IF NOT EXISTS subjects_kind ON subjects(kind);
 
 
 CREATE TABLE IF NOT EXISTS classes (
