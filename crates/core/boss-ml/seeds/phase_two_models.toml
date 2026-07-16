@@ -244,9 +244,9 @@ SELECT
     END AS severity,
     LEAST(1.0, (($1::date - j.updated_at::date)::float8 / 14.0)) AS score
 FROM jobs j
-INNER JOIN systems s ON s.asset_id = j.subject_id
+INNER JOIN assets s ON s.asset_id = j.subject_id
 WHERE j.kind IN ('field-service', 'service', 'repair', 'depot-return')
-  AND j.subject_kind = 'system'
+  AND j.subject_kind = 'asset'
   AND j.status IN ('open', 'blocked')
   AND $1::date - j.updated_at::date >= 3"""
   score_expr = "score"
@@ -262,7 +262,7 @@ kind = "declarative-rule"
 version = "v1"
 status = "active"
 description = """
-Installed / out-for-service systems whose last closed preventive-maintenance-visit Job \
+Installed / out-for-service assets whose last closed preventive-maintenance-visit Job \
 is older than the catalog's preventive_maintenance_interval_months window. Warning \
 once overdue by ≥1.5× the interval."""
 
@@ -287,12 +287,12 @@ SELECT
         (($1::date - COALESCE(last_pm.closed_on, s.first_seen))::float8 /
          GREATEST(1, sm.preventive_maintenance_interval_months * 30)::float8 - 1.0)
     ) AS score
-FROM systems s
+FROM assets s
 INNER JOIN asset_models sm ON sm.sku = s.sku
 LEFT JOIN LATERAL (
     SELECT j.closed_on FROM jobs j
     WHERE j.kind = 'preventive-maintenance-visit'
-      AND j.subject_kind = 'system'
+      AND j.subject_kind = 'asset'
       AND j.subject_id = s.asset_id
       AND j.status = 'closed'
     ORDER BY j.closed_on DESC NULLS LAST LIMIT 1
@@ -308,4 +308,4 @@ WHERE s.account_id IS NOT NULL
   entity_type = "account"
   entity_id_column = "account_id"
   row_key_column = "asset_id"
-  payload_template = { rule = "preventive-maintenance-due", asset_id = "{{asset_id}}", model_name = "{{model_name}}", severity = "{{severity}}", headline = "{{model_name}} {{asset_id}} — preventive maintenance overdue", context = "Last preventive maintenance reference {{reference_date}} ({{days_since}} days ago); interval {{preventive_maintenance_interval_months}}mo", deep_link = "/fleet/{{asset_id}}", days_since = "{{days_since}}", preventive_maintenance_interval_months = "{{preventive_maintenance_interval_months}}" }
+  payload_template = { rule = "preventive-maintenance-due", asset_id = "{{asset_id}}", model_name = "{{model_name}}", severity = "{{severity}}", headline = "{{model_name}} {{asset_id}} — preventive maintenance overdue", context = "Last preventive maintenance reference {{reference_date}} ({{days_since}} days ago); interval {{preventive_maintenance_interval_months}}mo", deep_link = "/assets/{{asset_id}}", days_since = "{{days_since}}", preventive_maintenance_interval_months = "{{preventive_maintenance_interval_months}}" }
