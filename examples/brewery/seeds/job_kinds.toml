@@ -29,7 +29,7 @@
 kind = "morning-brew"
 label = "Morning Brew"
 category = "production"
-subject_kinds = ["location"]
+subject_kinds = ["company"]
 description = """
 Daily production cycle on the brewhouse. Runs every brewing morning
 on the brewhouse Subject. Step graph maps directly onto the
@@ -948,7 +948,7 @@ metadata_defaults = { outcome_kind = "completed" }
 kind = "equipment-preventive-maintenance"
 label = "Equipment Preventive Maintenance"
 category = "operations"
-subject_kinds = ["location"]
+subject_kinds = ["company"]
 description = """
 Preventive maintenance pass on production equipment. v0 keys on
 Location (the brewhouse) because there's no equipment-Subject yet
@@ -1025,7 +1025,7 @@ metadata_defaults = { outcome_kind = "completed" }
 kind = "facility-overhead"
 label = "Facility Overhead"
 category = "operations"
-subject_kinds = ["location"]
+subject_kinds = ["company"]
 description = """
 Monthly operating-cost cycle for the brewery facility: approve the rent +
 utilities bills through the ledger AP subledger, then pay them. Opened by
@@ -1310,7 +1310,7 @@ metadata_defaults = { outcome_kind = "completed" }
 kind = "payroll-run"
 label = "Payroll Run"
 category = "finance"
-subject_kinds = ["location"]
+subject_kinds = ["company"]
 description = """
 Biweekly payroll batch. Opened by `[periodic.biweekly-payroll]`
 on every other Thursday; one Job per cycle per legal entity.
@@ -1380,7 +1380,7 @@ metadata_defaults = { outcome_kind = "completed" }
 kind = "sales-tax-filing"
 label = "Sales Tax Filing"
 category = "finance"
-subject_kinds = ["location"]
+subject_kinds = ["company"]
 description = """
 Quarterly sales-tax return. Opened by the PeriodicEngine on the
 filing-window anchor; the BatchEngine fanout fills the per-
@@ -1441,7 +1441,7 @@ metadata_defaults = { kind = "sales", jurisdiction = "US-CA" }
 kind = "payroll-941-filing"
 label = "Federal Payroll Tax Filing (941)"
 category = "finance"
-subject_kinds = ["location"]
+subject_kinds = ["company"]
 description = """
 Quarterly federal payroll tax (Form 941) filing — drains
 accumulated 2150 Payroll Liability for the closed quarter.
@@ -1494,7 +1494,7 @@ metadata_defaults = { kind = "payroll_941", jurisdiction = "US-FEDERAL" }
 kind = "income-tax-filing"
 label = "Estimated Income Tax Filing"
 category = "finance"
-subject_kinds = ["location"]
+subject_kinds = ["company"]
 description = """
 Quarterly estimated federal + state income-tax filing —
 drains accumulated 2310 Income Tax Payable. Steps walk
@@ -1550,7 +1550,7 @@ metadata_defaults = { kind = "income", jurisdiction = "US-FEDERAL" }
 kind = "excise-tax-filing"
 label = "Federal Excise Tax Filing (TTB)"
 category = "finance"
-subject_kinds = ["location"]
+subject_kinds = ["company"]
 description = """
 Quarterly federal beer excise tax (TTB) filing — drains accumulated
 2320 Excise Tax Payable for the closed quarter. The liability accrues
@@ -1716,7 +1716,7 @@ metadata_defaults = { account_id = "acc-direct-shop", amount_cents = 18000, curr
 kind = "morning-brew-ipa"
 label = "Morning Brew — IPA"
 category = "production"
-subject_kinds = ["location"]
+subject_kinds = ["company"]
 description = """
 Daily IPA brewing cycle. Identical step graph to morning-brew
 (mash → lauter → boil → whirlpool → fermentation → package),
@@ -1914,7 +1914,7 @@ metadata_defaults = { outcome_kind = "skipped" }
 kind = "morning-brew-stout"
 label = "Morning Brew — Stout"
 category = "production"
-subject_kinds = ["location"]
+subject_kinds = ["company"]
 description = """
 Daily Stout brewing cycle. Same step graph as morning-brew (mash →
 lauter → boil → whirlpool → fermentation → package), with a
@@ -2106,7 +2106,7 @@ metadata_defaults = { outcome_kind = "skipped" }
 kind = "morning-brew-lager"
 label = "Morning Brew — Lager"
 category = "production"
-subject_kinds = ["location"]
+subject_kinds = ["company"]
 description = """
 Daily Lager brewing cycle. Same step graph as morning-brew. Pilsner
 malt grain bill, noble hops, lager yeast. Output is FP-LAGER-*.
@@ -2295,7 +2295,7 @@ metadata_defaults = { outcome_kind = "skipped" }
 kind = "morning-brew-hazy"
 label = "Morning Brew — Hazy IPA"
 category = "production"
-subject_kinds = ["location"]
+subject_kinds = ["company"]
 description = """
 Daily Hazy IPA brewing cycle. Same step graph as morning-brew. Heavy
 late hop schedule, biotransformation dry hop in active fermentation,
@@ -2489,7 +2489,7 @@ metadata_defaults = { outcome_kind = "skipped" }
 kind = "ad-hoc"
 label = "Ad Hoc"
 category = "operations"
-subject_kinds = ["employee", "account", "vendor", "location", "asset", "purchase_order", "campaign"]
+subject_kinds = ["employee", "account", "vendor", "location", "asset", "purchase_order", "campaign", "company"]
 description = """
 Generic catchall for one-off work. Single task step; the operator
 fills in what the work is via the title + metadata.
@@ -2537,7 +2537,7 @@ metadata_defaults = { category = "ad-hoc" }
 kind = "batch-qc-hold"
 label = "Batch QC Hold (anomaly branch)"
 category = "production"
-subject_kinds = ["location"]
+subject_kinds = ["company"]
 description = """
 Opened when a parent production Job (typically morning-brew) flags
 a QC anomaly. Lab analysis + triage decision; outcome determines
@@ -2616,7 +2616,7 @@ metadata_defaults = { release_decision = "", parent_resumes = true }
 kind = "ap-payment-run"
 label = "Daily AP Payment Run"
 category = "finance"
-subject_kinds = ["location"]
+subject_kinds = ["company"]
 description = """
 Daily batch settlement of approved vendor invoices. Subject is
 the brewery location (the entity issuing the checks / ACH).

@@ -71,6 +71,7 @@ INSERT INTO subject_kinds (kind, label, description, owning_team, sort_order, pa
     ('calendar',       'Calendar',       'The "when" axis. Reservations, events, due dates, business calendars. Coordinates time across the other roots.',                       'platform',  5, NULL),
 
     -- Person specializations
+    ('company',        'Company',        'The tenant organization itself — one row per tenant; the subject of org-level work (payroll, tax filings, AP runs, facility overhead). The organization being modeled is a Subject in its own event log (Q6).', 'platform', 15, 'person'),
     ('account',        'Account',        'External account / customer (B2B account, wholesale customer).',                                                                         'platform', 20, 'person'),
     ('customer',       'Customer',       'External end-consumer. Distinct from account (B2B) — customers are individuals buying via a DTC channel like /shop. Carries email + name + purchase history.', 'platform', 25, 'person'),
     ('employee',       'Employee',       'A person on the roster. Subject of HR Jobs (hire, certification, …).',                                                                    'platform', 50, 'person'),

@@ -307,3 +307,52 @@ fn overhead_absorption_rules_agree() {
         "expected ≥6 brewing JobKinds with a derivable batch size, found {producing_kinds}"
     );
 }
+
+/// Q6 (subject-model design, resolved 2026-07-15): org-level work is
+/// about the COMPANY, not the brewhouse location it happened to be
+/// parked on. The org-level kinds — payroll, tax filings, AP runs,
+/// facility overhead, the daily production heartbeat and its QC/PM
+/// satellites — declare `subject_kinds = ["company"]`; `ad-hoc` keeps
+/// its menu but gains company for org-level one-offs. The location
+/// kind remains for genuinely place-bound work.
+#[test]
+fn org_level_kinds_are_about_the_company() {
+    use boss_jobs::seed_loader::load_job_kinds_with_owning_team;
+
+    let kinds_path = brewery_seeds_dir().join("job_kinds.toml");
+    let kinds = load_job_kinds_with_owning_team(&kinds_path, "brewery").unwrap();
+
+    let org_level = [
+        "payroll-run",
+        "payroll-941-filing",
+        "sales-tax-filing",
+        "income-tax-filing",
+        "excise-tax-filing",
+        "ap-payment-run",
+        "facility-overhead",
+        "equipment-preventive-maintenance",
+        "morning-brew",
+        "morning-brew-ipa",
+        "morning-brew-stout",
+        "morning-brew-lager",
+        "morning-brew-hazy",
+        "batch-qc-hold",
+    ];
+    for kind in org_level {
+        let spec = kinds
+            .iter()
+            .find(|k| k.kind == kind)
+            .unwrap_or_else(|| panic!("{kind} missing from job_kinds.toml"));
+        assert_eq!(
+            spec.subject_kinds,
+            vec!["company".to_string()],
+            "{kind} is org-level work — its subject is the company (Q6)"
+        );
+    }
+
+    let ad_hoc = kinds.iter().find(|k| k.kind == "ad-hoc").unwrap();
+    assert!(
+        ad_hoc.subject_kinds.contains(&"company".to_string()),
+        "ad-hoc must allow company subjects for org-level one-offs"
+    );
+}
