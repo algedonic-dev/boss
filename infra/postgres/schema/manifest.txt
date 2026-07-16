@@ -19,6 +19,7 @@
 27-shipping.sql
 28-scheduling.sql
 29-campaigns.sql
+30-customers.sql
 40-ledger.sql
 41-dispatcher.sql
 99-search.sql

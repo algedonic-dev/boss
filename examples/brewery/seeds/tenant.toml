@@ -601,6 +601,18 @@ rate = 0.04
 # campaigns.campaign.created outbox event in one transaction.
 created_event_kind = "campaigns.campaign.created"
 
+[subject_rates.customer]
+# DTC signups — the /shop channel's customer base growing over
+# time. Births route to POST /api/customers (boss-customers, Q4b):
+# row + identity + customers.customer.created outbox event in one
+# transaction. Real /shop checkouts mint through the same endpoint
+# (deterministic id from the buyer's email), so sim-born and
+# human-born customers share one home. Referenced by nothing yet —
+# re-subjecting direct-shop-order to the customer is the deferred
+# follow-on (it touches DTC billing).
+rate = 0.3
+created_event_kind = "customers.customer.created"
+
 # ---------------------------------------------------------------------------
 # Anomaly probabilities — likelihood that a Step on a given JobKind
 # experiences a given anomaly during its execution. Sim rolls these

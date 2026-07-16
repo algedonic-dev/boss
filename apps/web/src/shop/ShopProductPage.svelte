@@ -80,6 +80,25 @@
     error = null;
     try {
       const todayIso = appToday();
+      // The buyer gets a durable home first (boss-customers, Q4b):
+      // POST derives a deterministic id from the email, so the same
+      // buyer always lands on the same row and re-checkout is
+      // idempotent. Best-effort — a refused create still takes the
+      // order (the inline metadata fields below remain the shipping
+      // surface's source), it just goes unlinked.
+      let customerId: string | null = null;
+      try {
+        const cr = await fetch('/api/customers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, email, phone: phone || undefined }),
+        });
+        if (cr.ok) {
+          customerId = ((await cr.json()) as { id?: string }).id ?? null;
+        }
+      } catch {
+        // Unlinked order beats a failed order.
+      }
       const body = {
         kind: 'direct-shop-order',
         subject: { subject_kind: 'account', id: 'acc-direct-shop' },
@@ -94,6 +113,7 @@
         opened_on: todayIso,
         tags: ['direct-shop'],
         metadata: {
+          customer_id: customerId,
           customer_email: email,
           customer_name: name,
           customer_phone: phone,

@@ -639,6 +639,8 @@ pub mod live {
             7840
         } else if path.starts_with("/api/campaigns") {
             7845
+        } else if path.starts_with("/api/customers") {
+            7855
         } else if path.starts_with("/api/content") {
             7090
         } else {

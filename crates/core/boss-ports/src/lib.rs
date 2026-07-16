@@ -171,6 +171,11 @@ pub const SOLO: &[PortSpec] = &[
         scratch: None,
     },
     PortSpec {
+        name: "customers",
+        prod: 7855,
+        scratch: None,
+    },
+    PortSpec {
         name: "observability",
         prod: 7880,
         scratch: None,

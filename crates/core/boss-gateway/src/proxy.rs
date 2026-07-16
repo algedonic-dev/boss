@@ -307,6 +307,7 @@ pub static CALENDAR: ProxyConfig = ProxyConfig::new("calendar");
 pub static OBSERVABILITY: ProxyConfig = ProxyConfig::new("observability");
 pub static PRODUCTS: ProxyConfig = ProxyConfig::new("products");
 pub static CAMPAIGNS: ProxyConfig = ProxyConfig::new("campaigns");
+pub static CUSTOMERS: ProxyConfig = ProxyConfig::new("customers");
 /// Simulator UX service — hosts the /simulator SPA bundle + the
 /// /simulator/api/* control+status surface. Port 7010, declared in
 /// boss_ports.

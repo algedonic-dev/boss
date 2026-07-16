@@ -262,4 +262,10 @@ pub fn register_default_event_routes(out: &mut LiveApiOutput) {
         "/api/campaigns",
         EventHttpMethod::Post,
     );
+    // Customer births land in their domain home the same way (Q4b).
+    out.register_event_route(
+        "customers.customer.created",
+        "/api/customers",
+        EventHttpMethod::Post,
+    );
 }

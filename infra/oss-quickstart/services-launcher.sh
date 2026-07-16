@@ -36,6 +36,7 @@ SERVICES=(
     "boss-assets-api"
     "boss-catalog-api"
     "boss-campaigns-api"
+    "boss-customers-api"
     "boss-products-api"
     "boss-commerce-api"
     "boss-inventory-api"
