@@ -216,8 +216,9 @@ it          = true   # IT integrations panel (Chase / Stripe / ADP / DOR)
 [job_rates.morning-brew]
 rate = 2.0
 # Pale Ale brewing days. The 250-BBL brewhouse runs Pale Ale
-# weekdays. Subject is loc-brewery-brewhouse (the only brewhouse
-# Location in `locations.toml`).
+# weekdays. Subject is the company (Q6: the production heartbeat
+# is the organization's own work; the brewhouse is where it
+# happens, not what it's about).
 #
 # CLOSED-LOOP PRODUCTION REVIEW (2026-06-14). This kind switched
 # from an open-loop Poisson rate to a `deterministic = true` daily
@@ -248,7 +249,7 @@ rate = 2.0
 deterministic = true
 weekday_multiplier = 1.0
 weekend_multiplier = 0.0
-subject_distribution = { "loc-brewery-brewhouse" = 1.0 }
+subject_distribution = { "brewery" = 1.0 }
 
 [job_rates.morning-brew-stout]
 rate = 1.0
@@ -266,7 +267,7 @@ rate = 1.0
 deterministic = true
 weekday_multiplier = 1.0
 weekend_multiplier = 0.0
-subject_distribution = { "loc-brewery-brewhouse" = 1.0 }
+subject_distribution = { "brewery" = 1.0 }
 
 [job_rates.morning-brew-lager]
 rate = 1.0
@@ -280,7 +281,7 @@ rate = 1.0
 deterministic = true
 weekday_multiplier = 1.0
 weekend_multiplier = 0.0
-subject_distribution = { "loc-brewery-brewhouse" = 1.0 }
+subject_distribution = { "brewery" = 1.0 }
 
 [job_rates.morning-brew-hazy]
 rate = 1.0
@@ -291,7 +292,7 @@ rate = 1.0
 deterministic = true
 weekday_multiplier = 1.0
 weekend_multiplier = 0.0
-subject_distribution = { "loc-brewery-brewhouse" = 1.0 }
+subject_distribution = { "brewery" = 1.0 }
 
 [job_rates.morning-brew-ipa]
 rate = 4.0
@@ -317,7 +318,7 @@ rate = 4.0
 deterministic = true
 weekday_multiplier = 1.0
 weekend_multiplier = 0.0
-subject_distribution = { "loc-brewery-brewhouse" = 1.0 }
+subject_distribution = { "brewery" = 1.0 }
 
 # Wholesale account acquisition — the sales-rep funnel from cold
 # outreach through first-order. Subject is a prospect Account
@@ -461,7 +462,7 @@ rate = 0.07  # ~1 every 2 weeks
 # Maintenance techs work weekdays.
 weekday_multiplier = 1.4
 weekend_multiplier = 0.0
-subject_distribution = { "loc-brewery-brewhouse" = 1.0 }
+subject_distribution = { "brewery" = 1.0 }
 
 [job_rates.tap-launch]
 # Bumped 0.04 → 0.12 (#99 follow-up): the original rate was
@@ -960,9 +961,9 @@ action.subject_id = "brewery"
 # sales-tax-filing periodic never fired for months because of
 # this; caught 2026-05-06 during Stage 4 of the BatchEngine
 # rip). The four finance-cadence specs below all anchor on
-# `loc-brewery-brewhouse` (the brewery's primary location
-# subject, also used by equipment-preventive-maintenance), since their JobKinds
-# declare `subject_kinds = ["location"]`.
+# `(company, brewery)` — Q6: org-level work is about the
+# organization itself; their JobKinds declare
+# `subject_kinds = ["company"]`.
 # Quarterly sales-tax filing. Re-enabled 2026-06-13: the billing
 # dispatcher rule (invoice-issue-on-billing-step-done) now threads CA
 # sales tax (725 bps / US-CA) onto retail + taproom + event-package
