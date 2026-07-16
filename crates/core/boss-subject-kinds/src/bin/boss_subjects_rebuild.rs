@@ -125,6 +125,43 @@ async fn main() -> Result<()> {
             info!(table, kind, rows = res.rows_affected(), "backfilled");
             total += res.rows_affected();
         }
+
+        // JobKinds under design — the registry is multi-version, so
+        // DISTINCT ON picks the newest label per kind.
+        let res = sqlx::query(
+            "INSERT INTO subjects (kind, id, label) \
+             SELECT 'job-kind', jk.kind, jk.label \
+               FROM (SELECT DISTINCT ON (kind) kind, label \
+                       FROM job_kinds ORDER BY kind, version DESC) jk \
+             ON CONFLICT (kind, id) DO UPDATE \
+                SET label = COALESCE(EXCLUDED.label, subjects.label)",
+        )
+        .execute(&pool)
+        .await
+        .context("backfill from job_kinds")?;
+        info!(rows = res.rows_affected(), "backfilled job-kind identities");
+        total += res.rows_affected();
+
+        // Birth-by-job subjects that only ever existed as a Job's
+        // subject (design-doc reviews on `custom`, historical
+        // job-kind design Jobs) — the projection-side mirror of the
+        // log's jobs.job.created pass. Registered kinds only: the FK
+        // would reject anything else, and unregistered residue should
+        // stay visible, not get laundered in.
+        let res = sqlx::query(
+            "INSERT INTO subjects (kind, id) \
+             SELECT DISTINCT j.subject_kind, j.subject_id FROM jobs j \
+              WHERE EXISTS (SELECT 1 FROM subject_kinds k WHERE k.kind = j.subject_kind) \
+             ON CONFLICT (kind, id) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .context("backfill from jobs subjects")?;
+        info!(
+            rows = res.rows_affected(),
+            "backfilled job-borne identities"
+        );
+        total += res.rows_affected();
     }
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subjects")

@@ -219,13 +219,23 @@ impl PgSubjectExistence {
 #[async_trait]
 impl SubjectExistenceCheck for PgSubjectExistence {
     async fn check(&self, subject: &Subject) -> Result<(), SubjectExistenceError> {
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM subjects WHERE kind = $1 AND id = $2)")
-                .bind(&subject.kind)
-                .bind(&subject.id)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| SubjectExistenceError::Unavailable(e.to_string()))?;
+        // Birth-by-job kinds (SubjectKind registry rows carrying
+        // `metadata.birth = "job"`: `job-kind`, `custom`) pass without
+        // an identity row — the Job being created IS the subject's
+        // birth record, and `create_job_at` mints the identity inside
+        // the job-create transaction. A registry property, not a gate
+        // bypass: domain kinds stay fail-closed.
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM subjects WHERE kind = $1 AND id = $2) \
+             OR EXISTS(SELECT 1 FROM subject_kinds \
+                        WHERE kind = $1 AND retired_at IS NULL \
+                          AND metadata->>'birth' = 'job')",
+        )
+        .bind(&subject.kind)
+        .bind(&subject.id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| SubjectExistenceError::Unavailable(e.to_string()))?;
         if exists {
             Ok(())
         } else {

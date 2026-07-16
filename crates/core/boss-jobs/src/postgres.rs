@@ -263,6 +263,32 @@ impl JobsRepository for PgJobs {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), JobsError> {
         let (subj_kind, subj_ref) = subject_parts(&job.subject);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // Birth-by-job subject kinds (`metadata.birth = "job"` in the
+        // SubjectKind registry: `job-kind`, `custom`) have no domain
+        // table — this Job IS the subject's birth record, so its
+        // identity row is minted here, in the same transaction as the
+        // job insert (Q1 write-through). Domain kinds don't match the
+        // WHERE and mint nothing; their identity belongs to the domain
+        // write-through, and the existence gate upstream rejects
+        // ghosts. The rebuilder's `jobs.job.created` pass reproduces
+        // exactly these rows from the log.
+        sqlx::query(
+            "INSERT INTO subjects (kind, id) \
+             SELECT sk.kind, $2 FROM subject_kinds sk \
+              WHERE sk.kind = $1 AND sk.retired_at IS NULL \
+                AND sk.metadata->>'birth' = 'job' \
+             ON CONFLICT (kind, id) DO NOTHING",
+        )
+        .bind(subj_kind)
+        .bind(subj_ref)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
         // ON CONFLICT DO NOTHING — re-emission of an existing
         // Job (replay path, deterministic-UUID sim runs) is a
         // no-op rather than a 500. update_job_at is the path for
@@ -292,9 +318,12 @@ impl JobsRepository for PgJobs {
         .bind(&job.tags)
         .bind(job.job_kind_version)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
         Ok(())
     }
 

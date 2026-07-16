@@ -591,10 +591,11 @@ SQL
 # A violation here means a mint path was missed or a subject was
 # removed without retiring its identity.
 run_invariant "X. Job subjects resolve in the subjects identity table" "$(cat <<'SQL'
-SELECT j.kind || ': ' || j.subject_id
+SELECT j.kind || ': ' || j.subject_kind || '/' || j.subject_id
   FROM jobs j
  WHERE NOT EXISTS (
-     SELECT 1 FROM subjects s WHERE s.id = j.subject_id
+     SELECT 1 FROM subjects s
+      WHERE s.kind = j.subject_kind AND s.id = j.subject_id
  )
  LIMIT 20
 SQL
