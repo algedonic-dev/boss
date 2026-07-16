@@ -50,7 +50,10 @@ SEEDS_DIR="${BOSS_SIM_SEEDS_DIR:-/opt/boss/examples/brewery/seeds}"
 wait_for_stack() {
     command -v boss-ports-list >/dev/null 2>&1 || return 0
     command -v curl >/dev/null 2>&1 || return 0
-    local svcs="classes jobs policy people accounts inventory messages content calendar products ledger catalog assets"
+    # subject-kinds joined the list with Q6: prepare step 1c mints the
+    # company identity through it (hard-fail on refusal), so a cold
+    # stack must have it bound before prepare starts.
+    local svcs="classes subject-kinds jobs policy people accounts inventory messages content calendar products ledger catalog assets"
     declare -A PORT
     while IFS=: read -r name prod _; do [[ -n "$name" ]] && PORT["$name"]="$prod"; done < <(boss-ports-list --paired 2>/dev/null)
     while IFS=: read -r name prod;  do [[ -n "$name" ]] && PORT["$name"]="$prod"; done < <(boss-ports-list --solo 2>/dev/null)
