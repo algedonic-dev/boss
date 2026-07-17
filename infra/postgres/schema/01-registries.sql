@@ -164,6 +164,40 @@ CREATE TABLE IF NOT EXISTS subjects (
 CREATE INDEX IF NOT EXISTS subjects_kind ON subjects(kind);
 
 
+-- ---------------------------------------------------------------------------
+-- Subject edges — the one relationship registry
+-- (docs/design/subject-identity-and-relationships.md, R2).
+-- ---------------------------------------------------------------------------
+--
+-- A declared edge says: events of `source_kind` carry a subject
+-- reference at `field_path`, and that reference must resolve to a
+-- live `subjects` row of `target_kind`. The audit_log + event_outbox
+-- ref-check triggers read this registry and resolve every edge
+-- uniformly against `subjects (kind, id)` — which is why R1 (the
+-- identity table) comes first. It supersedes the per-table
+-- `audit_log_ref_checks` for every SUBJECT-referential edge; that
+-- table survives only for the handful of NON-subject reference guards
+-- (raw-material `part_sku` → `inventory_items`), a deliberately
+-- separate concern (decision 2026-07-17).
+--
+-- `on_missing` is 'abort' for every edge (Q2 — no prod data; a regen
+-- resets anything a newly-declared edge breaks, and a loud abort is
+-- the point). 'warn' exists for the rare legacy edge we want visible
+-- in logs without blocking, but nothing ships 'warn' today.
+--
+-- Each module seeds its own edge rows alongside the table it targets
+-- (accounts → 22, products → 25, …), the same convention the old
+-- ref-check rows followed, so a module stays independently removable.
+CREATE TABLE IF NOT EXISTS subject_edges (
+    source_kind  TEXT NOT NULL,   -- event kind (today) or subject kind
+    field_path   TEXT NOT NULL,   -- top-level payload key holding the ref
+    target_kind  TEXT NOT NULL REFERENCES subject_kinds(kind),
+    on_missing   TEXT NOT NULL DEFAULT 'abort'
+        CHECK (on_missing IN ('abort', 'warn')),
+    PRIMARY KEY (source_kind, field_path)
+);
+
+
 CREATE TABLE IF NOT EXISTS classes (
     subject_kind     TEXT NOT NULL,
     code             TEXT NOT NULL,

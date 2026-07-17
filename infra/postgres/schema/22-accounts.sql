@@ -195,12 +195,16 @@ CREATE INDEX IF NOT EXISTS support_cases_status ON support_cases(status);
 CREATE INDEX IF NOT EXISTS support_cases_assignee ON support_cases(assignee_id)
     WHERE assignee_id IS NOT NULL;
 
--- Accounts ref-check seed rows: commerce events that REFERENCE an
--- existing account. (Trigger + table live in 02-events.)
-INSERT INTO audit_log_ref_checks (event_kind, field_path, ref_table, ref_column) VALUES
-    ('commerce.invoice.created',      'account_id',  'accounts',        'id'),
-    ('commerce.invoice.paid',         'account_id',  'accounts',        'id'),
-    ('commerce.invoice.past_due',     'account_id',  'accounts',        'id'),
-    ('commerce.invoice.written_off',  'account_id',  'accounts',        'id')
-ON CONFLICT (event_kind, field_path) DO NOTHING;
+-- Accounts subject-edge seed rows: commerce events that REFERENCE an
+-- existing account Subject. R2 — resolved against `subjects`
+-- (kind='account') by the subject_edges trigger in 02-events, not the
+-- old per-table ref-check. Every account is a Subject (R1), so the
+-- resolution is equivalent to the retired `accounts.id` check and
+-- also survives an epoch rollover's reprojection.
+INSERT INTO subject_edges (source_kind, field_path, target_kind) VALUES
+    ('commerce.invoice.created',      'account_id',  'account'),
+    ('commerce.invoice.paid',         'account_id',  'account'),
+    ('commerce.invoice.past_due',     'account_id',  'account'),
+    ('commerce.invoice.written_off',  'account_id',  'account')
+ON CONFLICT (source_kind, field_path) DO NOTHING;
 

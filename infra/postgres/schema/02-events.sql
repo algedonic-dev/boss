@@ -223,12 +223,22 @@ CREATE TRIGGER audit_log_compute_row_hash_trg
 -- offending INSERT at the source is the only fix that doesn't
 -- require a separate scrub pass.
 --
--- Per-event-kind rules live in `audit_log_ref_checks` (registry).
+-- Two registries feed these triggers:
+--
+-- 1. `subject_edges` (R2, in 01-registries) — SUBJECT-referential
+--    edges, resolved uniformly against `subjects (kind, id)` by
+--    `check_subject_edges()` below. This is where every edge whose
+--    target is a Subject lives.
+-- 2. `audit_log_ref_checks` (this file) — the residual NON-subject
+--    reference guards (raw-material `part_sku` → `inventory_items`),
+--    resolved against an arbitrary `(ref_table, ref_column)` by
+--    `audit_log_check_refs()`. Parts are not identity-bearing
+--    Subjects, so they keep this separate mechanism (decision
+--    2026-07-17). Everything subject-referential moved to (1).
+--
 -- The trigger reads the registry, extracts the payload field for
--- each matching rule, and checks that the value exists in
--- (ref_table, ref_column). Empty value or NULL skips the check
--- (some events optionally carry a ref, e.g., audit metadata that
--- happens to include account_id only when scoped).
+-- each matching rule, and checks that the value exists. Empty value
+-- or NULL skips the check (some events optionally carry a ref).
 --
 -- Escape hatch: when `audit_log.ref_check` is set to 'off' in the
 -- session, every check is bypassed. The bundle-import path uses
@@ -340,4 +350,86 @@ DROP TRIGGER IF EXISTS event_outbox_check_refs_trg ON event_outbox;
 CREATE TRIGGER event_outbox_check_refs_trg
     BEFORE INSERT ON event_outbox
     FOR EACH ROW EXECUTE FUNCTION audit_log_check_refs();
+
+
+-- ---------------------------------------------------------------------------
+-- Subject-edge referential guard (R2 — the one relationship registry)
+-- ---------------------------------------------------------------------------
+--
+-- Reads `subject_edges` (01-registries) and resolves every declared
+-- edge for this event kind against the `subjects` identity table:
+-- `subjects (kind = target_kind, id = payload->>field_path)`. One
+-- resolution path for every kind — platform, tenant-defined, and the
+-- table-less ones (campaign, company, job-kind) — because R1 gave
+-- them all a home there. Same escape hatch, same dual-mount
+-- (audit_log + event_outbox) as the non-subject guard above; the
+-- outbox mount is the one that can ABORT inside the domain
+-- transaction (post-#118) instead of punching a provenance hole
+-- post-commit.
+--
+-- `on_missing = 'warn'` logs and allows; anything else (the 'abort'
+-- default) raises a foreign_key_violation. Per Q2 every shipped edge
+-- is 'abort'.
+CREATE OR REPLACE FUNCTION check_subject_edges()
+RETURNS TRIGGER AS $$
+DECLARE
+    edge      RECORD;
+    ref_value TEXT;
+    found     BOOLEAN;
+BEGIN
+    -- Escape hatch for bundle-import / restore sessions (shared with
+    -- the non-subject guard — the audit_log restore precedes the
+    -- rebuild of the projections it references).
+    BEGIN
+        IF current_setting('audit_log.ref_check', true) = 'off' THEN
+            RETURN NEW;
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        NULL;
+    END;
+
+    FOR edge IN
+        SELECT field_path, target_kind, on_missing
+          FROM subject_edges
+         WHERE source_kind = NEW.kind
+    LOOP
+        ref_value := NEW.payload ->> edge.field_path;
+        IF ref_value IS NULL OR ref_value = '' THEN
+            CONTINUE;
+        END IF;
+        SELECT EXISTS (
+            SELECT 1 FROM subjects
+             WHERE kind = edge.target_kind AND id = ref_value
+        ) INTO found;
+        IF NOT found THEN
+            IF edge.on_missing = 'warn' THEN
+                RAISE WARNING
+                    'subject edge %.% references missing %:% (on_missing=warn)',
+                    NEW.kind, edge.field_path, edge.target_kind, ref_value;
+            ELSE
+                RAISE EXCEPTION
+                    'subject edge %.% references non-existent %:%',
+                    NEW.kind, edge.field_path, edge.target_kind, ref_value
+                    USING ERRCODE = 'foreign_key_violation';
+            END IF;
+        END IF;
+    END LOOP;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+
+DROP TRIGGER IF EXISTS audit_log_check_subject_edges_trg ON audit_log;
+
+CREATE TRIGGER audit_log_check_subject_edges_trg
+    BEFORE INSERT ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION check_subject_edges();
+
+
+DROP TRIGGER IF EXISTS event_outbox_check_subject_edges_trg ON event_outbox;
+
+CREATE TRIGGER event_outbox_check_subject_edges_trg
+    BEFORE INSERT ON event_outbox
+    FOR EACH ROW EXECUTE FUNCTION check_subject_edges();
 
