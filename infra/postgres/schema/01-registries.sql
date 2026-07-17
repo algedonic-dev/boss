@@ -489,6 +489,34 @@ INSERT INTO locations (id, name, kind, timezone) VALUES
 
 
 -- -----------------------------------------------------------------------------
+-- Companies — tenant-organization reference data (Q6).
+-- -----------------------------------------------------------------------------
+--
+-- The `company` Subject is the organization being modeled — the
+-- subject of org-level work (payroll, tax filings, AP runs). It is
+-- tenant-singleton REFERENCE data, not event-sourced: exactly the
+-- shape `locations` already has. That distinction is load-bearing for
+-- the identity rebuild. A company identity minted only at prepare time
+-- (a live write-through) is NOT reproducible from `audit_log` — and an
+-- epoch rollover trims the log to its baseline (captured AFTER prepare)
+-- and reprojects `subjects` from what remains, so a prepare-only
+-- company vanishes and every org-level Job then fails the existence
+-- gate. Homing it here, read by the subjects rebuilder the same way
+-- locations are, makes the identity reproducible across every rollover.
+CREATE TABLE IF NOT EXISTS companies (
+    id    TEXT PRIMARY KEY,
+    name  TEXT NOT NULL
+);
+
+INSERT INTO companies (id, name) VALUES
+    -- The two worked-example tenants. A real deployment seeds its own
+    -- row (id = tenant.toml meta.tenant_id) the same way.
+    ('brewery',            'Algedonic Ales'),
+    ('used-device-shop',   'Used Device Shop')
+ON CONFLICT (id) DO NOTHING;
+
+
+-- -----------------------------------------------------------------------------
 -- Calendar reservations (global-calendar primitive — see
 -- docs/architecture-decisions.md §Calendar)
 -- -----------------------------------------------------------------------------

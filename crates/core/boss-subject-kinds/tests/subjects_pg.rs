@@ -176,3 +176,35 @@ async fn rebuild_tolerates_repeated_events_per_id_latest_label_wins() {
         "the latest event's label must win"
     );
 }
+
+/// The 2026-07-17 rollover incident: `company` identities are minted
+/// at prepare time (a live write-through), NOT event-sourced. An
+/// epoch rollover trims `audit_log` to its baseline and reprojects
+/// `subjects` from what remains — so a prepare-only company vanishes
+/// and every org-level Job then fails the existence gate. The
+/// `companies` reference table (schema-seeded, like `locations`) is
+/// the durable source the rebuild reads, so the identity survives.
+///
+/// This mirrors the rollover exactly: an audit_log with NO company
+/// events, and rebuild must still reproduce the tenant company.
+#[tokio::test(flavor = "multi_thread")]
+async fn rebuild_reproduces_company_from_reference_table_after_a_trim() {
+    let db = TestDb::new().await;
+    // The schema seeds companies (brewery, used-device-shop); the
+    // log carries nothing about them — exactly the post-trim state.
+    boss_subject_kinds::subjects::rebuild_subjects(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        subject_exists(&db.pool, "company", "brewery")
+            .await
+            .unwrap(),
+        "the tenant company must be reproducible from the reference table alone"
+    );
+    let label: Option<String> =
+        sqlx::query_scalar("SELECT label FROM subjects WHERE kind='company' AND id='brewery'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(label.as_deref(), Some("Algedonic Ales"));
+}
