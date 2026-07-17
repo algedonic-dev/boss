@@ -206,6 +206,10 @@ struct IdentitySource {
 ///    "no write path exists"), so their identity derives from the
 ///    reference table the same way ledger rebuilders read
 ///    `gl_accounts`. Everything event-sourced comes from the log.
+/// 4. the `companies` reference table — the tenant organization (Q6),
+///    identical shape to locations: seed-only reference identity, so
+///    it survives an epoch rollover's truncate-and-reproject (which a
+///    prepare-only write-through does not).
 pub async fn rebuild_subjects(pool: &PgPool) -> Result<u64, String> {
     let sources: SourcesToml = toml::from_str(IDENTITY_SOURCES_TOML).map_err(|e| e.to_string())?;
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
@@ -271,6 +275,23 @@ pub async fn rebuild_subjects(pool: &PgPool) -> Result<u64, String> {
     .execute(&mut *tx)
     .await
     .map_err(|e| format!("locations reference pass: {e}"))?;
+    total += res.rows_affected();
+
+    // Companies are tenant-organization reference rows (Q6), same
+    // shape as locations: seed-only, no create events BY DESIGN, so
+    // their identity derives from the `companies` reference table.
+    // WITHOUT this pass, the company minted at prepare time is lost
+    // the first time an epoch rollover reprojects subjects from the
+    // trimmed log, and every org-level Job then fails the existence
+    // gate (the 2026-07-17 rollover incident).
+    let res = sqlx::query(
+        "INSERT INTO subjects (kind, id, label) \
+         SELECT 'company', id, name FROM companies \
+         ON CONFLICT (kind, id) DO NOTHING",
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| format!("companies reference pass: {e}"))?;
     total += res.rows_affected();
 
     tx.commit().await.map_err(|e| e.to_string())?;
