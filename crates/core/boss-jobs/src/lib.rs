@@ -28,6 +28,7 @@ pub mod scheduling;
 // just `job-kind-design`); tenant JobKinds live in
 // `examples/<tenant>/seeds/job_kinds.toml` and load via `seed_loader`.
 // See docs/design/platform-vs-tenant-jobkinds.md.
+pub mod owner_resolution;
 pub mod seed_loader;
 pub mod step_plugins;
 pub mod step_registry;

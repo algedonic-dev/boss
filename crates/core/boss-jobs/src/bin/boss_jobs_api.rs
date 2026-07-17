@@ -159,6 +159,13 @@ async fn main() -> Result<()> {
             Arc::new(boss_jobs::PgStepPlugins::new(pool.clone()));
         let scheduling: Arc<dyn boss_jobs::scheduling::SchedulingRepository> =
             Arc::new(boss_jobs::scheduling::PgScheduling::new(pool));
+        // Q7: human job-owner resolution over the people roster.
+        let people_url =
+            std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people"));
+        let roster: Option<Arc<dyn boss_jobs::owner_resolution::RosterLookup>> = Some(Arc::new(
+            boss_jobs::owner_resolution::ReqwestRosterLookup::new(people_url.clone()),
+        ));
+        info!(%people_url, "human job-owner resolution wired (Q7)");
         return run_server(
             jobs,
             bus,
@@ -169,6 +176,7 @@ async fn main() -> Result<()> {
             calendar,
             subject_kinds,
             subject_existence,
+            roster,
             cancel_tx,
             cancel_rx,
             &cfg.http_bind,
@@ -198,6 +206,8 @@ async fn main() -> Result<()> {
         calendar,
         subject_kinds,
         subject_existence,
+        // In-memory spike path: no people stack to resolve against.
+        None,
         cancel_tx,
         cancel_rx,
         &cfg.http_bind,
@@ -216,6 +226,7 @@ async fn run_server<R: JobsRepository + 'static>(
     calendar: Option<Arc<dyn boss_calendar_client::CalendarClient>>,
     subject_kinds: Option<Arc<dyn boss_subject_kinds_client::SubjectKindsClient>>,
     subject_existence: Option<Arc<dyn boss_jobs::subject_existence::SubjectExistenceCheck>>,
+    roster: Option<Arc<dyn boss_jobs::owner_resolution::RosterLookup>>,
     cancel_tx: watch::Sender<bool>,
     cancel_rx: watch::Receiver<bool>,
     http_bind: &str,
@@ -275,6 +286,7 @@ async fn run_server<R: JobsRepository + 'static>(
         calendar,
         subject_kinds,
         subject_existence,
+        roster,
         clock: clock.clone(),
     };
     let mut app = router(state);

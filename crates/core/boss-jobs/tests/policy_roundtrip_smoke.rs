@@ -91,6 +91,7 @@ async fn smoke_tester_can_read_job_kinds_through_real_policy_api() {
         calendar: None,
         subject_kinds: None,
         subject_existence: None,
+        roster: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
     };
 

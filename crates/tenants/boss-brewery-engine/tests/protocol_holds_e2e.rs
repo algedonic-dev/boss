@@ -411,3 +411,37 @@ fn company_kind_rate_distributions_target_the_company() {
         }
     }
 }
+
+/// Q7: every Job names a responsible human owner, resolved from the
+/// kind's `metadata.owner_role` or (fallback) its first role-bearing
+/// step's `authority_role`. A kind with NEITHER can only produce
+/// unownable Jobs — the create gate rejects them at runtime, so the
+/// seed must fail here first, at test time.
+#[test]
+fn every_kind_can_resolve_a_human_owner() {
+    use boss_jobs::seed_loader::load_job_kinds_with_owning_team;
+
+    let kinds_path = brewery_seeds_dir().join("job_kinds.toml");
+    let kinds = load_job_kinds_with_owning_team(&kinds_path, "brewery").unwrap();
+
+    let mut unresolvable = Vec::new();
+    for k in &kinds {
+        let has_owner_role = k
+            .metadata
+            .get("owner_role")
+            .and_then(|v| v.as_str())
+            .is_some_and(|r| !r.is_empty());
+        let has_role_bearing_step = k
+            .steps
+            .iter()
+            .any(|s| s.authority_role.as_deref().is_some_and(|r| !r.is_empty()));
+        if !has_owner_role && !has_role_bearing_step {
+            unresolvable.push(k.kind.clone());
+        }
+    }
+    assert!(
+        unresolvable.is_empty(),
+        "kinds with no owner_role and no role-bearing step — their Jobs \
+         would be rejected at the Q7 gate: {unresolvable:?}"
+    );
+}

@@ -458,6 +458,36 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
         job.job_kind_version = spec.version;
     }
 
+    // Q7: every Job names a responsible HUMAN owner. Automation-shaped
+    // owners (system-sim, automation:*, rule:*) resolve server-side to
+    // the kind's owner_role holder (registry metadata), falling back
+    // to the first role-bearing step's authority_role; a human-shaped
+    // owner is kept. Unresolvable → reject: a Job nobody owns is the
+    // modeling error this gate ends. Steps stay automation-ownable.
+    if let Some(ref roster) = state.roster {
+        let owner_role = kind_spec
+            .as_ref()
+            .and_then(|s| s.metadata.get("owner_role"))
+            .and_then(|v| v.as_str());
+        let step_fallback = kind_spec
+            .as_ref()
+            .and_then(|s| s.steps.iter().find_map(|st| st.authority_role.as_deref()));
+        match crate::owner_resolution::resolve_owner(
+            roster.as_ref(),
+            &job.owner_id,
+            &job.id.to_string(),
+            owner_role,
+            step_fallback,
+        )
+        .await
+        {
+            Ok(owner) => job.owner_id = owner,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, e).into_response();
+            }
+        }
+    }
+
     // When `subject = Subject::Custom`, validate `custom_kind` against
     // the SubjectKind registry. Closed-variant subjects (System,
     // Account, Vendor, …) are intrinsically valid and bypass the check.

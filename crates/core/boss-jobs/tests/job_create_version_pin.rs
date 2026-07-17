@@ -80,6 +80,7 @@ async fn new_job_pins_to_active_version_not_default_one() {
         calendar: None,
         subject_kinds: None,
         subject_existence: None,
+        roster: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
     };
     let app = router(state);

@@ -68,6 +68,7 @@ fn build_app(policy: Arc<dyn PolicyClient>) -> (Router, Arc<InMemoryJobs>) {
         calendar: None,
         subject_kinds: None,
         subject_existence: None,
+        roster: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
     };
     (router(state), jobs)

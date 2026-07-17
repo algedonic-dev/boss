@@ -291,6 +291,11 @@ fn job_kind_design_spec() -> JobKindSpec {
         vec!["custom".into()],
         steps,
     );
+    // Q7: the responsible human for platform meta-work. The approve
+    // step's authority (`job-kind-approver`) is a policy CAPABILITY,
+    // not an employees.role value, so the step-authority fallback
+    // can't resolve it — name the operator-baseline role explicitly.
+    spec.metadata = serde_json::json!({ "owner_role": "platform-admin" });
     spec.description = Some(
         "Meta-kind: every JobKind in the registry is authored by a Job of this kind. \
          The terminal `job-kind-publish` step writes the spec into the registry and \
@@ -387,6 +392,11 @@ fn design_doc_review_spec() -> JobKindSpec {
         vec!["custom".into()],
         steps,
     );
+    // Q7: same platform-admin ownership as job-kind-design — the
+    // review step's authority is platform-admin already, but the
+    // explicit owner_role keeps both meta-kinds resolvable even if
+    // step shapes change.
+    spec.metadata = serde_json::json!({ "owner_role": "platform-admin" });
     spec.description = Some(
         "Meta-kind: every design doc under docs/design/ gets reviewed via a Job of this kind. \
          The `review-design` step uses a custom Step UX plugin that reads the doc's open \

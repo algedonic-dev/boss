@@ -108,6 +108,7 @@ fn build_app(existence: Option<Arc<dyn SubjectExistenceCheck>>) -> (Router, Arc<
         calendar: None,
         subject_kinds: None,
         subject_existence: existence,
+        roster: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
     };
     (router(state), jobs)
