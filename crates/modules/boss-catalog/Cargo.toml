@@ -32,7 +32,7 @@ clap = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"], optional = true }
+sqlx = { version = "0.9", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"], optional = true }
 uuid = { workspace = true }
 jsonschema = { version = "0.46", default-features = false }
 
@@ -48,7 +48,7 @@ boss-ports = { path = "../../core/boss-ports" }
 tower = { workspace = true }
 http-body-util = "0.1"
 boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
-sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
+sqlx = { version = "0.9", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
 
 [lints]
 workspace = true

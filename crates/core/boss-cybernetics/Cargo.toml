@@ -18,7 +18,7 @@ boss-core = { path = "../boss-core" }
 boss-events = { path = "../boss-events" }
 boss-nats = { path = "../boss-nats" }
 boss-clock-client = { path = "../boss-clock-client" }
-sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"], optional = true }
+sqlx = { version = "0.9", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json", "uuid"], optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
