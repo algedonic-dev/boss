@@ -35,6 +35,9 @@ struct Pagination {
     offset: Option<i64>,
     /// Scope the page to one account. Powers the unified
     /// account-detail view's Devices panel.
+    /// Account-scoped filter: matches assets whose HOLDER is this
+    /// account (holder_kind='account'). Location-held equipment never
+    /// matches — by design (Q5).
     account_id: Option<String>,
 }
 

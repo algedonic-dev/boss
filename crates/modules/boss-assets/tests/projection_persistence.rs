@@ -99,7 +99,7 @@ async fn append_received_event_creates_devices_row() {
         .expect("append");
 
     let row: (String, String, Option<String>) =
-        sqlx::query_as("SELECT asset_id, sku, account_id FROM assets WHERE asset_id = $1")
+        sqlx::query_as("SELECT asset_id, sku, holder_id FROM assets WHERE asset_id = $1")
             .bind("SN-PROJ-1")
             .fetch_one(&db.pool)
             .await
@@ -136,7 +136,8 @@ async fn subsequent_events_update_projection_in_place() {
             "SN-PROJ-2",
             10,
             AssetEventKind::Installed {
-                account_id: "account-007".into(),
+                holder_kind: "account".into(),
+                holder_id: "account-007".into(),
             },
         ))
         .await
@@ -150,7 +151,7 @@ async fn subsequent_events_update_projection_in_place() {
     assert_eq!(count, 1, "must be exactly one projection row per serial");
 
     let (phase, account): (String, Option<String>) =
-        sqlx::query_as("SELECT phase, account_id FROM assets WHERE asset_id = $1")
+        sqlx::query_as("SELECT phase, holder_id FROM assets WHERE asset_id = $1")
             .bind("SN-PROJ-2")
             .fetch_one(&db.pool)
             .await
@@ -181,7 +182,8 @@ async fn ticket_open_and_close_round_trip_through_projection() {
             "SN-PROJ-3",
             5,
             AssetEventKind::Installed {
-                account_id: "account-99".into(),
+                holder_kind: "account".into(),
+                holder_id: "account-99".into(),
             },
         ),
         evt(
@@ -261,7 +263,8 @@ async fn duplicate_event_does_not_corrupt_projection() {
             "SN-PROJ-4",
             5,
             AssetEventKind::Installed {
-                account_id: "account-1".into(),
+                holder_kind: "account".into(),
+                holder_id: "account-1".into(),
             },
         ))
         .await
@@ -332,7 +335,8 @@ async fn rebuild_projection_recreates_rows_from_event_log() {
             "SN-RB-1",
             5,
             AssetEventKind::Installed {
-                account_id: "account-1".into(),
+                holder_kind: "account".into(),
+                holder_id: "account-1".into(),
             },
         ),
         evt(
@@ -374,7 +378,7 @@ async fn rebuild_projection_recreates_rows_from_event_log() {
 
     // Cross-check: the SN-RB-1 row reflects the Installed projection.
     let (sku, phase, account): (String, String, Option<String>) =
-        sqlx::query_as("SELECT sku, phase, account_id FROM assets WHERE asset_id = $1")
+        sqlx::query_as("SELECT sku, phase, holder_id FROM assets WHERE asset_id = $1")
             .bind("SN-RB-1")
             .fetch_one(&db.pool)
             .await
@@ -441,7 +445,8 @@ async fn open_ticket_lands_in_asset_open_tickets_table() {
             "SN-DOT-1",
             5,
             AssetEventKind::Installed {
-                account_id: "account-X".into(),
+                holder_kind: "account".into(),
+                holder_id: "account-X".into(),
             },
         ),
         evt(
@@ -510,7 +515,8 @@ async fn batch_append_inserts_all_and_projects_per_serial() {
             "SN-BATCH-A",
             5,
             AssetEventKind::Installed {
-                account_id: "account-A".into(),
+                holder_kind: "account".into(),
+                holder_id: "account-A".into(),
             },
         ),
         evt(
@@ -528,7 +534,8 @@ async fn batch_append_inserts_all_and_projects_per_serial() {
             "SN-BATCH-B",
             10,
             AssetEventKind::Installed {
-                account_id: "account-B".into(),
+                holder_kind: "account".into(),
+                holder_id: "account-B".into(),
             },
         ),
         evt(
@@ -615,7 +622,8 @@ async fn batch_append_skips_duplicates_silently() {
                 "SN-DUP",
                 5,
                 AssetEventKind::Installed {
-                    account_id: "account-X".into(),
+                    holder_kind: "account".into(),
+                    holder_id: "account-X".into(),
                 },
             ),
         ])
@@ -662,7 +670,8 @@ async fn out_of_order_event_falls_back_to_full_reproject() {
             "SN-OOO",
             20,
             AssetEventKind::Installed {
-                account_id: "account-late".into(),
+                holder_kind: "account".into(),
+                holder_id: "account-late".into(),
             },
         ))
         .await
@@ -679,7 +688,8 @@ async fn out_of_order_event_falls_back_to_full_reproject() {
             "SN-OOO",
             15,
             AssetEventKind::Shipped {
-                account_id: "account-late".into(),
+                holder_kind: "account".into(),
+                holder_id: "account-late".into(),
             },
         ))
         .await

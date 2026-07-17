@@ -16,7 +16,8 @@ export const AssetSchema = z.object({
   // model until it is identified.
   sku: z.string().nullable(),
   phase: z.string(),
-  account_id: z.string().nullable(),
+  holder_kind: z.string().nullable(),
+  holder_id: z.string().nullable(),
   warranty_through: z.string().nullable(),
   open_ticket_count: z.number(),
   first_seen: z.string(),
@@ -26,7 +27,7 @@ export const AssetSchema = z.object({
 
 /// Asset events have a stable header (id/ts/actor_id/kind) plus
 /// kind-specific tail fields. `passthrough()` is load-bearing —
-/// the tail keys (account_id, sku, source, oem_serial, etc.) are
+/// the tail keys (holder_kind/holder_id, sku, source, oem_serial, etc.) are
 /// what the SPA's event-feed renderer reads.
 export const AssetEventSchema = z.object({
   id: z.string(),

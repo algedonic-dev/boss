@@ -1697,7 +1697,8 @@ fn ensure_brewhouse_assets(
             "ts": first_seen,
             "actor_id": "automation:brewery-data-seed",
             "kind": "Installed",
-            "account_id": "loc-brewery-brewhouse",
+            "holder_kind": "location",
+            "holder_id": "loc-brewery-brewhouse",
         });
         let resp = client
             .post(&url)

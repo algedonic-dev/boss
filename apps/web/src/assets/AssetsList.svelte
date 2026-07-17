@@ -168,7 +168,7 @@
               <th>BOSS ID</th>
               <th>SKU</th>
               <th>Phase</th>
-              <th>Account</th>
+              <th>Holder</th>
               <th>Warranty</th>
               <th class="num">{getLabel('assets.tickets_label', 'Open SRs')}</th>
               <th>Last event</th>
@@ -195,7 +195,7 @@
                 </td>
                 <td class="mono">{d.sku ?? '—'}</td>
                 <td>{PHASE_LABEL[d.phase]}</td>
-                <td class="mono">{d.account_id ?? '—'}</td>
+                <td class="mono">{d.holder_id ?? '—'}</td>
                 <td>{d.warranty_through ?? 'out'}</td>
                 <td class="num">{d.open_ticket_count}</td>
                 <td>{d.last_event_at}</td>

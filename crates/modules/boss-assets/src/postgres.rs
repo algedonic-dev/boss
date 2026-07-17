@@ -367,9 +367,11 @@ impl AssetsRepository for PgAssets {
         account_id: Option<&str>,
     ) -> Result<(Vec<AssetCurrentState>, i64), AssetsError> {
         // Account filter is optional; when set, both queries gain a
-        // `account_id = $?` clause so total + page agree.
+        // account filter = the typed pair (holder_kind='account');
+        // the brewery's location-held equipment never matches an
+        // account scope, which is the honest answer.
         let (total,): (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM assets WHERE ($1::text IS NULL OR account_id = $1)",
+            "SELECT count(*) FROM assets WHERE ($1::text IS NULL OR (holder_kind = 'account' AND holder_id = $1))",
         )
         .bind(account_id)
         .fetch_one(&self.pool)
@@ -377,10 +379,10 @@ impl AssetsRepository for PgAssets {
         .map_err(|e| AssetsError::Storage(e.to_string()))?;
 
         let rows: Vec<SystemRow> = sqlx::query_as(
-            "SELECT asset_id, sku, phase, account_id, warranty_through, \
+            "SELECT asset_id, sku, phase, holder_kind, holder_id, warranty_through, \
              open_ticket_count, first_seen, last_event_at, oem_serial \
              FROM assets \
-             WHERE ($1::text IS NULL OR account_id = $1) \
+             WHERE ($1::text IS NULL OR (holder_kind = 'account' AND holder_id = $1)) \
              ORDER BY last_event_at DESC LIMIT $2 OFFSET $3",
         )
         .bind(account_id)
@@ -400,7 +402,8 @@ impl AssetsRepository for PgAssets {
         let (count,): (i64,) = sqlx::query_as(
             "SELECT count(*) FROM asset_open_tickets t \
              JOIN assets d ON d.asset_id = t.asset_id \
-             WHERE d.account_id = $1 AND d.phase <> 'decommissioned'",
+             WHERE d.holder_kind = 'account' AND d.holder_id = $1 \
+               AND d.phase <> 'decommissioned'",
         )
         .bind(account_id)
         .fetch_one(&self.pool)
@@ -559,7 +562,8 @@ struct SystemRow {
     asset_id: String,
     sku: Option<String>,
     phase: String,
-    account_id: Option<String>,
+    holder_kind: Option<String>,
+    holder_id: Option<String>,
     warranty_through: Option<chrono::NaiveDate>,
     open_ticket_count: i32,
     first_seen: chrono::NaiveDate,
@@ -575,7 +579,8 @@ impl SystemRow {
             // Phase is a free-text Class code; the column stores the
             // kebab string directly, so the newtype wraps it as-is.
             phase: AssetLifecyclePhase::new(self.phase),
-            account_id: self.account_id,
+            holder_kind: self.holder_kind,
+            holder_id: self.holder_id,
             warranty_through: self.warranty_through,
             open_ticket_count: self.open_ticket_count as u32,
             first_seen: self.first_seen,
@@ -591,7 +596,7 @@ async fn fetch_system_state(
     serial: &AssetId,
 ) -> Result<Option<AssetCurrentState>, AssetsError> {
     let row: Option<SystemRow> = sqlx::query_as(
-        "SELECT asset_id, sku, phase, account_id, warranty_through, \
+        "SELECT asset_id, sku, phase, holder_kind, holder_id, warranty_through, \
                 open_ticket_count, first_seen, last_event_at, oem_serial \
          FROM assets WHERE asset_id = $1",
     )
@@ -776,13 +781,14 @@ async fn upsert_system(
     sqlx::query(
         r#"
         INSERT INTO assets
-            (asset_id, sku, phase, account_id, warranty_through,
+            (asset_id, sku, phase, holder_kind, holder_id, warranty_through,
              open_ticket_count, first_seen, last_event_at, oem_serial, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
         ON CONFLICT (asset_id) DO UPDATE SET
             sku = EXCLUDED.sku,
             phase = EXCLUDED.phase,
-            account_id = EXCLUDED.account_id,
+            holder_kind = EXCLUDED.holder_kind,
+            holder_id = EXCLUDED.holder_id,
             warranty_through = EXCLUDED.warranty_through,
             open_ticket_count = EXCLUDED.open_ticket_count,
             first_seen = EXCLUDED.first_seen,
@@ -794,7 +800,8 @@ async fn upsert_system(
     .bind(&state.asset_id.0)
     .bind(&state.sku)
     .bind(state.phase.as_str())
-    .bind(&state.account_id)
+    .bind(&state.holder_kind)
+    .bind(&state.holder_id)
     .bind(state.warranty_through)
     .bind(state.open_ticket_count as i32)
     .bind(state.first_seen)

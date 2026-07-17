@@ -24,7 +24,12 @@ CREATE TABLE IF NOT EXISTS assets (
         'registered', 'received', 'triaging', 'refurbing', 'qa', 'ready',
         'shipped', 'installed', 'out-for-service', 'decommissioned'
     )),
-    account_id           TEXT,                   -- NULL until first sale
+    -- The typed custody edge (Q5): who HOLDS the asset — an account
+    -- (device at a customer site), a location (brewhouse equipment).
+    -- NULL pair = in stock / unheld. Validated via R2's edge
+    -- registry once it lands.
+    holder_kind          TEXT,
+    holder_id            TEXT,
     warranty_through    DATE,                   -- NULL = out of warranty
     open_ticket_count   INTEGER NOT NULL DEFAULT 0,
     first_seen          DATE NOT NULL,
@@ -36,7 +41,7 @@ CREATE TABLE IF NOT EXISTS assets (
 
 CREATE INDEX IF NOT EXISTS assets_phase ON assets(phase);
 
-CREATE INDEX IF NOT EXISTS assets_account ON assets(account_id) WHERE account_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS assets_holder ON assets(holder_kind, holder_id) WHERE holder_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS assets_warranty ON assets(warranty_through) WHERE warranty_through IS NOT NULL;
 

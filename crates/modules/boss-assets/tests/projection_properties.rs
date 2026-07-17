@@ -65,8 +65,14 @@ fn arb_event_kind() -> impl Strategy<Value = AssetEventKind> {
         Just(AssetEventKind::QaPassed {
             certificate_id: None,
         }),
-        "account-[0-9]{3}".prop_map(|account_id| AssetEventKind::Shipped { account_id }),
-        "account-[0-9]{3}".prop_map(|account_id| AssetEventKind::Installed { account_id }),
+        "account-[0-9]{3}".prop_map(|holder_id| AssetEventKind::Shipped {
+            holder_kind: "account".to_string(),
+            holder_id,
+        }),
+        "account-[0-9]{3}".prop_map(|holder_id| AssetEventKind::Installed {
+            holder_kind: "account".to_string(),
+            holder_id,
+        }),
         ("account-[0-9]{3}", 1_000_000i64..10_000_000).prop_map(|(account_id, price_cents)| {
             AssetEventKind::Sold {
                 account_id,
@@ -197,7 +203,7 @@ proptest! {
             "late ServiceJobOpened must not change phase of decommissioned device"
         );
         prop_assert_eq!(
-            &extended_state.account_id, &state.account_id,
+            &extended_state.holder_id, &state.holder_id,
             "late event must not change account_id of decommissioned device"
         );
         prop_assert_eq!(
@@ -214,14 +220,16 @@ proptest! {
         let state = project(&asset_id(), &events).expect("non-empty log");
 
         // Walk the sorted stream up to (and including) the first
-        // Decommissioned and find the last account-setting event.
+        // Decommissioned and find the last holder-setting event
+        // (custody events carry the pair; ownership events imply an
+        // account holder — Q5).
         let relevant = events_before_or_at_decommission(&events);
-        let expected_account = relevant
+        let expected_holder = relevant
             .iter()
             .rev()
             .find_map(|e| match &e.kind {
-                AssetEventKind::Installed { account_id } => Some(account_id.clone()),
-                AssetEventKind::Shipped { account_id } => Some(account_id.clone()),
+                AssetEventKind::Installed { holder_id, .. } => Some(holder_id.clone()),
+                AssetEventKind::Shipped { holder_id, .. } => Some(holder_id.clone()),
                 AssetEventKind::Sold { account_id, .. } => Some(account_id.clone()),
                 AssetEventKind::OwnershipTransferred { to_account_id, .. } => {
                     Some(to_account_id.clone())
@@ -229,7 +237,7 @@ proptest! {
                 _ => None,
             });
         prop_assert_eq!(
-            state.account_id, expected_account,
+            state.holder_id, expected_holder,
             "final account_id must match latest account-setting event"
         );
     }
@@ -256,7 +264,7 @@ proptest! {
             "phase must be invariant under input reordering"
         );
         prop_assert_eq!(
-            state_a.account_id, state_b.account_id,
+            state_a.holder_id, state_b.holder_id,
             "account_id must be invariant under input reordering"
         );
         prop_assert_eq!(
@@ -309,7 +317,7 @@ proptest! {
         let state = project(&asset_id(), &events).expect("non-empty");
         if state.phase.as_str() == AssetLifecyclePhase::INSTALLED {
             prop_assert!(
-                state.account_id.is_some(),
+                state.holder_id.is_some(),
                 "phase=Installed requires account_id=Some"
             );
         }

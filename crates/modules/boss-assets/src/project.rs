@@ -25,7 +25,8 @@ use crate::types::{AssetCurrentState, AssetEvent, AssetEventKind, AssetId, Asset
 struct ProjectionAccumulator {
     phase: AssetLifecyclePhase,
     sku: Option<String>,
-    account_id: Option<String>,
+    holder_kind: Option<String>,
+    holder_id: Option<String>,
     warranty_through: Option<NaiveDate>,
     open_ticket_ids: HashSet<String>,
     first_seen: NaiveDate,
@@ -39,7 +40,8 @@ impl ProjectionAccumulator {
             asset_id: asset_id.clone(),
             sku: self.sku,
             phase: self.phase,
-            account_id: self.account_id,
+            holder_kind: self.holder_kind,
+            holder_id: self.holder_id,
             warranty_through: self.warranty_through,
             open_ticket_count: self.open_ticket_ids.len() as u32,
             first_seen: self.first_seen,
@@ -86,19 +88,32 @@ fn apply_one(acc: &mut ProjectionAccumulator, e: &AssetEvent) -> bool {
         AssetEventKind::RefurbStarted { .. } => acc.phase = AssetLifecyclePhase::REFURBING.into(),
         AssetEventKind::RefurbCompleted => acc.phase = AssetLifecyclePhase::QA.into(),
         AssetEventKind::QaPassed { .. } => acc.phase = AssetLifecyclePhase::READY.into(),
-        AssetEventKind::Shipped { account_id: c } => {
+        AssetEventKind::Shipped {
+            holder_kind,
+            holder_id,
+        } => {
             acc.phase = AssetLifecyclePhase::SHIPPED.into();
-            acc.account_id = Some(c.clone());
+            acc.holder_kind = Some(holder_kind.clone());
+            acc.holder_id = Some(holder_id.clone());
         }
-        AssetEventKind::Installed { account_id: c } => {
+        AssetEventKind::Installed {
+            holder_kind,
+            holder_id,
+        } => {
             acc.phase = AssetLifecyclePhase::INSTALLED.into();
-            acc.account_id = Some(c.clone());
+            acc.holder_kind = Some(holder_kind.clone());
+            acc.holder_id = Some(holder_id.clone());
         }
+        // Ownership events stay account-valued (the buyer IS an
+        // account); ownership implies custody handover in the current
+        // flows, so they set the holder to that account.
         AssetEventKind::Sold { account_id: c, .. } => {
-            acc.account_id = Some(c.clone());
+            acc.holder_kind = Some("account".into());
+            acc.holder_id = Some(c.clone());
         }
         AssetEventKind::OwnershipTransferred { to_account_id, .. } => {
-            acc.account_id = Some(to_account_id.clone());
+            acc.holder_kind = Some("account".into());
+            acc.holder_id = Some(to_account_id.clone());
         }
         AssetEventKind::WarrantyStarted { through, .. } => {
             acc.warranty_through = Some(*through);
@@ -112,7 +127,7 @@ fn apply_one(acc: &mut ProjectionAccumulator, e: &AssetEvent) -> bool {
             // needs service." A ticket opened on a asset that was
             // never installed somewhere doesn't put it in the field —
             // leave the phase alone in that case.
-            if acc.account_id.is_some() {
+            if acc.holder_id.is_some() {
                 acc.phase = AssetLifecyclePhase::OUT_FOR_SERVICE.into();
             }
         }
@@ -123,7 +138,7 @@ fn apply_one(acc: &mut ProjectionAccumulator, e: &AssetEvent) -> bool {
             // a later Open with the same id would restore the count
             // incorrectly.
             acc.open_ticket_ids.remove(job_id);
-            if acc.open_ticket_ids.is_empty() && acc.account_id.is_some() {
+            if acc.open_ticket_ids.is_empty() && acc.holder_id.is_some() {
                 acc.phase = AssetLifecyclePhase::INSTALLED.into();
             }
         }
@@ -197,7 +212,8 @@ pub fn apply_event(
         Some(state) => ProjectionAccumulator {
             phase: state.phase.clone(),
             sku: state.sku.clone(),
-            account_id: state.account_id.clone(),
+            holder_kind: state.holder_kind.clone(),
+            holder_id: state.holder_id.clone(),
             warranty_through: state.warranty_through,
             open_ticket_ids: existing_open_ticket_ids.clone(),
             first_seen: state.first_seen,
@@ -207,7 +223,8 @@ pub fn apply_event(
         None => ProjectionAccumulator {
             phase: AssetLifecyclePhase::REGISTERED.into(),
             sku: None,
-            account_id: None,
+            holder_kind: None,
+            holder_id: None,
             warranty_through: None,
             open_ticket_ids: HashSet::new(),
             first_seen: event.ts,
@@ -255,7 +272,8 @@ pub fn project(asset_id: &AssetId, events: &[AssetEvent]) -> Option<AssetCurrent
     let mut acc = ProjectionAccumulator {
         phase: AssetLifecyclePhase::REGISTERED.into(),
         sku: None,
-        account_id: None,
+        holder_kind: None,
+        holder_id: None,
         warranty_through: None,
         open_ticket_ids: HashSet::new(),
         first_seen,
@@ -318,7 +336,7 @@ mod tests {
         let state = project(&AssetId::new("LUM-3D-010000"), &events).unwrap();
         assert_eq!(state.phase.as_str(), AssetLifecyclePhase::RECEIVED);
         assert_eq!(state.sku, Some("Boss-TEST-2024".into()));
-        assert_eq!(state.account_id, None);
+        assert_eq!(state.holder_id, None);
         assert_eq!(state.first_seen, d(2026, 1, 1));
         assert_eq!(state.last_event_at, d(2026, 1, 1));
     }
@@ -442,14 +460,16 @@ mod tests {
                 "4",
                 d(2026, 1, 25),
                 AssetEventKind::Shipped {
-                    account_id: "account-007".into(),
+                    holder_kind: "account".into(),
+                    holder_id: "account-007".into(),
                 },
             ),
             evt(
                 "5",
                 d(2026, 2, 1),
                 AssetEventKind::Installed {
-                    account_id: "account-007".into(),
+                    holder_kind: "account".into(),
+                    holder_id: "account-007".into(),
                 },
             ),
             evt(
@@ -463,7 +483,8 @@ mod tests {
         ];
         let state = project(&AssetId::new("LUM-3D-010000"), &events).unwrap();
         assert_eq!(state.phase.as_str(), AssetLifecyclePhase::INSTALLED);
-        assert_eq!(state.account_id.as_deref(), Some("account-007"));
+        assert_eq!(state.holder_kind.as_deref(), Some("account"));
+        assert_eq!(state.holder_id.as_deref(), Some("account-007"));
         assert_eq!(state.warranty_through, Some(d(2028, 2, 1)));
         assert_eq!(state.open_ticket_count, 0);
     }
@@ -485,7 +506,8 @@ mod tests {
                 "2",
                 d(2026, 2, 1),
                 AssetEventKind::Installed {
-                    account_id: base_account.clone(),
+                    holder_kind: "account".into(),
+                    holder_id: base_account.clone(),
                 },
             ),
             evt(
@@ -539,7 +561,8 @@ mod tests {
                 "2",
                 d(2026, 2, 1),
                 AssetEventKind::Installed {
-                    account_id: "account-99".into(),
+                    holder_kind: "account".into(),
+                    holder_id: "account-99".into(),
                 },
             ),
             evt(
@@ -599,7 +622,7 @@ mod tests {
             AssetLifecyclePhase::INSTALLED,
             "asset with 0 open tickets must revert from OutForService to Installed"
         );
-        assert_eq!(state.account_id.as_deref(), Some("account-99"));
+        assert_eq!(state.holder_id.as_deref(), Some("account-99"));
     }
 
     #[test]
@@ -622,7 +645,8 @@ mod tests {
                 "2",
                 d(2026, 2, 1),
                 AssetEventKind::Installed {
-                    account_id: "account-99".into(),
+                    holder_kind: "account".into(),
+                    holder_id: "account-99".into(),
                 },
             ),
             evt(
@@ -675,7 +699,8 @@ mod tests {
                 "2",
                 d(2026, 2, 1),
                 AssetEventKind::Installed {
-                    account_id: "c".into(),
+                    holder_kind: "account".into(),
+                    holder_id: "c".into(),
                 },
             ),
             evt(
@@ -706,6 +731,32 @@ mod tests {
         let state = project(&AssetId::new("x"), &evts).unwrap();
         assert_eq!(state.open_ticket_count, 1);
         assert_eq!(state.phase.as_str(), AssetLifecyclePhase::OUT_FOR_SERVICE);
+    }
+
+    #[test]
+    fn installed_carries_a_typed_holder_the_brewery_shape() {
+        // Q5: equipment installed AT a location — the pair the audit
+        // found stuffed into account_id (170/170 brewery assets held
+        // location ids in an account column).
+        let events = vec![
+            evt(
+                "1",
+                d(2026, 1, 1),
+                AssetEventKind::Registered { oem_serial: None },
+            ),
+            evt(
+                "2",
+                d(2026, 1, 2),
+                AssetEventKind::Installed {
+                    holder_kind: "location".into(),
+                    holder_id: "loc-brewery-brewhouse".into(),
+                },
+            ),
+        ];
+        let state = project(&AssetId::new("SYS-00000001"), &events).unwrap();
+        assert_eq!(state.phase.as_str(), AssetLifecyclePhase::INSTALLED);
+        assert_eq!(state.holder_kind.as_deref(), Some("location"));
+        assert_eq!(state.holder_id.as_deref(), Some("loc-brewery-brewhouse"));
     }
 
     #[test]
@@ -766,7 +817,8 @@ mod tests {
                 "3",
                 d(2026, 2, 1),
                 AssetEventKind::Installed {
-                    account_id: "c".into(),
+                    holder_kind: "account".into(),
+                    holder_id: "c".into(),
                 },
             ),
             evt(

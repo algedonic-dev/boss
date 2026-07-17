@@ -328,7 +328,8 @@ async fn open_ticket_count_reflects_opened_tickets_for_account() {
             "evt-ct-2",
             "SN-CT-1",
             AssetEventKind::Installed {
-                account_id: "account-42".to_string(),
+                holder_kind: "account".to_string(),
+                holder_id: "account-42".to_string(),
             },
         ),
         system_event_fixture(
@@ -373,7 +374,8 @@ async fn closed_tickets_are_excluded_from_count() {
             "evt-cc-2",
             "SN-CC-1",
             AssetEventKind::Installed {
-                account_id: "account-77".to_string(),
+                holder_kind: "account".to_string(),
+                holder_id: "account-77".to_string(),
             },
         ),
         system_event_fixture(
@@ -540,7 +542,8 @@ async fn tickets_from_other_accounts_do_not_contribute_to_count() {
             "evt-oc-2",
             "SN-OC-1",
             AssetEventKind::Installed {
-                account_id: "account-a".to_string(),
+                holder_kind: "account".to_string(),
+                holder_id: "account-a".to_string(),
             },
         ),
         system_event_fixture(
@@ -556,7 +559,8 @@ async fn tickets_from_other_accounts_do_not_contribute_to_count() {
             "evt-oc-5",
             "SN-OC-2",
             AssetEventKind::Installed {
-                account_id: "account-b".to_string(),
+                holder_kind: "account".to_string(),
+                holder_id: "account-b".to_string(),
             },
         ),
         system_event_fixture(
@@ -601,7 +605,8 @@ async fn received_then_installed_projects_installed_phase() {
         "evt-life-2",
         "SN-LIFE-1",
         AssetEventKind::Installed {
-            account_id: "account-42".to_string(),
+            holder_kind: "account".to_string(),
+            holder_id: "account-42".to_string(),
         },
     );
 
@@ -621,7 +626,11 @@ async fn received_then_installed_projects_installed_phase() {
     let parsed: serde_json::Value = resp.assert_json();
     assert_eq!(parsed["events"].as_array().unwrap().len(), 2);
     assert_eq!(
-        parsed["current_state"]["account_id"].as_str(),
+        parsed["current_state"]["holder_kind"].as_str(),
+        Some("account"),
+    );
+    assert_eq!(
+        parsed["current_state"]["holder_id"].as_str(),
         Some("account-42"),
     );
 }

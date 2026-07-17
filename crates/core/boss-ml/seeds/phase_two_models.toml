@@ -231,7 +231,7 @@ Severity: critical ≥14d, warning ≥7d, info ≥3d."""
   kind = "declarative-rule"
   query = """
 SELECT
-    s.account_id AS account_id,
+    s.holder_id AS account_id,
     j.id::text AS job_id,
     j.title AS job_title,
     j.subject_id AS asset_id,
@@ -244,7 +244,7 @@ SELECT
     END AS severity,
     LEAST(1.0, (($1::date - j.updated_at::date)::float8 / 14.0)) AS score
 FROM jobs j
-INNER JOIN assets s ON s.asset_id = j.subject_id
+INNER JOIN assets s ON s.asset_id = j.subject_id AND s.holder_kind = 'account'
 WHERE j.kind IN ('field-service', 'service', 'repair', 'depot-return')
   AND j.subject_kind = 'asset'
   AND j.status IN ('open', 'blocked')
@@ -270,7 +270,7 @@ once overdue by ≥1.5× the interval."""
   kind = "declarative-rule"
   query = """
 SELECT
-    s.account_id AS account_id,
+    s.holder_id AS account_id,
     s.asset_id AS asset_id,
     sm.name AS model_name,
     sm.preventive_maintenance_interval_months AS preventive_maintenance_interval_months,
@@ -297,7 +297,7 @@ LEFT JOIN LATERAL (
       AND j.status = 'closed'
     ORDER BY j.closed_on DESC NULLS LAST LIMIT 1
 ) AS last_pm ON true
-WHERE s.account_id IS NOT NULL
+WHERE s.holder_kind = 'account' AND s.holder_id IS NOT NULL
   AND s.phase IN ('installed', 'out-for-service')
   AND (
       last_pm.closed_on IS NULL

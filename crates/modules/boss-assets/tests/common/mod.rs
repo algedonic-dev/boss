@@ -151,7 +151,8 @@ pub fn installed_event(id: &str, serial: &str, account_id: &str) -> AssetEvent {
         id,
         serial,
         AssetEventKind::Installed {
-            account_id: account_id.to_string(),
+            holder_kind: "account".to_string(),
+            holder_id: account_id.to_string(),
         },
     )
 }

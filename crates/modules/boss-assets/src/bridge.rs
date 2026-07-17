@@ -127,10 +127,12 @@ mod tests {
                 condition: crate::types::AssetCondition::new("new"),
             },
             AssetEventKind::Shipped {
-                account_id: String::new(),
+                holder_kind: String::new(),
+                holder_id: String::new(),
             },
             AssetEventKind::Installed {
-                account_id: String::new(),
+                holder_kind: String::new(),
+                holder_id: String::new(),
             },
             AssetEventKind::WarrantyStarted {
                 through: NaiveDate::from_ymd_opt(2028, 1, 1).unwrap(),
