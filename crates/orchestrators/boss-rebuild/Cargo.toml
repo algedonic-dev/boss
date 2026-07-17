@@ -12,7 +12,7 @@ path = "src/main.rs"
 boss-subject-kinds = { path = "../../core/boss-subject-kinds", features = ["postgres"] }
 anyhow = { workspace = true }
 clap = { workspace = true }
-sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres"] }
+sqlx = { version = "0.9", default-features = false, features = ["macros", "runtime-tokio", "postgres"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
