@@ -198,3 +198,22 @@ async fn unresolvable_owner_rejects_the_create() {
     let (all, _) = jobs.list_jobs(&Default::default(), 50, 0).await.unwrap();
     assert!(all.is_empty(), "a rejected create must not land a row");
 }
+
+#[tokio::test]
+async fn platform_meta_kinds_declare_a_resolvable_owner_role() {
+    // The 2026-07-17 smoke red: job-kind-design's approve authority
+    // (`job-kind-approver`) is a policy CAPABILITY, not an
+    // employees.role — the step fallback found zero holders, every
+    // design-Job create was rejected, no brewery kind ever
+    // published, and the whole from-empty stack starved. The
+    // platform meta-kinds must name a real role explicitly.
+    for spec in boss_jobs::registry::platform_kinds() {
+        let owner_role = spec.metadata.get("owner_role").and_then(|v| v.as_str());
+        assert_eq!(
+            owner_role,
+            Some("platform-admin"),
+            "{}: platform meta-work is owned by the operator baseline",
+            spec.kind
+        );
+    }
+}
