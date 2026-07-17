@@ -362,8 +362,8 @@ async fn seed_asset_model(pool: &PgPool, preventive_maintenance_interval_months:
 
 async fn seed_system(pool: &PgPool, asset_id: &str, phase: &str, first_seen: chrono::NaiveDate) {
     sqlx::query(
-        "INSERT INTO assets (asset_id, sku, phase, account_id, first_seen, last_event_at) \
-         VALUES ($1, $2, $3, $4, $5, $5)",
+        "INSERT INTO assets (asset_id, sku, phase, holder_kind, holder_id, first_seen, last_event_at) \
+         VALUES ($1, $2, $3, 'account', $4, $5, $5)",
     )
     .bind(asset_id)
     .bind(TEST_SKU)

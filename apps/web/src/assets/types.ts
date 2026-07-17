@@ -10,7 +10,8 @@ export type Asset = {
   // `registered` (it exists) before its catalog model is known.
   sku: string | null;
   phase: AssetLifecyclePhase;
-  account_id: string | null;
+  holder_kind: string | null;
+  holder_id: string | null;
   warranty_through: string | null;
   open_ticket_count: number;
   first_seen: string;

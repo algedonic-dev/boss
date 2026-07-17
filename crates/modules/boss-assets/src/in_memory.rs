@@ -104,7 +104,10 @@ impl AssetsRepository for InMemoryAssets {
         let mut assets: Vec<AssetCurrentState> = Vec::new();
         for (asset_id, events) in &state.events {
             if let Some(cs) = project(asset_id, events) {
-                if account_id.is_some_and(|p| cs.account_id.as_deref() != Some(p)) {
+                if account_id.is_some_and(|p| {
+                    cs.holder_kind.as_deref() != Some("account")
+                        || cs.holder_id.as_deref() != Some(p)
+                }) {
                     continue;
                 }
                 assets.push(cs);
@@ -152,8 +155,12 @@ impl AssetsRepository for InMemoryAssets {
                 continue;
             };
             let cs = project(&first.asset_id, events);
-            let system_account = cs.and_then(|c| c.account_id);
-            if system_account.as_deref() != Some(account_id) {
+            let held_by_account = cs.and_then(|c| {
+                (c.holder_kind.as_deref() == Some("account"))
+                    .then_some(c.holder_id)
+                    .flatten()
+            });
+            if held_by_account.as_deref() != Some(account_id) {
                 continue;
             }
             for e in events {
@@ -358,7 +365,8 @@ mod tests {
                 "e4",
                 d(2026, 2, 10),
                 AssetEventKind::Installed {
-                    account_id: "account-1".into(),
+                    holder_kind: "account".into(),
+                    holder_id: "account-1".into(),
                 },
             ),
             (
@@ -375,7 +383,7 @@ mod tests {
 
         let state = assets.current_state(&s).await.unwrap().unwrap();
         assert_eq!(state.phase.as_str(), AssetLifecyclePhase::INSTALLED);
-        assert_eq!(state.account_id.as_deref(), Some("account-1"));
+        assert_eq!(state.holder_id.as_deref(), Some("account-1"));
         assert_eq!(state.warranty_through, Some(d(2028, 2, 10)));
     }
 
@@ -452,7 +460,8 @@ mod tests {
                 "SN-1",
                 d(2026, 2, 1),
                 AssetEventKind::Installed {
-                    account_id: "c".into(),
+                    holder_kind: "account".into(),
+                    holder_id: "c".into(),
                 },
             ))
             .await

@@ -76,7 +76,9 @@ pub trait AssetsRepository: Send + Sync {
 
     /// Return a page of asset summaries with total count.
     ///
-    /// `account_id` scopes the result to assets currently owned by
+    /// `account_id` scopes the result to assets currently HELD by
+    /// (holder_kind='account', holder_id=account_id) — Q5's typed
+    /// pair; location-held equipment never matches. Owned by
     /// (or last associated with) one account — used by the unified
     /// account-detail view to render the Devices panel without
     /// pulling every assets row across the wire.

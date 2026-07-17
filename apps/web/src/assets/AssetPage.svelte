@@ -124,7 +124,7 @@
     <PageHeader
       eyebrow={`${getLabel('nav.assets_label', 'Assets')} · ${getLabel('assets.entity_singular', 'Asset')}`}
       title={device.asset_id}
-      subtitle={`${device.sku ?? 'unidentified'} · phase ${device.phase}${device.account_id ? ` · at ${device.account_id}` : ''}`}
+      subtitle={`${device.sku ?? 'unidentified'} · phase ${device.phase}${device.holder_id ? ` · held by ${device.holder_kind ?? '?'}/${device.holder_id}` : ''}`}
     />
 
     <div class="subject-actions">

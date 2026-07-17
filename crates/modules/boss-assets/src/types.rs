@@ -194,11 +194,17 @@ pub enum AssetEventKind {
         order_id: Option<String>,
         condition: AssetCondition,
     },
+    // Custody events carry the typed holder pair (Q5): WHO has the
+    // asset is a (kind, id) edge, not an account id. The brewery
+    // installs equipment at locations; the device shop ships to
+    // accounts — same event, honest subject either way.
     Shipped {
-        account_id: String,
+        holder_kind: String,
+        holder_id: String,
     },
     Installed {
-        account_id: String,
+        holder_kind: String,
+        holder_id: String,
     },
     WarrantyStarted {
         through: NaiveDate,
@@ -355,7 +361,13 @@ pub struct AssetCurrentState {
     #[serde(default)]
     pub sku: Option<String>,
     pub phase: AssetLifecyclePhase,
-    pub account_id: Option<String>,
+    /// The typed custody edge (Q5): who holds the asset — an
+    /// account's site, a location, a depot. Set by Shipped/Installed
+    /// (custody) and by Sold/OwnershipTransferred (ownership implies
+    /// custody handover in the current flows). Validated via R2 once
+    /// the edge registry lands.
+    pub holder_kind: Option<String>,
+    pub holder_id: Option<String>,
     pub warranty_through: Option<NaiveDate>,
     pub open_ticket_count: u32,
     pub first_seen: NaiveDate,
