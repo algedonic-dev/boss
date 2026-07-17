@@ -81,6 +81,7 @@ fn build_app(registry: Arc<dyn JobKindRegistry>) -> Router {
         calendar: None,
         subject_kinds: None,
         subject_existence: None,
+        roster: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
     };
     router(state)
@@ -325,6 +326,7 @@ async fn guest_cannot_publish_even_if_they_could_create() {
         calendar: None,
         subject_kinds: None,
         subject_existence: None,
+        roster: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
     };
     let app = router(state);

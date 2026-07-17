@@ -45,7 +45,7 @@ DAGs.
 """
 # JobKind-level display/routing hints. `surfaces` lists the
 # operational pages this JobKind appears on.
-metadata = { surfaces = ["qa"] }
+metadata = { surfaces = ["qa"], owner_role = "shift-lead" }
 
 # Trigger. Captures the opening signal (periodic action fires at
 # brewing-shift start) so operators see "how did this Job get here"
@@ -956,7 +956,7 @@ Location (the brewhouse) because there's no equipment-Subject yet
 metadata. SubjectKind registry would let this become
 subject_kinds=['equipment'].
 """
-metadata = { surfaces = ["qa"] }
+metadata = { surfaces = ["qa"], owner_role = "cellar-tech" }
 
 [[job_kind.step]]
 title = "trigger"
@@ -1023,6 +1023,8 @@ metadata_defaults = { outcome_kind = "completed" }
 
 [[job_kind]]
 kind = "facility-overhead"
+# Q7: the responsible human owner's role for Jobs of this kind.
+metadata = { owner_role = "bookkeeper" }
 label = "Facility Overhead"
 category = "operations"
 subject_kinds = ["company"]
@@ -1308,6 +1310,8 @@ metadata_defaults = { outcome_kind = "completed" }
 
 [[job_kind]]
 kind = "payroll-run"
+# Q7: the responsible human owner's role for Jobs of this kind.
+metadata = { owner_role = "bookkeeper" }
 label = "Payroll Run"
 category = "finance"
 subject_kinds = ["company"]
@@ -1378,6 +1382,8 @@ metadata_defaults = { outcome_kind = "completed" }
 
 [[job_kind]]
 kind = "sales-tax-filing"
+# Q7: the responsible human owner's role for Jobs of this kind.
+metadata = { owner_role = "bookkeeper" }
 label = "Sales Tax Filing"
 category = "finance"
 subject_kinds = ["company"]
@@ -1439,6 +1445,8 @@ metadata_defaults = { kind = "sales", jurisdiction = "US-CA" }
 
 [[job_kind]]
 kind = "payroll-941-filing"
+# Q7: the responsible human owner's role for Jobs of this kind.
+metadata = { owner_role = "bookkeeper" }
 label = "Federal Payroll Tax Filing (941)"
 category = "finance"
 subject_kinds = ["company"]
@@ -1492,6 +1500,8 @@ metadata_defaults = { kind = "payroll_941", jurisdiction = "US-FEDERAL" }
 
 [[job_kind]]
 kind = "income-tax-filing"
+# Q7: the responsible human owner's role for Jobs of this kind.
+metadata = { owner_role = "bookkeeper" }
 label = "Estimated Income Tax Filing"
 category = "finance"
 subject_kinds = ["company"]
@@ -1548,6 +1558,8 @@ metadata_defaults = { kind = "income", jurisdiction = "US-FEDERAL" }
 
 [[job_kind]]
 kind = "excise-tax-filing"
+# Q7: the responsible human owner's role for Jobs of this kind.
+metadata = { owner_role = "bookkeeper" }
 label = "Federal Excise Tax Filing (TTB)"
 category = "finance"
 subject_kinds = ["company"]
@@ -1714,6 +1726,8 @@ metadata_defaults = { account_id = "acc-direct-shop", amount_cents = 18000, curr
 
 [[job_kind]]
 kind = "morning-brew-ipa"
+# Q7: the responsible human owner's role for Jobs of this kind.
+metadata = { owner_role = "shift-lead" }
 label = "Morning Brew — IPA"
 category = "production"
 subject_kinds = ["company"]
@@ -1912,6 +1926,8 @@ metadata_defaults = { outcome_kind = "skipped" }
 
 [[job_kind]]
 kind = "morning-brew-stout"
+# Q7: the responsible human owner's role for Jobs of this kind.
+metadata = { owner_role = "shift-lead" }
 label = "Morning Brew — Stout"
 category = "production"
 subject_kinds = ["company"]
@@ -2104,6 +2120,8 @@ metadata_defaults = { outcome_kind = "skipped" }
 
 [[job_kind]]
 kind = "morning-brew-lager"
+# Q7: the responsible human owner's role for Jobs of this kind.
+metadata = { owner_role = "shift-lead" }
 label = "Morning Brew — Lager"
 category = "production"
 subject_kinds = ["company"]
@@ -2293,6 +2311,8 @@ metadata_defaults = { outcome_kind = "skipped" }
 
 [[job_kind]]
 kind = "morning-brew-hazy"
+# Q7: the responsible human owner's role for Jobs of this kind.
+metadata = { owner_role = "shift-lead" }
 label = "Morning Brew — Hazy IPA"
 category = "production"
 subject_kinds = ["company"]
@@ -2487,6 +2507,8 @@ metadata_defaults = { outcome_kind = "skipped" }
 
 [[job_kind]]
 kind = "ad-hoc"
+# Q7: the responsible human owner's role for Jobs of this kind.
+metadata = { owner_role = "shift-lead" }
 label = "Ad Hoc"
 category = "operations"
 subject_kinds = ["employee", "account", "vendor", "location", "asset", "purchase_order", "campaign", "company"]
@@ -2535,6 +2557,8 @@ metadata_defaults = { category = "ad-hoc" }
 
 [[job_kind]]
 kind = "batch-qc-hold"
+# Q7: the responsible human owner's role for Jobs of this kind.
+metadata = { owner_role = "qa-tech" }
 label = "Batch QC Hold (anomaly branch)"
 category = "production"
 subject_kinds = ["company"]
@@ -2614,6 +2638,8 @@ metadata_defaults = { release_decision = "", parent_resumes = true }
 
 [[job_kind]]
 kind = "ap-payment-run"
+# Q7: the responsible human owner's role for Jobs of this kind.
+metadata = { owner_role = "ap-clerk" }
 label = "Daily AP Payment Run"
 category = "finance"
 subject_kinds = ["company"]

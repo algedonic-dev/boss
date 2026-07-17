@@ -75,6 +75,7 @@ fn build_app(
         calendar: None,
         subject_kinds: None,
         subject_existence: None,
+        roster: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
     };
     (router(state), jobs, bus)
@@ -300,6 +301,7 @@ async fn publish_step_without_kind_registry_returns_503() {
         calendar: None,
         subject_kinds: None,
         subject_existence: None,
+        roster: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
     };
     let app = router(state);

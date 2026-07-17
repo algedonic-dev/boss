@@ -82,6 +82,9 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// opt-in shape as the registry clients above; preserves the
     /// in-memory test path.
     pub subject_existence: Option<Arc<dyn crate::subject_existence::SubjectExistenceCheck>>,
+    /// Human job-owner resolution (Q7). `None` skips — the
+    /// in-memory test paths without an upstream roster.
+    pub roster: Option<Arc<dyn crate::owner_resolution::RosterLookup>>,
     /// Authoritative clock. See `boss-clock-client`.
     pub clock: Arc<dyn boss_clock_client::ClockClient>,
 }

@@ -134,6 +134,7 @@ fn build_app(pool: PgPool) -> Router {
         calendar: None,
         subject_kinds: None,
         subject_existence: None,
+        roster: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
     };
     router(state)

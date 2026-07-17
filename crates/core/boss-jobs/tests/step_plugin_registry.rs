@@ -73,6 +73,7 @@ fn build_app(registry: Arc<dyn StepPluginRegistry>, policy: Arc<dyn PolicyClient
         calendar: None,
         subject_kinds: None,
         subject_existence: None,
+        roster: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
     };
     router(state)
