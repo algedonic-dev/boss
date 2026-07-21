@@ -252,14 +252,21 @@ pub async fn rebuild_subjects(pool: &PgPool) -> Result<u64, String> {
         total += res.rows_affected();
     }
 
+    // The jobs.job.created payload nests the subject:
+    // `{"subject": {"id": ..., "subject_kind": ...}}` (boss-core's
+    // Job serialization). Read the NESTED object — top-level
+    // `subject_kind`/`subject_id` keys never existed, so the old path
+    // silently homed nothing and every log-only rebuild dropped the
+    // birth-by-job subjects (job-kind, custom) that no TOML event
+    // source carries (task #18).
     let res = sqlx::query(
         "INSERT INTO subjects (kind, id) \
-         SELECT DISTINCT payload->>'subject_kind', payload->>'subject_id' \
+         SELECT DISTINCT payload->'subject'->>'subject_kind', payload->'subject'->>'id' \
          FROM audit_log \
          WHERE kind = 'jobs.job.created' \
-           AND payload->>'subject_kind' IS NOT NULL \
-           AND payload->>'subject_id' IS NOT NULL \
-           AND EXISTS (SELECT 1 FROM subject_kinds k WHERE k.kind = payload->>'subject_kind') \
+           AND payload->'subject'->>'subject_kind' IS NOT NULL \
+           AND payload->'subject'->>'id' IS NOT NULL \
+           AND EXISTS (SELECT 1 FROM subject_kinds k WHERE k.kind = payload->'subject'->>'subject_kind') \
          ON CONFLICT (kind, id) DO NOTHING",
     )
     .execute(&mut *tx)
