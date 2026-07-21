@@ -1,6 +1,7 @@
 //! In-memory adapter for `CommerceRepository`.
 
 use async_trait::async_trait;
+use boss_core::publisher::EventStamp;
 
 use crate::port::{CommerceError, CommerceRepository};
 use crate::types::{Invoice, InvoiceSummary, RevenueLine};
@@ -12,6 +13,10 @@ pub struct InMemoryCommerce {
     /// HTTP tests to exercise the converge-on-double-delivery
     /// contract (the transactional flip itself is pg-pinned).
     written_off: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Events the outbox-migrated paths would have recorded in-tx —
+    /// the in-memory analogue of `event_outbox`, collected for test
+    /// assertions (no relay here; the pg path is the real contract).
+    recorded: std::sync::Mutex<Vec<boss_core::event::Event>>,
 }
 
 impl InMemoryCommerce {
@@ -20,6 +25,18 @@ impl InMemoryCommerce {
             invoices,
             revenue: Vec::new(),
             written_off: std::sync::Mutex::new(std::collections::HashSet::new()),
+            recorded: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Events the outbox paths recorded — test visibility.
+    pub fn recorded_events(&self) -> Vec<boss_core::event::Event> {
+        self.recorded.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    fn record(&self, event: boss_core::event::Event) {
+        if let Ok(mut v) = self.recorded.lock() {
+            v.push(event);
         }
     }
 
@@ -82,6 +99,7 @@ impl CommerceRepository for InMemoryCommerce {
         &self,
         invoice: &Invoice,
         _now: chrono::DateTime<chrono::Utc>,
+        stamp: &EventStamp,
     ) -> Result<Invoice, CommerceError> {
         if invoice.line_items.is_empty() {
             return Err(CommerceError::Storage(format!(
@@ -109,6 +127,10 @@ impl CommerceRepository for InMemoryCommerce {
         // In-memory impl has no FG inventory to draw down — return
         // the invoice unchanged. Tests that depend on enrichment
         // use the postgres impl.
+        self.record(stamp.event(
+            crate::events::INVOICE_CREATED,
+            crate::events::invoice_created_payload(invoice),
+        ));
         Ok(invoice.clone())
     }
 
@@ -116,21 +138,38 @@ impl CommerceRepository for InMemoryCommerce {
         &self,
         id: &str,
         _paid_on: chrono::NaiveDate,
+        stamp: &EventStamp,
     ) -> Result<(), CommerceError> {
-        if !self.invoices.iter().any(|i| i.id == id) {
+        let Some(inv) = self.invoices.iter().find(|i| i.id == id) else {
             return Err(CommerceError::NotFound(format!("invoice {id}")));
-        }
+        };
+        self.record(stamp.event(
+            crate::events::INVOICE_PAID,
+            serde_json::to_value(inv).unwrap_or_default(),
+        ));
         Ok(())
     }
 
-    async fn mark_invoice_past_due(&self, id: &str) -> Result<(), CommerceError> {
-        if !self.invoices.iter().any(|i| i.id == id) {
+    async fn mark_invoice_past_due(
+        &self,
+        id: &str,
+        stamp: &EventStamp,
+    ) -> Result<(), CommerceError> {
+        let Some(inv) = self.invoices.iter().find(|i| i.id == id) else {
             return Err(CommerceError::NotFound(format!("invoice {id}")));
-        }
+        };
+        self.record(stamp.event(
+            crate::events::INVOICE_PAST_DUE,
+            serde_json::to_value(inv).unwrap_or_default(),
+        ));
         Ok(())
     }
 
-    async fn mark_invoice_written_off(&self, id: &str) -> Result<bool, CommerceError> {
+    async fn mark_invoice_written_off(
+        &self,
+        id: &str,
+        stamp: &EventStamp,
+    ) -> Result<bool, CommerceError> {
         use crate::types::InvoiceStatus;
         let Some(inv) = self.invoices.iter().find(|i| i.id == id) else {
             return Err(CommerceError::NotFound(format!("invoice {id}")));
@@ -149,6 +188,13 @@ impl CommerceRepository for InMemoryCommerce {
             return Ok(false);
         }
         flipped.insert(id.to_string());
+        // Emit-once is structural: only the flip-winning call records.
+        let mut written = inv.clone();
+        written.status = InvoiceStatus::WRITTEN_OFF.into();
+        self.record(stamp.event(
+            crate::events::INVOICE_WRITTEN_OFF,
+            serde_json::to_value(&written).unwrap_or_default(),
+        ));
         Ok(true)
     }
 

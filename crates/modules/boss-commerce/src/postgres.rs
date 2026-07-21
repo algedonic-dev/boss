@@ -167,6 +167,7 @@ impl CommerceRepository for PgCommerce {
         &self,
         inv: &Invoice,
         now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Invoice, CommerceError> {
         // Invariant: line-item revenue + sales tax must equal the
         // header rollup. Enforce in the adapter so a buggy caller
@@ -328,6 +329,18 @@ impl CommerceRepository for PgCommerce {
         )
         .await?;
 
+        // OUTBOX (phase 2): the commerce.invoice.created event records
+        // in THIS transaction — same enriched payload as the fact above
+        // — so the state change and its provenance commit or abort
+        // together, and the subject_edges trigger rejects a ghost
+        // account_id BEFORE it becomes state (the 2026-07-13 incident
+        // class, closed at the source). boss-event-relay moves it to
+        // audit_log + NATS after commit.
+        let event = stamp.event(crate::events::INVOICE_CREATED, issued_payload.clone());
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(CommerceError::Storage)?;
+
         // If the invoice is being created already-paid (replay path), emit
         // the paid fact too — but ONLY when `payment_method` is unset.
         // When the caller supplies a method (sim's two-phase bank-clearing
@@ -375,6 +388,7 @@ impl CommerceRepository for PgCommerce {
         &self,
         id: &str,
         paid_on: chrono::NaiveDate,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), CommerceError> {
         let mut tx = self
             .pool
@@ -417,30 +431,68 @@ impl CommerceRepository for PgCommerce {
             return Err(CommerceError::NotFound(format!("invoice {id}")));
         }
 
+        // OUTBOX (phase 2): record commerce.invoice.paid with the full
+        // post-update row state (the shape rebuild.rs consumes via
+        // from_value::<Invoice>) in the SAME transaction as the flip.
+        let invoice = fetch_invoice_in_tx(&mut tx, id).await?;
+        let event = stamp.event(
+            crate::events::INVOICE_PAID,
+            serde_json::to_value(&invoice).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(CommerceError::Storage)?;
+
         tx.commit()
             .await
             .map_err(|e| CommerceError::Storage(e.to_string()))?;
         Ok(())
     }
 
-    async fn mark_invoice_past_due(&self, id: &str) -> Result<(), CommerceError> {
+    async fn mark_invoice_past_due(
+        &self,
+        id: &str,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), CommerceError> {
         // No financial fact / journal entry on past-due — it's a
         // status flip used for reporting + collections workflow,
         // not a posting event. The original revenue accrual on
         // INVOICE_CREATED already debited A/R; past-due just
-        // ages it.
+        // ages it. The commerce.invoice.past_due EVENT still records
+        // (the rebuild path flips the projection from it) — in the
+        // same transaction as the flip, per outbox phase 2.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CommerceError::Storage(e.to_string()))?;
         let result = sqlx::query("UPDATE invoices SET status = 'past-due' WHERE id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| CommerceError::Storage(e.to_string()))?;
         if result.rows_affected() == 0 {
             return Err(CommerceError::NotFound(format!("invoice {id}")));
         }
+        let invoice = fetch_invoice_in_tx(&mut tx, id).await?;
+        let event = stamp.event(
+            crate::events::INVOICE_PAST_DUE,
+            serde_json::to_value(&invoice).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(CommerceError::Storage)?;
+        tx.commit()
+            .await
+            .map_err(|e| CommerceError::Storage(e.to_string()))?;
         Ok(())
     }
 
-    async fn mark_invoice_written_off(&self, id: &str) -> Result<bool, CommerceError> {
+    async fn mark_invoice_written_off(
+        &self,
+        id: &str,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<bool, CommerceError> {
         // Flip to terminal `written-off` AND record the
         // `finance.invoice.written_off` fact that posts DR 6700 Bad Debt
         // Expense / CR 1100 A/R. The fact is written LIVE here — exactly
@@ -523,6 +575,14 @@ impl CommerceRepository for PgCommerce {
             &invoice.id,
         )
         .await?;
+        // OUTBOX (phase 2): same payload as the fact, recorded in the
+        // same transaction, structurally gated on the flip winning —
+        // the emit-exactly-once contract the handler used to enforce
+        // by checking the returned bool.
+        let event = stamp.event(crate::events::INVOICE_WRITTEN_OFF, payload.clone());
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(CommerceError::Storage)?;
         tx.commit()
             .await
             .map_err(|e| CommerceError::Storage(e.to_string()))?;
@@ -796,6 +856,32 @@ impl CommerceRepository for PgCommerce {
             currency: "USD".to_string(),
         })
     }
+}
+
+/// Fetch the full invoice (header + line items) INSIDE the caller's
+/// transaction — the post-update row state the mark_* paths record as
+/// their event payload (rebuild consumes it via from_value::<Invoice>).
+/// The pool-based `invoice_by_id` can't see uncommitted updates; this
+/// can, and that's the point.
+async fn fetch_invoice_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> Result<Invoice, CommerceError> {
+    let row: InvoiceRow = sqlx::query_as("SELECT * FROM invoices WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| CommerceError::Storage(e.to_string()))?;
+    let mut invoice = row.into_invoice();
+    let lines: Vec<LineItemRow> = sqlx::query_as(
+        "SELECT id, invoice_id, revenue_category, amount_cents, currency, description, ref_id,                 sku, qty, cost_basis_cents, cost_total_cents          FROM invoice_line_items WHERE invoice_id = $1 ORDER BY id",
+    )
+    .bind(id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| CommerceError::Storage(e.to_string()))?;
+    invoice.line_items = lines.into_iter().map(|l| l.into_line_item()).collect();
+    Ok(invoice)
 }
 
 async fn insert_fact(

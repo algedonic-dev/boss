@@ -34,7 +34,7 @@ async fn post_invoice_emits_commerce_invoice_created_event() {
         .await
         .assert_status(StatusCode::CREATED);
 
-    let event = app.bus.assert_event_emitted("commerce.invoice.created");
+    let event = app.assert_recorded("commerce.invoice.created");
     assert_eq!(
         event.payload.get("id").and_then(|v| v.as_str()),
         Some("inv-event-1"),
@@ -195,7 +195,7 @@ async fn put_invoice_paid_emits_commerce_invoice_paid_event() {
         .await
         .assert_status(StatusCode::NO_CONTENT);
 
-    let event = app.bus.assert_event_emitted("commerce.invoice.paid");
+    let event = app.assert_recorded("commerce.invoice.paid");
     assert_eq!(
         event.payload.get("id").and_then(|v| v.as_str()),
         Some("inv-paid-2"),
@@ -260,7 +260,7 @@ async fn write_off_from_past_due_resolves_the_counterparty_chain_shape() {
         .await;
 
     resp.assert_status(StatusCode::OK);
-    let event = app.bus.assert_event_emitted("commerce.invoice.written_off");
+    let event = app.assert_recorded("commerce.invoice.written_off");
     assert_eq!(
         event.payload.get("id").and_then(|v| v.as_str()),
         Some("inv-step-chain-1"),
@@ -283,7 +283,7 @@ async fn write_off_from_past_due_resolves_the_webhook_copy_shape() {
         .await;
 
     resp.assert_status(StatusCode::OK);
-    app.bus.assert_event_emitted("commerce.invoice.written_off");
+    app.assert_recorded("commerce.invoice.written_off");
 }
 
 #[tokio::test]
@@ -307,7 +307,7 @@ async fn write_off_from_past_due_double_delivery_emits_one_event() {
         .assert_status(StatusCode::OK);
 
     assert_eq!(
-        app.bus.events_by_kind("commerce.invoice.written_off").len(),
+        app.recorded_of_kind("commerce.invoice.written_off").len(),
         1,
         "the second drive converges without a duplicate event"
     );
@@ -341,7 +341,7 @@ async fn put_write_off_second_call_converges_without_duplicate_event() {
         .assert_status(StatusCode::NO_CONTENT);
 
     assert_eq!(
-        app.bus.events_by_kind("commerce.invoice.written_off").len(),
+        app.recorded_of_kind("commerce.invoice.written_off").len(),
         1,
         "repeat PUT is a converged no-op"
     );

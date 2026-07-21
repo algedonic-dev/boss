@@ -2,6 +2,7 @@
 //! persistence.
 
 use async_trait::async_trait;
+use boss_core::publisher::EventStamp;
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::types::{Invoice, InvoiceSummary, RevenueLine};
@@ -39,41 +40,70 @@ pub trait CommerceRepository: Send + Sync {
     async fn invoice_by_id(&self, id: &str) -> Result<Option<Invoice>, CommerceError>;
 
     /// Create a new invoice. Convenience overload stamps
-    /// `created_at = Utc::now()`; handlers that emit a domain
-    /// event use `create_invoice_at` so the projection write and
-    /// the audit_log event share one timestamp. See
-    /// `docs/design/projection-rebuilders.md`.
+    /// `created_at = Utc::now()` and a platform-automation event
+    /// stamp; handlers use `create_invoice_at` so the projection
+    /// write and the audit_log event share one timestamp AND the
+    /// caller's actor. See `docs/design/projection-rebuilders.md`.
     async fn create_invoice(&self, invoice: &Invoice) -> Result<Invoice, CommerceError> {
-        self.create_invoice_at(invoice, Utc::now()).await
+        let now = Utc::now();
+        let stamp = EventStamp::new(
+            "commerce",
+            boss_core::actor::ActorId::Automation("platform".into()),
+            now,
+        );
+        self.create_invoice_at(invoice, now, &stamp).await
     }
     /// Persists the invoice and returns the same invoice with
     /// `line_items[].cost_basis_cents` enriched from the FG
-    /// inventory rows looked up during drawdown. Callers that
-    /// emit the `commerce.invoice.created` audit event MUST emit
-    /// the returned (enriched) invoice — emitting the input
-    /// directly leaves cost_basis_cents=null on every line, and
-    /// the `invoice_issued` posting rule's audit-log-replay path
-    /// then can't recover COGS (DR 5100 / CR 1320) on rebuild.
+    /// inventory rows looked up during drawdown.
+    ///
+    /// OUTBOX (transactional-audit-log phase 2): the adapter records
+    /// the `commerce.invoice.created` event — enriched via `stamp` —
+    /// inside the SAME transaction as the projection write, so the
+    /// event and the state commit or abort together (and the
+    /// subject_edges trigger can reject a ghost account_id BEFORE it
+    /// becomes state). Callers no longer publish this kind
+    /// post-commit; boss-event-relay moves it to audit_log + NATS.
     async fn create_invoice_at(
         &self,
         invoice: &Invoice,
         now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<Invoice, CommerceError>;
 
     /// Mark an invoice as paid (sets status='paid', paid_on=today).
     /// Convenience overload uses `Utc::now().date_naive()`.
     async fn mark_invoice_paid(&self, id: &str) -> Result<(), CommerceError> {
-        self.mark_invoice_paid_at(id, Utc::now().date_naive()).await
+        let now = Utc::now();
+        let stamp = EventStamp::new(
+            "commerce",
+            boss_core::actor::ActorId::Automation("platform".into()),
+            now,
+        );
+        self.mark_invoice_paid_at(id, now.date_naive(), &stamp)
+            .await
     }
-    async fn mark_invoice_paid_at(&self, id: &str, paid_on: NaiveDate)
-    -> Result<(), CommerceError>;
+    /// Records `commerce.invoice.paid` (full post-update row state)
+    /// in the same transaction as the status flip — outbox phase 2.
+    async fn mark_invoice_paid_at(
+        &self,
+        id: &str,
+        paid_on: NaiveDate,
+        stamp: &EventStamp,
+    ) -> Result<(), CommerceError>;
 
     /// Mark an invoice as past-due (sets status='past-due'). The
     /// AR aging counterparty fires this on the inverse branch of
     /// the same probability roll that fires mark-paid, so an
     /// invoice's status flips to one or the other after the
     /// net-30-ish delay — never both, never neither.
-    async fn mark_invoice_past_due(&self, id: &str) -> Result<(), CommerceError>;
+    /// Records `commerce.invoice.past_due` (full post-update row
+    /// state) in the same transaction as the flip — outbox phase 2.
+    async fn mark_invoice_past_due(
+        &self,
+        id: &str,
+        stamp: &EventStamp,
+    ) -> Result<(), CommerceError>;
 
     /// Flip an invoice to the terminal `written-off` status and record
     /// the bad-debt fact (DR 6700 / CR 1100 via the
@@ -87,7 +117,16 @@ pub trait CommerceRepository: Send + Sync {
     /// mutually exclusive, so that drive means model drift, not a race.
     /// See the brewery `[counterparty.bad-debt-writeoff]` for the
     /// 60-day-after-past-due trigger that drives this in sim.
-    async fn mark_invoice_written_off(&self, id: &str) -> Result<bool, CommerceError>;
+    /// Outbox phase 2: the `commerce.invoice.written_off` event
+    /// records in the same transaction as the flip + fact, gated on
+    /// the flip winning — so the emit-exactly-once contract the
+    /// callers used to enforce by checking the returned bool is now
+    /// structural.
+    async fn mark_invoice_written_off(
+        &self,
+        id: &str,
+        stamp: &EventStamp,
+    ) -> Result<bool, CommerceError>;
 
     /// Aggregated financial summary for the Finance dashboard.
     /// SQL-aggregated server-side so the UI renders correct totals

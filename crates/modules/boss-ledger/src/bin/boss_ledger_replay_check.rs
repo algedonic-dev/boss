@@ -79,11 +79,52 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| "connecting to Postgres")?;
 
+    wait_for_outbox_drain(&pool).await?;
+
     if cli.deep {
         run_deep(&pool, cli.max_print).await
     } else {
         run_shallow(&pool, cli.max_print).await
     }
+}
+
+/// Relay-lag watermark (transactional outbox, phase 2). Outbox-migrated
+/// emitters commit their event and their state TOGETHER — but the event
+/// reaches `audit_log` only when boss-event-relay drains it. In that
+/// window live projections legitimately LEAD the log, and a replay
+/// comparison would report false divergence. A healthy relay drains in
+/// milliseconds, so: wait (bounded) for pending = 0, and FAIL LOUDLY if
+/// the backlog doesn't clear — a stuck relay masks real divergence and
+/// is itself the incident, not a reason to skip the check silently.
+async fn wait_for_outbox_drain(pool: &PgPool) -> Result<()> {
+    const ATTEMPTS: u32 = 30; // × 1s = 30s bound
+    for attempt in 0..ATTEMPTS {
+        let pending: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM event_outbox WHERE delivered_at IS NULL")
+                .fetch_one(pool)
+                .await
+                .with_context(|| "querying event_outbox backlog")?;
+        if pending == 0 {
+            if attempt > 0 {
+                info!(
+                    waited_s = attempt,
+                    "outbox drained; replay comparison is watermark-safe"
+                );
+            }
+            return Ok(());
+        }
+        info!(
+            pending,
+            attempt, "waiting for the event relay to drain the outbox"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    error!(
+        "event_outbox backlog did not drain within {ATTEMPTS}s — the relay is stuck \
+         (check boss-event-relay); a replay comparison against a lagging log would \
+         report false divergence, and a stuck relay is itself the incident"
+    );
+    std::process::exit(2);
 }
 
 /// Entry-level check (default): financial_facts → gl_journal_entries.
