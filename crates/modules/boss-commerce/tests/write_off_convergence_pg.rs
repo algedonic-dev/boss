@@ -17,8 +17,17 @@
 use boss_commerce::PgCommerce;
 use boss_commerce::port::{CommerceError, CommerceRepository};
 use boss_commerce::types::*;
+use boss_core::publisher::EventStamp;
 use boss_testing::TestDb;
 use chrono::NaiveDate;
+
+fn stamp() -> EventStamp {
+    EventStamp::new(
+        "commerce",
+        boss_core::actor::ActorId::Automation("test".into()),
+        chrono::Utc::now(),
+    )
+}
 
 fn invoice(id: &str, status: &str) -> Invoice {
     Invoice {
@@ -70,14 +79,14 @@ async fn write_off_flips_once_and_double_delivery_converges() {
         .unwrap();
 
     let first = repo
-        .mark_invoice_written_off("inv-step-wo-1")
+        .mark_invoice_written_off("inv-step-wo-1", &stamp())
         .await
         .unwrap();
     assert!(first, "first drive performs the flip");
     assert_eq!(written_off_fact_count(&db, "inv-step-wo-1").await, 1);
 
     let second = repo
-        .mark_invoice_written_off("inv-step-wo-1")
+        .mark_invoice_written_off("inv-step-wo-1", &stamp())
         .await
         .unwrap();
     assert!(!second, "second drive converges as a no-op");
@@ -107,7 +116,7 @@ async fn write_off_from_outstanding_is_allowed() {
         .unwrap();
 
     assert!(
-        repo.mark_invoice_written_off("inv-step-wo-2")
+        repo.mark_invoice_written_off("inv-step-wo-2", &stamp())
             .await
             .unwrap()
     );
@@ -127,7 +136,7 @@ async fn write_off_paid_invoice_conflicts() {
         .unwrap();
 
     let err = repo
-        .mark_invoice_written_off("inv-step-wo-3")
+        .mark_invoice_written_off("inv-step-wo-3", &stamp())
         .await
         .unwrap_err();
     assert!(
@@ -143,7 +152,7 @@ async fn write_off_missing_invoice_not_found() {
     let repo = PgCommerce::new(db.pool.clone());
 
     let err = repo
-        .mark_invoice_written_off("inv-step-nope")
+        .mark_invoice_written_off("inv-step-nope", &stamp())
         .await
         .unwrap_err();
     assert!(

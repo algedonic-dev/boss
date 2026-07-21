@@ -26,6 +26,36 @@ use boss_testing::RecordingEventBus;
 pub struct CommerceTestApp {
     pub router: Router,
     pub bus: Arc<RecordingEventBus>,
+    /// The adapter behind the router — outbox phase 2 records the
+    /// four invoice kinds HERE (the in-memory analogue of
+    /// event_outbox), not on the bus.
+    pub repo: Arc<InMemoryCommerce>,
+}
+
+impl CommerceTestApp {
+    /// Assert exactly the outbox-recorded events of `kind` and return
+    /// them — the phase-2 analogue of `bus.assert_event_emitted`.
+    pub fn recorded_of_kind(&self, kind: &str) -> Vec<boss_core::event::Event> {
+        self.repo
+            .recorded_events()
+            .into_iter()
+            .filter(|e| e.kind == kind)
+            .collect()
+    }
+
+    pub fn assert_recorded(&self, kind: &str) -> boss_core::event::Event {
+        let mut events = self.recorded_of_kind(kind);
+        assert!(
+            !events.is_empty(),
+            "expected an outbox-recorded `{kind}` event; recorded kinds: {:?}",
+            self.repo
+                .recorded_events()
+                .iter()
+                .map(|e| e.kind.clone())
+                .collect::<Vec<_>>()
+        );
+        events.remove(0)
+    }
 }
 
 impl CommerceTestApp {
@@ -50,6 +80,7 @@ impl CommerceTestApp {
         people_client: Arc<dyn PeopleClient>,
     ) -> Self {
         let commerce = Arc::new(InMemoryCommerce::new(invoices));
+        let repo = commerce.clone();
         let bus = RecordingEventBus::new();
         let publisher = DomainPublisher::new(bus.clone(), "commerce");
         let policy: Arc<dyn PolicyClient> = Arc::new(PermissivePolicyClient);
@@ -62,7 +93,7 @@ impl CommerceTestApp {
             classes_client: None,
         };
         let router = router(state);
-        Self { router, bus }
+        Self { router, bus, repo }
     }
 }
 

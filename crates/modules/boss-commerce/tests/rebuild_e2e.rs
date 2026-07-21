@@ -1,6 +1,9 @@
-//! End-to-end: drive commerce writes through PgCommerce +
-//! PgAuditWriter, snapshot invoices + invoice_line_items, drop,
-//! rebuild from `audit_log`, assert match.
+//! End-to-end: drive commerce writes through PgCommerce (which
+//! records each invoice event on the transactional OUTBOX inside the
+//! domain tx — phase 2), drain the outbox through the relay pipeline
+//! into `audit_log`, snapshot invoices + invoice_line_items, drop,
+//! rebuild from `audit_log`, assert match. This is the REAL delivery
+//! path — no hand-emitted events.
 
 #![cfg(feature = "postgres")]
 
@@ -9,8 +12,9 @@ use std::sync::Arc;
 use boss_commerce::PgCommerce;
 use boss_commerce::rebuild_commerce;
 use boss_commerce::types::*;
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
+use boss_core::port::EventBus;
+use boss_core::publisher::EventStamp;
+use boss_events::outbox::drain_outbox_once;
 use boss_testing::{RecordingEventBus, TestDb};
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::PgPool;
@@ -92,8 +96,7 @@ fn fixture(id: &str, account: &str, lines: Vec<(RevenueCategory, i64, &str)>) ->
 async fn rebuild_reproduces_invoices_and_line_items() {
     let db = TestDb::new().await;
     let commerce = Arc::new(PgCommerce::new(db.pool.clone()));
-    let publisher = DomainPublisher::new(RecordingEventBus::new(), "commerce")
-        .with_audit(Arc::new(PgAuditWriter::new(db.pool.clone())));
+    let actor = boss_core::actor::ActorId::Automation("test".into());
 
     let now = Utc::now();
     let i1 = fixture(
@@ -110,44 +113,36 @@ async fn rebuild_reproduces_invoices_and_line_items() {
         vec![(RevenueCategory::from("contracts"), 12_000, "annual support")],
     );
 
-    // Drive both creates through the repo + emit_at directly (the
-    // crm-style harness is the same shape as what the http handler
-    // does — repo write then publisher.emit_at with full Invoice
-    // payload, both sharing one `now`).
-    commerce.create_invoice_at(&i1, now).await.unwrap();
-    publisher
-        .emit_at(
-            boss_commerce::events::INVOICE_CREATED,
-            serde_json::to_value(&i1).unwrap(),
-            now,
-        )
-        .await;
+    // Drive both creates through the repo alone — the adapter records
+    // each event on the outbox INSIDE its transaction (phase 2); no
+    // hand-emitted events anywhere in this test.
+    commerce
+        .create_invoice_at(&i1, now, &EventStamp::new("commerce", actor.clone(), now))
+        .await
+        .unwrap();
 
     let now2 = Utc::now();
-    commerce.create_invoice_at(&i2, now2).await.unwrap();
-    publisher
-        .emit_at(
-            boss_commerce::events::INVOICE_CREATED,
-            serde_json::to_value(&i2).unwrap(),
-            now2,
-        )
-        .await;
+    commerce
+        .create_invoice_at(&i2, now2, &EventStamp::new("commerce", actor.clone(), now2))
+        .await
+        .unwrap();
 
-    // Mark INV-001 paid; emit the post-paid Invoice as INVOICE_PAID.
+    // Mark INV-001 paid — the paid event records in the flip's tx.
     let now3 = Utc::now();
     let paid_on = now3.date_naive();
     commerce
-        .mark_invoice_paid_at(&i1.id, paid_on)
+        .mark_invoice_paid_at(&i1.id, paid_on, &EventStamp::new("commerce", actor, now3))
         .await
         .unwrap();
-    let post = commerce.invoice_by_id(&i1.id).await.unwrap().unwrap();
-    publisher
-        .emit_at(
-            boss_commerce::events::INVOICE_PAID,
-            serde_json::to_value(&post).unwrap(),
-            now3,
-        )
-        .await;
+
+    // Drain the outbox through the relay pipeline: outbox →
+    // audit_log (chained) → bus → delivered. THIS is what the
+    // rebuild below reads.
+    let bus = RecordingEventBus::new();
+    let stats = drain_outbox_once(&db.pool, &(bus as Arc<dyn EventBus>), 100)
+        .await
+        .expect("relay drain");
+    assert_eq!(stats.delivered, 3, "2 created + 1 paid via the outbox");
 
     // Snapshot.
     let invoices_before = snapshot_invoices(&db.pool).await;

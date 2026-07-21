@@ -248,30 +248,42 @@ async fn create_invoice<R: CommerceRepository + 'static>(
     }
     let invoice_id = invoice.id.clone();
     let now = boss_clock_client::now_from(&state.clock).await;
-    match state.commerce.create_invoice_at(&invoice, now).await {
-        Ok(enriched) => {
-            if let Some(pub_) = &state.publisher {
-                // Emit the ENRICHED invoice — line_items[].cost_basis_cents
-                // is now populated from the FG drawdown. The audit_log
-                // replay path depends on it to reconstruct COGS legs.
-                let actor = user
-                    .ambient_actor()
-                    .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                pub_.emit_with_actor_at(
-                    crate::events::INVOICE_CREATED,
-                    actor,
-                    crate::events::invoice_created_payload(&enriched),
-                    now,
-                )
-                .await;
-            }
-            (
-                StatusCode::CREATED,
-                Json(serde_json::json!({"ok": true, "id": invoice_id})),
-            )
-                .into_response()
-        }
+    // Outbox phase 2: the adapter records commerce.invoice.created
+    // (the ENRICHED invoice — cost_basis populated in-tx) inside the
+    // domain transaction; nothing publishes post-commit.
+    let stamp = event_stamp(&state, &user, now).await;
+    match state
+        .commerce
+        .create_invoice_at(&invoice, now, &stamp)
+        .await
+    {
+        Ok(_enriched) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"ok": true, "id": invoice_id})),
+        )
+            .into_response(),
         Err(e) => error_response(e),
+    }
+}
+
+/// Resolve the outbox event stamp for this request: the caller's
+/// actor + the authoritative timestamp, with `_simulated` resolved by
+/// the publisher's clock probe when one is wired (task-local sim
+/// chain only, otherwise — the test paths). The four invoice kinds
+/// record their events in the DOMAIN TRANSACTION via this stamp
+/// (outbox phase 2); the publisher no longer publishes them
+/// post-commit.
+async fn event_stamp<R: CommerceRepository>(
+    state: &CommerceApiState<R>,
+    user: &boss_policy_client::User,
+    now: chrono::DateTime<chrono::Utc>,
+) -> boss_core::publisher::EventStamp {
+    let actor = user
+        .ambient_actor()
+        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+    match &state.publisher {
+        Some(p) => p.stamp_with_actor_at(actor, now).await,
+        None => boss_core::publisher::EventStamp::new("commerce", actor, now),
     }
 }
 
@@ -280,12 +292,10 @@ async fn batch_invoices<R: CommerceRepository + 'static>(
     CurrentUser(user): CurrentUser,
     Json(invoices): Json<Vec<crate::types::Invoice>>,
 ) -> Response {
-    let actor = user
-        .ambient_actor()
-        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
     let mut inserted = 0u64;
     let mut skipped: Vec<(String, String)> = Vec::new();
     let batch_now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, &user, batch_now).await;
     for inv in &invoices {
         let now = batch_now;
         // Status registry gate — reject rows with an unregistered (or
@@ -315,7 +325,7 @@ async fn batch_invoices<R: CommerceRepository + 'static>(
         // guard), so re-invoking is safe.
         let mut attempt = 0u32;
         let result = loop {
-            match state.commerce.create_invoice_at(inv, now).await {
+            match state.commerce.create_invoice_at(inv, now, &stamp).await {
                 Err(e) if attempt < 4 && e.to_string().contains("deadlock detected") => {
                     attempt += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(15 * attempt as u64)).await;
@@ -324,17 +334,8 @@ async fn batch_invoices<R: CommerceRepository + 'static>(
             }
         };
         match result {
-            Ok(enriched) => {
+            Ok(_enriched) => {
                 inserted += 1;
-                if let Some(pub_) = &state.publisher {
-                    pub_.emit_with_actor_at(
-                        crate::events::INVOICE_CREATED,
-                        actor.clone(),
-                        crate::events::invoice_created_payload(&enriched),
-                        now,
-                    )
-                    .await;
-                }
             }
             Err(e) => {
                 // On a rejected row, log per-row + return the
@@ -392,26 +393,15 @@ async fn mark_invoice_paid<R: CommerceRepository + 'static>(
     let paid_on = body
         .and_then(|axum::Json(b)| b.paid_on)
         .unwrap_or_else(|| now.date_naive());
-    match state.commerce.mark_invoice_paid_at(&id, paid_on).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                // Read back the post-update Invoice (header + lines)
-                // so the event carries full row state.
-                if let Ok(Some(inv)) = state.commerce.invoice_by_id(&id).await {
-                    let actor = user.ambient_actor().unwrap_or_else(|| {
-                        boss_core::actor::ActorId::Automation("platform".into())
-                    });
-                    pub_.emit_with_actor_at(
-                        crate::events::INVOICE_PAID,
-                        actor,
-                        serde_json::to_value(&inv).unwrap_or_default(),
-                        now,
-                    )
-                    .await;
-                }
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    // Outbox phase 2: the adapter records commerce.invoice.paid (full
+    // post-update row state, read back inside its own transaction).
+    let stamp = event_stamp(&state, &user, now).await;
+    match state
+        .commerce
+        .mark_invoice_paid_at(&id, paid_on, &stamp)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => error_response(e),
     }
 }
@@ -422,49 +412,11 @@ async fn mark_invoice_past_due<R: CommerceRepository + 'static>(
     CurrentUser(user): CurrentUser,
 ) -> Response {
     let now = boss_clock_client::now_from(&state.clock).await;
-    match state.commerce.mark_invoice_past_due(&id).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher
-                && let Ok(Some(inv)) = state.commerce.invoice_by_id(&id).await
-            {
-                let actor = user
-                    .ambient_actor()
-                    .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                pub_.emit_with_actor_at(
-                    crate::events::INVOICE_PAST_DUE,
-                    actor,
-                    serde_json::to_value(&inv).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    // Outbox phase 2: recorded in the adapter's transaction.
+    let stamp = event_stamp(&state, &user, now).await;
+    match state.commerce.mark_invoice_past_due(&id, &stamp).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => error_response(e),
-    }
-}
-
-/// Read back the post-flip invoice and emit
-/// `commerce.invoice.written_off` with full row state (rebuild
-/// consumes the payload via `from_value::<Invoice>` to flip the
-/// projection). Callers gate this on the flip actually happening,
-/// so converged double deliveries emit exactly once.
-async fn emit_invoice_written_off<R: CommerceRepository + 'static>(
-    state: &CommerceApiState<R>,
-    actor: boss_core::actor::ActorId,
-    id: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) {
-    if let Some(pub_) = &state.publisher
-        && let Ok(Some(inv)) = state.commerce.invoice_by_id(id).await
-    {
-        pub_.emit_with_actor_at(
-            crate::events::INVOICE_WRITTEN_OFF,
-            actor,
-            serde_json::to_value(&inv).unwrap_or_default(),
-            now,
-        )
-        .await;
     }
 }
 
@@ -474,16 +426,12 @@ async fn mark_invoice_written_off<R: CommerceRepository + 'static>(
     CurrentUser(user): CurrentUser,
 ) -> Response {
     let now = boss_clock_client::now_from(&state.clock).await;
-    match state.commerce.mark_invoice_written_off(&id).await {
-        Ok(newly) => {
-            if newly {
-                let actor = user
-                    .ambient_actor()
-                    .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                emit_invoice_written_off(&state, actor, &id, now).await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    // Outbox phase 2: the adapter records the event in the flip's own
+    // transaction, structurally gated on the flip winning — the
+    // emit-once-on-`newly` dance this handler used to do is gone.
+    let stamp = event_stamp(&state, &user, now).await;
+    match state.commerce.mark_invoice_written_off(&id, &stamp).await {
+        Ok(_newly) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => error_response(e),
     }
 }
@@ -534,23 +482,22 @@ async fn write_off_invoice_from_past_due<R: CommerceRepository + 'static>(
     };
 
     let now = boss_clock_client::now_from(&state.clock).await;
-    match state.commerce.mark_invoice_written_off(&invoice_id).await {
-        Ok(newly) => {
-            if newly {
-                let actor = user
-                    .ambient_actor()
-                    .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                emit_invoice_written_off(&state, actor, &invoice_id, now).await;
-            }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "invoice_id": invoice_id,
-                    "written_off": newly,
-                })),
-            )
-                .into_response()
-        }
+    // Outbox phase 2: emit-once is structural in the adapter's
+    // transaction; `newly` stays in the response for the caller.
+    let stamp = event_stamp(&state, &user, now).await;
+    match state
+        .commerce
+        .mark_invoice_written_off(&invoice_id, &stamp)
+        .await
+    {
+        Ok(newly) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "invoice_id": invoice_id,
+                "written_off": newly,
+            })),
+        )
+            .into_response(),
         Err(e) => error_response(e),
     }
 }

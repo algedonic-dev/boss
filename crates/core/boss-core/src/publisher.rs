@@ -186,6 +186,37 @@ impl DomainPublisher {
             .await
     }
 
+    /// Resolve the enrichment envelope for IN-TRANSACTION (outbox)
+    /// event recording — the same `_actor` / `_simulated` semantics
+    /// [`Self::emit_with_actor_at`] applies at publish time, captured
+    /// as a value a domain repository can apply INSIDE its own
+    /// transaction via [`EventStamp::event`] +
+    /// `boss_events::outbox::record_event_in_tx`. This is how an
+    /// outbox-migrated emitter keeps byte-identical payload
+    /// enrichment with the publisher path it replaces: one resolution
+    /// (task-local sim chain OR the clock probe), two delivery
+    /// mechanisms.
+    pub async fn stamp_with_actor_at(
+        &self,
+        actor: ActorId,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> EventStamp {
+        let mut simulated = crate::sim_origin::is_in_sim_chain();
+        if !simulated && let Some(probe) = &self.sim_probe {
+            simulated = probe.simulated().await;
+        }
+        EventStamp {
+            source: self.source.clone(),
+            actor,
+            simulated: if simulated || self.sim_probe.is_some() {
+                Some(simulated)
+            } else {
+                None
+            },
+            timestamp,
+        }
+    }
+
     /// Publish a pre-built `Event`. Used by services like assets that
     /// already construct an `Event` via a domain bridge and need the
     /// id and timestamp on the wire to match what the rest of the
@@ -310,6 +341,54 @@ fn inject_actor(mut payload: serde_json::Value, actor: &ActorId) -> serde_json::
         "_actor": actor_value,
         "value": payload,
     })
+}
+
+/// The enrichment envelope for in-transaction (outbox) event
+/// recording. Resolved once per request — via
+/// [`DomainPublisher::stamp_with_actor_at`] when a publisher (and
+/// its sim probe) is wired, or [`EventStamp::new`] when not — and
+/// handed into the domain repository, which applies it to each
+/// payload it builds INSIDE its transaction. Keeps the outbox path's
+/// `_actor` / `_simulated` semantics byte-identical with
+/// `emit_with_actor_at`, from one resolution.
+#[derive(Debug, Clone)]
+pub struct EventStamp {
+    source: String,
+    actor: ActorId,
+    /// `Some(flag)` injects `_simulated: flag`; `None` leaves the key
+    /// off entirely (mirrors emit: the key appears when the chain is
+    /// simulated or a probe is wired at all).
+    simulated: Option<bool>,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+impl EventStamp {
+    /// Publisher-less construction (test paths, adapters without a
+    /// clock probe). Still honors the task-local sim chain, so a
+    /// sim-originated request stamps `_simulated: true` even here.
+    pub fn new(
+        source: impl Into<String>,
+        actor: ActorId,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let in_chain = crate::sim_origin::is_in_sim_chain();
+        Self {
+            source: source.into(),
+            actor,
+            simulated: in_chain.then_some(true),
+            timestamp,
+        }
+    }
+
+    /// Build the enriched `Event` for `kind` + `payload` — the in-tx
+    /// analogue of `emit_with_actor_at`'s construction.
+    pub fn event(&self, kind: &str, payload: serde_json::Value) -> Event {
+        let mut payload = inject_actor(payload, &self.actor);
+        if let Some(simulated) = self.simulated {
+            payload = inject_simulated(payload, simulated);
+        }
+        Event::new(&self.source, kind, payload, self.timestamp)
+    }
 }
 
 #[cfg(test)]
