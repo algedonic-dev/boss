@@ -68,11 +68,14 @@ CREATE INDEX IF NOT EXISTS finished_product_inventory_sku ON finished_product_in
 
 CREATE INDEX IF NOT EXISTS finished_product_inventory_location ON finished_product_inventory(location_id);
 
--- Products ref-check seed rows: events that REFERENCE an existing
--- products row. (Trigger + table live in 02-events.)
-INSERT INTO audit_log_ref_checks (event_kind, field_path, ref_table, ref_column) VALUES
-    ('products.produced',             'sku',         'products',        'sku'),
-    ('products.consumed',             'sku',         'products',        'sku'),
-    ('products.inventory.upserted',   'product_sku', 'products',        'sku')
-ON CONFLICT (event_kind, field_path) DO NOTHING;
+-- Products subject-edge seed rows: events that REFERENCE an existing
+-- product Subject. R2 — resolved against `subjects` (kind='product',
+-- keyed by SKU) by the subject_edges trigger in 02-events. Products
+-- are Subjects (R1, event-sourced via products.product.upserted), so
+-- this is equivalent to the retired `products.sku` ref-check.
+INSERT INTO subject_edges (source_kind, field_path, target_kind) VALUES
+    ('products.produced',             'sku',         'product'),
+    ('products.consumed',             'sku',         'product'),
+    ('products.inventory.upserted',   'product_sku', 'product')
+ON CONFLICT (source_kind, field_path) DO NOTHING;
 

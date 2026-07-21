@@ -96,6 +96,9 @@
 #   X. Job subjects resolve in the subjects identity table —
 #      the R1 acceptance invariant: every jobs.subject_id has an
 #      identity row (write-through + rebuilder + uniform gate).
+#   Y. Declared subject edges resolve — the R2 acceptance invariant:
+#      every event field named in `subject_edges` resolves to a live
+#      `subjects` row (the drift net behind the write-time triggers).
 #
 #   (T and U are reserved: the income-statement and cash-flow
 #   endpoints' structural audits — the S pattern applied to the
@@ -597,6 +600,31 @@ SELECT j.kind || ': ' || j.subject_kind || '/' || j.subject_id
      SELECT 1 FROM subjects s
       WHERE s.kind = j.subject_kind AND s.id = j.subject_id
  )
+ LIMIT 20
+SQL
+)"
+
+# ---- Y. Every declared subject edge resolves ----
+# The R2 acceptance invariant (subject-model design): the E-invariant
+# generalized over the `subject_edges` registry. The outbox/audit_log
+# triggers ABORT a write referencing a missing subject at write time;
+# this sweep is the drift net — it walks every declared edge against
+# the whole audit_log and catches anything that predates its rule or
+# rode in under `on_missing='warn'`. For each edge (source_kind,
+# field_path → target_kind) it finds any event of source_kind whose
+# payload field names a subject that isn't in `subjects`.
+run_invariant "Y. Declared subject edges resolve in the subjects table" "$(cat <<'SQL'
+SELECT a.kind || '.' || e.field_path || ' -> ' || e.target_kind
+       || ':' || (a.payload ->> e.field_path)
+  FROM subject_edges e
+  JOIN audit_log a ON a.kind = e.source_kind
+ WHERE a.payload ->> e.field_path IS NOT NULL
+   AND a.payload ->> e.field_path <> ''
+   AND NOT EXISTS (
+       SELECT 1 FROM subjects s
+        WHERE s.kind = e.target_kind
+          AND s.id = a.payload ->> e.field_path
+   )
  LIMIT 20
 SQL
 )"

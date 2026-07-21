@@ -347,11 +347,16 @@ CREATE INDEX IF NOT EXISTS vendor_facts_vendor ON vendor_facts(vendor_id, occurr
 
 CREATE INDEX IF NOT EXISTS vendor_facts_kind ON vendor_facts(fact_kind);
 
--- Inventory ref-check seed rows: events that REFERENCE an existing
--- inventory_items row. The audit_log_ref_checks table +
--- audit_log_check_refs() trigger live in 02-events; these rows live
--- with the table they reference so the module stays independently
--- removable.
+-- Inventory ref-check seed rows — the NON-subject residual (R2,
+-- decision 2026-07-17). Raw-material `part_sku` references point at
+-- the `inventory_items` catalog, NOT at a Subject: parts are fungible
+-- reference data, not identity-bearing things, so they are not a
+-- registered subject kind and cannot resolve against `subjects`.
+-- They therefore stay on the arbitrary-table `audit_log_ref_checks`
+-- mechanism + `audit_log_check_refs()` trigger (02-events), a
+-- deliberately separate concern from the subject_edges registry that
+-- now owns every subject-referential edge. If parts ever become a
+-- Subject kind, these move to subject_edges like the rest.
 INSERT INTO audit_log_ref_checks (event_kind, field_path, ref_table, ref_column) VALUES
     ('inventory.transferred',         'part_sku',    'inventory_items', 'part_sku'),
     ('inventory.item.consumed',       'part_sku',    'inventory_items', 'part_sku')
