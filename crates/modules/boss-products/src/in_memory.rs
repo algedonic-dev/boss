@@ -38,7 +38,11 @@ impl ProductsRepository for InMemoryProducts {
         Ok(self.products.lock().unwrap().get(sku).cloned())
     }
 
-    async fn upsert_product(&self, product: &Product) -> Result<(), ProductsError> {
+    async fn upsert_product(
+        &self,
+        product: &Product,
+        _stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), ProductsError> {
         self.products
             .lock()
             .unwrap()
@@ -57,7 +61,11 @@ impl ProductsRepository for InMemoryProducts {
         Ok(out)
     }
 
-    async fn upsert_inventory(&self, row: &ProductInventory) -> Result<(), ProductsError> {
+    async fn upsert_inventory(
+        &self,
+        row: &ProductInventory,
+        _stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), ProductsError> {
         self.inventory.lock().unwrap().insert(
             (row.product_sku.clone(), row.location_id.clone()),
             row.clone(),
@@ -74,6 +82,7 @@ impl ProductsRepository for InMemoryProducts {
         _source_table: &str,
         _source_id: &str,
         _happened_on: chrono::NaiveDate,
+        _stamp: &boss_core::publisher::EventStamp,
     ) -> Result<crate::types::JeRecorded, ProductsError> {
         Ok(crate::types::JeRecorded {
             fact_id: uuid::Uuid::new_v4(),
@@ -90,6 +99,7 @@ impl ProductsRepository for InMemoryProducts {
         total_cost_cents: Option<i64>,
         _now: chrono::DateTime<chrono::Utc>,
         _source_id: String,
+        _stamp: &boss_core::publisher::EventStamp,
     ) -> Result<InventoryDeltaResult, ProductsError> {
         if qty <= 0 {
             return Err(ProductsError::Invalid(format!(
@@ -135,6 +145,7 @@ impl ProductsRepository for InMemoryProducts {
         _revenue_category: Option<&str>,
         _now: chrono::DateTime<chrono::Utc>,
         _source_id: String,
+        _stamp: &boss_core::publisher::EventStamp,
     ) -> Result<InventoryDeltaResult, ProductsError> {
         if qty <= 0 {
             return Err(ProductsError::Invalid(format!(

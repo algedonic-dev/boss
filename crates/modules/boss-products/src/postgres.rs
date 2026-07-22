@@ -51,7 +51,11 @@ impl ProductsRepository for PgProducts {
         Ok(row.map(Into::into))
     }
 
-    async fn upsert_product(&self, product: &Product) -> Result<(), ProductsError> {
+    async fn upsert_product(
+        &self,
+        product: &Product,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), ProductsError> {
         let mut tx = self
             .pool
             .begin()
@@ -88,6 +92,14 @@ impl ProductsRepository for PgProducts {
         .execute(&mut *tx)
         .await
         .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        // OUTBOX (phase 2): the upsert event records with the row.
+        let event = stamp.event(
+            crate::events::PRODUCT_UPSERTED,
+            serde_json::to_value(product).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(ProductsError::Storage)?;
         tx.commit()
             .await
             .map_err(|e| ProductsError::Storage(e.to_string()))?;
@@ -108,7 +120,16 @@ impl ProductsRepository for PgProducts {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    async fn upsert_inventory(&self, row: &ProductInventory) -> Result<(), ProductsError> {
+    async fn upsert_inventory(
+        &self,
+        row: &ProductInventory,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), ProductsError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ProductsError::Storage(e.to_string()))?;
         sqlx::query(
             "INSERT INTO finished_product_inventory \
                 (product_sku, location_id, on_hand, reserved, value_cents) \
@@ -124,9 +145,20 @@ impl ProductsRepository for PgProducts {
         .bind(row.on_hand)
         .bind(row.reserved)
         .bind(row.value_cents)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ProductsError::Storage(e.to_string()))?;
+        // OUTBOX (phase 2): the inventory event records with the row.
+        let event = stamp.event(
+            crate::events::PRODUCT_INVENTORY_UPSERTED,
+            serde_json::to_value(row).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(ProductsError::Storage)?;
+        tx.commit()
+            .await
+            .map_err(|e| ProductsError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -139,6 +171,7 @@ impl ProductsRepository for PgProducts {
         source_table: &str,
         source_id: &str,
         happened_on: chrono::NaiveDate,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<JeRecorded, ProductsError> {
         if total_cost_cents <= 0 {
             return Err(ProductsError::Invalid(
@@ -190,6 +223,17 @@ impl ProductsRepository for PgProducts {
         .await
         .map_err(|e| ProductsError::Storage(e.to_string()))?;
 
+        // OUTBOX (phase 2): the event records ONLY when THIS call
+        // inserted the fact — emit-once-on-`inserted`, structural in
+        // the fact's own transaction (the HTTP handler used to gate
+        // this on the returned bool).
+        if inserted {
+            let event = stamp.event(crate::events::LEDGER_INVENTORY_TRANSFERRED, payload.clone());
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(ProductsError::Storage)?;
+        }
+
         tx.commit()
             .await
             .map_err(|e| ProductsError::Storage(e.to_string()))?;
@@ -208,6 +252,7 @@ impl ProductsRepository for PgProducts {
         total_cost_cents: Option<i64>,
         now: chrono::DateTime<chrono::Utc>,
         source_id: String,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<InventoryDeltaResult, ProductsError> {
         if qty <= 0 {
             return Err(ProductsError::Invalid(format!(
@@ -328,13 +373,30 @@ impl ProductsRepository for PgProducts {
             None
         };
 
+        // OUTBOX (phase 2): the post-delta inventory row + (when the
+        // GL moved) the produced fact payload record in THIS tx. The
+        // idempotency guard above means a redelivered produce never
+        // reaches here — no duplicate events, same as no duplicate
+        // on_hand.
+        let inventory: ProductInventory = row.into();
+        let event = stamp.event(
+            crate::events::PRODUCT_INVENTORY_UPSERTED,
+            serde_json::to_value(&inventory).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(ProductsError::Storage)?;
+        if let Some(gl) = &gl_move {
+            let event = stamp.event(crate::events::PRODUCT_PRODUCED, gl.payload.clone());
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(ProductsError::Storage)?;
+        }
+
         tx.commit()
             .await
             .map_err(|e| ProductsError::Storage(e.to_string()))?;
-        Ok(InventoryDeltaResult {
-            inventory: row.into(),
-            gl_move,
-        })
+        Ok(InventoryDeltaResult { inventory, gl_move })
     }
 
     async fn consume(
@@ -345,6 +407,7 @@ impl ProductsRepository for PgProducts {
         revenue_category: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
         source_id: String,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<InventoryDeltaResult, ProductsError> {
         if qty <= 0 {
             return Err(ProductsError::Invalid(format!(
@@ -478,13 +541,28 @@ impl ProductsRepository for PgProducts {
                 } else {
                     None
                 };
+                // OUTBOX (phase 2): post-delta row + (on a GL move)
+                // the consumed fact payload, in THIS tx. The
+                // idempotency guard above keeps redeliveries from
+                // reaching here — no duplicate events.
+                let inventory: ProductInventory = row.into();
+                let event = stamp.event(
+                    crate::events::PRODUCT_INVENTORY_UPSERTED,
+                    serde_json::to_value(&inventory).unwrap_or_default(),
+                );
+                boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                    .await
+                    .map_err(ProductsError::Storage)?;
+                if let Some(gl) = &gl_move {
+                    let event = stamp.event(crate::events::PRODUCT_CONSUMED, gl.payload.clone());
+                    boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                        .await
+                        .map_err(ProductsError::Storage)?;
+                }
                 tx.commit()
                     .await
                     .map_err(|e| ProductsError::Storage(e.to_string()))?;
-                Ok(InventoryDeltaResult {
-                    inventory: row.into(),
-                    gl_move,
-                })
+                Ok(InventoryDeltaResult { inventory, gl_move })
             }
             None => Err(ProductsError::Invalid(format!(
                 "consume failed: row missing or on_hand < {qty} for {sku} @ {location_id}"

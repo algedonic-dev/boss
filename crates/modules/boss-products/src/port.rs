@@ -2,6 +2,7 @@
 //! Adapters: PgProducts (postgres) + InMemoryProducts (tests).
 
 use async_trait::async_trait;
+use boss_core::publisher::EventStamp;
 
 use crate::types::{Product, ProductInventory};
 
@@ -48,7 +49,13 @@ pub trait ProductsRepository: Send + Sync {
 
     /// Upsert by SKU (idempotent on the natural key). Used by the
     /// brewery seed loader and the future authoring HTTP path.
-    async fn upsert_product(&self, product: &Product) -> Result<(), ProductsError>;
+    /// OUTBOX (phase 2): records `products.product.upserted` in the
+    /// same transaction as the row.
+    async fn upsert_product(
+        &self,
+        product: &Product,
+        stamp: &EventStamp,
+    ) -> Result<(), ProductsError>;
 
     /// Per-location rows for one SKU.
     async fn inventory_for(&self, sku: &str) -> Result<Vec<ProductInventory>, ProductsError>;
@@ -56,7 +63,13 @@ pub trait ProductsRepository: Send + Sync {
     /// Upsert one (sku, location) row. Production / sale side-effect
     /// handlers call this with delta-applied counts; the table holds
     /// absolute state, last-write-wins.
-    async fn upsert_inventory(&self, row: &ProductInventory) -> Result<(), ProductsError>;
+    /// OUTBOX (phase 2): records `products.inventory.upserted` in
+    /// the same transaction as the row.
+    async fn upsert_inventory(
+        &self,
+        row: &ProductInventory,
+        stamp: &EventStamp,
+    ) -> Result<(), ProductsError>;
 
     /// Atomic opening-balance / adjustment JE for FG inventory
     /// changes that don't already pair with a produce / consume
@@ -69,6 +82,11 @@ pub trait ProductsRepository: Send + Sync {
     /// Idempotent on the `(kind, source_table, source_id)`
     /// unique key, so the same opening row re-applied is a
     /// no-op. Returns the canonical fact_id.
+    /// OUTBOX (phase 2): when THIS call inserts the fact, the
+    /// matching `ledger.inventory.transferred` event records in the
+    /// same transaction — the emit-once-on-`inserted` contract the
+    /// HTTP handler used to enforce is structural now.
+    #[allow(clippy::too_many_arguments)]
     async fn record_inventory_je(
         &self,
         total_cost_cents: i64,
@@ -78,6 +96,7 @@ pub trait ProductsRepository: Send + Sync {
         source_table: &str,
         source_id: &str,
         happened_on: chrono::NaiveDate,
+        stamp: &EventStamp,
     ) -> Result<crate::types::JeRecorded, ProductsError>;
 
     /// Increment on_hand for (sku, location) by `qty`. Inserts the
@@ -94,6 +113,11 @@ pub trait ProductsRepository: Send + Sync {
     /// (PR 6a). `None` leaves value unchanged — callers that don't
     /// carry cost data move units only. The display
     /// `production_cost_cents` is derived (value / on_hand).
+    /// OUTBOX (phase 2): records `products.inventory.upserted`
+    /// (post-delta row) and, when a GL move happened,
+    /// `products.produced` (the fact payload verbatim) in the same
+    /// transaction as the delta.
+    #[allow(clippy::too_many_arguments)]
     async fn produce(
         &self,
         sku: &str,
@@ -102,6 +126,7 @@ pub trait ProductsRepository: Send + Sync {
         total_cost_cents: Option<i64>,
         now: chrono::DateTime<chrono::Utc>,
         source_id: String,
+        stamp: &EventStamp,
     ) -> Result<InventoryDeltaResult, ProductsError>;
 
     /// Decrement on_hand for (sku, location) by `qty`. Errors if
@@ -116,6 +141,10 @@ pub trait ProductsRepository: Send + Sync {
     /// is propagated to the `finance.cogs.recognized` payload so
     /// per-category gross margin rolls up exactly; `None` preserves
     /// the prior pro-rated rollup behavior.
+    /// OUTBOX (phase 2): symmetric to `produce` —
+    /// `products.inventory.upserted` + (on a GL move)
+    /// `products.consumed`, in the delta's transaction.
+    #[allow(clippy::too_many_arguments)]
     async fn consume(
         &self,
         sku: &str,
@@ -124,5 +153,6 @@ pub trait ProductsRepository: Send + Sync {
         revenue_category: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
         source_id: String,
+        stamp: &EventStamp,
     ) -> Result<InventoryDeltaResult, ProductsError>;
 }

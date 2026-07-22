@@ -12,6 +12,14 @@ use boss_products::port::ProductsRepository;
 use boss_testing::TestDb;
 use chrono::Utc;
 
+fn stamp() -> boss_core::publisher::EventStamp {
+    boss_core::publisher::EventStamp::new(
+        "products",
+        boss_core::actor::ActorId::Automation("test".into()),
+        chrono::Utc::now(),
+    )
+}
+
 async fn seed_product(db: &TestDb, sku: &str) {
     sqlx::query(
         "INSERT INTO products (sku, name, product_kind, package_unit, active) VALUES ($1, $1, 'beer', '1/2-bbl-keg', true) \
@@ -46,12 +54,28 @@ async fn produce_line_totals_then_full_drain_conserves_value_exactly() {
     seed_product(&db, sku).await;
 
     // Two produces with prime totals no per-unit cost can represent.
-    repo.produce(sku, loc, 210, Some(1_000_003), Utc::now(), "p1".into())
-        .await
-        .unwrap();
-    repo.produce(sku, loc, 315, Some(499_999), Utc::now(), "p2".into())
-        .await
-        .unwrap();
+    repo.produce(
+        sku,
+        loc,
+        210,
+        Some(1_000_003),
+        Utc::now(),
+        "p1".into(),
+        &stamp(),
+    )
+    .await
+    .unwrap();
+    repo.produce(
+        sku,
+        loc,
+        315,
+        Some(499_999),
+        Utc::now(),
+        "p2".into(),
+        &stamp(),
+    )
+    .await
+    .unwrap();
     let rows = repo.inventory_for(sku).await.unwrap();
     assert_eq!(rows[0].on_hand, 525);
     assert_eq!(rows[0].value_cents, 1_500_002);
@@ -66,6 +90,7 @@ async fn produce_line_totals_then_full_drain_conserves_value_exactly() {
             Some("wholesale"),
             Utc::now(),
             format!("c{i}"),
+            &stamp(),
         )
         .await
         .unwrap();

@@ -18,7 +18,6 @@ use axum::routing::{get, post, put};
 use boss_core::publisher::DomainPublisher;
 use serde::Deserialize;
 
-use crate::events;
 use crate::port::{ProductsError, ProductsRepository};
 use crate::types::{Product, ProductDetail, ProductInventory};
 
@@ -121,22 +120,34 @@ async fn get_product_detail<R: ProductsRepository + 'static>(
     .into_response()
 }
 
+/// Resolve the outbox event stamp for this request. Products
+/// handlers carry no CurrentUser extractor; the publisher's
+/// `default_actor` resolves the request identity from the task-local
+/// context (else `automation:products`), and its clock probe settles
+/// `_simulated` — the same envelope the retired post-commit emits
+/// carried (outbox phase 2).
+async fn event_stamp<R: ProductsRepository>(
+    state: &ProductsApiState<R>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> boss_core::publisher::EventStamp {
+    match &state.publisher {
+        Some(p) => p.stamp_with_actor_at(p.default_actor(), now).await,
+        None => boss_core::publisher::EventStamp::new(
+            "products",
+            boss_core::actor::ActorId::Automation("products".into()),
+            now,
+        ),
+    }
+}
+
 async fn upsert_product<R: ProductsRepository + 'static>(
     State(state): State<Arc<ProductsApiState<R>>>,
     Json(product): Json<Product>,
 ) -> Response {
-    match state.products.upsert_product(&product).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    events::PRODUCT_UPSERTED,
-                    serde_json::to_value(&product).unwrap_or_default(),
-                    boss_clock_client::now_from(&state.clock).await,
-                )
-                .await;
-            }
-            (StatusCode::CREATED, Json(product)).into_response()
-        }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
+    match state.products.upsert_product(&product, &stamp).await {
+        Ok(()) => (StatusCode::CREATED, Json(product)).into_response(),
         Err(e) => error_response(e),
     }
 }
@@ -146,18 +157,11 @@ async fn upsert_products_batch<R: ProductsRepository + 'static>(
     Json(products): Json<Vec<Product>>,
 ) -> Response {
     let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
     let mut inserted = 0u64;
     for p in &products {
-        if state.products.upsert_product(p).await.is_ok() {
+        if state.products.upsert_product(p, &stamp).await.is_ok() {
             inserted += 1;
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    events::PRODUCT_UPSERTED,
-                    serde_json::to_value(p).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            }
         }
     }
     Json(serde_json::json!({"upserted": inserted})).into_response()
@@ -170,16 +174,10 @@ async fn put_inventory<R: ProductsRepository + 'static>(
 ) -> Response {
     // The path SKU is authoritative; ignore any mismatched body field.
     row.product_sku = sku;
-    match state.products.upsert_inventory(&row).await {
+    let stamp_now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, stamp_now).await;
+    match state.products.upsert_inventory(&row, &stamp).await {
         Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    events::PRODUCT_INVENTORY_UPSERTED,
-                    serde_json::to_value(&row).unwrap_or_default(),
-                    boss_clock_client::now_from(&state.clock).await,
-                )
-                .await;
-            }
             // Atomic opening-balance JE. When PUT lands a row
             // carrying value, post DR 1320 (FG) / CR 3000 (Retained
             // Earnings) sized at exactly value_cents — the conserved
@@ -213,25 +211,15 @@ async fn put_inventory<R: ProductsRepository + 'static>(
                         "brewery_seed_opening_balance",
                         &source_id,
                         now.date_naive(),
+                        &stamp,
                     )
                     .await
                 {
-                    // The fact's WRITER owns its rebuild source: emit
-                    // the in-tx payload verbatim, only when THIS call
-                    // inserted it (see the inventory batch-upsert twin
-                    // for the 2026-07-09 regression this closes).
-                    Ok(je) => {
-                        if je.inserted
-                            && let Some(pub_) = &state.publisher
-                        {
-                            pub_.emit_at(
-                                crate::events::LEDGER_INVENTORY_TRANSFERRED,
-                                je.payload,
-                                now,
-                            )
-                            .await;
-                        }
-                    }
+                    // The adapter records the event in the fact's own
+                    // transaction, gated on `inserted` — the
+                    // emit-once dance that used to live here is
+                    // structural now (outbox phase 2).
+                    Ok(_je) => {}
                     Err(e) => {
                         tracing::warn!(
                             sku = %row.product_sku,
@@ -284,6 +272,7 @@ async fn post_produce<R: ProductsRepository + 'static>(
         Some(key) => format!("produce:{key}"),
         None => format!("produce:{sku}:{}", uuid::Uuid::new_v4()),
     };
+    let stamp = event_stamp(&state, now).await;
     match state
         .products
         .produce(
@@ -293,28 +282,11 @@ async fn post_produce<R: ProductsRepository + 'static>(
             body.total_cost_cents,
             now,
             source_id,
+            &stamp,
         )
         .await
     {
-        Ok(result) => {
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    events::PRODUCT_INVENTORY_UPSERTED,
-                    serde_json::to_value(&result.inventory).unwrap_or_default(),
-                    now,
-                )
-                .await;
-                // Emit the auditable WIP→FG GL move so bundle
-                // export + rebuild reproduces the financial_fact
-                // through `gl_fact_projection_rules`. The payload
-                // IS the projected fact payload — no transform.
-                if let Some(gl) = &result.gl_move {
-                    pub_.emit_at(events::PRODUCT_PRODUCED, gl.payload.clone(), now)
-                        .await;
-                }
-            }
-            Json(result.inventory).into_response()
-        }
+        Ok(result) => Json(result.inventory).into_response(),
         Err(e) => error_response(e),
     }
 }
@@ -329,6 +301,7 @@ async fn post_consume<R: ProductsRepository + 'static>(
         Some(key) => format!("consume:{key}"),
         None => format!("consume:{sku}:{}", uuid::Uuid::new_v4()),
     };
+    let stamp = event_stamp(&state, now).await;
     match state
         .products
         .consume(
@@ -338,27 +311,11 @@ async fn post_consume<R: ProductsRepository + 'static>(
             body.revenue_category.as_deref(),
             now,
             source_id,
+            &stamp,
         )
         .await
     {
-        Ok(result) => {
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    events::PRODUCT_INVENTORY_UPSERTED,
-                    serde_json::to_value(&result.inventory).unwrap_or_default(),
-                    now,
-                )
-                .await;
-                // Emit the auditable FG→COGS GL move. Symmetric
-                // to PRODUCT_PRODUCED above — pure passthrough to
-                // `finance.cogs.recognized` via the projection rule.
-                if let Some(gl) = &result.gl_move {
-                    pub_.emit_at(events::PRODUCT_CONSUMED, gl.payload.clone(), now)
-                        .await;
-                }
-            }
-            Json(result.inventory).into_response()
-        }
+        Ok(result) => Json(result.inventory).into_response(),
         Err(e) => error_response(e),
     }
 }

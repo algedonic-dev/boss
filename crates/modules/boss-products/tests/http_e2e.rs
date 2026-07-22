@@ -13,6 +13,14 @@ use boss_testing::TestDb;
 use http_body_util::BodyExt;
 use tower::util::ServiceExt;
 
+fn stamp() -> boss_core::publisher::EventStamp {
+    boss_core::publisher::EventStamp::new(
+        "products",
+        boss_core::actor::ActorId::Automation("test".into()),
+        chrono::Utc::now(),
+    )
+}
+
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
@@ -83,27 +91,33 @@ async fn detail_rolls_up_inventory_across_locations() {
     let r = router(state);
 
     use boss_products::ProductsRepository;
-    repo.upsert_product(&fp_pale()).await.unwrap();
-    repo.upsert_inventory(&ProductInventory {
-        product_sku: "FP-PALE-1-2-BBL".into(),
-        location_id: "loc-brewhouse".into(),
-        on_hand: 145,
-        reserved: 0,
-        value_cents: 0,
-        production_cost_cents: 0,
-        updated_at: None,
-    })
+    repo.upsert_product(&fp_pale(), &stamp()).await.unwrap();
+    repo.upsert_inventory(
+        &ProductInventory {
+            product_sku: "FP-PALE-1-2-BBL".into(),
+            location_id: "loc-brewhouse".into(),
+            on_hand: 145,
+            reserved: 0,
+            value_cents: 0,
+            production_cost_cents: 0,
+            updated_at: None,
+        },
+        &stamp(),
+    )
     .await
     .unwrap();
-    repo.upsert_inventory(&ProductInventory {
-        product_sku: "FP-PALE-1-2-BBL".into(),
-        location_id: "loc-taproom".into(),
-        on_hand: 12,
-        reserved: 0,
-        value_cents: 0,
-        production_cost_cents: 0,
-        updated_at: None,
-    })
+    repo.upsert_inventory(
+        &ProductInventory {
+            product_sku: "FP-PALE-1-2-BBL".into(),
+            location_id: "loc-taproom".into(),
+            on_hand: 12,
+            reserved: 0,
+            value_cents: 0,
+            production_cost_cents: 0,
+            updated_at: None,
+        },
+        &stamp(),
+    )
     .await
     .unwrap();
 
@@ -185,7 +199,7 @@ async fn put_inventory_uses_path_sku_as_authoritative() {
     let r = router(state);
 
     use boss_products::ProductsRepository;
-    repo.upsert_product(&fp_pale()).await.unwrap();
+    repo.upsert_product(&fp_pale(), &stamp()).await.unwrap();
 
     let body = serde_json::json!({
         "product_sku": "WRONG-SKU",
@@ -223,7 +237,7 @@ async fn produce_increments_then_consume_decrements() {
     let r = router(state);
 
     use boss_products::ProductsRepository;
-    repo.upsert_product(&fp_pale()).await.unwrap();
+    repo.upsert_product(&fp_pale(), &stamp()).await.unwrap();
 
     // Produce 30 (no row yet → INSERT) then 12 (row → UPDATE).
     for qty in [30, 12] {
@@ -278,7 +292,7 @@ async fn consume_below_zero_is_rejected() {
     let r = router(state);
 
     use boss_products::ProductsRepository;
-    repo.upsert_product(&fp_pale()).await.unwrap();
+    repo.upsert_product(&fp_pale(), &stamp()).await.unwrap();
     repo.produce(
         "FP-PALE-1-2-BBL",
         "loc-brewhouse",
@@ -286,6 +300,7 @@ async fn consume_below_zero_is_rejected() {
         None,
         chrono::Utc::now(),
         "test-produce".into(),
+        &stamp(),
     )
     .await
     .unwrap();
@@ -325,8 +340,8 @@ async fn list_default_filters_inactive() {
     let mut retired = fp_pale();
     retired.sku = "FP-RETIRED-1-2-BBL".into();
     retired.active = false;
-    repo.upsert_product(&active).await.unwrap();
-    repo.upsert_product(&retired).await.unwrap();
+    repo.upsert_product(&active, &stamp()).await.unwrap();
+    repo.upsert_product(&retired, &stamp()).await.unwrap();
     let _ = &mut active;
 
     let resp = r
