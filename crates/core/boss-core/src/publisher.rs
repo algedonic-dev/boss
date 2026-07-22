@@ -108,7 +108,7 @@ impl DomainPublisher {
     /// (`automation:<source>`). Never anonymous — there is no `system`
     /// actor; a write with no traceable authority is still attributed
     /// to the process that made it.
-    fn default_actor(&self) -> ActorId {
+    pub fn default_actor(&self) -> ActorId {
         crate::actor_context::current_actor()
             .unwrap_or_else(|| ActorId::Automation(self.source.clone()))
     }
