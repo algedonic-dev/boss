@@ -81,6 +81,8 @@ pub async fn lock_period(
     pool: &PgPool,
     period_id: Uuid,
     locked_by: &str,
+    stamp: &boss_core::publisher::EventStamp,
+    actor_id: &str,
 ) -> Result<String, LedgerError> {
     let mut tx = pool
         .begin()
@@ -132,6 +134,25 @@ pub async fn lock_period(
     .await
     .map_err(|e| LedgerError::Storage(e.to_string()))?;
 
+    // Operator-audit-trail event, recorded in the SAME tx as the lock
+    // (outbox phase 2). gl_periods is system-of-record (not derived
+    // from audit_log) so this doesn't drive a rebuild — its purpose
+    // is the who-locked-what trail for auditors, and the re-lock
+    // early-return above keeps idempotent repeats out of the log.
+    crate::events::record_ledger_event_in_tx(
+        &mut tx,
+        stamp,
+        "ledger.period.locked",
+        serde_json::json!({
+            "period_id": period_id,
+            "locked_by": locked_by,
+            "actor_id": actor_id,
+            "checksum": checksum,
+            "locked_at": stamp.timestamp,
+        }),
+    )
+    .await?;
+
     tx.commit()
         .await
         .map_err(|e| LedgerError::Storage(e.to_string()))?;
@@ -140,7 +161,16 @@ pub async fn lock_period(
 
 /// Unlock a period: clear the lock fields, set status back to 'open'.
 /// Operator-tier action; the HTTP layer is where auth gating happens.
-pub async fn unlock_period(pool: &PgPool, period_id: Uuid) -> Result<(), LedgerError> {
+pub async fn unlock_period(
+    pool: &PgPool,
+    period_id: Uuid,
+    stamp: &boss_core::publisher::EventStamp,
+    actor_id: &str,
+) -> Result<(), LedgerError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| LedgerError::Storage(e.to_string()))?;
     let result = sqlx::query(
         "UPDATE gl_periods SET \
             status = 'open', \
@@ -151,7 +181,7 @@ pub async fn unlock_period(pool: &PgPool, period_id: Uuid) -> Result<(), LedgerE
          WHERE id = $1",
     )
     .bind(period_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| LedgerError::Storage(e.to_string()))?;
 
@@ -160,6 +190,22 @@ pub async fn unlock_period(pool: &PgPool, period_id: Uuid) -> Result<(), LedgerE
             "period {period_id} not found"
         )));
     }
+    // Unlock is the destructive admin path — auditor visibility
+    // matters most here; the event commits with the flip.
+    crate::events::record_ledger_event_in_tx(
+        &mut tx,
+        stamp,
+        "ledger.period.unlocked",
+        serde_json::json!({
+            "period_id": period_id,
+            "actor_id": actor_id,
+            "unlocked_at": stamp.timestamp,
+        }),
+    )
+    .await?;
+    tx.commit()
+        .await
+        .map_err(|e| LedgerError::Storage(e.to_string()))?;
     Ok(())
 }
 

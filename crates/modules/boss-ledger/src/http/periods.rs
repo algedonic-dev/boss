@@ -38,28 +38,12 @@ pub(super) async fn lock_handler(
     let locked_by = body
         .and_then(|b| b.0.locked_by)
         .unwrap_or_else(|| "ledger".to_string());
-    match crate::periods::lock_period(&state.pool, id, &locked_by).await {
+    // Outbox phase 2: the who-locked-what audit event records inside
+    // lock_period's own transaction.
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = super::event_stamp(&state, &user, now).await;
+    match crate::periods::lock_period(&state.pool, id, &locked_by, &stamp, &user.id).await {
         Ok(checksum) => {
-            // Operator-audit-trail emit. gl_periods is system-of-
-            // record (not derived from audit_log) so this event
-            // doesn't drive a rebuild — its purpose is the
-            // who-locked-what trail for auditors. Emitted
-            // post-success so a failed lock doesn't pollute the
-            // log.
-            let now = boss_clock_client::now_from(&state.clock).await;
-            crate::events::emit_after_commit(
-                &state.publisher,
-                "ledger.period.locked",
-                serde_json::json!({
-                    "period_id": id,
-                    "locked_by": locked_by,
-                    "actor_id": user.id,
-                    "checksum": checksum,
-                    "locked_at": now,
-                }),
-                now,
-            )
-            .await;
             Json(serde_json::json!({"status": "locked", "checksum": checksum})).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -74,25 +58,10 @@ pub(super) async fn unlock_handler(
     if let Some(r) = reject_if_auditor(&user) {
         return r;
     }
-    match crate::periods::unlock_period(&state.pool, id).await {
-        Ok(()) => {
-            // Unlock is the destructive admin path — auditor
-            // visibility matters most here. Same rationale as
-            // lock_handler above.
-            let now = boss_clock_client::now_from(&state.clock).await;
-            crate::events::emit_after_commit(
-                &state.publisher,
-                "ledger.period.unlocked",
-                serde_json::json!({
-                    "period_id": id,
-                    "actor_id": user.id,
-                    "unlocked_at": now,
-                }),
-                now,
-            )
-            .await;
-            Json(serde_json::json!({"status": "open"})).into_response()
-        }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = super::event_stamp(&state, &user, now).await;
+    match crate::periods::unlock_period(&state.pool, id, &stamp, &user.id).await {
+        Ok(()) => Json(serde_json::json!({"status": "open"})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -142,6 +111,12 @@ pub(super) async fn create_period_handler(
     };
 
     let id = Uuid::new_v4();
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = super::event_stamp(&state, &user, now).await;
+    let mut tx = match state.pool.begin().await {
+        Ok(t) => t,
+        Err(e) => return storage_err(e),
+    };
     let result = sqlx::query(
         "INSERT INTO gl_periods (id, kind, starts_on, ends_on, status) \
          VALUES ($1, 'year', $2, $3, 'open') \
@@ -150,7 +125,7 @@ pub(super) async fn create_period_handler(
     .bind(id)
     .bind(starts_on)
     .bind(ends_on)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await;
     if let Err(e) = result {
         return storage_err(e);
@@ -160,17 +135,18 @@ pub(super) async fn create_period_handler(
     let row: Result<(Uuid,), _> =
         sqlx::query_as("SELECT id FROM gl_periods WHERE kind = 'year' AND starts_on = $1")
             .bind(starts_on)
-            .fetch_one(&state.pool)
+            .fetch_one(&mut *tx)
             .await;
     match row {
         Ok((existing_id,)) => {
-            // Operator-audit-trail emit. The period row is system
-            // of record; this event is for the audit trail only,
-            // not for rebuilders. Idempotent re-creates emit too
+            // Operator-audit-trail event, recorded in the SAME tx as
+            // the row (outbox phase 2). The period row is system of
+            // record; this event is for the audit trail only, not
+            // for rebuilders. Idempotent re-creates record too
             // (cheap; auditors see the second attempt for free).
-            let now = boss_clock_client::now_from(&state.clock).await;
-            crate::events::emit_after_commit(
-                &state.publisher,
+            if let Err(e) = crate::events::record_ledger_event_in_tx(
+                &mut tx,
+                &stamp,
                 "ledger.period.created",
                 serde_json::json!({
                     "period_id": existing_id,
@@ -180,9 +156,14 @@ pub(super) async fn create_period_handler(
                     "actor_id": user.id,
                     "created_at": now,
                 }),
-                now,
             )
-            .await;
+            .await
+            {
+                return ledger_err(e);
+            }
+            if let Err(e) = tx.commit().await {
+                return storage_err(e);
+            }
             Json(serde_json::json!({
                 "id":        existing_id,
                 "kind":      "year",
@@ -487,17 +468,26 @@ pub(super) async fn close_period_handler(
         return storage_err(e);
     }
 
+    // Outbox phase 2: the close event commits with the closing
+    // entry + the lock, atomically.
+    {
+        let now = boss_clock_client::now_from(&state.clock).await;
+        let stamp = super::event_stamp(&state, &user, now).await;
+        if let Err(e) = crate::events::record_ledger_event_in_tx(
+            &mut tx,
+            &stamp,
+            "ledger.period.closed",
+            payload.clone(),
+        )
+        .await
+        {
+            return ledger_err(e);
+        }
+    }
+
     if let Err(e) = tx.commit().await {
         return storage_err(e);
     }
-
-    crate::events::emit_after_commit(
-        &state.publisher,
-        "ledger.period.closed",
-        payload.clone(),
-        boss_clock_client::now_from(&state.clock).await,
-    )
-    .await;
 
     Json(ClosePeriodResponse {
         status: "locked",

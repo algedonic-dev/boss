@@ -105,6 +105,8 @@ pub(super) async fn create_bill(
         Err(e) => return ledger_err(e),
     }
 
+    // Outbox phase 2: `ledger.bill.approved` records inside this tx.
+    let stamp = super::event_stamp(&state, &user, now).await;
     let mut tx = match state.pool.begin().await {
         Ok(t) => t,
         Err(e) => return storage_err(e),
@@ -157,11 +159,16 @@ pub(super) async fn create_bill(
     {
         return e;
     }
+    if let Err(e) =
+        crate::events::record_ledger_event_in_tx(&mut tx, &stamp, "ledger.bill.approved", payload)
+            .await
+    {
+        return ledger_err(e);
+    }
 
     if let Err(e) = tx.commit().await {
         return storage_err(e);
     }
-    crate::events::emit_after_commit(&state.publisher, "ledger.bill.approved", payload, now).await;
 
     (StatusCode::CREATED, Json(bill)).into_response()
 }
@@ -173,7 +180,7 @@ async fn pay_one_bill(
     state: &LedgerApiState,
     bill: &crate::bills::Bill,
     paid_on: NaiveDate,
-    now: chrono::DateTime<chrono::Utc>,
+    stamp: &boss_core::publisher::EventStamp,
 ) -> Result<crate::bills::Bill, Response> {
     let mut tx = state.pool.begin().await.map_err(storage_err)?;
 
@@ -193,9 +200,11 @@ async fn pay_one_bill(
         "paid_on": paid_on,
     });
     record_and_post_bill_fact(&mut tx, "finance.bill.paid", &paid.id, paid_on, &payload).await?;
+    crate::events::record_ledger_event_in_tx(&mut tx, stamp, "ledger.bill.paid", payload)
+        .await
+        .map_err(ledger_err)?;
 
     tx.commit().await.map_err(storage_err)?;
-    crate::events::emit_after_commit(&state.publisher, "ledger.bill.paid", payload, now).await;
     Ok(paid)
 }
 
@@ -227,7 +236,8 @@ pub(super) async fn pay_bill(
         return Json(existing).into_response(); // idempotent
     }
 
-    match pay_one_bill(&state, &existing, paid_on, now).await {
+    let stamp = super::event_stamp(&state, &user, now).await;
+    match pay_one_bill(&state, &existing, paid_on, &stamp).await {
         Ok(bill) => Json(bill).into_response(),
         Err(e) => e,
     }
@@ -270,10 +280,11 @@ pub(super) async fn batch_pay_bills(
         Err(e) => return ledger_err(e),
     };
 
+    let stamp = super::event_stamp(&state, &user, now).await;
     let mut total: i64 = 0;
     let mut ids = Vec::with_capacity(approved.len());
     for bill in &approved {
-        match pay_one_bill(&state, bill, paid_on, now).await {
+        match pay_one_bill(&state, bill, paid_on, &stamp).await {
             Ok(paid) => {
                 total += paid.amount_cents;
                 ids.push(paid.id);

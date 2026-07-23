@@ -118,6 +118,12 @@ pub(super) async fn create_manual_entry(
         "lines": lines_json,
     });
 
+    let stamp = super::event_stamp(
+        &state,
+        &user,
+        boss_clock_client::now_from(&state.clock).await,
+    )
+    .await;
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
         Err(e) => return storage_err(e),
@@ -161,21 +167,23 @@ pub(super) async fn create_manual_entry(
         Err(e) => return storage_err(e),
     };
 
-    if let Err(e) = tx.commit().await {
-        return storage_err(e);
-    }
-
-    // Occurrence event, gated on THIS call having inserted the fact —
-    // an idempotent replay (same natural id) appends nothing to the
-    // log (queue item: dedup audit-event emits on redelivery).
-    if recorded.inserted {
-        crate::events::emit_after_commit(
-            &state.publisher,
+    // Occurrence event, in the SAME tx (outbox phase 2), gated on
+    // THIS call having inserted the fact — an idempotent replay (same
+    // natural id) records nothing.
+    if recorded.inserted
+        && let Err(e) = crate::events::record_ledger_event_in_tx(
+            &mut tx,
+            &stamp,
             "ledger.manual_entry.submitted",
             payload.clone(),
-            boss_clock_client::now_from(&state.clock).await,
         )
-        .await;
+        .await
+    {
+        return ledger_err(e);
+    }
+
+    if let Err(e) = tx.commit().await {
+        return storage_err(e);
     }
 
     Json(ManualEntryResponse {
@@ -495,36 +503,30 @@ async fn post_inventory_movement(
         Ok((id,)) => id,
         Err(e) => return storage_err(e),
     };
+    // Record the audit event in the SAME tx (outbox phase 2) so the
+    // projection survives a TRUNCATE-then-replay rebuild from
+    // audit_log. Brewery's opening balance JEs route here via the
+    // seed_parts path; this audit event is what lets them survive an
+    // epoch-loop restart. Gated on THIS call having inserted the
+    // fact: an idempotent replay (same source key) records nothing.
+    // `payload` already carries source_table/source_id/happened_on
+    // (folded in above) — recorded verbatim so the event matches the
+    // live fact byte-for-byte (modulo the stamp's envelope keys,
+    // which rebuild_facts::strip_envelope removes on the way back
+    // in). The old post-commit-crash window (fact committed, emit
+    // lost) is closed structurally.
+    if recorded.inserted {
+        let now = boss_clock_client::now_from(&state.clock).await;
+        let stamp = super::event_stamp(&state, &user, now).await;
+        if let Err(e) =
+            crate::events::record_ledger_event_in_tx(&mut tx, &stamp, event_kind, payload.clone())
+                .await
+        {
+            return ledger_err(e);
+        }
+    }
     if let Err(e) = tx.commit().await {
         return storage_err(e);
-    }
-    // Emit an audit_log event so the projection survives a
-    // TRUNCATE-then-replay rebuild from audit_log. Without this,
-    // the financial_fact + journal entry would be re-created on
-    // every live call but disappear on rebuild (no event to
-    // re-project from). Brewery's opening balance JEs route here
-    // via the seed_parts path; this audit event is what lets them
-    // survive an epoch-loop restart.
-    // Gated on THIS call having inserted the fact: the inserting
-    // delivery emits the rebuild source exactly once; an idempotent
-    // replay (same source key) appends nothing (queue item: dedup
-    // audit-event emits on redelivery). The post-commit-crash window
-    // (fact committed, emit lost) is the same accepted exposure as
-    // the consume path — the deep replay-check surfaces it as a
-    // live-fact-without-event divergence.
-    if recorded.inserted
-        && let Some(pub_) = &state.publisher
-    {
-        let actor = user
-            .ambient_actor()
-            .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-        // `payload` already carries source_table/source_id/happened_on
-        // (folded in above) — emit it verbatim so the event matches the
-        // live fact byte-for-byte (modulo the publisher's envelope keys,
-        // which rebuild_facts::strip_envelope removes on the way back in).
-        let now = boss_clock_client::now_from(&state.clock).await;
-        pub_.emit_with_actor_at(event_kind, actor, payload.clone(), now)
-            .await;
     }
     Json(InventoryTransferredResponse {
         fact_id,
@@ -659,13 +661,9 @@ pub(super) async fn supersede_fact_handler(
         }
     };
 
-    if let Err(e) = tx.commit().await {
-        return storage_err(e);
-    }
-
-    // Emit the audit-log event so a full rebuild from audit_log
-    // reproduces the supersede. Replay path
-    // (`replay_supersede_events_in_tx`) keys on the natural-key
+    // Record the audit event in the SAME tx (outbox phase 2) so a
+    // full rebuild from audit_log reproduces the supersede. Replay
+    // path (`replay_supersede_events_in_tx`) keys on the natural-key
     // triple — UUIDs aren't stable across rebuilds.
     let payload = serde_json::json!({
         "fact_id": fact_id,
@@ -675,13 +673,24 @@ pub(super) async fn supersede_fact_handler(
         "reason": body.reason,
         "superseded_by": body.superseded_by,
     });
-    crate::events::emit_after_commit(
-        &state.publisher,
-        "ledger.fact.superseded",
-        payload,
-        boss_clock_client::now_from(&state.clock).await,
-    )
-    .await;
+    {
+        let now = boss_clock_client::now_from(&state.clock).await;
+        let stamp = super::event_stamp(&state, &user, now).await;
+        if let Err(e) = crate::events::record_ledger_event_in_tx(
+            &mut tx,
+            &stamp,
+            "ledger.fact.superseded",
+            payload,
+        )
+        .await
+        {
+            return ledger_err(e);
+        }
+    }
+
+    if let Err(e) = tx.commit().await {
+        return storage_err(e);
+    }
 
     Json(SupersedeResponse {
         fact_id,

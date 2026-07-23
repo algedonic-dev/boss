@@ -149,17 +149,25 @@ pub(super) async fn create_bank_settlement(
         return ledger_err(e);
     }
 
+    // Outbox phase 2: the audit event commits with the fact + JE.
+    {
+        let now = boss_clock_client::now_from(&state.clock).await;
+        let stamp = super::event_stamp(&state, &user, now).await;
+        if let Err(e) = crate::events::record_ledger_event_in_tx(
+            &mut tx,
+            &stamp,
+            "ledger.payment.received",
+            payload.clone(),
+        )
+        .await
+        {
+            return ledger_err(e);
+        }
+    }
+
     if let Err(e) = tx.commit().await {
         return storage_err(e);
     }
-
-    crate::events::emit_after_commit(
-        &state.publisher,
-        "ledger.payment.received",
-        payload.clone(),
-        boss_clock_client::now_from(&state.clock).await,
-    )
-    .await;
 
     Json(BankSettlementView::from(settlement)).into_response()
 }
@@ -305,15 +313,13 @@ pub(super) async fn settle_bank_settlement(
     if let Some(r) = reject_if_auditor(&user) {
         return r;
     }
-    match settle_one(
-        &state.pool,
-        &state.publisher,
-        &id,
-        body.settled_on,
+    let stamp = super::event_stamp(
+        &state,
+        &user,
         boss_clock_client::now_from(&state.clock).await,
     )
-    .await
-    {
+    .await;
+    match settle_one(&state.pool, &stamp, &id, body.settled_on).await {
         Ok(view) => Json(view).into_response(),
         Err(SettleFailure::NotFound) => {
             (StatusCode::NOT_FOUND, "not found".to_string()).into_response()
@@ -356,17 +362,15 @@ pub(super) async fn sweep_bank_settlements(
         Ok(v) => v,
         Err(e) => return ledger_err(e),
     };
+    let stamp = super::event_stamp(
+        &state,
+        &user,
+        boss_clock_client::now_from(&state.clock).await,
+    )
+    .await;
     let mut swept = Vec::with_capacity(due.len());
     for row in due {
-        match settle_one(
-            &state.pool,
-            &state.publisher,
-            &row.id,
-            Some(as_of),
-            boss_clock_client::now_from(&state.clock).await,
-        )
-        .await
-        {
+        match settle_one(&state.pool, &stamp, &row.id, Some(as_of)).await {
             Ok(_) => swept.push(row.id),
             Err(SettleFailure::AlreadyFinal(_)) => {}
             Err(SettleFailure::NotFound) => {}
@@ -390,10 +394,9 @@ enum SettleFailure {
 
 async fn settle_one(
     pool: &PgPool,
-    publisher: &Option<Arc<boss_core::publisher::DomainPublisher>>,
+    stamp: &boss_core::publisher::EventStamp,
     id: &str,
     settled_on: Option<NaiveDate>,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<BankSettlementView, SettleFailure> {
     let existing = crate::bank_settlements::get(pool, id)
         .await
@@ -402,7 +405,7 @@ async fn settle_one(
     if existing.status != "pending" {
         return Err(SettleFailure::AlreadyFinal(existing.status));
     }
-    let on = settled_on.unwrap_or_else(|| now.date_naive());
+    let on = settled_on.unwrap_or_else(|| stamp.timestamp.date_naive());
 
     let settled = crate::bank_settlements::mark_settled(pool, id, on)
         .await
@@ -443,9 +446,11 @@ async fn settle_one(
         .await
         .map_err(SettleFailure::Ledger)?;
 
-    tx.commit().await.map_err(SettleFailure::Storage)?;
+    crate::events::record_ledger_event_in_tx(&mut tx, stamp, "ledger.payment.settled", payload)
+        .await
+        .map_err(SettleFailure::Ledger)?;
 
-    crate::events::emit_after_commit(publisher, "ledger.payment.settled", payload, now).await;
+    tx.commit().await.map_err(SettleFailure::Storage)?;
 
     Ok(BankSettlementView::from(settled))
 }

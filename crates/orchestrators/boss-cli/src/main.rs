@@ -566,7 +566,12 @@ async fn cmd_ledger_lock(postgres_url: &str, starts_on: &str, locked_by: &str) -
             .fetch_optional(&pool)
             .await?
             .ok_or_else(|| anyhow::anyhow!("no period with starts_on={starts_on}"))?;
-    let checksum = boss_ledger::periods::lock_period(&pool, id, locked_by)
+    let stamp = boss_core::publisher::EventStamp::new(
+        "ledger",
+        boss_core::actor::ActorId::Automation("operator-cli".into()),
+        chrono::Utc::now(),
+    );
+    let checksum = boss_ledger::periods::lock_period(&pool, id, locked_by, &stamp, locked_by)
         .await
         .map_err(|e| anyhow::anyhow!("lock_period: {e}"))?;
     println!("locked period {starts_on} — {checksum}");
@@ -588,7 +593,12 @@ async fn cmd_ledger_unlock(postgres_url: &str, starts_on: &str) -> Result<()> {
             .fetch_optional(&pool)
             .await?
             .ok_or_else(|| anyhow::anyhow!("no period with starts_on={starts_on}"))?;
-    boss_ledger::periods::unlock_period(&pool, id)
+    let stamp = boss_core::publisher::EventStamp::new(
+        "ledger",
+        boss_core::actor::ActorId::Automation("operator-cli".into()),
+        chrono::Utc::now(),
+    );
+    boss_ledger::periods::unlock_period(&pool, id, &stamp, "operator-cli")
         .await
         .map_err(|e| anyhow::anyhow!("unlock_period: {e}"))?;
     println!("unlocked period {starts_on}");
