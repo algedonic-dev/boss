@@ -21,6 +21,14 @@ use boss_inventory::types::InventoryItem;
 use boss_testing::TestDb;
 use chrono::Utc;
 
+fn stamp() -> boss_core::publisher::EventStamp {
+    boss_core::publisher::EventStamp::new(
+        "inventory-test",
+        boss_core::actor::ActorId::Automation("test".into()),
+        chrono::Utc::now(),
+    )
+}
+
 fn item(sku: &str, on_hand: u32, unit_cost_cents: i64) -> InventoryItem {
     InventoryItem {
         part_sku: sku.into(),
@@ -57,7 +65,7 @@ async fn receive_is_idempotent_on_source_id() {
     let db = TestDb::new().await;
     let inv = PgInventory::new(db.pool.clone());
     // Seed 1000 units @ 50¢.
-    inv.upsert_item_at(&item("ING-MALT-2ROW-50", 1000, 50), Utc::now())
+    inv.upsert_item_at(&item("ING-MALT-2ROW-50", 1000, 50), Utc::now(), &stamp())
         .await
         .unwrap();
 
@@ -65,7 +73,7 @@ async fn receive_is_idempotent_on_source_id() {
 
     // First delivery: on_hand += 200 → 1200, and a proof-fact lands.
     let first = inv
-        .receive_part_at("ING-MALT-2ROW-50", 200, Some(50), Utc::now(), key)
+        .receive_part_at("ING-MALT-2ROW-50", 200, Some(50), Utc::now(), key, &stamp())
         .await
         .unwrap();
     assert_eq!(first.item.on_hand, 1200);
@@ -91,7 +99,7 @@ async fn receive_is_idempotent_on_source_id() {
     // increment, no second fact row. THIS is the bug fix — without the
     // guard on_hand would climb to 1400 while DR-1300 stayed put.
     let replay = inv
-        .receive_part_at("ING-MALT-2ROW-50", 200, Some(50), Utc::now(), key)
+        .receive_part_at("ING-MALT-2ROW-50", 200, Some(50), Utc::now(), key, &stamp())
         .await
         .unwrap();
     assert_eq!(
@@ -123,6 +131,7 @@ async fn receive_is_idempotent_on_source_id() {
         Some(50),
         Utc::now(),
         "step-8:ING-MALT-2ROW-50",
+        &stamp(),
     )
     .await
     .unwrap();
@@ -145,14 +154,25 @@ async fn received_fact_is_gl_inert() {
     // gl_journal_entries rows.
     let db = TestDb::new().await;
     let inv = PgInventory::new(db.pool.clone());
-    inv.upsert_item_at(&item("ING-HOPS-CASCADE-44", 100, 30000), Utc::now())
-        .await
-        .unwrap();
+    inv.upsert_item_at(
+        &item("ING-HOPS-CASCADE-44", 100, 30000),
+        Utc::now(),
+        &stamp(),
+    )
+    .await
+    .unwrap();
 
     let key = "step-3:ING-HOPS-CASCADE-44";
-    inv.receive_part_at("ING-HOPS-CASCADE-44", 40, Some(30000), Utc::now(), key)
-        .await
-        .unwrap();
+    inv.receive_part_at(
+        "ING-HOPS-CASCADE-44",
+        40,
+        Some(30000),
+        Utc::now(),
+        key,
+        &stamp(),
+    )
+    .await
+    .unwrap();
 
     // The proof-fact exists ...
     assert_eq!(received_fact_count(&db.pool, key).await, 1);

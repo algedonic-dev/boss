@@ -123,9 +123,12 @@ pub(super) async fn consume_part<R: InventoryRepository + 'static>(
         .idempotency_key
         .clone()
         .unwrap_or_else(|| format!("{}@{}", part_sku, uuid::Uuid::new_v4()));
+    // Outbox phase 2: ITEM_CONSUMED + INVENTORY_TRANSFERRED record
+    // inside the repository transaction via the stamp.
+    let stamp = super::event_stamp(&state, &user, now).await;
     let applied = match state
         .inventory
-        .consume_part_at(&part_sku, body.qty, now, &consume_source_id)
+        .consume_part_at(&part_sku, body.qty, now, &consume_source_id, &stamp)
         .await
     {
         Ok(applied) => applied,
@@ -152,7 +155,10 @@ pub(super) async fn consume_part<R: InventoryRepository + 'static>(
         }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let crate::types::ConsumeApplied { item, fact_payload } = applied;
+    let crate::types::ConsumeApplied {
+        item,
+        fact_payload: _,
+    } = applied;
 
     // Check if stock dropped below reorder threshold. The threshold
     // counts (on_hand - allocated + inbound reservations) — Jobs whose
@@ -205,37 +211,6 @@ pub(super) async fn consume_part<R: InventoryRepository + 'static>(
         None
     };
 
-    if let Some(pub_) = &state.publisher {
-        // State event — full post-consume row state. Rebuild treats
-        // this as last-write-wins for the part_sku, so it never has to
-        // do delta arithmetic.
-        let actor = user
-            .ambient_actor()
-            .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-        pub_.emit_with_actor_at(
-            crate::events::ITEM_CONSUMED,
-            actor.clone(),
-            serde_json::to_value(&item).unwrap_or_default(),
-            now,
-        )
-        .await;
-        // Transfer event — the EXACT payload consume_part_at wrote as
-        // the in-tx fact, emitted verbatim. One construction feeds the
-        // live fact and the rebuild source, so byte-parity cannot
-        // drift; and a replayed consume returns no payload, so a
-        // redelivery appends no duplicate event.
-        if let Some(payload) = fact_payload {
-            pub_.emit_with_actor_at(
-                crate::events::INVENTORY_TRANSFERRED,
-                actor.clone(),
-                payload,
-                now,
-            )
-            .await;
-        }
-        let _ = actor;
-    }
-
     (
         StatusCode::OK,
         Json(ConsumeResponse {
@@ -281,25 +256,16 @@ pub(super) async fn batch_upsert_items<R: InventoryRepository + 'static>(
     CurrentUser(user): CurrentUser,
     Json(body): Json<Vec<crate::types::InventoryItem>>,
 ) -> Response {
-    let actor = user
-        .ambient_actor()
-        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
     let mut inserted = 0usize;
     let mut opening_jes = 0usize;
     let batch_now = boss_clock_client::now_from(&state.clock).await;
+    // Outbox phase 2: one stamp for the whole batch; ITEM_UPSERTED and
+    // the opening-JE event record inside each repository transaction.
+    let stamp = super::event_stamp(&state, &user, batch_now).await;
     for item in &body {
         let now = batch_now;
-        if let Err(e) = state.inventory.upsert_item_at(item, now).await {
+        if let Err(e) = state.inventory.upsert_item_at(item, now, &stamp).await {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-        if let Some(pub_) = &state.publisher {
-            pub_.emit_with_actor_at(
-                crate::events::ITEM_UPSERTED,
-                actor.clone(),
-                serde_json::to_value(item).unwrap_or_default(),
-                now,
-            )
-            .await;
         }
         // Atomic opening-balance JE. When a batch upsert lands a row
         // carrying value, post DR 1300 / CR 3000 sized at exactly
@@ -327,28 +293,19 @@ pub(super) async fn batch_upsert_items<R: InventoryRepository + 'static>(
                     "brewery_seed_opening_balance",
                     &source_id,
                     now.date_naive(),
+                    &stamp,
                 )
                 .await
             {
-                Ok(je) => {
+                Ok(_je) => {
+                    // The fact's WRITER owns its rebuild source: the
+                    // adapter records the event in-tx, only when the
+                    // call inserted the fact. (2026-07-09 regression:
+                    // the seed's second, conflicting writer owned this
+                    // emit, and #86's inserted-gating correctly muted
+                    // it — every opening then vanished on rebuild.
+                    // That gate is structural now.)
                     opening_jes += 1;
-                    // The fact's WRITER owns its rebuild source: emit
-                    // the in-tx payload verbatim, only when THIS call
-                    // inserted it. (2026-07-09 regression: the seed's
-                    // second, conflicting writer owned this emit, and
-                    // #86's inserted-gating correctly muted it — every
-                    // opening then vanished on rebuild.)
-                    if je.inserted
-                        && let Some(pub_) = &state.publisher
-                    {
-                        pub_.emit_with_actor_at(
-                            crate::events::LEDGER_INVENTORY_TRANSFERRED,
-                            actor.clone(),
-                            je.payload,
-                            now,
-                        )
-                        .await;
-                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -418,6 +375,10 @@ pub(super) async fn receive_part_handler<R: InventoryRepository + 'static>(
         .idempotency_key
         .clone()
         .unwrap_or_else(|| format!("{}@{}", part_sku, uuid::Uuid::new_v4()));
+    // Outbox phase 2: ITEM_UPSERTED (post-receive row state) +
+    // ITEM_RECEIVED (the exact proof-fact payload) record inside the
+    // repository transaction; a redelivered receive records nothing.
+    let stamp = super::event_stamp(&state, &user, now).await;
     let applied = match state
         .inventory
         .receive_part_at(
@@ -426,6 +387,7 @@ pub(super) async fn receive_part_handler<R: InventoryRepository + 'static>(
             body.unit_cost_cents,
             now,
             &receive_source_id,
+            &stamp,
         )
         .await
     {
@@ -437,40 +399,8 @@ pub(super) async fn receive_part_handler<R: InventoryRepository + 'static>(
     };
     let crate::types::ReceiveApplied {
         item,
-        receipt_payload,
+        receipt_payload: _,
     } = applied;
-
-    if let Some(pub_) = &state.publisher {
-        // State event — full post-receive row state. Rebuild treats this
-        // as last-write-wins for the part_sku, same as ITEM_CONSUMED on
-        // the consume side.
-        let actor = user
-            .ambient_actor()
-            .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-        pub_.emit_with_actor_at(
-            crate::events::ITEM_UPSERTED,
-            actor.clone(),
-            serde_json::to_value(&item).unwrap_or_default(),
-            now,
-        )
-        .await;
-        // Goods-receipt log marker — the EXACT proof-fact payload
-        // `receive_part_at` wrote in-tx, emitted verbatim (one
-        // construction: the ledger-facts rebuilder reconstructs a
-        // byte-identical `finance.inventory.received` from audit_log
-        // alone, mirroring ITEM_CONSUMED → INVENTORY_TRANSFERRED). The
-        // fact is GL-INERT: no gl_fact_projection_rules row + no
-        // RuleSet arm = zero journal lines; DR-1300 rides the
-        // bill-approval path. Gated: an idempotent replay returns no
-        // payload and appends nothing (queue item: dedup audit-event
-        // emits on redelivery). ITEM_UPSERTED above deliberately stays
-        // at-least-once — it is the last-write-wins rebuild source for
-        // the stock row, and a duplicate snapshot is harmless.
-        if let Some(payload) = receipt_payload {
-            pub_.emit_with_actor_at(crate::events::ITEM_RECEIVED, actor, payload, now)
-                .await;
-        }
-    }
 
     (
         StatusCode::OK,
@@ -514,13 +444,13 @@ pub(super) struct OverheadAbsorbedRequest {
 /// basis, so production-consume must debit it for both raw materials
 /// (the raw → WIP transfer) and the overhead drivers booked here.
 ///
-/// Two writes in one tx:
-///   1. `inventory.overhead.absorbed` event published to audit_log via
-///      the NATS publisher — provenance + replay material.
-///   2. `finance.inventory.transferred` financial_fact inserted
+/// Three writes in one repository tx (outbox phase 2):
+///   1. `finance.inventory.transferred` financial_fact inserted
 ///      directly + journal entry posted via the ledger's
 ///      `post_fact_in_tx` (same shape as the raw → WIP transfer fact,
 ///      with a different debit/credit pair).
+///   2. The `inventory.overhead.absorbed` audit event, recorded in
+///      the SAME transaction — provenance + replay material.
 ///
 /// On rebuild from audit_log alone, the `inventory.overhead.absorbed` →
 /// `finance.inventory.transferred` projection rule re-creates the
@@ -570,25 +500,14 @@ pub(super) async fn overhead_absorbed_handler<R: InventoryRepository + 'static>(
         ),
     };
 
-    // Keys MUST match the live fact built in `record_overhead_absorbed`
-    // (postgres.rs) so the rebuilt fact is byte-identical to the live one
-    // (the fact-level replay-check compares payloads). `step_id` is NOT a
-    // payload field: it is already encoded in `source_id`
-    // (`overhead-absorbed@<step_id>:<account>`), which is what the projection
-    // rule and the `drain-actual-wip` basis key on — a payload copy would
-    // only make the event diverge from the fact.
-    let payload = serde_json::json!({
-        "total_cost_cents": body.total_cost_cents,
-        "debit_account": body.debit_account,
-        "credit_account": body.credit_account,
-        "memo": memo,
-        "happened_on": happened_on,
-        "source_id": source_id,
-    });
-
-    // 1. Live posting — financial_fact + journal entry via the
-    //    repository. Same pattern as consume_part_at: the postgres
-    //    adapter handles the tx + boss_ledger::post_fact_in_tx call.
+    // Live posting — financial_fact + journal entry + the audit event
+    // via the repository, all in one tx. The adapter builds the ONE
+    // payload construction (fact and event byte-identical — the
+    // fact-level replay-check compares payloads; `step_id` is NOT a
+    // payload field: it is already encoded in `source_id`) and records
+    // `inventory.overhead.absorbed` gated on the fact being newly
+    // inserted, so an idempotent replay records nothing.
+    let stamp = super::event_stamp(&state, &user, now).await;
     let canonical_fact_id = match state
         .inventory
         .record_overhead_absorbed(
@@ -598,6 +517,7 @@ pub(super) async fn overhead_absorbed_handler<R: InventoryRepository + 'static>(
             &memo,
             &source_id,
             happened_on,
+            &stamp,
         )
         .await
     {
@@ -612,28 +532,7 @@ pub(super) async fn overhead_absorbed_handler<R: InventoryRepository + 'static>(
         }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let (canonical_fact_id, fact_inserted) = canonical_fact_id;
-
-    // 2. Audit-log publish — runs after the GL tx commits so a
-    //    posting failure doesn't leak a phantom event. Replay
-    //    material: the gl_fact_projection_rules row
-    //    `inventory.overhead.absorbed → finance.inventory.transferred`
-    //    reconstructs the fact from this event on rebuild. Gated on
-    //    THIS call having inserted the fact — an idempotent replay
-    //    appends nothing (queue item: dedup audit-event emits on
-    //    redelivery).
-    if fact_inserted && let Some(pub_) = &state.publisher {
-        let actor = user
-            .ambient_actor()
-            .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-        pub_.emit_with_actor_at(
-            crate::events::INVENTORY_OVERHEAD_ABSORBED,
-            actor,
-            payload.clone(),
-            now,
-        )
-        .await;
-    }
+    let (canonical_fact_id, _fact_inserted) = canonical_fact_id;
 
     (
         StatusCode::OK,

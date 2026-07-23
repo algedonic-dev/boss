@@ -10,6 +10,29 @@ use super::types::{
 };
 use crate::port::InventoryError;
 
+/// Begin a tx / record / commit helpers for the outbox-phase-2 write
+/// paths: every CRM mutation records its audit event in the SAME
+/// transaction as the row, so the event and the state commit or abort
+/// together (boss-event-relay moves it to audit_log + NATS).
+async fn begin(pool: &PgPool) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, InventoryError> {
+    pool.begin().await.map_err(store)
+}
+
+async fn record(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    stamp: &boss_core::publisher::EventStamp,
+    kind: &str,
+    payload: serde_json::Value,
+) -> Result<(), InventoryError> {
+    boss_events::outbox::record_event_in_tx(tx, &stamp.event(kind, payload))
+        .await
+        .map_err(InventoryError::Storage)
+}
+
+async fn commit(tx: sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), InventoryError> {
+    tx.commit().await.map_err(store)
+}
+
 pub struct PgProcurement {
     pool: PgPool,
 }
@@ -42,7 +65,9 @@ impl PgProcurement {
     pub async fn upsert_contact(
         &self,
         new: NewVendorContact,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<VendorContact, InventoryError> {
+        let mut tx = begin(&self.pool).await?;
         let specialties = serde_json::to_value(&new.specialties).unwrap_or(serde_json::json!([]));
         let row = sqlx::query(
             "INSERT INTO vendor_contacts \
@@ -74,18 +99,49 @@ impl PgProcurement {
         .bind(new.is_primary)
         .bind(new.relationship_start)
         .bind(new.notes.as_deref())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(store)?;
-        Ok(row_to_contact(&row))
+        let contact = row_to_contact(&row);
+        record(
+            &mut tx,
+            stamp,
+            crate::events::VENDOR_CONTACT_UPSERTED,
+            serde_json::to_value(&contact).unwrap_or_default(),
+        )
+        .await?;
+        commit(tx).await?;
+        Ok(contact)
     }
 
-    pub async fn delete_contact(&self, id: &str) -> Result<(), InventoryError> {
-        sqlx::query("DELETE FROM vendor_contacts WHERE id = $1")
+    pub async fn delete_contact(
+        &self,
+        vendor_id: &str,
+        id: &str,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), InventoryError> {
+        let mut tx = begin(&self.pool).await?;
+        let result = sqlx::query("DELETE FROM vendor_contacts WHERE id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(store)?;
+        // Event only when a row actually went away — a delete of a
+        // missing contact stays a no-op instead of logging a phantom.
+        if result.rows_affected() > 0 {
+            record(
+                &mut tx,
+                stamp,
+                crate::events::VENDOR_CONTACT_DELETED,
+                serde_json::json!({
+                    "id": id,
+                    "vendor_id": vendor_id,
+                    "deleted_at": stamp.timestamp,
+                }),
+            )
+            .await?;
+        }
+        commit(tx).await?;
         Ok(())
     }
 
@@ -115,7 +171,9 @@ impl PgProcurement {
     pub async fn insert_interaction(
         &self,
         new: NewVendorInteraction,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<VendorInteraction, InventoryError> {
+        let mut tx = begin(&self.pool).await?;
         let commitments = serde_json::to_value(&new.commitments).unwrap_or(serde_json::json!([]));
         let row = sqlx::query(
             "INSERT INTO vendor_interactions \
@@ -142,27 +200,54 @@ impl PgProcurement {
         .bind(new.linked_part_sku.as_deref())
         .bind(new.linked_job_id.as_deref())
         .bind(new.occurred_at)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(store)?;
-        Ok(row_to_interaction(&row))
+        let interaction = row_to_interaction(&row);
+        record(
+            &mut tx,
+            stamp,
+            crate::events::VENDOR_INTERACTION_RECORDED,
+            serde_json::to_value(&interaction).unwrap_or_default(),
+        )
+        .await?;
+        commit(tx).await?;
+        Ok(interaction)
     }
 
     pub async fn soft_delete_interaction(
         &self,
         id: &str,
         by_employee_id: &str,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), InventoryError> {
-        sqlx::query(
+        let mut tx = begin(&self.pool).await?;
+        let result = sqlx::query(
             "UPDATE vendor_interactions \
                 SET deleted_at = NOW(), deleted_by = $2 \
               WHERE id = $1 AND deleted_at IS NULL",
         )
         .bind(id)
         .bind(by_employee_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(store)?;
+        // The `deleted_at IS NULL` guard makes a re-delete a 0-row
+        // no-op; gating the event on it keeps the log duplicate-free.
+        if result.rows_affected() > 0 {
+            record(
+                &mut tx,
+                stamp,
+                crate::events::VENDOR_INTERACTION_DELETED,
+                serde_json::json!({
+                    "id": id,
+                    "deleted_by": by_employee_id,
+                    "deleted_at": stamp.timestamp,
+                }),
+            )
+            .await?;
+        }
+        commit(tx).await?;
         Ok(())
     }
 
@@ -188,7 +273,9 @@ impl PgProcurement {
     pub async fn upsert_account_team_member(
         &self,
         new: NewVendorAccountTeamMember,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<VendorAccountTeamMember, InventoryError> {
+        let mut tx = begin(&self.pool).await?;
         let row = sqlx::query(
             "INSERT INTO vendor_account_team \
                 (id, vendor_id, employee_id, role, assigned_on, notes) \
@@ -205,23 +292,62 @@ impl PgProcurement {
         .bind(&new.role)
         .bind(new.assigned_on)
         .bind(new.notes.as_deref())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(store)?;
-        Ok(row_to_team_member(&row))
+        let member = row_to_team_member(&row);
+        record(
+            &mut tx,
+            stamp,
+            crate::events::VENDOR_TEAM_ASSIGNED,
+            serde_json::to_value(&member).unwrap_or_default(),
+        )
+        .await?;
+        commit(tx).await?;
+        Ok(member)
     }
 
     pub async fn remove_account_team_member(
         &self,
         vendor_id: &str,
         role: &str,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), InventoryError> {
-        sqlx::query("DELETE FROM vendor_account_team WHERE vendor_id = $1 AND role = $2")
-            .bind(vendor_id)
-            .bind(role)
-            .execute(&self.pool)
-            .await
-            .map_err(store)?;
+        let mut tx = begin(&self.pool).await?;
+        // Capture the prior assignment IN the tx so the unassigned
+        // event carries the employee_id at the moment of removal
+        // (auditors see who was unassigned without walking history;
+        // previously this was a racy pre-read outside the delete).
+        let prior_employee_id: Option<String> = sqlx::query_scalar(
+            "SELECT employee_id FROM vendor_account_team WHERE vendor_id = $1 AND role = $2",
+        )
+        .bind(vendor_id)
+        .bind(role)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(store)?;
+        let result =
+            sqlx::query("DELETE FROM vendor_account_team WHERE vendor_id = $1 AND role = $2")
+                .bind(vendor_id)
+                .bind(role)
+                .execute(&mut *tx)
+                .await
+                .map_err(store)?;
+        if result.rows_affected() > 0 {
+            record(
+                &mut tx,
+                stamp,
+                crate::events::VENDOR_TEAM_UNASSIGNED,
+                serde_json::json!({
+                    "vendor_id": vendor_id,
+                    "role": role,
+                    "employee_id": prior_employee_id,
+                    "unassigned_at": stamp.timestamp,
+                }),
+            )
+            .await?;
+        }
+        commit(tx).await?;
         Ok(())
     }
 
@@ -252,7 +378,9 @@ impl PgProcurement {
     pub async fn upsert_contract(
         &self,
         new: NewVendorContract,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<VendorContract, InventoryError> {
+        let mut tx = begin(&self.pool).await?;
         let terms = if new.terms.is_null() {
             serde_json::json!({})
         } else {
@@ -293,10 +421,19 @@ impl PgProcurement {
         .bind(new.signed_by_employee_id.as_deref())
         .bind(new.signed_at)
         .bind(new.notes.as_deref())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(store)?;
-        Ok(row_to_contract(&row))
+        let contract = row_to_contract(&row);
+        record(
+            &mut tx,
+            stamp,
+            crate::events::VENDOR_CONTRACT_UPSERTED,
+            serde_json::to_value(&contract).unwrap_or_default(),
+        )
+        .await?;
+        commit(tx).await?;
+        Ok(contract)
     }
 }
 

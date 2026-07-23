@@ -58,7 +58,7 @@ async fn post_vendor_emits_vendor_created_event() {
         .await
         .assert_status(StatusCode::CREATED);
 
-    let event = app.bus.assert_event_emitted("inventory.vendor.created");
+    let event = app.assert_event_recorded("inventory.vendor.created");
     assert!(
         event
             .payload
@@ -96,7 +96,7 @@ async fn post_vendor_with_client_supplied_id_uses_it() {
         .await
         .assert_status(StatusCode::CREATED);
 
-    let event = app.bus.assert_event_emitted("inventory.vendor.created");
+    let event = app.assert_event_recorded("inventory.vendor.created");
     assert_eq!(
         event.payload.get("id").and_then(|v| v.as_str()),
         Some("VND-TEST01"),
@@ -169,7 +169,7 @@ async fn put_existing_vendor_emits_vendor_updated_event() {
         .await
         .assert_status(StatusCode::NO_CONTENT);
 
-    let event = app.bus.assert_event_emitted("inventory.vendor.updated");
+    let event = app.assert_event_recorded("inventory.vendor.updated");
     assert_eq!(
         event.payload.get("id").and_then(|v| v.as_str()),
         Some("VND-UPD-2"),
@@ -198,7 +198,7 @@ async fn put_nonexistent_vendor_does_not_emit_event() {
         .await
         .assert_status(StatusCode::NOT_FOUND);
 
-    app.bus.assert_event_not_emitted("inventory.vendor.updated");
+    app.assert_event_not_recorded("inventory.vendor.updated");
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +227,7 @@ async fn delete_existing_vendor_emits_vendor_deleted_event() {
         .await
         .assert_status(StatusCode::NO_CONTENT);
 
-    let event = app.bus.assert_event_emitted("inventory.vendor.deleted");
+    let event = app.assert_event_recorded("inventory.vendor.deleted");
     assert_eq!(
         event.payload.get("id").and_then(|v| v.as_str()),
         Some("VND-DEL-2"),
@@ -254,7 +254,7 @@ async fn delete_nonexistent_vendor_does_not_emit_event() {
         .await
         .assert_status(StatusCode::NOT_FOUND);
 
-    app.bus.assert_event_not_emitted("inventory.vendor.deleted");
+    app.assert_event_not_recorded("inventory.vendor.deleted");
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +274,7 @@ async fn consume_part_emits_item_consumed_event() {
     // The post-consume row state lands on `inventory.item.consumed`
     // — the legacy `inventory.part.consumed` marker was retired
     // since rebuild already uses the full-row state event.
-    let event = app.bus.assert_event_emitted("inventory.item.consumed");
+    let event = app.assert_event_recorded("inventory.item.consumed");
     assert_eq!(
         event.payload.get("part_sku").and_then(|v| v.as_str()),
         Some("PART-001"),
@@ -305,9 +305,7 @@ async fn create_order_returns_201_and_emits_po_upserted_event() {
     // Full PO row lands on `inventory.purchase_order.upserted` (the
     // `PO_UPSERTED` event kind); the legacy `inventory.po.created`
     // marker was retired.
-    let event = app
-        .bus
-        .assert_event_emitted("inventory.purchase_order.upserted");
+    let event = app.assert_event_recorded("inventory.purchase_order.upserted");
     assert!(
         event
             .payload
@@ -401,7 +399,7 @@ async fn update_order_status_emits_po_status_changed_event() {
         .await;
 
     resp.assert_status(StatusCode::OK);
-    let event = app.bus.assert_event_emitted("inventory.po.status_changed");
+    let event = app.assert_event_recorded("inventory.po.status_changed");
     assert_eq!(
         event.payload.get("id").and_then(|v| v.as_str()),
         Some("PO-UPD-1"),

@@ -26,6 +26,14 @@ use boss_inventory::types::InventoryItem;
 use boss_testing::TestDb;
 use chrono::Utc;
 
+fn stamp() -> boss_core::publisher::EventStamp {
+    boss_core::publisher::EventStamp::new(
+        "inventory-test",
+        boss_core::actor::ActorId::Automation("test".into()),
+        chrono::Utc::now(),
+    )
+}
+
 fn item(sku: &str, on_hand: u32, value_cents: i64) -> InventoryItem {
     InventoryItem {
         part_sku: sku.into(),
@@ -68,13 +76,13 @@ async fn mixed_price_receives_then_full_drain_conserves_value_exactly() {
     // Opening: 10,000 units worth exactly $3,333.33 — a value that no
     // integer per-unit cost can represent (33.3333¢/unit), the shape
     // that leaked under the old weighted-average scheme.
-    inv.upsert_item_at(&item(sku, 10_000, 333_333), Utc::now())
+    inv.upsert_item_at(&item(sku, 10_000, 333_333), Utc::now(), &stamp())
         .await
         .unwrap();
 
     // Receive 7,919 more (prime, guarantees ugly division) at 41¢ —
     // the exact line total lands on the row, nothing is re-averaged.
-    inv.receive_part_at(sku, 7_919, Some(41), Utc::now(), "recv:t1")
+    inv.receive_part_at(sku, 7_919, Some(41), Utc::now(), "recv:t1", &stamp())
         .await
         .unwrap();
     let after_recv = inv.item_by_sku(sku).await.unwrap().unwrap();
@@ -88,7 +96,7 @@ async fn mixed_price_receives_then_full_drain_conserves_value_exactly() {
     let mut drained = 0_i64;
     for (i, qty) in [5_000_u32, 9_999, 2_920].into_iter().enumerate() {
         let before = inv.item_by_sku(sku).await.unwrap().unwrap();
-        inv.consume_part_at(sku, qty, Utc::now(), &format!("cons:t{i}"))
+        inv.consume_part_at(sku, qty, Utc::now(), &format!("cons:t{i}"), &stamp())
             .await
             .unwrap();
         let after = inv.item_by_sku(sku).await.unwrap().unwrap();
@@ -121,10 +129,10 @@ async fn derived_avg_cost_is_value_over_on_hand() {
     let inv = PgInventory::new(db.pool.clone());
     let sku = "ING-HOPS-CASCADE-44";
 
-    inv.upsert_item_at(&item(sku, 0, 0), Utc::now())
+    inv.upsert_item_at(&item(sku, 0, 0), Utc::now(), &stamp())
         .await
         .unwrap();
-    inv.receive_part_at(sku, 3, Some(1_000), Utc::now(), "recv:a")
+    inv.receive_part_at(sku, 3, Some(1_000), Utc::now(), "recv:a", &stamp())
         .await
         .unwrap();
     let row = inv.item_by_sku(sku).await.unwrap().unwrap();

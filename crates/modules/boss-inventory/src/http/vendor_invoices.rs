@@ -95,53 +95,16 @@ pub(super) async fn upsert_vendor_invoice<R: InventoryRepository + 'static>(
         return resp;
     }
     let now = boss_clock_client::now_from(&state.clock).await;
+    // Outbox phase 2: the full-row UPSERTED event + the approved/paid
+    // transition events record inside the repository transaction
+    // (transitions gated on their fact actually inserting).
+    let stamp = super::event_stamp(&state, &user, now).await;
     match state
         .inventory
-        .upsert_vendor_invoice_at(&invoice, now)
+        .upsert_vendor_invoice_at(&invoice, now, &stamp)
         .await
     {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                let actor = user
-                    .ambient_actor()
-                    .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                pub_.emit_with_actor_at(
-                    crate::events::VENDOR_INVOICE_UPSERTED,
-                    actor.clone(),
-                    serde_json::to_value(&invoice).unwrap_or_default(),
-                    now,
-                )
-                .await;
-
-                // Transition events drive the bill.* fact projections.
-                // Emitted whenever approved_on/paid_on is present;
-                // financial_facts natural-key idempotency absorbs the
-                // duplicate-on-re-upsert case so the fact log stays
-                // 1:1 with the underlying state transition.
-                if let Some(approved_on) = invoice.approved_on {
-                    // Same shared helper as the in-tx fact write
-                    // (types::bill_approved_payload) so the event and the
-                    // live fact are byte-identical on rebuild.
-                    pub_.emit_with_actor_at(
-                        crate::events::VENDOR_INVOICE_APPROVED,
-                        actor.clone(),
-                        crate::types::bill_approved_payload(&invoice, approved_on),
-                        now,
-                    )
-                    .await;
-                }
-                if let Some(paid_on) = invoice.paid_on {
-                    pub_.emit_with_actor_at(
-                        crate::events::VENDOR_INVOICE_PAID,
-                        actor.clone(),
-                        crate::types::bill_paid_payload(&invoice, paid_on),
-                        now,
-                    )
-                    .await;
-                }
-            }
-            (StatusCode::CREATED, Json(invoice)).into_response()
-        }
+        Ok(()) => (StatusCode::CREATED, Json(invoice)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -245,28 +208,16 @@ pub(super) async fn create_vendor_invoice_from_po<R: InventoryRepository + 'stat
         lines,
     };
 
+    // Received state → the repository records only the full-row
+    // UPSERTED event in-tx (no approved/paid transition yet; that's
+    // the human step).
+    let stamp = super::event_stamp(&state, &user, now).await;
     match state
         .inventory
-        .upsert_vendor_invoice_at(&invoice, now)
+        .upsert_vendor_invoice_at(&invoice, now, &stamp)
         .await
     {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                // Received state → only the full-row UPSERTED event (no
-                // approved/paid transition yet; that's the human step).
-                let actor = user
-                    .ambient_actor()
-                    .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                pub_.emit_with_actor_at(
-                    crate::events::VENDOR_INVOICE_UPSERTED,
-                    actor,
-                    serde_json::to_value(&invoice).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            }
-            (StatusCode::CREATED, Json(invoice)).into_response()
-        }
+        Ok(()) => (StatusCode::CREATED, Json(invoice)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -305,9 +256,12 @@ pub(super) async fn batch_pay_vendor_invoices<R: InventoryRepository + 'static>(
     };
 
     let now = boss_clock_client::now_from(&state.clock).await;
-    let actor = user
-        .ambient_actor()
-        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+    // Outbox phase 2: each iteration's UPSERTED (full row at its new
+    // state — what the rebuild path reads to re-derive vendor_invoices)
+    // + PAID transition (drives the finance.bill.paid ledger
+    // projection; payload identical to the old inline shape via
+    // `bill_paid_payload`) record inside that upsert's transaction.
+    let stamp = super::event_stamp(&state, &user, now).await;
     let mut paid_ids = Vec::with_capacity(approved.len());
     let mut total: i64 = 0;
     for mut invoice in approved {
@@ -315,40 +269,10 @@ pub(super) async fn batch_pay_vendor_invoices<R: InventoryRepository + 'static>(
         invoice.paid_on = Some(req.paid_on);
         if let Err(e) = state
             .inventory
-            .upsert_vendor_invoice_at(&invoice, now)
+            .upsert_vendor_invoice_at(&invoice, now, &stamp)
             .await
         {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-        if let Some(pub_) = &state.publisher {
-            // VENDOR_INVOICE_UPSERTED carries the full row at its new
-            // state — this is what the rebuild path reads to re-derive
-            // vendor_invoices from audit_log. Without it a rebuild after
-            // a batch-pay sweep re-creates the row at status='approved'
-            // (its last UPSERTED state) and the projection drifts from
-            // reality. The PAID event below is the transition signal that
-            // drives the finance.bill.paid ledger projection.
-            pub_.emit_with_actor_at(
-                crate::events::VENDOR_INVOICE_UPSERTED,
-                actor.clone(),
-                serde_json::to_value(&invoice).unwrap_or_default(),
-                now,
-            )
-            .await;
-            pub_.emit_with_actor_at(
-                crate::events::VENDOR_INVOICE_PAID,
-                actor.clone(),
-                serde_json::json!({
-                    "vendor_invoice_id": invoice.id,
-                    "po_id": invoice.po_id,
-                    "vendor": invoice.vendor,
-                    "amount_cents": invoice.amount_cents,
-                    "currency": invoice.currency,
-                    "paid_on": req.paid_on,
-                }),
-                now,
-            )
-            .await;
         }
         total += invoice.amount_cents;
         paid_ids.push(invoice.id);

@@ -21,14 +21,10 @@ use std::sync::Arc;
 
 use axum::Router;
 use boss_core::publisher::DomainPublisher;
-#[cfg(feature = "postgres")]
-use boss_events::PgAuditWriter;
 use boss_inventory::http::{InventoryApiState, router};
 use boss_inventory::in_memory::InMemoryInventory;
 use boss_inventory::types::*;
 use boss_testing::RecordingEventBus;
-#[cfg(feature = "postgres")]
-use sqlx::PgPool;
 
 /// A fully wired inventory service for tests:
 /// - InMemoryInventory repository
@@ -38,6 +34,47 @@ pub struct InventoryTestApp {
     pub router: Router,
     #[allow(dead_code)]
     pub bus: Arc<RecordingEventBus>,
+    /// The in-memory repository — write paths RECORD their events
+    /// here (outbox phase 2), so HTTP-tier tests assert against
+    /// `recorded_events()` instead of the bus (handlers no longer
+    /// publish post-commit).
+    pub inventory: Arc<InMemoryInventory>,
+}
+
+impl InventoryTestApp {
+    /// Assert a write path recorded an event of `kind`; returns it.
+    #[allow(dead_code)]
+    pub fn assert_event_recorded(&self, kind: &str) -> boss_core::event::Event {
+        let events = self.inventory.recorded_events();
+        match events.iter().find(|e| e.kind == kind) {
+            Some(e) => e.clone(),
+            None => {
+                let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+                panic!(
+                    "\n  expected recorded event kind: {}\n  events actually recorded: {:?}\n  total events: {}\n",
+                    kind,
+                    kinds,
+                    events.len(),
+                );
+            }
+        }
+    }
+
+    /// Assert no event of `kind` was recorded by any write path.
+    #[allow(dead_code)]
+    pub fn assert_event_not_recorded(&self, kind: &str) {
+        if let Some(e) = self
+            .inventory
+            .recorded_events()
+            .into_iter()
+            .find(|e| e.kind == kind)
+        {
+            panic!(
+                "\n  expected event kind {} NOT to be recorded\n  but it was recorded with payload: {}\n",
+                kind, e.payload,
+            );
+        }
+    }
 }
 
 impl InventoryTestApp {
@@ -64,39 +101,18 @@ impl InventoryTestApp {
         let bus = RecordingEventBus::new();
         let publisher = DomainPublisher::new(bus.clone(), "inventory");
         let state = InventoryApiState {
-            inventory,
+            inventory: inventory.clone(),
             publisher: Some(publisher),
             clients: None,
             classes_client: None,
             clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
         };
         let router = router(state);
-        Self { router, bus }
-    }
-
-    /// Build a test app whose publisher persists every emitted event
-    /// to the given Postgres pool's `audit_log` table. Used by the
-    /// audit_log E2E integration test.
-    #[allow(dead_code)]
-    #[cfg(feature = "postgres")]
-    pub fn with_audit_pool(pool: PgPool) -> Self {
-        let inventory = Arc::new(InMemoryInventory::with_vendors(
-            vec![default_item("PART-001")],
-            vec![],
-            vec![],
-        ));
-        let bus = RecordingEventBus::new();
-        let publisher = DomainPublisher::new(bus.clone(), "inventory")
-            .with_audit(Arc::new(PgAuditWriter::new(pool)));
-        let state = InventoryApiState {
+        Self {
+            router,
+            bus,
             inventory,
-            publisher: Some(publisher),
-            clients: None,
-            classes_client: None,
-            clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        };
-        let router = router(state);
-        Self { router, bus }
+        }
     }
 }
 

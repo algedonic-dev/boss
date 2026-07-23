@@ -13,6 +13,14 @@ use boss_inventory::types::InventoryItem;
 use boss_testing::TestDb;
 use chrono::Utc;
 
+fn stamp() -> boss_core::publisher::EventStamp {
+    boss_core::publisher::EventStamp::new(
+        "inventory-test",
+        boss_core::actor::ActorId::Automation("test".into()),
+        chrono::Utc::now(),
+    )
+}
+
 async fn insert_vendor(db: &TestDb, id: &str, category: &str) {
     sqlx::query(
         "INSERT INTO vendors \
@@ -52,9 +60,13 @@ async fn category_fallback_resolves_a_matching_vendor() {
     insert_vendor(&db, "vnd-h1", "hops-supplier").await;
     insert_vendor(&db, "vnd-h0", "hops-supplier").await;
     insert_vendor(&db, "vnd-g0", "grain-supplier").await;
-    inv.upsert_item_at(&item("ING-HOPS-X", Some("hops-supplier")), Utc::now())
-        .await
-        .unwrap();
+    inv.upsert_item_at(
+        &item("ING-HOPS-X", Some("hops-supplier")),
+        Utc::now(),
+        &stamp(),
+    )
+    .await
+    .unwrap();
 
     // No PO history → category match → the lowest-id hops vendor, not the
     // grain vendor.
@@ -67,7 +79,7 @@ async fn category_with_no_vendor_resolves_to_none() {
     let db = TestDb::new().await;
     let inv = PgInventory::new(db.pool.clone());
     insert_vendor(&db, "vnd-h0", "hops-supplier").await;
-    inv.upsert_item_at(&item("PKG-X", Some("packaging")), Utc::now())
+    inv.upsert_item_at(&item("PKG-X", Some("packaging")), Utc::now(), &stamp())
         .await
         .unwrap();
 
@@ -82,7 +94,7 @@ async fn part_without_a_category_resolves_to_none() {
     let db = TestDb::new().await;
     let inv = PgInventory::new(db.pool.clone());
     insert_vendor(&db, "vnd-h0", "hops-supplier").await;
-    inv.upsert_item_at(&item("ING-X", None), Utc::now())
+    inv.upsert_item_at(&item("ING-X", None), Utc::now(), &stamp())
         .await
         .unwrap();
 

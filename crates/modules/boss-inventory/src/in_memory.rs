@@ -15,6 +15,14 @@ pub struct InMemoryInventory {
     purchase_orders: RwLock<Vec<PurchaseOrder>>,
     vendors: RwLock<Vec<Vendor>>,
     vendor_invoices: RwLock<Vec<VendorInvoice>>,
+    /// Events the write paths recorded (outbox phase 2). The Pg
+    /// adapter records on the transactional outbox; this collects the
+    /// state-event kinds in memory so HTTP-tier tests can assert the
+    /// handler → repository → event chain without Postgres. Fact-gated
+    /// kinds (the consume transfer, receipt marker, JE/overhead
+    /// events, bill transitions) are Pg-only — there are no
+    /// financial_facts here to gate on.
+    recorded: std::sync::Mutex<Vec<boss_core::event::Event>>,
 }
 
 impl InMemoryInventory {
@@ -24,6 +32,7 @@ impl InMemoryInventory {
             purchase_orders: RwLock::new(purchase_orders),
             vendors: RwLock::new(Vec::new()),
             vendor_invoices: RwLock::new(Vec::new()),
+            recorded: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -37,6 +46,23 @@ impl InMemoryInventory {
             purchase_orders: RwLock::new(purchase_orders),
             vendors: RwLock::new(vendors),
             vendor_invoices: RwLock::new(Vec::new()),
+            recorded: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Events recorded by the write paths, in call order.
+    pub fn recorded_events(&self) -> Vec<boss_core::event::Event> {
+        self.recorded.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    fn record(
+        &self,
+        stamp: &boss_core::publisher::EventStamp,
+        kind: &str,
+        payload: serde_json::Value,
+    ) {
+        if let Ok(mut v) = self.recorded.lock() {
+            v.push(stamp.event(kind, payload));
         }
     }
 }
@@ -53,11 +79,18 @@ impl InventoryRepository for InMemoryInventory {
 
     async fn upsert_item_at(
         &self,
-        _item: &InventoryItem,
+        item: &InventoryItem,
         _now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), InventoryError> {
-        // In-memory tests seed items via the constructor; upsert is a
-        // no-op here because `self.items` is not locked.
+        // In-memory tests seed items via the constructor; the row
+        // upsert is a no-op here because `self.items` is not locked —
+        // but the state event still records, like the Pg adapter.
+        self.record(
+            stamp,
+            crate::events::ITEM_UPSERTED,
+            serde_json::to_value(item).unwrap_or_default(),
+        );
         Ok(())
     }
 
@@ -86,13 +119,19 @@ impl InventoryRepository for InMemoryInventory {
         _qty: u32,
         _now: chrono::DateTime<chrono::Utc>,
         _source_id: &str,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<ConsumeApplied, InventoryError> {
         // In-memory: no mutation support, just return the item (no
-        // fact written → no payload to emit).
+        // fact written → no transfer event). The state event records.
         let item = self
             .item_by_sku(part_sku)
             .await?
             .ok_or_else(|| InventoryError::NotFound(part_sku.to_string()))?;
+        self.record(
+            stamp,
+            crate::events::ITEM_CONSUMED,
+            serde_json::to_value(&item).unwrap_or_default(),
+        );
         Ok(ConsumeApplied {
             item,
             fact_payload: None,
@@ -122,6 +161,7 @@ impl InventoryRepository for InMemoryInventory {
         _source_table: &str,
         _source_id: &str,
         _happened_on: chrono::NaiveDate,
+        _stamp: &boss_core::publisher::EventStamp,
     ) -> Result<JeRecorded, InventoryError> {
         Ok(JeRecorded {
             fact_id: uuid::Uuid::new_v4(),
@@ -138,6 +178,7 @@ impl InventoryRepository for InMemoryInventory {
         _memo: &str,
         _source_id: &str,
         _happened_on: chrono::NaiveDate,
+        _stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(uuid::Uuid, bool), InventoryError> {
         // No ledger / financial_facts in the in-memory adapter — tests
         // that exercise burden absorption use the postgres adapter.
@@ -152,13 +193,19 @@ impl InventoryRepository for InMemoryInventory {
         _unit_cost_cents: Option<i64>,
         _now: chrono::DateTime<chrono::Utc>,
         _source_id: &str,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<ReceiveApplied, InventoryError> {
         // In-memory: no mutation support, just return the item (no
-        // fact written → no payload → caller emits nothing).
+        // fact written → no receipt marker). The state event records.
         let item = self
             .item_by_sku(part_sku)
             .await?
             .ok_or_else(|| InventoryError::NotFound(part_sku.to_string()))?;
+        self.record(
+            stamp,
+            crate::events::ITEM_UPSERTED,
+            serde_json::to_value(&item).unwrap_or_default(),
+        );
         Ok(ReceiveApplied {
             item,
             receipt_payload: None,
@@ -169,6 +216,7 @@ impl InventoryRepository for InMemoryInventory {
         &self,
         po: &PurchaseOrder,
         _now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), InventoryError> {
         let mut pos = self
             .purchase_orders
@@ -178,10 +226,25 @@ impl InventoryRepository for InMemoryInventory {
             return Ok(());
         }
         pos.push(po.clone());
+        self.record(
+            stamp,
+            crate::events::PO_UPSERTED,
+            serde_json::to_value(po).unwrap_or_default(),
+        );
         Ok(())
     }
 
-    async fn update_po_status(&self, _id: &str, _status: &str) -> Result<(), InventoryError> {
+    async fn update_po_status(
+        &self,
+        id: &str,
+        status: &str,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), InventoryError> {
+        self.record(
+            stamp,
+            crate::events::PO_STATUS_CHANGED,
+            serde_json::json!({ "id": id, "new_status": status }),
+        );
         Ok(())
     }
 
@@ -197,6 +260,7 @@ impl InventoryRepository for InMemoryInventory {
         &self,
         vendor: &Vendor,
         _now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<String, InventoryError> {
         let mut vendors = self
             .vendors
@@ -209,10 +273,20 @@ impl InventoryRepository for InMemoryInventory {
             )));
         }
         vendors.push(vendor.clone());
+        self.record(
+            stamp,
+            crate::events::VENDOR_CREATED,
+            serde_json::to_value(vendor).unwrap_or_default(),
+        );
         Ok(vendor.id.clone())
     }
 
-    async fn update_vendor(&self, id: &str, vendor: &Vendor) -> Result<(), InventoryError> {
+    async fn update_vendor(
+        &self,
+        id: &str,
+        vendor: &Vendor,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), InventoryError> {
         let mut vendors = self
             .vendors
             .write()
@@ -222,10 +296,19 @@ impl InventoryRepository for InMemoryInventory {
             .find(|v| v.id == id)
             .ok_or_else(|| InventoryError::NotFound(format!("vendor {id}")))?;
         *existing = vendor.clone();
+        self.record(
+            stamp,
+            crate::events::VENDOR_UPDATED,
+            serde_json::to_value(vendor).unwrap_or_default(),
+        );
         Ok(())
     }
 
-    async fn delete_vendor(&self, id: &str) -> Result<(), InventoryError> {
+    async fn delete_vendor(
+        &self,
+        id: &str,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), InventoryError> {
         let mut vendors = self
             .vendors
             .write()
@@ -235,6 +318,11 @@ impl InventoryRepository for InMemoryInventory {
         if vendors.len() == len_before {
             return Err(InventoryError::NotFound(format!("vendor {id}")));
         }
+        self.record(
+            stamp,
+            crate::events::VENDOR_DELETED,
+            serde_json::json!({ "id": id, "deleted_at": stamp.timestamp }),
+        );
         Ok(())
     }
 
@@ -242,6 +330,7 @@ impl InventoryRepository for InMemoryInventory {
         &self,
         invoice: &VendorInvoice,
         _now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), InventoryError> {
         let mut rows = self
             .vendor_invoices
@@ -252,6 +341,11 @@ impl InventoryRepository for InMemoryInventory {
         } else {
             rows.push(invoice.clone());
         }
+        self.record(
+            stamp,
+            crate::events::VENDOR_INVOICE_UPSERTED,
+            serde_json::to_value(invoice).unwrap_or_default(),
+        );
         Ok(())
     }
 
