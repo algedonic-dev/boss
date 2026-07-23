@@ -98,27 +98,19 @@ pub(super) async fn create_order<R: InventoryRepository + 'static>(
     if let Err(reason) = po.validate_placement() {
         return (StatusCode::BAD_REQUEST, reason).into_response();
     }
-    match state.inventory.create_purchase_order_at(&po, now).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                // State event — full PO row state (incl. lines).
-                let actor = user
-                    .ambient_actor()
-                    .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                pub_.emit_with_actor_at(
-                    crate::events::PO_UPSERTED,
-                    actor,
-                    serde_json::to_value(&po).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            }
-            (
-                StatusCode::CREATED,
-                Json(serde_json::json!({"ok": true, "id": po_id})),
-            )
-                .into_response()
-        }
+    // Outbox phase 2: PO_UPSERTED records inside the repository
+    // transaction (header + lines + identity + event, atomically).
+    let stamp = super::event_stamp(&state, &user, now).await;
+    match state
+        .inventory
+        .create_purchase_order_at(&po, now, &stamp)
+        .await
+    {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"ok": true, "id": po_id})),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -128,11 +120,11 @@ pub(super) async fn batch_create_orders<R: InventoryRepository + 'static>(
     CurrentUser(user): CurrentUser,
     Json(body): Json<Vec<PurchaseOrder>>,
 ) -> Response {
-    let actor = user
-        .ambient_actor()
-        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
     let mut inserted = 0usize;
     let batch_now = boss_clock_client::now_from(&state.clock).await;
+    // Outbox phase 2: one stamp for the batch; PO_UPSERTED records
+    // inside each repository transaction.
+    let stamp = super::event_stamp(&state, &user, batch_now).await;
     for po in &body {
         let now = batch_now;
         // Required-at-place: a placed PO (status past Draft — the
@@ -141,17 +133,12 @@ pub(super) async fn batch_create_orders<R: InventoryRepository + 'static>(
         if let Err(reason) = po.validate_placement() {
             return (StatusCode::BAD_REQUEST, reason).into_response();
         }
-        if let Err(e) = state.inventory.create_purchase_order_at(po, now).await {
+        if let Err(e) = state
+            .inventory
+            .create_purchase_order_at(po, now, &stamp)
+            .await
+        {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-        if let Some(pub_) = &state.publisher {
-            pub_.emit_with_actor_at(
-                crate::events::PO_UPSERTED,
-                actor.clone(),
-                serde_json::to_value(po).unwrap_or_default(),
-                now,
-            )
-            .await;
         }
         inserted += 1;
     }
@@ -173,35 +160,17 @@ pub(super) async fn update_order_status<R: InventoryRepository + 'static>(
     CurrentUser(user): CurrentUser,
     Json(body): Json<UpdateStatusRequest>,
 ) -> Response {
-    match state.inventory.update_po_status(&id, &body.status).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                let now = boss_clock_client::now_from(&state.clock).await;
-                let actor = user
-                    .ambient_actor()
-                    .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                // Read back the full PO so the state event carries
-                // post-update row state for the rebuild.
-                if let Ok(Some(po)) = state.inventory.purchase_order_by_id(&id).await {
-                    pub_.emit_with_actor_at(
-                        crate::events::PO_UPSERTED,
-                        actor.clone(),
-                        serde_json::to_value(&po).unwrap_or_default(),
-                        now,
-                    )
-                    .await;
-                }
-                // Marker event for downstream consumers.
-                pub_.emit_with_actor_at(
-                    crate::events::PO_STATUS_CHANGED,
-                    actor,
-                    serde_json::json!({ "id": id, "new_status": body.status }),
-                    now,
-                )
-                .await;
-            }
-            Json(serde_json::json!({"ok": true})).into_response()
-        }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    // Outbox phase 2: PO_UPSERTED (post-update row state, read back
+    // in-tx) + the PO_STATUS_CHANGED marker record inside the
+    // repository transaction.
+    let stamp = super::event_stamp(&state, &user, now).await;
+    match state
+        .inventory
+        .update_po_status(&id, &body.status, &stamp)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
         Err(InventoryError::NotFound(id)) => {
             (StatusCode::NOT_FOUND, format!("PO not found: {id}")).into_response()
         }

@@ -1,6 +1,8 @@
-//! End-to-end: drive inventory writes through the API (PgInventory
-//! plus PgAuditWriter), snapshot the four projection tables, drop
-//! them, rebuild from `audit_log`, assert exact match.
+//! End-to-end: drive inventory writes through the API on the REAL
+//! pipeline (PgInventory records each event on the transactional
+//! outbox in the write's tx; the relay drain moves it to audit_log),
+//! snapshot the four projection tables, drop them, rebuild from
+//! `audit_log`, assert exact match.
 
 #![cfg(feature = "postgres")]
 
@@ -8,8 +10,8 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::http::StatusCode;
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
+use boss_core::port::EventBus;
+use boss_events::outbox::drain_outbox_once;
 use boss_inventory::PgInventory;
 use boss_inventory::http::{InventoryApiState, router};
 use boss_inventory::rebuild_inventory;
@@ -104,17 +106,28 @@ async fn snapshot_items(pool: &PgPool) -> Vec<ItemRow> {
 
 fn build_app(pool: PgPool) -> Router {
     let inventory = Arc::new(PgInventory::new(pool.clone()));
-    let bus = RecordingEventBus::new();
-    let publisher = DomainPublisher::new(bus.clone(), "inventory")
-        .with_audit(Arc::new(PgAuditWriter::new(pool)));
+    // No publisher: stamps fall back to source="inventory" and the
+    // adapters record on the outbox — deliberately NO direct audit
+    // writer, so these tests only pass through the real
+    // outbox → relay → audit_log path.
     let state = InventoryApiState {
         inventory,
-        publisher: Some(publisher),
+        publisher: None,
         clients: None,
         classes_client: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
     };
     router(state)
+}
+
+/// Drain the outbox through the relay pipeline: outbox → audit_log
+/// (chained) → bus → delivered. Rebuild reads audit_log.
+async fn drain(pool: &PgPool) -> u64 {
+    let bus = RecordingEventBus::new();
+    drain_outbox_once(pool, &(bus as Arc<dyn EventBus>), 1000)
+        .await
+        .expect("relay drain")
+        .delivered
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -243,7 +256,8 @@ async fn rebuild_reproduces_all_four_inventory_projections() {
         .unwrap();
     assert_eq!(cascade.on_hand, 88, "post-consume on_hand");
 
-    // 9. Sanity-check audit_log has the events.
+    // 9. Relay the outbox to audit_log, then sanity-check the events.
+    drain(&db.pool).await;
     let event_count: (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM audit_log WHERE kind LIKE 'inventory.%'")
             .fetch_one(&db.pool)
@@ -329,6 +343,9 @@ async fn rebuild_handles_vendor_delete() {
         .await
         .unwrap();
     assert_eq!(count.0, 0);
+
+    // Relay the create + delete events to audit_log for the rebuild.
+    assert_eq!(drain(&db.pool).await, 2, "create + delete via the outbox");
 
     let report = rebuild_inventory(&db.pool).await.unwrap();
     // Create + delete events both processed; final state has zero
