@@ -13,6 +13,14 @@ use boss_inventory::types::InventoryItem;
 use boss_testing::TestDb;
 use chrono::Utc;
 
+fn stamp() -> boss_core::publisher::EventStamp {
+    boss_core::publisher::EventStamp::new(
+        "inventory-test",
+        boss_core::actor::ActorId::Automation("test".into()),
+        chrono::Utc::now(),
+    )
+}
+
 fn item(sku: &str, on_hand: u32, unit_cost_cents: i64) -> InventoryItem {
     InventoryItem {
         part_sku: sku.into(),
@@ -35,12 +43,12 @@ async fn consume_is_idempotent_on_source_id() {
     let inv = PgInventory::new(db.pool.clone());
     // Seed 1000 units @ 50¢ so the consume writes a transfer fact (the
     // proof-of-application the guard keys on).
-    inv.upsert_item_at(&item("ING-MALT-2ROW-50", 1000, 50), Utc::now())
+    inv.upsert_item_at(&item("ING-MALT-2ROW-50", 1000, 50), Utc::now(), &stamp())
         .await
         .unwrap();
 
     let key = "step-7:ING-MALT-2ROW-50";
-    inv.consume_part_at("ING-MALT-2ROW-50", 200, Utc::now(), key)
+    inv.consume_part_at("ING-MALT-2ROW-50", 200, Utc::now(), key, &stamp())
         .await
         .unwrap();
     assert_eq!(
@@ -55,7 +63,7 @@ async fn consume_is_idempotent_on_source_id() {
     // Replay with the SAME source_id: guard short-circuits, no second
     // decrement.
     let replay = inv
-        .consume_part_at("ING-MALT-2ROW-50", 200, Utc::now(), key)
+        .consume_part_at("ING-MALT-2ROW-50", 200, Utc::now(), key, &stamp())
         .await
         .unwrap();
     assert_eq!(replay.item.on_hand, 800, "replay must not double-decrement");
@@ -74,6 +82,7 @@ async fn consume_is_idempotent_on_source_id() {
         200,
         Utc::now(),
         "step-8:ING-MALT-2ROW-50",
+        &stamp(),
     )
     .await
     .unwrap();
@@ -95,23 +104,27 @@ async fn replay_after_stock_fell_below_qty_is_still_a_noop() {
     // → dead-letter. The guard makes it a clean no-op instead.
     let db = TestDb::new().await;
     let inv = PgInventory::new(db.pool.clone());
-    inv.upsert_item_at(&item("ING-HOPS-CASCADE-44", 100, 30000), Utc::now())
-        .await
-        .unwrap();
+    inv.upsert_item_at(
+        &item("ING-HOPS-CASCADE-44", 100, 30000),
+        Utc::now(),
+        &stamp(),
+    )
+    .await
+    .unwrap();
 
     let key = "step-3:ING-HOPS-CASCADE-44";
-    inv.consume_part_at("ING-HOPS-CASCADE-44", 80, Utc::now(), key)
+    inv.consume_part_at("ING-HOPS-CASCADE-44", 80, Utc::now(), key, &stamp())
         .await
         .unwrap(); // on_hand → 20
     // Draw it down below the original qty via a different consume.
-    inv.consume_part_at("ING-HOPS-CASCADE-44", 15, Utc::now(), "other")
+    inv.consume_part_at("ING-HOPS-CASCADE-44", 15, Utc::now(), "other", &stamp())
         .await
         .unwrap(); // on_hand → 5
 
     // Redeliver the first consume (qty 80, but only 5 on hand): guard makes
     // it a no-op rather than an InsufficientStock error.
     let replay = inv
-        .consume_part_at("ING-HOPS-CASCADE-44", 80, Utc::now(), key)
+        .consume_part_at("ING-HOPS-CASCADE-44", 80, Utc::now(), key, &stamp())
         .await
         .expect("replay must succeed as a no-op, not InsufficientStock");
     assert_eq!(replay.item.on_hand, 5);

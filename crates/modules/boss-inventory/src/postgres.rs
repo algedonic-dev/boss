@@ -47,7 +47,13 @@ impl InventoryRepository for PgInventory {
         &self,
         item: &InventoryItem,
         now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), InventoryError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| InventoryError::Storage(e.to_string()))?;
         sqlx::query(
             "INSERT INTO inventory_items \
                 (part_sku, bin, on_hand, allocated, reorder_point, reorder_qty, \
@@ -76,9 +82,23 @@ impl InventoryRepository for PgInventory {
         .bind(item.vendor_price_cents)
         .bind(&item.vendor_category)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| InventoryError::Storage(e.to_string()))?;
+        // Outbox phase 2: the state event (the upserted row, last-
+        // write-wins rebuild source) commits with the row.
+        boss_events::outbox::record_event_in_tx(
+            &mut tx,
+            &stamp.event(
+                crate::events::ITEM_UPSERTED,
+                serde_json::to_value(item).unwrap_or_default(),
+            ),
+        )
+        .await
+        .map_err(InventoryError::Storage)?;
+        tx.commit()
+            .await
+            .map_err(|e| InventoryError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -120,6 +140,7 @@ impl InventoryRepository for PgInventory {
         qty: u32,
         now: chrono::DateTime<chrono::Utc>,
         source_id: &str,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<ConsumeApplied, InventoryError> {
         // One tx wraps: (1) the proportional value drain + on_hand
         // decrement, (2) the `finance.inventory.transferred` fact
@@ -256,6 +277,31 @@ impl InventoryRepository for PgInventory {
             None
         };
 
+        // Outbox phase 2: both audit events commit with the mutation.
+        // The state event is the post-consume row (last-write-wins
+        // rebuild source); the transfer event is the EXACT in-tx fact
+        // payload, so byte-parity with the rebuilt fact cannot drift.
+        // The replay path (guard above) returned before reaching here,
+        // so a redelivered consume records NOTHING — idempotence now
+        // covers the state event too, not just the transfer.
+        boss_events::outbox::record_event_in_tx(
+            &mut tx,
+            &stamp.event(
+                crate::events::ITEM_CONSUMED,
+                serde_json::to_value(&item).unwrap_or_default(),
+            ),
+        )
+        .await
+        .map_err(InventoryError::Storage)?;
+        if let Some(payload) = &fact_payload {
+            boss_events::outbox::record_event_in_tx(
+                &mut tx,
+                &stamp.event(crate::events::INVENTORY_TRANSFERRED, payload.clone()),
+            )
+            .await
+            .map_err(InventoryError::Storage)?;
+        }
+
         tx.commit()
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
@@ -380,6 +426,7 @@ impl InventoryRepository for PgInventory {
         memo: &str,
         source_id: &str,
         happened_on: chrono::NaiveDate,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(uuid::Uuid, bool), InventoryError> {
         if total_cost_cents <= 0 {
             return Err(InventoryError::Storage(
@@ -444,6 +491,20 @@ impl InventoryRepository for PgInventory {
                 e => InventoryError::Storage(format!("ledger post: {e}")),
             })?;
 
+        // Outbox phase 2: the audit event (rebuild material for the
+        // `inventory.overhead.absorbed → finance.inventory.transferred`
+        // projection rule) commits with the fact + JE. Gated on THIS
+        // call having inserted the fact — an idempotent replay records
+        // nothing, structurally.
+        if inserted {
+            boss_events::outbox::record_event_in_tx(
+                &mut tx,
+                &stamp.event(crate::events::INVENTORY_OVERHEAD_ABSORBED, payload.clone()),
+            )
+            .await
+            .map_err(InventoryError::Storage)?;
+        }
+
         tx.commit()
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
@@ -459,6 +520,7 @@ impl InventoryRepository for PgInventory {
         source_table: &str,
         source_id: &str,
         happened_on: chrono::NaiveDate,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<JeRecorded, InventoryError> {
         if total_cost_cents <= 0 {
             return Err(InventoryError::Storage(
@@ -515,6 +577,20 @@ impl InventoryRepository for PgInventory {
             .await
             .map_err(|e| InventoryError::Storage(format!("ledger post: {e}")))?;
 
+        // Outbox phase 2: the fact's WRITER owns its rebuild source —
+        // `ledger.inventory.transferred` records in the SAME tx, only
+        // when THIS call inserted the fact (the emit-once-on-`inserted`
+        // contract the HTTP handler used to enforce is structural now;
+        // mirrors ProductsRepository::record_inventory_je).
+        if inserted {
+            boss_events::outbox::record_event_in_tx(
+                &mut tx,
+                &stamp.event(crate::events::LEDGER_INVENTORY_TRANSFERRED, payload.clone()),
+            )
+            .await
+            .map_err(InventoryError::Storage)?;
+        }
+
         tx.commit()
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
@@ -532,6 +608,7 @@ impl InventoryRepository for PgInventory {
         unit_cost_cents: Option<i64>,
         now: chrono::DateTime<chrono::Utc>,
         source_id: &str,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<ReceiveApplied, InventoryError> {
         // One tx wraps: (1) the idempotency check, (2) the on_hand
         // increment (+ weighted-avg-cost update), (3) the
@@ -645,6 +722,30 @@ impl InventoryRepository for PgInventory {
         )
         .await?;
 
+        // Outbox phase 2: state event (post-receive row) + goods-
+        // receipt marker (the EXACT proof-fact payload) commit with
+        // the increment. The replay path (guard above) returned before
+        // reaching here, so a redelivered receive records NOTHING —
+        // the once-queued "dedup audit-event emits on redelivery"
+        // item is structural now (ITEM_UPSERTED included: a replay
+        // leaves the row untouched, so a duplicate snapshot carries
+        // no rebuild information).
+        boss_events::outbox::record_event_in_tx(
+            &mut tx,
+            &stamp.event(
+                crate::events::ITEM_UPSERTED,
+                serde_json::to_value(&item).unwrap_or_default(),
+            ),
+        )
+        .await
+        .map_err(InventoryError::Storage)?;
+        boss_events::outbox::record_event_in_tx(
+            &mut tx,
+            &stamp.event(crate::events::ITEM_RECEIVED, payload.clone()),
+        )
+        .await
+        .map_err(InventoryError::Storage)?;
+
         tx.commit()
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
@@ -658,6 +759,7 @@ impl InventoryRepository for PgInventory {
         &self,
         po: &PurchaseOrder,
         now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), InventoryError> {
         // Upsert so re-emitted POs (the sim re-POSTs on every status
         // transition, see the generator's `emit_po` path) update the
@@ -678,9 +780,7 @@ impl InventoryRepository for PgInventory {
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
         // Identity write-through (subject-model R1, Q1): the PO's
-        // identity row commits with its header row. (The per-line
-        // INSERTs below keep their pre-existing non-transactional
-        // shape — unchanged here.)
+        // identity row commits with its header row.
         boss_subject_kinds::subjects::record_subject_in_tx(
             &mut tx,
             "purchase_order",
@@ -709,10 +809,13 @@ impl InventoryRepository for PgInventory {
         .execute(&mut *tx)
         .await
         .map_err(|e| InventoryError::Storage(e.to_string()))?;
-        tx.commit()
-            .await
-            .map_err(|e| InventoryError::Storage(e.to_string()))?;
 
+        // Lines join the SAME tx (outbox phase 2). Previously they
+        // inserted post-commit, so a failed line left a committed
+        // header whose PO_UPSERTED event never fired — an unlogged
+        // state mutation, exactly the swallowed-write class the
+        // outbox exists to kill. Now header + lines + identity +
+        // event commit or abort together.
         for line in &po.lines {
             sqlx::query(
                 "INSERT INTO purchase_order_lines (po_id, part_sku, qty, unit_cost_cents, currency) \
@@ -723,28 +826,81 @@ impl InventoryRepository for PgInventory {
             .bind(line.qty as i32)
             .bind(line.unit_cost_cents)
             .bind(&line.currency)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
         }
 
+        // State event — the caller-intended PO state (matches the
+        // upsert semantics: re-POSTs carry the full intended row).
+        boss_events::outbox::record_event_in_tx(
+            &mut tx,
+            &stamp.event(
+                crate::events::PO_UPSERTED,
+                serde_json::to_value(po).unwrap_or_default(),
+            ),
+        )
+        .await
+        .map_err(InventoryError::Storage)?;
+
+        tx.commit()
+            .await
+            .map_err(|e| InventoryError::Storage(e.to_string()))?;
         Ok(())
     }
 
-    async fn update_po_status(&self, id: &str, status: &str) -> Result<(), InventoryError> {
+    async fn update_po_status(
+        &self,
+        id: &str,
+        status: &str,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), InventoryError> {
         // Validate status.
         let _ = parse_po_status(status)?;
 
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| InventoryError::Storage(e.to_string()))?;
         let result = sqlx::query("UPDATE purchase_orders SET status = $1 WHERE id = $2")
             .bind(status)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
 
         if result.rows_affected() == 0 {
             return Err(InventoryError::NotFound(id.to_string()));
         }
+
+        // Outbox phase 2: the state event carries POST-update row
+        // state read back inside the same tx, plus the status-changed
+        // marker for downstream consumers.
+        if let Some(po) = Self::fetch_po_in_tx(&mut tx, id).await? {
+            boss_events::outbox::record_event_in_tx(
+                &mut tx,
+                &stamp.event(
+                    crate::events::PO_UPSERTED,
+                    serde_json::to_value(&po).unwrap_or_default(),
+                ),
+            )
+            .await
+            .map_err(InventoryError::Storage)?;
+        }
+        boss_events::outbox::record_event_in_tx(
+            &mut tx,
+            &stamp.event(
+                crate::events::PO_STATUS_CHANGED,
+                serde_json::json!({ "id": id, "new_status": status }),
+            ),
+        )
+        .await
+        .map_err(InventoryError::Storage)?;
+
+        tx.commit()
+            .await
+            .map_err(|e| InventoryError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -761,6 +917,7 @@ impl InventoryRepository for PgInventory {
         &self,
         vendor: &Vendor,
         now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<String, InventoryError> {
         let mut tx = self
             .pool
@@ -802,13 +959,33 @@ impl InventoryRepository for PgInventory {
                 InventoryError::Storage(msg)
             }
         })?;
+        // Outbox phase 2: the state event commits with the row.
+        boss_events::outbox::record_event_in_tx(
+            &mut tx,
+            &stamp.event(
+                crate::events::VENDOR_CREATED,
+                serde_json::to_value(vendor).unwrap_or_default(),
+            ),
+        )
+        .await
+        .map_err(InventoryError::Storage)?;
         tx.commit()
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
         Ok(vendor.id.clone())
     }
 
-    async fn update_vendor(&self, id: &str, vendor: &Vendor) -> Result<(), InventoryError> {
+    async fn update_vendor(
+        &self,
+        id: &str,
+        vendor: &Vendor,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), InventoryError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| InventoryError::Storage(e.to_string()))?;
         let result = sqlx::query(
             "UPDATE vendors SET name = $1, contact_name = $2, contact_email = $3, \
              city = $4, state = $5, lead_time_days = $6, payment_terms = $7, category = $8, \
@@ -830,26 +1007,68 @@ impl InventoryRepository for PgInventory {
                 .map(|b| serde_json::to_value(b).unwrap_or_default()),
         )
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| InventoryError::Storage(e.to_string()))?;
 
         if result.rows_affected() == 0 {
             return Err(InventoryError::NotFound(format!("vendor {id}")));
         }
+        // Rename-safe identity write-through (mirrors upsert_product).
+        boss_subject_kinds::subjects::record_subject_in_tx(
+            &mut tx,
+            "vendor",
+            id,
+            vendor.name.as_deref(),
+        )
+        .await
+        .map_err(InventoryError::Storage)?;
+        boss_events::outbox::record_event_in_tx(
+            &mut tx,
+            &stamp.event(
+                crate::events::VENDOR_UPDATED,
+                serde_json::to_value(vendor).unwrap_or_default(),
+            ),
+        )
+        .await
+        .map_err(InventoryError::Storage)?;
+        tx.commit()
+            .await
+            .map_err(|e| InventoryError::Storage(e.to_string()))?;
         Ok(())
     }
 
-    async fn delete_vendor(&self, id: &str) -> Result<(), InventoryError> {
+    async fn delete_vendor(
+        &self,
+        id: &str,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), InventoryError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| InventoryError::Storage(e.to_string()))?;
         let result = sqlx::query("DELETE FROM vendors WHERE id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?;
 
         if result.rows_affected() == 0 {
             return Err(InventoryError::NotFound(format!("vendor {id}")));
         }
+        boss_events::outbox::record_event_in_tx(
+            &mut tx,
+            &stamp.event(
+                crate::events::VENDOR_DELETED,
+                serde_json::json!({ "id": id, "deleted_at": stamp.timestamp }),
+            ),
+        )
+        .await
+        .map_err(InventoryError::Storage)?;
+        tx.commit()
+            .await
+            .map_err(|e| InventoryError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -857,6 +1076,7 @@ impl InventoryRepository for PgInventory {
         &self,
         invoice: &VendorInvoice,
         now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), InventoryError> {
         let mut tx = self
             .pool
@@ -902,16 +1122,32 @@ impl InventoryRepository for PgInventory {
         .await
         .map_err(|e| InventoryError::Storage(e.to_string()))?;
 
+        // Outbox phase 2: the full-row state event (last-write-wins
+        // rebuild source for vendor_invoices) commits with the upsert.
+        boss_events::outbox::record_event_in_tx(
+            &mut tx,
+            &stamp.event(
+                crate::events::VENDOR_INVOICE_UPSERTED,
+                serde_json::to_value(invoice).unwrap_or_default(),
+            ),
+        )
+        .await
+        .map_err(InventoryError::Storage)?;
+
         // Emit financial facts for state transitions this upsert represents.
         // Idempotent via the unique (kind, source) index — replays and
         // repeated upserts on an already-approved/paid invoice are no-ops.
+        // The matching transition EVENTS record in the same tx, gated on
+        // the fact actually inserting — so a re-upsert of an already-
+        // approved/paid invoice appends no duplicate transition event
+        // (previously the HTTP layer re-emitted on every upsert).
         if let Some(approved_on) = invoice.approved_on {
-            // Shared helper so this in-tx fact and the emitted
-            // `inventory.vendor_invoice.approved` event (http/vendor_invoices.rs)
-            // are byte-identical on rebuild. `lines` (when present) is the
+            // Shared helper so the in-tx fact and the recorded
+            // `inventory.vendor_invoice.approved` event are
+            // byte-identical on rebuild. `lines` (when present) is the
             // authoritative source for the `bill_approved` JE amount.
             let payload = bill_approved_payload(invoice, approved_on);
-            insert_fact(
+            let inserted = insert_fact(
                 &mut tx,
                 "finance.bill.approved",
                 approved_on,
@@ -920,10 +1156,18 @@ impl InventoryRepository for PgInventory {
                 &invoice.id,
             )
             .await?;
+            if inserted {
+                boss_events::outbox::record_event_in_tx(
+                    &mut tx,
+                    &stamp.event(crate::events::VENDOR_INVOICE_APPROVED, payload),
+                )
+                .await
+                .map_err(InventoryError::Storage)?;
+            }
         }
         if let Some(paid_on) = invoice.paid_on {
             let payload = bill_paid_payload(invoice, paid_on);
-            insert_fact(
+            let inserted = insert_fact(
                 &mut tx,
                 "finance.bill.paid",
                 paid_on,
@@ -932,6 +1176,14 @@ impl InventoryRepository for PgInventory {
                 &invoice.id,
             )
             .await?;
+            if inserted {
+                boss_events::outbox::record_event_in_tx(
+                    &mut tx,
+                    &stamp.event(crate::events::VENDOR_INVOICE_PAID, payload),
+                )
+                .await
+                .map_err(InventoryError::Storage)?;
+            }
         }
 
         tx.commit()
@@ -1041,6 +1293,37 @@ impl InventoryRepository for PgInventory {
 }
 
 impl PgInventory {
+    /// In-tx read-back of a full `PurchaseOrder` (header + lines) so
+    /// the outbox state event carries post-update row state from the
+    /// SAME transaction (mirrors boss-commerce's `fetch_invoice_in_tx`).
+    async fn fetch_po_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: &str,
+    ) -> Result<Option<PurchaseOrder>, InventoryError> {
+        let row: Option<PurchaseOrderRow> =
+            sqlx::query_as("SELECT * FROM purchase_orders WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| InventoryError::Storage(e.to_string()))?;
+        let Some(row) = row else { return Ok(None) };
+        let lines: Vec<PoLineRow> =
+            sqlx::query_as("SELECT * FROM purchase_order_lines WHERE po_id = $1 ORDER BY part_sku")
+                .bind(&row.id)
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(|e| InventoryError::Storage(e.to_string()))?;
+        Ok(Some(PurchaseOrder {
+            id: row.id,
+            vendor: row.vendor,
+            status: parse_po_status(&row.status).unwrap_or(PoStatus::Draft),
+            placed_on: row.placed_on,
+            expected_on: row.expected_on,
+            received_on: row.received_on,
+            lines: lines.into_iter().map(|l| l.into_line()).collect(),
+        }))
+    }
+
     /// Fetch lines for a purchase order and assemble a full `PurchaseOrder`.
     async fn assemble(&self, row: PurchaseOrderRow) -> Result<PurchaseOrder, InventoryError> {
         let lines: Vec<PoLineRow> =

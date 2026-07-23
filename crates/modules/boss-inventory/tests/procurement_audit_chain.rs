@@ -3,14 +3,17 @@
 //!
 //! The four procurement entity surfaces (vendor_contacts,
 //! vendor_interactions, vendor_account_team, vendor_contracts) must
-//! emit an audit_log event for every write. Without it a
+//! record an audit event for every write — on the transactional
+//! outbox, inside the write's own transaction (outbox phase 2); the
+//! relay drain moves it to audit_log. Without it a
 //! `boss-rebuild-all` cycle would lose every row — `rebuild_inventory`
 //! replays those four kinds, and the projections are otherwise wiped
 //! via the ON DELETE CASCADE on vendors.
 //!
-//! This test exercises one write per surface, drops the
-//! projections, runs `rebuild_inventory`, and asserts every row
-//! reappears from `audit_log` alone.
+//! This test exercises one write per surface on the REAL pipeline
+//! (write → outbox → relay drain → audit_log), runs
+//! `rebuild_inventory`, and asserts every row reappears from
+//! `audit_log` alone.
 
 #![cfg(feature = "postgres")]
 
@@ -18,8 +21,8 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::http::StatusCode;
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
+use boss_core::port::EventBus;
+use boss_events::outbox::drain_outbox_once;
 use boss_inventory::procurement::http::{ProcurementApiState, router as procurement_router};
 use boss_inventory::rebuild_inventory;
 use boss_testing::{RecordingEventBus, TestDb, TestRequest};
@@ -113,11 +116,13 @@ async fn seed_vendor_and_employee(pool: &PgPool) {
 }
 
 fn build_app(pool: PgPool) -> Router {
-    let publisher = DomainPublisher::new(RecordingEventBus::new(), "inventory")
-        .with_audit(Arc::new(PgAuditWriter::new(pool.clone())));
+    // No publisher: the handler stamps fall back to
+    // source="inventory" and the adapters record on the outbox —
+    // there is deliberately NO direct audit writer here, so the test
+    // can only pass through the real outbox → relay → audit_log path.
     procurement_router(ProcurementApiState {
         pool,
-        publisher: Some(publisher),
+        publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
     })
 }
@@ -185,6 +190,14 @@ async fn vendor_crm_writes_survive_rebuild() {
         .send(&app)
         .await
         .assert_status(StatusCode::OK);
+
+    // Drain the outbox through the relay pipeline: outbox →
+    // audit_log (chained) → bus → delivered. Rebuild reads audit_log.
+    let bus = RecordingEventBus::new();
+    let stats = drain_outbox_once(&db.pool, &(bus as Arc<dyn EventBus>), 100)
+        .await
+        .expect("relay drain");
+    assert_eq!(stats.delivered, 4, "one event per CRM surface");
 
     // Pre-rebuild snapshot.
     let pre_contacts: (i64,) =

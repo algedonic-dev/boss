@@ -52,6 +52,27 @@ pub struct InventoryApiState<R: InventoryRepository> {
     pub clock: Arc<dyn boss_clock_client::ClockClient>,
 }
 
+/// Build the enrichment stamp for in-tx event recording: the caller's
+/// actor + the authoritative timestamp, with `_simulated` resolved by
+/// the publisher's clock probe when one is wired (task-local sim
+/// chain only otherwise — the test paths). Write handlers record
+/// their events in the DOMAIN TRANSACTION via this stamp (outbox
+/// phase 2); the publisher no longer publishes those kinds
+/// post-commit.
+pub(crate) async fn event_stamp<R: InventoryRepository>(
+    state: &InventoryApiState<R>,
+    user: &boss_policy_client::User,
+    now: chrono::DateTime<chrono::Utc>,
+) -> boss_core::publisher::EventStamp {
+    let actor = user
+        .ambient_actor()
+        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+    match &state.publisher {
+        Some(p) => p.stamp_with_actor_at(actor, now).await,
+        None => boss_core::publisher::EventStamp::new("inventory", actor, now),
+    }
+}
+
 pub fn router<R: InventoryRepository + 'static>(state: InventoryApiState<R>) -> Router {
     let shared = Arc::new(state);
     Router::new()

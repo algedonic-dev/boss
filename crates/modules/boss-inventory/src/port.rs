@@ -1,6 +1,7 @@
 //! Port (trait) for inventory storage.
 
 use async_trait::async_trait;
+use boss_core::publisher::EventStamp;
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::types::{
@@ -44,12 +45,22 @@ pub trait InventoryRepository: Send + Sync {
     /// the Warehouse workbench when a new part SKU is stocked for the
     /// first time.
     async fn upsert_item(&self, item: &InventoryItem) -> Result<(), InventoryError> {
-        self.upsert_item_at(item, Utc::now()).await
+        let now = Utc::now();
+        let stamp = EventStamp::new(
+            "inventory",
+            boss_core::actor::ActorId::Automation("platform".into()),
+            now,
+        );
+        self.upsert_item_at(item, now, &stamp).await
     }
+    /// Records `inventory.item.upserted` (the upserted row — the
+    /// last-write-wins rebuild source) in the same transaction as the
+    /// upsert — outbox phase 2.
     async fn upsert_item_at(
         &self,
         item: &InventoryItem,
         now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<(), InventoryError>;
     async fn all_purchase_orders(&self) -> Result<Vec<PurchaseOrder>, InventoryError>;
     async fn purchase_order_by_id(&self, id: &str)
@@ -60,7 +71,13 @@ pub trait InventoryRepository: Send + Sync {
         qty: u32,
     ) -> Result<ConsumeApplied, InventoryError> {
         let source_id = format!("{}@{}", part_sku, uuid::Uuid::new_v4());
-        self.consume_part_at(part_sku, qty, Utc::now(), &source_id)
+        let now = Utc::now();
+        let stamp = EventStamp::new(
+            "inventory",
+            boss_core::actor::ActorId::Automation("platform".into()),
+            now,
+        );
+        self.consume_part_at(part_sku, qty, now, &source_id, &stamp)
             .await
     }
     /// `source_id` must be unique per consume call — it's the
@@ -72,12 +89,19 @@ pub trait InventoryRepository: Send + Sync {
     /// all but the first fact. The HTTP handler generates a
     /// UUID-keyed source_id and uses the SAME value in the matching
     /// audit_log event payload so bundle round-trip stays idempotent.
+    ///
+    /// OUTBOX (phase 2): records `inventory.item.consumed` (post-
+    /// consume row state) + `inventory.transferred` (the exact in-tx
+    /// fact payload, value-draining consumes only) in the SAME
+    /// transaction as the decrement. The idempotency guard sits ahead
+    /// of both, so a redelivered consume records nothing.
     async fn consume_part_at(
         &self,
         part_sku: &str,
         qty: u32,
         now: DateTime<Utc>,
         source_id: &str,
+        stamp: &EventStamp,
     ) -> Result<ConsumeApplied, InventoryError>;
 
     /// Sum of `expected_qty - received_qty` across every open
@@ -108,13 +132,13 @@ pub trait InventoryRepository: Send + Sync {
     ) -> Result<Option<String>, InventoryError>;
 
     /// Record one production-overhead driver being capitalized into WIP at
-    /// production-consume time. Two writes in one tx:
+    /// production-consume time. Three writes in one tx (outbox phase 2):
     ///   1. `finance.inventory.transferred` financial_fact +
     ///      journal entry (DR `debit_account` / CR `credit_account`).
-    ///   2. The matching audit_log event is published by the HTTP
-    ///      handler after this method returns — same pattern as
-    ///      `consume_part_at` (the HTTP layer publishes ITEM_CONSUMED
-    ///      + INVENTORY_TRANSFERRED outside the tx).
+    ///   2. The matching `inventory.overhead.absorbed` audit event,
+    ///      recorded in the SAME transaction — gated on this call
+    ///      having inserted the fact, so an idempotent replay records
+    ///      nothing.
     ///
     /// `source_id` is the production-consume step id (typical) or a
     /// timestamp fallback; the `(kind, source_table, source_id)`
@@ -128,6 +152,7 @@ pub trait InventoryRepository: Send + Sync {
         memo: &str,
         source_id: &str,
         happened_on: NaiveDate,
+        stamp: &EventStamp,
     ) -> Result<(uuid::Uuid, bool), InventoryError>;
 
     /// Atomic opening-balance / adjustment JE for inventory
@@ -138,8 +163,10 @@ pub trait InventoryRepository: Send + Sync {
     /// shape). The `source_table` lets the caller distinguish
     /// `brewery_seed_opening_balance` (idempotent re-runs) from
     /// `inventory_adjustment` (time-stamped, fires every PUT).
-    /// Returns the fact_id so the HTTP layer can emit the
-    /// matching audit_log event from the same tx context.
+    /// OUTBOX (phase 2): when THIS call inserts the fact, the matching
+    /// `ledger.inventory.transferred` event records in the same
+    /// transaction — the emit-once-on-`inserted` contract is
+    /// structural (mirrors `ProductsRepository::record_inventory_je`).
     async fn record_inventory_je(
         &self,
         total_cost_cents: i64,
@@ -149,6 +176,7 @@ pub trait InventoryRepository: Send + Sync {
         source_table: &str,
         source_id: &str,
         happened_on: NaiveDate,
+        stamp: &EventStamp,
     ) -> Result<JeRecorded, InventoryError>;
     /// Receive a part — increments `on_hand` by `qty`. Used by
     /// the `receiving` StepType's side effect when a goods-receipt
@@ -183,9 +211,20 @@ pub trait InventoryRepository: Send + Sync {
         unit_cost_cents: Option<i64>,
         source_id: &str,
     ) -> Result<ReceiveApplied, InventoryError> {
-        self.receive_part_at(part_sku, qty, unit_cost_cents, Utc::now(), source_id)
+        let now = Utc::now();
+        let stamp = EventStamp::new(
+            "inventory",
+            boss_core::actor::ActorId::Automation("platform".into()),
+            now,
+        );
+        self.receive_part_at(part_sku, qty, unit_cost_cents, now, source_id, &stamp)
             .await
     }
+    /// OUTBOX (phase 2): records `inventory.item.upserted` (post-
+    /// receive row state) + `inventory.item.received` (the exact
+    /// proof-fact payload) in the SAME transaction as the increment.
+    /// The idempotency guard sits ahead of both, so a redelivered
+    /// receive records nothing.
     async fn receive_part_at(
         &self,
         part_sku: &str,
@@ -193,40 +232,100 @@ pub trait InventoryRepository: Send + Sync {
         unit_cost_cents: Option<i64>,
         now: DateTime<Utc>,
         source_id: &str,
+        stamp: &EventStamp,
     ) -> Result<ReceiveApplied, InventoryError>;
     async fn create_purchase_order(&self, po: &PurchaseOrder) -> Result<(), InventoryError> {
-        self.create_purchase_order_at(po, Utc::now()).await
+        let now = Utc::now();
+        let stamp = EventStamp::new(
+            "inventory",
+            boss_core::actor::ActorId::Automation("platform".into()),
+            now,
+        );
+        self.create_purchase_order_at(po, now, &stamp).await
     }
+    /// OUTBOX (phase 2): header + lines + subject identity +
+    /// `inventory.purchase_order.upserted` (the caller-intended PO
+    /// state) commit or abort in ONE transaction.
     async fn create_purchase_order_at(
         &self,
         po: &PurchaseOrder,
         now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<(), InventoryError>;
-    async fn update_po_status(&self, id: &str, status: &str) -> Result<(), InventoryError>;
+    /// Records `inventory.purchase_order.upserted` (post-update row
+    /// state, read back in-tx) + the `inventory.po.status_changed`
+    /// marker in the same transaction as the flip — outbox phase 2.
+    async fn update_po_status(
+        &self,
+        id: &str,
+        status: &str,
+        stamp: &EventStamp,
+    ) -> Result<(), InventoryError>;
 
     async fn all_vendors(&self) -> Result<Vec<Vendor>, InventoryError>;
+    /// Convenience overload: stamps `Utc::now()` + a platform-
+    /// automation event stamp. Handlers use `create_vendor_at`.
     async fn create_vendor(&self, vendor: &Vendor) -> Result<String, InventoryError> {
-        self.create_vendor_at(vendor, Utc::now()).await
+        let now = Utc::now();
+        let stamp = EventStamp::new(
+            "inventory",
+            boss_core::actor::ActorId::Automation("platform".into()),
+            now,
+        );
+        self.create_vendor_at(vendor, now, &stamp).await
     }
+    /// OUTBOX (transactional-audit-log phase 2): records
+    /// `inventory.vendor.created` (full row state) — enriched via
+    /// `stamp` — in the SAME transaction as the row + the subject
+    /// identity write-through, so the event and the state commit or
+    /// abort together. Callers no longer publish this kind
+    /// post-commit; boss-event-relay moves it to audit_log + NATS.
     async fn create_vendor_at(
         &self,
         vendor: &Vendor,
         now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<String, InventoryError>;
-    async fn update_vendor(&self, id: &str, vendor: &Vendor) -> Result<(), InventoryError>;
-    async fn delete_vendor(&self, id: &str) -> Result<(), InventoryError>;
+    /// Records `inventory.vendor.updated` (full post-update row
+    /// state) in the same transaction as the UPDATE — outbox phase 2.
+    /// Also refreshes the subject identity name write-through, so a
+    /// vendor rename keeps `subjects.name` current (mirrors
+    /// `ProductsRepository::upsert_product`).
+    async fn update_vendor(
+        &self,
+        id: &str,
+        vendor: &Vendor,
+        stamp: &EventStamp,
+    ) -> Result<(), InventoryError>;
+    /// Records `inventory.vendor.deleted` in the same transaction as
+    /// the DELETE — outbox phase 2. The subjects identity row stays
+    /// (identity is event-sourced; deletion is a fact, not an erasure).
+    async fn delete_vendor(&self, id: &str, stamp: &EventStamp) -> Result<(), InventoryError>;
 
     /// Three-way match: upsert a vendor invoice keyed by `id`. If
     /// the caller already ran the match logic, they pass the status,
     /// discrepancy_cents, and discrepancy_kind. Otherwise the invoice
     /// lands as `status=received` for later reconciliation.
     async fn upsert_vendor_invoice(&self, invoice: &VendorInvoice) -> Result<(), InventoryError> {
-        self.upsert_vendor_invoice_at(invoice, Utc::now()).await
+        let now = Utc::now();
+        let stamp = EventStamp::new(
+            "inventory",
+            boss_core::actor::ActorId::Automation("platform".into()),
+            now,
+        );
+        self.upsert_vendor_invoice_at(invoice, now, &stamp).await
     }
+    /// OUTBOX (phase 2): records `inventory.vendor_invoice.upserted`
+    /// (the full row — the last-write-wins rebuild source) plus the
+    /// `approved` / `paid` transition events in the SAME transaction
+    /// as the upsert + the transition facts. Transition events gate on
+    /// their fact actually inserting, so a re-upsert of an already-
+    /// approved/paid invoice appends no duplicate transition event.
     async fn upsert_vendor_invoice_at(
         &self,
         invoice: &VendorInvoice,
         now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<(), InventoryError>;
 
     /// List vendor invoices, optionally filtered by status.

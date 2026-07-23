@@ -82,27 +82,15 @@ pub(super) async fn create_vendor<R: InventoryRepository + 'static>(
     };
 
     let now = boss_clock_client::now_from(&state.clock).await;
-    match state.inventory.create_vendor_at(&vendor, now).await {
-        Ok(created_id) => {
-            if let Some(pub_) = &state.publisher {
-                // State event — full Vendor row state.
-                let actor = user
-                    .ambient_actor()
-                    .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                pub_.emit_with_actor_at(
-                    crate::events::VENDOR_CREATED,
-                    actor,
-                    serde_json::to_value(&vendor).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            }
-            (
-                StatusCode::CREATED,
-                Json(serde_json::json!({"ok": true, "id": created_id})),
-            )
-                .into_response()
-        }
+    // Outbox phase 2: `inventory.vendor.created` records inside the
+    // repository transaction via the stamp; no post-commit emit.
+    let stamp = super::event_stamp(&state, &user, now).await;
+    match state.inventory.create_vendor_at(&vendor, now, &stamp).await {
+        Ok(created_id) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"ok": true, "id": created_id})),
+        )
+            .into_response(),
         Err(InventoryError::Conflict(msg)) => (StatusCode::CONFLICT, msg).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -127,24 +115,10 @@ pub(super) async fn update_vendor<R: InventoryRepository + 'static>(
         behavior: body.behavior,
     };
 
-    match state.inventory.update_vendor(&id, &vendor).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                let now = boss_clock_client::now_from(&state.clock).await;
-                // State event — full Vendor row state.
-                let actor = user
-                    .ambient_actor()
-                    .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                pub_.emit_with_actor_at(
-                    crate::events::VENDOR_UPDATED,
-                    actor,
-                    serde_json::to_value(&vendor).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = super::event_stamp(&state, &user, now).await;
+    match state.inventory.update_vendor(&id, &vendor, &stamp).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(InventoryError::NotFound(msg)) => (StatusCode::NOT_FOUND, msg).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -155,23 +129,10 @@ pub(super) async fn delete_vendor<R: InventoryRepository + 'static>(
     Path(id): Path<String>,
     CurrentUser(user): CurrentUser,
 ) -> Response {
-    match state.inventory.delete_vendor(&id).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                let now = boss_clock_client::now_from(&state.clock).await;
-                let actor = user
-                    .ambient_actor()
-                    .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                pub_.emit_with_actor_at(
-                    crate::events::VENDOR_DELETED,
-                    actor,
-                    serde_json::json!({ "id": id, "deleted_at": now }),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = super::event_stamp(&state, &user, now).await;
+    match state.inventory.delete_vendor(&id, &stamp).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(InventoryError::NotFound(msg)) => (StatusCode::NOT_FOUND, msg).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

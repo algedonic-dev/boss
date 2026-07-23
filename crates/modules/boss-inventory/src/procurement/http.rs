@@ -23,11 +23,6 @@ use super::postgres::PgProcurement;
 use super::types::{
     NewVendorAccountTeamMember, NewVendorContact, NewVendorContract, NewVendorInteraction,
 };
-use crate::events::{
-    VENDOR_CONTACT_DELETED, VENDOR_CONTACT_UPSERTED, VENDOR_CONTRACT_UPSERTED,
-    VENDOR_INTERACTION_DELETED, VENDOR_INTERACTION_RECORDED, VENDOR_TEAM_ASSIGNED,
-    VENDOR_TEAM_UNASSIGNED,
-};
 use crate::port::InventoryError;
 
 #[derive(Clone)]
@@ -77,6 +72,25 @@ pub fn router(state: ProcurementApiState) -> Router {
         .with_state(shared)
 }
 
+/// Build the enrichment stamp for in-tx event recording (outbox
+/// phase 2). The CRM surface carries no CurrentUser extractor, so the
+/// actor is the publisher's default (mirrors the boss-products
+/// handler helper); `_simulated` resolves via the publisher's clock
+/// probe when one is wired.
+async fn event_stamp(
+    state: &ProcurementApiState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> boss_core::publisher::EventStamp {
+    match &state.publisher {
+        Some(p) => p.stamp_with_actor_at(p.default_actor(), now).await,
+        None => boss_core::publisher::EventStamp::new(
+            "inventory",
+            boss_core::actor::ActorId::Automation("platform".into()),
+            now,
+        ),
+    }
+}
+
 // --- contacts -----------------------------------------------------------
 
 async fn list_contacts(
@@ -106,21 +120,13 @@ async fn upsert_contact(
         )
             .into_response();
     }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
     match PgProcurement::new(state.pool.clone())
-        .upsert_contact(body)
+        .upsert_contact(body, &stamp)
         .await
     {
-        Ok(c) => {
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    VENDOR_CONTACT_UPSERTED,
-                    serde_json::to_value(&c).unwrap_or_default(),
-                    boss_clock_client::now_from(&state.clock).await,
-                )
-                .await;
-            }
-            Json(c).into_response()
-        }
+        Ok(c) => Json(c).into_response(),
         Err(e) => err(e),
     }
 }
@@ -129,26 +135,13 @@ async fn delete_contact(
     State(state): State<Arc<ProcurementApiState>>,
     Path((vendor_id, id)): Path<(String, String)>,
 ) -> Response {
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
     match PgProcurement::new(state.pool.clone())
-        .delete_contact(&id)
+        .delete_contact(&vendor_id, &id, &stamp)
         .await
     {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                let now = boss_clock_client::now_from(&state.clock).await;
-                pub_.emit_at(
-                    VENDOR_CONTACT_DELETED,
-                    serde_json::json!({
-                        "id": id,
-                        "vendor_id": vendor_id,
-                        "deleted_at": now,
-                    }),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err(e),
     }
 }
@@ -193,21 +186,13 @@ async fn insert_interaction(
         )
             .into_response();
     }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
     match PgProcurement::new(state.pool.clone())
-        .insert_interaction(body)
+        .insert_interaction(body, &stamp)
         .await
     {
-        Ok(i) => {
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    VENDOR_INTERACTION_RECORDED,
-                    serde_json::to_value(&i).unwrap_or_default(),
-                    boss_clock_client::now_from(&state.clock).await,
-                )
-                .await;
-            }
-            Json(i).into_response()
-        }
+        Ok(i) => Json(i).into_response(),
         Err(e) => err(e),
     }
 }
@@ -222,26 +207,13 @@ async fn soft_delete_interaction(
     Path((_vendor_id, id)): Path<(String, String)>,
     Json(body): Json<SoftDeleteBody>,
 ) -> Response {
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
     match PgProcurement::new(state.pool.clone())
-        .soft_delete_interaction(&id, &body.deleted_by)
+        .soft_delete_interaction(&id, &body.deleted_by, &stamp)
         .await
     {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                let now = boss_clock_client::now_from(&state.clock).await;
-                pub_.emit_at(
-                    VENDOR_INTERACTION_DELETED,
-                    serde_json::json!({
-                        "id": id,
-                        "deleted_by": body.deleted_by,
-                        "deleted_at": now,
-                    }),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err(e),
     }
 }
@@ -275,21 +247,13 @@ async fn upsert_account_team_member(
         )
             .into_response();
     }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
     match PgProcurement::new(state.pool.clone())
-        .upsert_account_team_member(body)
+        .upsert_account_team_member(body, &stamp)
         .await
     {
-        Ok(m) => {
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    VENDOR_TEAM_ASSIGNED,
-                    serde_json::to_value(&m).unwrap_or_default(),
-                    boss_clock_client::now_from(&state.clock).await,
-                )
-                .await;
-            }
-            Json(m).into_response()
-        }
+        Ok(m) => Json(m).into_response(),
         Err(e) => err(e),
     }
 }
@@ -298,38 +262,16 @@ async fn remove_account_team_member(
     State(state): State<Arc<ProcurementApiState>>,
     Path((vendor_id, role)): Path<(String, String)>,
 ) -> Response {
-    // Capture the prior assignment so the unassigned event carries
-    // the employee_id at the time of removal (auditors should see
-    // who was unassigned without walking the full history).
-    let pg = PgProcurement::new(state.pool.clone());
-    let prior_employee_id: Option<String> =
-        pg.list_account_team(&vendor_id)
-            .await
-            .ok()
-            .and_then(|members| {
-                members
-                    .into_iter()
-                    .find(|m| m.role == role)
-                    .map(|m| m.employee_id)
-            });
-    match pg.remove_account_team_member(&vendor_id, &role).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                let now = boss_clock_client::now_from(&state.clock).await;
-                pub_.emit_at(
-                    VENDOR_TEAM_UNASSIGNED,
-                    serde_json::json!({
-                        "vendor_id": vendor_id,
-                        "role": role,
-                        "employee_id": prior_employee_id,
-                        "unassigned_at": now,
-                    }),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    // The prior assignment (who was unassigned) is captured by the
+    // adapter INSIDE the delete tx, so the event payload can't race a
+    // concurrent reassignment.
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
+    match PgProcurement::new(state.pool.clone())
+        .remove_account_team_member(&vendor_id, &role, &stamp)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err(e),
     }
 }
@@ -370,21 +312,13 @@ async fn upsert_contract(
         )
             .into_response();
     }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
     match PgProcurement::new(state.pool.clone())
-        .upsert_contract(body)
+        .upsert_contract(body, &stamp)
         .await
     {
-        Ok(c) => {
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    VENDOR_CONTRACT_UPSERTED,
-                    serde_json::to_value(&c).unwrap_or_default(),
-                    boss_clock_client::now_from(&state.clock).await,
-                )
-                .await;
-            }
-            Json(c).into_response()
-        }
+        Ok(c) => Json(c).into_response(),
         Err(e) => err(e),
     }
 }

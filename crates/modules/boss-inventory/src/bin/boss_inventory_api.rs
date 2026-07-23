@@ -113,9 +113,11 @@ async fn main() -> Result<()> {
     );
     info!(%clock_url, "clock client wired");
 
-    // Wire the sim-mode probe into the publisher so every
-    // emit_at automatically injects `_simulated: bool` into
-    // the audit_log payload without per-handler changes.
+    // Wire the sim-mode probe into the publisher so every event
+    // stamp resolves `_simulated: bool` from clock mode without
+    // per-handler changes (outbox phase 2: handlers build
+    // EventStamps from this publisher and the repository records
+    // the events in the domain transaction).
     let publisher = publisher.map(|p| {
         p.with_sim_probe(Arc::new(boss_clock_client::ClockSimProbe::new(
             clock.clone(),
