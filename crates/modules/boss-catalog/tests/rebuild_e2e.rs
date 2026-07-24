@@ -1,6 +1,7 @@
-//! End-to-end: drive catalog writes through PgKb + PgAuditWriter,
-//! snapshot asset_models + key satellites, drop, rebuild from
-//! `audit_log`, assert match.
+//! End-to-end: drive catalog writes through PgKb on the REAL
+//! pipeline (outbox phase 2 — events record in the domain tx, the
+//! relay drain moves them to audit_log), snapshot asset_models + key
+//! satellites, drop, rebuild from `audit_log`, assert match.
 
 #![cfg(feature = "postgres")]
 
@@ -14,8 +15,8 @@ use boss_assets_client::FakeAssetsClient;
 use boss_catalog::PgKb;
 use boss_catalog::http::{KbApiState, router};
 use boss_catalog::rebuild_catalog;
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
+use boss_core::port::EventBus;
+use boss_events::outbox::drain_outbox_once;
 use boss_testing::{RecordingEventBus, TestDb, TestRequest};
 use chrono::{DateTime, Utc};
 use common::model_fixture;
@@ -63,17 +64,25 @@ async fn snapshot_use_cases(pool: &PgPool) -> Vec<UseCaseRow> {
 }
 
 fn build_app(pool: PgPool) -> Router {
-    let catalog = Arc::new(PgKb::new(pool.clone()));
-    let publisher = DomainPublisher::new(RecordingEventBus::new(), "kb")
-        .with_audit(Arc::new(PgAuditWriter::new(pool)));
+    // No publisher, no direct audit writer: events reach audit_log
+    // only via the outbox → relay drain (`drain_outbox`).
     let state = KbApiState {
-        catalog,
-        publisher: Some(publisher),
+        catalog: Arc::new(PgKb::new(pool)),
+        publisher: None,
         assets_client: Arc::new(FakeAssetsClient::with_count(0)),
         classes_client: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
     };
     router(state)
+}
+
+/// Drain the outbox through the relay pipeline into audit_log.
+async fn drain_outbox(pool: &PgPool) -> u64 {
+    let bus = RecordingEventBus::new();
+    drain_outbox_once(pool, &(bus as Arc<dyn EventBus>), 100)
+        .await
+        .expect("relay drain")
+        .delivered
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -106,7 +115,9 @@ async fn rebuild_reproduces_models_and_satellites() {
         .await
         .assert_status(StatusCode::NO_CONTENT);
 
-    // 3. Snapshot.
+    // 3. Drain the outbox into audit_log, then snapshot.
+    let delivered = drain_outbox(&db.pool).await;
+    assert_eq!(delivered, 3, "2 creates + 1 update arrive via the outbox");
     let models_before = snapshot_models(&db.pool).await;
     let extras_before = snapshot_extras(&db.pool).await;
     let ucs_before = snapshot_use_cases(&db.pool).await;
@@ -152,6 +163,9 @@ async fn rebuild_handles_model_delete() {
         .await
         .assert_status(StatusCode::NO_CONTENT);
 
+    let delivered = drain_outbox(&db.pool).await;
+    assert_eq!(delivered, 2, "create + delete arrive via the outbox");
+
     let report = rebuild_catalog(&db.pool).await.unwrap();
     assert!(report.models_upserted >= 1);
     assert!(report.models_deleted >= 1);
@@ -178,13 +192,16 @@ async fn rebuild_succeeds_with_referencing_systems_row() {
     let app = build_app(db.pool.clone());
 
     // 1. Create a model via the catalog API (lands in asset_models
-    //    + emits kb.model.created).
+    //    + records kb.model.created on the outbox), then drain into
+    //    audit_log so the rebuild can see it.
     let m = model_fixture("Boss-FLEET-FK");
     TestRequest::post("/api/catalog/models")
         .json(&m)
         .send(&app)
         .await
         .assert_status(StatusCode::CREATED);
+    let delivered = drain_outbox(&db.pool).await;
+    assert_eq!(delivered, 1, "the create arrives via the outbox");
 
     // 2. Insert a assets row that FK-references the model. Direct
     //    INSERT (not via boss-assets HTTP) so the test stays

@@ -213,20 +213,33 @@ async fn create_model<R: KbRepository + 'static>(
         return resp;
     }
     let now = boss_clock_client::now_from(&state.clock).await;
-    match state.catalog.create_model_at(&model, now).await {
-        Ok(sku) => {
-            if let Some(pub_) = &state.publisher {
-                // Full AssetModel row state — what the rebuilder consumes.
-                pub_.emit_at(
-                    crate::events::MODEL_CREATED,
-                    serde_json::to_value(&model).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            }
-            (StatusCode::CREATED, Json(serde_json::json!({ "sku": sku }))).into_response()
-        }
+    // OUTBOX (phase 2): the adapter records kb.model.created (full
+    // row state) inside the domain transaction; nothing publishes
+    // post-commit.
+    let stamp = event_stamp(&state, now).await;
+    match state.catalog.create_model_at(&model, now, &stamp).await {
+        Ok(sku) => (StatusCode::CREATED, Json(serde_json::json!({ "sku": sku }))).into_response(),
         Err(e) => kb_error_response(e),
+    }
+}
+
+/// Resolve the outbox event stamp for this request. Kb handlers
+/// carry no CurrentUser extractor; the publisher's `default_actor`
+/// resolves the request identity from the task-local context (else
+/// `automation:kb`), and its clock probe settles `_simulated` — the
+/// same envelope the retired post-commit emits carried (outbox
+/// phase 2).
+async fn event_stamp<R: KbRepository>(
+    state: &KbApiState<R>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> boss_core::publisher::EventStamp {
+    match &state.publisher {
+        Some(p) => p.stamp_with_actor_at(p.default_actor(), now).await,
+        None => boss_core::publisher::EventStamp::new(
+            "kb",
+            boss_core::actor::ActorId::Automation("kb".into()),
+            now,
+        ),
     }
 }
 
@@ -242,18 +255,13 @@ async fn update_model<R: KbRepository + 'static>(
         return resp;
     }
     let now = boss_clock_client::now_from(&state.clock).await;
-    match state.catalog.update_model_at(&sku, &model, now).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    crate::events::MODEL_UPDATED,
-                    serde_json::to_value(&model).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    let stamp = event_stamp(&state, now).await;
+    match state
+        .catalog
+        .update_model_at(&sku, &model, now, &stamp)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => kb_error_response(e),
     }
 }
@@ -296,18 +304,9 @@ async fn delete_model<R: KbRepository + 'static>(
     }
 
     let now = boss_clock_client::now_from(&state.clock).await;
-    match state.catalog.delete_model(&sku).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    crate::events::MODEL_DELETED,
-                    serde_json::json!({ "sku": sku, "deleted_at": now }),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    let stamp = event_stamp(&state, now).await;
+    match state.catalog.delete_model_at(&sku, now, &stamp).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => kb_error_response(e),
     }
 }

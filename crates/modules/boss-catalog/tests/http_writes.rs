@@ -38,7 +38,7 @@ async fn post_model_emits_kb_model_created_event() {
         .await
         .assert_status(StatusCode::CREATED);
 
-    let event = app.bus.assert_event_emitted("kb.model.created");
+    let event = app.assert_recorded("kb.model.created");
     assert_eq!(
         event.payload.get("sku").and_then(|v| v.as_str()),
         Some("Boss-TEST-EVENT-1"),
@@ -70,7 +70,7 @@ async fn post_duplicate_model_does_not_emit_event() {
         .await
         .assert_status(StatusCode::CONFLICT);
 
-    app.bus.assert_event_not_emitted("kb.model.created");
+    app.assert_not_recorded("kb.model.created");
 }
 
 #[tokio::test]
@@ -120,7 +120,7 @@ async fn put_existing_model_emits_updated_event() {
         .await
         .assert_status(StatusCode::NO_CONTENT);
 
-    app.bus.assert_event_emitted("kb.model.updated");
+    app.assert_recorded("kb.model.updated");
 }
 
 #[tokio::test]
@@ -147,7 +147,7 @@ async fn put_nonexistent_model_does_not_emit_event() {
         .await
         .assert_status(StatusCode::NOT_FOUND);
 
-    app.bus.assert_event_not_emitted("kb.model.updated");
+    app.assert_not_recorded("kb.model.updated");
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +176,7 @@ async fn delete_existing_model_emits_deleted_event() {
         .await
         .assert_status(StatusCode::NO_CONTENT);
 
-    let event = app.bus.assert_event_emitted("kb.model.deleted");
+    let event = app.assert_recorded("kb.model.deleted");
     assert_eq!(
         event.payload.get("sku").and_then(|v| v.as_str()),
         Some("Boss-TEST-DEL-2"),

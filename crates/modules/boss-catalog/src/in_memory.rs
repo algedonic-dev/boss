@@ -11,12 +11,26 @@ use crate::types::AssetModel;
 
 pub struct InMemoryKb {
     models: RwLock<Vec<AssetModel>>,
+    recorded: std::sync::Mutex<Vec<boss_core::event::Event>>,
 }
 
 impl InMemoryKb {
     pub fn new(models: Vec<AssetModel>) -> Self {
         Self {
             models: RwLock::new(models),
+            recorded: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Events the outbox paths recorded — test visibility (the
+    /// in-memory analogue of the Pg adapter's in-tx recording).
+    pub fn recorded_events(&self) -> Vec<boss_core::event::Event> {
+        self.recorded.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    fn record(&self, event: boss_core::event::Event) {
+        if let Ok(mut v) = self.recorded.lock() {
+            v.push(event);
         }
     }
 }
@@ -41,17 +55,23 @@ impl KbRepository for InMemoryKb {
         &self,
         model: &AssetModel,
         _now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<String, KbError> {
-        let mut models = self.models.write().unwrap();
-        if models.iter().any(|m| m.sku == model.sku) {
-            return Err(KbError::Conflict(format!(
-                "SKU {} already exists",
-                model.sku
-            )));
+        {
+            let mut models = self.models.write().unwrap();
+            if models.iter().any(|m| m.sku == model.sku) {
+                return Err(KbError::Conflict(format!(
+                    "SKU {} already exists",
+                    model.sku
+                )));
+            }
+            models.push(model.clone());
         }
-        let sku = model.sku.clone();
-        models.push(model.clone());
-        Ok(sku)
+        self.record(stamp.event(
+            crate::events::MODEL_CREATED,
+            serde_json::to_value(model).unwrap_or_default(),
+        ));
+        Ok(model.sku.clone())
     }
 
     async fn update_model_at(
@@ -59,23 +79,41 @@ impl KbRepository for InMemoryKb {
         sku: &str,
         model: &AssetModel,
         _now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), KbError> {
-        let mut models = self.models.write().unwrap();
-        let pos = models
-            .iter()
-            .position(|m| m.sku == sku)
-            .ok_or_else(|| KbError::NotFound(sku.to_string()))?;
-        models[pos] = model.clone();
+        {
+            let mut models = self.models.write().unwrap();
+            let pos = models
+                .iter()
+                .position(|m| m.sku == sku)
+                .ok_or_else(|| KbError::NotFound(sku.to_string()))?;
+            models[pos] = model.clone();
+        }
+        self.record(stamp.event(
+            crate::events::MODEL_UPDATED,
+            serde_json::to_value(model).unwrap_or_default(),
+        ));
         Ok(())
     }
 
-    async fn delete_model(&self, sku: &str) -> Result<(), KbError> {
-        let mut models = self.models.write().unwrap();
-        let pos = models
-            .iter()
-            .position(|m| m.sku == sku)
-            .ok_or_else(|| KbError::NotFound(sku.to_string()))?;
-        models.remove(pos);
+    async fn delete_model_at(
+        &self,
+        sku: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), KbError> {
+        {
+            let mut models = self.models.write().unwrap();
+            let pos = models
+                .iter()
+                .position(|m| m.sku == sku)
+                .ok_or_else(|| KbError::NotFound(sku.to_string()))?;
+            models.remove(pos);
+        }
+        self.record(stamp.event(
+            crate::events::MODEL_DELETED,
+            serde_json::json!({ "sku": sku, "deleted_at": now }),
+        ));
         Ok(())
     }
 

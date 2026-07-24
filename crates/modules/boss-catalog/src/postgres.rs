@@ -64,6 +64,7 @@ impl KbRepository for PgKb {
         &self,
         model: &AssetModel,
         now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<String, KbError> {
         let mut tx = self
             .pool
@@ -91,6 +92,15 @@ impl KbRepository for PgKb {
         .await?;
         upsert_model_row(&mut tx, model, now).await?;
         insert_satellites(&mut tx, model).await?;
+        // OUTBOX (phase 2): the created event (full row state)
+        // records with the rows.
+        let event = stamp.event(
+            crate::events::MODEL_CREATED,
+            serde_json::to_value(model).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(KbError::Storage)?;
         tx.commit()
             .await
             .map_err(|e| KbError::Storage(e.to_string()))?;
@@ -102,6 +112,7 @@ impl KbRepository for PgKb {
         sku: &str,
         model: &AssetModel,
         now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), KbError> {
         let mut tx = self
             .pool
@@ -131,13 +142,27 @@ impl KbRepository for PgKb {
         upsert_model_row(&mut tx, model, now).await?;
         delete_satellites(&mut tx, sku).await?;
         insert_satellites(&mut tx, model).await?;
+        // OUTBOX (phase 2): the updated event (full row state)
+        // records with the rows.
+        let event = stamp.event(
+            crate::events::MODEL_UPDATED,
+            serde_json::to_value(model).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(KbError::Storage)?;
         tx.commit()
             .await
             .map_err(|e| KbError::Storage(e.to_string()))?;
         Ok(())
     }
 
-    async fn delete_model(&self, sku: &str) -> Result<(), KbError> {
+    async fn delete_model_at(
+        &self,
+        sku: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), KbError> {
         let mut tx = self
             .pool
             .begin()
@@ -152,6 +177,15 @@ impl KbRepository for PgKb {
         if result.rows_affected() == 0 {
             return Err(KbError::NotFound(sku.to_string()));
         }
+        // OUTBOX (phase 2): the deleted event records only after the
+        // row actually deleted (NotFound above returns pre-recording).
+        let event = stamp.event(
+            crate::events::MODEL_DELETED,
+            serde_json::json!({ "sku": sku, "deleted_at": now }),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(KbError::Storage)?;
         tx.commit()
             .await
             .map_err(|e| KbError::Storage(e.to_string()))?;
