@@ -4,7 +4,9 @@
 //!
 //! Provides:
 //! - `ShippingTestApp` builder that wires InMemoryShipping + HTTP router
-//!   + RecordingEventBus + DomainPublisher
+//!   (publisher `None` — outbox phase 2: adapters record events in the
+//!   domain write, so the in-memory repo's `recorded_events()` is the
+//!   assertion surface, not a bus)
 //! - `shipment_fixture()` helper to build a valid Shipment
 //!
 //! Usage in a test:
@@ -14,77 +16,74 @@
 //! let resp = TestRequest::post("/api/shipping/shipments")
 //!     .json(&ship).send(&app.router).await;
 //! resp.assert_status(StatusCode::CREATED);
-//! app.bus.assert_event_emitted("shipping.shipment.created");
+//! app.assert_recorded("shipping.shipment.created");
 //! ```
 
 use std::sync::Arc;
 
 use axum::Router;
-use boss_core::publisher::DomainPublisher;
-#[cfg(feature = "postgres")]
-use boss_events::PgAuditWriter;
 use boss_shipping::http::{ShippingApiState, router};
 use boss_shipping::in_memory::InMemoryShipping;
 use boss_shipping::types::*;
-use boss_testing::RecordingEventBus;
-#[cfg(feature = "postgres")]
-use sqlx::PgPool;
 
 /// A fully wired shipping service for tests:
-/// - InMemoryShipping repository
-/// - DomainPublisher backed by RecordingEventBus
+/// - InMemoryShipping repository (collects outbox-recorded events)
 /// - Axum Router ready to accept requests
 pub struct ShippingTestApp {
     pub router: Router,
-    #[allow(dead_code)]
-    pub bus: Arc<RecordingEventBus>,
+    pub shipping: Arc<InMemoryShipping>,
 }
 
 impl ShippingTestApp {
     /// Build a fresh test app with an empty shipment list.
-    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::with_shipments(vec![])
     }
 
     /// Build a test app pre-populated with the given shipments.
-    #[allow(dead_code)]
     pub fn with_shipments(shipments: Vec<Shipment>) -> Self {
         let shipping = Arc::new(InMemoryShipping::new(shipments));
-        let bus = RecordingEventBus::new();
-        let publisher = DomainPublisher::new(bus.clone(), "shipping");
         let state = ShippingApiState {
-            shipping,
-            publisher: Some(publisher),
+            shipping: shipping.clone(),
+            publisher: None,
             classes_client: None,
             clock: Arc::new(boss_clock_client::WallClockClient),
         };
         let router = router(state);
-        Self { router, bus }
+        Self { router, shipping }
     }
 
-    /// Build a test app whose publisher persists every emitted event
-    /// to the given Postgres pool's `audit_log` table. Used by the
-    /// audit_log E2E integration test.
-    #[cfg(feature = "postgres")]
-    pub fn with_audit_pool(pool: PgPool) -> Self {
-        let shipping = Arc::new(InMemoryShipping::new(vec![]));
-        let bus = RecordingEventBus::new();
-        let publisher = DomainPublisher::new(bus.clone(), "shipping")
-            .with_audit(Arc::new(PgAuditWriter::new(pool)));
-        let state = ShippingApiState {
-            shipping,
-            publisher: Some(publisher),
-            classes_client: None,
-            clock: Arc::new(boss_clock_client::WallClockClient),
-        };
-        let router = router(state);
-        Self { router, bus }
+    /// Assert exactly-one recorded event of `kind` and return it.
+    pub fn assert_recorded(&self, kind: &str) -> boss_core::event::Event {
+        let matches: Vec<_> = self
+            .shipping
+            .recorded_events()
+            .into_iter()
+            .filter(|e| e.kind == kind)
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one recorded `{kind}` event, got {}",
+            matches.len()
+        );
+        matches.into_iter().next().unwrap()
+    }
+
+    /// Assert no recorded event of `kind`.
+    pub fn assert_not_recorded(&self, kind: &str) {
+        assert!(
+            !self
+                .shipping
+                .recorded_events()
+                .iter()
+                .any(|e| e.kind == kind),
+            "expected no recorded `{kind}` event"
+        );
     }
 }
 
 /// Build a valid Shipment suitable for create/update tests.
-#[allow(dead_code)]
 pub fn shipment_fixture(id: &str) -> Shipment {
     Shipment {
         id: id.to_string(),

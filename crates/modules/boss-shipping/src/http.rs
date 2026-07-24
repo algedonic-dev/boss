@@ -263,24 +263,37 @@ async fn create_shipment<R: ShippingRepository + 'static>(
         return resp;
     }
     let now = boss_clock_client::now_from(&state.clock).await;
-    match state.shipping.create_shipment_at(&shipment, now).await {
-        Ok(id) => {
-            if let Some(pub_) = &state.publisher {
-                // State event — full Shipment row state.
-                let actor = user
-                    .ambient_actor()
-                    .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                pub_.emit_with_actor_at(
-                    crate::events::SHIPMENT_CREATED,
-                    actor,
-                    serde_json::to_value(&shipment).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            }
-            (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response()
-        }
+    // OUTBOX (phase 2): the adapter records shipping.shipment.created
+    // (full row state) inside the domain transaction; nothing
+    // publishes post-commit.
+    let stamp = event_stamp(&state, &user, now).await;
+    match state
+        .shipping
+        .create_shipment_at(&shipment, now, &stamp)
+        .await
+    {
+        Ok(id) => (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response(),
         Err(e) => shipping_error_response(e),
+    }
+}
+
+/// Resolve the outbox event stamp for this request: the caller's
+/// actor + the authoritative timestamp, with `_simulated` resolved by
+/// the publisher's clock probe when one is wired (task-local sim
+/// chain only, otherwise — the test paths). Every shipping mutation
+/// records its event in the DOMAIN TRANSACTION via this stamp
+/// (outbox phase 2); the publisher no longer publishes post-commit.
+async fn event_stamp<R: ShippingRepository>(
+    state: &ShippingApiState<R>,
+    user: &boss_policy_client::User,
+    now: chrono::DateTime<chrono::Utc>,
+) -> boss_core::publisher::EventStamp {
+    let actor = user
+        .ambient_actor()
+        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+    match &state.publisher {
+        Some(p) => p.stamp_with_actor_at(actor, now).await,
+        None => boss_core::publisher::EventStamp::new("shipping", actor, now),
     }
 }
 
@@ -289,11 +302,9 @@ async fn batch_shipments<R: ShippingRepository + 'static>(
     CurrentUser(user): CurrentUser,
     Json(shipments): Json<Vec<Shipment>>,
 ) -> Response {
-    let actor = user
-        .ambient_actor()
-        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
     let mut inserted = 0u64;
     let batch_now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, &user, batch_now).await;
     for s in &shipments {
         let now = batch_now;
         // Status + carrier registry gates — skip rows with an
@@ -315,17 +326,13 @@ async fn batch_shipments<R: ShippingRepository + 'static>(
         {
             continue;
         }
-        if state.shipping.create_shipment_at(s, now).await.is_ok() {
+        if state
+            .shipping
+            .create_shipment_at(s, now, &stamp)
+            .await
+            .is_ok()
+        {
             inserted += 1;
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_with_actor_at(
-                    crate::events::SHIPMENT_CREATED,
-                    actor.clone(),
-                    serde_json::to_value(s).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            }
         }
     }
     (
@@ -352,22 +359,13 @@ async fn update_shipment<R: ShippingRepository + 'static>(
         return resp;
     }
     let now = boss_clock_client::now_from(&state.clock).await;
-    match state.shipping.update_shipment_at(&id, &shipment, now).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                let actor = user
-                    .ambient_actor()
-                    .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                pub_.emit_with_actor_at(
-                    crate::events::SHIPMENT_UPDATED,
-                    actor,
-                    serde_json::to_value(&shipment).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    let stamp = event_stamp(&state, &user, now).await;
+    match state
+        .shipping
+        .update_shipment_at(&id, &shipment, now, &stamp)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => shipping_error_response(e),
     }
 }
@@ -377,23 +375,10 @@ async fn delete_shipment<R: ShippingRepository + 'static>(
     Path(id): Path<String>,
     CurrentUser(user): CurrentUser,
 ) -> Response {
-    match state.shipping.delete_shipment(&id).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                let now = boss_clock_client::now_from(&state.clock).await;
-                let actor = user
-                    .ambient_actor()
-                    .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                pub_.emit_with_actor_at(
-                    crate::events::SHIPMENT_DELETED,
-                    actor,
-                    serde_json::json!({ "id": id, "deleted_at": now }),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, &user, now).await;
+    match state.shipping.delete_shipment_at(&id, now, &stamp).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => shipping_error_response(e),
     }
 }
@@ -463,36 +448,22 @@ async fn record_tracking_scan<R: ShippingRepository + 'static>(
         }))
         .into_response();
     }
-    let occurred_on = body
-        .day
-        .unwrap_or(boss_clock_client::now_from(&state.clock).await.date_naive());
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let occurred_on = body.day.unwrap_or(now.date_naive());
+    let stamp = event_stamp(&state, &user, now).await;
 
     match state
         .shipping
-        .record_tracking_scan(&shipment_id, &body.status, occurred_on, body.stage_index)
+        .record_tracking_scan(
+            &shipment_id,
+            &body.status,
+            occurred_on,
+            body.stage_index,
+            &stamp,
+        )
         .await
     {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                let now = boss_clock_client::now_from(&state.clock).await;
-                let actor = user
-                    .ambient_actor()
-                    .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                pub_.emit_with_actor_at(
-                    crate::events::TRACKING_RECORDED,
-                    actor,
-                    serde_json::json!({
-                        "shipment_id": shipment_id,
-                        "status": body.status,
-                        "occurred_on": occurred_on,
-                        "stage_index": body.stage_index,
-                    }),
-                    now,
-                )
-                .await;
-            }
-            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
-        }
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         // Out-of-order scan or shipment not yet projected — return
         // 200 with skipped so the sim's error budget stays clean.
         Err(ShippingError::NotFound(_)) => Json(serde_json::json!({

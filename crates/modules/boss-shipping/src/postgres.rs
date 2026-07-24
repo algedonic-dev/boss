@@ -112,6 +112,7 @@ impl ShippingRepository for PgShipping {
         &self,
         shipment: &Shipment,
         now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<String, ShippingError> {
         let mut tx = self
             .pool
@@ -130,6 +131,15 @@ impl ShippingRepository for PgShipping {
         insert_shipment_row(&mut tx, shipment, now).await?;
         insert_shipment_assets(&mut tx, shipment).await?;
         replace_shipment_line_items(&mut tx, shipment).await?;
+        // OUTBOX (phase 2): the created event (full row state, matching
+        // the upsert semantics above) records with the rows.
+        let event = stamp.event(
+            crate::events::SHIPMENT_CREATED,
+            serde_json::to_value(shipment).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(ShippingError::Storage)?;
         tx.commit()
             .await
             .map_err(|e| ShippingError::Storage(e.to_string()))?;
@@ -141,6 +151,7 @@ impl ShippingRepository for PgShipping {
         id: &str,
         shipment: &Shipment,
         now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), ShippingError> {
         let mut tx = self
             .pool
@@ -171,6 +182,15 @@ impl ShippingRepository for PgShipping {
             .map_err(|e| ShippingError::Storage(e.to_string()))?;
         insert_shipment_assets(&mut tx, shipment).await?;
         replace_shipment_line_items(&mut tx, shipment).await?;
+        // OUTBOX (phase 2): the updated event (full row state)
+        // records with the rows.
+        let event = stamp.event(
+            crate::events::SHIPMENT_UPDATED,
+            serde_json::to_value(shipment).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(ShippingError::Storage)?;
         tx.commit()
             .await
             .map_err(|e| ShippingError::Storage(e.to_string()))?;
@@ -275,7 +295,12 @@ impl ShippingRepository for PgShipping {
         })
     }
 
-    async fn delete_shipment(&self, id: &str) -> Result<(), ShippingError> {
+    async fn delete_shipment_at(
+        &self,
+        id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), ShippingError> {
         let mut tx = self
             .pool
             .begin()
@@ -294,6 +319,16 @@ impl ShippingRepository for PgShipping {
         if result.rows_affected() == 0 {
             return Err(ShippingError::NotFound(id.to_string()));
         }
+        // OUTBOX (phase 2): the deleted event records only after the
+        // row actually deleted (NotFound above returns pre-recording,
+        // so a phantom delete records nothing).
+        let event = stamp.event(
+            crate::events::SHIPMENT_DELETED,
+            serde_json::json!({ "id": id, "deleted_at": now }),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(ShippingError::Storage)?;
         tx.commit()
             .await
             .map_err(|e| ShippingError::Storage(e.to_string()))?;
@@ -306,6 +341,7 @@ impl ShippingRepository for PgShipping {
         status: &str,
         occurred_on: chrono::NaiveDate,
         stage_index: Option<i16>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), ShippingError> {
         let mut tx = self
             .pool
@@ -339,7 +375,10 @@ impl ShippingRepository for PgShipping {
             }
             ShippingError::Storage(e.to_string())
         })?;
-        let _ = result;
+        // The ON CONFLICT DO NOTHING idempotency guard doubles as the
+        // event gate: a replayed scan inserts nothing and records
+        // nothing (structural emit-once).
+        let inserted = result.rows_affected() > 0;
 
         // Roll up the shipment row's `status` column when the
         // scan corresponds to one of the row-state values.
@@ -347,12 +386,18 @@ impl ShippingRepository for PgShipping {
         // doesn't change the rollup; in-transit and delivered
         // do. Mapping kept narrow on purpose so unknown statuses
         // (carrier-specific edges) don't silently mutate the row.
+        //
+        // Gated on `inserted`: a replayed scan (conflict-skip) already
+        // rolled up when it first landed. Re-running the rollup would
+        // let a stale redelivered scan REGRESS status (in-transit
+        // after delivered) with no event behind it — a live-vs-rebuilt
+        // divergence. The scan is a full no-op or a full fact.
         let row_status = match status {
             "in-transit" => Some("in-transit"),
             "delivered" => Some("delivered"),
             _ => None,
         };
-        if let Some(s) = row_status {
+        if inserted && let Some(s) = row_status {
             // shipped_on COALESCEs on EVERY row-status transition so
             // a delivered shipment with no preceding in-transit scan
             // (carrier consolidator that only emits a final delivery
@@ -375,6 +420,22 @@ impl ShippingRepository for PgShipping {
             .execute(&mut *tx)
             .await
             .map_err(|e| ShippingError::Storage(e.to_string()))?;
+        }
+
+        if inserted {
+            // OUTBOX (phase 2): the scan event records with the row.
+            let event = stamp.event(
+                crate::events::TRACKING_RECORDED,
+                serde_json::json!({
+                    "shipment_id": shipment_id,
+                    "status": status,
+                    "occurred_on": occurred_on,
+                    "stage_index": stage_index,
+                }),
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(ShippingError::Storage)?;
         }
 
         tx.commit()
