@@ -340,10 +340,25 @@ echo "==> [2.6/10] seeding operator-baseline hires into audit_log"
 # seed binary also falls back to the first credentials.toml email
 # when this var is unset. Either path provisions the platform-admin
 # as part of system init; the gateway login no longer auto-creates.
+#
+# Since Q7 (every Job names a human owner), the platform-admin is
+# STRUCTURALLY required from empty: publish_job_kinds opens
+# `job-kind-design` Jobs whose owner resolves via role
+# `platform-admin`, and the brewery roster seeds no holder of it —
+# emp-bootstrap-admin IS the holder. The install launchers hard-fail
+# without an admin email (quickstart `:?`); this harness instead
+# provisions a deterministic validation identity when neither the
+# env var nor a readable credentials file supplies one (pristine
+# CI runners / regen VMs), so from-empty validation stays viable.
+BOSS_AUTH_FILE="${BOSS_AUTH_FILE:-/var/lib/boss/auth/credentials.toml}"
+if [[ -z "${BOSS_BOOTSTRAP_ADMIN_EMAIL:-}" && ! -r "$BOSS_AUTH_FILE" ]]; then
+    BOSS_BOOTSTRAP_ADMIN_EMAIL="validation-admin@boss.local"
+    echo "    (no admin email/credentials — provisioning ${BOSS_BOOTSTRAP_ADMIN_EMAIL})"
+fi
 DATABASE_URL="postgres://boss:boss@127.0.0.1/boss" \
 BOSS_EPOCH_START="$START" \
 BOSS_BOOTSTRAP_ADMIN_EMAIL="${BOSS_BOOTSTRAP_ADMIN_EMAIL:-}" \
-BOSS_AUTH_FILE="${BOSS_AUTH_FILE:-/var/lib/boss/auth/credentials.toml}" \
+BOSS_AUTH_FILE="$BOSS_AUTH_FILE" \
     "$REPO_ROOT/target/release/boss-operator-baseline-seed" \
     --seed-path "$REPO_ROOT/infra/operator-baseline/operator_hires.toml" \
     | grep -E "operator hired|seed complete|skipping|bootstrap-admin" || true
