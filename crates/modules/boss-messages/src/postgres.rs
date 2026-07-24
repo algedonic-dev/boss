@@ -54,18 +54,48 @@ impl MessageRepository for PgMessages {
         Ok(row.map(|r| r.into_message()))
     }
 
-    async fn mark_read(&self, id: &str, read_at: DateTime<Utc>) -> Result<(), MessageError> {
-        sqlx::query("UPDATE messages SET read_at = $1 WHERE id = $2")
+    async fn mark_read(
+        &self,
+        id: &str,
+        read_at: DateTime<Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), MessageError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| MessageError::Storage(e.to_string()))?;
+        let result = sqlx::query("UPDATE messages SET read_at = $1 WHERE id = $2")
             .bind(read_at)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| MessageError::Storage(e.to_string()))?;
+        // OUTBOX (phase 2): the read event records with the update —
+        // and only when a row actually updated. A phantom id keeps
+        // the endpoint's tolerant 200 but records no event (before,
+        // it published a read event for a nonexistent message).
+        if result.rows_affected() > 0 {
+            let event = stamp.event(
+                crate::events::MESSAGE_READ,
+                serde_json::json!({ "id": id, "read_at": read_at }),
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(MessageError::Storage)?;
+        }
+        tx.commit()
             .await
             .map_err(|e| MessageError::Storage(e.to_string()))?;
 
         Ok(())
     }
 
-    async fn send(&self, msg: &Message) -> Result<(), MessageError> {
+    async fn send(
+        &self,
+        msg: &Message,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), MessageError> {
         // Transparent newtype — the bare kebab code the column stores.
         let kind_str = msg.kind.as_str();
         let (entity_type, entity_id, entity_path) = match &msg.entity_ref {
@@ -86,7 +116,7 @@ impl MessageRepository for PgMessages {
         boss_subject_kinds::subjects::record_subject_in_tx(&mut tx, "message", &msg.id, None)
             .await
             .map_err(MessageError::Storage)?;
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO messages (id, sender_id, recipient_id, subject, body, entity_type, entity_id, entity_path, kind, sent_at, reply_to) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
              ON CONFLICT (id) DO NOTHING",
@@ -105,6 +135,21 @@ impl MessageRepository for PgMessages {
         .execute(&mut *tx)
         .await
         .map_err(|e| MessageError::Storage(e.to_string()))?;
+        // OUTBOX (phase 2): the sent event (full row state) records
+        // with the row — and only when the INSERT actually inserted.
+        // The ON CONFLICT (id) DO NOTHING idempotency guard doubles
+        // as the event gate: a redelivered notification collapses
+        // and records nothing (before, it published a duplicate
+        // sent event per redelivery).
+        if result.rows_affected() > 0 {
+            let event = stamp.event(
+                crate::events::MESSAGE_SENT,
+                serde_json::to_value(msg).unwrap_or_else(|_| serde_json::json!({ "id": msg.id })),
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(MessageError::Storage)?;
+        }
         tx.commit()
             .await
             .map_err(|e| MessageError::Storage(e.to_string()))?;
@@ -112,16 +157,38 @@ impl MessageRepository for PgMessages {
         Ok(())
     }
 
-    async fn delete_message(&self, id: &str) -> Result<(), MessageError> {
+    async fn delete_message(
+        &self,
+        id: &str,
+        now: DateTime<Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), MessageError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| MessageError::Storage(e.to_string()))?;
         let result = sqlx::query("DELETE FROM messages WHERE id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| MessageError::Storage(e.to_string()))?;
 
         if result.rows_affected() == 0 {
             return Err(MessageError::NotFound(format!("no message with ID {id}")));
         }
+        // OUTBOX (phase 2): the deleted event records only after the
+        // row actually deleted (NotFound above returns pre-recording).
+        let event = stamp.event(
+            crate::events::MESSAGE_DELETED,
+            serde_json::json!({ "id": id, "deleted_at": now }),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(MessageError::Storage)?;
+        tx.commit()
+            .await
+            .map_err(|e| MessageError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -141,16 +208,38 @@ impl MessageRepository for PgMessages {
         Ok(rows.into_iter().map(|r| r.into_message()).collect())
     }
 
-    async fn archive_message(&self, id: &str) -> Result<(), MessageError> {
+    async fn archive_message(
+        &self,
+        id: &str,
+        now: DateTime<Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), MessageError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| MessageError::Storage(e.to_string()))?;
         let result = sqlx::query("UPDATE messages SET kind = 'archived' WHERE id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| MessageError::Storage(e.to_string()))?;
 
         if result.rows_affected() == 0 {
             return Err(MessageError::NotFound(format!("no message with ID {id}")));
         }
+        // OUTBOX (phase 2): the archived event records only after the
+        // row actually updated.
+        let event = stamp.event(
+            crate::events::MESSAGE_ARCHIVED,
+            serde_json::json!({ "id": id, "archived_at": now }),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(MessageError::Storage)?;
+        tx.commit()
+            .await
+            .map_err(|e| MessageError::Storage(e.to_string()))?;
         Ok(())
     }
 }

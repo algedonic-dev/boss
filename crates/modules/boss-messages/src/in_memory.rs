@@ -9,12 +9,26 @@ use crate::types::{Message, MessageKind};
 
 pub struct InMemoryMessages {
     messages: RwLock<Vec<Message>>,
+    recorded: std::sync::Mutex<Vec<boss_core::event::Event>>,
 }
 
 impl InMemoryMessages {
     pub fn new(messages: Vec<Message>) -> Self {
         Self {
             messages: RwLock::new(messages),
+            recorded: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Events the outbox paths recorded — test visibility (the
+    /// in-memory analogue of the Pg adapter's in-tx recording).
+    pub fn recorded_events(&self) -> Vec<boss_core::event::Event> {
+        self.recorded.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    fn record(&self, event: boss_core::event::Event) {
+        if let Ok(mut v) = self.recorded.lock() {
+            v.push(event);
         }
     }
 }
@@ -46,37 +60,96 @@ impl MessageRepository for InMemoryMessages {
         Ok(guard.iter().find(|m| m.id == id).cloned())
     }
 
-    async fn mark_read(&self, id: &str, read_at: DateTime<Utc>) -> Result<(), MessageError> {
-        let mut guard = self.messages.write().await;
-        if let Some(msg) = guard.iter_mut().find(|m| m.id == id) {
-            msg.read_at = Some(read_at);
+    async fn mark_read(
+        &self,
+        id: &str,
+        read_at: DateTime<Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), MessageError> {
+        let updated = {
+            let mut guard = self.messages.write().await;
+            match guard.iter_mut().find(|m| m.id == id) {
+                Some(msg) => {
+                    msg.read_at = Some(read_at);
+                    true
+                }
+                None => false,
+            }
+        };
+        // Mirrors the Pg gate: a phantom id records nothing.
+        if updated {
+            self.record(stamp.event(
+                crate::events::MESSAGE_READ,
+                serde_json::json!({ "id": id, "read_at": read_at }),
+            ));
         }
         Ok(())
     }
 
-    async fn send(&self, msg: &Message) -> Result<(), MessageError> {
-        self.messages.write().await.push(msg.clone());
-        Ok(())
-    }
-
-    async fn delete_message(&self, id: &str) -> Result<(), MessageError> {
-        let mut guard = self.messages.write().await;
-        let len_before = guard.len();
-        guard.retain(|m| m.id != id);
-        if guard.len() == len_before {
-            return Err(MessageError::NotFound(format!("no message with ID {id}")));
+    async fn send(
+        &self,
+        msg: &Message,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), MessageError> {
+        // Mirrors the Pg ON CONFLICT (id) DO NOTHING collapse: a
+        // duplicate id is an idempotent no-op and records nothing.
+        let inserted = {
+            let mut guard = self.messages.write().await;
+            if guard.iter().any(|m| m.id == msg.id) {
+                false
+            } else {
+                guard.push(msg.clone());
+                true
+            }
+        };
+        if inserted {
+            self.record(stamp.event(
+                crate::events::MESSAGE_SENT,
+                serde_json::to_value(msg).unwrap_or_else(|_| serde_json::json!({ "id": msg.id })),
+            ));
         }
         Ok(())
     }
 
-    async fn archive_message(&self, id: &str) -> Result<(), MessageError> {
-        let mut guard = self.messages.write().await;
-        if let Some(msg) = guard.iter_mut().find(|m| m.id == id) {
-            msg.kind = MessageKind::ARCHIVED.into();
-            Ok(())
-        } else {
-            Err(MessageError::NotFound(format!("no message with ID {id}")))
+    async fn delete_message(
+        &self,
+        id: &str,
+        now: DateTime<Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), MessageError> {
+        {
+            let mut guard = self.messages.write().await;
+            let len_before = guard.len();
+            guard.retain(|m| m.id != id);
+            if guard.len() == len_before {
+                return Err(MessageError::NotFound(format!("no message with ID {id}")));
+            }
         }
+        self.record(stamp.event(
+            crate::events::MESSAGE_DELETED,
+            serde_json::json!({ "id": id, "deleted_at": now }),
+        ));
+        Ok(())
+    }
+
+    async fn archive_message(
+        &self,
+        id: &str,
+        now: DateTime<Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), MessageError> {
+        {
+            let mut guard = self.messages.write().await;
+            match guard.iter_mut().find(|m| m.id == id) {
+                Some(msg) => msg.kind = MessageKind::ARCHIVED.into(),
+                None => return Err(MessageError::NotFound(format!("no message with ID {id}"))),
+            }
+        }
+        self.record(stamp.event(
+            crate::events::MESSAGE_ARCHIVED,
+            serde_json::json!({ "id": id, "archived_at": now }),
+        ));
+        Ok(())
     }
 
     async fn thread(&self, message_id: &str) -> Result<Vec<Message>, MessageError> {
@@ -110,6 +183,14 @@ mod tests {
             read_at: if read { Some(Utc::now()) } else { None },
             reply_to: None,
         }
+    }
+
+    fn test_stamp() -> boss_core::publisher::EventStamp {
+        boss_core::publisher::EventStamp::new(
+            "messages",
+            boss_core::actor::ActorId::Automation("test".into()),
+            Utc::now(),
+        )
     }
 
     fn test_repo() -> InMemoryMessages {
@@ -177,7 +258,9 @@ mod tests {
                 .read_at
                 .is_none()
         );
-        repo.mark_read("msg-001", Utc::now()).await.unwrap();
+        repo.mark_read("msg-001", Utc::now(), &test_stamp())
+            .await
+            .unwrap();
         let msg = repo.message_by_id("msg-001").await.unwrap().unwrap();
         assert!(msg.read_at.is_some());
     }
@@ -186,7 +269,9 @@ mod tests {
     async fn mark_read_reduces_unread_count() {
         let repo = test_repo();
         let before = repo.unread_count("emp-001").await.unwrap();
-        repo.mark_read("msg-001", Utc::now()).await.unwrap();
+        repo.mark_read("msg-001", Utc::now(), &test_stamp())
+            .await
+            .unwrap();
         let after = repo.unread_count("emp-001").await.unwrap();
         assert_eq!(after, before - 1);
     }
@@ -195,21 +280,28 @@ mod tests {
     async fn delete_message_removes_it() {
         let repo = test_repo();
         assert!(repo.message_by_id("msg-001").await.unwrap().is_some());
-        repo.delete_message("msg-001").await.unwrap();
+        repo.delete_message("msg-001", Utc::now(), &test_stamp())
+            .await
+            .unwrap();
         assert!(repo.message_by_id("msg-001").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn delete_message_not_found() {
         let repo = test_repo();
-        let err = repo.delete_message("msg-999").await.unwrap_err();
+        let err = repo
+            .delete_message("msg-999", Utc::now(), &test_stamp())
+            .await
+            .unwrap_err();
         assert!(matches!(err, MessageError::NotFound(_)));
     }
 
     #[tokio::test]
     async fn archive_message_sets_kind() {
         let repo = test_repo();
-        repo.archive_message("msg-001").await.unwrap();
+        repo.archive_message("msg-001", Utc::now(), &test_stamp())
+            .await
+            .unwrap();
         let msg = repo.message_by_id("msg-001").await.unwrap().unwrap();
         assert_eq!(msg.kind.as_str(), MessageKind::ARCHIVED);
     }
@@ -217,7 +309,10 @@ mod tests {
     #[tokio::test]
     async fn archive_message_not_found() {
         let repo = test_repo();
-        let err = repo.archive_message("msg-999").await.unwrap_err();
+        let err = repo
+            .archive_message("msg-999", Utc::now(), &test_stamp())
+            .await
+            .unwrap_err();
         assert!(matches!(err, MessageError::NotFound(_)));
     }
 }

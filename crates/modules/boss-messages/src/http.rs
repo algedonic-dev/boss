@@ -71,22 +71,16 @@ async fn batch_messages<R: MessageRepository + 'static>(
     Json(body): Json<Vec<Message>>,
 ) -> Response {
     let now = boss_clock_client::now_from(&state.clock).await;
+    // OUTBOX (phase 2): the adapter records MESSAGE_SENT per row in
+    // the domain transaction, so the messages rebuilder can reproduce
+    // the projection from audit_log alone — otherwise sim-seeded
+    // chatter and bulk imports would be wiped on the next
+    // boss-rebuild-all cycle.
+    let stamp = event_stamp(&state, now).await;
     let mut inserted = 0usize;
     for msg in &body {
-        if let Err(e) = state.messages.send(msg).await {
+        if let Err(e) = state.messages.send(msg, &stamp).await {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-        // Emit MESSAGE_SENT per row so the messages rebuilder can
-        // reproduce the projection from audit_log alone — otherwise
-        // sim-seeded chatter and bulk imports would be wiped on the
-        // next boss-rebuild-all cycle.
-        if let Some(pub_) = &state.publisher {
-            pub_.emit_at(
-                crate::events::MESSAGE_SENT,
-                serde_json::to_value(msg).unwrap_or_else(|_| serde_json::json!({"id": msg.id})),
-                now,
-            )
-            .await;
         }
         inserted += 1;
     }
@@ -108,6 +102,26 @@ async fn health() -> Json<boss_core::startup::HealthResponse> {
         env!("CARGO_PKG_VERSION"),
         STORAGE,
     ))
+}
+
+/// Resolve the outbox event stamp for this request. Messages write
+/// handlers carry no CurrentUser extractor; the publisher's
+/// `default_actor` resolves the request identity from the task-local
+/// context (else `automation:messages`), and its clock probe settles
+/// `_simulated` — the same envelope the retired post-commit emits
+/// carried (outbox phase 2).
+async fn event_stamp<R: MessageRepository>(
+    state: &MessageApiState<R>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> boss_core::publisher::EventStamp {
+    match &state.publisher {
+        Some(p) => p.stamp_with_actor_at(p.default_actor(), now).await,
+        None => boss_core::publisher::EventStamp::new(
+            "messages",
+            boss_core::actor::ActorId::Automation("messages".into()),
+            now,
+        ),
+    }
 }
 
 #[derive(Serialize)]
@@ -179,21 +193,9 @@ async fn mark_read<R: MessageRepository + 'static>(
     // write and the event payload, so a rebuild from audit_log
     // produces an identical `read_at` value.
     let read_at = boss_clock_client::now_from(&state.clock).await;
-    match state.messages.mark_read(&id, read_at).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    crate::events::MESSAGE_READ,
-                    serde_json::json!({
-                        "id": id,
-                        "read_at": read_at,
-                    }),
-                    read_at,
-                )
-                .await;
-            }
-            Json(OkResponse { ok: true }).into_response()
-        }
+    let stamp = event_stamp(&state, read_at).await;
+    match state.messages.mark_read(&id, read_at, &stamp).await {
+        Ok(()) => Json(OkResponse { ok: true }).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -202,22 +204,10 @@ async fn delete_message<R: MessageRepository + 'static>(
     State(state): State<Arc<MessageApiState<R>>>,
     Path(id): Path<String>,
 ) -> Response {
-    match state.messages.delete_message(&id).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                let now = boss_clock_client::now_from(&state.clock).await;
-                pub_.emit_at(
-                    crate::events::MESSAGE_DELETED,
-                    serde_json::json!({
-                        "id": id,
-                        "deleted_at": now,
-                    }),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
+    match state.messages.delete_message(&id, now, &stamp).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(MessageError::NotFound(msg)) => (StatusCode::NOT_FOUND, msg).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -227,22 +217,10 @@ async fn archive_message<R: MessageRepository + 'static>(
     State(state): State<Arc<MessageApiState<R>>>,
     Path(id): Path<String>,
 ) -> Response {
-    match state.messages.archive_message(&id).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                let now = boss_clock_client::now_from(&state.clock).await;
-                pub_.emit_at(
-                    crate::events::MESSAGE_ARCHIVED,
-                    serde_json::json!({
-                        "id": id,
-                        "archived_at": now,
-                    }),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
+    match state.messages.archive_message(&id, now, &stamp).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(MessageError::NotFound(msg)) => (StatusCode::NOT_FOUND, msg).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -346,27 +324,16 @@ async fn send_message<R: MessageRepository + 'static>(
         reply_to: body.reply_to,
     };
 
-    match state.messages.send(&msg).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                // Full row state so the rebuilder can reconstruct
-                // the messages projection from this event alone. Any
-                // listener that needs only the id can still pluck it
-                // out of `payload.id`.
-                pub_.emit_at(
-                    crate::events::MESSAGE_SENT,
-                    serde_json::to_value(&msg)
-                        .unwrap_or_else(|_| serde_json::json!({ "id": msg.id })),
-                    msg.sent_at,
-                )
-                .await;
-            }
-            (
-                StatusCode::CREATED,
-                Json(serde_json::json!({"ok": true, "id": msg.id})),
-            )
-                .into_response()
-        }
+    // OUTBOX (phase 2): the adapter records MESSAGE_SENT (full row
+    // state, so the rebuilder can reconstruct the projection from
+    // this event alone) inside the domain transaction.
+    let stamp = event_stamp(&state, msg.sent_at).await;
+    match state.messages.send(&msg, &stamp).await {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"ok": true, "id": msg.id})),
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

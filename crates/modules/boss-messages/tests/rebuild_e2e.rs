@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::http::StatusCode;
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
+use boss_core::port::EventBus;
+use boss_events::outbox::drain_outbox_once;
 use boss_messages::PgMessages;
 use boss_messages::http::{MessageApiState, router};
 use boss_messages::rebuild_messages;
@@ -47,17 +47,24 @@ async fn snapshot_messages(pool: &sqlx::PgPool) -> Vec<MessageRow> {
 }
 
 fn build_app(pool: sqlx::PgPool) -> Router {
-    let repo = Arc::new(PgMessages::new(pool.clone()));
-    let bus = RecordingEventBus::new();
-    let publisher = DomainPublisher::new(bus.clone(), "messages")
-        .with_audit(Arc::new(PgAuditWriter::new(pool)));
+    // No publisher, no direct audit writer: events reach audit_log
+    // only via the outbox -> relay drain.
     let state = MessageApiState {
-        messages: repo,
-        publisher: Some(publisher),
+        messages: Arc::new(PgMessages::new(pool)),
+        publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
         classes_client: None,
     };
     router(state)
+}
+
+/// Drain the outbox through the relay pipeline into audit_log.
+async fn drain_outbox(pool: &sqlx::PgPool) -> u64 {
+    let bus = RecordingEventBus::new();
+    drain_outbox_once(pool, &(bus as Arc<dyn EventBus>), 100)
+        .await
+        .expect("relay drain")
+        .delivered
 }
 
 async fn send_message(router: &Router, sender: &str, recipient: &str, subject: &str) -> String {
@@ -106,8 +113,11 @@ async fn rebuild_reproduces_projection_after_drop() {
         .await
         .assert_status(StatusCode::NO_CONTENT);
 
-    // 2. Snapshot the projection. m4 should be gone (deleted), m2's
-    //    kind should be 'archived', m1+m3 should have read_at set.
+    // 2. Drain the outbox into audit_log, then snapshot the
+    //    projection. m4 should be gone (deleted), m2's kind should
+    //    be 'archived', m1+m3 should have read_at set.
+    let delivered = drain_outbox(&db.pool).await;
+    assert_eq!(delivered, 8, "4 sent + 2 read + 1 archived + 1 deleted");
     let before = snapshot_messages(&db.pool).await;
     assert_eq!(before.len(), 3, "post-delete count");
     let archived: Vec<_> = before.iter().filter(|r| r.kind == "archived").collect();
@@ -167,6 +177,8 @@ async fn rebuild_is_idempotent() {
         .await
         .assert_status(StatusCode::OK);
 
+    let delivered = drain_outbox(&db.pool).await;
+    assert_eq!(delivered, 3, "2 sent + 1 read arrive via the outbox");
     let baseline = snapshot_messages(&db.pool).await;
 
     // Two consecutive rebuilds should both land on the same state.

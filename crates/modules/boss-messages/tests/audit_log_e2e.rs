@@ -1,17 +1,37 @@
-//! End-to-end test for the messages → audit_log chain.
+//! End-to-end test for the messages → audit_log chain, on the REAL
+//! pipeline (outbox phase 2): the POST records the event on the
+//! transactional outbox inside the adapter's tx; the relay drain
+//! moves it to audit_log. Deliberately NO direct audit writer — this
+//! test only passes through the real outbox → relay → audit_log path.
 
 #![cfg(feature = "postgres")]
 
-mod common;
+use std::sync::Arc;
 
+use axum::Router;
 use axum::http::StatusCode;
-use boss_testing::{TestDb, TestRequest};
-use common::MessageTestApp;
+use boss_core::port::EventBus;
+use boss_events::outbox::drain_outbox_once;
+use boss_messages::PgMessages;
+use boss_messages::http::{MessageApiState, router};
+use boss_testing::{RecordingEventBus, TestDb, TestRequest};
+use sqlx::PgPool;
+
+fn build_app(pool: PgPool) -> Router {
+    // No publisher: the handler stamp falls back to source="messages"
+    // and the event records on the outbox.
+    router(MessageApiState {
+        messages: Arc::new(PgMessages::new(pool)),
+        publisher: None,
+        clock: Arc::new(boss_clock_client::WallClockClient),
+        classes_client: None,
+    })
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn send_message_lands_in_audit_log() {
     let db = TestDb::new().await;
-    let app = MessageTestApp::with_audit_pool(db.pool.clone());
+    let app = build_app(db.pool.clone());
 
     let body = serde_json::json!({
         "sender_id": "emp-sender",
@@ -22,9 +42,17 @@ async fn send_message_lands_in_audit_log() {
     });
     TestRequest::post("/api/messages/send")
         .json(&body)
-        .send(&app.router)
+        .send(&app)
         .await
         .assert_status(StatusCode::CREATED);
+
+    // Drain the outbox through the relay pipeline: outbox →
+    // audit_log (chained) → bus → delivered.
+    let bus = RecordingEventBus::new();
+    let stats = drain_outbox_once(&db.pool, &(bus as Arc<dyn EventBus>), 100)
+        .await
+        .expect("relay drain");
+    assert_eq!(stats.delivered, 1, "the send arrives via the outbox");
 
     let row: (String, String) = sqlx::query_as(
         "SELECT source, kind FROM audit_log \
@@ -33,7 +61,7 @@ async fn send_message_lands_in_audit_log() {
     )
     .fetch_one(&db.pool)
     .await
-    .expect("audit_log row should exist after POST");
+    .expect("audit_log row should exist after POST + drain");
 
     assert_eq!(row.0, "messages");
     assert_eq!(row.1, "messages.message.sent");
