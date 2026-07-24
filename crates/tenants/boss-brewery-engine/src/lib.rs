@@ -913,6 +913,22 @@ pub fn run_brewery_live(
     output: &mut dyn SimOutput,
 ) -> Result<RunReport> {
     let mut engine = BreweryEngineState::load(seeds, calendars_from_seeds(seeds))?;
+
+    // Identity rows for the pool campaigns (a table-less Subject
+    // kind): they must exist before the first tap-launch Job meets
+    // the uniform subject-existence gate — the same minting the
+    // daemon runs after its readiness gate. The bounded regen path
+    // skipped it, so a from-empty run died on the first campaign
+    // Job (`subject does not exist: campaign/cmp-anniversary`).
+    // Best-effort per id (refusals log and move on).
+    let campaign_ids = engine
+        .state
+        .subjects
+        .get("campaign")
+        .cloned()
+        .unwrap_or_default();
+    mint_campaign_identities(&campaign_ids, api_base);
+
     let start = start.unwrap_or(engine.tenant.meta.start_date);
     let end = start + chrono::Duration::days(days as i64 - 1);
     let ticks_per_day = engine.tenant.meta.ticks_per_day();
