@@ -1,9 +1,10 @@
 //! Service agreement endpoints — contract management for accounts.
 //!
-//! Audit-chain note: POST routes through `DomainPublisher` so every
-//! agreement upsert lands in `audit_log`. `rebuild_commerce`
-//! consumes `commerce.service_agreement.upserted` and reproduces
-//! the projection from the log alone.
+//! Audit-chain note: the POST records
+//! `commerce.service_agreement.upserted` on the transactional outbox
+//! INSIDE the upsert's transaction (outbox phase 2); boss-event-relay
+//! moves it to `audit_log`, and `rebuild_commerce` reproduces the
+//! projection from the log alone.
 
 use std::sync::Arc;
 
@@ -120,16 +121,38 @@ async fn create_agreement(
     State(state): State<AgreementsState>,
     Json(req): Json<ServiceAgreement>,
 ) -> Response {
-    if let Err(e) = upsert_agreement(state.pool.as_ref(), &req).await {
+    let now = state.clock.now().await.now;
+    // Outbox phase 2: the state event records in the SAME tx as the
+    // upsert. This surface carries no CurrentUser extractor, so the
+    // actor is the publisher's default.
+    let stamp = match &state.publisher {
+        Some(p) => p.stamp_with_actor_at(p.default_actor(), now).await,
+        None => boss_core::publisher::EventStamp::new(
+            "commerce",
+            boss_core::actor::ActorId::Automation("platform".into()),
+            now,
+        ),
+    };
+    let mut tx = match state.pool.begin().await {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    if let Err(e) = upsert_agreement(&mut *tx, &req).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
-    if let Some(pub_) = &state.publisher {
-        pub_.emit_at(
+    if let Err(e) = boss_events::outbox::record_event_in_tx(
+        &mut tx,
+        &stamp.event(
             SERVICE_AGREEMENT_UPSERTED,
             serde_json::to_value(&req).unwrap_or_default(),
-            state.clock.now().await.now,
-        )
-        .await;
+        ),
+    )
+    .await
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    if let Err(e) = tx.commit().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
     (
         StatusCode::CREATED,

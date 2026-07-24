@@ -126,6 +126,12 @@ jobs:
       - name: No-wallclock (timestamps route through clock-api)
         run: infra/lint/no-wallclock.sh
 
+      # Outbox phase 2: migrated crates record events in the domain
+      # transaction; post-commit publisher emits are pinned per crate
+      # and only ratchet down.
+      - name: Outbox migration ratchet (events record in-tx)
+        run: infra/lint/outbox-migration-ratchet.sh
+
   web:
     runs-on: ubuntu-latest
     steps:

@@ -1,7 +1,7 @@
-//! Audit-chain test for `service_agreements`.
-//!
-//! The agreements POST handler must emit an audit_log event for every
-//! write, and `rebuild_commerce` must replay it — otherwise every
+//! Audit-chain test for `service_agreements`, on the REAL pipeline
+//! (outbox phase 2): the POST records the event on the transactional
+//! outbox inside the upsert's tx; the relay drain moves it to
+//! audit_log, and `rebuild_commerce` must replay it — otherwise every
 //! agreement disappears on rebuild.
 
 #![cfg(feature = "postgres")]
@@ -12,8 +12,8 @@ use axum::Router;
 use axum::http::StatusCode;
 use boss_commerce::agreements::agreements_router;
 use boss_commerce::rebuild_commerce;
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
+use boss_core::port::EventBus;
+use boss_events::outbox::drain_outbox_once;
 use boss_testing::{RecordingEventBus, TestDb, TestRequest};
 use sqlx::PgPool;
 
@@ -36,13 +36,11 @@ async fn snapshot(pool: &PgPool) -> Vec<AgreementRow> {
 }
 
 fn build_app(pool: PgPool) -> Router {
-    let publisher = DomainPublisher::new(RecordingEventBus::new(), "commerce")
-        .with_audit(Arc::new(PgAuditWriter::new(pool.clone())));
-    agreements_router(
-        pool,
-        Some(publisher),
-        Arc::new(boss_clock_client::WallClockClient),
-    )
+    // No publisher: the handler stamp falls back to source="commerce"
+    // and the event records on the outbox — deliberately NO direct
+    // audit writer, so this test only passes through the real
+    // outbox → relay → audit_log path.
+    agreements_router(pool, None, Arc::new(boss_clock_client::WallClockClient))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -98,6 +96,14 @@ async fn agreement_survives_rebuild() {
         .send(&app)
         .await
         .assert_status(StatusCode::CREATED);
+
+    // Drain the outbox through the relay pipeline: outbox →
+    // audit_log (chained) → bus → delivered. Rebuild reads audit_log.
+    let bus = RecordingEventBus::new();
+    let stats = drain_outbox_once(&db.pool, &(bus as Arc<dyn EventBus>), 100)
+        .await
+        .expect("relay drain");
+    assert_eq!(stats.delivered, 2, "both upserts arrive via the outbox");
 
     let pre = snapshot(&db.pool).await;
     assert_eq!(pre.len(), 1);
