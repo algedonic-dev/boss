@@ -21,37 +21,31 @@
 //! Postgres treats NULLs as distinct in the unique index, so each
 //! manual-entry call inserts a fresh row.
 
-use std::sync::Arc;
-
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::NaiveDate;
 use serde_json::Value;
 use sqlx::Postgres;
 use uuid::Uuid;
 
-use boss_core::publisher::DomainPublisher;
-
 use crate::error::LedgerError;
 
-/// Fire the upstream `ledger.*` event for a fact-write site. Wraps
-/// the fire-and-forget pattern: emit when a publisher is configured,
-/// no-op otherwise. The `recorded_at` timestamp is stamped onto the
-/// audit_log row so a rebuild from audit_log produces identical
-/// `created_at` ordering to the live system.
-///
-/// Called *after* the caller's transaction commits — same fire-and-
-/// forget contract every other service uses. A delayed/failed emit
-/// is recoverable: the natural-key idempotency on `(kind,
-/// source_table, source_id)` means a follow-up emit that lands won't
-/// double-write the fact.
-pub async fn emit_after_commit(
-    publisher: &Option<Arc<DomainPublisher>>,
+/// Record the upstream `ledger.*` event for a fact-write site ON THE
+/// TRANSACTIONAL OUTBOX, in the SAME transaction as the fact (outbox
+/// phase 2) — the fact and its rebuild source commit or abort
+/// together, and `boss-event-relay` (not the handler) delivers to
+/// audit_log + NATS post-commit. Replaces the old post-commit
+/// `emit_after_commit` fire-and-forget, whose crash window (fact
+/// committed, emit lost) left live facts with no event to rebuild
+/// from — the deep replay-check surfaced those as
+/// live-fact-without-event divergences.
+pub async fn record_ledger_event_in_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    stamp: &boss_core::publisher::EventStamp,
     kind: &str,
     payload: Value,
-    recorded_at: DateTime<Utc>,
-) {
-    if let Some(p) = publisher {
-        p.emit_at(kind, payload, recorded_at).await;
-    }
+) -> Result<(), LedgerError> {
+    boss_events::outbox::record_event_in_tx(tx, &stamp.event(kind, payload))
+        .await
+        .map_err(LedgerError::Storage)
 }
 
 /// Namespace UUID for deterministic fact ids — UUIDv5 over the natural

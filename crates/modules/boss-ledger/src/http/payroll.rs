@@ -171,17 +171,27 @@ pub(super) async fn create_payroll_run(
         return ledger_err(e);
     }
 
+    // Outbox phase 2: the audit event records in the SAME tx as the
+    // fact + JE, so a crash can no longer commit the run without its
+    // rebuild source.
+    {
+        let now = boss_clock_client::now_from(&state.clock).await;
+        let stamp = super::event_stamp(&state, &user, now).await;
+        if let Err(e) = crate::events::record_ledger_event_in_tx(
+            &mut tx,
+            &stamp,
+            "ledger.payroll.run",
+            payload.clone(),
+        )
+        .await
+        {
+            return ledger_err(e);
+        }
+    }
+
     if let Err(e) = tx.commit().await {
         return storage_err(e);
     }
-
-    crate::events::emit_after_commit(
-        &state.publisher,
-        "ledger.payroll.run",
-        payload.clone(),
-        boss_clock_client::now_from(&state.clock).await,
-    )
-    .await;
 
     Json(PayrollRunView::from(run)).into_response()
 }
@@ -390,17 +400,27 @@ pub(super) async fn synthesize_payroll_run(
         return ledger_err(e);
     }
 
+    // Outbox phase 2: the audit event records in the SAME tx as the
+    // fact + JE, so a crash can no longer commit the run without its
+    // rebuild source.
+    {
+        let now = boss_clock_client::now_from(&state.clock).await;
+        let stamp = super::event_stamp(&state, &user, now).await;
+        if let Err(e) = crate::events::record_ledger_event_in_tx(
+            &mut tx,
+            &stamp,
+            "ledger.payroll.run",
+            payload.clone(),
+        )
+        .await
+        {
+            return ledger_err(e);
+        }
+    }
+
     if let Err(e) = tx.commit().await {
         return storage_err(e);
     }
-
-    crate::events::emit_after_commit(
-        &state.publisher,
-        "ledger.payroll.run",
-        payload.clone(),
-        boss_clock_client::now_from(&state.clock).await,
-    )
-    .await;
 
     Json(PayrollRunView::from(run)).into_response()
 }

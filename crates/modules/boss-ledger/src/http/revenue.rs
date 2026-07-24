@@ -61,6 +61,12 @@ pub(super) async fn create_revenue_schedule(
             .into_response();
     }
 
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = super::event_stamp(&state, &user, now).await;
+    let mut tx = match state.pool.begin().await {
+        Ok(t) => t,
+        Err(e) => return storage_err(e),
+    };
     let result = sqlx::query(
         "INSERT INTO revenue_schedules \
              (id, source_kind, source_id, account_id, revenue_category, \
@@ -82,22 +88,23 @@ pub(super) async fn create_revenue_schedule(
     .bind(body.end_date)
     .bind(&body.frequency)
     .bind(body.next_recognition_date)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await;
 
     match result {
         Ok(_) => {
-            // Operator-audit-trail emit. revenue_schedules is a
+            // Operator-audit-trail event, recorded in the SAME tx as
+            // the row (outbox phase 2). revenue_schedules is a
             // forecast configuration (not a derived projection),
             // so this event doesn't drive a rebuilder — just the
             // who-set-up-what trail. ON CONFLICT DO NOTHING above
-            // means re-emits land in the log even when the row
+            // means re-records land in the log even when the row
             // already existed; that's fine for the audit-trail
             // purpose (auditors see the second attempt at no
             // additional cost).
-            let now = boss_clock_client::now_from(&state.clock).await;
-            crate::events::emit_after_commit(
-                &state.publisher,
+            if let Err(e) = crate::events::record_ledger_event_in_tx(
+                &mut tx,
+                &stamp,
                 "ledger.revenue_schedule.created",
                 serde_json::json!({
                     "schedule_id": body.id,
@@ -109,9 +116,14 @@ pub(super) async fn create_revenue_schedule(
                     "actor_id": user.id,
                     "created_at": now,
                 }),
-                now,
             )
-            .await;
+            .await
+            {
+                return ledger_err(e);
+            }
+            if let Err(e) = tx.commit().await {
+                return storage_err(e);
+            }
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({ "id": body.id })),

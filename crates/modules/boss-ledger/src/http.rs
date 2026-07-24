@@ -78,6 +78,27 @@ pub struct LedgerApiState {
     pub clock: Arc<dyn boss_clock_client::ClockClient>,
 }
 
+/// Build the enrichment stamp for in-tx event recording (outbox
+/// phase 2): the caller's actor + the authoritative timestamp, with
+/// `_simulated` resolved by the publisher's clock probe when one is
+/// wired. Fact-write handlers record their `ledger.*` events in the
+/// DOMAIN TRANSACTION via this stamp (see
+/// `events::record_ledger_event_in_tx`); nothing publishes them
+/// post-commit anymore.
+pub(crate) async fn event_stamp(
+    state: &LedgerApiState,
+    user: &boss_policy_client::User,
+    now: chrono::DateTime<chrono::Utc>,
+) -> boss_core::publisher::EventStamp {
+    let actor = user
+        .ambient_actor()
+        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+    match &state.publisher {
+        Some(p) => p.stamp_with_actor_at(actor, now).await,
+        None => boss_core::publisher::EventStamp::new("ledger", actor, now),
+    }
+}
+
 pub fn router(state: LedgerApiState) -> Router {
     let shared = Arc::new(state);
     Router::new()

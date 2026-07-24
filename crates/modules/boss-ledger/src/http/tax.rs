@@ -362,13 +362,18 @@ pub(super) async fn create_tax_filing(
         let expense_account = expense_account
             .as_deref()
             .expect("accrue implies an expense account from tax_kinds");
+        let stamp = super::event_stamp(
+            &state,
+            &user,
+            boss_clock_client::now_from(&state.clock).await,
+        )
+        .await;
         if let Err(e) = post_accrual_entry(
             &state.pool,
-            &state.publisher,
+            &stamp,
             &filing,
             expense_account,
             body.period_start,
-            boss_clock_client::now_from(&state.clock).await,
         )
         .await
         {
@@ -385,11 +390,10 @@ pub(super) async fn create_tax_filing(
 /// so they can retry.
 async fn post_accrual_entry(
     pool: &PgPool,
-    publisher: &Option<Arc<boss_core::publisher::DomainPublisher>>,
+    stamp: &boss_core::publisher::EventStamp,
     filing: &crate::tax_filings::TaxFiling,
     expense_account: &str,
     posted_on: NaiveDate,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Response> {
     let mut tx = pool.begin().await.map_err(storage_err)?;
 
@@ -431,9 +435,11 @@ async fn post_accrual_entry(
         .await
         .map_err(ledger_err)?;
 
-    tx.commit().await.map_err(storage_err)?;
+    crate::events::record_ledger_event_in_tx(&mut tx, stamp, "ledger.tax.accrued", payload)
+        .await
+        .map_err(ledger_err)?;
 
-    crate::events::emit_after_commit(publisher, "ledger.tax.accrued", payload, now).await;
+    tx.commit().await.map_err(storage_err)?;
 
     Ok(())
 }
@@ -490,6 +496,7 @@ pub(super) async fn create_tax_accrual(
         "jurisdiction": body.jurisdiction,
     });
 
+    let stamp = super::event_stamp(&state, &user, now).await;
     let mut tx = match state.pool.begin().await {
         Ok(t) => t,
         Err(e) => return storage_err(e),
@@ -522,10 +529,6 @@ pub(super) async fn create_tax_accrual(
         return ledger_err(e);
     }
 
-    if let Err(e) = tx.commit().await {
-        return storage_err(e);
-    }
-
     // Distinct event kind from income-tax's `ledger.tax.accrued`: this
     // standalone accrual has no tax_filings row, so it gets its own
     // `ledger.tax.accrual.recorded` projection rule (source_table
@@ -533,14 +536,21 @@ pub(super) async fn create_tax_accrual(
     // `finance.tax.accrued` fact from audit_log alone. Sharing the
     // income-tax kind would route the rebuild through the
     // `/filing_id`-keyed rule, which extracts a NULL source_id here and
-    // silently drops the fact.
-    crate::events::emit_after_commit(
-        &state.publisher,
+    // silently drops the fact. Recorded in the SAME tx (outbox phase 2).
+    if let Err(e) = crate::events::record_ledger_event_in_tx(
+        &mut tx,
+        &stamp,
         "ledger.tax.accrual.recorded",
         payload,
-        now,
     )
-    .await;
+    .await
+    {
+        return ledger_err(e);
+    }
+
+    if let Err(e) = tx.commit().await {
+        return storage_err(e);
+    }
 
     (StatusCode::OK, Json(serde_json::json!({ "id": body.id }))).into_response()
 }
@@ -673,17 +683,24 @@ pub(super) async fn remit_tax_filing(
         return storage_err(e);
     }
 
+    {
+        let now = boss_clock_client::now_from(&state.clock).await;
+        let stamp = super::event_stamp(&state, &user, now).await;
+        if let Err(e) = crate::events::record_ledger_event_in_tx(
+            &mut tx,
+            &stamp,
+            "ledger.tax.remitted",
+            payload.clone(),
+        )
+        .await
+        {
+            return ledger_err(e);
+        }
+    }
+
     if let Err(e) = tx.commit().await {
         return storage_err(e);
     }
-
-    crate::events::emit_after_commit(
-        &state.publisher,
-        "ledger.tax.remitted",
-        payload.clone(),
-        boss_clock_client::now_from(&state.clock).await,
-    )
-    .await;
 
     let updated = match crate::tax_filings::get(&state.pool, &existing.id).await {
         Ok(Some(f)) => f,

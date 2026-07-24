@@ -5,11 +5,12 @@
 //! events don't drive a rebuilder — they're for the auditor
 //! "who did what when" trail.
 //!
-//! Each handler emits a `ledger.period.{locked,unlocked,created}` or
-//! `ledger.revenue_schedule.created` event carrying the actor_id +
-//! timestamp + key fields, so an auditor has a record of who locked
-//! period FY26 and when — not just that the row currently shows
-//! status='locked'.
+//! Each handler records a `ledger.period.{locked,unlocked,created}`
+//! or `ledger.revenue_schedule.created` event carrying the actor_id
+//! + timestamp + key fields — on the transactional outbox, in the
+//! same tx as the row (outbox phase 2); the relay drain moves it to
+//! audit_log. So an auditor has a record of who locked period FY26
+//! and when — not just that the row currently shows status='locked'.
 
 #![cfg(feature = "postgres")]
 
@@ -18,8 +19,8 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
+use boss_core::port::EventBus;
+use boss_events::outbox::drain_outbox_once;
 use boss_ledger::http::{LedgerApiState, router};
 use boss_testing::{RecordingEventBus, TestDb};
 use http_body_util::BodyExt;
@@ -27,16 +28,25 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 fn build_router(db: &TestDb) -> Router {
-    let publisher = DomainPublisher::new(RecordingEventBus::new(), "ledger")
-        .with_audit(Arc::new(PgAuditWriter::new(db.pool.clone())));
+    // No publisher: stamps fall back to source="ledger" and the
+    // handlers record on the outbox — deliberately NO direct audit
+    // writer, so these tests only pass through the real
+    // outbox → relay → audit_log path.
     router(LedgerApiState {
         pool: db.pool.clone(),
-        publisher: Some(Arc::new(publisher)),
+        publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
     })
 }
 
+/// Drain the outbox through the relay pipeline (outbox → audit_log →
+/// bus → delivered), then count. Every payload SELECT in these tests
+/// follows a count call, so the drain here covers them too.
 async fn count_audit_events(db: &TestDb, kind: &str) -> i64 {
+    let bus = RecordingEventBus::new();
+    drain_outbox_once(&db.pool, &(bus as Arc<dyn EventBus>), 100)
+        .await
+        .expect("relay drain");
     let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM audit_log WHERE kind = $1")
         .bind(kind)
         .fetch_one(&db.pool)

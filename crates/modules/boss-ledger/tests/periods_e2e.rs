@@ -11,6 +11,14 @@ use chrono::NaiveDate;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+fn stamp() -> boss_core::publisher::EventStamp {
+    boss_core::publisher::EventStamp::new(
+        "ledger",
+        boss_core::actor::ActorId::Automation("test".into()),
+        chrono::Utc::now(),
+    )
+}
+
 async fn seed_fact_and_post(
     db: &TestDb,
     kind: &str,
@@ -97,7 +105,9 @@ async fn lock_period_writes_checksum_and_pins_rule_version() {
     .unwrap();
 
     let pid = period_id_for(&db, NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).await;
-    let checksum = lock_period(&db.pool, pid, "operator-test").await.unwrap();
+    let checksum = lock_period(&db.pool, pid, "operator-test", &stamp(), "test")
+        .await
+        .unwrap();
     assert!(checksum.starts_with("sha256:"));
 
     let periods = list_periods(&db.pool).await.unwrap();
@@ -123,9 +133,15 @@ async fn locking_is_deterministic_same_state_same_checksum() {
     .unwrap();
 
     let pid = period_id_for(&db, NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).await;
-    let c1 = lock_period(&db.pool, pid, "op").await.unwrap();
-    unlock_period(&db.pool, pid).await.unwrap();
-    let c2 = lock_period(&db.pool, pid, "op").await.unwrap();
+    let c1 = lock_period(&db.pool, pid, "op", &stamp(), "test")
+        .await
+        .unwrap();
+    unlock_period(&db.pool, pid, &stamp(), "test")
+        .await
+        .unwrap();
+    let c2 = lock_period(&db.pool, pid, "op", &stamp(), "test")
+        .await
+        .unwrap();
     assert_eq!(c1, c2);
 }
 
@@ -145,7 +161,9 @@ async fn posting_to_locked_period_fails_with_locked_period_error() {
     .await
     .unwrap();
     let march_pid = period_id_for(&db, NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).await;
-    lock_period(&db.pool, march_pid, "op").await.unwrap();
+    lock_period(&db.pool, march_pid, "op", &stamp(), "test")
+        .await
+        .unwrap();
 
     // Now try to post another fact dated in March — it must fail.
     let p_mar2 = json!({"invoice_id": "i2", "amount_cents": 500, "line_items": [{"category": "parts", "amount_cents": 500}]});
@@ -184,8 +202,12 @@ async fn unlock_returns_period_to_open() {
     .await
     .unwrap();
     let pid = period_id_for(&db, NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).await;
-    lock_period(&db.pool, pid, "op").await.unwrap();
-    unlock_period(&db.pool, pid).await.unwrap();
+    lock_period(&db.pool, pid, "op", &stamp(), "test")
+        .await
+        .unwrap();
+    unlock_period(&db.pool, pid, &stamp(), "test")
+        .await
+        .unwrap();
 
     let periods = list_periods(&db.pool).await.unwrap();
     let march = periods.iter().find(|p| p.id == pid).unwrap();

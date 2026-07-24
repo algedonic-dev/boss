@@ -576,7 +576,12 @@ async fn post_manual_entry_rejects_locked_period() {
     .execute(&db.pool)
     .await
     .unwrap();
-    boss_ledger::periods::lock_period(&db.pool, jan_period_id, "test")
+    let stamp = boss_core::publisher::EventStamp::new(
+        "ledger",
+        boss_core::actor::ActorId::Automation("test".into()),
+        chrono::Utc::now(),
+    );
+    boss_ledger::periods::lock_period(&db.pool, jan_period_id, "test", &stamp, "test")
         .await
         .unwrap();
 
