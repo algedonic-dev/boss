@@ -8,12 +8,26 @@ use crate::types::{Shipment, ShipmentDirection};
 
 pub struct InMemoryShipping {
     shipments: std::sync::RwLock<Vec<Shipment>>,
+    recorded: std::sync::Mutex<Vec<boss_core::event::Event>>,
 }
 
 impl InMemoryShipping {
     pub fn new(shipments: Vec<Shipment>) -> Self {
         Self {
             shipments: std::sync::RwLock::new(shipments),
+            recorded: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Events the outbox paths recorded — test visibility (the
+    /// in-memory analogue of the Pg adapter's in-tx recording).
+    pub fn recorded_events(&self) -> Vec<boss_core::event::Event> {
+        self.recorded.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    fn record(&self, event: boss_core::event::Event) {
+        if let Ok(mut v) = self.recorded.lock() {
+            v.push(event);
         }
     }
 }
@@ -61,17 +75,23 @@ impl ShippingRepository for InMemoryShipping {
         &self,
         shipment: &Shipment,
         _now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<String, ShippingError> {
-        let mut shipments = self.shipments.write().unwrap();
-        if shipments.iter().any(|s| s.id == shipment.id) {
-            return Err(ShippingError::Conflict(format!(
-                "shipment {} already exists",
-                shipment.id
-            )));
+        {
+            let mut shipments = self.shipments.write().unwrap();
+            if shipments.iter().any(|s| s.id == shipment.id) {
+                return Err(ShippingError::Conflict(format!(
+                    "shipment {} already exists",
+                    shipment.id
+                )));
+            }
+            shipments.push(shipment.clone());
         }
-        let id = shipment.id.clone();
-        shipments.push(shipment.clone());
-        Ok(id)
+        self.record(stamp.event(
+            crate::events::SHIPMENT_CREATED,
+            serde_json::to_value(shipment).unwrap_or_default(),
+        ));
+        Ok(shipment.id.clone())
     }
 
     async fn update_shipment_at(
@@ -79,23 +99,41 @@ impl ShippingRepository for InMemoryShipping {
         id: &str,
         shipment: &Shipment,
         _now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), ShippingError> {
-        let mut shipments = self.shipments.write().unwrap();
-        let pos = shipments
-            .iter()
-            .position(|s| s.id == id)
-            .ok_or_else(|| ShippingError::NotFound(id.to_string()))?;
-        shipments[pos] = shipment.clone();
+        {
+            let mut shipments = self.shipments.write().unwrap();
+            let pos = shipments
+                .iter()
+                .position(|s| s.id == id)
+                .ok_or_else(|| ShippingError::NotFound(id.to_string()))?;
+            shipments[pos] = shipment.clone();
+        }
+        self.record(stamp.event(
+            crate::events::SHIPMENT_UPDATED,
+            serde_json::to_value(shipment).unwrap_or_default(),
+        ));
         Ok(())
     }
 
-    async fn delete_shipment(&self, id: &str) -> Result<(), ShippingError> {
-        let mut shipments = self.shipments.write().unwrap();
-        let pos = shipments
-            .iter()
-            .position(|s| s.id == id)
-            .ok_or_else(|| ShippingError::NotFound(id.to_string()))?;
-        shipments.remove(pos);
+    async fn delete_shipment_at(
+        &self,
+        id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), ShippingError> {
+        {
+            let mut shipments = self.shipments.write().unwrap();
+            let pos = shipments
+                .iter()
+                .position(|s| s.id == id)
+                .ok_or_else(|| ShippingError::NotFound(id.to_string()))?;
+            shipments.remove(pos);
+        }
+        self.record(stamp.event(
+            crate::events::SHIPMENT_DELETED,
+            serde_json::json!({ "id": id, "deleted_at": now }),
+        ));
         Ok(())
     }
 
@@ -105,9 +143,11 @@ impl ShippingRepository for InMemoryShipping {
         _status: &str,
         _occurred_on: chrono::NaiveDate,
         _stage_index: Option<i16>,
+        _stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), ShippingError> {
-        // In-memory backend: tracking events are not persisted.
-        // Tests that exercise the live flow use the Postgres path.
+        // In-memory backend: tracking events are not persisted (and
+        // so none are recorded). Tests that exercise the live flow
+        // use the Postgres path.
         Ok(())
     }
 

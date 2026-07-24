@@ -2,6 +2,8 @@
 //! persistence.
 
 use async_trait::async_trait;
+use boss_core::actor::ActorId;
+use boss_core::publisher::EventStamp;
 use chrono::{DateTime, Utc};
 
 use crate::types::{Shipment, ShipmentDirection};
@@ -19,12 +21,18 @@ pub enum ShippingError {
 /// Persistence port for shipments.
 ///
 /// Mutation methods come in two flavors: a convenience overload
-/// that stamps `Utc::now()` server-side, and an `_at` variant that
-/// takes an explicit timestamp. Handlers that emit a domain event
-/// for the same mutation use `_at` so the projection write and the
-/// audit_log event share one timestamp — required for the
-/// audit_log → projection rebuild path. See
+/// that stamps `Utc::now()` server-side (with a platform-automation
+/// event stamp — test-path ergonomics), and an `_at` variant that
+/// takes an explicit timestamp plus the caller's [`EventStamp`] so
+/// the projection write and the audit_log event share one timestamp —
+/// required for the audit_log → projection rebuild path. See
 /// `docs/design/projection-rebuilders.md`.
+///
+/// OUTBOX (phase 2): every mutation records its domain event on the
+/// transactional outbox INSIDE the adapter transaction via the
+/// stamp (`boss_events::outbox::record_event_in_tx`);
+/// boss-event-relay delivers to audit_log + NATS post-commit.
+/// Nothing publishes post-commit.
 #[async_trait]
 pub trait ShippingRepository: Send + Sync {
     /// Return every shipment.
@@ -44,28 +52,47 @@ pub trait ShippingRepository: Send + Sync {
     async fn shipment_by_id(&self, id: &str) -> Result<Option<Shipment>, ShippingError>;
 
     /// Create a new shipment. Returns the ID. Errors if ID already exists.
+    /// Records `shipping.shipment.created` (full row state) in-tx.
     async fn create_shipment(&self, shipment: &Shipment) -> Result<String, ShippingError> {
-        self.create_shipment_at(shipment, Utc::now()).await
+        let now = Utc::now();
+        let stamp = EventStamp::new("shipping", ActorId::Automation("platform".into()), now);
+        self.create_shipment_at(shipment, now, &stamp).await
     }
     async fn create_shipment_at(
         &self,
         shipment: &Shipment,
         now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<String, ShippingError>;
 
     /// Replace a shipment by ID. Errors if ID doesn't exist.
+    /// Records `shipping.shipment.updated` (full row state) in-tx.
     async fn update_shipment(&self, id: &str, shipment: &Shipment) -> Result<(), ShippingError> {
-        self.update_shipment_at(id, shipment, Utc::now()).await
+        let now = Utc::now();
+        let stamp = EventStamp::new("shipping", ActorId::Automation("platform".into()), now);
+        self.update_shipment_at(id, shipment, now, &stamp).await
     }
     async fn update_shipment_at(
         &self,
         id: &str,
         shipment: &Shipment,
         now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<(), ShippingError>;
 
     /// Delete a shipment and satellite data. Errors if ID doesn't exist.
-    async fn delete_shipment(&self, id: &str) -> Result<(), ShippingError>;
+    /// Records `shipping.shipment.deleted` (`{id, deleted_at}`) in-tx.
+    async fn delete_shipment(&self, id: &str) -> Result<(), ShippingError> {
+        let now = Utc::now();
+        let stamp = EventStamp::new("shipping", ActorId::Automation("platform".into()), now);
+        self.delete_shipment_at(id, now, &stamp).await
+    }
+    async fn delete_shipment_at(
+        &self,
+        id: &str,
+        now: DateTime<Utc>,
+        stamp: &EventStamp,
+    ) -> Result<(), ShippingError>;
 
     /// Record one carrier scan for a shipment + roll up the
     /// shipment's `status` column when the scan moves it to a
@@ -74,12 +101,16 @@ pub trait ShippingRepository: Send + Sync {
     /// Errors with `NotFound` when the shipment doesn't exist
     /// (allows the HTTP layer to skip cleanly on out-of-order
     /// scan delivery).
+    /// Records `shipping.tracking.recorded` in-tx — and ONLY when
+    /// the scan row actually inserted, so an idempotent replay
+    /// records nothing (the guard sits ahead of the recording).
     async fn record_tracking_scan(
         &self,
         shipment_id: &str,
         status: &str,
         occurred_on: chrono::NaiveDate,
         stage_index: Option<i16>,
+        stamp: &EventStamp,
     ) -> Result<(), ShippingError>;
 
     /// Aggregate status summary for one direction — counts per status

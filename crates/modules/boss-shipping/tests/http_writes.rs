@@ -38,7 +38,7 @@ async fn post_shipment_emits_shipment_created_event() {
         .await
         .assert_status(StatusCode::CREATED);
 
-    let event = app.bus.assert_event_emitted("shipping.shipment.created");
+    let event = app.assert_recorded("shipping.shipment.created");
     assert_eq!(
         event.payload.get("id").and_then(|v| v.as_str()),
         Some("ship-create-event-1"),
@@ -69,8 +69,7 @@ async fn post_duplicate_shipment_does_not_emit_event() {
         .await
         .assert_status(StatusCode::CONFLICT);
 
-    app.bus
-        .assert_event_not_emitted("shipping.shipment.created");
+    app.assert_not_recorded("shipping.shipment.created");
 }
 
 #[tokio::test]
@@ -120,7 +119,7 @@ async fn put_existing_shipment_emits_shipment_updated_event() {
         .await
         .assert_status(StatusCode::NO_CONTENT);
 
-    let event = app.bus.assert_event_emitted("shipping.shipment.updated");
+    let event = app.assert_recorded("shipping.shipment.updated");
     assert_eq!(
         event.payload.get("id").and_then(|v| v.as_str()),
         Some("ship-upd-2"),
@@ -151,8 +150,7 @@ async fn put_nonexistent_shipment_does_not_emit_event() {
         .await
         .assert_status(StatusCode::NOT_FOUND);
 
-    app.bus
-        .assert_event_not_emitted("shipping.shipment.updated");
+    app.assert_not_recorded("shipping.shipment.updated");
 }
 
 // ---------------------------------------------------------------------------
@@ -181,7 +179,7 @@ async fn delete_existing_shipment_emits_shipment_deleted_event() {
         .await
         .assert_status(StatusCode::NO_CONTENT);
 
-    let event = app.bus.assert_event_emitted("shipping.shipment.deleted");
+    let event = app.assert_recorded("shipping.shipment.deleted");
     assert_eq!(
         event.payload.get("id").and_then(|v| v.as_str()),
         Some("ship-del-2"),
@@ -208,8 +206,7 @@ async fn delete_nonexistent_shipment_does_not_emit_event() {
         .await
         .assert_status(StatusCode::NOT_FOUND);
 
-    app.bus
-        .assert_event_not_emitted("shipping.shipment.deleted");
+    app.assert_not_recorded("shipping.shipment.deleted");
 }
 
 #[tokio::test]

@@ -1,6 +1,8 @@
-//! End-to-end: drive shipping writes through PgShipping +
-//! PgAuditWriter, snapshot `shipments` + `shipment_assets`, drop,
-//! rebuild from `audit_log`, assert exact match.
+//! End-to-end: drive shipping writes through PgShipping on the REAL
+//! pipeline (outbox phase 2 — events record in the domain tx, the
+//! relay drain moves them to audit_log), snapshot `shipments` +
+//! `shipment_assets`, drop, rebuild from `audit_log`, assert exact
+//! match.
 
 #![cfg(feature = "postgres")]
 
@@ -8,8 +10,8 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::http::StatusCode;
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
+use boss_core::port::EventBus;
+use boss_events::outbox::drain_outbox_once;
 use boss_shipping::PgShipping;
 use boss_shipping::http::{ShippingApiState, router};
 use boss_shipping::rebuild_shipping;
@@ -58,16 +60,24 @@ async fn snapshot_shipment_systems(pool: &PgPool) -> Vec<ShipmentSystemRow> {
 }
 
 fn build_app(pool: PgPool) -> Router {
-    let shipping = Arc::new(PgShipping::new(pool.clone()));
-    let publisher = DomainPublisher::new(RecordingEventBus::new(), "shipping")
-        .with_audit(Arc::new(PgAuditWriter::new(pool)));
+    // No publisher, no direct audit writer: events reach audit_log
+    // only via the outbox → relay drain (`drain_outbox`).
     let state = ShippingApiState {
-        shipping,
-        publisher: Some(publisher),
+        shipping: Arc::new(PgShipping::new(pool)),
+        publisher: None,
         classes_client: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
     };
     router(state)
+}
+
+/// Drain the outbox through the relay pipeline into audit_log.
+async fn drain_outbox(pool: &PgPool) -> u64 {
+    let bus = RecordingEventBus::new();
+    drain_outbox_once(pool, &(bus as Arc<dyn EventBus>), 100)
+        .await
+        .expect("relay drain")
+        .delivered
 }
 
 fn fixture(id: &str, status: ShipmentStatus, systems: Vec<&str>) -> Shipment {
@@ -122,7 +132,9 @@ async fn rebuild_reproduces_shipments_and_systems() {
         .await
         .assert_status(StatusCode::NO_CONTENT);
 
-    // 3. Snapshot.
+    // 3. Drain the outbox into audit_log, then snapshot.
+    let delivered = drain_outbox(&db.pool).await;
+    assert_eq!(delivered, 3, "2 creates + 1 update arrive via the outbox");
     let shipments_before = snapshot_shipments(&db.pool).await;
     let systems_before = snapshot_shipment_systems(&db.pool).await;
     assert_eq!(shipments_before.len(), 2);
@@ -176,6 +188,9 @@ async fn rebuild_handles_shipment_delete() {
         .send(&app)
         .await
         .assert_status(StatusCode::NO_CONTENT);
+
+    let delivered = drain_outbox(&db.pool).await;
+    assert_eq!(delivered, 2, "create + delete arrive via the outbox");
 
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM shipments")
         .fetch_one(&db.pool)
