@@ -4,27 +4,23 @@
 //!
 //! Provides:
 //! - `MessageTestApp` builder that wires InMemoryMessages + HTTP router
-//!   + RecordingEventBus + DomainPublisher
+//!   (publisher `None` — outbox phase 2: adapters record events in the
+//!   domain write, so the in-memory repo's `recorded_events()` is the
+//!   assertion surface, not a bus)
 //! - `message_fixture()` helper that builds a valid Message
 
 use std::sync::Arc;
 
 use axum::Router;
-use boss_core::publisher::DomainPublisher;
-#[cfg(feature = "postgres")]
-use boss_events::PgAuditWriter;
 use boss_messages::http::{MessageApiState, router};
 use boss_messages::in_memory::InMemoryMessages;
 use boss_messages::types::{Message, MessageKind};
-use boss_testing::RecordingEventBus;
 use chrono::Utc;
-#[cfg(feature = "postgres")]
-use sqlx::PgPool;
 
 /// Fully wired messages service for tests.
 pub struct MessageTestApp {
     pub router: Router,
-    pub bus: Arc<RecordingEventBus>,
+    pub messages: Arc<InMemoryMessages>,
 }
 
 impl MessageTestApp {
@@ -36,35 +32,46 @@ impl MessageTestApp {
     /// Build a test app pre-populated with the given messages.
     pub fn with_messages(messages: Vec<Message>) -> Self {
         let repo = Arc::new(InMemoryMessages::new(messages));
-        let bus = RecordingEventBus::new();
-        let publisher = DomainPublisher::new(bus.clone(), "messages");
         let state = MessageApiState {
-            messages: repo,
-            publisher: Some(publisher),
+            messages: repo.clone(),
+            publisher: None,
             clock: Arc::new(boss_clock_client::WallClockClient),
             classes_client: None,
         };
         let router = router(state);
-        Self { router, bus }
+        Self {
+            router,
+            messages: repo,
+        }
     }
 
-    /// Build a test app whose publisher persists every emitted event
-    /// to the given Postgres pool's `audit_log` table. Used by the
-    /// audit_log E2E integration test.
-    #[cfg(feature = "postgres")]
-    pub fn with_audit_pool(pool: PgPool) -> Self {
-        let repo = Arc::new(InMemoryMessages::new(vec![]));
-        let bus = RecordingEventBus::new();
-        let publisher = DomainPublisher::new(bus.clone(), "messages")
-            .with_audit(Arc::new(PgAuditWriter::new(pool)));
-        let state = MessageApiState {
-            messages: repo,
-            publisher: Some(publisher),
-            clock: Arc::new(boss_clock_client::WallClockClient),
-            classes_client: None,
-        };
-        let router = router(state);
-        Self { router, bus }
+    /// Assert exactly-one recorded event of `kind` and return it.
+    pub fn assert_recorded(&self, kind: &str) -> boss_core::event::Event {
+        let matches: Vec<_> = self
+            .messages
+            .recorded_events()
+            .into_iter()
+            .filter(|e| e.kind == kind)
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one recorded `{kind}` event, got {}",
+            matches.len()
+        );
+        matches.into_iter().next().unwrap()
+    }
+
+    /// Assert no recorded event of `kind`.
+    pub fn assert_not_recorded(&self, kind: &str) {
+        assert!(
+            !self
+                .messages
+                .recorded_events()
+                .iter()
+                .any(|e| e.kind == kind),
+            "expected no recorded `{kind}` event"
+        );
     }
 }
 

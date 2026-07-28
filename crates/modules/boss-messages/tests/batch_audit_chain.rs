@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::http::StatusCode;
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
+use boss_core::port::EventBus;
+use boss_events::outbox::drain_outbox_once;
 use boss_messages::PgMessages;
 use boss_messages::http::{MessageApiState, router};
 use boss_messages::rebuild_messages;
@@ -21,14 +21,23 @@ use serde_json::json;
 use sqlx::PgPool;
 
 fn build_pg_app(pool: PgPool) -> Router {
-    let publisher = DomainPublisher::new(RecordingEventBus::new(), "messages")
-        .with_audit(Arc::new(PgAuditWriter::new(pool.clone())));
+    // No publisher, no direct audit writer: events reach audit_log
+    // only via the outbox -> relay drain.
     router(MessageApiState {
         messages: Arc::new(PgMessages::new(pool)),
-        publisher: Some(publisher),
+        publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
         classes_client: None,
     })
+}
+
+/// Drain the outbox through the relay pipeline into audit_log.
+async fn drain_outbox(pool: &PgPool) -> u64 {
+    let bus = RecordingEventBus::new();
+    drain_outbox_once(pool, &(bus as Arc<dyn EventBus>), 100)
+        .await
+        .expect("relay drain")
+        .delivered
 }
 
 async fn count(pool: &PgPool) -> i64 {
@@ -70,6 +79,9 @@ async fn batch_messages_survive_rebuild() {
         .send(&app)
         .await
         .assert_status(StatusCode::OK);
+
+    let delivered = drain_outbox(&db.pool).await;
+    assert_eq!(delivered, 2, "both batch sends arrive via the outbox");
 
     let pre = count(&db.pool).await;
     assert_eq!(pre, 2, "two batch rows landed in projection");

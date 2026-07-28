@@ -50,7 +50,7 @@ async fn post_send_emits_message_sent_event() {
         .await
         .assert_status(StatusCode::CREATED);
 
-    app.bus.assert_event_emitted("messages.message.sent");
+    app.assert_recorded("messages.message.sent");
 }
 
 #[tokio::test]
@@ -101,7 +101,7 @@ async fn post_read_emits_message_read_event() {
         .await
         .assert_status(StatusCode::OK);
 
-    let event = app.bus.assert_event_emitted("messages.message.read");
+    let event = app.assert_recorded("messages.message.read");
     assert_eq!(
         event.payload.get("id").and_then(|v| v.as_str()),
         Some("msg-read-2"),
@@ -134,7 +134,7 @@ async fn delete_existing_message_emits_deleted_event() {
         .await
         .assert_status(StatusCode::NO_CONTENT);
 
-    let event = app.bus.assert_event_emitted("messages.message.deleted");
+    let event = app.assert_recorded("messages.message.deleted");
     assert_eq!(
         event.payload.get("id").and_then(|v| v.as_str()),
         Some("msg-del-2"),
@@ -161,7 +161,7 @@ async fn delete_nonexistent_message_does_not_emit_event() {
         .await
         .assert_status(StatusCode::NOT_FOUND);
 
-    app.bus.assert_event_not_emitted("messages.message.deleted");
+    app.assert_not_recorded("messages.message.deleted");
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +190,7 @@ async fn archive_existing_message_emits_archived_event() {
         .await
         .assert_status(StatusCode::NO_CONTENT);
 
-    let event = app.bus.assert_event_emitted("messages.message.archived");
+    let event = app.assert_recorded("messages.message.archived");
     assert_eq!(
         event.payload.get("id").and_then(|v| v.as_str()),
         Some("msg-arch-2"),
@@ -217,8 +217,7 @@ async fn archive_nonexistent_message_does_not_emit_event() {
         .await
         .assert_status(StatusCode::NOT_FOUND);
 
-    app.bus
-        .assert_event_not_emitted("messages.message.archived");
+    app.assert_not_recorded("messages.message.archived");
 }
 
 // ---------------------------------------------------------------------------

@@ -59,6 +59,7 @@ MIGRATED=(
   boss-ledger
   boss-shipping
   boss-catalog
+  boss-messages
 )
 
 # Not-yet-migrated crates and their pinned post-commit emit counts.
@@ -69,7 +70,6 @@ declare -A PENDING=(
   [boss-accounts]=15
   [boss-people]=8
   [boss-content]=7
-  [boss-messages]=5
   [boss-calendar]=3
   [boss-cybernetics]=1
 )
