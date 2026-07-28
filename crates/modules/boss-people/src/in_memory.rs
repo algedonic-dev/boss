@@ -7,12 +7,26 @@ use crate::types::Employee;
 
 pub struct InMemoryPeople {
     employees: std::sync::RwLock<Vec<Employee>>,
+    recorded: std::sync::Mutex<Vec<boss_core::event::Event>>,
 }
 
 impl InMemoryPeople {
     pub fn new(employees: Vec<Employee>) -> Self {
         Self {
             employees: std::sync::RwLock::new(employees),
+            recorded: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Events the outbox paths recorded — test visibility (the
+    /// in-memory analogue of the Pg adapter's in-tx recording).
+    pub fn recorded_events(&self) -> Vec<boss_core::event::Event> {
+        self.recorded.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    fn record(&self, event: boss_core::event::Event) {
+        if let Ok(mut v) = self.recorded.lock() {
+            v.push(event);
         }
     }
 }
@@ -48,17 +62,23 @@ impl PeopleRepository for InMemoryPeople {
         &self,
         emp: &Employee,
         _now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<String, PeopleError> {
-        let mut employees = self.employees.write().unwrap();
-        if employees.iter().any(|e| e.id == emp.id) {
-            return Err(PeopleError::Conflict(format!(
-                "employee {} already exists",
-                emp.id
-            )));
+        {
+            let mut employees = self.employees.write().unwrap();
+            if employees.iter().any(|e| e.id == emp.id) {
+                return Err(PeopleError::Conflict(format!(
+                    "employee {} already exists",
+                    emp.id
+                )));
+            }
+            employees.push(emp.clone());
         }
-        let id = emp.id.clone();
-        employees.push(emp.clone());
-        Ok(id)
+        self.record(stamp.event(
+            crate::events::EMPLOYEE_CREATED,
+            serde_json::to_value(emp).unwrap_or_default(),
+        ));
+        Ok(emp.id.clone())
     }
 
     async fn update_employee_at(
@@ -66,23 +86,41 @@ impl PeopleRepository for InMemoryPeople {
         id: &str,
         emp: &Employee,
         _now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), PeopleError> {
-        let mut employees = self.employees.write().unwrap();
-        let pos = employees
-            .iter()
-            .position(|e| e.id == id)
-            .ok_or_else(|| PeopleError::NotFound(id.to_string()))?;
-        employees[pos] = emp.clone();
+        {
+            let mut employees = self.employees.write().unwrap();
+            let pos = employees
+                .iter()
+                .position(|e| e.id == id)
+                .ok_or_else(|| PeopleError::NotFound(id.to_string()))?;
+            employees[pos] = emp.clone();
+        }
+        self.record(stamp.event(
+            crate::events::EMPLOYEE_UPDATED,
+            serde_json::to_value(emp).unwrap_or_default(),
+        ));
         Ok(())
     }
 
-    async fn delete_employee(&self, id: &str) -> Result<(), PeopleError> {
-        let mut employees = self.employees.write().unwrap();
-        let pos = employees
-            .iter()
-            .position(|e| e.id == id)
-            .ok_or_else(|| PeopleError::NotFound(id.to_string()))?;
-        employees.remove(pos);
+    async fn delete_employee_at(
+        &self,
+        id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), PeopleError> {
+        {
+            let mut employees = self.employees.write().unwrap();
+            let pos = employees
+                .iter()
+                .position(|e| e.id == id)
+                .ok_or_else(|| PeopleError::NotFound(id.to_string()))?;
+            employees.remove(pos);
+        }
+        self.record(stamp.event(
+            crate::events::EMPLOYEE_DELETED,
+            serde_json::json!({ "id": id, "deleted_at": now }),
+        ));
         Ok(())
     }
 }

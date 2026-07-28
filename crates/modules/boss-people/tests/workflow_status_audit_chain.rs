@@ -16,16 +16,22 @@
 
 use std::sync::Arc;
 
+/// Drain the outbox through the relay pipeline into audit_log.
+async fn drain_outbox(pool: &PgPool) {
+    let bus = boss_testing::RecordingEventBus::new();
+    boss_events::outbox::drain_outbox_once(pool, &(bus as Arc<dyn boss_core::port::EventBus>), 100)
+        .await
+        .expect("relay drain");
+}
+
 use axum::Router;
 use axum::http::StatusCode;
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
 use boss_people::PgPeople;
 use boss_people::http::{PeopleApiState, router as people_router};
 use boss_people::rebuild_people;
 use boss_people::types::*;
 use boss_people::workflows::workflow_router;
-use boss_testing::{RecordingEventBus, TestDb, TestRequest};
+use boss_testing::{TestDb, TestRequest};
 use chrono::NaiveDate;
 use serde_json::json;
 use sqlx::PgPool;
@@ -42,12 +48,12 @@ async fn seed_location(pool: &PgPool) {
 }
 
 fn build_app(pool: PgPool) -> Router {
+    // No publisher, no direct audit writer: events reach audit_log
+    // only via the outbox -> relay drain.
     let people = Arc::new(PgPeople::new(pool.clone()));
-    let publisher = DomainPublisher::new(RecordingEventBus::new(), "people")
-        .with_audit(Arc::new(PgAuditWriter::new(pool.clone())));
     let crud_state = PeopleApiState {
         people: people.clone(),
-        publisher: Some(publisher.clone()),
+        publisher: None,
         policy: None,
         subject_kinds: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
@@ -55,7 +61,7 @@ fn build_app(pool: PgPool) -> Router {
     workflow_router(
         pool.clone(),
         people,
-        Some(publisher),
+        None,
         std::sync::Arc::new(boss_clock_client::WallClockClient),
     )
     .merge(people_router(crud_state))
@@ -119,6 +125,7 @@ async fn status_change_survives_rebuild() {
     // Audit-chain assertion: drop the projection rows, run the
     // rebuilder, expect the same shape to come back from
     // audit_log alone.
+    drain_outbox(&db.pool).await;
     let report = rebuild_people(&db.pool).await.expect("rebuild succeeds");
     assert!(report.employees_upserted >= 1);
     assert!(
@@ -175,6 +182,7 @@ async fn offboard_survives_rebuild() {
         .unwrap();
     assert_eq!(pre_status.0, "terminated");
 
+    drain_outbox(&db.pool).await;
     rebuild_people(&db.pool).await.expect("rebuild succeeds");
 
     let post_status: (String,) = sqlx::query_as("SELECT status FROM employees WHERE id = $1")

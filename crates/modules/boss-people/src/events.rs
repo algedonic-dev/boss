@@ -24,3 +24,23 @@ pub const EMPLOYEE_CHANGE_RECORDED: &str = "people.employee.change-recorded";
 /// projection row. Status changes ride on the same event kind via
 /// the ON CONFLICT DO UPDATE path the handler already uses.
 pub const REQUISITION_OPENED: &str = "people.requisition.opened";
+
+/// Resolve the outbox event stamp for a request. People write
+/// handlers carry no CurrentUser-derived actor; the publisher's
+/// `default_actor` resolves the request identity from the task-local
+/// context (else `automation:people`), and its clock probe settles
+/// `_simulated` — the same envelope the retired post-commit emits
+/// carried (outbox phase 2).
+pub(crate) async fn event_stamp(
+    publisher: &Option<boss_core::publisher::DomainPublisher>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> boss_core::publisher::EventStamp {
+    match publisher {
+        Some(p) => p.stamp_with_actor_at(p.default_actor(), now).await,
+        None => boss_core::publisher::EventStamp::new(
+            "people",
+            boss_core::actor::ActorId::Automation("people".into()),
+            now,
+        ),
+    }
+}

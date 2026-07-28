@@ -157,6 +157,7 @@ impl PeopleRepository for PgPeople {
         &self,
         emp: &Employee,
         now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<String, PeopleError> {
         // Registry validation runs before the transaction so a
         // mis-typed code doesn't waste a Postgres connection.
@@ -208,6 +209,15 @@ impl PeopleRepository for PgPeople {
         }
         upsert_employee_row(&mut tx, emp, now).await?;
         insert_employee_satellites(&mut tx, emp).await?;
+        // OUTBOX (phase 2): the created event (full row state)
+        // records with the rows.
+        let event = stamp.event(
+            crate::events::EMPLOYEE_CREATED,
+            serde_json::to_value(emp).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(PeopleError::Storage)?;
         tx.commit()
             .await
             .map_err(|e| PeopleError::Storage(e.to_string()))?;
@@ -219,6 +229,7 @@ impl PeopleRepository for PgPeople {
         id: &str,
         emp: &Employee,
         now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), PeopleError> {
         // Identity-first: validate only the descriptive fields that are
         // present. An id-only employee record carries none of these yet;
@@ -269,13 +280,27 @@ impl PeopleRepository for PgPeople {
             .await
             .map_err(|e| PeopleError::Storage(e.to_string()))?;
         insert_employee_satellites(&mut tx, emp).await?;
+        // OUTBOX (phase 2): the updated event (full row state)
+        // records with the rows.
+        let event = stamp.event(
+            crate::events::EMPLOYEE_UPDATED,
+            serde_json::to_value(emp).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(PeopleError::Storage)?;
         tx.commit()
             .await
             .map_err(|e| PeopleError::Storage(e.to_string()))?;
         Ok(())
     }
 
-    async fn delete_employee(&self, id: &str) -> Result<(), PeopleError> {
+    async fn delete_employee_at(
+        &self,
+        id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), PeopleError> {
         let mut tx = self
             .pool
             .begin()
@@ -299,6 +324,15 @@ impl PeopleRepository for PgPeople {
         if result.rows_affected() == 0 {
             return Err(PeopleError::NotFound(id.to_string()));
         }
+        // OUTBOX (phase 2): the deleted event records only after the
+        // row actually deleted (NotFound above returns pre-recording).
+        let event = stamp.event(
+            crate::events::EMPLOYEE_DELETED,
+            serde_json::json!({ "id": id, "deleted_at": now }),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(PeopleError::Storage)?;
         tx.commit()
             .await
             .map_err(|e| PeopleError::Storage(e.to_string()))?;

@@ -25,7 +25,7 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
-use crate::events::{EMPLOYEE_CHANGE_RECORDED, EMPLOYEE_UPDATED};
+use crate::events::EMPLOYEE_CHANGE_RECORDED;
 use crate::port::PeopleRepository;
 
 #[derive(Clone)]
@@ -141,7 +141,14 @@ async fn update_status(
     emp.status = Some(new_status);
 
     let now = boss_clock_client::now_from(&state.clock).await;
-    if let Err(e) = state.people.update_employee_at(&id, &emp, now).await {
+    // OUTBOX (phase 2): the adapter records people.employee.updated
+    // in the update transaction.
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    if let Err(e) = state
+        .people
+        .update_employee_at(&id, &emp, now, &stamp)
+        .await
+    {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
@@ -163,15 +170,6 @@ async fn update_status(
     .await
     {
         return e;
-    }
-
-    if let Some(pub_) = &state.publisher {
-        pub_.emit_at(
-            EMPLOYEE_UPDATED,
-            serde_json::to_value(&emp).unwrap_or_default(),
-            now,
-        )
-        .await;
     }
 
     Json(serde_json::json!({"ok": true})).into_response()
@@ -266,9 +264,12 @@ async fn update_employee_status(
     let from_status = emp.status.clone();
     emp.status = Some(new_status.to_string());
 
+    // OUTBOX (phase 2): the adapter records people.employee.updated
+    // in the update transaction.
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
     if let Err(e) = state
         .people
-        .update_employee_at(employee_id, &emp, now)
+        .update_employee_at(employee_id, &emp, now, &stamp)
         .await
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -292,35 +293,26 @@ async fn update_employee_status(
         return resp;
     }
 
-    if let Some(pub_) = &state.publisher {
-        pub_.emit_at(
-            EMPLOYEE_UPDATED,
-            serde_json::to_value(&emp).unwrap_or_default(),
-            now,
-        )
-        .await;
-    }
-
     Json(serde_json::json!({"ok": true})).into_response()
 }
 
-/// Single canonical write path for `employee_changes`. Emits the
-/// audit_log event first, then writes the projection in the same
-/// shape the rebuilder will reproduce. Returns the response only on
-/// failure (success continues — caller may chain further work).
+/// Single canonical write path for `employee_changes`. OUTBOX
+/// (phase 2): the projection row and its event record in ONE
+/// transaction. Before, this emitted the event FIRST and wrote
+/// after — a failed INSERT still shipped an event (an event with
+/// no fact), the inverse of the swallowed-write class this arc
+/// closes. Returns the response only on failure (success
+/// continues — caller may chain further work).
 async fn record_change_inner(
     state: &WorkflowState,
     rec: EmployeeChangeRecord,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Response> {
-    if let Some(pub_) = &state.publisher {
-        pub_.emit_at(
-            EMPLOYEE_CHANGE_RECORDED,
-            serde_json::to_value(&rec).unwrap_or_default(),
-            now,
-        )
-        .await;
-    }
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
     sqlx::query(
         "INSERT INTO employee_changes (employee_id, kind, from_value, to_value, effective_date, notes, initiated_by, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
@@ -333,9 +325,20 @@ async fn record_change_inner(
     .bind(&rec.notes)
     .bind(&rec.initiated_by)
     .bind(now)
-    .execute(state.pool.as_ref())
+    .execute(&mut *tx)
     .await
     .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response())?;
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let event = stamp.event(
+        EMPLOYEE_CHANGE_RECORDED,
+        serde_json::to_value(&rec).unwrap_or_default(),
+    );
+    boss_events::outbox::record_event_in_tx(&mut tx, &event)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e).into_response())?;
+    tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response())?;
     Ok(())
 }
 

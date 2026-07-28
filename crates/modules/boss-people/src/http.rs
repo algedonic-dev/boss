@@ -188,19 +188,12 @@ async fn create_employee<R: PeopleRepository + 'static>(
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
     let now = boss_clock_client::now_from(&state.clock).await;
-    match state.people.create_employee_at(&emp, now).await {
-        Ok(id) => {
-            if let Some(pub_) = &state.publisher {
-                // Full Employee row state — what the rebuilder consumes.
-                pub_.emit_at(
-                    crate::events::EMPLOYEE_CREATED,
-                    serde_json::to_value(&emp).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            }
-            (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response()
-        }
+    // OUTBOX (phase 2): the adapter records people.employee.created
+    // (full row state — what the rebuilder consumes) inside the
+    // domain transaction; nothing publishes post-commit.
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    match state.people.create_employee_at(&emp, now, &stamp).await {
+        Ok(id) => (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response(),
         Err(e) => people_error_response(e),
     }
 }
@@ -235,18 +228,13 @@ async fn update_employee<R: PeopleRepository + 'static>(
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
     let now = boss_clock_client::now_from(&state.clock).await;
-    match state.people.update_employee_at(&id, &emp, now).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    crate::events::EMPLOYEE_UPDATED,
-                    serde_json::to_value(&emp).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    match state
+        .people
+        .update_employee_at(&id, &emp, now, &stamp)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => people_error_response(e),
     }
 }
@@ -255,19 +243,10 @@ async fn delete_employee<R: PeopleRepository + 'static>(
     State(state): State<Arc<PeopleApiState<R>>>,
     Path(id): Path<String>,
 ) -> Response {
-    match state.people.delete_employee(&id).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                let now = boss_clock_client::now_from(&state.clock).await;
-                pub_.emit_at(
-                    crate::events::EMPLOYEE_DELETED,
-                    serde_json::json!({ "id": id, "deleted_at": now }),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    match state.people.delete_employee_at(&id, now, &stamp).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => people_error_response(e),
     }
 }

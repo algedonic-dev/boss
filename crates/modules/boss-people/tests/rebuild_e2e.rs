@@ -8,13 +8,11 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::http::StatusCode;
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
 use boss_people::PgPeople;
 use boss_people::http::{PeopleApiState, router};
 use boss_people::rebuild_people;
 use boss_people::types::*;
-use boss_testing::{RecordingEventBus, TestDb, TestRequest};
+use boss_testing::{TestDb, TestRequest};
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::PgPool;
 
@@ -78,17 +76,24 @@ async fn seed_location(pool: &PgPool) {
 }
 
 fn build_app(pool: PgPool) -> Router {
-    let people = Arc::new(PgPeople::new(pool.clone()));
-    let publisher = DomainPublisher::new(RecordingEventBus::new(), "people")
-        .with_audit(Arc::new(PgAuditWriter::new(pool)));
+    // No publisher, no direct audit writer: events reach audit_log
+    // only via the outbox -> relay drain.
     let state = PeopleApiState {
-        people,
-        publisher: Some(publisher),
+        people: Arc::new(PgPeople::new(pool)),
+        publisher: None,
         policy: None,
         subject_kinds: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
     };
     router(state)
+}
+
+/// Drain the outbox through the relay pipeline into audit_log.
+async fn drain_outbox(pool: &PgPool) {
+    let bus = boss_testing::RecordingEventBus::new();
+    boss_events::outbox::drain_outbox_once(pool, &(bus as Arc<dyn boss_core::port::EventBus>), 100)
+        .await
+        .expect("relay drain");
 }
 
 fn fixture(
@@ -203,6 +208,7 @@ async fn rebuild_reproduces_employees_skills_certs() {
         .await
         .unwrap();
 
+    drain_outbox(&db.pool).await;
     let report = rebuild_people(&db.pool).await.expect("rebuild succeeds");
     assert_eq!(report.employees_upserted, 3, "2 created + 1 updated");
 
@@ -258,6 +264,7 @@ async fn rebuild_handles_employee_delete() {
         .await
         .assert_status(StatusCode::NO_CONTENT);
 
+    drain_outbox(&db.pool).await;
     let report = rebuild_people(&db.pool).await.unwrap();
     assert!(report.employees_upserted >= 1);
     assert!(report.employees_deleted >= 1);

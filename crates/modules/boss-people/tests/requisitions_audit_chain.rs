@@ -16,11 +16,9 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::http::StatusCode;
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
 use boss_people::rebuild_people;
 use boss_people::requisitions::{Requisition, requisitions_router};
-use boss_testing::{RecordingEventBus, TestDb, TestRequest};
+use boss_testing::{TestDb, TestRequest};
 use chrono::NaiveDate;
 use sqlx::PgPool;
 
@@ -45,13 +43,21 @@ async fn snapshot_requisitions(pool: &PgPool) -> Vec<RequisitionRow> {
 }
 
 async fn build_app(pool: PgPool) -> Router {
-    let publisher = DomainPublisher::new(RecordingEventBus::new(), "people")
-        .with_audit(Arc::new(PgAuditWriter::new(pool.clone())));
+    // No publisher, no direct audit writer: events reach audit_log
+    // only via the outbox -> relay drain.
     requisitions_router(
         pool,
-        Some(publisher),
+        None,
         std::sync::Arc::new(boss_clock_client::WallClockClient),
     )
+}
+
+/// Drain the outbox through the relay pipeline into audit_log.
+async fn drain_outbox(pool: &PgPool) {
+    let bus = boss_testing::RecordingEventBus::new();
+    boss_events::outbox::drain_outbox_once(pool, &(bus as Arc<dyn boss_core::port::EventBus>), 100)
+        .await
+        .expect("relay drain");
 }
 
 async fn seed_employee_and_location(pool: &PgPool) {
@@ -138,6 +144,7 @@ async fn requisitions_survive_rebuild() {
     assert_eq!(pre.len(), 1);
     assert_eq!(pre[0].status, "interviewing");
 
+    drain_outbox(&db.pool).await;
     let report = rebuild_people(&db.pool).await.expect("rebuild");
     assert!(
         report.requisitions_upserted >= 2,

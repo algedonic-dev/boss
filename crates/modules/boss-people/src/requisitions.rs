@@ -81,17 +81,27 @@ async fn create_requisition(
     _headers: axum::http::HeaderMap,
     Json(req): Json<Requisition>,
 ) -> Response {
-    if let Err(e) = upsert_requisition(state.pool.as_ref(), &req).await {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    if let Err(e) = upsert_requisition(&mut *tx, &req).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
-    if let Some(pub_) = &state.publisher {
-        let now = boss_clock_client::now_from(&state.clock).await;
-        pub_.emit_at(
-            REQUISITION_OPENED,
-            serde_json::to_value(&req).unwrap_or_default(),
-            now,
-        )
-        .await;
+    // OUTBOX (phase 2): the opened event (full row state; status
+    // transitions ride the same kind via the ON CONFLICT DO UPDATE
+    // path) records with the row.
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let event = stamp.event(
+        REQUISITION_OPENED,
+        serde_json::to_value(&req).unwrap_or_default(),
+    );
+    if let Err(e) = boss_events::outbox::record_event_in_tx(&mut tx, &event).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    if let Err(e) = tx.commit().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
     (
         StatusCode::CREATED,
