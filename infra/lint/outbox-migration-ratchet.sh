@@ -63,6 +63,7 @@ MIGRATED=(
   boss-calendar
   boss-accounts
   boss-people
+  boss-content
 )
 
 # Not-yet-migrated crates and their pinned post-commit emit counts.
@@ -70,7 +71,6 @@ MIGRATED=(
 # its row down (to the MIGRATED list at zero). Baselines 2026-07-24.
 declare -A PENDING=(
   [boss-jobs]=28
-  [boss-content]=7
   [boss-cybernetics]=1
 )
 

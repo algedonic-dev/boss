@@ -279,18 +279,11 @@ async fn upload(
         uploaded_at: now,
     };
 
-    match state.repo.insert(draft.clone()).await {
-        Ok(row) => {
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    crate::events::FILE_ATTACHED,
-                    serde_json::to_value(&row).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            }
-            (StatusCode::CREATED, Json(row)).into_response()
-        }
+    // OUTBOX (phase 2): the adapter records content.file.attached in
+    // the same transaction as the row.
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    match state.repo.insert(draft.clone(), &stamp).await {
+        Ok(row) => (StatusCode::CREATED, Json(row)).into_response(),
         Err(e) => {
             // Row insert failed after bytes wrote — this is the
             // duplicate-object-key case (concurrent upload of the
@@ -542,18 +535,11 @@ async fn finalize_upload(
         uploaded_by: user.id.clone(),
         uploaded_at: now,
     };
-    match state.repo.insert(draft).await {
-        Ok(row) => {
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    crate::events::FILE_ATTACHED,
-                    serde_json::to_value(&row).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            }
-            (StatusCode::CREATED, Json(row)).into_response()
-        }
+    // OUTBOX (phase 2): the adapter records content.file.attached in
+    // the same transaction as the row.
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    match state.repo.insert(draft, &stamp).await {
+        Ok(row) => (StatusCode::CREATED, Json(row)).into_response(),
         Err(e) => err(e),
     }
 }
@@ -621,22 +607,12 @@ async fn soft_delete(
         return resp;
     }
     let now = boss_clock_client::now_from(&state.clock).await;
-    if let Err(e) = state.repo.soft_delete(id, now).await {
+    // OUTBOX (phase 2): the adapter records content.file.detached in
+    // the same transaction as the flip — and only on an actual flip,
+    // so a repeat delete no longer publishes a duplicate event.
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    if let Err(e) = state.repo.soft_delete(id, now, &user.id, &stamp).await {
         return err(e);
-    }
-    if let Some(pub_) = &state.publisher {
-        pub_.emit_at(
-            crate::events::FILE_DETACHED,
-            serde_json::json!({
-                "file_id": id,
-                "target_kind": row.target.kind.as_str(),
-                "target_id": row.target.id,
-                "deleted_by": user.id,
-                "deleted_at": now,
-            }),
-            now,
-        )
-        .await;
     }
     StatusCode::NO_CONTENT.into_response()
 }

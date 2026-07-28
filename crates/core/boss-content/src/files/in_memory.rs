@@ -34,7 +34,11 @@ impl InMemoryFileRepository {
 
 #[async_trait]
 impl FileRepository for InMemoryFileRepository {
-    async fn insert(&self, draft: FileRefDraft) -> Result<FileRef, FileError> {
+    async fn insert(
+        &self,
+        draft: FileRefDraft,
+        _stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<FileRef, FileError> {
         let mut rows = self.rows.lock().expect("poisoned");
         // Live-row dedup check: a different live row already pointing
         // at this object_key indicates a programming bug — callers
@@ -81,7 +85,13 @@ impl FileRepository for InMemoryFileRepository {
         Ok(out)
     }
 
-    async fn soft_delete(&self, id: Uuid, at: DateTime<Utc>) -> Result<(), FileError> {
+    async fn soft_delete(
+        &self,
+        id: Uuid,
+        at: DateTime<Utc>,
+        _deleted_by: &str,
+        _stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), FileError> {
         let mut rows = self.rows.lock().expect("poisoned");
         let Some(row) = rows.get_mut(&id) else {
             return Err(FileError::NotFound(id.to_string()));
@@ -194,11 +204,22 @@ mod tests {
 
     use chrono::TimeZone;
 
+    fn test_stamp() -> boss_core::publisher::EventStamp {
+        boss_core::publisher::EventStamp::new(
+            "content",
+            boss_core::actor::ActorId::Automation("test".into()),
+            chrono::Utc::now(),
+        )
+    }
+
     #[tokio::test]
     async fn insert_then_get_round_trips() {
         let repo = InMemoryFileRepository::new();
         let id = Uuid::new_v4();
-        let row = repo.insert(draft(id, "job-001", "abc")).await.unwrap();
+        let row = repo
+            .insert(draft(id, "job-001", "abc"), &test_stamp())
+            .await
+            .unwrap();
         assert_eq!(row.id, id);
         assert_eq!(row.target.id, "job-001");
         assert!(row.deleted_at.is_none());
@@ -213,9 +234,15 @@ mod tests {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let other = Uuid::new_v4();
-        repo.insert(draft(a, "job-001", "aaa")).await.unwrap();
-        repo.insert(draft(b, "job-001", "bbb")).await.unwrap();
-        repo.insert(draft(other, "job-002", "ccc")).await.unwrap();
+        repo.insert(draft(a, "job-001", "aaa"), &test_stamp())
+            .await
+            .unwrap();
+        repo.insert(draft(b, "job-001", "bbb"), &test_stamp())
+            .await
+            .unwrap();
+        repo.insert(draft(other, "job-002", "ccc"), &test_stamp())
+            .await
+            .unwrap();
 
         let target = ResourceRef {
             kind: ResourceKind::Job,
@@ -225,7 +252,9 @@ mod tests {
         assert_eq!(live.len(), 2);
 
         // Soft-delete one — list_for hides it.
-        repo.soft_delete(a, chrono::Utc::now()).await.unwrap();
+        repo.soft_delete(a, chrono::Utc::now(), "emp-test", &test_stamp())
+            .await
+            .unwrap();
         let live2 = repo.list_for(&target).await.unwrap();
         assert_eq!(live2.len(), 1);
         assert_eq!(live2[0].id, b);
@@ -242,19 +271,27 @@ mod tests {
         let dead_id = Uuid::new_v4();
         // Two refs sharing the same object — different bucket so the
         // dedup check doesn't trip.
-        repo.insert(FileRefDraft {
-            bucket: "a".into(),
-            ..draft(live_id, "job-001", "xyz")
-        })
+        repo.insert(
+            FileRefDraft {
+                bucket: "a".into(),
+                ..draft(live_id, "job-001", "xyz")
+            },
+            &test_stamp(),
+        )
         .await
         .unwrap();
-        repo.insert(FileRefDraft {
-            bucket: "b".into(),
-            ..draft(dead_id, "job-002", "xyz")
-        })
+        repo.insert(
+            FileRefDraft {
+                bucket: "b".into(),
+                ..draft(dead_id, "job-002", "xyz")
+            },
+            &test_stamp(),
+        )
         .await
         .unwrap();
-        repo.soft_delete(dead_id, chrono::Utc::now()).await.unwrap();
+        repo.soft_delete(dead_id, chrono::Utc::now(), "emp-test", &test_stamp())
+            .await
+            .unwrap();
 
         let all = repo.list_for_sha256("xyz").await.unwrap();
         assert_eq!(all.len(), 2, "GC sweep must see soft-deleted refs too");
@@ -265,9 +302,11 @@ mod tests {
         let repo = InMemoryFileRepository::new();
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        repo.insert(draft(a, "job-001", "shared")).await.unwrap();
+        repo.insert(draft(a, "job-001", "shared"), &test_stamp())
+            .await
+            .unwrap();
         let err = repo
-            .insert(draft(b, "job-002", "shared"))
+            .insert(draft(b, "job-002", "shared"), &test_stamp())
             .await
             .unwrap_err();
         assert!(matches!(err, FileError::DuplicateObject(_)));
@@ -277,11 +316,17 @@ mod tests {
     async fn soft_delete_is_idempotent_and_preserves_first_timestamp() {
         let repo = InMemoryFileRepository::new();
         let id = Uuid::new_v4();
-        repo.insert(draft(id, "job-001", "abc")).await.unwrap();
+        repo.insert(draft(id, "job-001", "abc"), &test_stamp())
+            .await
+            .unwrap();
         let t1 = chrono::Utc.with_ymd_and_hms(2026, 5, 3, 10, 0, 0).unwrap();
         let t2 = chrono::Utc.with_ymd_and_hms(2026, 5, 3, 11, 0, 0).unwrap();
-        repo.soft_delete(id, t1).await.unwrap();
-        repo.soft_delete(id, t2).await.unwrap();
+        repo.soft_delete(id, t1, "emp-test", &test_stamp())
+            .await
+            .unwrap();
+        repo.soft_delete(id, t2, "emp-test", &test_stamp())
+            .await
+            .unwrap();
         let row = repo.get(id).await.unwrap().expect("present");
         assert_eq!(row.deleted_at, Some(t1), "second delete is a no-op");
     }
@@ -290,7 +335,12 @@ mod tests {
     async fn soft_delete_unknown_id_is_not_found() {
         let repo = InMemoryFileRepository::new();
         let err = repo
-            .soft_delete(Uuid::new_v4(), chrono::Utc::now())
+            .soft_delete(
+                Uuid::new_v4(),
+                chrono::Utc::now(),
+                "emp-test",
+                &test_stamp(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, FileError::NotFound(_)));
