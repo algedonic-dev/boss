@@ -6,6 +6,8 @@
 //! deliberately out of scope at v1.
 
 use async_trait::async_trait;
+use boss_core::actor::ActorId;
+use boss_core::publisher::EventStamp;
 use chrono::{DateTime, Utc};
 
 use boss_core::calendar::{
@@ -36,6 +38,11 @@ pub enum CalendarError {
     Invalid(String),
 }
 
+/// OUTBOX (phase 2): every mutation records its domain event on the
+/// transactional outbox INSIDE the adapter transaction via the stamp
+/// (`boss_events::outbox::record_event_in_tx`); boss-event-relay
+/// delivers to audit_log + NATS post-commit. Idempotency guards sit
+/// AHEAD of the recording, so a no-op cancel records nothing.
 #[async_trait]
 pub trait CalendarClient: Send + Sync {
     /// Try to reserve `req.resource` for `req.window`. Returns the
@@ -49,12 +56,17 @@ pub trait CalendarClient: Send + Sync {
     /// audit_log → projection rebuild path. See
     /// `docs/design/projection-rebuilders.md`.
     async fn reserve(&self, req: ReservationRequest) -> Result<ReservationId, CalendarError> {
-        self.reserve_at(req, Utc::now()).await
+        let now = Utc::now();
+        let stamp = EventStamp::new("calendar", ActorId::Automation("platform".into()), now);
+        self.reserve_at(req, now, &stamp).await
     }
+    /// Records `calendar.reservation.reserved` (the full post-INSERT
+    /// row state) in-tx.
     async fn reserve_at(
         &self,
         req: ReservationRequest,
         now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<ReservationId, CalendarError>;
 
     /// List active (non-cancelled) reservations on `resource` whose
@@ -71,28 +83,25 @@ pub trait CalendarClient: Send + Sync {
     /// row state for event emission.
     async fn get(&self, id: ReservationId) -> Result<Option<Reservation>, CalendarError>;
 
-    /// Snapshot every active (non-cancelled) reservation tied to a
-    /// given `(reason_kind, reason_ref_id)` pair. Used by the
-    /// cancel-by-reason handler to enumerate which rows the cascade
-    /// will affect *before* it runs, so it can emit one CANCELLED
-    /// event per row.
-    async fn list_active_by_reason(
-        &self,
-        reason_kind: &str,
-        reason_ref_id: &str,
-    ) -> Result<Vec<Reservation>, CalendarError>;
-
     /// Soft-delete a reservation. Idempotent — calling twice is the
     /// same as calling once. `actor` is recorded for the audit trail
     /// but has no effect on the row's `created_by`.
     async fn cancel(&self, id: ReservationId, actor: &str) -> Result<(), CalendarError> {
-        self.cancel_at(id, actor, Utc::now()).await
+        let now = Utc::now();
+        let stamp = EventStamp::new("calendar", ActorId::Automation("platform".into()), now);
+        self.cancel_at(id, actor, now, &stamp).await
     }
+    /// Records `calendar.reservation.cancelled` (the full post-cancel
+    /// row state) in-tx — and ONLY when the cancel actually flipped
+    /// the row. An already-cancelled reservation is a full no-op
+    /// (before, the handler's fetch-back emitted a DUPLICATE
+    /// cancelled event on every repeat cancel).
     async fn cancel_at(
         &self,
         id: ReservationId,
         actor: &str,
         now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<(), CalendarError>;
 
     /// Cancel every reservation tied to a given `(reason_kind,
@@ -108,15 +117,23 @@ pub trait CalendarClient: Send + Sync {
         reason_ref_id: &str,
         actor: &str,
     ) -> Result<usize, CalendarError> {
-        self.cancel_by_reason_at(reason_kind, reason_ref_id, actor, Utc::now())
+        let now = Utc::now();
+        let stamp = EventStamp::new("calendar", ActorId::Automation("platform".into()), now);
+        self.cancel_by_reason_at(reason_kind, reason_ref_id, actor, now, &stamp)
             .await
     }
+    /// Records one `calendar.reservation.cancelled` (full post-cancel
+    /// row state) in-tx PER ROW the cascade flipped — replacing the
+    /// racy list-then-emit the HTTP handler used to do around the
+    /// UPDATE (a row cancelled between the list and the UPDATE got an
+    /// event without a fact, and vice versa).
     async fn cancel_by_reason_at(
         &self,
         reason_kind: &str,
         reason_ref_id: &str,
         actor: &str,
         now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<usize, CalendarError>;
 
     /// Fetch a named business calendar (`us-banking`, `us-tax`, …) with

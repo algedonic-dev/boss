@@ -26,11 +26,24 @@ pub struct InMemoryCalendar {
     /// Business calendars keyed by `code`. Mirrors the
     /// `business_calendars` + `business_calendar_closed_days` tables.
     business_calendars: RwLock<HashMap<String, BusinessCalendar>>,
+    recorded: std::sync::Mutex<Vec<boss_core::event::Event>>,
 }
 
 impl InMemoryCalendar {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Events the outbox paths recorded — test visibility (the
+    /// in-memory analogue of the Pg adapter's in-tx recording).
+    pub fn recorded_events(&self) -> Vec<boss_core::event::Event> {
+        self.recorded.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    fn record(&self, event: boss_core::event::Event) {
+        if let Ok(mut v) = self.recorded.lock() {
+            v.push(event);
+        }
     }
 
     /// Number of *active* (non-cancelled) reservations. Pure helper
@@ -51,6 +64,7 @@ impl CalendarClient for InMemoryCalendar {
         &self,
         req: ReservationRequest,
         now: chrono::DateTime<Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<ReservationId, CalendarError> {
         if req.window.duration_seconds() <= 0 {
             return Err(CalendarError::Invalid(
@@ -90,7 +104,13 @@ impl CalendarClient for InMemoryCalendar {
             created_at: now,
             cancelled_at: None,
         };
+        let event = stamp.event(
+            crate::events::RESERVATION_RESERVED,
+            serde_json::to_value(&row).unwrap_or_default(),
+        );
         rows.push(row);
+        drop(rows);
+        self.record(event);
         Ok(id)
     }
 
@@ -114,36 +134,33 @@ impl CalendarClient for InMemoryCalendar {
         Ok(rows.iter().find(|r| r.id == id).cloned())
     }
 
-    async fn list_active_by_reason(
-        &self,
-        reason_kind: &str,
-        reason_ref_id: &str,
-    ) -> Result<Vec<Reservation>, CalendarError> {
-        let rows = self.rows.read().unwrap();
-        Ok(rows
-            .iter()
-            .filter(|r| {
-                r.cancelled_at.is_none()
-                    && r.reason_kind.as_str() == reason_kind
-                    && r.reason_ref_id == reason_ref_id
-            })
-            .cloned()
-            .collect())
-    }
-
     async fn cancel_at(
         &self,
         id: ReservationId,
         _actor: &str,
         now: chrono::DateTime<Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), CalendarError> {
-        let mut rows = self.rows.write().unwrap();
-        let row = rows
-            .iter_mut()
-            .find(|r| r.id == id)
-            .ok_or(CalendarError::NotFound(id))?;
-        if row.cancelled_at.is_none() {
-            row.cancelled_at = Some(now);
+        // Mirrors the Pg gate: only an actual flip records; an
+        // already-cancelled row is a full no-op.
+        let flipped = {
+            let mut rows = self.rows.write().unwrap();
+            let row = rows
+                .iter_mut()
+                .find(|r| r.id == id)
+                .ok_or(CalendarError::NotFound(id))?;
+            if row.cancelled_at.is_none() {
+                row.cancelled_at = Some(now);
+                Some(row.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(row) = flipped {
+            self.record(stamp.event(
+                crate::events::RESERVATION_CANCELLED,
+                serde_json::to_value(&row).unwrap_or_default(),
+            ));
         }
         Ok(())
     }
@@ -154,19 +171,30 @@ impl CalendarClient for InMemoryCalendar {
         reason_ref_id: &str,
         _actor: &str,
         now: chrono::DateTime<Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<usize, CalendarError> {
-        let mut rows = self.rows.write().unwrap();
-        let mut count = 0;
-        for r in rows.iter_mut() {
-            if r.cancelled_at.is_none()
-                && r.reason_kind.as_str() == reason_kind
-                && r.reason_ref_id == reason_ref_id
-            {
-                r.cancelled_at = Some(now);
-                count += 1;
+        let flipped: Vec<Reservation> = {
+            let mut rows = self.rows.write().unwrap();
+            let mut flipped = Vec::new();
+            for r in rows.iter_mut() {
+                if r.cancelled_at.is_none()
+                    && r.reason_kind.as_str() == reason_kind
+                    && r.reason_ref_id == reason_ref_id
+                {
+                    r.cancelled_at = Some(now);
+                    flipped.push(r.clone());
+                }
             }
+            flipped
+        };
+        let n = flipped.len();
+        for row in flipped {
+            self.record(stamp.event(
+                crate::events::RESERVATION_CANCELLED,
+                serde_json::to_value(&row).unwrap_or_default(),
+            ));
         }
-        Ok(count)
+        Ok(n)
     }
 
     async fn get_business_calendar(
