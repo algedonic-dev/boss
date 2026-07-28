@@ -97,6 +97,7 @@ impl CalendarClient for PgCalendar {
         &self,
         req: ReservationRequest,
         now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<ReservationId, CalendarError> {
         if req.window.duration_seconds() <= 0 {
             return Err(CalendarError::Invalid(
@@ -122,6 +123,11 @@ impl CalendarClient for PgCalendar {
             )));
         }
         let id = Uuid::new_v4();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CalendarError::Storage(e.to_string()))?;
         let res = sqlx::query(
             "INSERT INTO calendar_reservations
              (id, resource_kind, resource_id, start_ts, end_ts,
@@ -139,21 +145,47 @@ impl CalendarClient for PgCalendar {
         .bind(req.notes.as_deref())
         .bind(&req.created_by)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await;
 
-        match res {
-            Ok(_) => Ok(ReservationId::from_uuid(id)),
-            Err(e) => {
-                if let sqlx::Error::Database(db_err) = &e
-                    && db_err.code().as_deref() == Some(SQLSTATE_EXCLUSION_VIOLATION)
-                {
-                    let existing = self.find_overlapping(&req.subject, req.window).await?;
-                    return Err(CalendarError::Conflict { existing });
-                }
-                Err(CalendarError::Storage(e.to_string()))
+        if let Err(e) = res {
+            // Dropping the tx rolls back the failed INSERT.
+            drop(tx);
+            if let sqlx::Error::Database(db_err) = &e
+                && db_err.code().as_deref() == Some(SQLSTATE_EXCLUSION_VIOLATION)
+            {
+                let existing = self.find_overlapping(&req.subject, req.window).await?;
+                return Err(CalendarError::Conflict { existing });
             }
+            return Err(CalendarError::Storage(e.to_string()));
         }
+
+        // OUTBOX (phase 2): the reserved event (full post-INSERT row
+        // state, built from the same values just written) records
+        // with the row.
+        let reservation = Reservation {
+            id: ReservationId::from_uuid(id),
+            subject: req.subject,
+            window: req.window,
+            reason_kind: req.reason_kind,
+            reason_ref_id: req.reason_ref_id,
+            strength: req.strength,
+            notes: req.notes,
+            created_by: req.created_by,
+            created_at: now,
+            cancelled_at: None,
+        };
+        let event = stamp.event(
+            crate::events::RESERVATION_RESERVED,
+            serde_json::to_value(&reservation).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(CalendarError::Storage)?;
+        tx.commit()
+            .await
+            .map_err(|e| CalendarError::Storage(e.to_string()))?;
+        Ok(ReservationId::from_uuid(id))
     }
 
     async fn list(
@@ -197,60 +229,69 @@ impl CalendarClient for PgCalendar {
         row.map(Reservation::try_from).transpose()
     }
 
-    async fn list_active_by_reason(
-        &self,
-        reason_kind: &str,
-        reason_ref_id: &str,
-    ) -> Result<Vec<Reservation>, CalendarError> {
-        let rows: Vec<ReservationRow> = sqlx::query_as(
-            "SELECT id, resource_kind, resource_id, start_ts, end_ts,
-                    reason_kind, reason_ref_id, strength, notes,
-                    created_by, created_at, cancelled_at
-             FROM calendar_reservations
-             WHERE cancelled_at IS NULL
-               AND reason_kind = $1
-               AND reason_ref_id = $2",
-        )
-        .bind(reason_kind)
-        .bind(reason_ref_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CalendarError::Storage(e.to_string()))?;
-        rows.into_iter().map(Reservation::try_from).collect()
-    }
-
     async fn cancel_at(
         &self,
         id: ReservationId,
         _actor: &str,
         now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), CalendarError> {
         let uuid = *id.inner().as_uuid();
-        // Idempotent: leave `cancelled_at` alone if already set.
-        let res = sqlx::query(
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CalendarError::Storage(e.to_string()))?;
+        // Idempotent: leave `cancelled_at` alone if already set. The
+        // guard doubles as the event gate — RETURNING yields the row
+        // only when this call actually flipped it.
+        let row: Option<ReservationRow> = sqlx::query_as(
             "UPDATE calendar_reservations
              SET cancelled_at = $2
-             WHERE id = $1 AND cancelled_at IS NULL",
+             WHERE id = $1 AND cancelled_at IS NULL
+             RETURNING id, resource_kind, resource_id, start_ts, end_ts,
+                       reason_kind, reason_ref_id, strength, notes,
+                       created_by, created_at, cancelled_at",
         )
         .bind(uuid)
         .bind(now)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| CalendarError::Storage(e.to_string()))?;
-        if res.rows_affected() == 0 {
-            // Row could be missing OR already cancelled. Probe to
-            // distinguish — NotFound is a different kind of
-            // problem than no-op-cancel.
-            let exists: Option<(Uuid,)> =
-                sqlx::query_as("SELECT id FROM calendar_reservations WHERE id = $1")
-                    .bind(uuid)
-                    .fetch_optional(&self.pool)
+        match row {
+            Some(row) => {
+                // OUTBOX (phase 2): the cancelled event (full
+                // post-cancel row state) records with the flip. An
+                // already-cancelled row records nothing — before,
+                // the handler's fetch-back emitted a DUPLICATE
+                // cancelled event on every repeat cancel.
+                let reservation = Reservation::try_from(row)?;
+                let event = stamp.event(
+                    crate::events::RESERVATION_CANCELLED,
+                    serde_json::to_value(&reservation).unwrap_or_default(),
+                );
+                boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                    .await
+                    .map_err(CalendarError::Storage)?;
+                tx.commit()
                     .await
                     .map_err(|e| CalendarError::Storage(e.to_string()))?;
-            if exists.is_none() {
-                return Err(CalendarError::NotFound(id));
             }
-            // Row existed and was already cancelled — Ok.
+            None => {
+                // Row could be missing OR already cancelled. Probe to
+                // distinguish — NotFound is a different kind of
+                // problem than no-op-cancel.
+                let exists: Option<(Uuid,)> =
+                    sqlx::query_as("SELECT id FROM calendar_reservations WHERE id = $1")
+                        .bind(uuid)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(|e| CalendarError::Storage(e.to_string()))?;
+                if exists.is_none() {
+                    return Err(CalendarError::NotFound(id));
+                }
+                // Row existed and was already cancelled — Ok, no event.
+            }
         }
         Ok(())
     }
@@ -261,21 +302,48 @@ impl CalendarClient for PgCalendar {
         reason_ref_id: &str,
         _actor: &str,
         now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<usize, CalendarError> {
-        let res = sqlx::query(
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CalendarError::Storage(e.to_string()))?;
+        // RETURNING enumerates exactly the rows this cascade flipped,
+        // so the per-row events record in the SAME transaction as the
+        // flips — replacing the handler's racy list-then-emit around
+        // the UPDATE.
+        let rows: Vec<ReservationRow> = sqlx::query_as(
             "UPDATE calendar_reservations
              SET cancelled_at = $3
              WHERE reason_kind = $1
                AND reason_ref_id = $2
-               AND cancelled_at IS NULL",
+               AND cancelled_at IS NULL
+             RETURNING id, resource_kind, resource_id, start_ts, end_ts,
+                       reason_kind, reason_ref_id, strength, notes,
+                       created_by, created_at, cancelled_at",
         )
         .bind(reason_kind)
         .bind(reason_ref_id)
         .bind(now)
-        .execute(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| CalendarError::Storage(e.to_string()))?;
-        Ok(res.rows_affected() as usize)
+        let n = rows.len();
+        for row in rows {
+            let reservation = Reservation::try_from(row)?;
+            let event = stamp.event(
+                crate::events::RESERVATION_CANCELLED,
+                serde_json::to_value(&reservation).unwrap_or_default(),
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(CalendarError::Storage)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| CalendarError::Storage(e.to_string()))?;
+        Ok(n)
     }
 
     async fn get_business_calendar(

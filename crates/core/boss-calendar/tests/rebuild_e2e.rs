@@ -1,6 +1,8 @@
-//! End-to-end: drive calendar writes through PgCalendar +
-//! PgAuditWriter, snapshot calendar_reservations, drop, rebuild
-//! from `audit_log`, assert exact match.
+//! End-to-end: drive calendar writes through PgCalendar on the REAL
+//! pipeline (outbox phase 2 — events record in the domain tx, the
+//! relay drain moves them to audit_log), snapshot
+//! calendar_reservations, drop, rebuild from `audit_log`, assert
+//! exact match.
 
 #![cfg(feature = "postgres")]
 
@@ -14,8 +16,8 @@ use boss_calendar::rebuild_calendar;
 use boss_calendar::{CalendarClient, PgCalendar};
 use boss_core::calendar::{ReservationRequest, ReservationStrength, TimeWindow, reason};
 use boss_core::job::Subject;
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
+use boss_core::port::EventBus;
+use boss_events::outbox::drain_outbox_once;
 use boss_testing::{RecordingEventBus, TestDb};
 use chrono::{DateTime, TimeZone, Utc};
 use http_body_util::BodyExt;
@@ -44,15 +46,24 @@ async fn snapshot(pool: &PgPool) -> Vec<ReservationRow> {
 }
 
 fn build_app(pool: PgPool) -> (Router, Arc<dyn CalendarClient>) {
+    // No publisher, no direct audit writer: events reach audit_log
+    // only via the outbox -> relay drain.
     let calendar: Arc<dyn CalendarClient> = Arc::new(PgCalendar::new(pool.clone()));
-    let publisher = DomainPublisher::new(RecordingEventBus::new(), "calendar")
-        .with_audit(Arc::new(PgAuditWriter::new(pool)));
     let state = CalendarApiState {
         calendar: calendar.clone(),
-        publisher: Some(publisher),
+        publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
     };
     (router(state), calendar)
+}
+
+/// Drain the outbox through the relay pipeline into audit_log.
+async fn drain_outbox(pool: &PgPool) -> u64 {
+    let bus = RecordingEventBus::new();
+    drain_outbox_once(pool, &(bus as Arc<dyn EventBus>), 100)
+        .await
+        .expect("relay drain")
+        .delivered
 }
 
 fn t(h: u32) -> DateTime<Utc> {
@@ -124,7 +135,12 @@ async fn rebuild_reproduces_reservations() {
     // 2. Cancel one.
     delete_reserve(&app, id1).await;
 
-    // 3. Snapshot.
+    // 3. Drain the outbox into audit_log, then snapshot.
+    let delivered = drain_outbox(&db.pool).await;
+    assert_eq!(
+        delivered, 3,
+        "2 reserved + 1 cancelled arrive via the outbox"
+    );
     let before = snapshot(&db.pool).await;
     assert_eq!(before.len(), 2);
     assert_eq!(
@@ -176,6 +192,8 @@ async fn rebuild_cancel_without_cancelled_at_uses_event_time() {
         created_by: "tester".into(),
     };
     let id = post_reserve(&app, &r).await;
+    let delivered = drain_outbox(&db.pool).await;
+    assert_eq!(delivered, 1, "the reserve arrives via the outbox");
 
     // Reuse that payload (cancelled_at already null) as a cancel event
     // stamped at a historical instant clearly distinct from "now".

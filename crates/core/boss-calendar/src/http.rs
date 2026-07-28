@@ -89,21 +89,33 @@ async fn create_reservation(
     Json(req): Json<ReservationRequest>,
 ) -> Response {
     let now = boss_clock_client::now_from(&state.clock).await;
-    match state.calendar.reserve_at(req, now).await {
-        Ok(id) => {
-            if let Some(pub_) = &state.publisher
-                && let Ok(Some(reservation)) = state.calendar.get(id).await
-            {
-                pub_.emit_at(
-                    crate::events::RESERVATION_RESERVED,
-                    serde_json::to_value(&reservation).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            }
-            (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response()
-        }
+    // OUTBOX (phase 2): the adapter records the reserved event (full
+    // post-INSERT row state) inside the domain transaction; nothing
+    // publishes post-commit and no fetch-back read is needed.
+    let stamp = event_stamp(&state, now).await;
+    match state.calendar.reserve_at(req, now, &stamp).await {
+        Ok(id) => (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response(),
         Err(e) => calendar_error_response(e),
+    }
+}
+
+/// Resolve the outbox event stamp for this request. Calendar write
+/// handlers carry no CurrentUser extractor; the publisher's
+/// `default_actor` resolves the request identity from the task-local
+/// context (else `automation:calendar`), and its clock probe settles
+/// `_simulated` — the same envelope the retired post-commit emits
+/// carried (outbox phase 2).
+async fn event_stamp(
+    state: &CalendarApiState,
+    now: DateTime<Utc>,
+) -> boss_core::publisher::EventStamp {
+    match &state.publisher {
+        Some(p) => p.stamp_with_actor_at(p.default_actor(), now).await,
+        None => boss_core::publisher::EventStamp::new(
+            "calendar",
+            boss_core::actor::ActorId::Automation("calendar".into()),
+            now,
+        ),
     }
 }
 
@@ -159,20 +171,16 @@ async fn cancel_reservation(
     };
     let res_id = ReservationId::from_uuid(uuid);
     let now = boss_clock_client::now_from(&state.clock).await;
-    match state.calendar.cancel_at(res_id, &q.actor, now).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher
-                && let Ok(Some(reservation)) = state.calendar.get(res_id).await
-            {
-                pub_.emit_at(
-                    crate::events::RESERVATION_CANCELLED,
-                    serde_json::to_value(&reservation).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    // OUTBOX (phase 2): the adapter records the cancelled event (full
+    // post-cancel row state) with the flip — and only on an actual
+    // flip, so a repeat cancel no longer publishes a duplicate event.
+    let stamp = event_stamp(&state, now).await;
+    match state
+        .calendar
+        .cancel_at(res_id, &q.actor, now, &stamp)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => calendar_error_response(e),
     }
 }
@@ -190,40 +198,17 @@ async fn cancel_by_reason(
     Json(body): Json<CancelByReasonBody>,
 ) -> Response {
     let now = boss_clock_client::now_from(&state.clock).await;
-    // Snapshot the rows about to be cancelled so we can emit one
-    // CANCELLED event per affected row — required for the rebuild
-    // path to reproduce post-cascade state.
-    let about_to_cancel = if state.publisher.is_some() {
-        state
-            .calendar
-            .list_active_by_reason(&body.kind, &body.ref_id)
-            .await
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    // OUTBOX (phase 2): the adapter enumerates the flipped rows via
+    // UPDATE ... RETURNING and records one cancelled event per row in
+    // the SAME transaction — the racy list-then-emit snapshot this
+    // handler used to take around the UPDATE is gone.
+    let stamp = event_stamp(&state, now).await;
     match state
         .calendar
-        .cancel_by_reason_at(&body.kind, &body.ref_id, &body.actor, now)
+        .cancel_by_reason_at(&body.kind, &body.ref_id, &body.actor, now, &stamp)
         .await
     {
-        Ok(n) => {
-            if let Some(pub_) = &state.publisher {
-                for r in about_to_cancel {
-                    let cancelled = boss_core::calendar::Reservation {
-                        cancelled_at: Some(now),
-                        ..r
-                    };
-                    pub_.emit_at(
-                        crate::events::RESERVATION_CANCELLED,
-                        serde_json::to_value(&cancelled).unwrap_or_default(),
-                        now,
-                    )
-                    .await;
-                }
-            }
-            Json(serde_json::json!({ "cancelled": n })).into_response()
-        }
+        Ok(n) => Json(serde_json::json!({ "cancelled": n })).into_response(),
         Err(e) => calendar_error_response(e),
     }
 }
