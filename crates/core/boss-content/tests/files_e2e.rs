@@ -8,6 +8,14 @@
 use chrono::{DateTime, TimeZone, Utc};
 use uuid::Uuid;
 
+fn test_stamp() -> boss_core::publisher::EventStamp {
+    boss_core::publisher::EventStamp::new(
+        "content",
+        boss_core::actor::ActorId::Automation("test".into()),
+        chrono::Utc::now(),
+    )
+}
+
 use std::sync::Arc;
 
 use boss_content::files::{
@@ -54,7 +62,7 @@ fn draft(id: Uuid, target: ResourceRef, sha: &str, bucket: &str) -> FileRefDraft
 async fn run_insert_get_round_trips(repo: &dyn FileRepository) {
     let id = Uuid::new_v4();
     let row = repo
-        .insert(draft(id, job_target("job-001"), "abc", "bk"))
+        .insert(draft(id, job_target("job-001"), "abc", "bk"), &test_stamp())
         .await
         .unwrap();
     assert_eq!(row.id, id);
@@ -71,21 +79,26 @@ async fn run_list_for_filters_target_and_hides_soft_deleted(repo: &dyn FileRepos
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let other = Uuid::new_v4();
-    repo.insert(draft(a, job_target("job-001"), "aaa", "bk"))
+    repo.insert(draft(a, job_target("job-001"), "aaa", "bk"), &test_stamp())
         .await
         .unwrap();
-    repo.insert(draft(b, job_target("job-001"), "bbb", "bk"))
+    repo.insert(draft(b, job_target("job-001"), "bbb", "bk"), &test_stamp())
         .await
         .unwrap();
-    repo.insert(draft(other, job_target("job-002"), "ccc", "bk"))
-        .await
-        .unwrap();
+    repo.insert(
+        draft(other, job_target("job-002"), "ccc", "bk"),
+        &test_stamp(),
+    )
+    .await
+    .unwrap();
 
     let target = job_target("job-001");
     let live = repo.list_for(&target).await.unwrap();
     assert_eq!(live.len(), 2);
 
-    repo.soft_delete(a, at(60)).await.unwrap();
+    repo.soft_delete(a, at(60), "emp-test", &test_stamp())
+        .await
+        .unwrap();
     let live2 = repo.list_for(&target).await.unwrap();
     assert_eq!(live2.len(), 1, "soft-deleted row hidden from list_for");
     assert_eq!(live2[0].id, b);
@@ -97,13 +110,21 @@ async fn run_list_for_filters_target_and_hides_soft_deleted(repo: &dyn FileRepos
 async fn run_list_for_sha256_includes_soft_deleted(repo: &dyn FileRepository) {
     let live_id = Uuid::new_v4();
     let dead_id = Uuid::new_v4();
-    repo.insert(draft(live_id, job_target("job-001"), "shr", "bk-a"))
+    repo.insert(
+        draft(live_id, job_target("job-001"), "shr", "bk-a"),
+        &test_stamp(),
+    )
+    .await
+    .unwrap();
+    repo.insert(
+        draft(dead_id, job_target("job-002"), "shr", "bk-b"),
+        &test_stamp(),
+    )
+    .await
+    .unwrap();
+    repo.soft_delete(dead_id, at(0), "emp-test", &test_stamp())
         .await
         .unwrap();
-    repo.insert(draft(dead_id, job_target("job-002"), "shr", "bk-b"))
-        .await
-        .unwrap();
-    repo.soft_delete(dead_id, at(0)).await.unwrap();
 
     let all = repo.list_for_sha256("shr").await.unwrap();
     assert_eq!(all.len(), 2, "GC sweep needs to see soft-deleted refs");
@@ -114,11 +135,17 @@ async fn run_list_for_sha256_includes_soft_deleted(repo: &dyn FileRepository) {
 async fn run_duplicate_object_key_in_same_bucket_is_rejected(repo: &dyn FileRepository) {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
-    repo.insert(draft(a, job_target("job-001"), "shared", "bk"))
-        .await
-        .unwrap();
+    repo.insert(
+        draft(a, job_target("job-001"), "shared", "bk"),
+        &test_stamp(),
+    )
+    .await
+    .unwrap();
     let err = repo
-        .insert(draft(b, job_target("job-002"), "shared", "bk"))
+        .insert(
+            draft(b, job_target("job-002"), "shared", "bk"),
+            &test_stamp(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, FileError::DuplicateObject(_)));
@@ -126,11 +153,15 @@ async fn run_duplicate_object_key_in_same_bucket_is_rejected(repo: &dyn FileRepo
 
 async fn run_soft_delete_is_idempotent_first_timestamp_wins(repo: &dyn FileRepository) {
     let id = Uuid::new_v4();
-    repo.insert(draft(id, job_target("job-001"), "abc", "bk"))
+    repo.insert(draft(id, job_target("job-001"), "abc", "bk"), &test_stamp())
         .await
         .unwrap();
-    repo.soft_delete(id, at(0)).await.unwrap();
-    repo.soft_delete(id, at(60)).await.unwrap();
+    repo.soft_delete(id, at(0), "emp-test", &test_stamp())
+        .await
+        .unwrap();
+    repo.soft_delete(id, at(60), "emp-test", &test_stamp())
+        .await
+        .unwrap();
     let row = repo.get(id).await.unwrap().expect("present");
     assert_eq!(
         row.deleted_at,
@@ -140,7 +171,10 @@ async fn run_soft_delete_is_idempotent_first_timestamp_wins(repo: &dyn FileRepos
 }
 
 async fn run_soft_delete_unknown_id_is_not_found(repo: &dyn FileRepository) {
-    let err = repo.soft_delete(Uuid::new_v4(), at(0)).await.unwrap_err();
+    let err = repo
+        .soft_delete(Uuid::new_v4(), at(0), "emp-test", &test_stamp())
+        .await
+        .unwrap_err();
     assert!(matches!(err, FileError::NotFound(_)));
 }
 
@@ -395,8 +429,10 @@ async fn pg_gc_deletes_orphan_bytes_past_grace() {
     let id = uuid::Uuid::new_v4();
     let mut d = draft(id, job_target("job-1"), "old", "test");
     d.uploaded_at = at(-7 * 86_400); // 7 days back so the grace math is unambiguous
-    repo.insert(d).await.unwrap();
-    repo.soft_delete(id, at(-31 * 86_400)).await.unwrap();
+    repo.insert(d, &test_stamp()).await.unwrap();
+    repo.soft_delete(id, at(-31 * 86_400), "emp-test", &test_stamp())
+        .await
+        .unwrap();
 
     // Reference the GC `now` to the fixed test clock (`at(0)`), so the
     // 31-days-ago soft-delete is deterministically past the 30-day
@@ -422,20 +458,28 @@ async fn pg_gc_keeps_bytes_when_live_ref_shares_sha() {
 
     let dead = uuid::Uuid::new_v4();
     let live = uuid::Uuid::new_v4();
-    repo.insert(FileRefDraft {
-        bucket: "a".into(),
-        ..draft(dead, job_target("job-1"), "shared", "test")
-    })
+    repo.insert(
+        FileRefDraft {
+            bucket: "a".into(),
+            ..draft(dead, job_target("job-1"), "shared", "test")
+        },
+        &test_stamp(),
+    )
     .await
     .unwrap();
-    repo.insert(FileRefDraft {
-        bucket: "b".into(),
-        ..draft(live, job_target("job-2"), "shared", "test")
-    })
+    repo.insert(
+        FileRefDraft {
+            bucket: "b".into(),
+            ..draft(live, job_target("job-2"), "shared", "test")
+        },
+        &test_stamp(),
+    )
     .await
     .unwrap();
     // Soft-delete the dead ref well past the grace window.
-    repo.soft_delete(dead, at(-31 * 86_400)).await.unwrap();
+    repo.soft_delete(dead, at(-31 * 86_400), "emp-test", &test_stamp())
+        .await
+        .unwrap();
 
     // Reference the GC `now` to the fixed test clock (`at(0)`), so the
     // 31-days-ago soft-delete is deterministically past the 30-day
@@ -460,11 +504,16 @@ async fn pg_gc_within_grace_does_not_delete() {
         .unwrap();
 
     let id = uuid::Uuid::new_v4();
-    repo.insert(draft(id, job_target("job-1"), "recent", "test"))
+    repo.insert(
+        draft(id, job_target("job-1"), "recent", "test"),
+        &test_stamp(),
+    )
+    .await
+    .unwrap();
+    // Soft-deleted only 5 days ago — well inside the 30-day grace.
+    repo.soft_delete(id, at(-5 * 86_400), "emp-test", &test_stamp())
         .await
         .unwrap();
-    // Soft-deleted only 5 days ago — well inside the 30-day grace.
-    repo.soft_delete(id, at(-5 * 86_400)).await.unwrap();
 
     // Reference the GC `now` to the same fixed test clock the
     // soft-delete uses (`at(0)`), not wall-clock `Utc::now()`. The
@@ -499,7 +548,7 @@ async fn pg_audit_sample_matches_when_bytes_are_intact() {
     let mut d = draft(id, job_target("job-1"), &sha, "test");
     d.size_bytes = bytes.len() as i64;
     d.object_key = format!("sha256/{sha}");
-    repo.insert(d).await.unwrap();
+    repo.insert(d, &test_stamp()).await.unwrap();
 
     let report = audit_sample(&db.pool, storage.clone(), 50)
         .await
@@ -517,9 +566,12 @@ async fn pg_audit_sample_flags_bytes_missing_for_live_ref() {
     let storage = Arc::new(InMemoryFileStorage::new());
 
     let id = uuid::Uuid::new_v4();
-    repo.insert(draft(id, job_target("job-1"), "missing", "test"))
-        .await
-        .unwrap();
+    repo.insert(
+        draft(id, job_target("job-1"), "missing", "test"),
+        &test_stamp(),
+    )
+    .await
+    .unwrap();
 
     let report = audit_sample(&db.pool, storage.clone(), 50)
         .await
@@ -552,7 +604,7 @@ async fn pg_audit_sample_flags_hash_mismatch() {
     let id = uuid::Uuid::new_v4();
     let mut d = draft(id, job_target("job-1"), "expected", "test");
     d.object_key = "sha256/expected".into();
-    repo.insert(d).await.unwrap();
+    repo.insert(d, &test_stamp()).await.unwrap();
 
     let report = audit_sample(&db.pool, storage.clone(), 50)
         .await

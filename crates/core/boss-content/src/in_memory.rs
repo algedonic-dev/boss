@@ -83,6 +83,7 @@ impl ContentRepository for InMemoryContent {
         draft: BulletinDraft,
         actor_id: &str,
         now: chrono::DateTime<Utc>,
+        _stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Bulletin, ContentError> {
         if draft.title.trim().is_empty() {
             return Err(ContentError::Validation("title is required".into()));
@@ -119,6 +120,7 @@ impl ContentRepository for InMemoryContent {
         id: Uuid,
         patch: BulletinPatch,
         now: chrono::DateTime<Utc>,
+        _stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Bulletin, ContentError> {
         let mut state = self.state.lock().map_err(poisoned)?;
         let existing = state
@@ -150,7 +152,12 @@ impl ContentRepository for InMemoryContent {
         Ok(existing.clone())
     }
 
-    async fn delete_bulletin(&self, id: Uuid) -> Result<(), ContentError> {
+    async fn delete_bulletin_at(
+        &self,
+        id: Uuid,
+        _now: chrono::DateTime<Utc>,
+        _stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), ContentError> {
         let mut state = self.state.lock().map_err(poisoned)?;
         if state.bulletins.remove(&id).is_none() {
             return Err(ContentError::NotFound(format!("bulletin {id}")));
@@ -164,6 +171,7 @@ impl ContentRepository for InMemoryContent {
         id: Uuid,
         employee_id: &str,
         _now: chrono::DateTime<Utc>,
+        _stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), ContentError> {
         let mut state = self.state.lock().map_err(poisoned)?;
         if !state.bulletins.contains_key(&id) {

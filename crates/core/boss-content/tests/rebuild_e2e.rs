@@ -6,12 +6,26 @@
 
 use std::sync::Arc;
 
+fn test_stamp(now: chrono::DateTime<Utc>) -> boss_core::publisher::EventStamp {
+    boss_core::publisher::EventStamp::new(
+        "content",
+        boss_core::actor::ActorId::Automation("test".into()),
+        now,
+    )
+}
+
+/// Drain the outbox through the relay pipeline into audit_log.
+async fn drain_outbox(pool: &PgPool) {
+    let bus = RecordingEventBus::new();
+    boss_events::outbox::drain_outbox_once(pool, &(bus as Arc<dyn boss_core::port::EventBus>), 100)
+        .await
+        .expect("relay drain");
+}
+
 use boss_content::ContentRepository;
 use boss_content::PgContent;
 use boss_content::rebuild_content;
 use boss_content::types::*;
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
 use boss_testing::{RecordingEventBus, TestDb};
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::PgPool;
@@ -50,9 +64,9 @@ async fn snapshot_dismissals(pool: &PgPool) -> Vec<DismissalRow> {
 #[tokio::test(flavor = "multi_thread")]
 async fn rebuild_reproduces_bulletins_and_dismissals() {
     let db = TestDb::new().await;
+    // No publisher, no direct audit writer: the repo records events
+    // on the outbox in-tx; the drain moves them to audit_log.
     let repo = Arc::new(PgContent::new(db.pool.clone()));
-    let publisher = DomainPublisher::new(RecordingEventBus::new(), "content")
-        .with_audit(Arc::new(PgAuditWriter::new(db.pool.clone())));
 
     // 1. Create two bulletins.
     let now1 = Utc::now();
@@ -69,19 +83,13 @@ async fn rebuild_reproduces_bulletins_and_dismissals() {
             },
             "emp-author",
             now1,
+            &test_stamp(now1),
         )
         .await
         .unwrap();
-    publisher
-        .emit_at(
-            boss_content::events::BULLETIN_CREATED,
-            serde_json::to_value(&b1).unwrap(),
-            now1,
-        )
-        .await;
 
     let now2 = Utc::now();
-    let b2 = repo
+    let _b2 = repo
         .create_bulletin_at(
             BulletinDraft {
                 id: None,
@@ -94,20 +102,14 @@ async fn rebuild_reproduces_bulletins_and_dismissals() {
             },
             "emp-author",
             now2,
+            &test_stamp(now2),
         )
         .await
         .unwrap();
-    publisher
-        .emit_at(
-            boss_content::events::BULLETIN_CREATED,
-            serde_json::to_value(&b2).unwrap(),
-            now2,
-        )
-        .await;
 
     // 2. Update b1.
     let now3 = Utc::now();
-    let b1u = repo
+    let _b1u = repo
         .update_bulletin_at(
             b1.id,
             BulletinPatch {
@@ -118,33 +120,16 @@ async fn rebuild_reproduces_bulletins_and_dismissals() {
                 audience: None,
             },
             now3,
+            &test_stamp(now3),
         )
         .await
         .unwrap();
-    publisher
-        .emit_at(
-            boss_content::events::BULLETIN_UPDATED,
-            serde_json::to_value(&b1u).unwrap(),
-            now3,
-        )
-        .await;
 
     // 3. Dismiss b1 for one employee.
     let now4 = Utc::now();
-    repo.dismiss_bulletin_at(b1.id, "emp-reader", now4)
+    repo.dismiss_bulletin_at(b1.id, "emp-reader", now4, &test_stamp(now4))
         .await
         .unwrap();
-    publisher
-        .emit_at(
-            boss_content::events::BULLETIN_DISMISSED,
-            serde_json::json!({
-                "bulletin_id": b1.id,
-                "employee_id": "emp-reader",
-                "dismissed_at": now4,
-            }),
-            now4,
-        )
-        .await;
 
     // 4. Snapshot.
     let bulletins_before = snapshot_bulletins(&db.pool).await;
@@ -152,7 +137,8 @@ async fn rebuild_reproduces_bulletins_and_dismissals() {
     assert_eq!(bulletins_before.len(), 2);
     assert_eq!(dismissals_before.len(), 1);
 
-    // 5. Wipe + rebuild.
+    // 5. Drain the outbox into audit_log, then wipe + rebuild.
+    drain_outbox(&db.pool).await;
     let report = rebuild_content(&db.pool).await.expect("rebuild succeeds");
     assert_eq!(report.bulletins_upserted, 3, "2 created + 1 updated");
     assert_eq!(report.dismissals_inserted, 1);

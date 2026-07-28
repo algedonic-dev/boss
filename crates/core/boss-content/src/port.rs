@@ -1,6 +1,8 @@
 //! Port: what persistence must do for the content service.
 
 use async_trait::async_trait;
+use boss_core::actor::ActorId;
+use boss_core::publisher::EventStamp;
 use chrono::{DateTime, NaiveDate, Utc};
 use uuid::Uuid;
 
@@ -29,46 +31,74 @@ pub trait ContentRepository: Send + Sync {
 
     async fn get_bulletin(&self, id: Uuid) -> Result<Option<Bulletin>, ContentError>;
 
+    /// OUTBOX (phase 2): records `content.bulletin.created` (full
+    /// row state) in-tx — only when the INSERT actually inserted (a
+    /// double-submit retry collapses on ON CONFLICT (id) and records
+    /// nothing).
     async fn create_bulletin(
         &self,
         draft: BulletinDraft,
         actor_id: &str,
     ) -> Result<Bulletin, ContentError> {
-        self.create_bulletin_at(draft, actor_id, Utc::now()).await
+        let now = Utc::now();
+        let stamp = EventStamp::new("content", ActorId::Automation("platform".into()), now);
+        self.create_bulletin_at(draft, actor_id, now, &stamp).await
     }
     async fn create_bulletin_at(
         &self,
         draft: BulletinDraft,
         actor_id: &str,
         now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<Bulletin, ContentError>;
 
+    /// Records `content.bulletin.updated` (full row state) in-tx.
     async fn update_bulletin(
         &self,
         id: Uuid,
         patch: BulletinPatch,
     ) -> Result<Bulletin, ContentError> {
-        self.update_bulletin_at(id, patch, Utc::now()).await
+        let now = Utc::now();
+        let stamp = EventStamp::new("content", ActorId::Automation("platform".into()), now);
+        self.update_bulletin_at(id, patch, now, &stamp).await
     }
     async fn update_bulletin_at(
         &self,
         id: Uuid,
         patch: BulletinPatch,
         now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<Bulletin, ContentError>;
 
-    async fn delete_bulletin(&self, id: Uuid) -> Result<(), ContentError>;
+    /// Records `content.bulletin.deleted` (`{id, deleted_at}`) in-tx
+    /// after the row actually deleted.
+    async fn delete_bulletin(&self, id: Uuid) -> Result<(), ContentError> {
+        let now = Utc::now();
+        let stamp = EventStamp::new("content", ActorId::Automation("platform".into()), now);
+        self.delete_bulletin_at(id, now, &stamp).await
+    }
+    async fn delete_bulletin_at(
+        &self,
+        id: Uuid,
+        now: DateTime<Utc>,
+        stamp: &EventStamp,
+    ) -> Result<(), ContentError>;
 
     /// Mark a bulletin dismissed for one employee. Idempotent — second
-    /// call is a no-op.
+    /// call is a no-op. Records `content.bulletin.dismissed` in-tx —
+    /// only when the dismissal row actually inserted (a repeat
+    /// dismissal records nothing).
     async fn dismiss_bulletin(&self, id: Uuid, employee_id: &str) -> Result<(), ContentError> {
-        self.dismiss_bulletin_at(id, employee_id, Utc::now()).await
+        let now = Utc::now();
+        let stamp = EventStamp::new("content", ActorId::Automation("platform".into()), now);
+        self.dismiss_bulletin_at(id, employee_id, now, &stamp).await
     }
     async fn dismiss_bulletin_at(
         &self,
         id: Uuid,
         employee_id: &str,
         now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<(), ContentError>;
 
     // --- Manual ---------------------------------------------------------

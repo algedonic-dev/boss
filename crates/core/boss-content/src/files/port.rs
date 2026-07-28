@@ -8,7 +8,9 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use boss_core::publisher::EventStamp;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::files::error::FileError;
@@ -26,7 +28,9 @@ pub trait FileRepository: Send + Sync {
     /// can mint it ahead of time and use it as both the row PK and
     /// the audit_log event id (per the design's identity choice).
     /// Returns the persisted row with `deleted_at: None`.
-    async fn insert(&self, draft: FileRefDraft) -> Result<FileRef, FileError>;
+    /// OUTBOX (phase 2): records `content.file.attached` (the full
+    /// FileRef) in the same transaction as the row.
+    async fn insert(&self, draft: FileRefDraft, stamp: &EventStamp) -> Result<FileRef, FileError>;
 
     /// Lookup by id. Returns `Some` even for soft-deleted rows so
     /// the audit page can render historical attachments; callers that
@@ -48,10 +52,16 @@ pub trait FileRepository: Send + Sync {
     /// re-deleting an already-deleted row is a no-op (the original
     /// timestamp is preserved for audit). Returns `NotFound` if the
     /// row id doesn't exist.
+    /// OUTBOX (phase 2): records `content.file.detached`
+    /// (`{file_id, target_kind, target_id, deleted_by, deleted_at}`)
+    /// in-tx — and ONLY when this call actually flipped the row, so
+    /// a repeat soft-delete records no duplicate event.
     async fn soft_delete(
         &self,
         id: Uuid,
-        at: chrono::DateTime<chrono::Utc>,
+        at: DateTime<Utc>,
+        deleted_by: &str,
+        stamp: &EventStamp,
     ) -> Result<(), FileError>;
 }
 

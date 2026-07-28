@@ -25,3 +25,24 @@ pub const BULLETIN_DISMISSED: &str = "content.bulletin.dismissed";
 // deleted_at column without a side-channel lookup.
 pub const FILE_ATTACHED: &str = "content.file.attached";
 pub const FILE_DETACHED: &str = "content.file.detached";
+
+/// Resolve the outbox event stamp for a request. Content write
+/// handlers derive identity from the X-Boss-User header, not a
+/// CurrentUser extractor; the publisher's `default_actor` resolves
+/// the request identity from the task-local context (else
+/// `automation:content`), and its clock probe settles `_simulated` —
+/// the same envelope the retired post-commit emits carried (outbox
+/// phase 2).
+pub(crate) async fn event_stamp(
+    publisher: &Option<boss_core::publisher::DomainPublisher>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> boss_core::publisher::EventStamp {
+    match publisher {
+        Some(p) => p.stamp_with_actor_at(p.default_actor(), now).await,
+        None => boss_core::publisher::EventStamp::new(
+            "content",
+            boss_core::actor::ActorId::Automation("content".into()),
+            now,
+        ),
+    }
+}

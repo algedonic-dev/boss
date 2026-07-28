@@ -63,7 +63,12 @@ fn row_to_file_ref(row: &sqlx::postgres::PgRow) -> Result<FileRef, FileError> {
 
 #[async_trait]
 impl FileRepository for PgFileRepository {
-    async fn insert(&self, draft: FileRefDraft) -> Result<FileRef, FileError> {
+    async fn insert(
+        &self,
+        draft: FileRefDraft,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<FileRef, FileError> {
+        let mut tx = self.pool.begin().await.map_err(store)?;
         sqlx::query(
             "INSERT INTO file_refs (
                 id, target_kind, target_id, bucket, object_key,
@@ -82,10 +87,22 @@ impl FileRepository for PgFileRepository {
         .bind(&draft.filename)
         .bind(&draft.uploaded_by)
         .bind(draft.uploaded_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(store)?;
-        Ok(draft.into_ref())
+        let row = draft.into_ref();
+        // OUTBOX (phase 2): the attached event (the full FileRef —
+        // its event id IS the row id per the design's identity
+        // choice) records with the row.
+        let event = stamp.event(
+            crate::events::FILE_ATTACHED,
+            serde_json::to_value(&row).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(FileError::Storage)?;
+        tx.commit().await.map_err(store)?;
+        Ok(row)
     }
 
     async fn get(&self, id: Uuid) -> Result<Option<FileRef>, FileError> {
@@ -136,23 +153,61 @@ impl FileRepository for PgFileRepository {
         rows.iter().map(row_to_file_ref).collect()
     }
 
-    async fn soft_delete(&self, id: Uuid, at: DateTime<Utc>) -> Result<(), FileError> {
-        // COALESCE preserves the original deleted_at on a re-delete,
-        // matching the in-memory adapter's "first timestamp wins"
-        // contract. The RETURNING clause + check_count distinguishes
-        // not-found from no-op.
-        let res = sqlx::query(
+    async fn soft_delete(
+        &self,
+        id: Uuid,
+        at: DateTime<Utc>,
+        deleted_by: &str,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), FileError> {
+        let mut tx = self.pool.begin().await.map_err(store)?;
+        // The deleted_at IS NULL guard preserves the original
+        // timestamp on a re-delete ("first timestamp wins") AND
+        // doubles as the event gate: RETURNING yields the row only
+        // when THIS call flipped it, so a repeat soft-delete records
+        // no duplicate detached event.
+        let flipped: Option<(String, String)> = sqlx::query_as(
             "UPDATE file_refs
-             SET deleted_at = COALESCE(deleted_at, $2)
-             WHERE id = $1",
+             SET deleted_at = $2
+             WHERE id = $1 AND deleted_at IS NULL
+             RETURNING target_kind, target_id",
         )
         .bind(id)
         .bind(at)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(store)?;
-        if res.rows_affected() == 0 {
-            return Err(FileError::NotFound(id.to_string()));
+        match flipped {
+            Some((target_kind, target_id)) => {
+                // OUTBOX (phase 2): the detached event records with
+                // the flip.
+                let event = stamp.event(
+                    crate::events::FILE_DETACHED,
+                    serde_json::json!({
+                        "file_id": id,
+                        "target_kind": target_kind,
+                        "target_id": target_id,
+                        "deleted_by": deleted_by,
+                        "deleted_at": at,
+                    }),
+                );
+                boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                    .await
+                    .map_err(FileError::Storage)?;
+                tx.commit().await.map_err(store)?;
+            }
+            None => {
+                // Missing row vs already-deleted no-op.
+                let exists: Option<(Uuid,)> =
+                    sqlx::query_as("SELECT id FROM file_refs WHERE id = $1")
+                        .bind(id)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(store)?;
+                if exists.is_none() {
+                    return Err(FileError::NotFound(id.to_string()));
+                }
+            }
         }
         Ok(())
     }

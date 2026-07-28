@@ -121,6 +121,7 @@ impl ContentRepository for PgContent {
         draft: BulletinDraft,
         actor_id: &str,
         now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Bulletin, ContentError> {
         if draft.title.trim().is_empty() {
             return Err(ContentError::Validation("title is required".into()));
@@ -134,7 +135,12 @@ impl ContentRepository for PgContent {
         // creates a duplicate bulletin.
         let id = draft.id.unwrap_or_else(Uuid::new_v4);
         let posted_on = draft.posted_on.unwrap_or_else(|| now.date_naive());
-        sqlx::query(
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ContentError::Storage(e.to_string()))?;
+        let res = sqlx::query(
             "INSERT INTO bulletins \
                 (id, title, body, actor_id, posted_on, expires_on, priority, audience, \
                  created_at, updated_at) \
@@ -150,12 +156,31 @@ impl ContentRepository for PgContent {
         .bind(draft.priority.as_str())
         .bind(&draft.audience.0)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ContentError::Storage(e.to_string()))?;
-        self.get_bulletin(id)
+        let bulletin = fetch_bulletin_in_tx(&mut tx, id)
             .await?
-            .ok_or_else(|| ContentError::Storage("just-created bulletin vanished".into()))
+            .ok_or_else(|| ContentError::Storage("just-created bulletin vanished".into()))?;
+        // OUTBOX (phase 2): the created event (full row state)
+        // records with the row — and only when the INSERT actually
+        // inserted. The ON CONFLICT (id) DO NOTHING retry guard
+        // doubles as the event gate: a double-submit collapses and
+        // records nothing (before, every retry published a duplicate
+        // created event).
+        if res.rows_affected() > 0 {
+            let event = stamp.event(
+                crate::events::BULLETIN_CREATED,
+                serde_json::to_value(&bulletin).unwrap_or_default(),
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(ContentError::Storage)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| ContentError::Storage(e.to_string()))?;
+        Ok(bulletin)
     }
 
     async fn update_bulletin_at(
@@ -163,6 +188,7 @@ impl ContentRepository for PgContent {
         id: Uuid,
         patch: BulletinPatch,
         now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<Bulletin, ContentError> {
         // Pull the current row so we can merge the patch without a
         // dynamic UPDATE builder. Small rows, small fields.
@@ -192,6 +218,11 @@ impl ContentRepository for PgContent {
         let priority = patch.priority.unwrap_or(current.priority);
         let audience = patch.audience.unwrap_or(current.audience);
 
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ContentError::Storage(e.to_string()))?;
         sqlx::query(
             "UPDATE bulletins SET \
                  title = $2, body = $3, expires_on = $4, \
@@ -205,24 +236,59 @@ impl ContentRepository for PgContent {
         .bind(priority.as_str())
         .bind(&audience.0)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ContentError::Storage(e.to_string()))?;
 
-        self.get_bulletin(id)
+        let bulletin = fetch_bulletin_in_tx(&mut tx, id)
             .await?
-            .ok_or_else(|| ContentError::Storage("bulletin vanished mid-update".into()))
+            .ok_or_else(|| ContentError::Storage("bulletin vanished mid-update".into()))?;
+        // OUTBOX (phase 2): the updated event (full row state)
+        // records with the row.
+        let event = stamp.event(
+            crate::events::BULLETIN_UPDATED,
+            serde_json::to_value(&bulletin).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(ContentError::Storage)?;
+        tx.commit()
+            .await
+            .map_err(|e| ContentError::Storage(e.to_string()))?;
+        Ok(bulletin)
     }
 
-    async fn delete_bulletin(&self, id: Uuid) -> Result<(), ContentError> {
+    async fn delete_bulletin_at(
+        &self,
+        id: Uuid,
+        now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), ContentError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ContentError::Storage(e.to_string()))?;
         let res = sqlx::query("DELETE FROM bulletins WHERE id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| ContentError::Storage(e.to_string()))?;
         if res.rows_affected() == 0 {
             return Err(ContentError::NotFound(format!("bulletin {id}")));
         }
+        // OUTBOX (phase 2): the deleted event records only after the
+        // row actually deleted (NotFound above returns pre-recording).
+        let event = stamp.event(
+            crate::events::BULLETIN_DELETED,
+            serde_json::json!({ "id": id, "deleted_at": now }),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(ContentError::Storage)?;
+        tx.commit()
+            .await
+            .map_err(|e| ContentError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -231,28 +297,54 @@ impl ContentRepository for PgContent {
         id: Uuid,
         employee_id: &str,
         now: chrono::DateTime<chrono::Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), ContentError> {
         // Idempotent: ON CONFLICT DO NOTHING so repeat dismissals are
         // no-ops. Validate the bulletin exists first so a stale client
         // gets 404 rather than a silent success.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| ContentError::Storage(e.to_string()))?;
         let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM bulletins WHERE id = $1")
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|e| ContentError::Storage(e.to_string()))?;
         if exists.is_none() {
             return Err(ContentError::NotFound(format!("bulletin {id}")));
         }
-        sqlx::query(
+        let res = sqlx::query(
             "INSERT INTO bulletin_dismissals (bulletin_id, employee_id, dismissed_at) \
              VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
         )
         .bind(id)
         .bind(employee_id)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| ContentError::Storage(e.to_string()))?;
+        // OUTBOX (phase 2): the ON CONFLICT idempotency guard doubles
+        // as the event gate — a repeat dismissal records nothing
+        // (before, every repeat published a duplicate dismissed
+        // event).
+        if res.rows_affected() > 0 {
+            let event = stamp.event(
+                crate::events::BULLETIN_DISMISSED,
+                serde_json::json!({
+                    "bulletin_id": id,
+                    "employee_id": employee_id,
+                    "dismissed_at": now,
+                }),
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(ContentError::Storage)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| ContentError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -439,6 +531,26 @@ impl ContentRepository for PgContent {
         .map_err(store)?;
         rows.iter().map(row_to_version).collect()
     }
+}
+
+/// Fetch one bulletin INSIDE the caller's transaction — the in-tx
+/// sibling of `get_bulletin`, used by the outbox-recording write
+/// paths so the event payload reflects the row state being committed.
+async fn fetch_bulletin_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+) -> Result<Option<Bulletin>, ContentError> {
+    let row = sqlx::query(
+        "SELECT id, title, body, actor_id, posted_on, expires_on, \
+                priority, audience, created_at, updated_at, \
+                false AS dismissed \
+         FROM bulletins WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| ContentError::Storage(e.to_string()))?;
+    row.as_ref().map(row_to_bulletin).transpose()
 }
 
 fn row_to_bulletin(row: &sqlx::postgres::PgRow) -> Result<Bulletin, ContentError> {
