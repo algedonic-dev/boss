@@ -2,6 +2,8 @@
 //! persistence.
 
 use async_trait::async_trait;
+use boss_core::actor::ActorId;
+use boss_core::publisher::EventStamp;
 use chrono::{DateTime, Utc};
 
 use crate::types::Employee;
@@ -37,26 +39,46 @@ pub trait PeopleRepository: Send + Sync {
     async fn direct_reports(&self, manager_id: &str) -> Result<Vec<Employee>, PeopleError>;
 
     /// Create a new employee. Returns the ID. Errors if ID already exists.
+    /// OUTBOX (phase 2): records `people.employee.created` (full row
+    /// state) in the same transaction as the row.
     async fn create_employee(&self, emp: &Employee) -> Result<String, PeopleError> {
-        self.create_employee_at(emp, Utc::now()).await
+        let now = Utc::now();
+        let stamp = EventStamp::new("people", ActorId::Automation("platform".into()), now);
+        self.create_employee_at(emp, now, &stamp).await
     }
     async fn create_employee_at(
         &self,
         emp: &Employee,
         now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<String, PeopleError>;
 
     /// Replace an employee by ID. Errors if ID doesn't exist.
+    /// Records `people.employee.updated` (full row state) in-tx.
     async fn update_employee(&self, id: &str, emp: &Employee) -> Result<(), PeopleError> {
-        self.update_employee_at(id, emp, Utc::now()).await
+        let now = Utc::now();
+        let stamp = EventStamp::new("people", ActorId::Automation("platform".into()), now);
+        self.update_employee_at(id, emp, now, &stamp).await
     }
     async fn update_employee_at(
         &self,
         id: &str,
         emp: &Employee,
         now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<(), PeopleError>;
 
     /// Delete an employee and satellite data. Errors if ID doesn't exist.
-    async fn delete_employee(&self, id: &str) -> Result<(), PeopleError>;
+    /// Records `people.employee.deleted` (`{id, deleted_at}`) in-tx.
+    async fn delete_employee(&self, id: &str) -> Result<(), PeopleError> {
+        let now = Utc::now();
+        let stamp = EventStamp::new("people", ActorId::Automation("platform".into()), now);
+        self.delete_employee_at(id, now, &stamp).await
+    }
+    async fn delete_employee_at(
+        &self,
+        id: &str,
+        now: DateTime<Utc>,
+        stamp: &EventStamp,
+    ) -> Result<(), PeopleError>;
 }

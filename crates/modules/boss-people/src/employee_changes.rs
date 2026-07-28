@@ -82,15 +82,10 @@ async fn create_change(
         initiated_by: req.initiated_by,
     };
 
-    if let Some(pub_) = &state.publisher {
-        pub_.emit_at(
-            EMPLOYEE_CHANGE_RECORDED,
-            serde_json::to_value(&rec).unwrap_or_default(),
-            now,
-        )
-        .await;
-    }
-
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
     let result = sqlx::query(
         "INSERT INTO employee_changes (employee_id, kind, from_value, to_value, effective_date, notes, initiated_by, created_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
@@ -104,11 +99,29 @@ async fn create_change(
     .bind(&rec.notes)
     .bind(&rec.initiated_by)
     .bind(now)
-    .execute(state.pool.as_ref())
+    .execute(&mut *tx)
     .await;
-
-    match result {
-        Ok(_) => (StatusCode::CREATED, Json(serde_json::json!({"ok": true}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    let inserted = match result {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    // OUTBOX (phase 2): the event records with the row — and only
+    // when the INSERT actually inserted. Before, the handler
+    // published FIRST and wrote after: a failed or conflict-skipped
+    // INSERT still shipped an event (an event with no fact), the
+    // inverse of the swallowed-write class this arc closes.
+    if inserted {
+        let stamp = crate::events::event_stamp(&state.publisher, now).await;
+        let event = stamp.event(
+            EMPLOYEE_CHANGE_RECORDED,
+            serde_json::to_value(&rec).unwrap_or_default(),
+        );
+        if let Err(e) = boss_events::outbox::record_event_in_tx(&mut tx, &event).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
     }
+    if let Err(e) = tx.commit().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    (StatusCode::CREATED, Json(serde_json::json!({"ok": true}))).into_response()
 }

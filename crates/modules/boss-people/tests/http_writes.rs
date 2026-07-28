@@ -36,7 +36,7 @@ async fn post_employee_emits_people_employee_created_event() {
         .await
         .assert_status(StatusCode::CREATED);
 
-    let event = app.bus.assert_event_emitted("people.employee.created");
+    let event = app.assert_recorded("people.employee.created");
     assert_eq!(
         event.payload.get("id").and_then(|v| v.as_str()),
         Some("emp-event-1"),
@@ -68,7 +68,7 @@ async fn post_duplicate_employee_does_not_emit_event() {
         .await
         .assert_status(StatusCode::CONFLICT);
 
-    app.bus.assert_event_not_emitted("people.employee.created");
+    app.assert_not_recorded("people.employee.created");
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +102,7 @@ async fn put_existing_employee_emits_updated_event() {
         .await
         .assert_status(StatusCode::NO_CONTENT);
 
-    app.bus.assert_event_emitted("people.employee.updated");
+    app.assert_recorded("people.employee.updated");
 }
 
 #[tokio::test]
@@ -144,7 +144,7 @@ async fn delete_existing_employee_emits_deleted_event() {
         .await
         .assert_status(StatusCode::NO_CONTENT);
 
-    let event = app.bus.assert_event_emitted("people.employee.deleted");
+    let event = app.assert_recorded("people.employee.deleted");
     assert_eq!(
         event.payload.get("id").and_then(|v| v.as_str()),
         Some("emp-del-2"),

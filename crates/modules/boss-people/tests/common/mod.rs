@@ -20,21 +20,17 @@
 use std::sync::Arc;
 
 use axum::Router;
-use boss_core::publisher::DomainPublisher;
-#[cfg(feature = "postgres")]
-use boss_events::PgAuditWriter;
 use boss_people::InMemoryPeople;
 use boss_people::http::{PeopleApiState, router};
 use boss_people::types::*;
 use boss_policy_client::{PermissivePolicyClient, PolicyClient};
-use boss_testing::RecordingEventBus;
-#[cfg(feature = "postgres")]
-use sqlx::PgPool;
 
-/// A fully wired people service for tests.
+/// A fully wired people service for tests (publisher `None` — outbox
+/// phase 2: the adapter records events in the domain write, so the
+/// in-memory repo's `recorded_events()` is the assertion surface).
 pub struct PeopleTestApp {
     pub router: Router,
-    pub bus: Arc<RecordingEventBus>,
+    pub people: Arc<InMemoryPeople>,
 }
 
 impl PeopleTestApp {
@@ -46,37 +42,40 @@ impl PeopleTestApp {
     /// Build a test app pre-populated with the given employees.
     pub fn with_employees(employees: Vec<Employee>) -> Self {
         let people = Arc::new(InMemoryPeople::new(employees));
-        let bus = RecordingEventBus::new();
-        let publisher = DomainPublisher::new(bus.clone(), "people");
         let state = PeopleApiState {
-            people,
-            publisher: Some(publisher),
+            people: people.clone(),
+            publisher: None,
             policy: Some(Arc::new(PermissivePolicyClient) as Arc<dyn PolicyClient>),
             subject_kinds: None,
             clock: Arc::new(boss_clock_client::WallClockClient),
         };
         let router = router(state);
-        Self { router, bus }
+        Self { router, people }
     }
 
-    /// Build a test app whose publisher persists every emitted event
-    /// to the given Postgres pool's `audit_log` table. Used by the
-    /// audit_log E2E integration test.
-    #[cfg(feature = "postgres")]
-    pub fn with_audit_pool(pool: PgPool) -> Self {
-        let people = Arc::new(InMemoryPeople::new(vec![]));
-        let bus = RecordingEventBus::new();
-        let publisher = DomainPublisher::new(bus.clone(), "people")
-            .with_audit(Arc::new(PgAuditWriter::new(pool)));
-        let state = PeopleApiState {
-            people,
-            publisher: Some(publisher),
-            policy: Some(Arc::new(PermissivePolicyClient) as Arc<dyn PolicyClient>),
-            subject_kinds: None,
-            clock: Arc::new(boss_clock_client::WallClockClient),
-        };
-        let router = router(state);
-        Self { router, bus }
+    /// Assert exactly-one recorded event of `kind` and return it.
+    pub fn assert_recorded(&self, kind: &str) -> boss_core::event::Event {
+        let matches: Vec<_> = self
+            .people
+            .recorded_events()
+            .into_iter()
+            .filter(|e| e.kind == kind)
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one recorded `{kind}` event, got {}",
+            matches.len()
+        );
+        matches.into_iter().next().unwrap()
+    }
+
+    /// Assert no recorded event of `kind`.
+    pub fn assert_not_recorded(&self, kind: &str) {
+        assert!(
+            !self.people.recorded_events().iter().any(|e| e.kind == kind),
+            "expected no recorded `{kind}` event"
+        );
     }
 }
 
