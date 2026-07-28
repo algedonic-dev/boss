@@ -254,6 +254,12 @@ if [[ "$START" -eq 1 ]]; then
     # value → dispatcher warns + falls back to spread.
     DISPATCHER_ENV="$DISPATCHER_ENV BOSS_DISPATCH_STRATEGY=spread"
     DISPATCHER_ENV="$DISPATCHER_ENV BOSS_EVENT_WEBHOOK_URL=http://127.0.0.1:7099/callback"
+    # boss-event-relay: outbox → audit_log + NATS (outbox phase 2).
+    # The dispatcher's step.done/step.ready signals ride this path —
+    # without the relay no side-effect rules ever fire. Borrows the
+    # jobs config (generated above) for postgres_url + nats_url,
+    # matching the systemd unit.
+    start_svc boss-event-relay   "" "$REPO_ROOT/target/release/boss-event-relay" --config /etc/boss-jobs-api.toml
     start_svc boss-dispatcher    "$DISPATCHER_ENV" "$REPO_ROOT/target/release/boss-dispatcher"
 
     start_svc boss-brewery-sim   "$SIM_ENV" "$REPO_ROOT/target/release/boss-brewery-sim"
