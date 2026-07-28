@@ -2,6 +2,7 @@
 //! materialize binary call into.
 
 use async_trait::async_trait;
+use boss_core::publisher::EventStamp;
 use chrono::{DateTime, NaiveDate, Utc};
 use uuid::Uuid;
 
@@ -20,12 +21,18 @@ pub enum SchedulingError {
     Storage(String),
 }
 
+/// OUTBOX (phase 2): every mutation records its scheduling.* event
+/// on the transactional outbox INSIDE the write transaction via the
+/// caller's stamp (`boss_events::outbox::record_event_in_tx`);
+/// boss-event-relay delivers to audit_log + NATS post-commit.
+/// Deletes record only after the row actually deleted.
 #[async_trait]
 pub trait SchedulingRepository: Send + Sync {
     // ----- Availability -----
     async fn create_availability(
         &self,
         new: NewTechAvailability,
+        stamp: &EventStamp,
     ) -> Result<TechAvailability, SchedulingError>;
     async fn list_availability(
         &self,
@@ -33,12 +40,18 @@ pub trait SchedulingRepository: Send + Sync {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
     ) -> Result<Vec<TechAvailability>, SchedulingError>;
-    async fn delete_availability(&self, id: Uuid) -> Result<(), SchedulingError>;
+    async fn delete_availability(
+        &self,
+        id: Uuid,
+        now: DateTime<Utc>,
+        stamp: &EventStamp,
+    ) -> Result<(), SchedulingError>;
 
     // ----- Assignments -----
     async fn create_assignment(
         &self,
         new: NewScheduledAssignment,
+        stamp: &EventStamp,
     ) -> Result<ScheduledAssignment, SchedulingError>;
     async fn get_assignment(
         &self,
@@ -55,8 +68,15 @@ pub trait SchedulingRepository: Send + Sync {
         &self,
         id: Uuid,
         status: super::types::AssignmentStatus,
+        now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<(), SchedulingError>;
-    async fn delete_assignment(&self, id: Uuid) -> Result<(), SchedulingError>;
+    async fn delete_assignment(
+        &self,
+        id: Uuid,
+        now: DateTime<Utc>,
+        stamp: &EventStamp,
+    ) -> Result<(), SchedulingError>;
 
     // ----- Shift patterns -----
     async fn upsert_shift_pattern(
@@ -67,6 +87,7 @@ pub trait SchedulingRepository: Send + Sync {
         ends_at_time: chrono::NaiveTime,
         timezone: &str,
         effective_from: NaiveDate,
+        stamp: &EventStamp,
     ) -> Result<TechShiftPattern, SchedulingError>;
     async fn list_shift_patterns(
         &self,
@@ -108,6 +129,8 @@ pub trait SchedulingRepository: Send + Sync {
         &self,
         employee_id: &str,
         new_token: &str,
+        now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<(), SchedulingError>;
 
     /// Reverse lookup for the public `/ics/{token}.ics` endpoint.

@@ -12,7 +12,6 @@ use std::sync::Arc;
 use axum::Router;
 use axum::http::StatusCode;
 use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
 use boss_jobs::scheduling::PgScheduling;
 use boss_jobs::scheduling::http::{SchedulingApiState, router as scheduling_router};
 use boss_jobs::scheduling::rebuild_scheduling;
@@ -60,9 +59,18 @@ async fn seed_employee_and_target_job(pool: &PgPool, emp_id: &str, job_id: &str)
     .unwrap();
 }
 
+/// Drain the outbox through the relay pipeline into audit_log.
+async fn drain_outbox(pool: &PgPool) {
+    let bus = RecordingEventBus::new();
+    boss_events::outbox::drain_outbox_once(pool, &(bus as Arc<dyn boss_core::port::EventBus>), 100)
+        .await
+        .expect("relay drain");
+}
+
 fn build_app(pool: PgPool) -> Router {
-    let publisher = DomainPublisher::new(RecordingEventBus::new(), "scheduling")
-        .with_audit(Arc::new(PgAuditWriter::new(pool.clone())));
+    // No direct audit writer: events record on the outbox in the
+    // domain write; the drain moves them to audit_log.
+    let publisher = DomainPublisher::new(RecordingEventBus::new(), "scheduling");
     scheduling_router(SchedulingApiState {
         repo: Arc::new(PgScheduling::new(pool)),
         publisher: Some(publisher),
@@ -154,7 +162,8 @@ async fn scheduling_writes_survive_rebuild() {
     assert_eq!(pre_shift.0, 1);
     assert_eq!(pre_token.0, 1);
 
-    // Rebuild.
+    // Drain the outbox into audit_log, then rebuild.
+    drain_outbox(&db.pool).await;
     let report = rebuild_scheduling(&db.pool).await.expect("rebuild");
     assert!(report.availability_upserted >= 1, "{report:?}");
     assert!(report.assignments_upserted >= 1, "{report:?}");

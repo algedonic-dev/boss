@@ -64,13 +64,13 @@ MIGRATED=(
   boss-accounts
   boss-people
   boss-content
+  boss-jobs
 )
 
 # Not-yet-migrated crates and their pinned post-commit emit counts.
 # Migrating a crate = move its sites to record_event_in_tx and ratchet
 # its row down (to the MIGRATED list at zero). Baselines 2026-07-24.
 declare -A PENDING=(
-  [boss-jobs]=28
   [boss-cybernetics]=1
 )
 

@@ -261,6 +261,7 @@ impl JobsRepository for PgJobs {
         &self,
         job: &Job,
         now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
         let (subj_kind, subj_ref) = subject_parts(&job.subject);
         let mut tx = self
@@ -294,7 +295,7 @@ impl JobsRepository for PgJobs {
         // no-op rather than a 500. update_job_at is the path for
         // intentional changes; create_job_at represents "make
         // sure this Job exists with its initial state."
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             INSERT INTO jobs (id, kind, subject_kind, subject_id, title, owner_id,
                               status, priority, opened_on, due_on, closed_on, metadata, tags,
@@ -321,6 +322,17 @@ impl JobsRepository for PgJobs {
         .execute(&mut *tx)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // OUTBOX (phase 2): the caller's events (JOB_CREATED) record
+        // with the row — and only when the INSERT actually inserted.
+        // The ON CONFLICT replay guard doubles as the event gate: a
+        // re-emitted Job (deterministic sim runs) records nothing.
+        if result.rows_affected() > 0 {
+            for event in events {
+                boss_events::outbox::record_event_in_tx(&mut tx, event)
+                    .await
+                    .map_err(JobsError::Storage)?;
+            }
+        }
         tx.commit()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -342,8 +354,14 @@ impl JobsRepository for PgJobs {
         &self,
         job: &Job,
         now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
         let (subj_kind, subj_ref) = subject_parts(&job.subject);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
         let result = sqlx::query(
             r#"
             UPDATE jobs SET kind = $2, subject_kind = $3, subject_id = $4,
@@ -367,13 +385,24 @@ impl JobsRepository for PgJobs {
         .bind(&job.metadata)
         .bind(&job.tags)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
 
         if result.rows_affected() == 0 {
             return Err(JobsError::NotFound(job.id));
         }
+        // OUTBOX (phase 2): the caller's events (JOB_UPDATED + status
+        // markers) record with the row (the NotFound above returns
+        // pre-recording).
+        for event in events {
+            boss_events::outbox::record_event_in_tx(&mut tx, event)
+                .await
+                .map_err(JobsError::Storage)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -488,6 +517,7 @@ impl JobsRepository for PgJobs {
         &self,
         step: &Step,
         now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
         // Snapshot the current active plugin version for this step kind
         // so republishing the plugin later doesn't retroactively change
@@ -504,7 +534,12 @@ impl JobsRepository for PgJobs {
         // create_job_at: replay paths (deterministic sim runs)
         // re-emit Steps; update_step_at handles intentional
         // changes. Without this an idempotent retry 500's.
-        sqlx::query(
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let result = sqlx::query(
             r#"
             INSERT INTO steps (id, job_id, kind, title, assignee_id, status, sort_order,
                                blocked_by, sign_offs_required, sign_offs, fields,
@@ -531,9 +566,22 @@ impl JobsRepository for PgJobs {
         .bind(version)
         .bind(step.embedded_job.map(|j| *j.inner().as_uuid()))
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // OUTBOX (phase 2): the caller's events (STEP_CREATED) record
+        // with the row — only when the INSERT actually inserted (the
+        // replay guard doubles as the event gate).
+        if result.rows_affected() > 0 {
+            for event in events {
+                boss_events::outbox::record_event_in_tx(&mut tx, event)
+                    .await
+                    .map_err(JobsError::Storage)?;
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -552,7 +600,13 @@ impl JobsRepository for PgJobs {
         &self,
         step: &Step,
         now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
         let result = sqlx::query(
             r#"
             UPDATE steps SET kind = $2, title = $3, assignee_id = $4,
@@ -591,13 +645,23 @@ impl JobsRepository for PgJobs {
         .bind(&step.notes)
         .bind(step.embedded_job.map(|j| *j.inner().as_uuid()))
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
 
         if result.rows_affected() == 0 {
             return Err(JobsError::StepNotFound(step.id));
         }
+        // OUTBOX (phase 2): the caller's events (STEP_UPDATED +
+        // completion/ready/done markers) record with the row.
+        for event in events {
+            boss_events::outbox::record_event_in_tx(&mut tx, event)
+                .await
+                .map_err(JobsError::Storage)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -606,7 +670,13 @@ impl JobsRepository for PgJobs {
         step_id: &StepId,
         stamp: &boss_core::job::SignOffStamp,
         now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
         let result = sqlx::query(
             "UPDATE steps SET sign_offs = sign_offs || $2::jsonb, updated_at = $3 \
              WHERE id = $1",
@@ -614,12 +684,42 @@ impl JobsRepository for PgJobs {
         .bind(*step_id.inner().as_uuid())
         .bind(serde_json::to_value(stamp).map_err(|e| JobsError::Storage(e.to_string()))?)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
         if result.rows_affected() == 0 {
             return Err(JobsError::StepNotFound(*step_id));
         }
+        // OUTBOX (phase 2): the caller's STEP_SIGNED_OFF marker
+        // records with the stamp append.
+        for event in events {
+            boss_events::outbox::record_event_in_tx(&mut tx, event)
+                .await
+                .map_err(JobsError::Storage)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn record_events(&self, events: &[boss_core::event::Event]) -> Result<(), JobsError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        for event in events {
+            boss_events::outbox::record_event_in_tx(&mut tx, event)
+                .await
+                .map_err(JobsError::Storage)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
         Ok(())
     }
 

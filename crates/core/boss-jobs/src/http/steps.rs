@@ -66,19 +66,17 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
     }
 
     let now = boss_clock_client::now_from(&state.clock).await;
-    if let Err(e) = state.jobs.add_step_at(&step, now).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
-
-    // State event — full row state, what the rebuild consumes. The
-    // actor is stamped from the authenticated session per the Level-B
-    // actor-stamping invariant. Sim / runner back-channel paths
-    // (role=system-sim|system, or an `automation:`/`rule:` id) include
-    // an `assignee_id` on the Step body that names the real Employee
-    // taking on the work; we honor that as the audit actor so
-    // step.created rows attribute to a person, not a process. Otherwise
-    // the actor is the session's own identity — a human operator, or
-    // the named automation (`automation:<authority>`); never anonymous.
+    // OUTBOX (phase 2): STEP_CREATED (full row state, what the
+    // rebuild consumes) records in the SAME transaction as the row.
+    // The actor is stamped from the authenticated session per the
+    // Level-B actor-stamping invariant. Sim / runner back-channel
+    // paths (role=system-sim|system, or an `automation:`/`rule:` id)
+    // include an `assignee_id` on the Step body that names the real
+    // Employee taking on the work; we honor that as the audit actor
+    // so step.created rows attribute to a person, not a process.
+    // Otherwise the actor is the session's own identity — a human
+    // operator, or the named automation (`automation:<authority>`);
+    // never anonymous.
     let is_automation = user.id == "anonymous"
         || user.id.starts_with("automation:")
         || user.id.starts_with("rule:")
@@ -94,15 +92,14 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
             .ambient_actor()
             .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into())),
     };
-    state
-        .publisher
-        .emit_with_actor_at(
-            events::STEP_CREATED,
-            actor,
-            serde_json::to_value(&step).unwrap_or_default(),
-            now,
-        )
-        .await;
+    let stamp = state.publisher.stamp_with_actor_at(actor, now).await;
+    let step_event = stamp.event(
+        events::STEP_CREATED,
+        serde_json::to_value(&step).unwrap_or_default(),
+    );
+    if let Err(e) = state.jobs.add_step_at(&step, now, &[step_event]).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
 
     (
         StatusCode::CREATED,
@@ -461,21 +458,18 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     }
 
     let now = boss_clock_client::now_from(&state.clock).await;
-    if let Err(e) = state.jobs.update_step_at(&step, now).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
 
-    // State event + actor stamping per the Level-B invariant. The
-    // actor here is the session user who PUT the step — typically a
-    // human (the assignee or a manager signing off). Sim / dispatcher
+    // OUTBOX (phase 2): the state event + every marker this
+    // transition produces record in the SAME transaction as the
+    // step row. Actor stamping per the Level-B invariant: the actor
+    // is the session user who PUT the step — typically a human (the
+    // assignee or a manager signing off). Sim / dispatcher
     // back-channel paths set x-boss-user to a synthetic slug
-    // (`brewery-sim`, `rule:<name>`) AND include a
-    // `completed_by` field in the body that names the real
-    // Employee whose work the step represents. We honor that
-    // override when the calling identity is an automation slug
-    // so the audit_log row attributes work to a person, not a
-    // process — preserves the "human-powered state machine" frame
-    // for sim-driven traffic.
+    // (`brewery-sim`, `rule:<name>`) AND include a `completed_by`
+    // field in the body that names the real Employee whose work the
+    // step represents; we honor that override when the calling
+    // identity is an automation slug so the audit_log row attributes
+    // work to a person, not a process.
     let body_completed_by = body
         .get("completed_by")
         .and_then(|v| v.as_str())
@@ -494,56 +488,45 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
             .ambient_actor()
             .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into())),
     };
-    state
+    let stamp = state
         .publisher
-        .emit_with_actor_at(
-            events::STEP_UPDATED,
-            actor.clone(),
-            serde_json::to_value(&step).unwrap_or_default(),
-            now,
-        )
+        .stamp_with_actor_at(actor.clone(), now)
         .await;
+    let mut step_events = vec![stamp.event(
+        events::STEP_UPDATED,
+        serde_json::to_value(&step).unwrap_or_default(),
+    )];
 
     // The `job-kind-publish` dispatch produces an audit-bearing
     // event with the full published spec — what `rebuild_job_kinds`
     // reads to reconstruct the registry from audit_log.
     if let Some(spec) = &published_kind {
-        state
-            .publisher
-            .emit_with_actor_at(
-                events::JOB_KIND_PUBLISHED,
-                actor.clone(),
-                serde_json::to_value(spec).unwrap_or_default(),
-                now,
-            )
-            .await;
+        step_events.push(stamp.event(
+            events::JOB_KIND_PUBLISHED,
+            serde_json::to_value(spec).unwrap_or_default(),
+        ));
     }
 
     // Marker events for downstream consumers — informational
     // duplicates of state already in STEP_UPDATED. Rebuild ignores.
     if old.status != StepStatus::Completed && step.status == StepStatus::Completed {
-        state
-            .publisher
-            .emit_with_actor_at(
-                events::STEP_COMPLETED,
-                actor.clone(),
-                serde_json::json!({
-                    "job_id": job_id.to_string(),
-                    "step_id": step_id.to_string(),
-                }),
-                now,
-            )
-            .await;
+        step_events.push(stamp.event(
+            events::STEP_COMPLETED,
+            serde_json::json!({
+                "job_id": job_id.to_string(),
+                "step_id": step_id.to_string(),
+            }),
+        ));
 
-        // Dispatcher routing: rules in
-        // infra/dispatcher/rules.toml listen on
-        // `step.done.<kind>` so each StepType's side effects can
-        // be declared as a rule without a giant `match` in the
-        // subscriber. Payload mirrors the simulator's in-process
-        // SimEventBus shape so handlers don't fork by source —
-        // subject_kind / subject_id come from the parent Job so
-        // every handler has the Subject identity without an
-        // extra fetch.
+        // Dispatcher routing: rules in infra/dispatcher/rules.toml
+        // listen on `step.done.<kind>` so each StepType's side
+        // effects can be declared as a rule without a giant `match`
+        // in the subscriber. Payload mirrors the simulator's
+        // in-process SimEventBus shape so handlers don't fork by
+        // source — subject_kind / subject_id come from the parent
+        // Job so every handler has the Subject identity without an
+        // extra fetch. (Read before the write; the step update
+        // doesn't touch the job row.)
         if !step.kind.is_empty() {
             let (subject_kind, subject_id) =
                 if let Ok(Some(job)) = state.jobs.get_job(&job_id).await {
@@ -554,42 +537,36 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                 } else {
                     (String::new(), String::new())
                 };
-            state
-                .publisher
-                .emit_with_actor_at(
-                    &format!("step.done.{}", step.kind),
-                    actor.clone(),
-                    serde_json::json!({
-                        "job_id": job_id.to_string(),
-                        "step_id": step_id.to_string(),
-                        "kind": step.kind,
-                        "subject_kind": subject_kind,
-                        "subject_id": subject_id,
-                        "completed_on": step.completed_on,
-                        "metadata": step.metadata,
-                    }),
-                    now,
-                )
-                .await;
+            step_events.push(stamp.event(
+                &format!("step.done.{}", step.kind),
+                serde_json::json!({
+                    "job_id": job_id.to_string(),
+                    "step_id": step_id.to_string(),
+                    "kind": step.kind,
+                    "subject_kind": subject_kind,
+                    "subject_id": subject_id,
+                    "completed_on": step.completed_on,
+                    "metadata": step.metadata,
+                }),
+            ));
         }
     }
 
     if stamps_invalidated {
         let stale_roles: Vec<String> = step.sign_offs.iter().map(|st| st.role.clone()).collect();
-        state
-            .publisher
-            .emit_with_actor_at(
-                events::STEP_STAMPS_INVALIDATED,
-                actor.clone(),
-                serde_json::json!({
-                    "job_id": job_id.to_string(),
-                    "step_id": step_id.to_string(),
-                    "stale_roles": stale_roles,
-                    "required_roles": step.sign_offs_required,
-                }),
-                now,
-            )
-            .await;
+        step_events.push(stamp.event(
+            events::STEP_STAMPS_INVALIDATED,
+            serde_json::json!({
+                "job_id": job_id.to_string(),
+                "step_id": step_id.to_string(),
+                "stale_roles": stale_roles,
+                "required_roles": step.sign_offs_required,
+            }),
+        ));
+    }
+
+    if let Err(e) = state.jobs.update_step_at(&step, now, &step_events).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
     // Re-evaluate readiness: the just-updated step's status change may
@@ -635,7 +612,29 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                         );
                         for idx in changed {
                             let changed_step = &steps[idx];
-                            if let Err(e) = state.jobs.update_step_at(changed_step, now).await {
+                            // OUTBOX (phase 2): the promoted step's
+                            // state event + D6 ready marker (when it
+                            // lands in `Ready` — lets dispatcher rules
+                            // react to a step *becoming eligible*, the
+                            // delegate-subjob spawn fork D7) record in
+                            // the SAME transaction as the promotion.
+                            let mut reeval_events = vec![stamp.event(
+                                events::STEP_UPDATED,
+                                serde_json::to_value(changed_step).unwrap_or_default(),
+                            )];
+                            if changed_step.status == StepStatus::Ready
+                                && !changed_step.kind.is_empty()
+                            {
+                                reeval_events.push(
+                                    build_step_ready_event(&state, &job, changed_step, &actor, now)
+                                        .await,
+                                );
+                            }
+                            if let Err(e) = state
+                                .jobs
+                                .update_step_at(changed_step, now, &reeval_events)
+                                .await
+                            {
                                 tracing::warn!(
                                     job_id = %job_id,
                                     step_id = %changed_step.id,
@@ -643,29 +642,6 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                                     "re-eval: failed to persist promoted step",
                                 );
                                 continue;
-                            }
-                            state
-                                .publisher
-                                .emit_with_actor_at(
-                                    events::STEP_UPDATED,
-                                    actor.clone(),
-                                    serde_json::to_value(changed_step).unwrap_or_default(),
-                                    now,
-                                )
-                                .await;
-                            // D6 ready marker: when a step the re-eval
-                            // just promoted lands in `Ready`, fire
-                            // `step.ready.<kind>` so dispatcher rules
-                            // can react to a step *becoming eligible*
-                            // (the delegate-subjob spawn fork, D7) the
-                            // same way `step.done.<kind>` lets them react
-                            // to completion. Payload mirrors the
-                            // `step.done` marker shape (subject pulled
-                            // from the parent Job already in hand).
-                            if changed_step.status == StepStatus::Ready
-                                && !changed_step.kind.is_empty()
-                            {
-                                emit_step_ready(&state, &job, changed_step, &actor, now).await;
                             }
                         }
 
@@ -729,57 +705,47 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                 let _ = (job_now,); // keep job_now hoisted for the update_job_at call below
             }
             let job_now = boss_clock_client::now_from(&state.clock).await;
-            let _ = state.jobs.update_job_at(&job, job_now).await;
-
-            // State event — full row state for the rebuild. The
-            // actor is inherited from the step transition that
-            // triggered this auto-close: the operator (or sim slug)
-            // who flipped the terminal step is the responsible CPU
-            // for the resulting Job state change too.
-            state
+            // OUTBOX (phase 2): the state event (full row state for
+            // the rebuild) + status markers record in the SAME
+            // transaction as the auto-transition. The actor is
+            // inherited from the step transition that triggered it:
+            // the operator (or sim slug) who flipped the terminal
+            // step is the responsible CPU for the resulting Job
+            // state change too.
+            let close_stamp = state
                 .publisher
-                .emit_with_actor_at(
-                    events::JOB_UPDATED,
-                    actor.clone(),
-                    serde_json::to_value(&job).unwrap_or_default(),
-                    job_now,
-                )
+                .stamp_with_actor_at(actor.clone(), job_now)
                 .await;
-
-            state
-                .publisher
-                .emit_with_actor_at(
+            let mut close_events = vec![
+                close_stamp.event(
+                    events::JOB_UPDATED,
+                    serde_json::to_value(&job).unwrap_or_default(),
+                ),
+                close_stamp.event(
                     events::JOB_STATUS_CHANGED,
-                    actor.clone(),
                     serde_json::json!({
                         "id": job.id.to_string(),
                         "old_status": old_status,
                         "new_status": new_status,
                     }),
-                    job_now,
-                )
-                .await;
-
+                ),
+            ];
             if new_status == JobStatus::Closed {
-                state
-                    .publisher
-                    .emit_with_actor_at(
-                        events::JOB_CLOSED,
-                        actor.clone(),
-                        serde_json::json!({
-                            "id": job.id.to_string(),
-                            "closed_on": job.closed_on,
-                            // D7: same delegate-subjob back-link as the
-                            // terminal-close path, so a child Job that
-                            // closes via the all-steps-terminal catch-all
-                            // (no declared `outcome` step) still triggers
-                            // the parent resolve. Null when absent.
-                            "parent_step_id": job.metadata.get("parent_step_id"),
-                        }),
-                        job_now,
-                    )
-                    .await;
+                close_events.push(close_stamp.event(
+                    events::JOB_CLOSED,
+                    serde_json::json!({
+                        "id": job.id.to_string(),
+                        "closed_on": job.closed_on,
+                        // D7: same delegate-subjob back-link as the
+                        // terminal-close path, so a child Job that
+                        // closes via the all-steps-terminal catch-all
+                        // (no declared `outcome` step) still triggers
+                        // the parent resolve. Null when absent.
+                        "parent_step_id": job.metadata.get("parent_step_id"),
+                    }),
+                ));
             }
+            let _ = state.jobs.update_job_at(&job, job_now, &close_events).await;
         }
     }
 
@@ -861,26 +827,28 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
         stamped_at: now,
         shape_hash: shape.clone(),
     };
-    if let Err(e) = state.jobs.append_sign_off(&step_id, &stamp, now).await {
+    // OUTBOX (phase 2): the signed-off marker records in the SAME
+    // transaction as the stamp append.
+    let actor = boss_core::actor::ActorId::human(&user.id);
+    let event_stamp = state.publisher.stamp_with_actor_at(actor, now).await;
+    let signed_off_event = event_stamp.event(
+        events::STEP_SIGNED_OFF,
+        serde_json::json!({
+            "job_id": job_id.to_string(),
+            "step_id": step_id.to_string(),
+            "role": role,
+            "authority_id": user.id,
+            "shape_hash": shape,
+        }),
+    );
+    if let Err(e) = state
+        .jobs
+        .append_sign_off(&step_id, &stamp, now, &[signed_off_event])
+        .await
+    {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
     step.sign_offs.push(stamp);
-    let actor = boss_core::actor::ActorId::human(&user.id);
-    state
-        .publisher
-        .emit_with_actor_at(
-            events::STEP_SIGNED_OFF,
-            actor,
-            serde_json::json!({
-                "job_id": job_id.to_string(),
-                "step_id": step_id.to_string(),
-                "role": role,
-                "authority_id": user.id,
-                "shape_hash": shape,
-            }),
-            now,
-        )
-        .await;
     Json(step).into_response()
 }
 
@@ -910,6 +878,11 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
         return;
     }
 
+    let terminal_stamp = state
+        .publisher
+        .stamp_with_actor_at(actor.clone(), now)
+        .await;
+
     // Skip every still-non-terminal step. The Job is closing on its
     // terminal outcome; any Pending/Ready/Active step is now moot.
     if let Ok(steps) = state.jobs.list_steps(job_id).await {
@@ -919,7 +892,13 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
                 StepStatus::Pending | StepStatus::Ready | StepStatus::Active
             ) {
                 s.status = StepStatus::Skipped;
-                if let Err(e) = state.jobs.update_step_at(&s, now).await {
+                // OUTBOX (phase 2): the skip's state event records in
+                // the SAME transaction as the row.
+                let skip_event = terminal_stamp.event(
+                    events::STEP_UPDATED,
+                    serde_json::to_value(&s).unwrap_or_default(),
+                );
+                if let Err(e) = state.jobs.update_step_at(&s, now, &[skip_event]).await {
                     tracing::warn!(
                         job_id = %job_id,
                         step_id = %s.id,
@@ -928,15 +907,6 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
                     );
                     continue;
                 }
-                state
-                    .publisher
-                    .emit_with_actor_at(
-                        events::STEP_UPDATED,
-                        actor.clone(),
-                        serde_json::to_value(&s).unwrap_or_default(),
-                        now,
-                    )
-                    .await;
             }
         }
     }
@@ -955,38 +925,23 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
         job.metadata = serde_json::json!({ "outcome": outcome });
     }
 
-    if let Err(e) = state.jobs.update_job_at(&job, now).await {
-        tracing::warn!(job_id = %job_id, error = %e, "terminal close: failed to persist closed Job");
-        return;
-    }
-
-    state
-        .publisher
-        .emit_with_actor_at(
+    // OUTBOX (phase 2): the close's state event + markers record in
+    // the SAME transaction as the row.
+    let close_events = [
+        terminal_stamp.event(
             events::JOB_UPDATED,
-            actor.clone(),
             serde_json::to_value(&job).unwrap_or_default(),
-            now,
-        )
-        .await;
-    state
-        .publisher
-        .emit_with_actor_at(
+        ),
+        terminal_stamp.event(
             events::JOB_STATUS_CHANGED,
-            actor.clone(),
             serde_json::json!({
                 "id": job.id.to_string(),
                 "old_status": old_status,
                 "new_status": JobStatus::Closed,
             }),
-            now,
-        )
-        .await;
-    state
-        .publisher
-        .emit_with_actor_at(
+        ),
+        terminal_stamp.event(
             events::JOB_CLOSED,
-            actor.clone(),
             serde_json::json!({
                 "id": job.id.to_string(),
                 "closed_on": job.closed_on,
@@ -997,47 +952,50 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
                 // an ordinary (non-delegated) Job.
                 "parent_step_id": job.metadata.get("parent_step_id"),
             }),
-            now,
-        )
-        .await;
+        ),
+    ];
+    if let Err(e) = state.jobs.update_job_at(&job, now, &close_events).await {
+        tracing::warn!(job_id = %job_id, error = %e, "terminal close: failed to persist closed Job");
+    }
 }
 
-/// D6 ready marker — emit `step.ready.<kind>` for a step that just
-/// transitioned into `Ready`. Mirrors the `step.done.<kind>` marker
-/// (informational duplicate of state already in STEP_UPDATED /
+/// D6 ready marker — build the `step.ready.<kind>` event for a step
+/// that just transitioned into `Ready`. Mirrors the `step.done.<kind>`
+/// marker (informational duplicate of state already in STEP_UPDATED /
 /// STEP_CREATED; the rebuilder ignores it). The dispatcher rule
 /// registry subscribes to it the same way it subscribes to
 /// `step.done.<kind>`; the D7 delegate-subjob spawn fork is its first
-/// consumer.
+/// consumer. OUTBOX (phase 2): callers record the built event either
+/// in the promoting write's transaction (re-eval) or via
+/// `record_events` (the post-materialization pass).
 ///
 /// The payload is shape-compatible with the `step.done` marker — same
 /// `job_id` / `step_id` / `kind` / `subject_kind` / `subject_id` /
 /// `metadata` keys — so handlers reuse the same `StepEvent` view. The
 /// Subject identity comes from the parent `job` the caller already
 /// holds, so no extra fetch.
-pub(super) async fn emit_step_ready<R: JobsRepository + 'static, B: EventBus + 'static>(
+pub(super) async fn build_step_ready_event<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &Arc<JobsApiState<R, B>>,
     job: &Job,
     step: &Step,
     actor: &boss_core::actor::ActorId,
     now: chrono::DateTime<chrono::Utc>,
-) {
+) -> boss_core::event::Event {
     let subject_kind = boss_core::primitives::Subject::kind(&job.subject).to_string();
     let subject_id = boss_core::primitives::Subject::id(&job.subject).to_string();
-    state
+    let stamp = state
         .publisher
-        .emit_with_actor_at(
-            &format!("step.ready.{}", step.kind),
-            actor.clone(),
-            serde_json::json!({
-                "job_id": step.job_id.to_string(),
-                "step_id": step.id.to_string(),
-                "kind": step.kind,
-                "subject_kind": subject_kind,
-                "subject_id": subject_id,
-                "metadata": step.metadata,
-            }),
-            now,
-        )
+        .stamp_with_actor_at(actor.clone(), now)
         .await;
+    stamp.event(
+        &format!("step.ready.{}", step.kind),
+        serde_json::json!({
+            "job_id": step.job_id.to_string(),
+            "step_id": step.id.to_string(),
+            "kind": step.kind,
+            "subject_kind": subject_kind,
+            "subject_id": subject_id,
+            "metadata": step.metadata,
+        }),
+    )
 }

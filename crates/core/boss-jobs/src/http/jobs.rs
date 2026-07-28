@@ -530,31 +530,22 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
 
     let job_id = job.id;
 
-    // Log-first: emit JOB_CREATED, then write the projection. The log
-    // is authoritative — if the emit fails we don't write the
-    // projection at all (returning 500), so the jobs table never runs
-    // ahead of the log and a rebuild can't reconstruct a phantom row.
+    // OUTBOX (phase 2): JOB_CREATED records on the transactional
+    // outbox INSIDE the job-insert transaction — the log and the
+    // projection commit or fail together, which subsumes the old
+    // log-first two-phase dance (emit, then write, 500 in between).
+    // The adapter's ON CONFLICT replay guard gates the event, so a
+    // re-emitted Job (deterministic sim runs) records nothing —
+    // before, every replay published a duplicate created event.
     let actor = user
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-    let emitted = state
-        .publisher
-        .emit_with_actor_at(
-            events::JOB_CREATED,
-            actor,
-            serde_json::to_value(&job).unwrap_or_default(),
-            now,
-        )
-        .await;
-    if !emitted {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to publish jobs.job.created — see audit_log writer logs".to_string(),
-        )
-            .into_response();
-    }
-
-    if let Err(e) = state.jobs.create_job_at(&job, now).await {
+    let job_stamp = state.publisher.stamp_with_actor_at(actor, now).await;
+    let job_event = job_stamp.event(
+        events::JOB_CREATED,
+        serde_json::to_value(&job).unwrap_or_default(),
+    );
+    if let Err(e) = state.jobs.create_job_at(&job, now, &[job_event]).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
@@ -592,34 +583,23 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
         // Materialization is ATOMIC from an observer's view. A consumer
         // that reacts to a `step.ready` event — the dispatcher's marker
         // auto-complete, a delegate-subjob fork — must see the COMPLETE
-        // step graph. So two passes: (1) emit STEP_CREATED + persist
-        // EVERY step (log-first: emit, then write); (2) only once the
-        // whole graph is durable, fire `step.ready`. Materialized steps
-        // need their STEP_CREATED events or the rebuilder at
-        // boss-jobs/src/rebuild.rs can't reconstruct the rows from
-        // audit_log and the projection diverges from the log.
+        // step graph. So two passes: (1) persist EVERY step with its
+        // STEP_CREATED event recorded in the SAME transaction (outbox
+        // phase 2 — the old emit-then-write window is gone); (2) only
+        // once the whole graph is durable, record `step.ready`.
+        // Materialized steps need their STEP_CREATED events or the
+        // rebuilder at boss-jobs/src/rebuild.rs can't reconstruct the
+        // rows from audit_log and the projection diverges from the log.
         for step in &steps {
             let step_actor = user
                 .ambient_actor()
                 .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-            let step_emitted = state
-                .publisher
-                .emit_with_actor_at(
-                    events::STEP_CREATED,
-                    step_actor,
-                    serde_json::to_value(step).unwrap_or_default(),
-                    now,
-                )
-                .await;
-            if !step_emitted {
-                tracing::warn!(
-                    job_id = %job_id,
-                    step_id = %step.id,
-                    "failed to publish jobs.step.created for materialized step",
-                );
-                continue;
-            }
-            if let Err(e) = state.jobs.add_step_at(step, now).await {
+            let step_stamp = state.publisher.stamp_with_actor_at(step_actor, now).await;
+            let step_event = step_stamp.event(
+                events::STEP_CREATED,
+                serde_json::to_value(step).unwrap_or_default(),
+            );
+            if let Err(e) = state.jobs.add_step_at(step, now, &[step_event]).await {
                 tracing::warn!(
                     job_id = %job_id,
                     step_id = %step.id,
@@ -632,16 +612,23 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
         // of a `step.ready` event sees a complete, consistent Job.
         // `materialize_steps_at` ran the open-time readiness pass, so the
         // trigger (and any step whose `ready_when` already holds) is `Ready`
-        // here — fire `step.ready.<kind>` so the dispatcher's marker
-        // auto-complete + delegate-subjob forks (D7) react against the whole
-        // graph, never a partial one.
+        // here — record `step.ready.<kind>` on the outbox so the
+        // dispatcher's marker auto-complete + delegate-subjob forks (D7)
+        // react against the whole graph, never a partial one.
+        let mut ready_events = Vec::new();
         for step in &steps {
             if step.status == StepStatus::Ready && !step.kind.is_empty() {
                 let ready_actor = user
                     .ambient_actor()
                     .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                emit_step_ready(&state, &job, step, &ready_actor, now).await;
+                ready_events
+                    .push(build_step_ready_event(&state, &job, step, &ready_actor, now).await);
             }
+        }
+        if !ready_events.is_empty()
+            && let Err(e) = state.jobs.record_events(&ready_events).await
+        {
+            tracing::warn!(job_id = %job_id, error = %e, "failed to record step.ready markers");
         }
         if !steps.is_empty() {
             tracing::debug!(
@@ -863,56 +850,39 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
     }
 
     let now = boss_clock_client::now_from(&state.clock).await;
-    if let Err(e) = state.jobs.update_job_at(&job, now).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
-
-    // State event — full row state, what the rebuild consumes.
+    // OUTBOX (phase 2): the state event (full row state, what the
+    // rebuild consumes) + the status-transition markers (topic-only
+    // duplicates for downstream consumers; rebuild ignores them)
+    // record in the SAME transaction as the row.
     let actor = user
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-    state
-        .publisher
-        .emit_with_actor_at(
-            events::JOB_UPDATED,
-            actor.clone(),
-            serde_json::to_value(&job).unwrap_or_default(),
-            now,
-        )
-        .await;
-
-    // Marker events for downstream consumers (UI, integrations) —
-    // duplicates state already in JOB_UPDATED but gives them a topic
-    // to filter on without payload matching. Rebuild ignores these.
+    let stamp = state.publisher.stamp_with_actor_at(actor, now).await;
+    let mut job_events = vec![stamp.event(
+        events::JOB_UPDATED,
+        serde_json::to_value(&job).unwrap_or_default(),
+    )];
     if old_status != job.status {
-        state
-            .publisher
-            .emit_with_actor_at(
-                events::JOB_STATUS_CHANGED,
-                actor.clone(),
+        job_events.push(stamp.event(
+            events::JOB_STATUS_CHANGED,
+            serde_json::json!({
+                "id": job.id.to_string(),
+                "old_status": old_status,
+                "new_status": job.status,
+            }),
+        ));
+        if job.status == JobStatus::Closed {
+            job_events.push(stamp.event(
+                events::JOB_CLOSED,
                 serde_json::json!({
                     "id": job.id.to_string(),
-                    "old_status": old_status,
-                    "new_status": job.status,
+                    "closed_on": job.closed_on,
                 }),
-                now,
-            )
-            .await;
-
-        if job.status == JobStatus::Closed {
-            state
-                .publisher
-                .emit_with_actor_at(
-                    events::JOB_CLOSED,
-                    actor.clone(),
-                    serde_json::json!({
-                        "id": job.id.to_string(),
-                        "closed_on": job.closed_on,
-                    }),
-                    now,
-                )
-                .await;
+            ));
         }
+    }
+    if let Err(e) = state.jobs.update_job_at(&job, now, &job_events).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
     StatusCode::NO_CONTENT.into_response()
