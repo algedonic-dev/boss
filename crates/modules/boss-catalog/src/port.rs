@@ -3,6 +3,8 @@
 //! this trait.
 
 use async_trait::async_trait;
+use boss_core::actor::ActorId;
+use boss_core::publisher::EventStamp;
 use chrono::{DateTime, Utc};
 
 use crate::types::{AssetModel, PartCatalogRow};
@@ -27,9 +29,16 @@ pub enum KbError {
 /// Implementations may cache aggressively for reads.
 ///
 /// Mutation methods come in two flavors: a convenience overload that
-/// stamps `Utc::now()` server-side, and an `_at` variant for the
+/// stamps `Utc::now()` server-side (with a platform-automation event
+/// stamp — test-path ergonomics), and an `_at` variant for the
 /// audit_log → projection rebuild path. See
 /// `docs/design/projection-rebuilders.md`.
+///
+/// OUTBOX (phase 2): every mutation records its domain event on the
+/// transactional outbox INSIDE the adapter transaction via the stamp
+/// (`boss_events::outbox::record_event_in_tx`); boss-event-relay
+/// delivers to audit_log + NATS post-commit. Nothing publishes
+/// post-commit.
 #[async_trait]
 pub trait KbRepository: Send + Sync {
     /// Return every device model in the knowledge base.
@@ -39,28 +48,47 @@ pub trait KbRepository: Send + Sync {
     async fn model_by_sku(&self, sku: &str) -> Result<Option<AssetModel>, KbError>;
 
     /// Create a new device model. Returns the SKU. Errors if SKU already exists.
+    /// Records `kb.model.created` (full row state) in-tx.
     async fn create_model(&self, model: &AssetModel) -> Result<String, KbError> {
-        self.create_model_at(model, Utc::now()).await
+        let now = Utc::now();
+        let stamp = EventStamp::new("kb", ActorId::Automation("platform".into()), now);
+        self.create_model_at(model, now, &stamp).await
     }
     async fn create_model_at(
         &self,
         model: &AssetModel,
         now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<String, KbError>;
 
     /// Replace a device model by SKU. Errors if SKU doesn't exist.
+    /// Records `kb.model.updated` (full row state) in-tx.
     async fn update_model(&self, sku: &str, model: &AssetModel) -> Result<(), KbError> {
-        self.update_model_at(sku, model, Utc::now()).await
+        let now = Utc::now();
+        let stamp = EventStamp::new("kb", ActorId::Automation("platform".into()), now);
+        self.update_model_at(sku, model, now, &stamp).await
     }
     async fn update_model_at(
         &self,
         sku: &str,
         model: &AssetModel,
         now: DateTime<Utc>,
+        stamp: &EventStamp,
     ) -> Result<(), KbError>;
 
     /// Delete a device model and all satellite data. Errors if SKU doesn't exist.
-    async fn delete_model(&self, sku: &str) -> Result<(), KbError>;
+    /// Records `kb.model.deleted` (`{sku, deleted_at}`) in-tx.
+    async fn delete_model(&self, sku: &str) -> Result<(), KbError> {
+        let now = Utc::now();
+        let stamp = EventStamp::new("kb", ActorId::Automation("platform".into()), now);
+        self.delete_model_at(sku, now, &stamp).await
+    }
+    async fn delete_model_at(
+        &self,
+        sku: &str,
+        now: DateTime<Utc>,
+        stamp: &EventStamp,
+    ) -> Result<(), KbError>;
 
     /// Return every row in the `parts` table — independent of any
     /// `asset_models.spare_parts` / `asset_models.consumables`

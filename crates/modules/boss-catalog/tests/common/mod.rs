@@ -1,8 +1,10 @@
 //! Shared test scaffolding for the knowledge-base crate.
 //!
 //! Provides:
-//! - `KbTestApp` builder that wires InMemoryKb + HTTP router
-//!   + RecordingEventBus + DomainPublisher + a stub AssetsClient
+//! - `KbTestApp` builder that wires InMemoryKb + HTTP router + a stub
+//!   AssetsClient (publisher `None` — outbox phase 2: adapters record
+//!   events in the domain write, so the in-memory repo's
+//!   `recorded_events()` is the assertion surface, not a bus)
 //! - `model_fixture()` and helpers to build valid AssetModel instances
 //!
 //! Delete-guard tests use the shipped `boss_assets_client::FakeAssetsClient`.
@@ -17,12 +19,6 @@ use boss_assets_client::{AssetsClient, AssetsClientError};
 use boss_catalog::InMemoryKb;
 use boss_catalog::http::{KbApiState, router};
 use boss_catalog::types::*;
-use boss_core::publisher::DomainPublisher;
-#[cfg(feature = "postgres")]
-use boss_events::PgAuditWriter;
-use boss_testing::RecordingEventBus;
-#[cfg(feature = "postgres")]
-use sqlx::PgPool;
 
 /// Stub AssetsClient that reports zero for every call. Used by
 /// kb tests that don't exercise the delete guard path — they
@@ -47,12 +43,11 @@ impl AssetsClient for StubAssetsClient {
 }
 
 /// A fully wired knowledge-base service for tests:
-/// - InMemoryKb repository
-/// - DomainPublisher backed by RecordingEventBus
+/// - InMemoryKb repository (collects outbox-recorded events)
 /// - Axum Router ready to accept requests
 pub struct KbTestApp {
     pub router: Router,
-    pub bus: Arc<RecordingEventBus>,
+    pub catalog: Arc<InMemoryKb>,
 }
 
 impl KbTestApp {
@@ -64,38 +59,44 @@ impl KbTestApp {
     /// Build a test app pre-populated with the given models.
     pub fn with_models(models: Vec<AssetModel>) -> Self {
         let catalog = Arc::new(InMemoryKb::new(models));
-        let bus = RecordingEventBus::new();
-        let publisher = DomainPublisher::new(bus.clone(), "kb");
         let state = KbApiState {
-            catalog,
-            publisher: Some(publisher),
+            catalog: catalog.clone(),
+            publisher: None,
             assets_client: Arc::new(StubAssetsClient),
             classes_client: None,
             clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
         };
         let router = router(state);
-        Self { router, bus }
+        Self { router, catalog }
     }
 
-    /// Build a test app whose publisher persists every emitted event
-    /// to the given Postgres pool's `audit_log` table. Use this from
-    /// integration tests that exercise the full HTTP → publisher →
-    /// audit-log chain.
-    #[cfg(feature = "postgres")]
-    pub fn with_audit_pool(pool: PgPool) -> Self {
-        let catalog = Arc::new(InMemoryKb::new(vec![]));
-        let bus = RecordingEventBus::new();
-        let publisher =
-            DomainPublisher::new(bus.clone(), "kb").with_audit(Arc::new(PgAuditWriter::new(pool)));
-        let state = KbApiState {
-            catalog,
-            publisher: Some(publisher),
-            assets_client: Arc::new(StubAssetsClient),
-            classes_client: None,
-            clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        };
-        let router = router(state);
-        Self { router, bus }
+    /// Assert exactly-one recorded event of `kind` and return it.
+    pub fn assert_recorded(&self, kind: &str) -> boss_core::event::Event {
+        let matches: Vec<_> = self
+            .catalog
+            .recorded_events()
+            .into_iter()
+            .filter(|e| e.kind == kind)
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one recorded `{kind}` event, got {}",
+            matches.len()
+        );
+        matches.into_iter().next().unwrap()
+    }
+
+    /// Assert no recorded event of `kind`.
+    pub fn assert_not_recorded(&self, kind: &str) {
+        assert!(
+            !self
+                .catalog
+                .recorded_events()
+                .iter()
+                .any(|e| e.kind == kind),
+            "expected no recorded `{kind}` event"
+        );
     }
 }
 
