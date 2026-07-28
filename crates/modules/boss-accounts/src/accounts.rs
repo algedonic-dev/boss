@@ -370,30 +370,32 @@ async fn create_account(
         }
     }
 
-    if let Err(e) = tx.commit().await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    // OUTBOX (phase 2): the created event (full account + contacts
+    // state — what the rebuilder consumes) records with the rows,
+    // plus the territory-rep mirror so rebuild_accounts can
+    // repopulate `account_team_members` — only when a rep was
+    // actually assigned at create.
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let event = stamp.event(
+        crate::events::ACCOUNT_CREATED,
+        serde_json::to_value(&body).unwrap_or_default(),
+    );
+    if let Err(e) = boss_events::outbox::record_event_in_tx(&mut tx, &event).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    if let Some(evt) = &territory_evt {
+        let event = stamp.event(
+            crate::events::ACCOUNT_TEAM_ASSIGNED,
+            serde_json::to_value(evt).unwrap_or_default(),
+        );
+        if let Err(e) = boss_events::outbox::record_event_in_tx(&mut tx, &event).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
     }
 
-    if let Some(pub_) = &state.publisher {
-        let now = boss_clock_client::now_from(&state.clock).await;
-        // Full account + contacts state — what the rebuilder consumes.
-        pub_.emit_at(
-            crate::events::ACCOUNT_CREATED,
-            serde_json::to_value(&body).unwrap_or_default(),
-            now,
-        )
-        .await;
-        // Mirror the territory-rep upsert so rebuild_accounts can
-        // repopulate `account_team_members` from audit_log — only when
-        // a rep was actually assigned at create.
-        if let Some(evt) = &territory_evt {
-            pub_.emit_at(
-                crate::events::ACCOUNT_TEAM_ASSIGNED,
-                serde_json::to_value(evt).unwrap_or_default(),
-                now,
-            )
-            .await;
-        }
+    if let Err(e) = tx.commit().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
     (
@@ -519,30 +521,31 @@ async fn update_account(
         }
     }
 
-    if let Err(e) = tx.commit().await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    // OUTBOX (phase 2): full account + contacts state (rebuild
+    // treats UPDATED the same as CREATED — UPSERT both projections),
+    // plus the territory-rep mirror when assigned. Records with the
+    // rows.
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let event = stamp.event(
+        crate::events::ACCOUNT_UPDATED,
+        serde_json::to_value(&body).unwrap_or_default(),
+    );
+    if let Err(e) = boss_events::outbox::record_event_in_tx(&mut tx, &event).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    if let Some(evt) = &territory_evt {
+        let event = stamp.event(
+            crate::events::ACCOUNT_TEAM_ASSIGNED,
+            serde_json::to_value(evt).unwrap_or_default(),
+        );
+        if let Err(e) = boss_events::outbox::record_event_in_tx(&mut tx, &event).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
     }
 
-    if let Some(pub_) = &state.publisher {
-        let now = boss_clock_client::now_from(&state.clock).await;
-        // Full account + contacts state. Rebuild treats UPDATED
-        // events the same as CREATED (UPSERT both projections).
-        pub_.emit_at(
-            crate::events::ACCOUNT_UPDATED,
-            serde_json::to_value(&body).unwrap_or_default(),
-            now,
-        )
-        .await;
-        // Territory-rep mirror so rebuild_accounts can repopulate
-        // `account_team_members` for this account — only when assigned.
-        if let Some(evt) = &territory_evt {
-            pub_.emit_at(
-                crate::events::ACCOUNT_TEAM_ASSIGNED,
-                serde_json::to_value(evt).unwrap_or_default(),
-                now,
-            )
-            .await;
-        }
+    if let Err(e) = tx.commit().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
     StatusCode::NO_CONTENT.into_response()
@@ -602,31 +605,37 @@ async fn replace_contacts(
         }
     }
 
-    if let Err(e) = tx.commit().await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    // OUTBOX (phase 2): read the account row back INSIDE the
+    // transaction so the event carries full AccountWithContacts
+    // state (same shape the rebuilder consumes for create/update)
+    // and records atomically with the contact rows. The old
+    // post-commit read-back silently SKIPPED the event when the
+    // read failed — a committed fact with no event.
+    let account = match sqlx::query_as::<_, Account>(
+        "SELECT id, name, director, city, state, tier, customer_since, \
+                territory_rep_id, account_type \
+         FROM accounts WHERE id = $1",
+    )
+    .bind(&id)
+    .fetch_one(&mut *tx)
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let payload = AccountWithContacts { account, contacts };
+    let event = stamp.event(
+        crate::events::ACCOUNT_UPDATED,
+        serde_json::to_value(&payload).unwrap_or_default(),
+    );
+    if let Err(e) = boss_events::outbox::record_event_in_tx(&mut tx, &event).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
 
-    if let Some(pub_) = &state.publisher {
-        // Read back the current account row so the event carries
-        // full AccountWithContacts state — same shape the rebuilder
-        // consumes for create/update.
-        if let Ok(Some(account)) = sqlx::query_as::<_, Account>(
-            "SELECT id, name, director, city, state, tier, customer_since, \
-                    territory_rep_id, account_type \
-             FROM accounts WHERE id = $1",
-        )
-        .bind(&id)
-        .fetch_optional(state.pool.as_ref())
-        .await
-        {
-            let payload = AccountWithContacts { account, contacts };
-            pub_.emit_at(
-                crate::events::ACCOUNT_UPDATED,
-                serde_json::to_value(&payload).unwrap_or_default(),
-                boss_clock_client::now_from(&state.clock).await,
-            )
-            .await;
-        }
+    if let Err(e) = tx.commit().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
     StatusCode::NO_CONTENT.into_response()
@@ -687,18 +696,21 @@ async fn delete_account(
         _ => {}
     }
 
-    if let Err(e) = tx.commit().await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    // OUTBOX (phase 2): the deleted event records only after the row
+    // actually deleted (the rows_affected NotFound above returns
+    // pre-recording).
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let event = stamp.event(
+        crate::events::ACCOUNT_DELETED,
+        serde_json::json!({ "id": id, "deleted_at": now }),
+    );
+    if let Err(e) = boss_events::outbox::record_event_in_tx(&mut tx, &event).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
 
-    if let Some(pub_) = &state.publisher {
-        let now = boss_clock_client::now_from(&state.clock).await;
-        pub_.emit_at(
-            crate::events::ACCOUNT_DELETED,
-            serde_json::json!({ "id": id, "deleted_at": now }),
-            now,
-        )
-        .await;
+    if let Err(e) = tx.commit().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
     StatusCode::NO_CONTENT.into_response()

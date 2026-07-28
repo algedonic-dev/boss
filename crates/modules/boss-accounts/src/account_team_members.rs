@@ -203,16 +203,26 @@ async fn batch_assign_account_team(
             assigned_on,
             notes: item.notes.clone(),
         };
-        if let Err(e) = upsert_team_member(state.pool.as_ref(), &evt).await {
+        // OUTBOX (phase 2): each assignment records with its row, in
+        // its own transaction (preserving this endpoint's
+        // committed-prefix semantics on a mid-batch failure).
+        let mut tx = match state.pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        if let Err(e) = upsert_team_member(&mut *tx, &evt).await {
             return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response();
         }
-        if let Some(pub_) = &state.publisher {
-            pub_.emit_at(
-                ACCOUNT_TEAM_ASSIGNED,
-                serde_json::to_value(&evt).unwrap_or_default(),
-                now,
-            )
-            .await;
+        let stamp = crate::events::event_stamp(&state.publisher, now).await;
+        let event = stamp.event(
+            ACCOUNT_TEAM_ASSIGNED,
+            serde_json::to_value(&evt).unwrap_or_default(),
+        );
+        if let Err(e) = boss_events::outbox::record_event_in_tx(&mut tx, &event).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        if let Err(e) = tx.commit().await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
         inserted += 1;
     }
@@ -345,23 +355,28 @@ async fn assign_account_team(
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
-    if let Err(e) = tx.commit().await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
-
-    if let Some(pub_) = &state.publisher {
-        pub_.emit_at(
+    // OUTBOX (phase 2): the assignment + its auto-posted note record
+    // in the SAME transaction as their rows — team change, audit
+    // note, and both events succeed or fail together.
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    for (kind, payload) in [
+        (
             ACCOUNT_TEAM_ASSIGNED,
             serde_json::to_value(&evt).unwrap_or_default(),
-            now,
-        )
-        .await;
-        pub_.emit_at(
+        ),
+        (
             ACCOUNT_NOTE_POSTED,
             serde_json::to_value(&note_evt).unwrap_or_default(),
-            now,
-        )
-        .await;
+        ),
+    ] {
+        let event = stamp.event(kind, payload);
+        if let Err(e) = boss_events::outbox::record_event_in_tx(&mut tx, &event).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+
+    if let Err(e) = tx.commit().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
     (
@@ -425,29 +440,33 @@ async fn unassign_account_team(
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
-    if let Err(e) = tx.commit().await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
-
-    if let Some(pub_) = &state.publisher {
-        let team_evt = AccountTeamUnassignmentEvent {
-            account_id,
-            role: role.clone(),
-            employee_id: removed_employee,
-            unassigned_at: now,
-        };
-        pub_.emit_at(
+    // OUTBOX (phase 2): the unassignment + its auto-posted note
+    // record in the SAME transaction as the delete + note rows.
+    let team_evt = AccountTeamUnassignmentEvent {
+        account_id,
+        role: role.clone(),
+        employee_id: removed_employee,
+        unassigned_at: now,
+    };
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    for (kind, payload) in [
+        (
             ACCOUNT_TEAM_UNASSIGNED,
             serde_json::to_value(&team_evt).unwrap_or_default(),
-            now,
-        )
-        .await;
-        pub_.emit_at(
+        ),
+        (
             ACCOUNT_NOTE_POSTED,
             serde_json::to_value(&note_evt).unwrap_or_default(),
-            now,
-        )
-        .await;
+        ),
+    ] {
+        let event = stamp.event(kind, payload);
+        if let Err(e) = boss_events::outbox::record_event_in_tx(&mut tx, &event).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+
+    if let Err(e) = tx.commit().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
     StatusCode::NO_CONTENT.into_response()

@@ -254,7 +254,7 @@ async fn check_note_kind(
 pub(crate) async fn upsert_note<'e, E>(
     executor: E,
     evt: &AccountNotePostedEvent,
-) -> sqlx::Result<()>
+) -> sqlx::Result<u64>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
@@ -272,7 +272,7 @@ where
     .bind(evt.occurred_at)
     .execute(executor)
     .await
-    .map(|_| ())
+    .map(|r| r.rows_affected())
 }
 
 async fn list_notes(
@@ -322,16 +322,30 @@ async fn create_note(
         body: req.body,
         occurred_at: req.occurred_at.unwrap_or(now),
     };
-    if let Err(e) = upsert_note(state.pool.as_ref(), &evt).await {
-        return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response();
-    }
-    if let Some(pub_) = &state.publisher {
-        pub_.emit_at(
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let inserted = match upsert_note(&mut *tx, &evt).await {
+        Ok(n) => n > 0,
+        Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
+    };
+    // OUTBOX (phase 2): the posted event records with the row — and
+    // only when the INSERT actually inserted (the ON CONFLICT (id)
+    // DO NOTHING guard doubles as the event gate, so a replayed
+    // create records nothing).
+    if inserted {
+        let stamp = crate::events::event_stamp(&state.publisher, now).await;
+        let event = stamp.event(
             ACCOUNT_NOTE_POSTED,
             serde_json::to_value(&evt).unwrap_or_default(),
-            now,
-        )
-        .await;
+        );
+        if let Err(e) = boss_events::outbox::record_event_in_tx(&mut tx, &event).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Err(e) = tx.commit().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
     (
         StatusCode::CREATED,
@@ -352,20 +366,30 @@ async fn delete_note(
         deleted_by: query.actor_id.clone(),
         deleted_at: now,
     };
-    let n = match soft_delete_note(state.pool.as_ref(), &evt).await {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let n = match soft_delete_note(&mut *tx, &evt).await {
         Ok(n) => n,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     if n == 0 {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if let Some(pub_) = &state.publisher {
-        pub_.emit_at(
-            ACCOUNT_NOTE_DELETED,
-            serde_json::to_value(&evt).unwrap_or_default(),
-            now,
-        )
-        .await;
+    // OUTBOX (phase 2): the deleted event records with the flip (the
+    // NotFound above returns pre-recording; an already-deleted note
+    // matches 0 rows and records nothing).
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let event = stamp.event(
+        ACCOUNT_NOTE_DELETED,
+        serde_json::to_value(&evt).unwrap_or_default(),
+    );
+    if let Err(e) = boss_events::outbox::record_event_in_tx(&mut tx, &event).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    if let Err(e) = tx.commit().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
     StatusCode::NO_CONTENT.into_response()
 }
