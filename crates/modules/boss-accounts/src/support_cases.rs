@@ -175,16 +175,32 @@ async fn create_case(
     _headers: axum::http::HeaderMap,
     Json(req): Json<SupportCase>,
 ) -> Response {
-    if let Err(e) = upsert_case(state.pool.as_ref(), &req).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
-    if let Some(pub_) = &state.publisher {
-        pub_.emit_at(
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let inserted = match upsert_case(&mut *tx, &req).await {
+        Ok(n) => n > 0,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    // OUTBOX (phase 2): the opened event records with the row — and
+    // only when the INSERT actually inserted. The ON CONFLICT (id)
+    // DO NOTHING idempotency guard doubles as the event gate: a
+    // replayed create collapses and records nothing (before, every
+    // replay published a duplicate opened event).
+    if inserted {
+        let now = boss_clock_client::now_from(&state.clock).await;
+        let stamp = crate::events::event_stamp(&state.publisher, now).await;
+        let event = stamp.event(
             SUPPORT_CASE_OPENED,
             serde_json::to_value(&req).unwrap_or_default(),
-            boss_clock_client::now_from(&state.clock).await,
-        )
-        .await;
+        );
+        if let Err(e) = boss_events::outbox::record_event_in_tx(&mut tx, &event).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    }
+    if let Err(e) = tx.commit().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
     (StatusCode::CREATED, Json(serde_json::json!({"ok": true}))).into_response()
 }
@@ -192,7 +208,7 @@ async fn create_case(
 /// Single canonical INSERT for `support_cases`. Used by both the
 /// handler and the rebuilder. ON CONFLICT DO NOTHING so re-replay
 /// of the same `id` is idempotent.
-pub(crate) async fn upsert_case<'e, E>(executor: E, case: &SupportCase) -> sqlx::Result<()>
+pub(crate) async fn upsert_case<'e, E>(executor: E, case: &SupportCase) -> sqlx::Result<u64>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
@@ -217,7 +233,7 @@ where
     .bind(case.csat)
     .execute(executor)
     .await
-    .map(|_| ())
+    .map(|r| r.rows_affected())
 }
 
 async fn update_case(
@@ -234,20 +250,30 @@ async fn update_case(
         resolution_notes: req.resolution_notes,
         csat: req.csat,
     };
-    let n = match apply_case_update(state.pool.as_ref(), &evt).await {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let n = match apply_case_update(&mut *tx, &evt).await {
         Ok(n) => n,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     if n == 0 {
         return (StatusCode::NOT_FOUND, format!("no support case {id}")).into_response();
     }
-    if let Some(pub_) = &state.publisher {
-        pub_.emit_at(
-            SUPPORT_CASE_UPDATED,
-            serde_json::to_value(&evt).unwrap_or_default(),
-            boss_clock_client::now_from(&state.clock).await,
-        )
-        .await;
+    // OUTBOX (phase 2): the updated event records with the update
+    // (the NotFound above returns pre-recording).
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let event = stamp.event(
+        SUPPORT_CASE_UPDATED,
+        serde_json::to_value(&evt).unwrap_or_default(),
+    );
+    if let Err(e) = boss_events::outbox::record_event_in_tx(&mut tx, &event).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    if let Err(e) = tx.commit().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
     Json(serde_json::json!({"ok": true})).into_response()
 }

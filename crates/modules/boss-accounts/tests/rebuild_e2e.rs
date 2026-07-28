@@ -11,11 +11,17 @@ use axum::http::StatusCode;
 use boss_accounts::accounts::accounts_router;
 use boss_accounts::rebuild_accounts;
 use boss_assets_client::FakeAssetsClient;
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
-use boss_testing::{TestDb, TestRequest};
+use boss_testing::{RecordingEventBus, TestDb, TestRequest};
 use chrono::NaiveDate;
 use sqlx::PgPool;
+
+/// Drain the outbox through the relay pipeline into audit_log.
+async fn drain_outbox(pool: &PgPool) {
+    let bus = RecordingEventBus::new();
+    boss_events::outbox::drain_outbox_once(pool, &(bus as Arc<dyn boss_core::port::EventBus>), 100)
+        .await
+        .expect("relay drain");
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 struct AccountRow {
@@ -52,11 +58,11 @@ async fn snapshot_contacts(pool: &PgPool) -> Vec<ContactRow> {
 }
 
 async fn build_app(pool: PgPool) -> Router {
-    let publisher = DomainPublisher::new(boss_testing::RecordingEventBus::new(), "accounts")
-        .with_audit(Arc::new(PgAuditWriter::new(pool.clone())));
+    // No publisher, no direct audit writer: events reach audit_log
+    // only via the outbox -> relay drain.
     accounts_router(
         pool,
-        Some(publisher),
+        None,
         Arc::new(FakeAssetsClient::with_count(0)),
         std::sync::Arc::new(boss_clock_client::WallClockClient),
         None,
@@ -170,7 +176,8 @@ async fn rebuild_reproduces_accounts_and_contacts() {
     assert_eq!(accounts_before[0].name, "Hopswell Brewing (Renamed)");
     assert_eq!(accounts_before[0].account_type, "wholesale-distributor");
 
-    // 4. Verify audit_log has the events.
+    // 4. Drain the outbox into audit_log, then verify the events.
+    drain_outbox(&db.pool).await;
     let event_count: (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM audit_log WHERE kind LIKE 'accounts.account.%'")
             .fetch_one(&db.pool)
@@ -193,6 +200,7 @@ async fn rebuild_reproduces_accounts_and_contacts() {
         .await
         .unwrap();
 
+    drain_outbox(&db.pool).await;
     let report = rebuild_accounts(&db.pool).await.expect("rebuild succeeds");
     assert_eq!(report.accounts_upserted, 3, "2 created + 1 updated");
 
@@ -231,6 +239,7 @@ async fn rebuild_handles_account_delete() {
         .unwrap();
     assert_eq!(count.0, 0);
 
+    drain_outbox(&db.pool).await;
     let report = rebuild_accounts(&db.pool).await.unwrap();
     assert!(report.accounts_upserted >= 1);
     assert!(report.accounts_deleted >= 1);

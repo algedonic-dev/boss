@@ -15,6 +15,14 @@
 
 use std::sync::Arc;
 
+/// Drain the outbox through the relay pipeline into audit_log.
+async fn drain_outbox(pool: &PgPool) {
+    let bus = RecordingEventBus::new();
+    boss_events::outbox::drain_outbox_once(pool, &(bus as Arc<dyn boss_core::port::EventBus>), 100)
+        .await
+        .expect("relay drain");
+}
+
 use axum::Router;
 use axum::http::StatusCode;
 use boss_accounts::account_notes::account_notes_router;
@@ -22,8 +30,6 @@ use boss_accounts::account_team_members::account_team_router;
 use boss_accounts::accounts::accounts_router;
 use boss_accounts::rebuild_accounts;
 use boss_assets_client::FakeAssetsClient;
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
 use boss_testing::{RecordingEventBus, TestDb, TestRequest};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -50,24 +56,24 @@ async fn snapshot_notes(pool: &PgPool) -> Vec<NoteRow> {
 }
 
 async fn build_app(pool: PgPool) -> Router {
-    let publisher = DomainPublisher::new(RecordingEventBus::new(), "accounts")
-        .with_audit(Arc::new(PgAuditWriter::new(pool.clone())));
+    // No publisher, no direct audit writer: events reach audit_log
+    // only via the outbox -> relay drain.
     accounts_router(
         pool.clone(),
-        Some(publisher.clone()),
+        None,
         Arc::new(FakeAssetsClient::with_count(0)),
         std::sync::Arc::new(boss_clock_client::WallClockClient),
         None,
     )
     .merge(account_team_router(
         pool.clone(),
-        Some(publisher.clone()),
+        None,
         std::sync::Arc::new(boss_clock_client::WallClockClient),
         None,
     ))
     .merge(account_notes_router(
         pool,
-        Some(publisher),
+        None,
         std::sync::Arc::new(boss_clock_client::WallClockClient),
         None,
     ))
@@ -141,6 +147,7 @@ async fn notes_survive_rebuild() {
     assert!(kinds.contains(&"call"));
     assert!(kinds.contains(&"interaction"));
 
+    drain_outbox(&db.pool).await;
     let report = rebuild_accounts(&db.pool).await.expect("rebuild");
     assert!(
         report.notes_posted >= 2,
@@ -193,6 +200,7 @@ async fn note_soft_delete_survives_rebuild() {
     assert!(pre_target.deleted_at.is_some(), "soft-delete stamped");
     assert_eq!(pre_target.deleted_by.as_deref(), Some("emp-rep-002"));
 
+    drain_outbox(&db.pool).await;
     let report = rebuild_accounts(&db.pool).await.expect("rebuild");
     assert!(
         report.notes_deleted >= 1,

@@ -16,14 +16,20 @@
 
 use std::sync::Arc;
 
+/// Drain the outbox through the relay pipeline into audit_log.
+async fn drain_outbox(pool: &PgPool) {
+    let bus = RecordingEventBus::new();
+    boss_events::outbox::drain_outbox_once(pool, &(bus as Arc<dyn boss_core::port::EventBus>), 100)
+        .await
+        .expect("relay drain");
+}
+
 use axum::Router;
 use axum::http::StatusCode;
 use boss_accounts::account_team_members::account_team_router;
 use boss_accounts::accounts::accounts_router;
 use boss_accounts::rebuild_accounts;
 use boss_assets_client::FakeAssetsClient;
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
 use boss_testing::{RecordingEventBus, TestDb, TestRequest};
 use chrono::NaiveDate;
 use sqlx::PgPool;
@@ -48,18 +54,18 @@ async fn snapshot_team(pool: &PgPool) -> Vec<TeamRow> {
 }
 
 async fn build_app(pool: PgPool) -> Router {
-    let publisher = DomainPublisher::new(RecordingEventBus::new(), "accounts")
-        .with_audit(Arc::new(PgAuditWriter::new(pool.clone())));
+    // No publisher, no direct audit writer: events reach audit_log
+    // only via the outbox -> relay drain.
     accounts_router(
         pool.clone(),
-        Some(publisher.clone()),
+        None,
         Arc::new(FakeAssetsClient::with_count(0)),
         std::sync::Arc::new(boss_clock_client::WallClockClient),
         None,
     )
     .merge(account_team_router(
         pool,
-        Some(publisher),
+        None,
         std::sync::Arc::new(boss_clock_client::WallClockClient),
         None,
     ))
@@ -137,6 +143,7 @@ async fn team_assignments_survive_rebuild() {
     );
 
     // 3. Rebuild. The team roster must reappear from audit_log alone.
+    drain_outbox(&db.pool).await;
     let report = rebuild_accounts(&db.pool).await.expect("rebuild succeeds");
     assert!(
         report.team_members_upserted >= 2,
@@ -197,6 +204,7 @@ async fn team_unassignment_survives_rebuild() {
     assert_eq!(pre.len(), 1);
     assert_eq!(pre[0].role, "territory-rep");
 
+    drain_outbox(&db.pool).await;
     let report = rebuild_accounts(&db.pool).await.expect("rebuild succeeds");
     assert!(
         report.team_members_unassigned >= 1,

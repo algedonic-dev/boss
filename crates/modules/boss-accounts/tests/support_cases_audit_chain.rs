@@ -15,14 +15,20 @@
 
 use std::sync::Arc;
 
+/// Drain the outbox through the relay pipeline into audit_log.
+async fn drain_outbox(pool: &PgPool) {
+    let bus = RecordingEventBus::new();
+    boss_events::outbox::drain_outbox_once(pool, &(bus as Arc<dyn boss_core::port::EventBus>), 100)
+        .await
+        .expect("relay drain");
+}
+
 use axum::Router;
 use axum::http::StatusCode;
 use boss_accounts::accounts::accounts_router;
 use boss_accounts::rebuild_accounts;
 use boss_accounts::support_cases::support_cases_router;
 use boss_assets_client::FakeAssetsClient;
-use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
 use boss_testing::{RecordingEventBus, TestDb, TestRequest};
 use chrono::NaiveDate;
 use sqlx::PgPool;
@@ -48,18 +54,18 @@ async fn snapshot_cases(pool: &PgPool) -> Vec<CaseRow> {
 }
 
 async fn build_app(pool: PgPool) -> Router {
-    let publisher = DomainPublisher::new(RecordingEventBus::new(), "accounts")
-        .with_audit(Arc::new(PgAuditWriter::new(pool.clone())));
+    // No publisher, no direct audit writer: events reach audit_log
+    // only via the outbox -> relay drain.
     accounts_router(
         pool.clone(),
-        Some(publisher.clone()),
+        None,
         Arc::new(FakeAssetsClient::with_count(0)),
         std::sync::Arc::new(boss_clock_client::WallClockClient),
         None,
     )
     .merge(support_cases_router(
         pool,
-        Some(publisher),
+        None,
         std::sync::Arc::new(boss_clock_client::WallClockClient),
     ))
 }
@@ -143,6 +149,7 @@ async fn support_cases_survive_rebuild() {
     assert_eq!(pre[0].assignee_id.as_deref(), Some("emp-rep-001"));
     assert_eq!(pre[0].csat, Some(5));
 
+    drain_outbox(&db.pool).await;
     let report = rebuild_accounts(&db.pool).await.expect("rebuild");
     assert!(
         report.support_cases_opened >= 1,
