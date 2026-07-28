@@ -47,6 +47,16 @@ SERVICES=(
     "boss-ledger-api"
     "boss-docs-api"
     "boss-events-api"
+    # boss-event-relay: the single mover from the transactional
+    # event_outbox into audit_log + NATS (outbox phase 2). Every
+    # migrated domain's events — including the dispatcher's
+    # step.done/step.ready signals from boss-jobs — stage on the
+    # outbox and reach NATS only through this relay. Without it the
+    # dispatcher never hears a step complete and NO side effects
+    # fire (2026-07-28 smoke failure: invoices=0 forever). Borrows
+    # the jobs config for postgres_url + nats_url, same as the
+    # systemd unit.
+    "boss-event-relay"
     "boss-jobs-api"
     # boss-observability is a non-`-api` service: NATS aggregator +
     # /api/snapshot for the /ops dashboard. Required for /ops to
@@ -109,7 +119,14 @@ for svc in "${SERVICES[@]}"; do
         continue
     fi
     echo "    starting $svc"
-    "$svc" 2>&1 &
+    if [[ "$svc" == "boss-event-relay" ]]; then
+        # Shares the jobs config for postgres_url + nats_url (see the
+        # SERVICES comment) — the relay's env fallbacks differ from
+        # the BOSS_POSTGRES_URL convention the other services use.
+        "$svc" --config /etc/boss-jobs-api.toml 2>&1 &
+    else
+        "$svc" 2>&1 &
+    fi
     PIDS+=($!)
     # Tiny stagger so log lines from different services don't
     # interleave during the first second.

@@ -13,6 +13,7 @@ use crate::port::{JobFilter, JobScope, JobsError, JobsRepository, LaunchCalendar
 #[derive(Default)]
 pub struct InMemoryJobs {
     inner: Mutex<State>,
+    recorded: Mutex<Vec<boss_core::event::Event>>,
 }
 
 #[derive(Default)]
@@ -24,6 +25,18 @@ struct State {
 impl InMemoryJobs {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Events the outbox paths recorded — test visibility (the
+    /// in-memory analogue of the Pg adapter's in-tx recording).
+    pub fn recorded_events(&self) -> Vec<boss_core::event::Event> {
+        self.recorded.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+
+    fn record_all(&self, events: &[boss_core::event::Event]) {
+        if let Ok(mut v) = self.recorded.lock() {
+            v.extend_from_slice(events);
+        }
     }
 }
 
@@ -100,9 +113,23 @@ impl JobsRepository for InMemoryJobs {
         &self,
         job: &Job,
         _now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
-        let mut state = self.inner.lock().expect("poisoned");
-        state.jobs.insert(job_key(&job.id), job.clone());
+        // Mirror the Pg replay guard: an existing id is a no-op that
+        // records nothing.
+        let inserted = {
+            let mut state = self.inner.lock().expect("poisoned");
+            match state.jobs.entry(job_key(&job.id)) {
+                std::collections::hash_map::Entry::Occupied(_) => false,
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(job.clone());
+                    true
+                }
+            }
+        };
+        if inserted {
+            self.record_all(events);
+        }
         Ok(())
     }
 
@@ -115,13 +142,17 @@ impl JobsRepository for InMemoryJobs {
         &self,
         job: &Job,
         _now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
-        let mut state = self.inner.lock().expect("poisoned");
-        let key = job_key(&job.id);
-        if !state.jobs.contains_key(&key) {
-            return Err(JobsError::NotFound(job.id));
+        {
+            let mut state = self.inner.lock().expect("poisoned");
+            let key = job_key(&job.id);
+            if !state.jobs.contains_key(&key) {
+                return Err(JobsError::NotFound(job.id));
+            }
+            state.jobs.insert(key, job.clone());
         }
-        state.jobs.insert(key, job.clone());
+        self.record_all(events);
         Ok(())
     }
 
@@ -152,9 +183,23 @@ impl JobsRepository for InMemoryJobs {
         &self,
         step: &Step,
         _now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
-        let mut state = self.inner.lock().expect("poisoned");
-        state.steps.insert(step_key(&step.id), step.clone());
+        // Mirror the Pg replay guard: an existing id is a no-op that
+        // records nothing.
+        let inserted = {
+            let mut state = self.inner.lock().expect("poisoned");
+            match state.steps.entry(step_key(&step.id)) {
+                std::collections::hash_map::Entry::Occupied(_) => false,
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(step.clone());
+                    true
+                }
+            }
+        };
+        if inserted {
+            self.record_all(events);
+        }
         Ok(())
     }
 
@@ -167,6 +212,7 @@ impl JobsRepository for InMemoryJobs {
         &self,
         step: &Step,
         _now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
         let mut state = self.inner.lock().expect("poisoned");
         let key = step_key(&step.id);
@@ -188,6 +234,8 @@ impl JobsRepository for InMemoryJobs {
             next.metadata = existing.metadata.clone();
         }
         state.steps.insert(key, next);
+        drop(state);
+        self.record_all(events);
         Ok(())
     }
 
@@ -196,13 +244,22 @@ impl JobsRepository for InMemoryJobs {
         step_id: &StepId,
         stamp: &boss_core::job::SignOffStamp,
         _now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
     ) -> Result<(), JobsError> {
-        let mut state = self.inner.lock().expect("poisoned");
-        let key = step_key(step_id);
-        let Some(existing) = state.steps.get_mut(&key) else {
-            return Err(JobsError::StepNotFound(*step_id));
-        };
-        existing.sign_offs.push(stamp.clone());
+        {
+            let mut state = self.inner.lock().expect("poisoned");
+            let key = step_key(step_id);
+            let Some(existing) = state.steps.get_mut(&key) else {
+                return Err(JobsError::StepNotFound(*step_id));
+            };
+            existing.sign_offs.push(stamp.clone());
+        }
+        self.record_all(events);
+        Ok(())
+    }
+
+    async fn record_events(&self, events: &[boss_core::event::Event]) -> Result<(), JobsError> {
+        self.record_all(events);
         Ok(())
     }
 

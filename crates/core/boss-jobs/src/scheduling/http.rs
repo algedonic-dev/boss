@@ -13,10 +13,6 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use super::events::{
-    ASSIGNMENT_CREATED, ASSIGNMENT_DELETED, ASSIGNMENT_STATUS_CHANGED, AVAILABILITY_CREATED,
-    AVAILABILITY_DELETED, CALENDAR_TOKEN_ROTATED, SHIFT_PATTERN_UPSERTED,
-};
 use super::ics::build_ics;
 use super::port::{SchedulingError, SchedulingRepository};
 use super::types::{AssignmentStatus, NewScheduledAssignment, NewTechAvailability};
@@ -26,8 +22,8 @@ pub struct SchedulingApiState {
     /// Audit-log + NATS publisher. `None` allowed for tests that
     /// only exercise projection writes.
     pub publisher: Option<DomainPublisher>,
-    /// Authoritative clock — every emit_at stamps via clock-api so
-    /// sim mode produces sim-dated audit_log rows. Same trait as
+    /// Authoritative clock — every event stamp resolves via clock-api
+    /// so sim mode produces sim-dated audit_log rows. Same trait as
     /// the rest of the workspace.
     pub clock: Arc<dyn ClockClient>,
 }
@@ -95,6 +91,25 @@ fn resolve_range(q: &RangeQuery) -> (DateTime<Utc>, DateTime<Utc>) {
     (from, to)
 }
 
+/// Resolve the outbox event stamp for this request. Scheduling
+/// handlers carry no CurrentUser extractor; the publisher's
+/// `default_actor` resolves the request identity from the task-local
+/// context, and its clock probe settles `_simulated` — the same
+/// envelope the retired post-commit emits carried (outbox phase 2).
+async fn event_stamp(
+    state: &SchedulingApiState,
+    now: DateTime<Utc>,
+) -> boss_core::publisher::EventStamp {
+    match &state.publisher {
+        Some(p) => p.stamp_with_actor_at(p.default_actor(), now).await,
+        None => boss_core::publisher::EventStamp::new(
+            "jobs",
+            boss_core::actor::ActorId::Automation("scheduling".into()),
+            now,
+        ),
+    }
+}
+
 async fn list_avail(
     State(state): State<Arc<SchedulingApiState>>,
     Query(q): Query<RangeQuery>,
@@ -114,18 +129,12 @@ async fn create_avail(
     State(state): State<Arc<SchedulingApiState>>,
     Json(body): Json<NewTechAvailability>,
 ) -> Response {
-    match state.repo.create_availability(body).await {
-        Ok(row) => {
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    AVAILABILITY_CREATED,
-                    serde_json::to_value(&row).unwrap_or_default(),
-                    boss_clock_client::now_from(&state.clock).await,
-                )
-                .await;
-            }
-            (StatusCode::CREATED, Json(row)).into_response()
-        }
+    // OUTBOX (phase 2): the adapter records the scheduling events
+    // inside the domain transaction; nothing publishes post-commit.
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
+    match state.repo.create_availability(body, &stamp).await {
+        Ok(row) => (StatusCode::CREATED, Json(row)).into_response(),
         Err(e) => err(e),
     }
 }
@@ -134,19 +143,10 @@ async fn delete_avail(
     State(state): State<Arc<SchedulingApiState>>,
     Path(id): Path<Uuid>,
 ) -> Response {
-    match state.repo.delete_availability(id).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                let now = boss_clock_client::now_from(&state.clock).await;
-                pub_.emit_at(
-                    AVAILABILITY_DELETED,
-                    serde_json::json!({"id": id, "deleted_at": now}),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
+    match state.repo.delete_availability(id, now, &stamp).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err(e),
     }
 }
@@ -183,18 +183,10 @@ async fn create_assign(
     State(state): State<Arc<SchedulingApiState>>,
     Json(body): Json<NewScheduledAssignment>,
 ) -> Response {
-    match state.repo.create_assignment(body).await {
-        Ok(row) => {
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    ASSIGNMENT_CREATED,
-                    serde_json::to_value(&row).unwrap_or_default(),
-                    boss_clock_client::now_from(&state.clock).await,
-                )
-                .await;
-            }
-            (StatusCode::CREATED, Json(row)).into_response()
-        }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
+    match state.repo.create_assignment(body, &stamp).await {
+        Ok(row) => (StatusCode::CREATED, Json(row)).into_response(),
         Err(e) => err(e),
     }
 }
@@ -214,19 +206,10 @@ async fn delete_assign(
     State(state): State<Arc<SchedulingApiState>>,
     Path(id): Path<Uuid>,
 ) -> Response {
-    match state.repo.delete_assignment(id).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                let now = boss_clock_client::now_from(&state.clock).await;
-                pub_.emit_at(
-                    ASSIGNMENT_DELETED,
-                    serde_json::json!({"id": id, "deleted_at": now}),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
+    match state.repo.delete_assignment(id, now, &stamp).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err(e),
     }
 }
@@ -241,23 +224,14 @@ async fn update_assign_status(
     Path(id): Path<Uuid>,
     Json(body): Json<StatusBody>,
 ) -> Response {
-    match state.repo.update_assignment_status(id, body.status).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                let now = boss_clock_client::now_from(&state.clock).await;
-                pub_.emit_at(
-                    ASSIGNMENT_STATUS_CHANGED,
-                    serde_json::json!({
-                        "id": id,
-                        "status": body.status,
-                        "changed_at": now,
-                    }),
-                    now,
-                )
-                .await;
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
+    match state
+        .repo
+        .update_assignment_status(id, body.status, now, &stamp)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err(e),
     }
 }
@@ -307,6 +281,8 @@ async fn upsert_shift(
     let eff = body
         .effective_from
         .unwrap_or_else(|| Utc::now().date_naive());
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
     match state
         .repo
         .upsert_shift_pattern(
@@ -316,20 +292,11 @@ async fn upsert_shift(
             body.ends_at_time,
             &body.timezone,
             eff,
+            &stamp,
         )
         .await
     {
-        Ok(row) => {
-            if let Some(pub_) = &state.publisher {
-                pub_.emit_at(
-                    SHIFT_PATTERN_UPSERTED,
-                    serde_json::to_value(&row).unwrap_or_default(),
-                    boss_clock_client::now_from(&state.clock).await,
-                )
-                .await;
-            }
-            Json(row).into_response()
-        }
+        Ok(row) => Json(row).into_response(),
         Err(e) => err(e),
     }
 }
@@ -403,31 +370,22 @@ async fn rotate_calendar_token(
     // format emits 32 hex chars per UUID, so the token is a 64-char
     // URL-safe string.
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    match state.repo.rotate_calendar_token(&emp_id, &token).await {
-        Ok(()) => {
-            if let Some(pub_) = &state.publisher {
-                let now = boss_clock_client::now_from(&state.clock).await;
-                pub_.emit_at(
-                    CALENDAR_TOKEN_ROTATED,
-                    serde_json::json!({
-                        "employee_id": emp_id,
-                        "token": token,
-                        "rotated_at": now,
-                    }),
-                    now,
-                )
-                .await;
-            }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "employee_id": emp_id,
-                    "token": token,
-                    "ics_url": format!("/ics/{token}/calendar.ics"),
-                })),
-            )
-                .into_response()
-        }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
+    match state
+        .repo
+        .rotate_calendar_token(&emp_id, &token, now, &stamp)
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "employee_id": emp_id,
+                "token": token,
+                "ics_url": format!("/ics/{token}/calendar.ics"),
+            })),
+        )
+            .into_response(),
         Err(e) => err(e),
     }
 }

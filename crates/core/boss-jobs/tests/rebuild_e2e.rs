@@ -12,7 +12,6 @@ use axum::http::{Request, StatusCode};
 use boss_core::job::{Job, JobId, JobStatus, Priority, Step, StepId, StepStatus, Subject};
 use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
-use boss_events::PgAuditWriter;
 use boss_jobs::PgJobs;
 use boss_jobs::http::{JobsApiState, router};
 use boss_jobs::rebuild_jobs_and_steps;
@@ -104,12 +103,21 @@ fn user_header(u: &User) -> String {
     serde_json::to_string(u).unwrap()
 }
 
+/// Drain the outbox through the relay pipeline into audit_log.
+async fn drain_outbox(pool: &PgPool) {
+    let bus = RecordingEventBus::new();
+    boss_events::outbox::drain_outbox_once(pool, &(bus as Arc<dyn EventBus>), 200)
+        .await
+        .expect("relay drain");
+}
+
 fn build_app(pool: PgPool) -> Router {
+    // No direct audit writer: events record on the outbox in the
+    // domain write; the drain moves them to audit_log.
     let jobs = Arc::new(PgJobs::new(pool.clone()));
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
-    let publisher = DomainPublisher::new(bus_dyn, "jobs")
-        .with_audit(Arc::new(PgAuditWriter::new(pool.clone())));
+    let publisher = DomainPublisher::new(bus_dyn, "jobs");
     let step_registry = Arc::new(StepRegistry::v1());
 
     // Permissive policy — every action allowed for the test user.
@@ -310,7 +318,9 @@ async fn rebuild_reproduces_jobs_and_steps_after_drop() {
     assert_eq!(jobs_before.len(), 2);
     assert_eq!(steps_before.len(), 3);
 
-    // 6. Verify expected events landed in audit_log.
+    // 6. Drain the outbox, then verify expected events landed in
+    //    audit_log.
+    drain_outbox(&db.pool).await;
     let event_count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM audit_log \
          WHERE kind LIKE 'jobs.job.%' OR kind LIKE 'jobs.step.%'",
@@ -374,6 +384,7 @@ async fn rebuild_is_idempotent() {
 
     let baseline_jobs = snapshot_jobs(&db.pool).await;
 
+    drain_outbox(&db.pool).await;
     rebuild_jobs_and_steps(&db.pool).await.unwrap();
     assert_eq!(snapshot_jobs(&db.pool).await, baseline_jobs);
 

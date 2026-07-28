@@ -124,12 +124,14 @@ impl SchedulingRepository for PgScheduling {
     async fn create_availability(
         &self,
         new: NewTechAvailability,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<TechAvailability, SchedulingError> {
         if new.ends_at <= new.starts_at {
             return Err(SchedulingError::BadRequest(
                 "ends_at must be after starts_at".into(),
             ));
         }
+        let mut tx = self.pool.begin().await.map_err(storage)?;
         let row: AvailRow = sqlx::query_as(
             "INSERT INTO tech_availability
                 (employee_id, kind, starts_at, ends_at, notes, source)
@@ -142,10 +144,21 @@ impl SchedulingRepository for PgScheduling {
         .bind(new.ends_at)
         .bind(new.notes)
         .bind(new.source.as_str())
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(storage)?;
-        avail_from(row)
+        let availability = avail_from(row)?;
+        // OUTBOX (phase 2): the created event (full row state)
+        // records with the row.
+        let event = stamp.event(
+            super::events::AVAILABILITY_CREATED,
+            serde_json::to_value(&availability).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(SchedulingError::Storage)?;
+        tx.commit().await.map_err(storage)?;
+        Ok(availability)
     }
 
     async fn list_availability(
@@ -170,27 +183,45 @@ impl SchedulingRepository for PgScheduling {
         rows.into_iter().map(avail_from).collect()
     }
 
-    async fn delete_availability(&self, id: Uuid) -> Result<(), SchedulingError> {
+    async fn delete_availability(
+        &self,
+        id: Uuid,
+        now: DateTime<Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), SchedulingError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
         let r = sqlx::query("DELETE FROM tech_availability WHERE id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(storage)?;
         if r.rows_affected() == 0 {
             return Err(SchedulingError::NotFound(id.to_string()));
         }
+        // OUTBOX (phase 2): records only after the row actually
+        // deleted (NotFound above returns pre-recording).
+        let event = stamp.event(
+            super::events::AVAILABILITY_DELETED,
+            serde_json::json!({"id": id, "deleted_at": now}),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(SchedulingError::Storage)?;
+        tx.commit().await.map_err(storage)?;
         Ok(())
     }
 
     async fn create_assignment(
         &self,
         new: NewScheduledAssignment,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<ScheduledAssignment, SchedulingError> {
         if new.ends_at <= new.starts_at {
             return Err(SchedulingError::BadRequest(
                 "ends_at must be after starts_at".into(),
             ));
         }
+        let mut tx = self.pool.begin().await.map_err(storage)?;
         let row: AssignRow = sqlx::query_as(
             "INSERT INTO scheduled_assignments
                 (tech_id, target_job_id, kind, starts_at, ends_at, status, notes)
@@ -205,10 +236,21 @@ impl SchedulingRepository for PgScheduling {
         .bind(new.ends_at)
         .bind(new.status.as_str())
         .bind(new.notes)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(storage)?;
-        assign_from(row)
+        let assignment = assign_from(row)?;
+        // OUTBOX (phase 2): the created event (full row state)
+        // records with the row.
+        let event = stamp.event(
+            super::events::ASSIGNMENT_CREATED,
+            serde_json::to_value(&assignment).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(SchedulingError::Storage)?;
+        tx.commit().await.map_err(storage)?;
+        Ok(assignment)
     }
 
     async fn get_assignment(
@@ -257,7 +299,10 @@ impl SchedulingRepository for PgScheduling {
         &self,
         id: Uuid,
         status: AssignmentStatus,
+        now: DateTime<Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), SchedulingError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
         let r = sqlx::query(
             "UPDATE scheduled_assignments
              SET status = $2, updated_at = NOW()
@@ -265,24 +310,49 @@ impl SchedulingRepository for PgScheduling {
         )
         .bind(id)
         .bind(status.as_str())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(storage)?;
         if r.rows_affected() == 0 {
             return Err(SchedulingError::NotFound(id.to_string()));
         }
+        // OUTBOX (phase 2): records with the update.
+        let event = stamp.event(
+            super::events::ASSIGNMENT_STATUS_CHANGED,
+            serde_json::json!({"id": id, "status": status, "changed_at": now}),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(SchedulingError::Storage)?;
+        tx.commit().await.map_err(storage)?;
         Ok(())
     }
 
-    async fn delete_assignment(&self, id: Uuid) -> Result<(), SchedulingError> {
+    async fn delete_assignment(
+        &self,
+        id: Uuid,
+        now: DateTime<Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<(), SchedulingError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
         let r = sqlx::query("DELETE FROM scheduled_assignments WHERE id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(storage)?;
         if r.rows_affected() == 0 {
             return Err(SchedulingError::NotFound(id.to_string()));
         }
+        // OUTBOX (phase 2): records only after the row actually
+        // deleted.
+        let event = stamp.event(
+            super::events::ASSIGNMENT_DELETED,
+            serde_json::json!({"id": id, "deleted_at": now}),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(SchedulingError::Storage)?;
+        tx.commit().await.map_err(storage)?;
         Ok(())
     }
 
@@ -294,7 +364,9 @@ impl SchedulingRepository for PgScheduling {
         ends_at_time: NaiveTime,
         timezone: &str,
         effective_from: NaiveDate,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<TechShiftPattern, SchedulingError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
         let row: ShiftRow = sqlx::query_as(
             "INSERT INTO tech_shift_patterns
                 (employee_id, day_of_week, starts_at_time, ends_at_time,
@@ -313,10 +385,21 @@ impl SchedulingRepository for PgScheduling {
         .bind(ends_at_time)
         .bind(timezone)
         .bind(effective_from)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(storage)?;
-        Ok(shift_from(row))
+        let pattern = shift_from(row);
+        // OUTBOX (phase 2): the upserted event (full row state)
+        // records with the row.
+        let event = stamp.event(
+            super::events::SHIFT_PATTERN_UPSERTED,
+            serde_json::to_value(&pattern).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(SchedulingError::Storage)?;
+        tx.commit().await.map_err(storage)?;
+        Ok(pattern)
     }
 
     async fn list_shift_patterns(
@@ -519,7 +602,10 @@ impl SchedulingRepository for PgScheduling {
         &self,
         employee_id: &str,
         new_token: &str,
+        now: DateTime<Utc>,
+        stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), SchedulingError> {
+        let mut tx = self.pool.begin().await.map_err(storage)?;
         sqlx::query(
             "INSERT INTO tech_calendar_tokens (employee_id, token) \
              VALUES ($1, $2) \
@@ -528,9 +614,23 @@ impl SchedulingRepository for PgScheduling {
         )
         .bind(employee_id)
         .bind(new_token)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(storage)?;
+        // OUTBOX (phase 2): records with the rotation so a published
+        // ICS URL keeps resolving after replay.
+        let event = stamp.event(
+            super::events::CALENDAR_TOKEN_ROTATED,
+            serde_json::json!({
+                "employee_id": employee_id,
+                "token": new_token,
+                "rotated_at": now,
+            }),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(SchedulingError::Storage)?;
+        tx.commit().await.map_err(storage)?;
         Ok(())
     }
 

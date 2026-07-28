@@ -102,29 +102,53 @@ pub struct AssignmentRow {
 /// **Timestamp threading.** The four mutation methods come in two
 /// flavors: a convenience overload (`create_job(&job)`) that stamps
 /// `Utc::now()` server-side, and an `_at` variant
-/// (`create_job_at(&job, now)`) that takes an explicit timestamp.
-/// Handlers that emit a domain event for the same mutation should
-/// use the `_at` form so the projection write and the audit_log
-/// event share one timestamp — required for the audit_log →
-/// projection rebuild path to reproduce `created_at` / `updated_at`
-/// exactly. See `docs/design/projection-rebuilders.md`.
+/// (`create_job_at(&job, now, events)`) that takes an explicit
+/// timestamp. Handlers use the `_at` form so the projection write
+/// and the audit_log event share one timestamp — required for the
+/// audit_log → projection rebuild path to reproduce `created_at` /
+/// `updated_at` exactly. See `docs/design/projection-rebuilders.md`.
+///
+/// **OUTBOX (phase 2) — events ride the write.** Every `_at` mutation
+/// takes `events: &[boss_core::event::Event]` — the pre-built state
+/// event(s) + marker event(s) describing the mutation — and records
+/// them on the transactional outbox INSIDE the write transaction
+/// (`boss_events::outbox::record_event_in_tx`); boss-event-relay
+/// delivers to audit_log + NATS post-commit. The HANDLER keeps the
+/// event-derivation logic (status-transition markers, `step.done` /
+/// `step.ready` dispatcher signals, actor stamping); the adapter
+/// guarantees fact + events commit or fail together. Creation paths
+/// (`create_job_at`, `add_step_at`) are ON CONFLICT DO NOTHING
+/// replay-tolerant — their events record ONLY when the insert
+/// actually inserted, so a replayed create records nothing (before,
+/// every replay published duplicate created events). The convenience
+/// overloads pass no events (test-path ergonomics).
 #[async_trait]
 pub trait JobsRepository: Send + Sync {
     // ----- Jobs -----
 
     async fn create_job(&self, job: &Job) -> Result<(), JobsError> {
-        self.create_job_at(job, Utc::now()).await
+        self.create_job_at(job, Utc::now(), &[]).await
     }
 
-    async fn create_job_at(&self, job: &Job, now: DateTime<Utc>) -> Result<(), JobsError>;
+    async fn create_job_at(
+        &self,
+        job: &Job,
+        now: DateTime<Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<(), JobsError>;
 
     async fn get_job(&self, id: &JobId) -> Result<Option<Job>, JobsError>;
 
     async fn update_job(&self, job: &Job) -> Result<(), JobsError> {
-        self.update_job_at(job, Utc::now()).await
+        self.update_job_at(job, Utc::now(), &[]).await
     }
 
-    async fn update_job_at(&self, job: &Job, now: DateTime<Utc>) -> Result<(), JobsError>;
+    async fn update_job_at(
+        &self,
+        job: &Job,
+        now: DateTime<Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<(), JobsError>;
 
     async fn list_jobs(
         &self,
@@ -136,18 +160,28 @@ pub trait JobsRepository: Send + Sync {
     // ----- Steps -----
 
     async fn add_step(&self, step: &Step) -> Result<(), JobsError> {
-        self.add_step_at(step, Utc::now()).await
+        self.add_step_at(step, Utc::now(), &[]).await
     }
 
-    async fn add_step_at(&self, step: &Step, now: DateTime<Utc>) -> Result<(), JobsError>;
+    async fn add_step_at(
+        &self,
+        step: &Step,
+        now: DateTime<Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<(), JobsError>;
 
     async fn get_step(&self, id: &StepId) -> Result<Option<Step>, JobsError>;
 
     async fn update_step(&self, step: &Step) -> Result<(), JobsError> {
-        self.update_step_at(step, Utc::now()).await
+        self.update_step_at(step, Utc::now(), &[]).await
     }
 
-    async fn update_step_at(&self, step: &Step, now: DateTime<Utc>) -> Result<(), JobsError>;
+    async fn update_step_at(
+        &self,
+        step: &Step,
+        now: DateTime<Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<(), JobsError>;
 
     /// Append one sign-off stamp atomically. Stamps are
     /// append-only and owned by this path — the generic step UPDATE
@@ -159,7 +193,15 @@ pub trait JobsRepository: Send + Sync {
         step_id: &StepId,
         stamp: &boss_core::job::SignOffStamp,
         now: DateTime<Utc>,
+        events: &[boss_core::event::Event],
     ) -> Result<(), JobsError>;
+
+    /// Record events on the transactional outbox with NO accompanying
+    /// row write — the reliable-delivery path for standalone marker
+    /// events (the post-materialization `step.ready.<kind>` pass).
+    /// Same delivery guarantees as the in-write recording; its own
+    /// small transaction.
+    async fn record_events(&self, events: &[boss_core::event::Event]) -> Result<(), JobsError>;
 
     async fn list_steps(&self, job_id: &JobId) -> Result<Vec<Step>, JobsError>;
 

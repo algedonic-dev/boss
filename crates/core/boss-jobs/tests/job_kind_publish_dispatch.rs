@@ -173,7 +173,7 @@ async fn put_step_done(
 #[tokio::test]
 async fn done_dispatches_publish_authored_and_emits_kind_published_event() {
     let kinds: Arc<dyn JobKindRegistry> = Arc::new(InMemoryJobKinds::new());
-    let (app, jobs, bus) = build_app(kinds.clone());
+    let (app, jobs, _bus) = build_app(kinds.clone());
 
     let spec = valid_spec("morning-brew");
     let metadata = json!({
@@ -199,8 +199,11 @@ async fn done_dispatches_publish_authored_and_emits_kind_published_event() {
         *job_id.inner().as_uuid(),
     );
 
-    // The audit-bearing event landed.
-    let events = bus.events();
+    // The audit-bearing event landed — OUTBOX (phase 2): recorded by
+    // the repository in the step-update write, not published on the
+    // bus (the in-memory repo collects what the Pg adapter would
+    // record in-tx).
+    let events = jobs.recorded_events();
     let published: Vec<_> = events
         .iter()
         .filter(|e| e.kind == JOB_KIND_PUBLISHED)
@@ -219,7 +222,7 @@ async fn done_dispatches_publish_authored_and_emits_kind_published_event() {
 #[tokio::test]
 async fn missing_job_kind_spec_metadata_returns_400_no_publish() {
     let kinds: Arc<dyn JobKindRegistry> = Arc::new(InMemoryJobKinds::new());
-    let (app, jobs, bus) = build_app(kinds.clone());
+    let (app, jobs, _bus) = build_app(kinds.clone());
 
     let (job_id, step_id) =
         seed_publish_step(jobs.as_ref(), json!({ "previous_kind_version": 0 })).await;
@@ -231,8 +234,9 @@ async fn missing_job_kind_spec_metadata_returns_400_no_publish() {
         "missing job_kind_spec must abort the step write"
     );
 
-    // No publish event should have fired.
-    let events = bus.events();
+    // No publish event should have recorded — OUTBOX (phase 2): the
+    // repo collects what the Pg adapter would record in-tx.
+    let events = jobs.recorded_events();
     assert!(
         events.iter().all(|e| e.kind != JOB_KIND_PUBLISHED),
         "no jobs.kind.published event must fire when dispatch fails"
@@ -259,7 +263,7 @@ async fn missing_job_kind_spec_metadata_returns_400_no_publish() {
 #[tokio::test]
 async fn malformed_job_kind_spec_returns_400() {
     let kinds: Arc<dyn JobKindRegistry> = Arc::new(InMemoryJobKinds::new());
-    let (app, jobs, bus) = build_app(kinds.clone());
+    let (app, jobs, _bus) = build_app(kinds.clone());
 
     let (job_id, step_id) = seed_publish_step(
         jobs.as_ref(),
@@ -270,7 +274,7 @@ async fn malformed_job_kind_spec_returns_400() {
     let resp = put_step_done(&app, job_id, step_id, &user_header(&cto())).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-    let events = bus.events();
+    let events = jobs.recorded_events();
     assert!(events.iter().all(|e| e.kind != JOB_KIND_PUBLISHED));
 }
 
