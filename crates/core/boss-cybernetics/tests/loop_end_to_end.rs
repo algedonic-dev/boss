@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use boss_core::agent::{AgentId, AgentSpec, Cost, Message, Window};
 use boss_core::event::Event;
-use boss_core::port::{CostLedger, EventBus, EventStream, MessageQueue};
+use boss_core::port::{CostLedger, MessageQueue};
 use boss_cybernetics::Cybernetics;
 use boss_cybernetics::telemetry::{
     COST_RECORDED, DISPATCH_COMPLETED, DISPATCH_DENIED, DISPATCH_REQUESTED, DISPATCH_STARTED,
@@ -19,7 +19,7 @@ use boss_cybernetics::telemetry::{
 use boss_events::bus::InMemoryEventBus;
 use boss_events::dispatcher::StubDispatcher;
 use boss_events::ledger::InMemoryCostLedger;
-use boss_events::queue::InMemoryMessageQueue;
+use boss_events::queue::{InMemoryEventRecorder, InMemoryMessageQueue};
 use boss_events::registry::InMemoryAgentRegistry;
 use tokio::sync::watch;
 
@@ -37,7 +37,7 @@ fn planner_spec() -> AgentSpec {
 struct Harness {
     vm: String,
     cyb: Arc<Cybernetics>,
-    bus: Arc<InMemoryEventBus>,
+    recorder: Arc<InMemoryEventRecorder>,
     queue: Arc<InMemoryMessageQueue>,
     ledger: Arc<InMemoryCostLedger>,
     cancel_tx: watch::Sender<bool>,
@@ -57,6 +57,9 @@ async fn boot(specs: Vec<AgentSpec>, synthetic_cost: Cost) -> Harness {
         bus.clone(),
         format!("cybernetics/{}", vm),
     ));
+    // OUTBOX (phase 2): telemetry records via the EventRecorder port;
+    // the in-memory recorder collects what the Pg impl would stage.
+    let recorder = Arc::new(InMemoryEventRecorder::new());
     let cyb = Arc::new(Cybernetics::new(
         vm.clone(),
         queue.clone(),
@@ -64,6 +67,7 @@ async fn boot(specs: Vec<AgentSpec>, synthetic_cost: Cost) -> Harness {
         dispatcher,
         registry,
         publisher,
+        recorder.clone() as Arc<dyn boss_core::port::EventRecorder>,
         clock,
     ));
 
@@ -73,10 +77,11 @@ async fn boot(specs: Vec<AgentSpec>, synthetic_cost: Cost) -> Harness {
         let _ = runner.run(cancel_rx).await;
     });
 
+    let _ = bus; // envelope-building only post-outbox
     Harness {
         vm,
         cyb,
-        bus,
+        recorder,
         queue,
         ledger,
         cancel_tx,
@@ -91,17 +96,37 @@ impl Harness {
     }
 }
 
-/// Drain events from the stream until `kind` is observed or timeout expires.
-async fn expect_kind(stream: &mut Box<dyn EventStream>, kind: &str) -> Event {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let next = tokio::time::timeout(remaining, stream.next()).await;
-        match next {
-            Ok(Some(e)) if e.kind == kind => return e,
-            Ok(Some(_)) => continue,
-            Ok(None) => panic!("stream closed before observing {kind}"),
-            Err(_) => panic!("timed out waiting for {kind}"),
+/// Ordered cursor over the recorder — the outbox-era analogue of the
+/// old bus-stream drain. Scans recorded events from the cursor until
+/// `kind` appears (polling — the dispatch loop is async) or the
+/// timeout expires; advances the cursor past the match so successive
+/// calls assert ORDER, same as the stream did.
+struct EventCursor {
+    recorder: Arc<InMemoryEventRecorder>,
+    idx: usize,
+}
+
+impl EventCursor {
+    fn new(recorder: Arc<InMemoryEventRecorder>) -> Self {
+        Self { recorder, idx: 0 }
+    }
+
+    async fn expect_kind(&mut self, kind: &str) -> Event {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let events = self.recorder.events();
+            if let Some(pos) = events[self.idx.min(events.len())..]
+                .iter()
+                .position(|e| e.kind == kind)
+            {
+                let abs = self.idx + pos;
+                self.idx = abs + 1;
+                return events[abs].clone();
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timed out waiting for {kind}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 }
@@ -114,14 +139,14 @@ async fn happy_path_emits_full_telemetry_sequence() {
         usd_micros: 500,
     };
     let h = boot(vec![planner_spec()], cost).await;
-    let mut stream = h.bus.subscribe("cybernetics.>").await.unwrap();
+    let mut cursor = EventCursor::new(h.recorder.clone());
 
     let agent = AgentId::try_new("planner").unwrap();
     let msg = Message::new(agent.clone(), "work.plan", serde_json::json!({"n": 1}));
     let msg_id = h.cyb.submit(msg).await.unwrap();
 
     // Every lifecycle event must fire, in order.
-    let enq = expect_kind(&mut stream, MESSAGE_ENQUEUED).await;
+    let enq = cursor.expect_kind(MESSAGE_ENQUEUED).await;
     assert_eq!(enq.source, format!("cybernetics/{}", h.vm));
     assert_eq!(enq.payload["agent"], "planner");
     assert_eq!(enq.payload["kind"], "work.plan");
@@ -131,20 +156,20 @@ async fn happy_path_emits_full_telemetry_sequence() {
         msg_id.to_string()
     );
 
-    let req = expect_kind(&mut stream, DISPATCH_REQUESTED).await;
+    let req = cursor.expect_kind(DISPATCH_REQUESTED).await;
     assert_eq!(req.payload["agent"], "planner");
     assert_eq!(req.payload["attempt"], 1);
 
-    let started = expect_kind(&mut stream, DISPATCH_STARTED).await;
+    let started = cursor.expect_kind(DISPATCH_STARTED).await;
     assert_eq!(started.payload["agent"], "planner");
     assert!(started.payload.get("run_id").is_some());
 
-    let completed = expect_kind(&mut stream, DISPATCH_COMPLETED).await;
+    let completed = cursor.expect_kind(DISPATCH_COMPLETED).await;
     assert_eq!(completed.payload["agent"], "planner");
     assert_eq!(completed.payload["status"], "completed");
     assert_eq!(completed.payload["outcome"]["kind"], "success");
 
-    let cost_evt = expect_kind(&mut stream, COST_RECORDED).await;
+    let cost_evt = cursor.expect_kind(COST_RECORDED).await;
     assert_eq!(cost_evt.payload["agent"], "planner");
     assert_eq!(cost_evt.payload["cost"]["usd_micros"], 500);
 
@@ -159,7 +184,7 @@ async fn happy_path_emits_full_telemetry_sequence() {
 #[tokio::test]
 async fn unknown_agent_is_rejected_with_telemetry() {
     let h = boot(vec![], Cost::ZERO).await;
-    let mut stream = h.bus.subscribe("cybernetics.>").await.unwrap();
+    let mut cursor = EventCursor::new(h.recorder.clone());
 
     let ghost = AgentId::try_new("ghost").unwrap();
     let msg = Message::new(ghost, "any", serde_json::json!({}));
@@ -169,7 +194,7 @@ async fn unknown_agent_is_rejected_with_telemetry() {
         boss_cybernetics::CyberneticsError::UnknownAgent(_)
     ));
 
-    let evt = expect_kind(&mut stream, MESSAGE_REJECTED).await;
+    let evt = cursor.expect_kind(MESSAGE_REJECTED).await;
     assert_eq!(evt.payload["agent"], "ghost");
     assert_eq!(evt.payload["reason"], "unknown_agent");
 
@@ -190,7 +215,7 @@ async fn budget_exhaustion_denies_dispatch() {
         },
     )
     .await;
-    let mut stream = h.bus.subscribe("cybernetics.>").await.unwrap();
+    let mut cursor = EventCursor::new(h.recorder.clone());
 
     let agent = AgentId::try_new("planner").unwrap();
     // Pre-fund the ledger past the cap.
@@ -210,8 +235,8 @@ async fn budget_exhaustion_denies_dispatch() {
     h.cyb.submit(msg).await.unwrap();
 
     // Enqueued + denied, and we must NOT see dispatch.started.
-    expect_kind(&mut stream, MESSAGE_ENQUEUED).await;
-    let denied = expect_kind(&mut stream, DISPATCH_DENIED).await;
+    cursor.expect_kind(MESSAGE_ENQUEUED).await;
+    let denied = cursor.expect_kind(DISPATCH_DENIED).await;
     assert_eq!(denied.payload["agent"], "planner");
     assert!(
         denied.payload["reason"]

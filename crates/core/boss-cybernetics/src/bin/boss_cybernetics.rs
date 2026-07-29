@@ -86,6 +86,12 @@ async fn main() -> Result<()> {
     let source = format!("cybernetics/{}", cfg.vm_id);
     #[allow(unused_mut)]
     let mut publisher = boss_core::publisher::DomainPublisher::new(bus.clone(), &source);
+    // Non-postgres builds fall back to an in-memory recorder (toy
+    // mode — telemetry is not persisted, matching the old
+    // no-audit-writer behavior of feature-less builds).
+    #[allow(unused_mut, unused_assignments)]
+    let mut recorder: Arc<dyn boss_core::port::EventRecorder> =
+        Arc::new(boss_events::queue::InMemoryEventRecorder::new());
     #[cfg(feature = "postgres")]
     {
         let pg_url = std::env::var("BOSS_POSTGRES_URL")
@@ -102,9 +108,12 @@ async fn main() -> Result<()> {
             .max_connections(5)
             .connect(&pg_url)
             .await
-            .with_context(|| "connecting to Postgres for cybernetics audit_log")?;
-        publisher = publisher.with_audit(Arc::new(boss_events::PgAuditWriter::new(pool)));
-        info!("audit_log persistence wired for cybernetics events");
+            .with_context(|| "connecting to Postgres for cybernetics telemetry outbox")?;
+        // OUTBOX (phase 2): telemetry records on the transactional
+        // outbox; boss-event-relay delivers to audit_log + NATS. The
+        // publisher no longer needs a direct audit writer.
+        recorder = Arc::new(boss_events::outbox::PgOutboxRecorder::new(pool));
+        info!("transactional-outbox recorder wired for cybernetics events");
     }
     let publisher = Arc::new(publisher.with_sim_probe(Arc::new(
         boss_clock_client::ClockSimProbe::new(clock.clone()),
@@ -117,6 +126,7 @@ async fn main() -> Result<()> {
         dispatcher.clone(),
         registry.clone(),
         publisher,
+        recorder,
         clock.clone(),
     ));
 

@@ -8,14 +8,14 @@ use std::time::Duration;
 
 use boss_core::agent::{AgentId, AgentSpec, Message};
 use boss_core::event::Event;
-use boss_core::port::{EventBus, EventStream};
+use boss_core::port::EventBus;
 use boss_cybernetics::Cybernetics;
 use boss_cybernetics::ingress::{Ingress, envelope};
 use boss_cybernetics::telemetry::MESSAGE_ENQUEUED;
 use boss_events::bus::InMemoryEventBus;
 use boss_events::dispatcher::StubDispatcher;
 use boss_events::ledger::InMemoryCostLedger;
-use boss_events::queue::InMemoryMessageQueue;
+use boss_events::queue::{InMemoryEventRecorder, InMemoryMessageQueue};
 use boss_events::registry::InMemoryAgentRegistry;
 use tokio::sync::watch;
 
@@ -30,16 +30,20 @@ fn planner() -> AgentSpec {
     }
 }
 
-async fn expect_kind(stream: &mut Box<dyn EventStream>, kind: &str) -> Event {
+/// Poll the recorder until an event of `kind` appears — the
+/// outbox-era analogue of draining a bus subscription (telemetry now
+/// records via the EventRecorder port; the in-memory recorder
+/// collects what the Pg impl would stage on the outbox).
+async fn expect_kind(recorder: &InMemoryEventRecorder, kind: &str) -> Event {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(remaining, stream.next()).await {
-            Ok(Some(e)) if e.kind == kind => return e,
-            Ok(Some(_)) => continue,
-            Ok(None) => panic!("stream closed before observing {kind}"),
-            Err(_) => panic!("timed out waiting for {kind}"),
+        if let Some(e) = recorder.events().into_iter().find(|e| e.kind == kind) {
+            return e;
         }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("timed out waiting for {kind}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -56,6 +60,7 @@ async fn envelope_published_to_bus_reaches_submit() {
         bus.clone(),
         format!("cybernetics/{}", vm),
     ));
+    let recorder = Arc::new(InMemoryEventRecorder::new());
     let cyb = Arc::new(Cybernetics::new(
         vm,
         queue.clone(),
@@ -63,11 +68,9 @@ async fn envelope_published_to_bus_reaches_submit() {
         dispatcher,
         registry,
         publisher.clone(),
+        recorder.clone() as Arc<dyn boss_core::port::EventRecorder>,
         clock,
     ));
-
-    // Observe telemetry by subscribing to the same bus.
-    let mut tele = bus.subscribe("cybernetics.>").await.unwrap();
 
     // Start both the Cybernetics loop and the ingress bridge.
     let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -95,7 +98,7 @@ async fn envelope_published_to_bus_reaches_submit() {
     bus.publish(env).await.unwrap();
 
     // Ingress should deliver the message to Cybernetics; observe enqueued.
-    let enq = expect_kind(&mut tele, MESSAGE_ENQUEUED).await;
+    let enq = expect_kind(&recorder, MESSAGE_ENQUEUED).await;
     assert_eq!(enq.payload["agent"], "planner");
     assert_eq!(enq.payload["kind"], "work.plan");
     assert_eq!(
@@ -122,6 +125,7 @@ async fn malformed_envelope_is_dropped_not_fatal() {
         bus.clone(),
         format!("cybernetics/{}", vm),
     ));
+    let recorder = Arc::new(InMemoryEventRecorder::new());
     let cyb = Arc::new(Cybernetics::new(
         vm,
         queue.clone(),
@@ -129,9 +133,9 @@ async fn malformed_envelope_is_dropped_not_fatal() {
         dispatcher,
         registry,
         publisher.clone(),
+        recorder.clone() as Arc<dyn boss_core::port::EventRecorder>,
         clock,
     ));
-    let mut tele = bus.subscribe("cybernetics.>").await.unwrap();
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let ingress_bus: Arc<dyn EventBus> = bus.clone();
@@ -159,7 +163,7 @@ async fn malformed_envelope_is_dropped_not_fatal() {
     bus.publish(envelope(vm, "t", &msg)).await.unwrap();
 
     // We should see the good message enqueued (the bad one was skipped).
-    let enq = expect_kind(&mut tele, MESSAGE_ENQUEUED).await;
+    let enq = expect_kind(&recorder, MESSAGE_ENQUEUED).await;
     assert_eq!(enq.payload["kind"], "work.ok");
 
     let _ = cancel_tx.send(true);
