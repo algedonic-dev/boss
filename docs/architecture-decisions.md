@@ -106,6 +106,44 @@ The general principle: the only hard constraint on creating a Subject
 is its identity; any further "required at create" constraint is data,
 not a baked-in NOT NULL or event field.
 
+**Identity has a home: the `subjects` table** (R1, approved
+2026-07-15; live contract:
+`docs/design/subject-identity-and-relationships.md`). One thin
+`(kind, id, label)` row per subject — identity only, no attributes —
+that every domain mint upserts in the same transaction as its domain
+row AND the rebuilder reproduces from `*.created` events (the
+dual write-through/projection contract, Q1; the deep replay-check
+owns its correctness). The uniform existence gate is one indexed
+lookup against it, for every kind including tenant-defined ones.
+Kinds with no rebuild source are **rollover landmines**: any subject
+minted only at prepare time vanishes when the epoch rollover
+reprojects — the class bit three times (company → the `companies`
+reference-table pass, birth-by-job kinds → the nested-payload jobs
+pass, assets → the TOML identity sources), so a new kind lands with
+its rebuild source or not at all.
+
+**Relationships are one registry: `subject_edges`** (R2, shipped in
+two passes 2026-07-17/29). A declared edge — `source_kind` event,
+dotted `field_path`, target kind either pinned (`target_kind`) or
+read from the payload (`target_kind_path`, the typed-pair shape:
+job.subject's own subject_kind, the asset custody holder_kind) — is
+enforced by the `check_subject_edges()` trigger on `event_outbox` +
+`audit_log`, aborting inside the domain transaction (Q2:
+abort-everywhere, no warn-mode legacy), and swept nightly by
+conservation invariant Y. It superseded the three partial registries
+(audit_log_ref_checks survives only for non-subject residuals like
+part_sku). Absent refs skip — identity-first — and an id whose
+dynamic kind half is absent skips with it; a kind-mismatched pair
+aborts. Custody is subject-valued: the asset holder is a typed
+(holder_kind, holder_id) pair (Q5), not an account id. Org-level
+work is about the **company** Subject (Q6) — one row per tenant,
+reproduced from the `companies` reference table. Jobs are owned by
+humans, never automations (Q7) — steps may be automation-executed,
+but the Job's owner resolves to a person (the owner-resolution
+module's role-holder spread). Deploy-order rule for new abort
+edges on a live system: backfill `subjects` first, then apply the
+edge.
+
 A **Class** is not a Subject: Classes are typed reference data
 keyed `(subject_kind, code)` that each Subject kind owns — roles,
 account types, asset models, departments all land in the one

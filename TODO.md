@@ -96,6 +96,37 @@ first-contact fixes (#74). Sorted by dependency, not size.
       through drain-actual-wip automatically — no stamped amounts
       anywhere (per #77).
 
+## Subject-model audit residuals (2026-07-14 appendix, re-homed 2026-07-29)
+
+The R1–R4 workstream + both edge PRs (#137, #159) shipped; the
+design doc flattened into the baseline record and its appendix
+defect worklist — independent, own-PR-sized findings of record —
+lives here now. Items verified still open at re-homing:
+
+- [ ] `assets.phase`: closed DB CHECK duplicating the Class rows —
+      the "extend via a Class row" promise is false at the DB layer.
+- [ ] `classes.subject_kind` has no FK to `subject_kinds`; drift
+      possible in both directions.
+- [ ] `purchase_orders` vendor column duality (FK'd `vendor_id` vs
+      the non-FK `vendor` TEXT the Rust type maps to). Partially
+      mitigated: the `vendor` TEXT ref is now edge-enforced against
+      subjects (#159); the column duality itself remains.
+- [ ] Closed enums that should be Classes: `PoStatus`,
+      `VendorInvoiceStatus`, `DocumentAudience`.
+- [ ] Doc-claimed-but-unimplemented validation:
+      `products.product_kind`, invoice `revenue_category`.
+- [ ] Deferred taxonomy lifts: account tier/type, vendor
+      `payment_terms`, revenue categories, tax jurisdictions/rates
+      in `rules.toml`.
+- [ ] `brewery-hire` subject shape (an existing employee as the
+      hire target) — suppressed with `rate=0`; needs remodeling,
+      likely subject = the requisition or the org.
+- [ ] Dead-by-construction seed ids: `loc-hq` in the sim pool with
+      no locations row; `acc-prospect-*` seeded for `sale` but
+      absent from the sim pool.
+- [x] `assets.account_id` holding location ids — resolved by the Q5
+      typed holder pair (#134) + custody edges (#159).
+
 ## Open questions — back-compat cleanup
 
 The pre-release back-compat audit found vestigial code preserving
