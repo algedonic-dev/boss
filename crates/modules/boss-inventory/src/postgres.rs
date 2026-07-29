@@ -854,9 +854,8 @@ impl InventoryRepository for PgInventory {
         status: &str,
         stamp: &boss_core::publisher::EventStamp,
     ) -> Result<(), InventoryError> {
-        // Validate status.
-        let _ = parse_po_status(status)?;
-
+        // Status vocabulary is validated at the API boundary against
+        // the Class registry; the storage adapter stores the code.
         let mut tx = self
             .pool
             .begin()
@@ -1315,7 +1314,7 @@ impl PgInventory {
         Ok(Some(PurchaseOrder {
             id: row.id,
             vendor: row.vendor,
-            status: parse_po_status(&row.status).unwrap_or(PoStatus::Draft),
+            status: PoStatus::new(&row.status),
             placed_on: row.placed_on,
             expected_on: row.expected_on,
             received_on: row.received_on,
@@ -1335,7 +1334,7 @@ impl PgInventory {
         Ok(PurchaseOrder {
             id: row.id,
             vendor: row.vendor,
-            status: parse_po_status(&row.status).unwrap_or(PoStatus::Draft),
+            status: PoStatus::new(&row.status),
             placed_on: row.placed_on,
             expected_on: row.expected_on,
             received_on: row.received_on,
@@ -1571,29 +1570,11 @@ async fn insert_fact(
     Ok(result.rows_affected() > 0)
 }
 
-pub(crate) fn po_status_str(s: &PoStatus) -> &'static str {
-    match s {
-        PoStatus::Draft => "draft",
-        PoStatus::Submitted => "submitted",
-        PoStatus::Acknowledged => "acknowledged",
-        PoStatus::InTransit => "in-transit",
-        PoStatus::Received => "received",
-        PoStatus::Closed => "closed",
-    }
-}
-
-fn parse_po_status(s: &str) -> Result<PoStatus, InventoryError> {
-    match s {
-        "draft" => Ok(PoStatus::Draft),
-        "submitted" => Ok(PoStatus::Submitted),
-        "acknowledged" => Ok(PoStatus::Acknowledged),
-        "in-transit" => Ok(PoStatus::InTransit),
-        "received" => Ok(PoStatus::Received),
-        "closed" => Ok(PoStatus::Closed),
-        other => Err(InventoryError::Storage(format!(
-            "unknown PO status: {other}"
-        ))),
-    }
+pub(crate) fn po_status_str(s: &PoStatus) -> &str {
+    // Transparent newtype — the bare kebab code the column stores.
+    // Validation against the active Class set lives at the API
+    // boundary, not this storage adapter.
+    s.as_str()
 }
 
 #[derive(sqlx::FromRow)]
@@ -1641,26 +1622,5 @@ impl VendorInvoiceRow {
             // re-reads correctly.
             lines: Vec::new(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_all_po_statuses() {
-        let cases = [
-            "draft",
-            "submitted",
-            "acknowledged",
-            "in-transit",
-            "received",
-            "closed",
-        ];
-        for s in cases {
-            assert!(parse_po_status(s).is_ok(), "failed to parse PO status: {s}");
-        }
-        assert!(parse_po_status("pending").is_err());
     }
 }

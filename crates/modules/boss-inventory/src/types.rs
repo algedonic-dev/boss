@@ -196,23 +196,66 @@ impl VendorBehavior {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PoStatus {
-    Draft,
-    Submitted,
-    Acknowledged,
-    InTransit,
-    Received,
-    Closed,
-}
+/// Purchase-order lifecycle status. Free-text wrapper around a
+/// kebab-case Class code; the closed enum was lifted to a
+/// String-newtype (subject-model audit residual, 2026-07-29) so
+/// tenants extend the lifecycle via Class rows
+/// (subject_kind='purchase_order', member_attribute='status')
+/// instead of forking core. Validated against the active Class set
+/// at the API boundary where client-supplied; the wire shape is the
+/// same kebab string the old enum serialized.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PoStatus(pub String);
 
 impl PoStatus {
+    pub const DRAFT: &'static str = "draft";
+    pub const SUBMITTED: &'static str = "submitted";
+    pub const ACKNOWLEDGED: &'static str = "acknowledged";
+    pub const IN_TRANSIT: &'static str = "in-transit";
+    pub const RECEIVED: &'static str = "received";
+    pub const CLOSED: &'static str = "closed";
+
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// True once the PO has been placed with the vendor — any status
-    /// past `Draft`. A `Draft` PO may be a bare identity (identity-first);
-    /// every placed status carries the required-at-place obligations.
+    /// past `draft`. A `draft` PO may be a bare identity
+    /// (identity-first); every placed status carries the
+    /// required-at-place obligations. A tenant-added status is by
+    /// definition past draft.
     pub fn is_placed(&self) -> bool {
-        !matches!(self, PoStatus::Draft)
+        self.0 != Self::DRAFT
+    }
+
+    /// True while goods are still expected — anything short of the
+    /// received/closed terminals. Drives the warehouse inbound
+    /// rollup's open-PO filter; a tenant-added status counts as open.
+    pub fn is_open(&self) -> bool {
+        self.0 != Self::RECEIVED && self.0 != Self::CLOSED
+    }
+}
+
+impl std::fmt::Display for PoStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for PoStatus {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for PoStatus {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
     }
 }
 
@@ -532,7 +575,7 @@ mod po_placement_tests {
     fn draft_po_can_be_a_bare_identity() {
         // Identity-first: a Draft needs nothing but its id.
         assert!(
-            po(PoStatus::Draft, None, false, false)
+            po(PoStatus::new(PoStatus::DRAFT), None, false, false)
                 .validate_placement()
                 .is_ok()
         );
@@ -542,23 +585,23 @@ mod po_placement_tests {
     fn placed_po_requires_vendor_lines_and_placed_on() {
         // Required-at-place: each missing field is rejected with a reason.
         assert!(
-            po(PoStatus::Submitted, None, true, true)
+            po(PoStatus::new(PoStatus::SUBMITTED), None, true, true)
                 .validate_placement()
                 .is_err()
         );
         assert!(
-            po(PoStatus::Submitted, Some("v"), false, true)
+            po(PoStatus::new(PoStatus::SUBMITTED), Some("v"), false, true)
                 .validate_placement()
                 .is_err()
         );
         assert!(
-            po(PoStatus::Submitted, Some("v"), true, false)
+            po(PoStatus::new(PoStatus::SUBMITTED), Some("v"), true, false)
                 .validate_placement()
                 .is_err()
         );
         // Complete placed PO passes.
         assert!(
-            po(PoStatus::Submitted, Some("v"), true, true)
+            po(PoStatus::new(PoStatus::SUBMITTED), Some("v"), true, true)
                 .validate_placement()
                 .is_ok()
         );

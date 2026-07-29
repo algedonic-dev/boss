@@ -80,7 +80,7 @@ pub(super) async fn create_order<R: InventoryRepository + 'static>(
     let po = PurchaseOrder {
         id: po_id.clone(),
         vendor: body.vendor,
-        status: PoStatus::Draft,
+        status: PoStatus::new(PoStatus::DRAFT),
         placed_on: None,
         expected_on: None,
         received_on: None,
@@ -127,6 +127,12 @@ pub(super) async fn batch_create_orders<R: InventoryRepository + 'static>(
     let stamp = super::event_stamp(&state, &user, batch_now).await;
     for po in &body {
         let now = batch_now;
+        // The closed enum used to reject unknown statuses at
+        // deserialization; the registry gate is that check now.
+        if let Err(resp) = check_po_status(state.classes_client.as_ref(), po.status.as_str()).await
+        {
+            return resp;
+        }
         // Required-at-place: a placed PO (status past Draft — the
         // auto-restock posts Submitted POs here) must carry vendor,
         // lines, and placed_on. A bare Draft passes.
@@ -149,6 +155,38 @@ pub(super) async fn batch_create_orders<R: InventoryRepository + 'static>(
         .into_response()
 }
 
+/// Validate a client-supplied PO status against the Class registry
+/// (`subject_kind='purchase_order'`). Permissive when no registry is
+/// wired (test path); fail-closed 503 when unreachable; 400 on an
+/// unregistered code — the same contract as the shipping status
+/// gate. This replaces the validation the closed PoStatus enum used
+/// to do at deserialization time.
+async fn check_po_status(
+    classes_client: Option<&Arc<dyn boss_classes_client::ClassesClient>>,
+    status: &str,
+) -> Result<(), Response> {
+    let Some(client) = classes_client else {
+        return Ok(());
+    };
+    let class_ref = boss_core::primitives::ClassRef::new("purchase_order", status);
+    match client.class_exists(&class_ref).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown PO status `{status}` — register it as a Class first \
+                 (subject_kind='purchase_order')"
+            ),
+        )
+            .into_response()),
+        Err(e) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("classes registry unreachable: {e}"),
+        )
+            .into_response()),
+    }
+}
+
 #[derive(Deserialize)]
 pub(super) struct UpdateStatusRequest {
     status: String,
@@ -160,6 +198,9 @@ pub(super) async fn update_order_status<R: InventoryRepository + 'static>(
     CurrentUser(user): CurrentUser,
     Json(body): Json<UpdateStatusRequest>,
 ) -> Response {
+    if let Err(resp) = check_po_status(state.classes_client.as_ref(), &body.status).await {
+        return resp;
+    }
     let now = boss_clock_client::now_from(&state.clock).await;
     // Outbox phase 2: PO_UPSERTED (post-update row state, read back
     // in-tx) + the PO_STATUS_CHANGED marker record inside the

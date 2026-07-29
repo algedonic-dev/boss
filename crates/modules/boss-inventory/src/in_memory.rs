@@ -471,7 +471,7 @@ mod tests {
         PurchaseOrder {
             id: id.to_string(),
             vendor: Some("Acme Parts Co".to_string()),
-            status: PoStatus::Submitted,
+            status: PoStatus::new(PoStatus::SUBMITTED),
             placed_on: Some(chrono::NaiveDate::from_ymd_opt(2025, 3, 1).unwrap()),
             expected_on: Some(chrono::NaiveDate::from_ymd_opt(2025, 3, 15).unwrap()),
             received_on: None,

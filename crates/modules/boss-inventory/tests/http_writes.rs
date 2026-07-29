@@ -366,10 +366,10 @@ async fn batch_create_orders_preserves_backdated_fields() {
 
     let one = pos.iter().find(|p| p.id == "PO-BATCH-1").unwrap();
     assert_eq!(one.vendor.as_deref(), Some("Optica Components"));
-    assert!(matches!(
+    assert_eq!(
         one.status,
-        boss_inventory::types::PoStatus::Received
-    ));
+        boss_inventory::types::PoStatus::new(boss_inventory::types::PoStatus::RECEIVED)
+    );
     assert_eq!(
         one.placed_on,
         Some(chrono::NaiveDate::from_ymd_opt(2022, 6, 1).unwrap())
@@ -380,7 +380,10 @@ async fn batch_create_orders_preserves_backdated_fields() {
     );
 
     let two = pos.iter().find(|p| p.id == "PO-BATCH-2").unwrap();
-    assert!(matches!(two.status, boss_inventory::types::PoStatus::Draft));
+    assert_eq!(
+        two.status,
+        boss_inventory::types::PoStatus::new(boss_inventory::types::PoStatus::DRAFT)
+    );
     assert_eq!(two.received_on, None);
 }
 

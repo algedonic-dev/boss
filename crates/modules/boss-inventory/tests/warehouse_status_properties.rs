@@ -77,12 +77,12 @@ fn arb_item() -> impl Strategy<Value = InventoryItem> {
 
 fn arb_po_status() -> impl Strategy<Value = PoStatus> {
     prop_oneof![
-        Just(PoStatus::Draft),
-        Just(PoStatus::Submitted),
-        Just(PoStatus::Acknowledged),
-        Just(PoStatus::InTransit),
-        Just(PoStatus::Received),
-        Just(PoStatus::Closed),
+        Just(PoStatus::new(PoStatus::DRAFT)),
+        Just(PoStatus::new(PoStatus::SUBMITTED)),
+        Just(PoStatus::new(PoStatus::ACKNOWLEDGED)),
+        Just(PoStatus::new(PoStatus::IN_TRANSIT)),
+        Just(PoStatus::new(PoStatus::RECEIVED)),
+        Just(PoStatus::new(PoStatus::CLOSED)),
     ]
 }
 
@@ -252,7 +252,7 @@ proptest! {
         // `total_open` counts every PO that isn't Received or Closed.
         let expected_open: i64 = pos
             .iter()
-            .filter(|p| !matches!(p.status, PoStatus::Received | PoStatus::Closed))
+            .filter(|p| p.status.is_open())
             .count() as i64;
         prop_assert_eq!(ipo.total_open, expected_open);
 
