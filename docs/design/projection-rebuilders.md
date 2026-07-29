@@ -67,37 +67,54 @@ deploy is replaying simulated activity.
 
 Two ergonomics enforce this across services:
 
-**`DomainPublisher::emit_at(kind, payload, timestamp)`**
-(`boss-core/src/publisher.rs`) — publishes an event with a
-caller-supplied timestamp; it takes no defaulted-`Utc::now()`
-variant, because a wallclock default leaks wall-time rows into a
-sim regen instead of stamping the sim clock. The handler reads `now`
-once from the clock service and passes it both to the projection
-write AND to `emit_at`. Audit_log row's `timestamp` column then matches what the
-projection's `created_at` / `updated_at` got bound to.
+**`EventStamp` carries the timestamp into the write**
+(`boss-core/src/publisher.rs`). Events record on the transactional
+outbox INSIDE the domain transaction (the write-path contract:
+[transactional-audit-log.md](transactional-audit-log.md)); the
+stamp the handler builds — `publisher.stamp_with_actor_at(actor,
+now)` — bakes the caller-supplied `now` into every event it mints,
+and there is no defaulted-`Utc::now()` variant, because a wallclock
+default would leak wall-time rows into a sim regen instead of
+stamping the sim clock. The handler reads `now` once from the clock
+service and passes it to the `_at` mutation, which binds it into
+the row's `created_at` / `updated_at` AND records the stamped
+event(s) in the same transaction — so the audit_log row's
+`timestamp` matches what the projection got bound to, structurally.
 
-**Repository trait `_at` overloads** — every mutation method
-gets a sibling that takes the timestamp explicitly:
+**Repository trait `_at` overloads** — every mutation method gets
+a sibling that takes the timestamp plus the event payload (a
+`stamp: &EventStamp` the adapter records its own kind with, or —
+where handlers derive markers the adapter can't, as in boss-jobs —
+the pre-built `events: &[Event]`):
 
 ```rust
 async fn create_job(&self, job: &Job) -> Result<(), JobsError> {
-    self.create_job_at(job, Utc::now()).await
+    self.create_job_at(job, Utc::now(), &[]).await
 }
-async fn create_job_at(&self, job: &Job, now: DateTime<Utc>) -> Result<(), JobsError>;
+async fn create_job_at(
+    &self,
+    job: &Job,
+    now: DateTime<Utc>,
+    events: &[Event],
+) -> Result<(), JobsError>;
 ```
 
-The `_at` form is what the handler calls when emitting an event.
-The convenience overload stays as a default impl so existing
+The `_at` form is what the handler calls on the event-bearing
+path. The convenience overload stays as a default impl so
 non-event call sites (tests, scripts, internal cleanups) compile
-unchanged. The Pg adapter binds `now` explicitly into the
-`created_at` / `updated_at` columns.
+unchanged — and record nothing, correctly.
 
-Pattern in the handler:
+Pattern in the handler (jobs' events-ride-the-write shape; the
+per-kind-stamp crates pass `&stamp` and let the adapter build the
+payload):
 
 ```rust
-let now = state.clock.now().await.now;
-state.jobs.create_job_at(&job, now).await?;
-publisher.emit_at(JOB_CREATED, serde_json::to_value(&job)?, now).await;
+let now = boss_clock_client::now_from(&state.clock).await;
+let stamp = state.publisher.stamp_with_actor_at(actor, now).await;
+let event = stamp.event(JOB_CREATED, serde_json::to_value(&job)?);
+state.jobs.create_job_at(&job, now, &[event]).await?;
+// The adapter recorded JOB_CREATED in the same transaction as the
+// row; boss-event-relay delivers it to audit_log + NATS.
 ```
 
 Rebuilders that don't follow this can't reproduce timestamps

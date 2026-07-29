@@ -320,11 +320,38 @@ the system contributes zero error of its own. Every projection row
 representing a sim-time event stamps **the sim-day the engine
 emitted**, never wall-clock `NOW()`.
 
+**Events become durable atomically with the state they describe**
+(the transactional-outbox decision, arc completed 2026-07-29;
+living contract:
+`docs/design/transactional-audit-log.md`). Writers stage events on
+`event_outbox` inside the domain transaction
+(`record_event_in_tx`); the single `boss-event-relay` daemon drains
+them into `audit_log` + NATS in order. This replaced the original
+best-effort post-commit publisher after the 2026-07-13
+replay-divergence incident proved the swallowed-write class real
+(260+ committed state changes with no event). The decision chain
+that got here: relay as a separate binary in the deploy list from
+day one; explicit `record_event_in_tx(&mut tx, …)` threading at
+call sites rather than publisher magic; epoch trim TRUNCATEs the
+outbox before the audit DELETE; ref-checks moved up to the outbox
+trigger so phantom-subject writes abort the operation. The interim
+"rebuild-consumed kinds only" classification was ultimately
+superseded — **every** emit migrated (three recipes: per-kind
+stamps on port mutations, jobs' events-ride-the-write
+`events: &[Event]` parameter, and the `EventRecorder` port for
+row-less telemetry), idempotency guards double as event gates
+(replays record nothing), and
+`infra/lint/outbox-migration-ratchet.sh` enforces a flat CI ban on
+post-commit publishing workspace-wide. Two full-year from-empty
+regens (484K and 1.84M outbox events, zero undelivered) are the
+acceptance record.
+
 The log itself is tamper-evident in three layers: append-only
 enforcement (BEFORE-triggers reject UPDATE/DELETE), a **hash
 chain** (each row stores its predecessor's hash and its own,
 computed by a trigger that assigns ids post-advisory-lock so the
-verifier's id-walk matches commit order; the chain columns ship in
+verifier's id-walk matches commit order — uncontended now that the
+relay is the log's single writer; the chain columns ship in
 the schema, chained from the genesis row), and a **daily
 checkpoint** that emits the chain head outside the database for
 auditor comparison. `boss-audit-integrity-check` walks the chain
