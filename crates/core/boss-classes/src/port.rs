@@ -12,6 +12,12 @@ pub enum ClassError {
     NotFound(ClassRef),
     #[error("conflict: {0}")]
     Conflict(String),
+    /// A class row named a subject_kind the SubjectKind registry
+    /// doesn't carry — "Classes are typed reference data each
+    /// Subject kind owns", so the kind must exist first. Enforced by
+    /// the classes.subject_kind FK.
+    #[error("unregistered subject kind: {0} — register it in the SubjectKind registry first")]
+    UnregisteredKind(String),
 }
 
 /// Persistence port for the Class registry.
