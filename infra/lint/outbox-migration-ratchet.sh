@@ -16,24 +16,14 @@
 #
 # THE CHECKED PROPERTY
 # --------------------
-# Every crate is in exactly one class:
-#
-#   MIGRATED — records in-tx; post-commit publishing is BANNED.
-#     Any `emit_*` call site here fails CI.
-#
-#   PENDING  — not yet migrated; its post-commit emit count is PINNED.
-#     Count goes UP   → fail (new events must be born on the outbox —
-#                       even in a pending crate, add new writes via
-#                       record_event_in_tx, not the publisher).
-#     Count goes DOWN → fail with a "ratchet down" instruction (update
-#                       the baseline in the same PR, so this table
-#                       stays the migration scoreboard).
-#
-#   Everything else — zero emit sites. A brand-new crate that starts
-#     publishing post-commit fails CI immediately.
-#
-# When the last PENDING baseline hits zero, delete the PENDING table
-# and this lint becomes a flat ban.
+# The migration COMPLETED 2026-07-28 (the last PENDING row,
+# boss-cybernetics, moved to the record-only EventRecorder path), so
+# this is now a FLAT BAN: NO crate may call the post-commit publish
+# APIs. Domain writes record via record_event_in_tx inside their
+# transaction; row-less signals (cybernetics telemetry, the jobs
+# post-materialization step.ready pass) record via the EventRecorder
+# port / JobsRepository::record_events. A brand-new crate that starts
+# publishing post-commit fails CI immediately.
 #
 # WHAT COUNTS AS AN EMIT SITE
 # ---------------------------
@@ -50,29 +40,6 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
-
-# Crates that completed the migration — post-commit publishing banned.
-MIGRATED=(
-  boss-commerce
-  boss-products
-  boss-inventory
-  boss-ledger
-  boss-shipping
-  boss-catalog
-  boss-messages
-  boss-calendar
-  boss-accounts
-  boss-people
-  boss-content
-  boss-jobs
-)
-
-# Not-yet-migrated crates and their pinned post-commit emit counts.
-# Migrating a crate = move its sites to record_event_in_tx and ratchet
-# its row down (to the MIGRATED list at zero). Baselines 2026-07-24.
-declare -A PENDING=(
-  [boss-cybernetics]=1
-)
 
 EMIT_PATTERN='\.emit_at\(|\.emit_with_actor_at\(|\.emit_simulated_at\(|\.emit_with_actor_simulated_at\('
 
@@ -101,63 +68,25 @@ list_sites() {
 
 fail=0
 
-echo "outbox-migration-ratchet: post-commit publisher emits per crate"
+echo "outbox-migration-ratchet: post-commit publisher emits (flat ban)"
 echo
 
-# 1. MIGRATED crates: zero tolerance.
-for crate in "${MIGRATED[@]}"; do
-  dir=$(find crates -maxdepth 2 -type d -name "$crate" | head -1)
-  [ -z "$dir" ] && { echo "  [ERROR] migrated crate $crate not found"; fail=1; continue; }
-  n=$(count_sites "$dir/src")
-  if [ "$n" -ne 0 ]; then
-    echo "  [FAIL] $crate is MIGRATED but has $n post-commit emit site(s):"
-    list_sites "$dir/src"
-    echo "         → record the event in the domain transaction instead:"
-    echo "           boss_events::outbox::record_event_in_tx(&mut tx, &stamp.event(kind, payload))"
-    fail=1
-  else
-    echo "  [ok]   $crate: 0 (migrated)"
-  fi
-done
-
-# 2. PENDING crates: pinned baselines, both directions checked.
-for crate in "${!PENDING[@]}"; do
-  dir=$(find crates -maxdepth 2 -type d -name "$crate" | head -1)
-  [ -z "$dir" ] && { echo "  [ERROR] pending crate $crate not found"; fail=1; continue; }
-  n=$(count_sites "$dir/src")
-  base=${PENDING[$crate]}
-  if [ "$n" -gt "$base" ]; then
-    echo "  [FAIL] $crate: $n emit sites (baseline $base) — new events must record"
-    echo "         on the transactional outbox, not publish post-commit."
-    list_sites "$dir/src"
-    fail=1
-  elif [ "$n" -lt "$base" ]; then
-    echo "  [FAIL] $crate: $n emit sites (baseline $base) — nice, it went DOWN."
-    echo "         Ratchet the baseline in infra/lint/outbox-migration-ratchet.sh"
-    echo "         to $n in this PR (move the crate to MIGRATED when it hits 0)."
-    fail=1
-  else
-    echo "  [ok]   $crate: $n (pinned)"
-  fi
-done
-
-# 3. Every other crate: zero emit sites (new crates are born on the outbox).
-known=" ${MIGRATED[*]} ${!PENDING[*]} "
+# Flat ban: every crate must have zero post-commit emit sites.
 while IFS= read -r cargo_toml; do
   dir=$(dirname "$cargo_toml")
   crate=$(basename "$dir")
-  case "$known" in *" $crate "*) continue ;; esac
   [ -d "$dir/src" ] || continue
   n=$(count_sites "$dir/src")
   if [ "$n" -ne 0 ]; then
-    echo "  [FAIL] $crate is not on the migration lists but has $n emit site(s)"
-    echo "         — new crates record events in-tx via the outbox, they don't"
-    echo "         publish post-commit. (If this is genuinely ephemeral,"
-    echo "         non-state signaling, add it to PENDING with a reason.)"
+    echo "  [FAIL] $crate has $n post-commit emit site(s):"
     list_sites "$dir/src"
+    echo "         → record the event in the domain transaction instead:"
+    echo "           boss_events::outbox::record_event_in_tx(&mut tx, &stamp.event(kind, payload))"
+    echo "         (row-less signals go through the EventRecorder port)"
     fail=1
   fi
 done < <(find crates -mindepth 3 -maxdepth 3 -name Cargo.toml)
+echo "  [ok] zero post-commit emit sites across the workspace"
 
 echo
 if [ "$fail" -ne 0 ]; then

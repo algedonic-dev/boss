@@ -225,3 +225,33 @@ mod tests {
         assert_eq!(depths, vec![(a, 2)]);
     }
 }
+
+/// In-memory [`boss_core::port::EventRecorder`] — collects recorded
+/// events for test assertion (the in-memory analogue of
+/// `PgOutboxRecorder`'s outbox staging).
+#[derive(Default)]
+pub struct InMemoryEventRecorder {
+    events: std::sync::Mutex<Vec<boss_core::event::Event>>,
+}
+
+impl InMemoryEventRecorder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Events recorded so far, in order.
+    pub fn events(&self) -> Vec<boss_core::event::Event> {
+        self.events.lock().map(|v| v.clone()).unwrap_or_default()
+    }
+}
+
+#[async_trait::async_trait]
+impl boss_core::port::EventRecorder for InMemoryEventRecorder {
+    async fn record(&self, event: &boss_core::event::Event) -> Result<(), String> {
+        self.events
+            .lock()
+            .map_err(|_| "recorder mutex poisoned".to_string())?
+            .push(event.clone());
+        Ok(())
+    }
+}

@@ -33,12 +33,18 @@ pub struct Cybernetics {
     ledger: Arc<dyn CostLedger>,
     dispatcher: Arc<dyn AgentDispatcher>,
     registry: Arc<dyn AgentRegistry>,
-    /// Authoritative event publisher. Routes telemetry to NATS AND to
-    /// audit_log via the wired PgAuditWriter, so agent activity is
-    /// persistent and rebuildable like every other Tier-1 service —
-    /// a raw `EventBus` would drop agent dispatches/denials/cost-records
-    /// when the broadcast channel rolled over.
+    /// Envelope builder for telemetry events — resolves the
+    /// `_actor` / `_simulated` stamping (sim probe) exactly like the
+    /// retired post-commit emits. Publishing itself moved to the
+    /// `recorder` (outbox phase 2).
     publisher: Arc<boss_core::publisher::DomainPublisher>,
+    /// OUTBOX (phase 2): where telemetry events go. Cybernetics
+    /// events ARE its rebuildable state (agent dispatches, denials,
+    /// cost records) but have no domain row write to join, so they
+    /// record via the record-only outbox port; boss-event-relay
+    /// delivers to audit_log + NATS with the same guarantees as
+    /// every domain write.
+    recorder: Arc<dyn boss_core::port::EventRecorder>,
     /// Authoritative clock — every telemetry event stamps its
     /// timestamp from here (sim or wall depending on clock-api
     /// mode). See `boss-clock-client`.
@@ -53,6 +59,7 @@ impl Cybernetics {
         dispatcher: Arc<dyn AgentDispatcher>,
         registry: Arc<dyn AgentRegistry>,
         publisher: Arc<boss_core::publisher::DomainPublisher>,
+        recorder: Arc<dyn boss_core::port::EventRecorder>,
         clock: Arc<dyn ClockClient>,
     ) -> Self {
         Self {
@@ -62,6 +69,7 @@ impl Cybernetics {
             dispatcher,
             registry,
             publisher,
+            recorder,
             clock,
         }
     }
@@ -285,10 +293,13 @@ impl Cybernetics {
     }
 
     async fn emit(&self, kind: &'static str, payload: serde_json::Value) {
-        // Route through DomainPublisher so the event lands in
-        // audit_log via the wired AuditWriter AND fans out on NATS —
-        // without the audit_log rows, rebuilders couldn't reconstruct
-        // agent activity.
+        // OUTBOX (phase 2): record on the transactional outbox (via
+        // the EventRecorder port) instead of publishing post-hoc —
+        // boss-event-relay delivers to audit_log + NATS, so agent
+        // activity gets the same delivery guarantee as a domain
+        // write. The publisher still builds the envelope (`_actor` /
+        // `_simulated` via its sim probe) so the payload enrichment
+        // is byte-identical to the retired emit path.
         //
         // We tag the payload with vm_id (the per-VM cybernetics
         // identity) so cross-VM rollups can attribute later. Source
@@ -303,12 +314,10 @@ impl Cybernetics {
             );
         }
         let actor = boss_core::actor::ActorId::Automation("cybernetics".to_string());
-        let ok = self
-            .publisher
-            .emit_with_actor_at(kind, actor, payload, now)
-            .await;
-        if !ok {
-            warn!(kind, "cybernetics telemetry emit failed");
+        let stamp = self.publisher.stamp_with_actor_at(actor, now).await;
+        let event = stamp.event(kind, payload);
+        if let Err(e) = self.recorder.record(&event).await {
+            warn!(kind, error = %e, "cybernetics telemetry record failed");
         }
     }
 }

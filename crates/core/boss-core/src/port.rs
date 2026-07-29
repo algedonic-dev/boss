@@ -61,6 +61,19 @@ pub enum EventStoreError {
 // Cybernetics ports
 // ---------------------------------------------------------------------------
 
+/// Port: transactional event recorder — the outbox-backed sink for
+/// telemetry/domain events that have NO accompanying row write to
+/// join (outbox phase 2). The Pg implementation stages the event on
+/// `event_outbox` in a small transaction of its own; boss-event-relay
+/// delivers to audit_log + NATS. In-memory implementations collect
+/// for test assertion. This is how a component whose events ARE its
+/// state (cybernetics telemetry) gets the same delivery guarantee as
+/// a domain write without pretending it has a domain table.
+#[async_trait]
+pub trait EventRecorder: Send + Sync {
+    async fn record(&self, event: &Event) -> Result<(), String>;
+}
+
 /// Port: durable per-agent inbox.
 ///
 /// Messages are enqueued when they arrive from the bus, claimed by the

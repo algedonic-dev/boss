@@ -170,3 +170,27 @@ pub async fn drain_outbox_once(
         audit_inserted,
     })
 }
+
+/// Pg-backed [`boss_core::port::EventRecorder`] — records each event
+/// on the transactional outbox in a small transaction of its own.
+/// The record-only sibling of `record_event_in_tx` for components
+/// whose events have no accompanying row write (cybernetics
+/// telemetry).
+pub struct PgOutboxRecorder {
+    pool: sqlx::PgPool,
+}
+
+impl PgOutboxRecorder {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl boss_core::port::EventRecorder for PgOutboxRecorder {
+    async fn record(&self, event: &Event) -> Result<(), String> {
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+        record_event_in_tx(&mut tx, event).await?;
+        tx.commit().await.map_err(|e| e.to_string())
+    }
+}
