@@ -13,10 +13,10 @@ use boss_inventory::postgres::PgInventory;
 use boss_testing::{RecordingEventBus, TestDb, TestRequest};
 use serde_json::json;
 
-/// Seed a vendor row. `create_purchase_order_at` binds the PO's
-/// `vendor` name string into `purchase_orders.vendor_id`, which has a
-/// hard FK to `vendors(id)`. A fresh test DB has no vendors, so the
-/// batch insert 500s on the FK unless the referenced vendor exists.
+/// Seed a vendor row. The old hard vendor_id FK is gone (the R2
+/// subject edge on purchase_order.upserted → vendor is the guard,
+/// and TestDb runs with ref-checks off), but the seeded vendors keep
+/// the fixture honest about what production data looks like.
 async fn seed_vendor(pool: &sqlx::PgPool, id: &str) {
     sqlx::query(
         "INSERT INTO vendors (id, name, contact_name, contact_email, city, state, payment_terms, category) \
@@ -47,9 +47,8 @@ fn pg_router(pool: sqlx::PgPool) -> Router {
 async fn batch_create_persists_backdated_pos_in_postgres() {
     let db = TestDb::new().await;
 
-    // Vendor rows must exist: `create_purchase_order_at` binds the PO's
-    // `vendor` name into `purchase_orders.vendor_id`, which carries a
-    // hard FK to `vendors(id)`. Seed the two vendors this batch uses.
+    // Seed the two vendors this batch names (fixture realism; the
+    // hard FK is gone — see seed_vendor's doc).
     seed_vendor(&db.pool, "Optica Components").await;
     seed_vendor(&db.pool, "NetParts Direct").await;
 
