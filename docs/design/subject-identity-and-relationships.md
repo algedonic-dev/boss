@@ -1,295 +1,137 @@
-# Subject identity & relationships — giving the model a home
+# Subject identity & relationships — the identity and edge contracts
 
-**Status:** approved 2026-07-15 (all seven questions resolved via the
-in-app decision tracker). **Owner:** platform. **Provenance:** the
-2026-07-14 subject-model audit (three-track: code map, seed/data map,
-live DB) and the 2026-07-13 phantom-account incident it grew out of.
+**Status:** living contract (the workstream that established it —
+R1–R4 + Q1–Q7, approved 2026-07-15 — completed 2026-07-29; decision
+history folded into
+[docs/architecture-decisions.md](../architecture-decisions.md)
+§Primitives; the audit's residual defect worklist moved to
+TODO.md). Every new subject kind and every new cross-kind reference
+follows this contract.
 
-## Problem
+## The two invariants
 
-The subject **vocabulary** is healthy: the SubjectKind registry (five
-roots, thirteen concrete kinds, taxonomy via `parent_kind`) and the
-Class registry match the architecture decisions faithfully. The
-failures are one level down, and they are systematic rather than
-scattered:
+> **Identity has a home.** A Subject exists iff it has a row in
+> `subjects (kind, id)`. Identity-first: the row can exist from the
+> id alone, before anything else about the subject is known.
+>
+> **References are declared and enforced.** Every subject-valued
+> reference an event carries is a declared `subject_edges` row,
+> resolved against `subjects` inside the domain transaction — a
+> write referencing a missing subject aborts before it becomes
+> state.
 
-**1. Identity has no home.** `Subject` in code is an unbacked
-`(kind, id)` string pair; there is no core table where a subject's
-identity *lives*. Two registered kinds (`campaign`, `customer`) have
-no table, no crate, no KB view — yet live jobs carry campaign
-subjects and `marketing_assets.linked_campaign_ids` points at ids
-that are structurally unenforceable. The inverse also exists: the
-`/system/job-kinds` design workflow opens Jobs whose subject is a
-JobKind registry row, a kind never registered. The decision record
-says a Subject "can exist from its stable id alone" — identity-first
-— but there is nowhere for the bare identity to exist.
+Together they close the phantom-reference class behind the
+2026-07-13 incident from the referent side, the way the
+transactional outbox
+([transactional-audit-log.md](transactional-audit-log.md)) closes
+it from the provenance side.
 
-**2. Relationships are implicit, enforcement is a patchwork.** Each
-cross-kind edge gets whatever its author reached for: a real FK
-(mostly intra-domain), a handler check (per-field, opt-in), an
-audit-trigger rule, or nothing. The tiers do not correlate with
-importance: `invoices.account_id` — the incident edge — is guarded
-only by the audit trigger, and the handler-side guard documented on
-commerce's `people_client` is never called. The jobs
-subject-existence gate covers five kinds of sixteen-plus, fails open
-on upstream blips, and re-checks nothing after creation. Shipments
-have no linkage to invoices or accounts at all. Meanwhile the system
-has grown **three partial relationship registries** — the
-`audit_log_ref_checks` trigger rules (nine edges), the integrity
-scan's `audit_invariant_rules.toml` soft-FK rules, and the FK
-patchwork — none complete, none authoritative.
+## The `subjects` identity table
 
-**3. Id conventions fork per writer.** Five account-id conventions
-coexist (`acc-bigseed-NNNN` seed, `acc-prospect-NNN`,
-`acc-direct-shop`, sim-born `account-NNNNN`, used-device-shop
-`acc-NNNN`); vendors fork identically; the same 67 brewery vessels
-carry three naming stories across seeds, JobKind prose, and UI
-comments. Convention forks are how phantom references get
-manufactured — the sim's `account-NNNNN` mints were the raw material
-of the July incident.
+One thin row per subject: `(kind, id, label, created_at,
+retired_at)`, PK `(kind, id)`, kind FK'd to the SubjectKind
+registry. Identity only — attributes stay in domain tables and KB
+views; this is the minimal durable fact "this subject exists."
 
-The incident chain that motivated the audit ran through all three:
-a stale in-memory roster (a convention fork's id), referencing a
-subject with no identity anywhere (no home), caught by no write-time
-check (patchwork), surfacing only in the nightly deep replay-check.
+**The dual contract (Q1: write-through AND projection).** Domain
+services upsert the identity row in the same transaction as their
+domain row (`record_subject_in_tx`), AND `rebuild_subjects`
+reproduces every row from the log + reference tables — the
+`financial_facts` shape; the deep replay-check owns its
+correctness. The rebuild has four source families:
 
-## Design intent being served
+1. **TOML identity sources**
+   (`boss-subject-kinds/seeds/subject_identity_sources.toml`) — one
+   row per identity-bearing event kind (`accounts.account.created`,
+   `asset.registered` + `asset.received`, `messages.message.sent`,
+   …). Extending coverage is a row append.
+2. **The jobs pass** — every `jobs.job.created` subject pair, read
+   from the NESTED payload (`payload.subject.subject_kind` /
+   `payload.subject.id` — top-level keys never existed; reading
+   them matched zero rows and silently dropped the birth-by-job
+   kinds, the #140 lesson). Identity-first made literal: a Job
+   about a subject proves the subject existed.
+3. **Reference tables** for seed-only kinds with no create events
+   by design: `locations`, `companies`.
+4. **Birth-by-job kinds** (`job-kind`, `custom` — registry rows
+   with `metadata.birth = "job"`): their identity row is minted in
+   the job-create transaction itself; the jobs pass reproduces it.
 
-Nothing here replaces the standing decisions — each proposal makes
-one of them literal:
+**The landmine rule.** A kind minted only by a live write-through —
+no TOML source, no reference table, no jobs-pass coverage —
+VANISHES at the next epoch rollover's truncate-and-reproject. This
+class has bitten three times (company, birth-by-job kinds, the
+170-asset fleet). A new subject kind lands WITH its rebuild source,
+or not at all. Corollary: a projection pass that matches zero rows
+raises nothing — parity between domain rows and reproduced subjects
+is the check.
 
-- *"Subject is a trait, not an enum; `{subject_kind, id}` validated
-  against the registry"* → the pair gets a table so validation can
-  mean existence, not just vocabulary.
-- *"Subject creation is identity-first — the only hard constraint is
-  identity"* → an identity row IS that constraint's artifact.
-- *"Registries over hardcoded paths"* → relationships become one
-  registry instead of three partials plus code.
+**The existence gate** is one indexed lookup against `subjects`,
+uniform across every kind including tenant-defined ones, mounted in
+the jobs create path (abort-by-default posture: NotFound → 400,
+upstream-unavailable → fail closed 503).
 
-## Proposal R1 — a core `subjects` identity table
+## The `subject_edges` relationship registry
 
-One thin table, deliberately minimal:
-
-```sql
-CREATE TABLE subjects (
-    kind        TEXT NOT NULL REFERENCES subject_kinds(kind),
-    id          TEXT NOT NULL,
-    label       TEXT,            -- display convenience only
-    created_at  TIMESTAMPTZ NOT NULL,
-    retired_at  TIMESTAMPTZ,
-    PRIMARY KEY (kind, id)
-);
-```
-
-- **Identity only.** No attributes — those stay in the domain tables
-  and KB views. This is not a unified entity table; it is the
-  minimal durable fact "this subject exists" (information is
-  simple; the identity row is the smallest possible fact).
-- **Every mint upserts it.** Domain services insert the identity row
-  in the same transaction as their domain row (via the outbox
-  pattern's transaction, once the emitters migrate). A kind with no
-  domain crate — campaign today — can mint identity rows directly:
-  identity-first becomes literal, and the crate can arrive later.
-- **It is a projection.** Rebuildable from `*.created` events like
-  every other table, checked by the deep replay-check like every
-  other projection.
-- **The existence gate collapses to one query.** The five per-kind
-  HTTP endpoints (and the eleven unchecked kinds, and the fail-open
-  behavior) are replaced by one indexed lookup that works for every
-  kind uniformly, including tenant-defined ones.
-
-## Proposal R2 — one relationship registry
-
-Promote the declared-edge idea to the single source of truth:
+A declared edge says: events of `source_kind` carry a subject
+reference at `field_path`, and it must resolve in `subjects`.
 
 ```sql
-CREATE TABLE subject_edges (
-    source_kind  TEXT NOT NULL,   -- event kind or subject kind
-    field_path   TEXT NOT NULL,   -- payload/column path
-    target_kind  TEXT NOT NULL REFERENCES subject_kinds(kind),
-    on_missing   TEXT NOT NULL DEFAULT 'abort',  -- abort | warn
-    PRIMARY KEY (source_kind, field_path)
-);
+subject_edges (
+    source_kind      TEXT,  -- event kind
+    field_path       TEXT,  -- dotted payload path to the ref id
+    target_kind      TEXT,  -- pinned kind …
+    target_kind_path TEXT,  -- … XOR dotted path to a payload kind
+    on_missing       TEXT   -- 'abort' (everything) | 'warn' (nothing today)
+)
 ```
 
-- **Consolidates the three partials**: `audit_log_ref_checks`
-  (trigger rules), `audit_invariant_rules.toml` (integrity-scan
-  soft-FKs), and the intent currently encoded in scattered handler
-  checks. One registry, read by every enforcement point.
-- **Enforced where it can abort**: the outbox ref-check trigger —
-  in the domain transaction, post-#118 — so a write referencing a
-  missing subject fails *before* it becomes state. Resolution is
-  against `subjects (kind, id)` uniformly, which is why R1 comes
-  first.
-- **Swept where it can drift**: a conservation-sweep invariant walks
-  the registry nightly (the E-invariant generalized), catching edges
-  that predate their rule and any `on_missing = 'warn'` legacy
-  edges.
-- **First edges to declare**: `job.subject → (declared kinds)`,
-  `invoice.account_id → account`, asset holder (see Q5),
-  `purchase_order.vendor → vendor`, the shipment linkage (once
-  modeled), and the asset event payload refs that are unchecked
-  today.
+- **Dotted paths** (`#>>` resolution): `account_id`, `subject.id`,
+  `kind.holder_id` are all one mechanism.
+- **Dynamic target kinds** (`target_kind_path`) are the typed-pair
+  shape: the event names its own target — a Job's
+  `subject.subject_kind`, a custody event's `kind.holder_kind`
+  ("the brewery installs at locations; the device shop ships to
+  accounts" — one rule). A kind-mismatched pair aborts; an id whose
+  kind half is absent skips, like an absent ref (identity-first).
+- **Enforced where it can abort**: `check_subject_edges()` runs
+  BEFORE INSERT on `event_outbox` (inside the domain transaction —
+  the write fails before it becomes state) and on `audit_log`
+  (belt-and-braces). The bundle-import escape hatch
+  (`audit_log.ref_check = 'off'`) covers restore sessions.
+- **Swept where it can drift**: conservation invariant Y walks
+  every declared edge against the whole log nightly.
+- **Q2 posture**: every shipped edge is `abort`. No prod data; a
+  loud abort is the point.
+- Each module seeds its own edge rows alongside the tables it
+  targets, so modules stay independently removable.
+  `audit_log_ref_checks` survives only for non-subject residuals
+  (raw-material `part_sku` → `inventory_items`).
 
-## Proposal R3 — one id-minting authority per kind
+**Deploy-order rule for new abort edges on a live system:**
+backfill `subjects` first (additive INSERT from the log — no
+TRUNCATE window on a running demo), then apply the edge. An edge
+declared over missing identity rows is an abort storm.
 
-Subject ids are minted through one core path (a helper that upserts
-the identity row and returns the id, or `POST /api/subjects`), with
-one convention per kind. Seeds, the sim, and tenant engines all
-route through it. The five-way account fork and the seed/sim vendor
-fork end; the audit's "convention fork per writer" class becomes
-structurally impossible rather than reviewed-for.
+## Custody, company, ownership (the settled shapes)
 
-## Proposal R4 — home or retire the inert kinds
+- **Asset custody is subject-valued** (Q5): the typed
+  `(holder_kind, holder_id)` pair on Shipped/Installed, validated
+  by a dynamic-kind edge — never an overloaded account-id column.
+- **Org-level work is about the company** (Q6): one `company`
+  subject per tenant (reproduced from the `companies` reference
+  table); payroll, tax filings, AP runs, facility overhead all open
+  Jobs about it. The organization being modeled is itself a Subject
+  in its own event log.
+- **Jobs are owned by humans** (Q7): `jobs.owner` always resolves
+  to a person (the owner-resolution module's deterministic
+  role-holder spread); steps may be automation-executed. There is
+  no automation-identity registry.
 
-- **campaign**: identity rows via R1 now; a `boss-campaigns` module
-  only when a real workstream needs attributes (Q4).
-- **customer**: blocked on the standing `/shop` email-OTP product
-  decision; until then, either mint identity rows at checkout or
-  retire the kind from the registry rather than carrying dead
-  vocabulary.
-- **recipe / equipment** (brewery tenant): finish registry-validation
-  Phase B/C or retire; the beer-style taxonomy currently parked
-  under `subject_kind="campaign"` moves home when `recipe` goes
-  live.
-- **job-kind**: register it. The design workflow is real and good;
-  the model should admit what the system already does.
+## Id minting (R3)
 
-## Appendix — defect worklist (own-PR-sized, independent)
-
-Findings of record from the audit; none block R1–R4:
-
-1. `assets.account_id` holds location ids on the brewery tenant
-   (170/170) — see Q5 for the shape.
-2. `purchase_orders` carries both FK'd `vendor_id` and non-FK
-   `vendor` TEXT; the Rust type maps to the TEXT column, bypassing
-   the FK.
-3. `assets.phase`: closed DB CHECK duplicating the Class rows — the
-   "extend via a Class row" promise is false at the DB layer.
-4. `classes.subject_kind` has no FK to `subject_kinds`; drift exists
-   in both directions today.
-5. Doc-claimed-but-unimplemented validation: `products.product_kind`,
-   invoice `revenue_category`.
-6. Closed enums that should be Classes: `PoStatus`,
-   `VendorInvoiceStatus`, `DocumentAudience`.
-7. Deferred taxonomy lifts: account tier/type, vendor
-   `payment_terms`, revenue categories, tax jurisdictions/rates in
-   `rules.toml`.
-8. `brewery-hire` subject shape (an existing employee as the hire
-   target) — suppressed with `rate=0`; needs remodeling, likely
-   subject = the requisition or the org.
-9. Dead-by-construction seed ids: `loc-hq` in the sim pool with no
-   locations row; `acc-prospect-*` seeded for `sale` but absent from
-   the sim pool.
-
-## Phasing
-
-1. R1 table + rebuilder + backfill (from domain tables and the
-   audit log) + the uniform existence gate behind a flag.
-2. Gate swap: jobs (all kinds now checked), then the remaining
-   reference sites via the outbox migration — complete as of
-   2026-07-29, so every `record_event_in_tx` caller carries edge
-   enforcement for free.
-3. R2 registry consolidation: migrate `audit_log_ref_checks` rows
-   and the integrity-scan TOML into `subject_edges`; wire the
-   outbox trigger and the sweep to read it.
-4. R3 mint consolidation (no back-compat needed — regen wipes).
-5. R4 kind-by-kind; appendix defects as independent PRs throughout.
-
-**Acceptance:** the audit's dangling counts reach and hold zero; a
-new conservation invariant ("every job subject resolves in
-`subjects`; every declared edge resolves") runs green over a full
-365-day regen and on the playground nightly.
-
-## Open questions
-
-All 7 open questions were resolved 2026-07-15 via the in-app
-decision tracker and flushed to git. See the Decisions
-section below. This section is kept empty as the landing
-place for any new questions that surface during
-implementation.
-
-## Decisions
-
-### Q1: Is `subjects` write-through, a projection, or both? (resolved)
-
-Resolved 2026-07-15 — override.
-
-Both sounds good
-
-**Operationally:** domain services upsert the identity row in the
-domain transaction AND the rebuilder reproduces it from `*.created`
-events — the `financial_facts` dual contract; the deep replay-check
-owns its correctness.
-
-### Q2: Edge enforcement default — abort or warn? (resolved)
-
-Resolved 2026-07-15 — override.
-
-Abort by default. We can afford to fix anything that breaks.
-
-**Operationally:** stronger than the doc's phased recommendation —
-`on_missing = 'abort'` for every declared edge from day one, legacy
-included. No prod data; a regen resets anything a newly-declared
-edge breaks, and a loud abort is the point.
-
-### Q3: Do the big soft edges also become composite FKs onto `subjects`? (resolved)
-
-Resolved 2026-07-15 — override.
-
-Sounds good
-
-**Operationally:** the recommendation as written — trigger + sweep
-via R2 now; revisit per-edge composite FKs once the outbox
-migration settles write ordering.
-
-### Q4: Campaign and customer — identity rows now, crates when? (resolved)
-
-Resolved 2026-07-15 — override.
-
-I am fine with both as crates now. This isn't that hard of a decison.
-
-**Operationally:** skip the identity-rows-only interim — build
-`boss-campaigns` and the customer module as real domain crates in
-the R1 workstream (hexagonal shape: domain types + port + HTTP
-surface + rebuilder), with identity rows landing via the same mints.
-
-### Q5: What is the asset holder edge? (resolved)
-
-Resolved 2026-07-15 — override.
-
-Your recommendation is good.
-
-**Operationally:** a typed holder pair (`holder_kind`, `holder_id`)
-validated via R2, replacing the overloaded `assets.account_id`;
-custody is subject-valued (the reservation-on-Subject precedent).
-
-### Q6: What subject is org-level work about? (resolved)
-
-Resolved 2026-07-15 — override.
-
-Can the Company be the Subject?
-
-**Operationally:** yes — that is the answer. A first-class `company`
-subject kind with one row per tenant; the thirteen org-level
-JobKinds (payroll, tax filings, AP runs, facility overhead) get
-`subject = the company` instead of the brewhouse location. The
-cybernetics framing made literal: the organization being modeled is
-itself a Subject in its own event log.
-
-### Q7: Do automation actors get identities? (resolved)
-
-Resolved 2026-07-15 — override.
-
-A job shouldn't be owned by an automation. Only a step should be
-owned by an automation. Automation actors shouldn't need identities
-I think.
-
-**Operationally:** ownership semantics split by level — `jobs.owner`
-is always a human (accountability lives with people); steps may be
-executed/owned by automations; no automation-identity registry.
-Implementation note: every flow that opens Jobs with
-`automation:*`/`rule:*` owners (the sim, dispatcher spawn rules)
-must name a responsible human owner instead — the role-appropriate
-person for the JobKind, which the `company` subject's org structure
-(Q6) can eventually resolve.
+One convention per kind, one minting path: domain services via
+their create write-through, table-less kinds via
+`POST /api/subjects/{kind}` (idempotent upsert). Seeds, the sim,
+and tenant engines route through the same paths — a convention fork
+per writer is how phantom references get manufactured.
