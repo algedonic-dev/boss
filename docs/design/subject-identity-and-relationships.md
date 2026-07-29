@@ -187,9 +187,9 @@ Findings of record from the audit; none block R1–R4:
 1. R1 table + rebuilder + backfill (from domain tables and the
    audit log) + the uniform existence gate behind a flag.
 2. Gate swap: jobs (all kinds now checked), then the remaining
-   reference sites as they migrate to the outbox
-   (`record_event_in_tx` callers pick up edge enforcement for
-   free).
+   reference sites via the outbox migration — complete as of
+   2026-07-29, so every `record_event_in_tx` caller carries edge
+   enforcement for free.
 3. R2 registry consolidation: migrate `audit_log_ref_checks` rows
    and the integrity-scan TOML into `subject_edges`; wire the
    outbox trigger and the sweep to read it.
