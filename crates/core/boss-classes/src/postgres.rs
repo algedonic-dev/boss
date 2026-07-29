@@ -125,7 +125,17 @@ impl ClassRepository for PgClasses {
             .bind(r.sort_order)
             .execute(&mut *tx)
             .await
-            .map_err(|e| ClassError::Storage(e.to_string()))?;
+            .map_err(|e| {
+                // The classes.subject_kind FK (SQLSTATE 23503):
+                // surface WHICH kind was unregistered instead of a
+                // generic storage 500.
+                if let sqlx::Error::Database(ref dbe) = e
+                    && dbe.code().as_deref() == Some("23503")
+                {
+                    return ClassError::UnregisteredKind(r.subject_kind.clone());
+                }
+                ClassError::Storage(e.to_string())
+            })?;
             inserted += result.rows_affected();
         }
         tx.commit()
