@@ -20,10 +20,14 @@ CREATE TABLE IF NOT EXISTS assets (
     -- real catalog model — the FK enforces that, and an unidentified
     -- asset simply has no model-derived attributes yet.
     sku                 TEXT REFERENCES asset_models(sku),
-    phase               TEXT NOT NULL CHECK (phase IN (
-        'registered', 'received', 'triaging', 'refurbing', 'qa', 'ready',
-        'shipped', 'installed', 'out-for-service', 'decommissioned'
-    )),
+    -- Phase vocabulary lives in the Class registry
+    -- (subject_kind='asset', member_attribute='phase'), not a CHECK
+    -- (audit residual closed 2026-07-29: the old closed CHECK
+    -- duplicated the ten Class rows and walled off tenant-added
+    -- phases — the "extend via a Class row" promise, now true at the
+    -- DB layer too). Values are projector-derived from the
+    -- AssetEventKind mapping, not client-supplied.
+    phase               TEXT NOT NULL,
     -- The typed custody edge (Q5): who HOLDS the asset — an account
     -- (device at a customer site), a location (brewhouse equipment).
     -- NULL pair = in stock / unheld. Validated via R2's edge
