@@ -213,7 +213,12 @@ CREATE TABLE IF NOT EXISTS subject_edges (
 
 
 CREATE TABLE IF NOT EXISTS classes (
-    subject_kind     TEXT NOT NULL,
+    -- FK to the SubjectKind registry (subject-model audit residual,
+    -- closed 2026-07-29): a Class belongs to a registered kind by
+    -- definition — "Classes are typed reference data each Subject
+    -- kind owns". Before this FK, drift was possible in both
+    -- directions; now a class row for an unregistered kind aborts.
+    subject_kind     TEXT NOT NULL REFERENCES subject_kinds(kind),
     code             TEXT NOT NULL,
     display_name     TEXT NOT NULL,
     parent_code      TEXT,

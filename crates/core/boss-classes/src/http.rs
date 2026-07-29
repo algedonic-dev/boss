@@ -157,6 +157,11 @@ async fn batch_upsert(
             "inserted": inserted,
         }))
         .into_response(),
+        // A class for an unregistered kind is a caller error, not a
+        // storage failure — 422 with the offending kind named.
+        Err(e @ crate::port::ClassError::UnregisteredKind(_)) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
