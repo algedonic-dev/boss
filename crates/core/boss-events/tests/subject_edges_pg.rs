@@ -29,6 +29,22 @@ async fn declare_edge(db: &TestDb, source_kind: &str, field: &str, target: &str,
     .unwrap();
 }
 
+/// Declare a dynamic-kind edge: the target kind is read from the
+/// event payload at `target_kind_path` (R2 PR2 — the typed-pair
+/// edges: job.subject, asset custody holder).
+async fn declare_dynamic_edge(db: &TestDb, source_kind: &str, field: &str, kind_path: &str) {
+    sqlx::query(
+        "INSERT INTO subject_edges (source_kind, field_path, target_kind_path) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind(source_kind)
+    .bind(field)
+    .bind(kind_path)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
 async fn seed_subject(db: &TestDb, kind: &str, id: &str) {
     sqlx::query("INSERT INTO subjects (kind, id) VALUES ($1, $2)")
         .bind(kind)
@@ -194,4 +210,170 @@ async fn seeded_module_edges_are_present() {
         stragglers, 0,
         "no subject-referential rows remain on audit_log_ref_checks"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamic_target_kind_resolves_from_the_payload() {
+    // The typed-pair shape (R2 PR2): the event names its own target
+    // kind. One edge rule covers "the brewery installs at locations;
+    // the device shop ships to accounts".
+    let db = TestDb::new().await;
+    declare_dynamic_edge(&db, "test.custody.moved", "holder_id", "holder_kind").await;
+    seed_subject(&db, "location", "loc-real").await;
+    seed_subject(&db, "account", "acc-real").await;
+
+    let mut tx = db.pool.begin().await.unwrap();
+    enable_ref_check(&mut tx).await;
+    // Same rule resolves against either kind, per event.
+    record_event_in_tx(
+        &mut tx,
+        &event(
+            "test.custody.moved",
+            serde_json::json!({"holder_kind": "location", "holder_id": "loc-real"}),
+        ),
+    )
+    .await
+    .expect("location holder must resolve");
+    record_event_in_tx(
+        &mut tx,
+        &event(
+            "test.custody.moved",
+            serde_json::json!({"holder_kind": "account", "holder_id": "acc-real"}),
+        ),
+    )
+    .await
+    .expect("account holder must resolve");
+    tx.commit().await.unwrap();
+
+    // Wrong kind for a real id → abort (the pair is checked as a
+    // pair, not id-existence-anywhere).
+    let mut tx = db.pool.begin().await.unwrap();
+    enable_ref_check(&mut tx).await;
+    let err = record_event_in_tx(
+        &mut tx,
+        &event(
+            "test.custody.moved",
+            serde_json::json!({"holder_kind": "account", "holder_id": "loc-real"}),
+        ),
+    )
+    .await;
+    assert!(err.is_err(), "kind-mismatched pair must abort");
+    drop(tx);
+
+    // Id present but kind absent → skipped like an absent ref
+    // (identity-first events may carry neither half yet).
+    let mut tx = db.pool.begin().await.unwrap();
+    enable_ref_check(&mut tx).await;
+    record_event_in_tx(
+        &mut tx,
+        &event(
+            "test.custody.moved",
+            serde_json::json!({"holder_id": "loc-real"}),
+        ),
+    )
+    .await
+    .expect("kindless ref must skip the check");
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_field_paths_resolve_with_dotted_syntax() {
+    // The job.subject shape: {"subject": {"subject_kind": ..., "id":
+    // ...}} — dotted paths on both halves (the #140 nesting lesson,
+    // now enforceable at the write).
+    let db = TestDb::new().await;
+    declare_dynamic_edge(&db, "test.job.opened", "subject.id", "subject.subject_kind").await;
+    seed_subject(&db, "account", "acc-nested").await;
+
+    let mut tx = db.pool.begin().await.unwrap();
+    enable_ref_check(&mut tx).await;
+    record_event_in_tx(
+        &mut tx,
+        &event(
+            "test.job.opened",
+            serde_json::json!({"subject": {"subject_kind": "account", "id": "acc-nested"}}),
+        ),
+    )
+    .await
+    .expect("nested subject pair must resolve");
+    tx.commit().await.unwrap();
+
+    let mut tx = db.pool.begin().await.unwrap();
+    enable_ref_check(&mut tx).await;
+    let err = record_event_in_tx(
+        &mut tx,
+        &event(
+            "test.job.opened",
+            serde_json::json!({"subject": {"subject_kind": "account", "id": "acc-phantom"}}),
+        ),
+    )
+    .await;
+    assert!(err.is_err(), "nested phantom subject must abort");
+    drop(tx);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn edge_rows_require_exactly_one_kind_source() {
+    // The CHECK constraint: static target_kind XOR dynamic
+    // target_kind_path.
+    let db = TestDb::new().await;
+    let both = sqlx::query(
+        "INSERT INTO subject_edges (source_kind, field_path, target_kind, target_kind_path) \
+         VALUES ('test.bad.both', 'x', 'account', 'y')",
+    )
+    .execute(&db.pool)
+    .await;
+    assert!(both.is_err(), "both kind sources must be rejected");
+    let neither = sqlx::query(
+        "INSERT INTO subject_edges (source_kind, field_path) VALUES ('test.bad.neither', 'x')",
+    )
+    .execute(&db.pool)
+    .await;
+    assert!(neither.is_err(), "neither kind source must be rejected");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pr2_module_edges_are_seeded() {
+    // Pin the R2 PR2 edge rows: jobs' subject pair (dynamic), the
+    // asset custody pair (dynamic) + commerce account refs, and the
+    // PO vendor.
+    let db = TestDb::new().await;
+    let jobs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM subject_edges \
+         WHERE source_kind IN ('jobs.job.created', 'jobs.job.updated') \
+           AND field_path = 'subject.id' AND target_kind_path = 'subject.subject_kind'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(jobs, 2, "job subject edges (created + updated)");
+
+    let custody: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM subject_edges \
+         WHERE source_kind IN ('asset.shipped', 'asset.installed') \
+           AND field_path = 'kind.holder_id' AND target_kind_path = 'kind.holder_kind'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(custody, 2, "asset custody-pair edges");
+
+    let commerce: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM subject_edges \
+         WHERE source_kind IN ('asset.sold', 'asset.ownership_transferred') \
+           AND target_kind = 'account'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(commerce, 3, "asset commerce account refs");
+
+    let po: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM subject_edges \
+         WHERE source_kind = 'inventory.purchase_order.upserted' AND target_kind = 'vendor'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(po, 1, "PO vendor edge");
 }

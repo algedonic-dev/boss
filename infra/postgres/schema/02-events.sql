@@ -373,9 +373,10 @@ CREATE TRIGGER event_outbox_check_refs_trg
 CREATE OR REPLACE FUNCTION check_subject_edges()
 RETURNS TRIGGER AS $$
 DECLARE
-    edge      RECORD;
-    ref_value TEXT;
-    found     BOOLEAN;
+    edge          RECORD;
+    ref_value     TEXT;
+    resolved_kind TEXT;
+    found         BOOLEAN;
 BEGIN
     -- Escape hatch for bundle-import / restore sessions (shared with
     -- the non-subject guard — the audit_log restore precedes the
@@ -389,27 +390,41 @@ BEGIN
     END;
 
     FOR edge IN
-        SELECT field_path, target_kind, on_missing
+        SELECT field_path, target_kind, target_kind_path, on_missing
           FROM subject_edges
          WHERE source_kind = NEW.kind
     LOOP
-        ref_value := NEW.payload ->> edge.field_path;
+        -- Dotted payload paths via #>> — a single-segment path is the
+        -- original top-level lookup.
+        ref_value := NEW.payload #>> string_to_array(edge.field_path, '.');
         IF ref_value IS NULL OR ref_value = '' THEN
+            CONTINUE;
+        END IF;
+        -- Static target kind, or dynamic from the payload (the
+        -- typed-pair edges: job.subject, asset custody holder). An
+        -- id with no kind alongside it is skipped like an absent
+        -- ref — identity-first events may carry neither.
+        IF edge.target_kind_path IS NOT NULL THEN
+            resolved_kind := NEW.payload #>> string_to_array(edge.target_kind_path, '.');
+        ELSE
+            resolved_kind := edge.target_kind;
+        END IF;
+        IF resolved_kind IS NULL OR resolved_kind = '' THEN
             CONTINUE;
         END IF;
         SELECT EXISTS (
             SELECT 1 FROM subjects
-             WHERE kind = edge.target_kind AND id = ref_value
+             WHERE kind = resolved_kind AND id = ref_value
         ) INTO found;
         IF NOT found THEN
             IF edge.on_missing = 'warn' THEN
                 RAISE WARNING
                     'subject edge %.% references missing %:% (on_missing=warn)',
-                    NEW.kind, edge.field_path, edge.target_kind, ref_value;
+                    NEW.kind, edge.field_path, resolved_kind, ref_value;
             ELSE
                 RAISE EXCEPTION
                     'subject edge %.% references non-existent %:%',
-                    NEW.kind, edge.field_path, edge.target_kind, ref_value
+                    NEW.kind, edge.field_path, resolved_kind, ref_value
                     USING ERRCODE = 'foreign_key_violation';
             END IF;
         END IF;

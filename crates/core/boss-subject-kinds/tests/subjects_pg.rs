@@ -245,3 +245,54 @@ async fn rebuild_homes_job_subjects_from_the_nested_payload() {
         "rebuild must home a job's subject from payload.subject (nested)"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rebuild_reproduces_asset_and_message_subjects_from_the_log() {
+    // The R2 PR2 identity-source gap: assets and messages were minted
+    // by live write-throughs but had no rebuild source, so every
+    // epoch rollover's reprojection dropped them (found as 170 assets
+    // / 0 asset subjects on the playground). The TOML sources close
+    // it: asset identity from registered OR received (the seeded
+    // brewhouse fleet lands received-first, no prior registered);
+    // message identity from sent.
+    let db = TestDb::new().await;
+    for (kind, payload) in [
+        (
+            "asset.registered",
+            serde_json::json!({"asset_id": "SYS-REG-1", "kind": {"kind": "Registered"}}),
+        ),
+        (
+            "asset.received",
+            serde_json::json!({"asset_id": "SYS-RCV-1", "kind": {"kind": "Received"}}),
+        ),
+        (
+            "messages.message.sent",
+            serde_json::json!({"id": "msg-1", "subject": "Hello", "recipient_id": "emp-1"}),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO audit_log (event_id, timestamp, source, kind, payload) \
+             VALUES (gen_random_uuid(), '2026-07-29T00:00:00Z'::timestamptz, 'test', $1, $2)",
+        )
+        .bind(kind)
+        .bind(payload)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    boss_subject_kinds::subjects::rebuild_subjects(&db.pool)
+        .await
+        .unwrap();
+
+    for (kind, id) in [
+        ("asset", "SYS-REG-1"),
+        ("asset", "SYS-RCV-1"),
+        ("message", "msg-1"),
+    ] {
+        assert!(
+            subject_exists(&db.pool, kind, id).await.unwrap(),
+            "rebuild must reproduce {kind}:{id} from the log"
+        );
+    }
+}

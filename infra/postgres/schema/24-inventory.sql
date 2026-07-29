@@ -362,3 +362,13 @@ INSERT INTO audit_log_ref_checks (event_kind, field_path, ref_table, ref_column)
     ('inventory.item.consumed',       'part_sku',    'inventory_items', 'part_sku')
 ON CONFLICT (event_kind, field_path) DO NOTHING;
 
+
+
+-- ---------------------------------------------------------------------------
+-- Subject edges (R2 PR2): a purchase order's vendor. Identity-first:
+-- a Draft PO may carry no vendor (the trigger skips absent refs);
+-- once named, the vendor must exist as a Subject.
+-- ---------------------------------------------------------------------------
+INSERT INTO subject_edges (source_kind, field_path, target_kind, target_kind_path) VALUES
+    ('inventory.purchase_order.upserted', 'vendor', 'vendor', NULL)
+ON CONFLICT (source_kind, field_path) DO NOTHING;
