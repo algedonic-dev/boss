@@ -767,12 +767,12 @@ impl InventoryRepository for PgInventory {
         // Without this, a PO stays in its initial Draft state forever
         // and the vendor_invoices chain loses its trigger signal.
         //
-        // `vendor_id` is populated alongside `vendor` so the FK
-        // (`vendor_id REFERENCES vendors(id)`) is actually wired.
-        // Today the brewery sim's vendor string IS the vendor id
-        // (`vnd-bigseed-NNN`); the soft-FK lint that backstops this
-        // would warn if the value didn't resolve, but in production
-        // we want the hard FK doing the work.
+        // ONE vendor column (the duplicate vendor_id + its hard FK
+        // are gone): the R2 subject edge on
+        // inventory.purchase_order.upserted → vendor aborts a
+        // dangling vendor in the SAME transaction (the PO_UPSERTED
+        // event records in-tx below), and a Draft PO's absent
+        // vendor skips per identity-first.
         let status_str = po_status_str(&po.status);
         let mut tx = self
             .pool
@@ -790,16 +790,15 @@ impl InventoryRepository for PgInventory {
         .await
         .map_err(InventoryError::Storage)?;
         sqlx::query(
-            "INSERT INTO purchase_orders (id, vendor_id, vendor, status, placed_on, expected_on, received_on, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+            "INSERT INTO purchase_orders (id, vendor, status, placed_on, expected_on, received_on, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (id) DO UPDATE SET \
-                vendor_id = EXCLUDED.vendor_id, \
+                vendor = EXCLUDED.vendor, \
                 status = EXCLUDED.status, \
                 expected_on = EXCLUDED.expected_on, \
                 received_on = EXCLUDED.received_on",
         )
         .bind(&po.id)
-        .bind(&po.vendor)        // vendor_id — same string as vendor today
         .bind(&po.vendor)
         .bind(status_str)
         .bind(po.placed_on)

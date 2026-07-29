@@ -66,7 +66,7 @@ pub async fn rebuild_inventory(pool: &PgPool) -> Result<RebuildReport, RebuildEr
 
     // Order matters for FK constraints:
     // - vendor_invoices and purchase_order_lines reference purchase_orders
-    // - purchase_orders.vendor_id references vendors
+    // - purchase_orders.vendor is edge-enforced against vendor subjects
     // The `ON DELETE CASCADE` on the children means we only have to
     // explicitly delete from the leaf tables that reference vendors,
     // but doing all five in dependency order is more robust.
@@ -387,10 +387,9 @@ async fn upsert_purchase_order(
     ts: DateTime<Utc>,
 ) -> Result<(), RebuildError> {
     sqlx::query(
-        "INSERT INTO purchase_orders (id, vendor_id, vendor, status, placed_on, expected_on, received_on, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+        "INSERT INTO purchase_orders (id, vendor, status, placed_on, expected_on, received_on, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
          ON CONFLICT (id) DO UPDATE SET \
-             vendor_id = EXCLUDED.vendor_id, \
              vendor = EXCLUDED.vendor, \
              status = EXCLUDED.status, \
              placed_on = EXCLUDED.placed_on, \
@@ -398,7 +397,6 @@ async fn upsert_purchase_order(
              received_on = EXCLUDED.received_on",
     )
     .bind(&po.id)
-    .bind(&po.vendor)        // vendor_id — same string today (sim id == name)
     .bind(&po.vendor)
     .bind(po_status_str(&po.status))
     .bind(po.placed_on)

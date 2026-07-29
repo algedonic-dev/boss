@@ -92,11 +92,18 @@ CREATE TABLE IF NOT EXISTS vendors (
 
 CREATE TABLE IF NOT EXISTS purchase_orders (
     id              TEXT PRIMARY KEY,
-    vendor_id       TEXT REFERENCES vendors(id),
     -- Identity-first: a Draft PO can exist as a bare identity. Vendor,
     -- lines, and placement dates are required only to PLACE it
     -- (enforced at the API layer by PurchaseOrder::validate_placement
     -- when status leaves 'draft'), so they're nullable here.
+    --
+    -- ONE vendor column (audit residual closed 2026-07-29: the old
+    -- duplicate vendor_id carried a hard vendors(id) FK while the
+    -- Rust type mapped this TEXT — both always held the same
+    -- string). Referential integrity is the R2 subject edge on
+    -- inventory.purchase_order.upserted → vendor, which aborts in
+    -- the same transaction as the write (Q3: trigger + sweep now,
+    -- per-edge composite FKs revisited later).
     vendor          TEXT,
     status          TEXT NOT NULL CHECK (status IN (
         'draft', 'submitted', 'acknowledged', 'in-transit', 'received', 'closed'
