@@ -320,3 +320,20 @@ INSERT INTO step_plugins (
     'platform'
 ) ON CONFLICT (kind, version) DO NOTHING;
 
+
+
+-- ---------------------------------------------------------------------------
+-- Subject edges (R2 PR2): the Job's subject pair. The payload nests
+-- it as {"subject": {"subject_kind": ..., "id": ...}} (boss-core's
+-- Job serialization — the #140 lesson), and the target kind is the
+-- event's own subject_kind, so these are dynamic-kind edges
+-- (target_kind_path). Declared on created AND updated: a Job may not
+-- be opened about — nor re-pointed at — a subject that does not
+-- exist. Birth-by-job kinds satisfy this in-transaction (create_job_at
+-- mints their identity row before recording the event); domain kinds
+-- are backstopped here behind the HTTP existence gate.
+-- ---------------------------------------------------------------------------
+INSERT INTO subject_edges (source_kind, field_path, target_kind, target_kind_path) VALUES
+    ('jobs.job.created', 'subject.id', NULL, 'subject.subject_kind'),
+    ('jobs.job.updated', 'subject.id', NULL, 'subject.subject_kind')
+ON CONFLICT (source_kind, field_path) DO NOTHING;

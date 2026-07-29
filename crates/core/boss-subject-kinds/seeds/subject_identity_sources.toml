@@ -64,3 +64,30 @@ event_kind = "customers.customer.created"
 subject_kind = "customer"
 id_field = "id"
 label_field = "name"
+
+# Assets: every lifecycle event carries the envelope's asset_id, but
+# identity is proven by the birth-adjacent kinds. Registered is the
+# canonical identity-birth; Received covers the seeded-fleet path
+# that lands received+installed without a prior registered (the
+# brewery's brewhouse seed). Without these rows the 170-asset fleet
+# vanished from `subjects` at every epoch rollover (found 2026-07-29
+# while declaring the R2 custody edges — the prepare-only-identity
+# landmine, again).
+[[source]]
+event_kind = "asset.registered"
+subject_kind = "asset"
+id_field = "asset_id"
+
+[[source]]
+event_kind = "asset.received"
+subject_kind = "asset"
+id_field = "asset_id"
+
+# Messages: minted by the send write-through since R1, but with no
+# rebuild source every rollover reprojection dropped them (silently —
+# nothing edges message subjects yet). Same fix class as asset.
+[[source]]
+event_kind = "messages.message.sent"
+subject_kind = "message"
+id_field = "id"
+label_field = "subject"

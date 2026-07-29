@@ -185,15 +185,29 @@ CREATE INDEX IF NOT EXISTS subjects_kind ON subjects(kind);
 -- the point). 'warn' exists for the rare legacy edge we want visible
 -- in logs without blocking, but nothing ships 'warn' today.
 --
+-- `field_path` is a dotted payload path ('account_id',
+-- 'subject.id', 'kind.holder_id') resolved with #>> — single-segment
+-- paths behave exactly as the original top-level lookup did.
+--
+-- The target kind comes from exactly one of two columns (enforced by
+-- CHECK): `target_kind` pins it statically ('account'), while
+-- `target_kind_path` reads it from the event payload at a dotted
+-- path — the typed-pair edges (job.subject's subject_kind, the asset
+-- custody holder_kind) name their own target per event. A dynamic
+-- kind that resolves to nothing in `subjects` aborts like any other
+-- missing edge, which also catches unregistered-kind garbage.
+--
 -- Each module seeds its own edge rows alongside the table it targets
 -- (accounts → 22, products → 25, …), the same convention the old
 -- ref-check rows followed, so a module stays independently removable.
 CREATE TABLE IF NOT EXISTS subject_edges (
-    source_kind  TEXT NOT NULL,   -- event kind (today) or subject kind
-    field_path   TEXT NOT NULL,   -- top-level payload key holding the ref
-    target_kind  TEXT NOT NULL REFERENCES subject_kinds(kind),
-    on_missing   TEXT NOT NULL DEFAULT 'abort'
+    source_kind      TEXT NOT NULL,   -- event kind (today) or subject kind
+    field_path       TEXT NOT NULL,   -- dotted payload path holding the ref id
+    target_kind      TEXT REFERENCES subject_kinds(kind),
+    target_kind_path TEXT,            -- dotted payload path holding the kind
+    on_missing       TEXT NOT NULL DEFAULT 'abort'
         CHECK (on_missing IN ('abort', 'warn')),
+    CHECK ((target_kind IS NULL) <> (target_kind_path IS NULL)),
     PRIMARY KEY (source_kind, field_path)
 );
 

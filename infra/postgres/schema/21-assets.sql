@@ -140,3 +140,24 @@ CREATE INDEX IF NOT EXISTS asset_accessories_asset ON asset_accessories(asset_id
 CREATE INDEX IF NOT EXISTS asset_accessories_installed
     ON asset_accessories(asset_id) WHERE removed_on IS NULL;
 
+
+
+-- ---------------------------------------------------------------------------
+-- Subject edges (R2 PR2): the asset events' subject references. The
+-- AssetEvent payload nests its variant fields under "kind" (the
+-- internally-tagged AssetEventKind), so every path here is dotted.
+--
+-- - Custody pair (Q5): shipped/installed carry the typed
+--   (holder_kind, holder_id) — the target kind is the event's own
+--   holder_kind (dynamic), honoring "the brewery installs at
+--   locations; the device shop ships to accounts — same event".
+-- - Commerce refs: sold names the buying account;
+--   ownership_transferred names both sides. Fixed target kind.
+-- ---------------------------------------------------------------------------
+INSERT INTO subject_edges (source_kind, field_path, target_kind, target_kind_path) VALUES
+    ('asset.shipped',               'kind.holder_id',       NULL,      'kind.holder_kind'),
+    ('asset.installed',             'kind.holder_id',       NULL,      'kind.holder_kind'),
+    ('asset.sold',                  'kind.account_id',      'account', NULL),
+    ('asset.ownership_transferred', 'kind.from_account_id', 'account', NULL),
+    ('asset.ownership_transferred', 'kind.to_account_id',   'account', NULL)
+ON CONFLICT (source_kind, field_path) DO NOTHING;

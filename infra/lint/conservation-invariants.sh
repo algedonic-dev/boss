@@ -614,16 +614,23 @@ SQL
 # field_path → target_kind) it finds any event of source_kind whose
 # payload field names a subject that isn't in `subjects`.
 run_invariant "Y. Declared subject edges resolve in the subjects table" "$(cat <<'SQL'
-SELECT a.kind || '.' || e.field_path || ' -> ' || e.target_kind
-       || ':' || (a.payload ->> e.field_path)
+SELECT a.kind || '.' || e.field_path || ' -> '
+       || COALESCE(e.target_kind,
+                   a.payload #>> string_to_array(e.target_kind_path, '.'))
+       || ':' || (a.payload #>> string_to_array(e.field_path, '.'))
   FROM subject_edges e
   JOIN audit_log a ON a.kind = e.source_kind
- WHERE a.payload ->> e.field_path IS NOT NULL
-   AND a.payload ->> e.field_path <> ''
+ WHERE (a.payload #>> string_to_array(e.field_path, '.')) IS NOT NULL
+   AND (a.payload #>> string_to_array(e.field_path, '.')) <> ''
+   AND COALESCE(e.target_kind,
+                a.payload #>> string_to_array(e.target_kind_path, '.')) IS NOT NULL
+   AND COALESCE(e.target_kind,
+                a.payload #>> string_to_array(e.target_kind_path, '.')) <> ''
    AND NOT EXISTS (
        SELECT 1 FROM subjects s
-        WHERE s.kind = e.target_kind
-          AND s.id = a.payload ->> e.field_path
+        WHERE s.kind = COALESCE(e.target_kind,
+                                a.payload #>> string_to_array(e.target_kind_path, '.'))
+          AND s.id = a.payload #>> string_to_array(e.field_path, '.')
    )
  LIMIT 20
 SQL
