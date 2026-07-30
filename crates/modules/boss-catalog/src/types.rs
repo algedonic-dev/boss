@@ -255,12 +255,46 @@ pub struct Document {
     pub audience: DocumentAudience,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DocumentAudience {
-    Internal,
-    Customer,
-    Public,
+/// Who a document is visible to. Free-text wrapper around a Class
+/// code (`subject_kind='asset'`, `member_attribute='document-audience'`)
+/// — the closed enum was lifted so tenants add audiences via Class
+/// rows instead of forking core. Validated at the catalog API boundary
+/// where client-supplied; the wire shape is the same kebab string the
+/// old enum serialized.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DocumentAudience(pub String);
+
+impl DocumentAudience {
+    pub const INTERNAL: &'static str = "internal";
+    pub const CUSTOMER: &'static str = "customer";
+    pub const PUBLIC: &'static str = "public";
+
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for DocumentAudience {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for DocumentAudience {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for DocumentAudience {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
 }
 
 /// Generic entity-keyed document — the `documents` table is keyed

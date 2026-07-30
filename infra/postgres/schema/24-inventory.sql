@@ -164,9 +164,10 @@ CREATE TABLE IF NOT EXISTS vendor_invoices (
     matched_on        DATE,
     approved_on       DATE,
     paid_on           DATE,
-    status            TEXT NOT NULL CHECK (status IN (
-        'received', 'matched', 'mismatched', 'approved', 'paid'
-    )) DEFAULT 'received',
+    -- Free-text status; the vocabulary lives in the Class registry
+    -- (subject_kind='vendor-invoice', member_attribute='status'),
+    -- validated at the inventory API boundary, not a DB CHECK.
+    status            TEXT NOT NULL DEFAULT 'received',
     discrepancy_cents BIGINT,
     -- Free-text discrepancy kind (nullable: a clean match carries none);
     -- tenants extend via the Class registry under
@@ -392,4 +393,15 @@ INSERT INTO classes (subject_kind, code, display_name, member_attribute, sort_or
     ('purchase_order', 'in-transit',   'In Transit',   'status', 40),
     ('purchase_order', 'received',     'Received',     'status', 50),
     ('purchase_order', 'closed',       'Closed',       'status', 60)
+ON CONFLICT (subject_kind, code) DO NOTHING;
+
+-- Vendor-invoice three-way-match statuses — same lift. They share the
+-- vendor-invoice code namespace with the discrepancy kinds seeded in
+-- 01-registries.sql; member_attribute keeps the taxonomies apart.
+INSERT INTO classes (subject_kind, code, display_name, member_attribute, sort_order) VALUES
+    ('vendor-invoice', 'received',   'Received',   'status', 20),
+    ('vendor-invoice', 'matched',    'Matched',    'status', 21),
+    ('vendor-invoice', 'mismatched', 'Mismatched', 'status', 22),
+    ('vendor-invoice', 'approved',   'Approved',   'status', 23),
+    ('vendor-invoice', 'paid',       'Paid',       'status', 24)
 ON CONFLICT (subject_kind, code) DO NOTHING;

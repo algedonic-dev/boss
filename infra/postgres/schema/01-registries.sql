@@ -507,6 +507,12 @@ INSERT INTO classes (subject_kind, code, display_name, member_attribute, sort_or
     ('asset', 'installed',       'Installed',        'phase', 57),
     ('asset', 'out-for-service', 'Out for Service',  'phase', 58),
     ('asset', 'decommissioned',  'Decommissioned',   'phase', 59),
+    -- asset.document-audience — who a KB document is visible to (the
+    -- lifted DocumentAudience). Document *kinds* are tenant vocabulary
+    -- (seeded per tenant); audiences are platform-generic.
+    ('asset', 'internal', 'Internal', 'document-audience', 70),
+    ('asset', 'customer', 'Customer', 'document-audience', 71),
+    ('asset', 'public',   'Public',   'document-audience', 72),
     -- shipment.status — the ShipmentStatus lifecycle.
     ('shipment', 'label-created', 'Label Created', 'status', 20),
     ('shipment', 'picked-up',     'Picked Up',     'status', 21),

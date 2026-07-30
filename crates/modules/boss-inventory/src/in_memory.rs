@@ -7,7 +7,7 @@ use std::sync::RwLock;
 use crate::port::{InventoryError, InventoryRepository};
 use crate::types::{
     ApAging, ApAgingBucket, ConsumeApplied, InventoryItem, JeRecorded, PurchaseOrder,
-    ReceiveApplied, Vendor, VendorInvoice, VendorInvoiceStatus,
+    ReceiveApplied, Vendor, VendorInvoice,
 };
 
 pub struct InMemoryInventory {
@@ -392,7 +392,7 @@ impl InventoryRepository for InMemoryInventory {
         let mut total_outstanding: i64 = 0;
         let mut total_count: i64 = 0;
         for v in rows.iter() {
-            if matches!(v.status, VendorInvoiceStatus::Paid) {
+            if v.status.is_paid() {
                 continue;
             }
             let days = (today - v.received_on).num_days();

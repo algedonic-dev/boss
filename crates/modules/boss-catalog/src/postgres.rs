@@ -417,7 +417,7 @@ impl PgKb {
                     url: r.url,
                     version: r.version,
                     published: r.published,
-                    audience: parse_audience(&r.audience)?,
+                    audience: DocumentAudience::new(&r.audience),
                 })
             })
             .collect()
@@ -583,12 +583,12 @@ pub(crate) async fn insert_satellites(
              VALUES ($1,$2,$3,$4,$5,$6,$7)",
         )
         .bind(sku)
-        .bind(to_kebab(&doc.kind))
+        .bind(doc.kind.as_str())
         .bind(&doc.title)
         .bind(&doc.url)
         .bind(&doc.version)
         .bind(doc.published)
-        .bind(to_kebab(&doc.audience))
+        .bind(doc.audience.as_str())
         .execute(&mut *tx)
         .await
         .map_err(|e| KbError::Storage(e.to_string()))?;
@@ -767,20 +767,11 @@ struct DocumentRow {
 // Enum parsing helpers
 // ---------------------------------------------------------------------------
 
-// DeviceCategory and DocumentKind are now free-text wrappers, lifted to
-// the Class registry under subject_kind='asset' (categories via
-// member_attribute='category', document kinds via 'document-kind').
+// DeviceCategory, DocumentKind, and DocumentAudience are free-text
+// wrappers, lifted to the Class registry under subject_kind='asset'
+// (member_attribute 'category' / 'document-kind' / 'document-audience').
 // Validation against the active Class set lives at the API boundary, not
 // the storage adapter, so this layer trusts whatever the DB carries.
-
-fn parse_audience(s: &str) -> Result<DocumentAudience, KbError> {
-    match s {
-        "internal" => Ok(DocumentAudience::Internal),
-        "customer" => Ok(DocumentAudience::Customer),
-        "public" => Ok(DocumentAudience::Public),
-        other => Err(KbError::Storage(format!("unknown audience: {other}"))),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -811,16 +802,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_all_audiences() {
-        assert_eq!(
-            parse_audience("internal").unwrap(),
-            DocumentAudience::Internal
-        );
-        assert_eq!(
-            parse_audience("customer").unwrap(),
-            DocumentAudience::Customer
-        );
-        assert_eq!(parse_audience("public").unwrap(), DocumentAudience::Public);
-        assert!(parse_audience("admin").is_err());
+    fn document_audience_round_trips_through_serde() {
+        // Free-text wrapper serializes transparently to a bare string
+        // and round-trips back — same contract as DocumentKind.
+        let a = DocumentAudience::new("partner");
+        let s = serde_json::to_string(&a).unwrap();
+        assert_eq!(s, "\"partner\"");
+        let back: DocumentAudience = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, a);
     }
 }

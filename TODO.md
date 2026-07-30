@@ -103,16 +103,17 @@ design doc flattened into the baseline record and its appendix
 defect worklist — independent, own-PR-sized findings of record —
 lives here now. Items verified still open at re-homing:
 
-- [ ] `assets.phase`: closed DB CHECK duplicating the Class rows —
-      the "extend via a Class row" promise is false at the DB layer.
-- [ ] `classes.subject_kind` has no FK to `subject_kinds`; drift
-      possible in both directions.
-- [ ] `purchase_orders` vendor column duality (FK'd `vendor_id` vs
-      the non-FK `vendor` TEXT the Rust type maps to). Partially
-      mitigated: the `vendor` TEXT ref is now edge-enforced against
-      subjects (#159); the column duality itself remains.
-- [ ] Closed enums that should be Classes: `PoStatus`,
-      `VendorInvoiceStatus`, `DocumentAudience`.
+- [x] `assets.phase` closed DB CHECK — dropped (#163); vocabulary
+      lives in the Class rows, validated at the API boundary.
+- [x] `classes.subject_kind` FK to `subject_kinds` — added (#161),
+      with a 422 on batch-upsert against an unregistered kind.
+- [x] `purchase_orders` vendor column duality — the vestigial FK'd
+      `vendor_id` dropped (#162); the `vendor` TEXT ref is the one
+      column, edge-enforced against subjects (#159).
+- [x] Closed enums that should be Classes: `PoStatus`,
+      `VendorInvoiceStatus`, `DocumentAudience` — all three lifted
+      to String newtypes + Class rows + API-boundary gates
+      (#164, #165).
 - [ ] Doc-claimed-but-unimplemented validation:
       `products.product_kind`, invoice `revenue_category`.
 - [ ] Deferred taxonomy lifts: account tier/type, vendor
@@ -121,9 +122,9 @@ lives here now. Items verified still open at re-homing:
 - [ ] `brewery-hire` subject shape (an existing employee as the
       hire target) — suppressed with `rate=0`; needs remodeling,
       likely subject = the requisition or the org.
-- [ ] Dead-by-construction seed ids: `loc-hq` in the sim pool with
-      no locations row; `acc-prospect-*` seeded for `sale` but
-      absent from the sim pool.
+- [x] Dead-by-construction seed ids — verified stale 2026-07-29:
+      `loc-hq` has its locations row (01-registries seed) and all 30
+      `acc-prospect-*` accounts are in the sim pool with subjects.
 - [x] `assets.account_id` holding location ids — resolved by the Q5
       typed holder pair (#134) + custody edges (#159).
 

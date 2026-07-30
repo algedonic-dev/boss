@@ -150,7 +150,10 @@ CREATE TABLE IF NOT EXISTS asset_documents (
     url             TEXT NOT NULL,
     version         TEXT,
     published       DATE,
-    audience        TEXT NOT NULL CHECK (audience IN ('internal', 'customer', 'public'))
+    -- Free-text audience; vocabulary in the Class registry under
+    -- (subject_kind='asset', member_attribute='document-audience'),
+    -- validated at the catalog API boundary, not a DB CHECK.
+    audience        TEXT NOT NULL
 );
 
 

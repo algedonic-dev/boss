@@ -81,6 +81,38 @@ async fn check_discrepancy_kind(
     }
 }
 
+/// Validate a client-supplied vendor-invoice status against the Class
+/// registry under `(subject_kind='vendor-invoice')` — same contract as
+/// [`check_discrepancy_kind`] (permissive when no registry is wired,
+/// 503 fail-closed unreachable, 400 unregistered). Statuses and
+/// discrepancy kinds share the vendor-invoice code namespace; their
+/// `member_attribute` keeps them distinguishable in the registry.
+async fn check_vi_status(
+    classes_client: Option<&Arc<dyn ClassesClient>>,
+    status: &str,
+) -> Result<(), Response> {
+    let Some(client) = classes_client else {
+        return Ok(());
+    };
+    let class_ref = ClassRef::new("vendor-invoice", status);
+    match client.class_exists(&class_ref).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown vendor-invoice status `{status}` — register it as a Class \
+                 first (subject_kind='vendor-invoice')"
+            ),
+        )
+            .into_response()),
+        Err(e) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("classes registry unreachable: {e}"),
+        )
+            .into_response()),
+    }
+}
+
 pub(super) async fn upsert_vendor_invoice<R: InventoryRepository + 'static>(
     State(state): State<Arc<InventoryApiState<R>>>,
     CurrentUser(user): CurrentUser,
@@ -91,6 +123,12 @@ pub(super) async fn upsert_vendor_invoice<R: InventoryRepository + 'static>(
     if let Some(kind) = &invoice.discrepancy_kind
         && let Err(resp) =
             check_discrepancy_kind(state.classes_client.as_ref(), kind.as_str()).await
+    {
+        return resp;
+    }
+    // The status rides the client body on this path (the enum lift
+    // moved its vocabulary to the Class registry).
+    if let Err(resp) = check_vi_status(state.classes_client.as_ref(), invoice.status.as_str()).await
     {
         return resp;
     }
@@ -202,7 +240,7 @@ pub(super) async fn create_vendor_invoice_from_po<R: InventoryRepository + 'stat
         matched_on: None,
         approved_on: None,
         paid_on: None,
-        status: VendorInvoiceStatus::Received,
+        status: VendorInvoiceStatus::new(VendorInvoiceStatus::RECEIVED),
         discrepancy_cents: None,
         discrepancy_kind: None,
         lines,
@@ -265,7 +303,7 @@ pub(super) async fn batch_pay_vendor_invoices<R: InventoryRepository + 'static>(
     let mut paid_ids = Vec::with_capacity(approved.len());
     let mut total: i64 = 0;
     for mut invoice in approved {
-        invoice.status = crate::types::VendorInvoiceStatus::Paid;
+        invoice.status = crate::types::VendorInvoiceStatus::new(VendorInvoiceStatus::PAID);
         invoice.paid_on = Some(req.paid_on);
         if let Err(e) = state
             .inventory
