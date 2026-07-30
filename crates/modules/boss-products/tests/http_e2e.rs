@@ -45,6 +45,7 @@ async fn upsert_then_list_returns_the_product() {
         products: Arc::new(PgProducts::new(db.pool.clone())),
         publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
+        classes_client: None,
     };
     let r = router(state);
 
@@ -87,6 +88,7 @@ async fn detail_rolls_up_inventory_across_locations() {
         products: repo.clone(),
         publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
+        classes_client: None,
     };
     let r = router(state);
 
@@ -145,6 +147,7 @@ async fn upsert_is_idempotent_on_sku() {
         products: Arc::new(PgProducts::new(db.pool.clone())),
         publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
+        classes_client: None,
     };
     let r = router(state);
 
@@ -195,6 +198,7 @@ async fn put_inventory_uses_path_sku_as_authoritative() {
         products: repo.clone(),
         publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
+        classes_client: None,
     };
     let r = router(state);
 
@@ -233,6 +237,7 @@ async fn produce_increments_then_consume_decrements() {
         products: repo.clone(),
         publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
+        classes_client: None,
     };
     let r = router(state);
 
@@ -288,6 +293,7 @@ async fn consume_below_zero_is_rejected() {
         products: repo.clone(),
         publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
+        classes_client: None,
     };
     let r = router(state);
 
@@ -332,6 +338,7 @@ async fn list_default_filters_inactive() {
         products: repo.clone(),
         publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
+        classes_client: None,
     };
     let r = router(state);
 
@@ -368,4 +375,73 @@ async fn list_default_filters_inactive() {
         .unwrap();
     let body = body_json(resp).await;
     assert_eq!(body.as_array().unwrap().len(), 2);
+}
+
+/// With a Class registry wired, `product_kind` + `package_unit` are
+/// validated against `(subject_kind='product', code)`: registered codes
+/// upsert (201), unregistered ones are rejected (400) with nothing
+/// written. Mirrors the boss-inventory vendor-invoice-status gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_gates_taxonomy_against_the_class_registry() {
+    use boss_classes_client::FakeClassesClient;
+    use boss_core::primitives::ClassRef;
+
+    let db = TestDb::new().await;
+    let classes = Arc::new(FakeClassesClient::with(vec![
+        ClassRef::new("product", "beer"),
+        ClassRef::new("product", "1/2-bbl-keg"),
+    ])) as Arc<dyn boss_classes_client::ClassesClient>;
+    let state = ProductsApiState {
+        products: Arc::new(PgProducts::new(db.pool.clone())),
+        publisher: None,
+        clock: Arc::new(boss_clock_client::WallClockClient),
+        classes_client: Some(classes),
+    };
+    let r = router(state);
+
+    let post = |body: Product| {
+        let r = r.clone();
+        async move {
+            r.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/products")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Registered kind + package_unit → accepted.
+    assert_eq!(post(fp_pale()).await.status(), StatusCode::CREATED);
+
+    // Unregistered product_kind → rejected, nothing written.
+    let mut wine = fp_pale();
+    wine.sku = "FP-WINE-1-2-BBL".into();
+    wine.product_kind = "wine".into();
+    assert_eq!(post(wine).await.status(), StatusCode::BAD_REQUEST);
+
+    // Unregistered package_unit → rejected.
+    let mut drum = fp_pale();
+    drum.sku = "FP-PALE-55GAL".into();
+    drum.package_unit = "55gal-drum".into();
+    assert_eq!(post(drum).await.status(), StatusCode::BAD_REQUEST);
+
+    // Only the accepted product persisted.
+    let resp = r
+        .oneshot(
+            Request::builder()
+                .uri("/api/products")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let products = body.as_array().unwrap();
+    assert_eq!(products.len(), 1);
+    assert_eq!(products[0]["sku"], "FP-PALE-1-2-BBL");
 }

@@ -1436,6 +1436,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "boss-classes-client",
  "boss-clock-client",
  "boss-core",
  "boss-events",

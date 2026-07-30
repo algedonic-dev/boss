@@ -222,6 +222,7 @@ write_config products <<EOF
 postgres_url = "$DB_URL"
 http_bind = "0.0.0.0:$(p products)"
 nats_url = "$NATS_URL"
+classes_api_url = "http://127.0.0.1:$(p classes)"
 EOF
 
 # No nats_url: campaigns emits via the transactional outbox (#118);

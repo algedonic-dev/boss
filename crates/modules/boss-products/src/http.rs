@@ -15,6 +15,8 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
+use boss_classes_client::ClassesClient;
+use boss_core::primitives::ClassRef;
 use boss_core::publisher::DomainPublisher;
 use serde::Deserialize;
 
@@ -28,6 +30,10 @@ pub struct ProductsApiState<R: ProductsRepository> {
     /// Authoritative clock. See `boss-clock-client`. Every
     /// handler stamps dates via `state.clock.now().await`.
     pub clock: Arc<dyn boss_clock_client::ClockClient>,
+    /// Class registry, for validating a product's taxonomy fields
+    /// (`product_kind`, `package_unit`) against `(subject_kind='product',
+    /// code)`. `None` on the test path leaves both fields ungated.
+    pub classes_client: Option<Arc<dyn ClassesClient>>,
 }
 
 pub fn router<R: ProductsRepository + 'static>(state: ProductsApiState<R>) -> Router {
@@ -140,10 +146,60 @@ async fn event_stamp<R: ProductsRepository>(
     }
 }
 
+/// Validate a product's taxonomy fields against the Class registry.
+///
+/// `product_kind` and `package_unit` are both free-text strings the
+/// tenant curates (the closed vocabulary lives as `product` Classes, not
+/// a DB CHECK), so the registry is what makes them mean something. Keys
+/// on `(subject_kind='product', code)` — `member_attribute` is display
+/// metadata, not part of the existence key, so the two fields share the
+/// `product` code namespace without collision (`beer` vs `1/2-bbl-keg`).
+/// Same contract as `check_status` in boss-commerce: permissive when no
+/// registry is wired (test path), fail-closed 503 when unreachable, 400
+/// on an unregistered code.
+async fn check_product_taxonomy(
+    classes_client: Option<&Arc<dyn ClassesClient>>,
+    product: &Product,
+) -> Result<(), Response> {
+    let Some(client) = classes_client else {
+        return Ok(());
+    };
+    for (field, code) in [
+        ("product_kind", product.product_kind.as_str()),
+        ("package_unit", product.package_unit.as_str()),
+    ] {
+        let class_ref = ClassRef::new("product", code);
+        match client.class_exists(&class_ref).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "unknown {field} `{code}` — register it as a Class \
+                         first (subject_kind='product')"
+                    ),
+                )
+                    .into_response());
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("classes registry unreachable: {e}"),
+                )
+                    .into_response());
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn upsert_product<R: ProductsRepository + 'static>(
     State(state): State<Arc<ProductsApiState<R>>>,
     Json(product): Json<Product>,
 ) -> Response {
+    if let Err(resp) = check_product_taxonomy(state.classes_client.as_ref(), &product).await {
+        return resp;
+    }
     let now = boss_clock_client::now_from(&state.clock).await;
     let stamp = event_stamp(&state, now).await;
     match state.products.upsert_product(&product, &stamp).await {
@@ -156,6 +212,14 @@ async fn upsert_products_batch<R: ProductsRepository + 'static>(
     State(state): State<Arc<ProductsApiState<R>>>,
     Json(products): Json<Vec<Product>>,
 ) -> Response {
+    // Validate every row's taxonomy up front so a seed with an
+    // unregistered kind fails loudly (400) with nothing applied,
+    // rather than silently dropping the offending SKUs from the count.
+    for p in &products {
+        if let Err(resp) = check_product_taxonomy(state.classes_client.as_ref(), p).await {
+            return resp;
+        }
+    }
     let now = boss_clock_client::now_from(&state.clock).await;
     let stamp = event_stamp(&state, now).await;
     let mut inserted = 0u64;

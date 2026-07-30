@@ -430,12 +430,14 @@ EOF
             # Finished-product catalog + per-location on-hand. NATS
             # publisher gates the products.* state events the
             # rebuild path (and downstream /shop / /products UI)
-            # consume.
+            # consume. classes_api_url backs product_kind +
+            # package_unit validation against the `product` Classes.
             cat <<EOF
 # Managed by infra/deploy-services.sh — edits will be overwritten.
 postgres_url = "$PROD_DB_URL"
 http_bind = "127.0.0.1:$port"
 nats_url = "$NATS_URL"
+classes_api_url = "http://127.0.0.1:$(port_of classes prod)"
 EOF
             ;;
         campaigns)

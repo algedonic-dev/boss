@@ -423,5 +423,33 @@
     "member_attribute": "category",
     "metadata": { "behavior_template": { "lead_time_days": 5.0, "lead_spread_days": 2.0, "fulfilment_rate": 0.97, "ap_payment_days": 5.0, "ap_spread_days": 2.0 } },
     "sort_order": 50
+  },
+  {
+    "subject_kind": "product",
+    "code": "beer",
+    "display_name": "Beer",
+    "member_attribute": "product_kind",
+    "sort_order": 10
+  },
+  {
+    "subject_kind": "product",
+    "code": "1/2-bbl-keg",
+    "display_name": "1/2 BBL Keg",
+    "member_attribute": "package_unit",
+    "sort_order": 10
+  },
+  {
+    "subject_kind": "product",
+    "code": "1/6-bbl-keg",
+    "display_name": "1/6 BBL Keg (Sixtel)",
+    "member_attribute": "package_unit",
+    "sort_order": 20
+  },
+  {
+    "subject_kind": "product",
+    "code": "12oz-case",
+    "display_name": "12oz Case",
+    "member_attribute": "package_unit",
+    "sort_order": 30
   }
 ]

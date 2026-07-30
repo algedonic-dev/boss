@@ -760,3 +760,40 @@ member_attribute = "account_team_role"
 code = "executive-sponsor"
 display_name = "Executive Sponsor"
 sort_order = 304
+
+# ---------------------------------------------------------------------------
+# Product taxonomy — the curated vocabulary for the finished-product
+# catalog (products.toml). `boss-products` validates every SKU's
+# `product_kind` + `package_unit` against these rows keyed
+# (subject_kind='product', code) — member_attribute is display metadata,
+# not part of the existence key, so the two fields share the namespace.
+# Add a code here before a SKU can use it.
+# ---------------------------------------------------------------------------
+
+[[class]]
+subject_kind = "product"
+member_attribute = "product_kind"
+code = "beer"
+display_name = "Beer"
+sort_order = 10
+
+[[class]]
+subject_kind = "product"
+member_attribute = "package_unit"
+code = "1/2-bbl-keg"
+display_name = "1/2 BBL Keg"
+sort_order = 10
+
+[[class]]
+subject_kind = "product"
+member_attribute = "package_unit"
+code = "1/6-bbl-keg"
+display_name = "1/6 BBL Keg (Sixtel)"
+sort_order = 20
+
+[[class]]
+subject_kind = "product"
+member_attribute = "package_unit"
+code = "12oz-case"
+display_name = "12oz Case"
+sort_order = 30
