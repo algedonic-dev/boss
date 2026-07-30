@@ -212,6 +212,43 @@ async fn check_status(
     }
 }
 
+/// Validate a line item's `revenue_category` against the Class registry.
+///
+/// Revenue categories are a taxonomy the `invoice` subject kind owns
+/// (`01-registries.sql`: invoice "owns the status + revenue-category
+/// taxonomies"), tenant-curated and seeded per-tenant — the brewery's
+/// seven live in classes.json alongside the platform status codes,
+/// sharing the `invoice` code namespace without collision
+/// (member_attribute is display metadata, not part of the existence
+/// key). Same key + same contract as `check_status`: permissive when no
+/// registry is wired (test path), 400 on an unregistered code, 503 when
+/// the registry is unreachable.
+async fn check_revenue_category(
+    classes_client: Option<&Arc<dyn ClassesClient>>,
+    category: &str,
+) -> Result<(), Response> {
+    let Some(client) = classes_client else {
+        return Ok(());
+    };
+    let class_ref = ClassRef::new("invoice", category);
+    match client.class_exists(&class_ref).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown revenue_category `{category}` — register it as a \
+                 Class first (subject_kind='invoice')"
+            ),
+        )
+            .into_response()),
+        Err(e) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("classes registry unreachable: {e}"),
+        )
+            .into_response()),
+    }
+}
+
 async fn create_invoice<R: CommerceRepository + 'static>(
     State(state): State<Arc<CommerceApiState<R>>>,
     CurrentUser(user): CurrentUser,
@@ -223,6 +260,18 @@ async fn create_invoice<R: CommerceRepository + 'static>(
     // a clean 400 regardless of the caller's role.
     if let Err(resp) = check_status(state.classes_client.as_ref(), invoice.status.as_str()).await {
         return resp;
+    }
+    // Every line's revenue_category must likewise be a registered Class
+    // under (subject_kind='invoice'). Same fail-loud gate as status.
+    for line in &invoice.line_items {
+        if let Err(resp) = check_revenue_category(
+            state.classes_client.as_ref(),
+            line.revenue_category.as_str(),
+        )
+        .await
+        {
+            return resp;
+        }
     }
     // Policy: creating an invoice requires an active Create rule on
     // Resource::invoice() for the caller's role. If the state doesn't
@@ -312,6 +361,37 @@ async fn batch_invoices<R: CommerceRepository + 'static>(
             skipped.push((
                 inv.id.clone(),
                 format!("unregistered status `{}`", inv.status),
+            ));
+            continue;
+        }
+        // Same registry gate for each line's revenue_category — skip
+        // the whole invoice and report if any line carries an
+        // unregistered (or unreachable-registry) category.
+        let bad_category = {
+            let mut found = None;
+            for line in &inv.line_items {
+                if check_revenue_category(
+                    state.classes_client.as_ref(),
+                    line.revenue_category.as_str(),
+                )
+                .await
+                .is_err()
+                {
+                    found = Some(line.revenue_category.as_str().to_string());
+                    break;
+                }
+            }
+            found
+        };
+        if let Some(cat) = bad_category {
+            tracing::warn!(
+                invoice_id = %inv.id,
+                revenue_category = %cat,
+                "invoice line revenue_category not registered as a Class; skipping invoice in batch"
+            );
+            skipped.push((
+                inv.id.clone(),
+                format!("unregistered revenue_category `{cat}`"),
             ));
             continue;
         }
@@ -603,6 +683,62 @@ mod tests {
             clock: Arc::new(boss_clock_client::WallClockClient),
             classes_client: None,
         })
+    }
+
+    fn test_app_with_classes(classes: Arc<dyn ClassesClient>) -> Router {
+        let commerce = Arc::new(InMemoryCommerce::new(vec![]));
+        let policy: Arc<dyn PolicyClient> = Arc::new(boss_policy_client::PermissivePolicyClient);
+        router(CommerceApiState {
+            commerce,
+            publisher: None,
+            people_client: Arc::new(AlwaysExistsPeople),
+            policy: Some(policy),
+            clock: Arc::new(boss_clock_client::WallClockClient),
+            classes_client: Some(classes),
+        })
+    }
+
+    async fn post_invoice(app: &Router, invoice: &Invoice) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/commerce/invoices/create")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(invoice).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// With a Class registry wired, every invoice line's
+    /// `revenue_category` is validated against (subject_kind='invoice',
+    /// code): a registered category creates (201), an unregistered one is
+    /// rejected (400). The status gate must also see a registered code,
+    /// so `outstanding` is registered alongside.
+    #[tokio::test]
+    async fn create_invoice_gates_revenue_category_against_the_class_registry() {
+        use boss_classes_client::FakeClassesClient;
+
+        let classes = Arc::new(FakeClassesClient::with(vec![
+            ClassRef::new("invoice", "outstanding"),
+            ClassRef::new("invoice", "wholesale"),
+        ])) as Arc<dyn ClassesClient>;
+        let app = test_app_with_classes(classes);
+
+        // Registered revenue_category → created.
+        let mut ok = test_invoice("inv-ok");
+        ok.line_items[0].revenue_category = RevenueCategory::from("wholesale");
+        assert_eq!(post_invoice(&app, &ok).await.status(), StatusCode::CREATED);
+
+        // Unregistered revenue_category → rejected before the write.
+        let mut bad = test_invoice("inv-bad");
+        bad.line_items[0].revenue_category = RevenueCategory::from("unicorn-sales");
+        assert_eq!(
+            post_invoice(&app, &bad).await.status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]
