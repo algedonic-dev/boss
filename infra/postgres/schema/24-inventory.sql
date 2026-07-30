@@ -52,10 +52,13 @@ CREATE TABLE IF NOT EXISTS inventory_items (
 CREATE TABLE IF NOT EXISTS vendors (
     id                TEXT PRIMARY KEY,
     -- Identity-first: only `id` is required; descriptive fields are
-    -- nullable and enriched after the vendor exists. The payment_terms
-    -- CHECK still rejects bad values but passes NULL. `category` is
-    -- nullable — an un-categorized vendor is simply not yet an
-    -- auto-restock target (vendor_for matches on category).
+    -- nullable and enriched after the vendor exists. `payment_terms`
+    -- carries no DB CHECK: boss-inventory validates it on the vendor
+    -- write path against the Class registry keyed (subject_kind='vendor',
+    -- code), so a tenant adds a term by seeding a `vendor` Class, not by
+    -- forking this constraint. NULL passes (unenriched vendor).
+    -- `category` is nullable — an un-categorized vendor is simply not yet
+    -- an auto-restock target (vendor_for matches on category).
     name              TEXT,
     -- Denormalised "primary contact" scalars, mirroring the is_primary
     -- row in `vendor_contacts` (the normalized source of truth, below).
@@ -66,9 +69,7 @@ CREATE TABLE IF NOT EXISTS vendors (
     city              TEXT,
     state             TEXT,
     lead_time_days    SMALLINT NOT NULL DEFAULT 7,
-    payment_terms     TEXT CHECK (payment_terms IS NULL OR payment_terms IN (
-        'net-30', 'net-45', 'net-60', 'prepaid'
-    )),
+    payment_terms     TEXT,  -- Class (subject_kind='vendor'): net-30 / net-45 / net-60 / prepaid; validated at the API boundary
     -- Free-text per-tenant taxonomy. Brewery uses
     -- grain-supplier / hops-supplier / yeast-bank / packaging /
     -- specialty-ingredients / equipment / general; the
