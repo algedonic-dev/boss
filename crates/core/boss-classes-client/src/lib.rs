@@ -10,6 +10,24 @@
 use async_trait::async_trait;
 use boss_core::http_client::{self, HttpClientError, ServiceLabel};
 use boss_core::primitives::{Class, ClassRef};
+use percent_encoding::{AsciiSet, utf8_percent_encode};
+
+/// RFC 3986 "unreserved" set — everything EXCEPT `A-Z a-z 0-9 - . _ ~`
+/// is percent-encoded. A Class code goes into a URL path segment, so any
+/// code containing `/` (e.g. the `1/2-bbl-keg` package_unit), a space,
+/// `?`, or `#` would otherwise split or truncate the path. Hyphenated
+/// codes (`grain-supplier`, `past-due`) contain only unreserved chars,
+/// so they pass through unchanged — this is a no-op for every existing
+/// caller and only rescues codes with reserved characters.
+const PATH_SEGMENT: &AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+fn seg(s: &str) -> impl std::fmt::Display + '_ {
+    utf8_percent_encode(s, PATH_SEGMENT)
+}
 
 /// Fetch employee Classes from the registry and seed
 /// [`boss_core::roles`]' executive cache from the rows whose
@@ -139,7 +157,9 @@ impl ClassesClient for ReqwestClassesClient {
     async fn class_exists(&self, class_ref: &ClassRef) -> Result<bool, ClassesClientError> {
         let url = format!(
             "{}/api/classes/{}/{}/exists",
-            self.base_url, class_ref.subject_kind, class_ref.code
+            self.base_url,
+            seg(&class_ref.subject_kind),
+            seg(&class_ref.code)
         );
         http_client::get_exists(&self.http, &url).await
     }
@@ -220,6 +240,18 @@ impl ClassesClient for FakeClassesClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_segment_encodes_reserved_chars_only() {
+        // Slash-bearing code (a product package_unit) must encode, or it
+        // splits the `/exists` path — the products-gate bug.
+        assert_eq!(seg("1/2-bbl-keg").to_string(), "1%2F2-bbl-keg");
+        // Unreserved codes (the common case) pass through untouched, so
+        // this is a no-op for every existing caller.
+        assert_eq!(seg("grain-supplier").to_string(), "grain-supplier");
+        assert_eq!(seg("past-due").to_string(), "past-due");
+        assert_eq!(seg("beer").to_string(), "beer");
+    }
 
     #[tokio::test]
     async fn permissive_fake_accepts_anything() {

@@ -236,6 +236,36 @@ mod tests {
         assert_eq!(v["exists"], json!(true));
     }
 
+    /// A Class code containing a slash (`1/2-bbl-keg`, a product
+    /// package_unit) must round-trip through the `/exists` path: the
+    /// client percent-encodes the slash to `%2F`, matchit keeps it in a
+    /// single `{code}` segment, and the `Path` extractor decodes it back
+    /// before the lookup. Without encoding the raw slash splits the path
+    /// and 404s — the bug that broke the products taxonomy gate.
+    #[tokio::test]
+    async fn exists_resolves_a_slash_in_the_code_when_percent_encoded() {
+        let class = Class {
+            subject_kind: "product".into(),
+            code: "1/2-bbl-keg".into(),
+            display_name: "1/2 BBL Keg".into(),
+            parent_code: None,
+            member_attribute: Some("package_unit".into()),
+            metadata: json!({}),
+            sort_order: 10,
+            retired_at: None,
+        };
+        let app = build_app(vec![class]);
+        let req = Request::builder()
+            .uri("/api/classes/product/1%2F2-bbl-keg/exists")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["exists"], json!(true));
+    }
+
     /// `x-boss-user` JSON for an operator-tier caller. Mirrors the
     /// header the gateway injects + the seed binaries send.
     fn operator_header() -> String {
