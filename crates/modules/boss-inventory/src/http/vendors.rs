@@ -8,11 +8,49 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
+use boss_classes_client::ClassesClient;
+use boss_core::primitives::ClassRef;
 use boss_policy_client::CurrentUser;
 
 use super::InventoryApiState;
 use crate::port::{InventoryError, InventoryRepository};
 use crate::types::{Vendor, VendorBehavior};
+
+/// Validate a vendor's `payment_terms` against the Class registry under
+/// `(subject_kind='vendor')`. Terms are a curated vocabulary (net-30,
+/// prepaid, …) the tenant extends by adding a Class row, not by editing
+/// a DB CHECK — the CHECK this replaces forced a core fork to add a
+/// term. Same contract as [`super::vendor_invoices`]' status gate:
+/// permissive when no registry is wired, 503 when unreachable, 400 on an
+/// unregistered code. The caller skips the optional field — an absent
+/// `payment_terms` (nullable, enriched later) never reaches here.
+/// Vendor `category` and `payment_terms` share the `vendor` code
+/// namespace; their `member_attribute` keeps them distinct.
+async fn check_payment_terms(
+    classes_client: Option<&Arc<dyn ClassesClient>>,
+    terms: &str,
+) -> Result<(), Response> {
+    let Some(client) = classes_client else {
+        return Ok(());
+    };
+    let class_ref = ClassRef::new("vendor", terms);
+    match client.class_exists(&class_ref).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown payment terms `{terms}` — register it as a Class first \
+                 (subject_kind='vendor')"
+            ),
+        )
+            .into_response()),
+        Err(e) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("classes registry unreachable: {e}"),
+        )
+            .into_response()),
+    }
+}
 
 pub(super) async fn list_vendors<R: InventoryRepository + 'static>(
     State(state): State<Arc<InventoryApiState<R>>>,
@@ -61,6 +99,14 @@ pub(super) async fn create_vendor<R: InventoryRepository + 'static>(
     CurrentUser(user): CurrentUser,
     Json(body): Json<CreateVendorRequest>,
 ) -> Response {
+    // Optional-skip: only a *present* payment_terms is validated; an
+    // absent one (nullable, enriched later) passes straight through.
+    if let Some(terms) = body.payment_terms.as_deref()
+        && let Err(resp) = check_payment_terms(state.classes_client.as_ref(), terms).await
+    {
+        return resp;
+    }
+
     let id = body.id.unwrap_or_else(|| {
         format!(
             "VND-{}",
@@ -102,6 +148,14 @@ pub(super) async fn update_vendor<R: InventoryRepository + 'static>(
     CurrentUser(user): CurrentUser,
     Json(body): Json<CreateVendorRequest>,
 ) -> Response {
+    // Optional-skip: only a *present* payment_terms is validated; an
+    // absent one (nullable, enriched later) passes straight through.
+    if let Some(terms) = body.payment_terms.as_deref()
+        && let Err(resp) = check_payment_terms(state.classes_client.as_ref(), terms).await
+    {
+        return resp;
+    }
+
     let vendor = Vendor {
         id: id.clone(),
         name: body.name,

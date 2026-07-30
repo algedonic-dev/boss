@@ -127,9 +127,24 @@ lives here now. Items verified still open at re-homing:
       codes without collision. Not a Class of a fake "revenue" subject
       and not config-vocab (no module reads tenant.toml) — the invoice
       IS the subject, mirroring the existing invoice-status gate.
-- [ ] Deferred taxonomy lifts: account tier/type, vendor
-      `payment_terms`, revenue categories, tax jurisdictions/rates
-      in `rules.toml`.
+- [x] Vendor `payment_terms` — DB CHECK dropped; lifted to a
+      Class-of-`vendor` vocabulary (net-30/45/60, prepaid) validated on
+      the vendor write path keyed (subject_kind='vendor', code), NULL
+      permissive (#168).
+- [ ] Deferred taxonomy lifts — re-triaged 2026-07-30:
+      • `account_type` is ALREADY a Class + validated (accounts.rs) —
+        done, not open.
+      • account `tier` is a doc contradiction: `22-accounts.sql` calls
+        it a Class-registry field, but class-registry.md §"When NOT to
+        use" calls `tier` per-row Subject config, not a Class. Resolve
+        the disposition before acting.
+      • revenue categories + tax jurisdictions/rates in `rules.toml` are
+        dispatcher RULE ARGS (`default_revenue_category`,
+        `tax_jurisdiction`, `taxable_categories`, `tax_rate_bps`), not a
+        taxonomy table — a different shape than a Class lift.
+- [ ] Vendor `category` is unvalidated on the write path despite having
+      seeded `vendor` Classes (grain-supplier, …) the sim relies on —
+      the same gate as `payment_terms`, just for `category`. Own PR.
 - [ ] `brewery-hire` subject shape (an existing employee as the
       hire target) — suppressed with `rate=0`; needs remodeling,
       likely subject = the requisition or the org.

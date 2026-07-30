@@ -500,5 +500,33 @@
     "display_name": "Uncategorized",
     "member_attribute": "revenue_category",
     "sort_order": 70
+  },
+  {
+    "subject_kind": "vendor",
+    "code": "net-30",
+    "display_name": "Net 30",
+    "member_attribute": "payment_terms",
+    "sort_order": 10
+  },
+  {
+    "subject_kind": "vendor",
+    "code": "net-45",
+    "display_name": "Net 45",
+    "member_attribute": "payment_terms",
+    "sort_order": 20
+  },
+  {
+    "subject_kind": "vendor",
+    "code": "net-60",
+    "display_name": "Net 60",
+    "member_attribute": "payment_terms",
+    "sort_order": 30
+  },
+  {
+    "subject_kind": "vendor",
+    "code": "prepaid",
+    "display_name": "Prepaid",
+    "member_attribute": "payment_terms",
+    "sort_order": 40
   }
 ]

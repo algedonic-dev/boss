@@ -48,6 +48,43 @@ async fn post_vendor_returns_201_on_valid_input() {
     resp.assert_status(StatusCode::CREATED);
 }
 
+/// With a Class registry wired, `payment_terms` is validated against
+/// (subject_kind='vendor', code): a registered term creates (201), an
+/// unregistered one is rejected (400), and an absent term still creates
+/// (201 — NULL-permissive, matching the old DB CHECK's `IS NULL OR ...`).
+#[tokio::test]
+async fn post_vendor_gates_payment_terms_against_the_class_registry() {
+    use boss_classes_client::{ClassesClient, FakeClassesClient};
+    use boss_core::primitives::ClassRef;
+    use std::sync::Arc;
+
+    let classes = Arc::new(FakeClassesClient::with(vec![ClassRef::new(
+        "vendor", "net-30",
+    )])) as Arc<dyn ClassesClient>;
+    let app = InventoryTestApp::with_classes(classes);
+
+    // Registered term → created.
+    TestRequest::post("/api/inventory/vendors")
+        .json(&json!({ "id": "VND-OK", "name": "Acme", "payment_terms": "net-30" }))
+        .send(&app.router)
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    // Unregistered term → rejected.
+    TestRequest::post("/api/inventory/vendors")
+        .json(&json!({ "id": "VND-BAD", "name": "Beta", "payment_terms": "net-99" }))
+        .send(&app.router)
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+
+    // Absent term → created (nullable, enriched later).
+    TestRequest::post("/api/inventory/vendors")
+        .json(&json!({ "id": "VND-NONE", "name": "Gamma" }))
+        .send(&app.router)
+        .await
+        .assert_status(StatusCode::CREATED);
+}
+
 #[tokio::test]
 async fn post_vendor_emits_vendor_created_event() {
     let app = InventoryTestApp::new();

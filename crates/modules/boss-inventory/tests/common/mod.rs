@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use axum::Router;
+use boss_classes_client::ClassesClient;
 use boss_core::publisher::DomainPublisher;
 use boss_inventory::http::{InventoryApiState, router};
 use boss_inventory::in_memory::InMemoryInventory;
@@ -81,22 +82,39 @@ impl InventoryTestApp {
     /// Build a fresh test app with no items, orders, or vendors.
     #[allow(dead_code)]
     pub fn new() -> Self {
-        Self::build(vec![default_item("PART-001")], vec![], vec![])
+        Self::build(vec![default_item("PART-001")], vec![], vec![], None)
     }
 
     /// Build a test app pre-populated with the given vendors.
     #[allow(dead_code)]
     pub fn with_vendors(vendors: Vec<Vendor>) -> Self {
-        Self::build(vec![default_item("PART-001")], vec![], vendors)
+        Self::build(vec![default_item("PART-001")], vec![], vendors, None)
     }
 
     /// Build a test app pre-populated with the given purchase orders.
     #[allow(dead_code)]
     pub fn with_orders(orders: Vec<PurchaseOrder>) -> Self {
-        Self::build(vec![default_item("PART-001")], orders, vec![])
+        Self::build(vec![default_item("PART-001")], orders, vec![], None)
     }
 
-    fn build(items: Vec<InventoryItem>, orders: Vec<PurchaseOrder>, vendors: Vec<Vendor>) -> Self {
+    /// Build a test app with a Class registry wired — for the write-path
+    /// gates (vendor `payment_terms`, vendor-invoice status, …).
+    #[allow(dead_code)]
+    pub fn with_classes(classes: Arc<dyn ClassesClient>) -> Self {
+        Self::build(
+            vec![default_item("PART-001")],
+            vec![],
+            vec![],
+            Some(classes),
+        )
+    }
+
+    fn build(
+        items: Vec<InventoryItem>,
+        orders: Vec<PurchaseOrder>,
+        vendors: Vec<Vendor>,
+        classes_client: Option<Arc<dyn ClassesClient>>,
+    ) -> Self {
         let inventory = Arc::new(InMemoryInventory::with_vendors(items, orders, vendors));
         let bus = RecordingEventBus::new();
         let publisher = DomainPublisher::new(bus.clone(), "inventory");
@@ -104,7 +122,7 @@ impl InventoryTestApp {
             inventory: inventory.clone(),
             publisher: Some(publisher),
             clients: None,
-            classes_client: None,
+            classes_client,
             clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
         };
         let router = router(state);

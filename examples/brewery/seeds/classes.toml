@@ -856,3 +856,40 @@ member_attribute = "revenue_category"
 code = "uncategorized"
 display_name = "Uncategorized"
 sort_order = 70
+
+# ---------------------------------------------------------------------------
+# Vendor payment terms — the curated AP-terms vocabulary. boss-inventory
+# validates a vendor's `payment_terms` against these rows keyed
+# (subject_kind='vendor', code); they share the `vendor` code namespace
+# with the supplier categories above without collision (member_attribute
+# distinguishes them). Replaces the old DB CHECK — add a term here, not
+# by forking the constraint.
+# ---------------------------------------------------------------------------
+
+[[class]]
+subject_kind = "vendor"
+member_attribute = "payment_terms"
+code = "net-30"
+display_name = "Net 30"
+sort_order = 10
+
+[[class]]
+subject_kind = "vendor"
+member_attribute = "payment_terms"
+code = "net-45"
+display_name = "Net 45"
+sort_order = 20
+
+[[class]]
+subject_kind = "vendor"
+member_attribute = "payment_terms"
+code = "net-60"
+display_name = "Net 60"
+sort_order = 30
+
+[[class]]
+subject_kind = "vendor"
+member_attribute = "payment_terms"
+code = "prepaid"
+display_name = "Prepaid"
+sort_order = 40
