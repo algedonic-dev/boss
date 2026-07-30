@@ -105,9 +105,12 @@ CREATE TABLE IF NOT EXISTS purchase_orders (
     -- the same transaction as the write (Q3: trigger + sweep now,
     -- per-edge composite FKs revisited later).
     vendor          TEXT,
-    status          TEXT NOT NULL CHECK (status IN (
-        'draft', 'submitted', 'acknowledged', 'in-transit', 'received', 'closed'
-    )),
+    -- Status vocabulary lives in the Class registry
+    -- (subject_kind='purchase_order', member_attribute='status'),
+    -- validated at the API boundary — not a CHECK (the closed CHECK
+    -- + closed Rust enum walled off tenant-added lifecycle statuses;
+    -- lifted 2026-07-29 like ShipmentStatus before it).
+    status          TEXT NOT NULL,
     placed_on       DATE,
     expected_on     DATE,
     received_on     DATE,
@@ -379,3 +382,14 @@ ON CONFLICT (event_kind, field_path) DO NOTHING;
 INSERT INTO subject_edges (source_kind, field_path, target_kind, target_kind_path) VALUES
     ('inventory.purchase_order.upserted', 'vendor', 'vendor', NULL)
 ON CONFLICT (source_kind, field_path) DO NOTHING;
+
+-- PO lifecycle statuses as Class rows — the vocabulary the
+-- API-boundary gate validates against (the lifted PoStatus).
+INSERT INTO classes (subject_kind, code, display_name, member_attribute, sort_order) VALUES
+    ('purchase_order', 'draft',        'Draft',        'status', 10),
+    ('purchase_order', 'submitted',    'Submitted',    'status', 20),
+    ('purchase_order', 'acknowledged', 'Acknowledged', 'status', 30),
+    ('purchase_order', 'in-transit',   'In Transit',   'status', 40),
+    ('purchase_order', 'received',     'Received',     'status', 50),
+    ('purchase_order', 'closed',       'Closed',       'status', 60)
+ON CONFLICT (subject_kind, code) DO NOTHING;

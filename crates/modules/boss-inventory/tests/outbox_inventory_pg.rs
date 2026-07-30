@@ -173,7 +173,7 @@ async fn po_status_flip_records_post_update_state_plus_marker() {
         &PurchaseOrder {
             id: "PO-OUTBOX-1".into(),
             vendor: Some("vnd-outbox".into()),
-            status: PoStatus::Draft,
+            status: PoStatus::new(PoStatus::DRAFT),
             placed_on: None,
             expected_on: None,
             received_on: None,
@@ -246,7 +246,7 @@ async fn vendor_invoice_reupsert_appends_no_duplicate_transition() {
         &PurchaseOrder {
             id: "PO-OUTBOX-9".into(),
             vendor: Some("vnd-outbox".into()),
-            status: PoStatus::Draft,
+            status: PoStatus::new(PoStatus::DRAFT),
             placed_on: None,
             expected_on: None,
             received_on: None,

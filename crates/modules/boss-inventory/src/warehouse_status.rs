@@ -143,10 +143,7 @@ pub struct InboundPoRow {
 pub const INBOUND_PO_PREVIEW_LIMIT: usize = 20;
 
 fn inbound_pos_summary(pos: &[PurchaseOrder], today: NaiveDate) -> InboundPoSummary {
-    let open: Vec<&PurchaseOrder> = pos
-        .iter()
-        .filter(|po| !matches!(po.status, PoStatus::Received | PoStatus::Closed))
-        .collect();
+    let open: Vec<&PurchaseOrder> = pos.iter().filter(|po| po.status.is_open()).collect();
 
     let week_end = today + Duration::days(7);
 
@@ -158,12 +155,14 @@ fn inbound_pos_summary(pos: &[PurchaseOrder], today: NaiveDate) -> InboundPoSumm
     let mut arriving_soon = 0i64;
 
     for po in &open {
-        match po.status {
-            PoStatus::Draft => draft += 1,
-            PoStatus::Submitted => submitted += 1,
-            PoStatus::Acknowledged => acknowledged += 1,
-            PoStatus::InTransit => in_transit += 1,
-            PoStatus::Received | PoStatus::Closed => {}
+        // Known statuses bucket into the named counters; a
+        // tenant-added status still counts in total_open above.
+        match po.status.as_str() {
+            PoStatus::DRAFT => draft += 1,
+            PoStatus::SUBMITTED => submitted += 1,
+            PoStatus::ACKNOWLEDGED => acknowledged += 1,
+            PoStatus::IN_TRANSIT => in_transit += 1,
+            _ => {}
         }
         // Only placed POs have an expected-arrival date; a bare Draft
         // (identity-first, no dates yet) is counted above but isn't
@@ -193,7 +192,7 @@ fn inbound_pos_summary(pos: &[PurchaseOrder], today: NaiveDate) -> InboundPoSumm
             Some(InboundPoRow {
                 id: po.id.clone(),
                 vendor: po.vendor.clone().unwrap_or_default(),
-                status: po_status_label(po.status).to_string(),
+                status: po.status.to_string(),
                 expected_on,
                 days_until_expected: (expected_on - today).num_days(),
                 line_count: po.lines.len(),
@@ -210,17 +209,6 @@ fn inbound_pos_summary(pos: &[PurchaseOrder], today: NaiveDate) -> InboundPoSumm
         late_count: late,
         arriving_this_week_count: arriving_soon,
         recent,
-    }
-}
-
-fn po_status_label(status: PoStatus) -> &'static str {
-    match status {
-        PoStatus::Draft => "draft",
-        PoStatus::Submitted => "submitted",
-        PoStatus::Acknowledged => "acknowledged",
-        PoStatus::InTransit => "in-transit",
-        PoStatus::Received => "received",
-        PoStatus::Closed => "closed",
     }
 }
 
@@ -365,10 +353,26 @@ mod tests {
     fn inbound_pos_exclude_received_and_closed() {
         let today = d(2026, 4, 22);
         let pos = vec![
-            po("PO-1", PoStatus::Draft, today + Duration::days(3)),
-            po("PO-2", PoStatus::Received, today - Duration::days(10)),
-            po("PO-3", PoStatus::Closed, today - Duration::days(30)),
-            po("PO-4", PoStatus::InTransit, today + Duration::days(1)),
+            po(
+                "PO-1",
+                PoStatus::new(PoStatus::DRAFT),
+                today + Duration::days(3),
+            ),
+            po(
+                "PO-2",
+                PoStatus::new(PoStatus::RECEIVED),
+                today - Duration::days(10),
+            ),
+            po(
+                "PO-3",
+                PoStatus::new(PoStatus::CLOSED),
+                today - Duration::days(30),
+            ),
+            po(
+                "PO-4",
+                PoStatus::new(PoStatus::IN_TRANSIT),
+                today + Duration::days(1),
+            ),
         ];
         let summary = inbound_pos_summary(&pos, today);
         assert_eq!(summary.total_open, 2);
@@ -381,9 +385,21 @@ mod tests {
     fn inbound_pos_flags_late_when_expected_date_has_passed() {
         let today = d(2026, 4, 22);
         let pos = vec![
-            po("PO-LATE", PoStatus::InTransit, today - Duration::days(3)),
-            po("PO-SOON", PoStatus::Submitted, today + Duration::days(2)),
-            po("PO-FAR", PoStatus::Draft, today + Duration::days(30)),
+            po(
+                "PO-LATE",
+                PoStatus::new(PoStatus::IN_TRANSIT),
+                today - Duration::days(3),
+            ),
+            po(
+                "PO-SOON",
+                PoStatus::new(PoStatus::SUBMITTED),
+                today + Duration::days(2),
+            ),
+            po(
+                "PO-FAR",
+                PoStatus::new(PoStatus::DRAFT),
+                today + Duration::days(30),
+            ),
         ];
         let summary = inbound_pos_summary(&pos, today);
         assert_eq!(summary.late_count, 1);
@@ -394,9 +410,21 @@ mod tests {
     fn inbound_pos_recent_sorted_by_expected_on_asc() {
         let today = d(2026, 4, 22);
         let pos = vec![
-            po("PO-FAR", PoStatus::Submitted, today + Duration::days(20)),
-            po("PO-NEAR", PoStatus::Submitted, today + Duration::days(2)),
-            po("PO-LATE", PoStatus::InTransit, today - Duration::days(5)),
+            po(
+                "PO-FAR",
+                PoStatus::new(PoStatus::SUBMITTED),
+                today + Duration::days(20),
+            ),
+            po(
+                "PO-NEAR",
+                PoStatus::new(PoStatus::SUBMITTED),
+                today + Duration::days(2),
+            ),
+            po(
+                "PO-LATE",
+                PoStatus::new(PoStatus::IN_TRANSIT),
+                today - Duration::days(5),
+            ),
         ];
         let summary = inbound_pos_summary(&pos, today);
         let ids: Vec<&str> = summary.recent.iter().map(|r| r.id.as_str()).collect();
@@ -408,7 +436,7 @@ mod tests {
     #[test]
     fn inbound_pos_status_labels_kebab_case() {
         let today = d(2026, 4, 22);
-        let pos = vec![po("PO-IT", PoStatus::InTransit, today)];
+        let pos = vec![po("PO-IT", PoStatus::new(PoStatus::IN_TRANSIT), today)];
         let summary = inbound_pos_summary(&pos, today);
         assert_eq!(summary.recent[0].status, "in-transit");
     }
@@ -418,7 +446,11 @@ mod tests {
     #[test]
     fn build_warehouse_status_passes_through_cross_service_summaries() {
         let items = vec![item("PART-A", 50, 10, 20)];
-        let pos = vec![po("PO-1", PoStatus::Submitted, d(2026, 4, 25))];
+        let pos = vec![po(
+            "PO-1",
+            PoStatus::new(PoStatus::SUBMITTED),
+            d(2026, 4, 25),
+        )];
         let refurb = RefurbWipSummary {
             total_in_flight: 12,
             by_stage: vec![
@@ -532,12 +564,12 @@ mod tests {
             offset_days in -180i64..180,
         ) -> PurchaseOrder {
             let status = match status_ix {
-                0 => PoStatus::Draft,
-                1 => PoStatus::Submitted,
-                2 => PoStatus::Acknowledged,
-                3 => PoStatus::InTransit,
-                4 => PoStatus::Received,
-                _ => PoStatus::Closed,
+                0 => PoStatus::new(PoStatus::DRAFT),
+                1 => PoStatus::new(PoStatus::SUBMITTED),
+                2 => PoStatus::new(PoStatus::ACKNOWLEDGED),
+                3 => PoStatus::new(PoStatus::IN_TRANSIT),
+                4 => PoStatus::new(PoStatus::RECEIVED),
+                _ => PoStatus::new(PoStatus::CLOSED),
             };
             let today = d(2026, 4, 22);
             let expected = today + Duration::days(offset_days);
@@ -630,7 +662,7 @@ mod tests {
             let summary = inbound_pos_summary(&pos, today);
             let expected = pos
                 .iter()
-                .filter(|po| !matches!(po.status, PoStatus::Received | PoStatus::Closed))
+                .filter(|po| po.status.is_open())
                 .count() as i64;
             prop_assert_eq!(summary.total_open, expected);
         }
