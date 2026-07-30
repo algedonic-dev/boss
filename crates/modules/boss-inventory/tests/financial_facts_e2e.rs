@@ -125,7 +125,7 @@ async fn received_only_emits_no_fact() {
 
     inv.upsert_vendor_invoice(&vendor_invoice(
         "vi-ff-1",
-        VendorInvoiceStatus::Received,
+        VendorInvoiceStatus::new(VendorInvoiceStatus::RECEIVED),
         None,
         None,
         None,
@@ -146,7 +146,7 @@ async fn approved_emits_approved_fact() {
     let approved_on = NaiveDate::from_ymd_opt(2026, 3, 5).unwrap();
     inv.upsert_vendor_invoice(&vendor_invoice(
         "vi-ff-2",
-        VendorInvoiceStatus::Approved,
+        VendorInvoiceStatus::new(VendorInvoiceStatus::APPROVED),
         Some(approved_on),
         Some(approved_on),
         None,
@@ -182,7 +182,7 @@ async fn paid_emits_both_facts() {
     let paid_on = NaiveDate::from_ymd_opt(2026, 4, 4).unwrap();
     inv.upsert_vendor_invoice(&vendor_invoice(
         "vi-ff-3",
-        VendorInvoiceStatus::Paid,
+        VendorInvoiceStatus::new(VendorInvoiceStatus::PAID),
         Some(approved_on),
         Some(approved_on),
         Some(paid_on),
@@ -215,7 +215,7 @@ async fn stepwise_lifecycle_emits_facts_exactly_once() {
 
     inv.upsert_vendor_invoice(&vendor_invoice(
         "vi-ff-4",
-        VendorInvoiceStatus::Received,
+        VendorInvoiceStatus::new(VendorInvoiceStatus::RECEIVED),
         None,
         None,
         None,
@@ -226,7 +226,7 @@ async fn stepwise_lifecycle_emits_facts_exactly_once() {
     let approved_on = NaiveDate::from_ymd_opt(2026, 3, 5).unwrap();
     inv.upsert_vendor_invoice(&vendor_invoice(
         "vi-ff-4",
-        VendorInvoiceStatus::Approved,
+        VendorInvoiceStatus::new(VendorInvoiceStatus::APPROVED),
         Some(approved_on),
         Some(approved_on),
         None,
@@ -237,7 +237,7 @@ async fn stepwise_lifecycle_emits_facts_exactly_once() {
     let paid_on = NaiveDate::from_ymd_opt(2026, 4, 4).unwrap();
     inv.upsert_vendor_invoice(&vendor_invoice(
         "vi-ff-4",
-        VendorInvoiceStatus::Paid,
+        VendorInvoiceStatus::new(VendorInvoiceStatus::PAID),
         Some(approved_on),
         Some(approved_on),
         Some(paid_on),
@@ -260,7 +260,7 @@ async fn replay_is_idempotent() {
     let paid_on = NaiveDate::from_ymd_opt(2026, 4, 4).unwrap();
     let fixture = vendor_invoice(
         "vi-ff-5",
-        VendorInvoiceStatus::Paid,
+        VendorInvoiceStatus::new(VendorInvoiceStatus::PAID),
         Some(approved_on),
         Some(approved_on),
         Some(paid_on),

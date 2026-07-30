@@ -331,7 +331,7 @@ mod tests {
             matched_on: None,
             approved_on: None,
             paid_on: None,
-            status: VendorInvoiceStatus::Received,
+            status: VendorInvoiceStatus::new(VendorInvoiceStatus::RECEIVED),
             discrepancy_cents: None,
             discrepancy_kind: None,
             lines: Vec::new(),
@@ -372,7 +372,10 @@ mod tests {
         let rows: Vec<VendorInvoice> = serde_json::from_slice(&body).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "VI-1");
-        assert_eq!(rows[0].status, VendorInvoiceStatus::Received);
+        assert_eq!(
+            rows[0].status,
+            VendorInvoiceStatus::new(VendorInvoiceStatus::RECEIVED)
+        );
     }
 
     #[tokio::test]
@@ -398,7 +401,10 @@ mod tests {
         assert_eq!(inv.id, "vi-PO-001");
         assert_eq!(inv.po_id, "PO-001");
         assert_eq!(inv.vendor, "Acme Parts Co");
-        assert_eq!(inv.status, VendorInvoiceStatus::Received);
+        assert_eq!(
+            inv.status,
+            VendorInvoiceStatus::new(VendorInvoiceStatus::RECEIVED)
+        );
         // Resolved from the PO's line (25 × 15_000), not supplied by caller.
         assert_eq!(inv.amount_cents, 25 * 15_000);
         assert_eq!(inv.lines.len(), 1);
@@ -523,16 +529,43 @@ mod tests {
     async fn upsert_invoice_skips_gate_when_discrepancy_kind_absent() {
         use boss_classes_client::FakeClassesClient;
         use boss_core::primitives::ClassRef;
-        // Registry knows nothing about this code, but a clean match
+        // Registry knows no discrepancy code but does know the status
+        // (statuses are always seeded); a clean match
         // (discrepancy_kind = None) must pass straight through.
-        let classes = Arc::new(FakeClassesClient::with(vec![ClassRef::new(
-            "vendor-invoice",
-            "overbilled",
-        )])) as Arc<dyn boss_classes_client::ClassesClient>;
+        let classes = Arc::new(FakeClassesClient::with(vec![
+            ClassRef::new("vendor-invoice", "overbilled"),
+            ClassRef::new("vendor-invoice", "received"),
+        ])) as Arc<dyn boss_classes_client::ClassesClient>;
         let app = app_with_classes_client(classes);
         let invoice = test_vendor_invoice("VI-D3", "PO-001"); // discrepancy_kind: None
         let resp = app.oneshot(post_invoice_request(&invoice)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn upsert_invoice_rejected_when_status_unknown() {
+        use boss_classes_client::FakeClassesClient;
+        use boss_core::primitives::ClassRef;
+        // The status vocabulary lives in the Class registry (the
+        // VendorInvoiceStatus enum lift); an unregistered status on the
+        // client body is a 400, not a silent write.
+        let classes = Arc::new(FakeClassesClient::with(vec![ClassRef::new(
+            "vendor-invoice",
+            "received",
+        )])) as Arc<dyn boss_classes_client::ClassesClient>;
+        let app = app_with_classes_client(classes);
+        let mut invoice = test_vendor_invoice("VI-D5", "PO-001");
+        invoice.status = crate::types::VendorInvoiceStatus::new("under-review");
+        let resp = app.oneshot(post_invoice_request(&invoice)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(
+            body.contains("under-review") && body.contains("subject_kind='vendor-invoice'"),
+            "error must name the rejected status and the registry shape, got: {body}"
+        );
     }
 
     #[tokio::test]
@@ -565,7 +598,7 @@ mod tests {
             .await
             .unwrap();
         // Second POST: matched + approved, same id.
-        invoice.status = VendorInvoiceStatus::Approved;
+        invoice.status = VendorInvoiceStatus::new(VendorInvoiceStatus::APPROVED);
         invoice.matched_on = Some(chrono::NaiveDate::from_ymd_opt(2025, 3, 21).unwrap());
         invoice.approved_on = Some(chrono::NaiveDate::from_ymd_opt(2025, 3, 22).unwrap());
         let _ = app
@@ -596,7 +629,10 @@ mod tests {
         let rows: Vec<VendorInvoice> = serde_json::from_slice(&body).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "VI-2");
-        assert_eq!(rows[0].status, VendorInvoiceStatus::Approved);
+        assert_eq!(
+            rows[0].status,
+            VendorInvoiceStatus::new(VendorInvoiceStatus::APPROVED)
+        );
         assert!(rows[0].approved_on.is_some());
     }
 }

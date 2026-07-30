@@ -322,35 +322,54 @@ impl PurchaseOrder {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum VendorInvoiceStatus {
-    Received,
-    Matched,
-    Mismatched,
-    Approved,
-    Paid,
-}
+/// Vendor-invoice three-way-match status. Free-text wrapper around a
+/// Class code, same lift as [`PoStatus`]: tenants extend the
+/// lifecycle via Class rows (subject_kind='vendor-invoice',
+/// member_attribute='status') instead of forking core. Client-supplied
+/// statuses are validated at the API boundary; the wire shape is the
+/// same kebab string the old enum serialized.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct VendorInvoiceStatus(pub String);
 
 impl VendorInvoiceStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            VendorInvoiceStatus::Received => "received",
-            VendorInvoiceStatus::Matched => "matched",
-            VendorInvoiceStatus::Mismatched => "mismatched",
-            VendorInvoiceStatus::Approved => "approved",
-            VendorInvoiceStatus::Paid => "paid",
-        }
+    pub const RECEIVED: &'static str = "received";
+    pub const MATCHED: &'static str = "matched";
+    pub const MISMATCHED: &'static str = "mismatched";
+    pub const APPROVED: &'static str = "approved";
+    pub const PAID: &'static str = "paid";
+
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
     }
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "received" => VendorInvoiceStatus::Received,
-            "matched" => VendorInvoiceStatus::Matched,
-            "mismatched" => VendorInvoiceStatus::Mismatched,
-            "approved" => VendorInvoiceStatus::Approved,
-            "paid" => VendorInvoiceStatus::Paid,
-            _ => return None,
-        })
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// True once the invoice is settled — the terminal state the AP
+    /// batch-pay run stamps. Everything else (including a
+    /// tenant-added status) still counts as outstanding AP.
+    pub fn is_paid(&self) -> bool {
+        self.0 == Self::PAID
+    }
+}
+
+impl std::fmt::Display for VendorInvoiceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for VendorInvoiceStatus {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for VendorInvoiceStatus {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
     }
 }
 

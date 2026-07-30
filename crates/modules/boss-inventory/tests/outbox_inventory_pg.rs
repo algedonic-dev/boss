@@ -269,7 +269,7 @@ async fn vendor_invoice_reupsert_appends_no_duplicate_transition() {
         matched_on: None,
         approved_on: Some(approved_on),
         paid_on: None,
-        status: VendorInvoiceStatus::Approved,
+        status: VendorInvoiceStatus::new(VendorInvoiceStatus::APPROVED),
         discrepancy_cents: None,
         discrepancy_kind: None,
         lines: vec![],

@@ -1607,8 +1607,7 @@ impl VendorInvoiceRow {
             matched_on: self.matched_on,
             approved_on: self.approved_on,
             paid_on: self.paid_on,
-            status: VendorInvoiceStatus::parse(&self.status)
-                .unwrap_or(VendorInvoiceStatus::Received),
+            status: VendorInvoiceStatus::new(&self.status),
             discrepancy_cents: self.discrepancy_cents,
             // Free-text code lifted to the Class registry; trust the
             // stored value (validation lives at the API boundary).
