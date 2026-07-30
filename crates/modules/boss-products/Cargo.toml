@@ -22,6 +22,7 @@ postgres = ["dep:sqlx", "boss-events/postgres", "boss-ledger/postgres", "dep:bos
 [dependencies]
 boss-subject-kinds = { path = "../../core/boss-subject-kinds", features = ["postgres"], optional = true }
 boss-core = { path = "../../core/boss-core" }
+boss-classes-client = { path = "../../core/boss-classes-client" }
 boss-clock-client = { path = "../../core/boss-clock-client" }
 boss-ports = { path = "../../core/boss-ports" }
 boss-events = { path = "../../core/boss-events" }

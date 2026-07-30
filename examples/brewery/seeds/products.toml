@@ -7,10 +7,12 @@
 # rebuilder reproduces the catalog deterministically from
 # products.product.upserted on replay.
 #
-# package_unit values are tenant-defined and validated against
-# the Class registry's (subject_kind='product', member_attribute=
-# 'package_unit') rows — the brewery currently uses
-# 1/2-bbl-keg, 1/6-bbl-keg, 12oz-case.
+# product_kind and package_unit are both tenant-defined and validated
+# on upsert against the Class registry's (subject_kind='product', code)
+# rows — the brewery seeds product_kind='beer' and package_units
+# 1/2-bbl-keg, 1/6-bbl-keg, 12oz-case (see classes.toml). A SKU whose
+# kind or unit isn't a registered `product` Class is rejected 400, so
+# classes.json loads before this file (prepare step 1).
 #
 # Initial on-hand at the brewhouse cooler is wired separately
 # via finished_product_inventory POSTs so a fresh deploy renders

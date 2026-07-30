@@ -13,13 +13,17 @@
 -- One row per SKU = one product at one package size. `package_unit`
 -- is denorm metadata (the SKU itself encodes the unit) used for
 -- /products UI rollups by package class. `product_kind` lets a tenant
--- group SKUs (every brewery beer is `product_kind='beer'`).
+-- group SKUs (every brewery beer is `product_kind='beer'`). Both are
+-- tenant-extensible taxonomies with no DB CHECK by design: boss-products
+-- validates them on upsert against the Class registry keyed
+-- (subject_kind='product', code), so a tenant adds a new kind or unit by
+-- seeding a `product` Class, not by altering this table.
 -- -----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS products (
     sku             TEXT PRIMARY KEY,
     name            TEXT NOT NULL,
-    product_kind    TEXT NOT NULL,                          -- 'beer', 'cider', 'mead', 'refurb-device', ...
-    package_unit    TEXT NOT NULL,                          -- '1/2-bbl-keg', '1/6-bbl-keg', '12oz-case', 'unit'
+    product_kind    TEXT NOT NULL,                          -- Class (subject_kind='product'): 'beer', 'cider', 'mead', 'refurb-device', ...
+    package_unit    TEXT NOT NULL,                          -- Class (subject_kind='product'): '1/2-bbl-keg', '1/6-bbl-keg', '12oz-case', 'unit'
     description     TEXT,
     metadata        JSONB NOT NULL DEFAULT '{}'::jsonb,     -- abv, ibu, style, msrp_cents, ...
     active          BOOLEAN NOT NULL DEFAULT TRUE,

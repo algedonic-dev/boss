@@ -50,6 +50,11 @@ async fn main() -> Result<()> {
     );
     info!(%clock_url, "clock client wired");
 
+    let classes_client = Some(Arc::new(boss_classes_client::ReqwestClassesClient::new(
+        cfg.classes_api_url.clone(),
+    )) as Arc<dyn boss_classes_client::ClassesClient>);
+    info!(classes_url = %cfg.classes_api_url, "product taxonomy validation enabled");
+
     let publisher = match &cfg.nats_url {
         Some(url) => {
             let bus = boss_nats::NatsEventBus::connect(url)
@@ -75,6 +80,7 @@ async fn main() -> Result<()> {
         products,
         publisher,
         clock,
+        classes_client,
     };
     let app = router(state);
     // Sim-origin middleware: extract x-sim-origin header and set the
