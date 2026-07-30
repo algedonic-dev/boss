@@ -797,3 +797,62 @@ member_attribute = "package_unit"
 code = "12oz-case"
 display_name = "12oz Case"
 sort_order = 30
+
+# ---------------------------------------------------------------------------
+# Invoice revenue categories — the taxonomy the `invoice` subject kind
+# owns (alongside its platform status codes). boss-commerce validates
+# every invoice line's `revenue_category` against these rows keyed
+# (subject_kind='invoice', code). Tenant-curated: these are the
+# brewery's revenue lines (they mirror tenant.toml's
+# finance.revenue_category.* labels the /finance + invoice UIs show).
+# Add a code here before a line item can use it.
+# ---------------------------------------------------------------------------
+
+[[class]]
+subject_kind = "invoice"
+member_attribute = "revenue_category"
+code = "wholesale"
+display_name = "Wholesale beer"
+sort_order = 10
+
+[[class]]
+subject_kind = "invoice"
+member_attribute = "revenue_category"
+code = "retail"
+display_name = "Retail (DTC)"
+sort_order = 20
+
+[[class]]
+subject_kind = "invoice"
+member_attribute = "revenue_category"
+code = "taproom"
+display_name = "Taproom pours"
+sort_order = 30
+
+[[class]]
+subject_kind = "invoice"
+member_attribute = "revenue_category"
+code = "event-package"
+display_name = "Event packages"
+sort_order = 40
+
+[[class]]
+subject_kind = "invoice"
+member_attribute = "revenue_category"
+code = "distribution"
+display_name = "Distribution"
+sort_order = 50
+
+[[class]]
+subject_kind = "invoice"
+member_attribute = "revenue_category"
+code = "merchandise"
+display_name = "Merchandise"
+sort_order = 60
+
+[[class]]
+subject_kind = "invoice"
+member_attribute = "revenue_category"
+code = "uncategorized"
+display_name = "Uncategorized"
+sort_order = 70

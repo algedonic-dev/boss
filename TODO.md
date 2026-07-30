@@ -119,13 +119,14 @@ lives here now. Items verified still open at re-homing:
       (#166). Neither carries a DB CHECK by design; a tenant adds a
       kind/unit by seeding a `product` Class. Made the products.toml
       doc claim (previously package_unit only) true for both fields.
-- [ ] Invoice `revenue_category` validation — enforce against the
-      tenant's `finance.revenue_category.*` config vocabulary (the
-      gateway already serves it; the commerce write path doesn't gate
-      it). Deliberately NOT a Class: there's no revenue Subject, and
-      free-text is the honest default for an unconfigured tenant
-      (class-registry.md §"When NOT to use"). Permissive when unset,
-      503 when the vocabulary is unreadable.
+- [x] Invoice `revenue_category` — validated on every line against the
+      Class registry keyed (subject_kind='invoice', code). Revenue
+      categories are a taxonomy the `invoice` subject owns
+      (01-registries.sql), seeded per-tenant (classes.json); the
+      `invoice` Class namespace carries both status + revenue-category
+      codes without collision. Not a Class of a fake "revenue" subject
+      and not config-vocab (no module reads tenant.toml) — the invoice
+      IS the subject, mirroring the existing invoice-status gate.
 - [ ] Deferred taxonomy lifts: account tier/type, vendor
       `payment_terms`, revenue categories, tax jurisdictions/rates
       in `rules.toml`.

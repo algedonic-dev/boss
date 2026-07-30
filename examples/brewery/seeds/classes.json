@@ -451,5 +451,54 @@
     "display_name": "12oz Case",
     "member_attribute": "package_unit",
     "sort_order": 30
+  },
+  {
+    "subject_kind": "invoice",
+    "code": "wholesale",
+    "display_name": "Wholesale beer",
+    "member_attribute": "revenue_category",
+    "sort_order": 10
+  },
+  {
+    "subject_kind": "invoice",
+    "code": "retail",
+    "display_name": "Retail (DTC)",
+    "member_attribute": "revenue_category",
+    "sort_order": 20
+  },
+  {
+    "subject_kind": "invoice",
+    "code": "taproom",
+    "display_name": "Taproom pours",
+    "member_attribute": "revenue_category",
+    "sort_order": 30
+  },
+  {
+    "subject_kind": "invoice",
+    "code": "event-package",
+    "display_name": "Event packages",
+    "member_attribute": "revenue_category",
+    "sort_order": 40
+  },
+  {
+    "subject_kind": "invoice",
+    "code": "distribution",
+    "display_name": "Distribution",
+    "member_attribute": "revenue_category",
+    "sort_order": 50
+  },
+  {
+    "subject_kind": "invoice",
+    "code": "merchandise",
+    "display_name": "Merchandise",
+    "member_attribute": "revenue_category",
+    "sort_order": 60
+  },
+  {
+    "subject_kind": "invoice",
+    "code": "uncategorized",
+    "display_name": "Uncategorized",
+    "member_attribute": "revenue_category",
+    "sort_order": 70
   }
 ]

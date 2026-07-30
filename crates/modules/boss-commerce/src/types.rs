@@ -76,10 +76,13 @@ impl From<&str> for InvoiceStatus {
 /// chart-of-accounts codes; they fail-open on unknown values
 /// rather than rejecting at the type system. That's the
 /// trade-off vs the prior closed enum — broader tenant support
-/// at the cost of "compiler caught my typo." Mitigation:
-/// tenant.toml's `[labels]` block is the human-readable
-/// reference; ledger posting rules log warnings on categories
-/// that fall through to the uncategorized bucket.
+/// at the cost of "compiler caught my typo." The typo is instead
+/// caught at the write boundary: `create_invoice`/`batch_invoices`
+/// validate every line's category against the Class registry keyed
+/// `(subject_kind='invoice', code)`, so an unregistered category is a
+/// 400, not a silent uncategorized bucket. The `invoice` Classes are
+/// tenant-curated (the brewery's live in classes.json, mirroring
+/// tenant.toml's `[labels]` for display).
 ///
 /// Construct from string literals via
 /// `RevenueCategory::from("wholesale")` or
