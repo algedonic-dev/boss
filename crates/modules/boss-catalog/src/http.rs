@@ -164,10 +164,12 @@ async fn check_category(
     }
 }
 
-/// Validate each document's `kind` against the Class registry under
-/// `(subject_kind='asset', member_attribute='document-kind')`. Same
-/// contract as `check_category`: permissive when no registry is wired,
-/// fail-closed (503) when it's unreachable, 400 on an unregistered code.
+/// Validate each document's `kind` and `audience` against the Class
+/// registry under `subject_kind='asset'` (kinds carry
+/// `member_attribute='document-kind'`, audiences 'document-audience').
+/// Same contract as `check_category`: permissive when no registry is
+/// wired, fail-closed (503) when it's unreachable, 400 on an
+/// unregistered code.
 async fn check_document_kinds(
     classes_client: Option<&Arc<dyn ClassesClient>>,
     documents: &[Document],
@@ -176,26 +178,31 @@ async fn check_document_kinds(
         return Ok(());
     };
     for doc in documents {
-        let class_ref = ClassRef::new("asset", doc.kind.as_str());
-        match client.class_exists(&class_ref).await {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "unknown document kind `{}` — register it as a Class first \
-                         (subject_kind='asset', member_attribute='document-kind')",
-                        doc.kind.as_str()
-                    ),
-                )
-                    .into_response());
-            }
-            Err(e) => {
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("classes registry unreachable: {e}"),
-                )
-                    .into_response());
+        for (code, attribute) in [
+            (doc.kind.as_str(), "document-kind"),
+            (doc.audience.as_str(), "document-audience"),
+        ] {
+            let class_ref = ClassRef::new("asset", code);
+            match client.class_exists(&class_ref).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "unknown document {attribute} `{code}` — register it as a \
+                             Class first (subject_kind='asset', \
+                             member_attribute='{attribute}')"
+                        ),
+                    )
+                        .into_response());
+                }
+                Err(e) => {
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("classes registry unreachable: {e}"),
+                    )
+                        .into_response());
+                }
             }
         }
     }
