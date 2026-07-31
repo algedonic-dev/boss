@@ -142,9 +142,12 @@ lives here now. Items verified still open at re-homing:
         dispatcher RULE ARGS (`default_revenue_category`,
         `tax_jurisdiction`, `taxable_categories`, `tax_rate_bps`), not a
         taxonomy table — a different shape than a Class lift.
-- [ ] Vendor `category` is unvalidated on the write path despite having
-      seeded `vendor` Classes (grain-supplier, …) the sim relies on —
-      the same gate as `payment_terms`, just for `category`. Own PR.
+- [x] Vendor `category` — validated on the vendor write path against
+      (subject_kind='vendor', code), sharing the `check_vendor_class`
+      helper with `payment_terms` (#169). Completed the category Class
+      vocabulary: the 8 plain OpEx categories the loaded classes.json
+      never carried (only .toml had them — drift) + `uncategorized` (the
+      sim's spawn default) now seed, so every posted category resolves.
 - [ ] `brewery-hire` subject shape (an existing employee as the
       hire target) — suppressed with `rate=0`; needs remodeling,
       likely subject = the requisition or the org.

@@ -70,13 +70,16 @@ CREATE TABLE IF NOT EXISTS vendors (
     state             TEXT,
     lead_time_days    SMALLINT NOT NULL DEFAULT 7,
     payment_terms     TEXT,  -- Class (subject_kind='vendor'): net-30 / net-45 / net-60 / prepaid; validated at the API boundary
-    -- Free-text per-tenant taxonomy. Brewery uses
-    -- grain-supplier / hops-supplier / yeast-bank / packaging /
-    -- specialty-ingredients / equipment / general; the
-    -- used-device-shop tenant uses networking-components / optics /
-    -- electronics / consumables / packaging / calibration /
-    -- general. Class registry validates per-tenant. Nullable: an
-    -- un-categorized vendor isn't an auto-restock target yet.
+    -- Tenant-curated taxonomy, validated on the vendor write path
+    -- against the Class registry keyed (subject_kind='vendor', code) —
+    -- no DB CHECK. The five supply-chain categories (grain-supplier,
+    -- hops-supplier, yeast-bank, specialty-ingredients, packaging) carry
+    -- a `behavior_template`; the rest (equipment, utilities, lab,
+    -- logistics, marketing, professional-services, sanitation, uniforms)
+    -- are plain OpEx/service categories, plus `uncategorized` for the
+    -- sim-spawned catch-all. Add a category by seeding a `vendor` Class.
+    -- Nullable: an un-categorized (NULL) vendor isn't an auto-restock
+    -- target yet and skips the gate.
     category          TEXT,
     -- How the system expects this vendor to behave (supply lead time,
     -- fulfilment, AP timing) — per-actor data the simulator reads to drive
