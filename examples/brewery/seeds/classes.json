@@ -425,6 +425,69 @@
     "sort_order": 50
   },
   {
+    "subject_kind": "vendor",
+    "code": "equipment",
+    "display_name": "Equipment (Fermenters / Pumps)",
+    "member_attribute": "category",
+    "sort_order": 60
+  },
+  {
+    "subject_kind": "vendor",
+    "code": "utilities",
+    "display_name": "Utilities / Water Treatment",
+    "member_attribute": "category",
+    "sort_order": 70
+  },
+  {
+    "subject_kind": "vendor",
+    "code": "lab",
+    "display_name": "Analytical Lab / Testing",
+    "member_attribute": "category",
+    "sort_order": 75
+  },
+  {
+    "subject_kind": "vendor",
+    "code": "logistics",
+    "display_name": "Logistics / Freight",
+    "member_attribute": "category",
+    "sort_order": 80
+  },
+  {
+    "subject_kind": "vendor",
+    "code": "marketing",
+    "display_name": "Marketing / Printers",
+    "member_attribute": "category",
+    "sort_order": 85
+  },
+  {
+    "subject_kind": "vendor",
+    "code": "professional-services",
+    "display_name": "Professional Services (Legal / Accounting)",
+    "member_attribute": "category",
+    "sort_order": 90
+  },
+  {
+    "subject_kind": "vendor",
+    "code": "sanitation",
+    "display_name": "Sanitation / Cleaning",
+    "member_attribute": "category",
+    "sort_order": 95
+  },
+  {
+    "subject_kind": "vendor",
+    "code": "uniforms",
+    "display_name": "Uniforms / Workwear",
+    "member_attribute": "category",
+    "sort_order": 100
+  },
+  {
+    "subject_kind": "vendor",
+    "code": "uncategorized",
+    "display_name": "Uncategorized",
+    "member_attribute": "category",
+    "sort_order": 999
+  },
+  {
     "subject_kind": "product",
     "code": "beer",
     "display_name": "Beer",

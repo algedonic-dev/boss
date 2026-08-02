@@ -415,6 +415,17 @@ code = "uniforms"
 display_name = "Uniforms / Workwear"
 sort_order = 100
 
+# The sim's counterparty spawner mints vendors with category
+# 'uncategorized' (shape_driven engine) — the catch-all bucket for a
+# vendor not yet classified. Must be a registered Class now that the
+# write path validates category.
+[[class]]
+subject_kind = "vendor"
+member_attribute = "category"
+code = "uncategorized"
+display_name = "Uncategorized"
+sort_order = 999
+
 # ---------------------------------------------------------------------------
 # Employee — industrial-brewery org expansion
 #

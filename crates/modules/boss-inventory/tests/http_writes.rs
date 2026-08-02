@@ -85,6 +85,44 @@ async fn post_vendor_gates_payment_terms_against_the_class_registry() {
         .assert_status(StatusCode::CREATED);
 }
 
+/// `category` is gated the same way as `payment_terms` — both validate
+/// against (subject_kind='vendor', code) via the shared helper: a
+/// registered category creates (201), an unregistered one is rejected
+/// (400), an absent one still creates (201 — NULL-permissive).
+#[tokio::test]
+async fn post_vendor_gates_category_against_the_class_registry() {
+    use boss_classes_client::{ClassesClient, FakeClassesClient};
+    use boss_core::primitives::ClassRef;
+    use std::sync::Arc;
+
+    let classes = Arc::new(FakeClassesClient::with(vec![ClassRef::new(
+        "vendor",
+        "grain-supplier",
+    )])) as Arc<dyn ClassesClient>;
+    let app = InventoryTestApp::with_classes(classes);
+
+    // Registered category → created.
+    TestRequest::post("/api/inventory/vendors")
+        .json(&json!({ "id": "VND-CAT-OK", "name": "Malthouse", "category": "grain-supplier" }))
+        .send(&app.router)
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    // Unregistered category → rejected.
+    TestRequest::post("/api/inventory/vendors")
+        .json(&json!({ "id": "VND-CAT-BAD", "name": "Mystery Co", "category": "unicorn-farm" }))
+        .send(&app.router)
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+
+    // Absent category → created (nullable, enriched later).
+    TestRequest::post("/api/inventory/vendors")
+        .json(&json!({ "id": "VND-CAT-NONE", "name": "TBD Vendor" }))
+        .send(&app.router)
+        .await
+        .assert_status(StatusCode::CREATED);
+}
+
 #[tokio::test]
 async fn post_vendor_emits_vendor_created_event() {
     let app = InventoryTestApp::new();

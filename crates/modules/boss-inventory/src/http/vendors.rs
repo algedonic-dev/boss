@@ -16,30 +16,29 @@ use super::InventoryApiState;
 use crate::port::{InventoryError, InventoryRepository};
 use crate::types::{Vendor, VendorBehavior};
 
-/// Validate a vendor's `payment_terms` against the Class registry under
-/// `(subject_kind='vendor')`. Terms are a curated vocabulary (net-30,
-/// prepaid, …) the tenant extends by adding a Class row, not by editing
-/// a DB CHECK — the CHECK this replaces forced a core fork to add a
-/// term. Same contract as [`super::vendor_invoices`]' status gate:
-/// permissive when no registry is wired, 503 when unreachable, 400 on an
-/// unregistered code. The caller skips the optional field — an absent
-/// `payment_terms` (nullable, enriched later) never reaches here.
-/// Vendor `category` and `payment_terms` share the `vendor` code
-/// namespace; their `member_attribute` keeps them distinct.
-async fn check_payment_terms(
+/// Validate a vendor taxonomy value against the Class registry under
+/// `(subject_kind='vendor')`. Both `category` and `payment_terms` are
+/// curated vocabularies a tenant extends by adding a Class row (not by
+/// editing a DB CHECK); they share the `vendor` code namespace, kept
+/// distinct in the registry by `member_attribute`. Same contract as
+/// [`super::vendor_invoices`]' status gate: permissive when no registry
+/// is wired, 503 when unreachable, 400 on an unregistered code. Callers
+/// skip the optional field — an absent value (nullable, enriched later)
+/// never reaches here. `field` names the offending attribute in the 400.
+async fn check_vendor_class(
     classes_client: Option<&Arc<dyn ClassesClient>>,
-    terms: &str,
+    field: &str,
+    code: &str,
 ) -> Result<(), Response> {
     let Some(client) = classes_client else {
         return Ok(());
     };
-    let class_ref = ClassRef::new("vendor", terms);
-    match client.class_exists(&class_ref).await {
+    match client.class_exists(&ClassRef::new("vendor", code)).await {
         Ok(true) => Ok(()),
         Ok(false) => Err((
             StatusCode::BAD_REQUEST,
             format!(
-                "unknown payment terms `{terms}` — register it as a Class first \
+                "unknown {field} `{code}` — register it as a Class first \
                  (subject_kind='vendor')"
             ),
         )
@@ -99,10 +98,16 @@ pub(super) async fn create_vendor<R: InventoryRepository + 'static>(
     CurrentUser(user): CurrentUser,
     Json(body): Json<CreateVendorRequest>,
 ) -> Response {
-    // Optional-skip: only a *present* payment_terms is validated; an
+    // Optional-skip: only *present* taxonomy fields are validated; an
     // absent one (nullable, enriched later) passes straight through.
     if let Some(terms) = body.payment_terms.as_deref()
-        && let Err(resp) = check_payment_terms(state.classes_client.as_ref(), terms).await
+        && let Err(resp) =
+            check_vendor_class(state.classes_client.as_ref(), "payment terms", terms).await
+    {
+        return resp;
+    }
+    if let Some(cat) = body.category.as_deref()
+        && let Err(resp) = check_vendor_class(state.classes_client.as_ref(), "category", cat).await
     {
         return resp;
     }
@@ -148,10 +153,16 @@ pub(super) async fn update_vendor<R: InventoryRepository + 'static>(
     CurrentUser(user): CurrentUser,
     Json(body): Json<CreateVendorRequest>,
 ) -> Response {
-    // Optional-skip: only a *present* payment_terms is validated; an
+    // Optional-skip: only *present* taxonomy fields are validated; an
     // absent one (nullable, enriched later) passes straight through.
     if let Some(terms) = body.payment_terms.as_deref()
-        && let Err(resp) = check_payment_terms(state.classes_client.as_ref(), terms).await
+        && let Err(resp) =
+            check_vendor_class(state.classes_client.as_ref(), "payment terms", terms).await
+    {
+        return resp;
+    }
+    if let Some(cat) = body.category.as_deref()
+        && let Err(resp) = check_vendor_class(state.classes_client.as_ref(), "category", cat).await
     {
         return resp;
     }
