@@ -94,13 +94,32 @@ pub struct NewBankSettlement<'a> {
     pub settle_in_days: Option<i64>,
 }
 
-/// Insert a fresh pending settlement. Idempotent on `id` — a repeat
-/// insert with the same id is a no-op (returns the existing row),
-/// which lets sim replays re-hit the same payments without duplicates.
-pub async fn create_pending(
-    pool: &PgPool,
+/// A settlement write plus whether it actually created the row.
+/// `inserted` is the idempotency guard doubling as the event gate: the
+/// caller records `ledger.payment.received` only when a row really
+/// landed, so a repeat POST can't put a second receive in the log.
+#[derive(Debug, Clone)]
+pub struct CreatedSettlement {
+    pub settlement: BankSettlement,
+    pub inserted: bool,
+}
+
+/// Insert a fresh pending settlement, inside the caller's transaction
+/// so the receive event can ride the same commit. Idempotent on `id` —
+/// a repeat insert with the same id is a no-op (returns the existing
+/// row), which lets sim replays re-hit the same payments without
+/// duplicates.
+///
+/// In-tx is load-bearing now that `bank_settlements` is a projection of
+/// the log (see `rebuild_bank_settlements`): a row that committed
+/// without its event would simply vanish on the next rebuild.
+///
+/// `xmax = 0` is Postgres's tell for "this RETURNING row came from the
+/// INSERT arm, not the DO UPDATE arm".
+pub async fn create_pending_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     new: NewBankSettlement<'_>,
-) -> Result<BankSettlement, LedgerError> {
+) -> Result<CreatedSettlement, LedgerError> {
     if new.amount_cents <= 0 {
         return Err(LedgerError::Storage(
             "amount_cents must be positive".to_string(),
@@ -118,7 +137,8 @@ pub async fn create_pending(
          VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending') \
          ON CONFLICT (id) DO UPDATE SET updated_at = bank_settlements.updated_at \
          RETURNING id, invoice_id, received_on, expected_settle_on, settled_on, \
-                   amount_cents, bank_provider, payment_method, status",
+                   amount_cents, bank_provider, payment_method, status, \
+                   (xmax = 0) AS inserted",
     )
     .bind(new.id)
     .bind(new.invoice_id)
@@ -127,11 +147,14 @@ pub async fn create_pending(
     .bind(new.amount_cents)
     .bind(new.bank_provider)
     .bind(new.payment_method.as_str())
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await
     .map_err(|e| LedgerError::Storage(e.to_string()))?;
 
-    Ok(row_to_settlement(&row))
+    Ok(CreatedSettlement {
+        inserted: row.get("inserted"),
+        settlement: row_to_settlement(&row),
+    })
 }
 
 /// All pending settlements whose expected-settle date has arrived

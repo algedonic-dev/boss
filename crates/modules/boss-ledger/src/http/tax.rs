@@ -338,8 +338,31 @@ pub(super) async fn create_tax_filing(
         None => body.amount_cents,
     };
 
-    let filing = match crate::tax_filings::upsert(
-        &state.pool,
+    let stamp = super::event_stamp(
+        &state,
+        &user,
+        boss_clock_client::now_from(&state.clock).await,
+    )
+    .await;
+
+    // The row and its creation event commit together. `tax_filings` is
+    // a projection of `ledger.tax.filing.created` (+ `ledger.tax.remitted`
+    // for the status flip), so a row that reached the table without its
+    // event in the log would vanish on the next rebuild — and a filing
+    // that survives a rebuild it shouldn't is exactly the bug this
+    // projection closes (see `rebuild_tax_filings`).
+    //
+    // Emitted for EVERY kind, not just the accruing ones: sales /
+    // payroll_941 / payroll_940 / excise post no accrual entry (their
+    // liability was already credited by their own source facts), so
+    // `ledger.tax.accrued` alone would leave four of the five kinds
+    // unreconstructable.
+    let mut tx = match state.pool.begin().await {
+        Ok(t) => t,
+        Err(e) => return storage_err(e),
+    };
+    let upserted = match crate::tax_filings::upsert_in_tx(
+        &mut tx,
         crate::tax_filings::NewTaxFiling {
             id: &body.id,
             kind: &body.kind,
@@ -354,20 +377,44 @@ pub(super) async fn create_tax_filing(
     )
     .await
     {
-        Ok(f) => f,
+        Ok(u) => u,
         Err(e) => return ledger_err(e),
     };
+    let filing = upserted.filing;
+
+    // Gate on the upsert's own idempotency: a repeat POST that resolved
+    // to an existing row must not append a second creation to the log.
+    if upserted.inserted {
+        let created_payload = serde_json::json!({
+            "filing_id": filing.id,
+            "kind": filing.kind,
+            "jurisdiction": filing.jurisdiction,
+            "period_start": filing.period_start,
+            "period_end": filing.period_end,
+            "due_on": filing.due_on,
+            "amount_cents": filing.amount_cents,
+            "liability_account": filing.liability_account,
+            "provider": filing.provider,
+        });
+        if let Err(e) = crate::events::record_ledger_event_in_tx(
+            &mut tx,
+            &stamp,
+            "ledger.tax.filing.created",
+            created_payload,
+        )
+        .await
+        {
+            return ledger_err(e);
+        }
+    }
+    if let Err(e) = tx.commit().await {
+        return storage_err(e);
+    }
 
     if accrue {
         let expense_account = expense_account
             .as_deref()
             .expect("accrue implies an expense account from tax_kinds");
-        let stamp = super::event_stamp(
-            &state,
-            &user,
-            boss_clock_client::now_from(&state.clock).await,
-        )
-        .await;
         if let Err(e) = post_accrual_entry(
             &state.pool,
             &stamp,

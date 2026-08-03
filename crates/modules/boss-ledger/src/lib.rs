@@ -44,9 +44,13 @@ pub mod postgres;
 #[cfg(feature = "postgres")]
 pub mod rebuild;
 #[cfg(feature = "postgres")]
+pub mod rebuild_bank_settlements;
+#[cfg(feature = "postgres")]
 pub mod rebuild_facts;
 #[cfg(feature = "postgres")]
 pub mod rebuild_payroll;
+#[cfg(feature = "postgres")]
+pub mod rebuild_tax_filings;
 #[cfg(feature = "postgres")]
 pub mod replay_check;
 #[cfg(feature = "postgres")]
@@ -74,6 +78,16 @@ pub use rebuild_facts::{
 
 #[cfg(feature = "postgres")]
 pub use rebuild_payroll::{RebuildPayrollReport, rebuild_payroll, rebuild_payroll_in_tx};
+
+#[cfg(feature = "postgres")]
+pub use rebuild_tax_filings::{
+    RebuildTaxFilingsReport, rebuild_tax_filings, rebuild_tax_filings_in_tx,
+};
+
+#[cfg(feature = "postgres")]
+pub use rebuild_bank_settlements::{
+    RebuildBankSettlementsReport, rebuild_bank_settlements, rebuild_bank_settlements_in_tx,
+};
 
 #[cfg(feature = "postgres")]
 pub use replay_check::{

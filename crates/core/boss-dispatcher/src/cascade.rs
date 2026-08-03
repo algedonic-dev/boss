@@ -68,7 +68,14 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         ),
         ("ledger.bill.payment_batch", vec!["ledger.bill.paid"]),
         ("ledger.tax.accrue", vec!["ledger.tax.accrued"]),
-        ("ledger.tax.remit", vec!["ledger.tax.remitted"]),
+        // Two emits: the handler POSTs the filing (which records
+        // `ledger.tax.filing.created` — the event `tax_filings` is
+        // projected from) and then, when `remit=true`, follows with the
+        // remit POST.
+        (
+            "ledger.tax.remit",
+            vec!["ledger.tax.filing.created", "ledger.tax.remitted"],
+        ),
         ("ledger.payroll.run.submit", vec!["ledger.payroll.run"]),
         ("people.hire", vec!["people.employee.created"]),
         ("people.terminate", vec!["people.employee.updated"]),

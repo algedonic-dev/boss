@@ -87,8 +87,17 @@ pub(super) async fn create_bank_settlement(
         return Json(BankSettlementView::from(existing)).into_response();
     }
 
-    let settlement = match crate::bank_settlements::create_pending(
-        &state.pool,
+    // The row and its receive event commit together: `bank_settlements`
+    // is a projection of `ledger.payment.received` (+
+    // `ledger.payment.settled` for the status flip), so a row that
+    // committed without its event would vanish on the next rebuild.
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => return storage_err(e),
+    };
+
+    let created = match crate::bank_settlements::create_pending_in_tx(
+        &mut tx,
         crate::bank_settlements::NewBankSettlement {
             id: &body.id,
             invoice_id: &body.invoice_id,
@@ -101,22 +110,36 @@ pub(super) async fn create_bank_settlement(
     )
     .await
     {
-        Ok(s) => s,
+        Ok(c) => c,
         Err(e) => return ledger_err(e),
     };
+    let settlement = created.settlement;
 
-    let mut tx = match state.pool.begin().await {
-        Ok(tx) => tx,
-        Err(e) => return storage_err(e),
-    };
+    // Gate the fact + event on the insert actually happening. The
+    // `get` short-circuit above catches the ordinary repeat POST; this
+    // catches the concurrent one, where the loser must not append a
+    // second receive for a settlement the winner already logged.
+    if !created.inserted {
+        let _ = tx.rollback().await;
+        return Json(BankSettlementView::from(settlement)).into_response();
+    }
 
+    // `expected_settle_on` + `bank_provider` ride the payload so the
+    // row is reconstructable. The settle window is NOT re-derivable on
+    // replay: `settle_in_days` overrides the method default, so
+    // recomputing it would make the rebuilt row disagree with what
+    // actually happened. This is the fact payload too — the projection
+    // rule maps the event through wholesale, so live and rebuilt facts
+    // stay byte-identical.
     let payload = serde_json::json!({
         "invoice_id": body.invoice_id,
         "account_id": body.account_id,
         "settlement_id": body.id,
         "received_on": body.received_on,
+        "expected_settle_on": settlement.expected_settle_on,
         "amount_cents": body.amount_cents,
         "currency": body.currency,
+        "bank_provider": body.bank_provider,
         "payment_method": body.payment_method,
     });
     let live_fact_id = match crate::events::record_fact_in_tx(

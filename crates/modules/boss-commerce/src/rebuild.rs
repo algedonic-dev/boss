@@ -52,32 +52,19 @@ pub async fn rebuild_commerce(pool: &PgPool) -> Result<RebuildReport, RebuildErr
     // trace back to an event. Service agreements ride alongside
     // invoices.
     //
-    // bank_settlements is *live* state (written by the
-    // /api/ledger/bank-settlements/* HTTP path, not from audit_log)
-    // with an FK to invoices(id). To survive the TRUNCATE we:
-    //   1. snapshot (id → invoice_id) into a temp table,
-    //   2. detach (NULL-out invoice_id) so CASCADE doesn't delete
-    //      the rows,
-    //   3. TRUNCATE invoices,
-    //   4. replay invoice events to re-upsert invoices with the
-    //      same deterministic id (inv-step-{step_id}),
-    //   5. restore invoice_id from the snapshot.
-    // The schema makes invoice_id nullable to make step 2 legal;
-    // step 5 puts it back so the live FK semantics hold once the
-    // rebuild commits.
-    sqlx::query(
-        "CREATE TEMP TABLE _bs_attachments \
-         ON COMMIT DROP \
-         AS SELECT id, invoice_id FROM bank_settlements \
-         WHERE invoice_id IS NOT NULL",
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| RebuildError::Storage(e.to_string()))?;
-    sqlx::query("UPDATE bank_settlements SET invoice_id = NULL WHERE invoice_id IS NOT NULL")
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| RebuildError::Storage(e.to_string()))?;
+    // `bank_settlements` used to be detached-and-re-attached around
+    // this TRUNCATE (snapshot id → invoice_id, NULL the column, replay
+    // invoices, restore by the deterministic inv-step-{step_id} key).
+    // That dance is gone: it guarded an FK bank_settlements → invoices
+    // that does not exist, so the CASCADE never reached the table
+    // anyway — and after a demo epoch trim the prior lap's invoices are
+    // gone for good, so the re-attach silently left every one of those
+    // rows with a NULL invoice_id, forever. They accumulated into the
+    // millions and crashed the settlement sweep (`row_to_settlement`
+    // decodes invoice_id as a non-Option String). `bank_settlements` is
+    // now a projection of audit_log in its own right — see
+    // boss_ledger::rebuild_bank_settlements, which runs after this step
+    // in boss-rebuild-all.
     sqlx::query("TRUNCATE invoices, invoice_line_items, service_agreements CASCADE")
         .execute(&mut *tx)
         .await
@@ -145,22 +132,6 @@ pub async fn rebuild_commerce(pool: &PgPool) -> Result<RebuildReport, RebuildErr
             }
         }
     }
-
-    // Step 5: re-attach bank_settlements rows to the freshly
-    // upserted invoices. Settlements whose invoice didn't replay
-    // (deleted upstream, schema drift) keep NULL invoice_id —
-    // they're discoverable via a follow-up audit but don't break
-    // the rebuild.
-    sqlx::query(
-        "UPDATE bank_settlements bs \
-         SET invoice_id = a.invoice_id \
-         FROM _bs_attachments a \
-         WHERE bs.id = a.id \
-           AND EXISTS (SELECT 1 FROM invoices i WHERE i.id = a.invoice_id)",
-    )
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| RebuildError::Storage(e.to_string()))?;
 
     tx.commit()
         .await

@@ -473,18 +473,20 @@ ON CONFLICT (event_kind) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS bank_settlements (
     id                  TEXT PRIMARY KEY,
-    -- NULLable so the commerce rebuilder can detach + reattach
-    -- bank_settlements rows around a TRUNCATE-then-replay of
-    -- invoices. The rebuild's intent (see boss-commerce
-    -- src/rebuild.rs): UPDATE invoice_id=NULL, TRUNCATE invoices
-    -- CASCADE (skipping bank_settlements), re-upsert invoices,
-    -- bank_settlements rows survive with detached invoice_id
-    -- pointers that snap back via the same deterministic
-    -- inv-step-{step_id} key the live emitter mints. NOT NULL
-    -- would force a full bank_settlements rebuild from
-    -- audit_log too, which today's design treats as live state
-    -- written by /api/ledger/bank-settlements/* endpoints.
-    invoice_id          TEXT,
+    -- NOT NULL. This column was nullable so the commerce rebuilder
+    -- could detach + re-attach settlements around its TRUNCATE of
+    -- invoices. That dance is gone (it guarded an FK to invoices that
+    -- never existed) and `bank_settlements` is now a projection of
+    -- audit_log in its own right — boss_ledger::rebuild_bank_settlements
+    -- TRUNCATEs and replays `ledger.payment.received` /
+    -- `ledger.payment.settled`, and a receive always carries its
+    -- invoice_id. Leaving it nullable is what let 1.1M orphaned rows
+    -- accumulate across demo epochs and crash the settlement sweep:
+    -- `row_to_settlement` decodes this into a non-Option String, so one
+    -- NULL in the sweep's window panicked every call and stopped AR
+    -- collections for the rest of the lap. A settlement with no invoice
+    -- is not a meaningful row; the constraint says so.
+    invoice_id          TEXT NOT NULL,
     received_on         DATE NOT NULL,
     expected_settle_on  DATE NOT NULL,
     settled_on          DATE,

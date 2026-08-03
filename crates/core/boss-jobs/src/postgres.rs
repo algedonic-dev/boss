@@ -14,20 +14,34 @@ pub struct PgJobs {
     /// helpers (`boss-rebuild-all` for the demo-loop reset) can
     /// reuse it without parsing config or guessing.
     db_url: Option<String>,
+    /// NATS URL retained for the same reason: the demo-loop reset
+    /// purges the JetStream delivery buffer, and this service reads
+    /// its broker address from config (`nats_url`), not from the
+    /// environment — so guessing at `BOSS_NATS_URL` would silently
+    /// skip the purge on every real deployment.
+    nats_url: Option<String>,
 }
 
 impl PgJobs {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool, db_url: None }
+        Self {
+            pool,
+            db_url: None,
+            nats_url: None,
+        }
     }
 
-    /// Constructor variant that retains the connection URL for
-    /// subprocess helpers. Falls back to `BOSS_POSTGRES_URL` env
-    /// var or a hardcoded default when the URL isn't passed.
-    pub fn with_url(pool: PgPool, db_url: String) -> Self {
+    /// Constructor variant that retains the connection URLs for the
+    /// demo-loop reset: `db_url` for the `boss-rebuild-all` subprocess,
+    /// `nats_url` for the delivery-buffer purge. `db_url` falls back to
+    /// `BOSS_POSTGRES_URL` or a hardcoded default when absent;
+    /// `nats_url` falls back to `BOSS_NATS_URL`, and the purge is
+    /// skipped if neither is set.
+    pub fn with_urls(pool: PgPool, db_url: String, nats_url: String) -> Self {
         Self {
             pool,
             db_url: Some(db_url),
+            nats_url: Some(nats_url),
         }
     }
 }
@@ -1158,8 +1172,15 @@ impl JobsRepository for PgJobs {
             .clone()
             .or_else(|| std::env::var("BOSS_POSTGRES_URL").ok())
             .unwrap_or_else(|| "postgres://boss:boss@127.0.0.1/boss".to_string());
+        let nats_url = self
+            .nats_url
+            .clone()
+            .or_else(|| std::env::var("BOSS_NATS_URL").ok());
         tokio::spawn(async move {
-            if let Err(e) = run_restart_epoch_background(&pool, &db_url, start, baseline).await {
+            if let Err(e) =
+                run_restart_epoch_background(&pool, &db_url, nats_url.as_deref(), start, baseline)
+                    .await
+            {
                 tracing::error!(error = %e, "restart_epoch background task failed");
                 // Clear the flag on failure so the operator can
                 // retry. Daemon stays paused; sim_clock state is
@@ -1189,6 +1210,7 @@ impl JobsRepository for PgJobs {
 async fn run_restart_epoch_background(
     pool: &PgPool,
     db_url: &str,
+    nats_url: Option<&str>,
     epoch_start: chrono::NaiveDate,
     baseline: i64,
 ) -> Result<(), JobsError> {
@@ -1291,6 +1313,15 @@ async fn run_restart_epoch_background(
         "restart_epoch: audit_log trimmed past seed baseline"
     );
 
+    // Drop the JetStream delivery buffer for the same reason the outbox
+    // was truncated above: whatever is still buffered belongs to the
+    // epoch just deleted, and redelivering it against the trimmed
+    // database 404s through the whole redelivery budget and
+    // dead-letters. Best-effort — a restart that completes with a stale
+    // buffer is far better than one that aborts because NATS was
+    // briefly unreachable, so this logs and carries on.
+    purge_epoch_delivery_buffer(nats_url).await;
+
     // Clear directly-written per-epoch ledger state that no audit-log
     // rebuilder owns (see clear_epoch_payroll_state), so the new cycle
     // starts from an empty payroll ledger instead of deduping against
@@ -1333,6 +1364,50 @@ async fn run_restart_epoch_background(
     .await
     .map_err(|e| JobsError::Storage(e.to_string()))?;
     Ok(())
+}
+
+/// Purge the `BOSS_EVENTS` JetStream buffer on a demo-loop reset.
+///
+/// Deliberately best-effort: it opens its own short-lived connection
+/// rather than holding one open across the restart, because the purge
+/// is a nice-to-have-correctness step on a path whose job is to get the
+/// demo into a clean new epoch. Every failure mode (no URL configured,
+/// NATS down, stream absent on a first run) logs and returns.
+///
+/// The URL is passed in, not read from the environment: this service
+/// takes its broker address from config (`nats_url` in
+/// `/etc/boss-jobs-api.toml`), so an env-var lookup would find nothing
+/// on a real deployment and skip the purge silently.
+///
+/// Reset-path only. A purge on an ordinary restart would discard the
+/// in-flight events the durability layer exists to protect.
+async fn purge_epoch_delivery_buffer(nats_url: Option<&str>) {
+    let Some(url) = nats_url else {
+        tracing::warn!(
+            "restart_epoch: no NATS URL configured; skipping delivery-buffer purge \
+             (stale events may dead-letter against the trimmed database)"
+        );
+        return;
+    };
+    let client = match async_nats::connect(url).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "restart_epoch: NATS connect failed; \
+                 leaving the delivery buffer as-is (stale events may dead-letter)");
+            return;
+        }
+    };
+    let ctx = async_nats::jetstream::new(client);
+    match boss_nats::durable::purge_stream(&ctx, boss_nats::durable::STREAM_NAME).await {
+        Ok(()) => tracing::info!(
+            stream = boss_nats::durable::STREAM_NAME,
+            "restart_epoch: delivery buffer purged"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "restart_epoch: stream purge failed; stale events may dead-letter"
+        ),
+    }
 }
 
 /// Clear the directly-written per-epoch payroll projection tables on a
