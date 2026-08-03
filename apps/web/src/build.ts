@@ -27,13 +27,31 @@ await rm(OUT, { recursive: true, force: true });
 // place service entries are declared — both the SPA and the dev
 // proxy import from `_generated/ports.ts`.
 //
-// The binary path resolution is the same shape as `infra/check-
-// binary-freshness.sh`: PATH first, then `$REPO_ROOT/target/release/`.
+// `$REPO_ROOT/target/release/` FIRST, then PATH — the same order
+// `infra/lint/no-snapshot-arrays.sh` uses, and deliberately the
+// opposite of `infra/check-binary-freshness.sh`.
+//
+// The two scripts want different things. Freshness-checking asks "is
+// what's INSTALLED current?", so it must resolve the installed binary.
+// Codegen asks "what does THIS working tree declare?", so it must
+// resolve the binary built from this tree; an entry in PATH came from
+// whenever someone last ran a deploy and can be arbitrarily old.
+//
+// Resolving PATH first is how this file and the lint disagreed
+// permanently on any box carrying an installed binary older than the
+// tree: codegen regenerated ports.ts from the stale one, the lint
+// compared against the fresh one and failed, and the suggested fix
+// (`bun run build`) regenerated from the stale one again. On the
+// playground that was a 2026-07-01 binary missing `campaigns` and
+// `customers` — two services behind, and no amount of rebuilding
+// converged.
 function findBossPortsList(): string {
+  const repoRoot = pathJoin(import.meta.dir, '..', '..', '..');
+  const inTarget = pathJoin(repoRoot, 'target', 'release', 'boss-ports-list');
+  if (existsSync(inTarget)) return inTarget;
   const onPath = spawnSync('which', ['boss-ports-list'], { encoding: 'utf-8' });
   if (onPath.status === 0 && onPath.stdout.trim()) return onPath.stdout.trim();
-  const repoRoot = pathJoin(import.meta.dir, '..', '..', '..');
-  return pathJoin(repoRoot, 'target', 'release', 'boss-ports-list');
+  return inTarget;
 }
 const portsListBin = findBossPortsList();
 const generatedPath = pathJoin(import.meta.dir, '_generated', 'ports.ts');
