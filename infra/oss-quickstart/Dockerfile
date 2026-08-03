@@ -31,7 +31,7 @@
 # layer serves both: local rebuilds hit the local layer cache, CI
 # restores the same layer from the Actions cache.
 # ---------------------------------------------------------------------------
-FROM rust:1.96-slim-bookworm@sha256:c8a94a78f67ec8c4d474ec7f71e0720f21eb7e584e158daec0874cafa7c30e4d AS rust-base
+FROM rust:1.97-slim-bookworm@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777 AS rust-base
 
 # sqlx + reqwest need pkg-config + libssl-dev for the rustls-native
 # bridge; the rest of the workspace is pure Rust.
@@ -162,7 +162,7 @@ RUN cd apps/web && bun run build
 # ---------------------------------------------------------------------------
 # Stage 5 — runtime.
 # ---------------------------------------------------------------------------
-FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716 AS runtime
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
 
 # Runtime deps: ca-certs for outbound HTTPS (the gateway), libssl
 # for rustls's native bridge, postgresql-client for the init
