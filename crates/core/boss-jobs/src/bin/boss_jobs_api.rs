@@ -145,12 +145,16 @@ async fn main() -> Result<()> {
             pool.clone(),
         )));
         info!("audit_log persistence enabled");
-        // Pass the URL alongside the pool so the demo-loop
-        // restart-epoch endpoint can spawn boss-rebuild-all
-        // against the same DB without re-parsing config.
-        let jobs = Arc::new(boss_jobs::PgJobs::with_url(
+        // Pass the URLs alongside the pool so the demo-loop
+        // restart-epoch endpoint can spawn boss-rebuild-all against the
+        // same DB, and purge the JetStream delivery buffer on the same
+        // broker, without re-parsing config. The NATS URL comes from
+        // config rather than the environment — this service has never
+        // set `BOSS_NATS_URL`, so reading one would skip the purge.
+        let jobs = Arc::new(boss_jobs::PgJobs::with_urls(
             pool.clone(),
             pg_url.to_string(),
+            cfg.nats_url.clone(),
         ));
         let kind_registry: Arc<dyn boss_jobs::JobKindRegistry> =
             Arc::new(boss_jobs::PgJobKinds::new(pool.clone()));

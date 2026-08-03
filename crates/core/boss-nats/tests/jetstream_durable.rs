@@ -7,8 +7,10 @@
 //! cargo test -p boss-nats --test jetstream_durable -- --ignored
 //! ```
 //!
-//! Each test that exercises delivery mechanics uses its own throwaway,
-//! memory-backed stream so runs don't collide or pollute `BOSS_EVENTS`.
+//! Each test that exercises delivery mechanics uses its own throwaway
+//! stream so runs don't collide or pollute `BOSS_EVENTS` — memory-backed
+//! for speed, except the purge test, which needs the file store
+//! production uses.
 
 use std::time::Duration;
 
@@ -33,6 +35,24 @@ async fn throwaway_stream(ctx: &jetstream::Context, tag: &str) -> (String, Strin
         subjects: vec![format!("{name}.>")],
         retention: stream::RetentionPolicy::Limits,
         storage: stream::StorageType::Memory,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    (name.clone(), name)
+}
+
+/// Same as [`throwaway_stream`] but file-backed, matching production
+/// `BOSS_EVENTS`. Only needed where the memory store's capabilities
+/// differ (purge).
+async fn throwaway_file_stream(ctx: &jetstream::Context, tag: &str) -> (String, String) {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let name = format!("test_{tag}_{id}");
+    ctx.create_stream(stream::Config {
+        name: name.clone(),
+        subjects: vec![format!("{name}.>")],
+        retention: stream::RetentionPolicy::Limits,
+        storage: stream::StorageType::File,
         ..Default::default()
     })
     .await
@@ -167,6 +187,85 @@ async fn durable_consumer_resumes_unacked_after_reopen() {
         .unwrap();
     assert_eq!(&m.payload[..], b"{\"id\":\"e3\"}");
     durable::settle::<&str>(&m, Ok(())).await;
+
+    ctx.delete_stream(&stream_name).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires nats-server with JetStream at 127.0.0.1:4222"]
+async fn purge_drops_undelivered_messages_but_keeps_the_durable_consumer() {
+    // The demo epoch restart trims audit_log back to the seed baseline.
+    // Anything still sitting in the delivery buffer at that moment
+    // belongs to the epoch being deleted: redelivering it against the
+    // trimmed database 404s through the whole redelivery budget and
+    // dead-letters — spurious noise in a gate whose whole value is
+    // reading zero. `purge_stream` drops that backlog.
+    //
+    // Purge, NOT `reset_stream`: reset deletes the stream and with it
+    // every durable consumer, so a live dispatcher would have to
+    // re-create its consumers mid-flight. The consumer must survive.
+    let ctx = context().await;
+    // File-backed, unlike the other throwaways: the memory store rejects
+    // purge outright ("partial purges not supported"), and production
+    // BOSS_EVENTS is `StorageType::File` — a memory-store test here would
+    // be exercising a different code path than the one that ships.
+    let (stream_name, root) = throwaway_file_stream(&ctx, "purge").await;
+
+    for i in 0..3 {
+        ctx.publish(
+            format!("{root}.evt"),
+            format!("{{\"id\":\"e{i}\"}}").into_bytes().into(),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    }
+
+    // A durable consumer exists and has NOT read anything yet — the
+    // backlog is exactly what a restart must not replay.
+    let mut msgs = durable::open_durable(&ctx, &stream_name, "d", vec![format!("{root}.>")])
+        .await
+        .unwrap();
+
+    durable::purge_stream(&ctx, &stream_name).await.unwrap();
+
+    let info = ctx
+        .get_stream(&stream_name)
+        .await
+        .unwrap()
+        .info()
+        .await
+        .unwrap()
+        .clone();
+    assert_eq!(info.state.messages, 0, "purge empties the buffer");
+
+    // The consumer is still there (reset_stream would have deleted it)
+    // and simply has nothing to deliver.
+    ctx.get_stream(&stream_name)
+        .await
+        .unwrap()
+        .get_consumer::<jetstream::consumer::pull::Config>("d")
+        .await
+        .expect("the durable consumer survives a purge");
+    let nothing = tokio::time::timeout(Duration::from_secs(2), msgs.next()).await;
+    assert!(
+        nothing.is_err(),
+        "purged messages must not be delivered to the surviving consumer"
+    );
+
+    // A post-purge publish still flows — the stream is usable, not sealed.
+    ctx.publish(format!("{root}.evt"), b"{\"id\":\"after\"}".to_vec().into())
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    let m = tokio::time::timeout(Duration::from_secs(5), msgs.next())
+        .await
+        .expect("a post-purge message should arrive")
+        .expect("stream open")
+        .unwrap();
+    assert_eq!(m.payload.as_ref(), b"{\"id\":\"after\"}");
 
     ctx.delete_stream(&stream_name).await.unwrap();
 }

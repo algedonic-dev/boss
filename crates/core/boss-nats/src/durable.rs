@@ -182,6 +182,36 @@ pub async fn reset_stream(ctx: &Context) -> Result<(), DurableError> {
     ensure_stream(ctx).await
 }
 
+/// Drop every message currently buffered on `stream_name`, keeping the
+/// stream and its durable consumers in place.
+///
+/// This is the delivery-buffer half of a demo epoch restart. That
+/// restart trims `audit_log` back to the seed baseline, so anything
+/// still sitting in the buffer at that moment belongs to the epoch being
+/// deleted — redelivering it against the trimmed database 404s through
+/// the whole redelivery budget and dead-letters. The dead-letter count
+/// is a release gate whose entire value is reading zero, so a restart
+/// that reliably manufactures spurious entries erodes the signal. Same
+/// reasoning as the `TRUNCATE event_outbox` one hop upstream: at restart
+/// time every pending item is the finished epoch's by definition, and
+/// must die with it rather than relay into the new one.
+///
+/// Purge, NOT [`reset_stream`]: reset deletes the stream and with it
+/// every durable consumer, forcing a live dispatcher to re-create its
+/// consumers mid-flight. A purge leaves the consumers attached; the
+/// server advances their floors past the dropped messages.
+pub async fn purge_stream(ctx: &Context, stream_name: &str) -> Result<(), DurableError> {
+    let stream = ctx
+        .get_stream(stream_name)
+        .await
+        .map_err(|e| DurableError::Stream(e.to_string()))?;
+    stream
+        .purge()
+        .await
+        .map_err(|e| DurableError::Stream(e.to_string()))?;
+    Ok(())
+}
+
 /// Durable pull-consumer configuration for the given durable name and
 /// filter subjects. Explicit ACK + bounded redelivery is the whole point:
 /// without it a failed handler would drop the event.
