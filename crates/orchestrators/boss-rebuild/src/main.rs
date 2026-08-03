@@ -213,6 +213,18 @@ async fn main() -> Result<()> {
         boss_ledger::rebuild_tax_filings(&pool)
     );
 
+    // Ledger bank settlements: project `ledger.payment.received` +
+    // `ledger.payment.settled` back into `bank_settlements`. Third
+    // table in the same class. Runs after `commerce` (which TRUNCATEs
+    // invoices) so the settlements land against the freshly replayed
+    // invoices rather than being detached around them — the old
+    // detach/re-attach dance is what orphaned a lap's rows and
+    // eventually crashed the settlement sweep.
+    step!(
+        "ledger-bank-settlements",
+        boss_ledger::rebuild_bank_settlements(&pool)
+    );
+
     let total_elapsed_ms = started_at.elapsed().as_millis();
     info!(
         elapsed_ms = total_elapsed_ms,
