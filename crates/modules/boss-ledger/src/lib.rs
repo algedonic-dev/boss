@@ -48,6 +48,8 @@ pub mod rebuild_facts;
 #[cfg(feature = "postgres")]
 pub mod rebuild_payroll;
 #[cfg(feature = "postgres")]
+pub mod rebuild_tax_filings;
+#[cfg(feature = "postgres")]
 pub mod replay_check;
 #[cfg(feature = "postgres")]
 pub mod supersede;
@@ -74,6 +76,11 @@ pub use rebuild_facts::{
 
 #[cfg(feature = "postgres")]
 pub use rebuild_payroll::{RebuildPayrollReport, rebuild_payroll, rebuild_payroll_in_tx};
+
+#[cfg(feature = "postgres")]
+pub use rebuild_tax_filings::{
+    RebuildTaxFilingsReport, rebuild_tax_filings, rebuild_tax_filings_in_tx,
+};
 
 #[cfg(feature = "postgres")]
 pub use replay_check::{

@@ -73,11 +73,29 @@ fn validate_new(new: &NewTaxFiling<'_>) -> Result<(), LedgerError> {
     Ok(())
 }
 
-/// Insert (or reuse) a tax filing row. Idempotent on the PK id and on
-/// the `(kind, jurisdiction, period_start, period_end)` unique index.
-/// Returns the row that ended up in the table so replay callers can
-/// short-circuit without a second round trip.
-pub async fn upsert(pool: &PgPool, new: NewTaxFiling<'_>) -> Result<TaxFiling, LedgerError> {
+/// A filing write plus whether it actually created the row. `inserted`
+/// is the idempotency guard doubling as the event gate: the caller
+/// records `ledger.tax.filing.created` only when a row really landed,
+/// so a repeat POST can't put a second creation in the log.
+#[derive(Debug, Clone)]
+pub struct UpsertedFiling {
+    pub filing: TaxFiling,
+    pub inserted: bool,
+}
+
+/// Insert (or reuse) a tax filing row, inside the caller's transaction
+/// so the creation event can ride the same commit. Idempotent on the PK
+/// id and on the `(kind, jurisdiction, period_start, period_end)` unique
+/// index. Returns the row that ended up in the table so replay callers
+/// can short-circuit without a second round trip.
+///
+/// `xmax = 0` is Postgres's tell for "this RETURNING row came from the
+/// INSERT arm, not the DO UPDATE arm" — the only way to distinguish
+/// them when the conflict action has to touch the row.
+pub async fn upsert_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    new: NewTaxFiling<'_>,
+) -> Result<UpsertedFiling, LedgerError> {
     validate_new(&new)?;
 
     let row = sqlx::query(
@@ -88,7 +106,8 @@ pub async fn upsert(pool: &PgPool, new: NewTaxFiling<'_>) -> Result<TaxFiling, L
          ON CONFLICT (kind, jurisdiction, period_start, period_end) \
          DO UPDATE SET updated_at = NOW() \
          RETURNING id, kind, jurisdiction, period_start, period_end, due_on, \
-                   filed_on, amount_cents, liability_account, status, provider",
+                   filed_on, amount_cents, liability_account, status, provider, \
+                   (xmax = 0) AS inserted",
     )
     .bind(new.id)
     .bind(new.kind)
@@ -99,33 +118,14 @@ pub async fn upsert(pool: &PgPool, new: NewTaxFiling<'_>) -> Result<TaxFiling, L
     .bind(new.amount_cents)
     .bind(new.liability_account)
     .bind(new.provider)
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await
     .map_err(|e| LedgerError::Storage(e.to_string()))?;
 
-    Ok(row_to_filing(&row))
-}
-
-/// Flip an accrued filing to `paid`. Called from the HTTP handler right
-/// after the `finance.tax.remitted` fact is inserted and posted.
-pub async fn mark_paid(
-    pool: &PgPool,
-    id: &str,
-    filed_on: NaiveDate,
-) -> Result<TaxFiling, LedgerError> {
-    let row = sqlx::query(
-        "UPDATE tax_filings \
-            SET status = 'paid', filed_on = $2, updated_at = NOW() \
-          WHERE id = $1 \
-          RETURNING id, kind, jurisdiction, period_start, period_end, due_on, \
-                    filed_on, amount_cents, liability_account, status, provider",
-    )
-    .bind(id)
-    .bind(filed_on)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| LedgerError::Storage(e.to_string()))?;
-    Ok(row_to_filing(&row))
+    Ok(UpsertedFiling {
+        inserted: row.get("inserted"),
+        filing: row_to_filing(&row),
+    })
 }
 
 pub async fn get(pool: &PgPool, id: &str) -> Result<Option<TaxFiling>, LedgerError> {

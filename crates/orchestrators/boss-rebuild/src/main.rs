@@ -200,6 +200,19 @@ async fn main() -> Result<()> {
     // that collide with the synthesize idempotency key.
     step!("ledger-payroll", boss_ledger::rebuild_payroll(&pool));
 
+    // Ledger tax filings: project the `ledger.tax.filing.created` +
+    // `ledger.tax.remitted` events back into `tax_filings`. Same
+    // stale-across-epochs class as payroll above — a prior-lap filing
+    // that survived the trim was already marked `paid`, so the new
+    // lap's remit short-circuited and its liability (2150/2300/2310/
+    // 2320) never drained. Rooted in audit_log rather than
+    // financial_facts because a non-accruing filing posts no entry and
+    // therefore has no fact to rebuild from.
+    step!(
+        "ledger-tax-filings",
+        boss_ledger::rebuild_tax_filings(&pool)
+    );
+
     let total_elapsed_ms = started_at.elapsed().as_millis();
     info!(
         elapsed_ms = total_elapsed_ms,
