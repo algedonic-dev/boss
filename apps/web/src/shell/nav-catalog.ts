@@ -26,15 +26,14 @@
 // second half.
 
 import type { RouteName } from '@boss/web-kit/session/permissions';
+import type { AppId } from '@boss/web-kit/nav';
 
-/// Top-level apps. Each owns a tab in the chrome bar and its own
-/// sidebar below it; every routable surface belongs to exactly one.
-///
-/// Apps partition PRESENTATION, never data — CRM's "account" and
-/// Finance's "account" are the same Subject read through two lenses,
-/// not two records kept in step by convention. Adding an app must
-/// never mean adding a store.
-export type AppId = 'simulator' | 'model' | 'user';
+export type { AppId };
+
+// `AppId` and the tab list live in @boss/web-kit/nav (the bar is
+// rendered by apps/web AND apps/simulator). THIS file answers the
+// other half — which surface belongs to which app — because web-kit
+// has no business knowing about /ux/warehouse.
 
 export type NavItem = Readonly<{
   id: string;
@@ -57,29 +56,29 @@ export type NavItem = Readonly<{
 export type NavGroup = Readonly<{ label: string; items: ReadonlyArray<NavItem> }>;
 
 export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
-  jobs:      { id: 'jobs',      label: 'All jobs',         path: '/ux/jobs',      permKey: 'jobs',      app: 'user' },
-  sales:     { id: 'sales',     label: 'Sales pipeline',   path: '/ux/sales',     permKey: 'sales',     app: 'user' },
-  service:   { id: 'service',   label: 'Service queue',    path: '/ux/service',   permKey: 'service',   module: 'support', app: 'user' },
-  refurb:    { id: 'refurb',    label: 'Refurbishment',    path: '/ux/refurb',    permKey: 'refurb',    module: 'support', app: 'user' },
-  qa:        { id: 'qa',        label: 'QA',               path: '/ux/qa',        permKey: 'qa',        module: 'qa',      app: 'user' },
-  finance:   { id: 'finance',   label: 'Finance',          path: '/ux/finance',   permKey: 'finance',   module: 'finance', app: 'user' },
-  warehouse: { id: 'warehouse', label: 'Inventory',        path: '/ux/warehouse', permKey: 'warehouse', module: 'warehouse', app: 'user' },
-  shipping:  { id: 'shipping',  label: 'Shipments',        path: '/ux/shipping',  permKey: 'shipping',  module: 'shipping', app: 'user' },
-  support:   { id: 'support',   label: 'Support',          path: '/ux/support',   permKey: 'support',   module: 'support', app: 'user' },
-  ops:       { id: 'ops',       label: 'Operations',       path: '/ux/ops',       permKey: 'ops',       app: 'user' },
-  exec:      { id: 'exec',      label: 'Exec',             path: '/ux/exec',      permKey: 'exec',      module: 'exec',    app: 'user' },
-  schedule:  { id: 'schedule',  label: 'My schedule',      path: '/ux/calendar/me', permKey: 'schedule', app: 'user' },
-  catalog:   { id: 'catalog',   label: 'Equipment',        path: '/ux/catalog',   permKey: 'catalog',   module: 'equipment', app: 'user' },
-  parts:     { id: 'parts',     label: 'Ingredients & parts', path: '/ux/parts',  permKey: 'parts',     module: 'parts',   app: 'user' },
-  products:  { id: 'products',  label: 'Products',         path: '/ux/products',  permKey: 'parts',     module: 'parts',   app: 'user' },
-  accounts:  { id: 'accounts',  label: 'Accounts',         path: '/ux/accounts',  permKey: 'accounts',  app: 'user' },
-  vendors:   { id: 'vendors',   label: 'Vendors',          path: '/ux/vendors',   permKey: 'vendors',   app: 'user' },
-  people:    { id: 'people',    label: 'Employees',        path: '/ux/people',    permKey: 'people',    app: 'user' },
-  assets:    { id: 'assets',    label: 'Assets',           path: '/ux/assets',    permKey: 'assets',    module: 'equipment', app: 'user' },
-  shop:      { id: 'shop',      label: 'Shop',             path: '/ux/shop',      permKey: 'shop',      app: 'user' },
-  inbox:     { id: 'inbox',     label: 'Inbox',            path: '/ux/inbox',     permKey: 'inbox',     app: 'user' },
-  'marketing-assets': { id: 'marketing-assets', label: 'Marketing assets', path: '/ux/marketing-assets', permKey: 'marketing-assets', module: 'marketing-assets', app: 'user' },
-  calendar:  { id: 'calendar',  label: 'Release calendar', path: '/ux/calendar',  permKey: 'calendar',  module: 'calendar', app: 'user' },
+  jobs:      { id: 'jobs',      label: 'All jobs',         path: '/ux/jobs',      permKey: 'jobs',      app: 'operations' },
+  sales:     { id: 'sales',     label: 'Sales pipeline',   path: '/ux/sales',     permKey: 'sales',     app: 'crm' },
+  service:   { id: 'service',   label: 'Service queue',    path: '/ux/service',   permKey: 'service',   module: 'support', app: 'operations' },
+  refurb:    { id: 'refurb',    label: 'Refurbishment',    path: '/ux/refurb',    permKey: 'refurb',    module: 'support', app: 'operations' },
+  qa:        { id: 'qa',        label: 'QA',               path: '/ux/qa',        permKey: 'qa',        module: 'qa',      app: 'operations' },
+  finance:   { id: 'finance',   label: 'Finance',          path: '/ux/finance',   permKey: 'finance',   module: 'finance', app: 'finance' },
+  warehouse: { id: 'warehouse', label: 'Inventory',        path: '/ux/warehouse', permKey: 'warehouse', module: 'warehouse', app: 'supply-chain' },
+  shipping:  { id: 'shipping',  label: 'Shipments',        path: '/ux/shipping',  permKey: 'shipping',  module: 'shipping', app: 'supply-chain' },
+  support:   { id: 'support',   label: 'Support',          path: '/ux/support',   permKey: 'support',   module: 'support', app: 'crm' },
+  ops:       { id: 'ops',       label: 'Operations',       path: '/ux/ops',       permKey: 'ops',       app: 'operations' },
+  exec:      { id: 'exec',      label: 'Exec',             path: '/ux/exec',      permKey: 'exec',      module: 'exec',    app: 'home' },
+  schedule:  { id: 'schedule',  label: 'My schedule',      path: '/ux/calendar/me', permKey: 'schedule', app: 'home' },
+  catalog:   { id: 'catalog',   label: 'Equipment',        path: '/ux/catalog',   permKey: 'catalog',   module: 'equipment', app: 'supply-chain' },
+  parts:     { id: 'parts',     label: 'Ingredients & parts', path: '/ux/parts',  permKey: 'parts',     module: 'parts',   app: 'supply-chain' },
+  products:  { id: 'products',  label: 'Products',         path: '/ux/products',  permKey: 'parts',     module: 'parts',   app: 'supply-chain' },
+  accounts:  { id: 'accounts',  label: 'Accounts',         path: '/ux/accounts',  permKey: 'accounts',  app: 'crm' },
+  vendors:   { id: 'vendors',   label: 'Vendors',          path: '/ux/vendors',   permKey: 'vendors',   app: 'finance' },
+  people:    { id: 'people',    label: 'Employees',        path: '/ux/people',    permKey: 'people',    app: 'people' },
+  assets:    { id: 'assets',    label: 'Assets',           path: '/ux/assets',    permKey: 'assets',    module: 'equipment', app: 'supply-chain' },
+  shop:      { id: 'shop',      label: 'Shop',             path: '/ux/shop',      permKey: 'shop',      app: 'crm' },
+  inbox:     { id: 'inbox',     label: 'Inbox',            path: '/ux/inbox',     permKey: 'inbox',     app: 'home' },
+  'marketing-assets': { id: 'marketing-assets', label: 'Marketing assets', path: '/ux/marketing-assets', permKey: 'marketing-assets', module: 'marketing-assets', app: 'crm' },
+  calendar:  { id: 'calendar',  label: 'Release calendar', path: '/ux/calendar',  permKey: 'calendar',  module: 'calendar', app: 'operations' },
 
   // Modeling surfaces — operator-tier (no separate /admin tier).
   // policy + job-kinds are dept-head + COO authority (per the
@@ -118,5 +117,8 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
 /// anything it didn't list.
 export function appForSection(section: string): AppId {
   const entry = (ROUTE_CATALOG as Record<string, NavItem | undefined>)[section];
-  return entry?.app ?? 'user';
+  // `me` (App.svelte's terminal fallback) and any plain sub-page id
+  // resolve to Home — personal surfaces, which is where the fallback
+  // belongs now that there is an app for them.
+  return entry?.app ?? 'home';
 }

@@ -31,78 +31,7 @@
   // order an operator would scan them. Rendered as-is; the visible()
   // filter then drops anything the role/manifest blocks. A
   // service-only persona simply sees Service + Inventory + Shipments.
-  const SURFACE_ORDER: ReadonlyArray<RouteName> = [
-    'exec',       // executive
-    'sales',      // sales department
-    'service',    // service department
-    'qa',         // quality
-    'warehouse',  // warehouse + inventory
-    'shipping',   // shipping department
-    'support',    // support department
-    'finance',    // finance department
-    'system-model', // System Model hub (the landing, leads the cluster)
-    'system-monitoring', // live state — service map, perf, events, atlas
-    'system-step-plugins', // custom step UX bundles
-    'system-dispatcher', // dispatcher rule cascade (read-only)
-    'system-subjects', // SubjectKind taxonomy + Class registry (read-only)
-    // 'it-sim' retired 2026-05-03 with boss-sim-api (HumanWorker step 9b).
-    'ops',        // operations
-    'policy',     // dept heads + COO — author role/scope policy
-    'job-kinds',  // dept heads + COO — model the dept's work types
-    'auth-admin', // dept heads + COO + IT — onboard / reset credentials
-  ];
-
-  const KNOW: NavGroup = {
-    label: 'Knowledge Bases',
-    items: [
-      ROUTE_CATALOG.catalog,
-      ROUTE_CATALOG.parts,
-      ROUTE_CATALOG.products,
-      ROUTE_CATALOG.accounts,
-      ROUTE_CATALOG.vendors,
-      ROUTE_CATALOG.people,
-      ROUTE_CATALOG['marketing-assets'],
-      ROUTE_CATALOG.calendar,
-      { id: 'manual', label: 'Company manual', path: '/ux/manual', permKey: 'inbox' },
-      // Workflows = KB of every active JobKind — everyone's
-      // read-only catalog of "what kinds of work does this place
-      // run?" Pairs with the /job-kinds Surface (editor), which
-      // is gated to dept heads + COO + the C-suite catch-all.
-      ROUTE_CATALOG.workflows,
-      // IT Knowledge Base — department-rooted KB carrying ADRs,
-      // architecture diagrams, hardware/software/provider
-      // reference. Replaces the old /design + /architecture
-      // entries: ADRs and the architecture diagrams now live
-      // under the IT department surface (paired with /it/monitoring
-      // for live state).
-      ROUTE_CATALOG['system-kb'],
-      // Design review — brings back the workflow that was retired
-      // 2026-05-03. Lists every docs/design/*.md with parsed open
-      // questions + the in-flight design-doc-review Job (if any).
-      // The "system modeling its own development" claim depends on
-      // this surface existing.
-      ROUTE_CATALOG['system-design'],
-    ],
-  };
-
-  const BROWSE: NavGroup = {
-    label: 'Surfaces',
-    items: SURFACE_ORDER.map((r) => ROUTE_CATALOG[r]),
-  };
-
-  // /admin tier removed entirely (2026-05-03). Engineers and
-  // platform operators are operators like anyone else; their
-  // surfaces sit alongside the rest in the same Surfaces group:
-  //   - /policy + /job-kinds → modeling surfaces, gated to
-  //     dept heads + COO + C-suite (NOT IT — those decisions
-  //     are operational, not technical).
-  //   - /it/monitoring + /it/kb + /it/step-plugins + /it/sim →
-  //     the IT department's surface set. Engineers run the
-  //     platform; their "Work" looks like everyone else's.
-  // Future surfaces should NOT bring back the Admin tier; pick
-  // a department-rooted slug and a role-gated permKey.
-
-  let { activeSection, perspective = 'user', children } = $props<{
+  let { activeSection, perspective = 'home', children } = $props<{
     activeSection: string;
     // Which app tab this shell renders under. Drives which surfaces
     // appear in the sidebar. Typed as the full AppId — the shell
@@ -112,10 +41,41 @@
     children: () => any;
   }>();
 
+  // Svelte's generated props type widens `perspective` to `any` through
+  // the default, which silently un-types every Record lookup below.
+  // Pin it once.
+  let activeApp = $derived(perspective as AppId);
+
   let user = $derived(
     session.value.kind === 'ready' ? session.value.user : null,
   );
   let role = $derived((user?.role ?? null) as Role | null);
+
+  // Per-app surface order. Each domain app owns one group; the order
+  // is how an operator in that app would scan it, not alphabetical.
+  // `visible()` then drops whatever the role or the tenant manifest
+  // blocks, so a support-only persona simply sees a shorter CRM list.
+  //
+  // This replaced a single flat SURFACE_ORDER plus a "Knowledge Bases"
+  // group — one 24-entry list every operator scrolled regardless of
+  // what they were doing. The knowledge-base surfaces (equipment,
+  // ingredients & parts, products) weren't a category of their own so
+  // much as Supply Chain's reference data, and they read that way now.
+  const APP_SURFACES: Readonly<Partial<Record<AppId, ReadonlyArray<RouteName>>>> = {
+    crm: ['accounts', 'sales', 'support', 'shop', 'marketing-assets'],
+    finance: ['finance', 'vendors'],
+    operations: ['ops', 'jobs', 'service', 'refurb', 'qa', 'calendar'],
+    'supply-chain': ['warehouse', 'shipping', 'parts', 'products', 'catalog', 'assets'],
+    people: ['people'],
+  };
+
+  const APP_GROUP_LABEL: Readonly<Partial<Record<AppId, string>>> = {
+    crm: 'Customers',
+    finance: 'Finance',
+    operations: 'Operations',
+    'supply-chain': 'Supply chain',
+    people: 'People',
+  };
 
   // Work group is role-keyed: each role gets a tailored 3-5 item
   // list of the surfaces they personally operate from. The same
@@ -170,8 +130,38 @@
     },
   ];
 
+  // Home — personal work, whichever domain it belongs to. The
+  // role-keyed Work list lives here rather than being repeated in
+  // every app: "what am I meant to be doing" is one question, and its
+  // answer crosses CRM, Operations and Finance freely.
+  const HOME_GROUPS = $derived<ReadonlyArray<NavGroup>>([
+    WORK,
+    {
+      label: 'Mine',
+      items: [
+        // Permkey-less: /` is App.svelte's `me` route, which has no
+        // catalog entry (it is everyone's, ungated).
+        { id: 'my-day', label: 'My Day', path: '/' },
+        ROUTE_CATALOG.inbox,
+        ROUTE_CATALOG.schedule,
+        ROUTE_CATALOG.exec,
+      ],
+    },
+  ]);
+
   let MAIN = $derived<ReadonlyArray<NavGroup>>(
-    perspective === 'model' ? MODEL_GROUPS : [WORK, BROWSE, KNOW],
+    activeApp === 'model'
+      ? MODEL_GROUPS
+      : activeApp === 'home'
+        ? HOME_GROUPS
+        : [
+            {
+              label: APP_GROUP_LABEL[activeApp] ?? '',
+              items: (APP_SURFACES[activeApp] ?? []).map(
+                (r: RouteName) => ROUTE_CATALOG[r],
+              ),
+            },
+          ],
   );
 
   // A surface is in-perspective when its catalog `app` matches the
@@ -184,7 +174,7 @@
     // Log / Atlas) carries no app of its own — it belongs to whatever
     // group it's placed in, so it's always in-perspective.
     if (i.permKey === undefined) return true;
-    return (ROUTE_CATALOG[i.permKey]?.app ?? 'user') === perspective;
+    return (ROUTE_CATALOG[i.permKey]?.app ?? 'home') === activeApp;
   }
 
   function visible(items: ReadonlyArray<NavItem>): ReadonlyArray<NavItem> {
