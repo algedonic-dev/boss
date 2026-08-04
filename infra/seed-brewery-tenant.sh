@@ -75,16 +75,32 @@ if command -v boss-brewery-sim >/dev/null 2>&1; then
     echo "    preparing brewery tenant model (boss-brewery-sim prepare)"
     wait_for_stack
     ok=
+    prepare_log="$(mktemp)"
+    trap 'rm -f "$prepare_log"' EXIT
     for attempt in 1 2 3; do
+        # Capture rather than discard. `prepare >/dev/null 2>&1` threw
+        # away the only description of the failure, so a broken reset
+        # said nothing more than "prepare failed" and the reason had to
+        # be recovered by re-running prepare by hand afterwards.
         if BOSS_SIM_SEEDS_DIR="$SEEDS_DIR" BOSS_EPOCH_START="$EPOCH_START" \
-            boss-brewery-sim prepare >/dev/null 2>&1; then
+            boss-brewery-sim prepare >"$prepare_log" 2>&1; then
             ok=1; echo "    ✓ brewery tenant prepared"; break
         fi
         echo "    (prepare attempt $attempt failed; retrying)"; sleep 3
     done
-    [[ -n "$ok" ]] || echo "    WARN: brewery prepare failed — sim will idle" >&2
+    if [[ -z "$ok" ]]; then
+        echo "ERROR: brewery prepare failed after 3 attempts — last output:" >&2
+        tail -20 "$prepare_log" >&2
+        echo "ERROR: aborting BEFORE stamping the reset baseline." >&2
+        echo "       A baseline stamped over a failed prepare captures a log with no" >&2
+        echo "       published JobKinds, and the next restart-epoch trims to it —" >&2
+        echo "       destroying the tenant model permanently rather than just idling." >&2
+        exit 1
+    fi
 else
-    echo "    WARN: boss-brewery-sim not on PATH — sim will idle" >&2
+    echo "ERROR: boss-brewery-sim not on PATH — cannot seed the tenant." >&2
+    echo "       Refusing to stamp a reset baseline over an unseeded database." >&2
+    exit 1
 fi
 
 # Stamp the reset baseline: the panel's Reset button (restart-epoch) trims
@@ -92,6 +108,11 @@ fi
 # and *before* the sim's first tick — i.e. "seeded day 0". The endpoint
 # self-heals if this is unset, but captures too late (after sim activity),
 # so set it explicitly now while the log holds only the seed.
+#
+# Only reachable when prepare succeeded — the branch above exits non-zero
+# otherwise. That ordering is the point: the stamp is destructive on the
+# NEXT restart, not this one, so a baseline taken over a half-seeded log
+# fails silently now and unrecoverably later.
 if command -v psql >/dev/null 2>&1 && [[ -n "${BOSS_POSTGRES_URL:-}" ]]; then
     if psql "$BOSS_POSTGRES_URL" -v ON_ERROR_STOP=1 -c \
         "UPDATE sim_clock SET epoch_baseline_audit_id = (SELECT COALESCE(MAX(id),0) FROM audit_log) WHERE id = 1;" \
