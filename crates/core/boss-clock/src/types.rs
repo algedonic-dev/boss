@@ -206,3 +206,108 @@ pub enum ClockMode {
     /// Sim mode. `now` returns the formula-computed sim instant.
     Sim,
 }
+
+/// Response of `GET /api/clock/baseline` — the provenance of the
+/// seed baseline this tenant replays.
+///
+/// Deliberately NOT folded into [`ClockNow`]. That type is `Copy` and
+/// is read on the hot path by every service stamping every event;
+/// `source_ref` is a `String` (breaking `Copy` across 41 call sites)
+/// carrying information those callers never look at, and which only
+/// changes when someone re-cuts the baseline. Provenance is a
+/// different question from "what time is it", so it gets its own
+/// endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BaselineProvenance {
+    /// `MAX(audit_log.id)` at the moment the seed finished — the id
+    /// `restart-epoch` trims back to. `None` before any seed has
+    /// completed.
+    pub baseline_audit_id: Option<i64>,
+    /// Wall instant the baseline was cut. `None` on installs seeded
+    /// before this was recorded.
+    pub cut_at: Option<DateTime<Utc>>,
+    /// Source revision the seed was cut from — a short git SHA.
+    /// `None` when the seeding host had no git (docker images ship
+    /// no `.git`), which reads as "unknown", never as "current".
+    pub source_ref: Option<String>,
+    /// Whole days between the cut and now. `None` when `cut_at` is
+    /// unknown. This is the number worth looking at: the demo
+    /// replays the baseline forever, so age is exactly how far the
+    /// running tenant's model has fallen behind the source tree.
+    pub age_days: Option<i64>,
+}
+
+impl BaselineProvenance {
+    /// Build from stored fields, deriving `age_days` against `now`.
+    ///
+    /// A cut timestamp in the future (clock skew between the seeding
+    /// host and the reader) clamps to 0 rather than reporting a
+    /// negative age — "cut in the future" is not a meaningful
+    /// staleness answer, and 0 is the honest floor.
+    pub fn new(
+        baseline_audit_id: Option<i64>,
+        cut_at: Option<DateTime<Utc>>,
+        source_ref: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let age_days = cut_at.map(|cut| (now - cut).num_days().max(0));
+        Self {
+            baseline_audit_id,
+            cut_at,
+            source_ref,
+            age_days,
+        }
+    }
+}
+
+#[cfg(test)]
+mod baseline_tests {
+    use super::*;
+
+    fn t(s: &str) -> DateTime<Utc> {
+        s.parse().expect("test timestamp parses")
+    }
+
+    #[test]
+    fn age_is_whole_days_between_cut_and_now() {
+        let p = BaselineProvenance::new(
+            Some(4495),
+            Some(t("2026-07-11T03:54:56Z")),
+            Some("27e29fda".to_string()),
+            t("2026-08-04T03:05:12Z"),
+        );
+        // The real playground gap that made a 3-week-old fix look
+        // like an open modeling defect.
+        assert_eq!(p.age_days, Some(23));
+        assert_eq!(p.baseline_audit_id, Some(4495));
+        assert_eq!(p.source_ref.as_deref(), Some("27e29fda"));
+    }
+
+    #[test]
+    fn a_fresh_cut_is_zero_days_old() {
+        let cut = t("2026-08-04T03:05:12Z");
+        let p = BaselineProvenance::new(Some(1), Some(cut), None, cut);
+        assert_eq!(p.age_days, Some(0));
+    }
+
+    #[test]
+    fn unknown_cut_yields_unknown_age_not_zero() {
+        // The distinction that matters: a seed with no recorded
+        // provenance must not read as "cut just now".
+        let p = BaselineProvenance::new(Some(1), None, None, t("2026-08-04T03:05:12Z"));
+        assert_eq!(p.age_days, None);
+        assert_eq!(p.cut_at, None);
+        assert_eq!(p.source_ref, None);
+    }
+
+    #[test]
+    fn a_future_cut_clamps_to_zero_rather_than_going_negative() {
+        let p = BaselineProvenance::new(
+            Some(1),
+            Some(t("2026-08-05T00:00:00Z")),
+            None,
+            t("2026-08-04T00:00:00Z"),
+        );
+        assert_eq!(p.age_days, Some(0));
+    }
+}

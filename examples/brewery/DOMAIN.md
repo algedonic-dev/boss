@@ -55,7 +55,7 @@ and `equipment`. Here is how the brewery's world lands on that registry:
 | Brewery thing | subject_kind | How it's modeled |
 |---|---|---|
 | Brewhouse, taproom, the three delivery routes | `location` | `seeds/locations.toml` — one brewhouse, one taproom, three distribution routes. |
-| Brewers, cellar techs, bartenders, drivers | `employee` (a `person`) | `seeds/employees.json`; each one's role + department is a Class row from `seeds/classes.toml`. |
+| Brewers, cellar techs, bartenders, drivers | `employee` (a `person`) | `seeds/employees.json`; each one's role + department is a Class row seeded platform-side in `infra/postgres/schema/01-registries.sql`. |
 | Distributors, bar/restaurant accounts, chain retail | `account` (a `person`) | The account's flavor is its `account_type` — `wholesale-distributor`, `bar-restaurant`, `chain-retail`, or `corporate-event` — validated against the Class registry. |
 | Grain, hops, yeast, and packaging suppliers | `vendor` (a `person`) | 40 suppliers in `seeds/vendors.toml`. |
 | Tap launches and seasonal promotions | `campaign` (an `intangible`) | The Subject a marketing-push Job is about. |
@@ -75,12 +75,12 @@ examples/brewery/
   scripts/gen_employees.py  ← deterministic roster generator → employees.json
   data/                     ← supporting data the generators draw from
   seeds/
-    classes.toml            ← Roles, Departments, Beer Styles,
-                              Vendor Categories — brewery taxonomies
-                              as Class registry rows
-    classes.json            ← the Class rows seeded via
-                              POST /api/classes/batch — the form the
-                              install / reset / CI paths load
+    classes.json            ← brewery taxonomies as Class registry
+                              rows (vendor categories, revenue
+                              categories, product kinds + package
+                              units, asset categories), seeded via
+                              POST /api/classes/batch — the only form
+                              the install / reset / CI paths load
     locations.toml          ← Location rows for the demo brewery
                               (one taproom, one brewhouse, three
                               distribution routes)

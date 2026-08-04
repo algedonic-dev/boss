@@ -113,11 +113,37 @@ fi
 # otherwise. That ordering is the point: the stamp is destructive on the
 # NEXT restart, not this one, so a baseline taken over a half-seeded log
 # fails silently now and unrecoverably later.
+#
+# Provenance rides the same UPDATE. The baseline is a build artifact
+# the demo then replays forever, so "which revision is this tenant
+# pinned to, and how old is that pin?" has to be answerable without
+# archaeology on audit_log.created_at — read it back at
+# GET /api/clock/baseline.
+#
+# BOSS_BASELINE_SOURCE_REF overrides for callers that know their
+# revision without a working tree (docker images ship no .git). When
+# neither that nor git resolves, the column stays NULL and reads as
+# "unknown" — deliberately not a guess, and never "current".
+source_ref="${BOSS_BASELINE_SOURCE_REF:-}"
+if [[ -z "$source_ref" ]] && command -v git >/dev/null 2>&1; then
+    source_ref="$(git -C "$(dirname "${BASH_SOURCE[0]}")/.." rev-parse --short HEAD 2>/dev/null || true)"
+fi
+# Piped, not `-c`: psql only interpolates `:'var'` for input read from
+# stdin or a file. Under `-c` the literal `:'ref'` reaches the server
+# and the statement dies on a syntax error — which would have taken
+# `epoch_baseline_audit_id` down with it, since it is the same UPDATE.
+# `:'ref'` also quotes + escapes the value properly, so no hand-rolled
+# shell quoting.
 if command -v psql >/dev/null 2>&1 && [[ -n "${BOSS_POSTGRES_URL:-}" ]]; then
-    if psql "$BOSS_POSTGRES_URL" -v ON_ERROR_STOP=1 -c \
-        "UPDATE sim_clock SET epoch_baseline_audit_id = (SELECT COALESCE(MAX(id),0) FROM audit_log) WHERE id = 1;" \
+    if printf '%s\n' \
+        "UPDATE sim_clock SET \
+            epoch_baseline_audit_id = (SELECT COALESCE(MAX(id),0) FROM audit_log), \
+            baseline_cut_at = NOW(), \
+            baseline_source_ref = NULLIF(:'ref', '') \
+          WHERE id = 1;" \
+        | psql "$BOSS_POSTGRES_URL" -v ON_ERROR_STOP=1 -v ref="${source_ref}" \
         >/dev/null 2>&1; then
-        echo "    ✓ reset baseline stamped (seeded day 0)"
+        echo "    ✓ reset baseline stamped (seeded day 0, source ${source_ref:-unknown})"
     else
         echo "    WARN: reset-baseline stamp failed; restart-epoch will self-heal" >&2
     fi
