@@ -450,16 +450,16 @@ title_template = "Confirm order — {subject.id}"
 # demo's flea-circus visual: every spawned Job shows real SKUs +
 # quantities, not an empty placeholder.
 metadata_defaults = { delivery_window = "", line_items = [
-    { sku = "FP-IPA-1-2-BBL", qty = 2, unit_price_cents = 30000, description = "IPA 1/2 BBL keg" },
-    { sku = "FP-IPA-1-6-BBL", qty = 3, unit_price_cents = 15000, description = "IPA 1/6 BBL keg" },
-    { sku = "FP-PALE-1-2-BBL", qty = 2, unit_price_cents = 30000, description = "Pale Ale 1/2 BBL keg" },
-    { sku = "FP-PALE-1-6-BBL", qty = 2, unit_price_cents = 15000, description = "Pale Ale 1/6 BBL keg" },
-    { sku = "FP-LAGER-1-2-BBL", qty = 1, unit_price_cents = 30000, description = "Lager 1/2 BBL keg" },
-    { sku = "FP-LAGER-1-6-BBL", qty = 1, unit_price_cents = 15000, description = "Lager 1/6 BBL keg" },
-    { sku = "FP-STOUT-1-2-BBL", qty = 1, unit_price_cents = 30000, description = "Stout 1/2 BBL keg" },
-    { sku = "FP-STOUT-1-6-BBL", qty = 1, unit_price_cents = 15000, description = "Stout 1/6 BBL keg" },
-    { sku = "FP-HAZY-1-2-BBL", qty = 1, unit_price_cents = 30000, description = "Hazy IPA 1/2 BBL keg" },
-    { sku = "FP-HAZY-1-6-BBL", qty = 1, unit_price_cents = 15000, description = "Hazy IPA 1/6 BBL keg" },
+    { sku = "FP-IPA-1-2-BBL", qty = 2, unit_price_cents = 14500, description = "IPA 1/2 BBL keg" },
+    { sku = "FP-IPA-1-6-BBL", qty = 3, unit_price_cents = 8500, description = "IPA 1/6 BBL keg" },
+    { sku = "FP-PALE-1-2-BBL", qty = 2, unit_price_cents = 14500, description = "Pale Ale 1/2 BBL keg" },
+    { sku = "FP-PALE-1-6-BBL", qty = 2, unit_price_cents = 8500, description = "Pale Ale 1/6 BBL keg" },
+    { sku = "FP-LAGER-1-2-BBL", qty = 1, unit_price_cents = 14500, description = "Lager 1/2 BBL keg" },
+    { sku = "FP-LAGER-1-6-BBL", qty = 1, unit_price_cents = 8500, description = "Lager 1/6 BBL keg" },
+    { sku = "FP-STOUT-1-2-BBL", qty = 1, unit_price_cents = 14500, description = "Stout 1/2 BBL keg" },
+    { sku = "FP-STOUT-1-6-BBL", qty = 1, unit_price_cents = 8500, description = "Stout 1/6 BBL keg" },
+    { sku = "FP-HAZY-1-2-BBL", qty = 1, unit_price_cents = 14500, description = "Hazy IPA 1/2 BBL keg" },
+    { sku = "FP-HAZY-1-6-BBL", qty = 1, unit_price_cents = 8500, description = "Hazy IPA 1/6 BBL keg" },
 ] }
 
 # Stock-check gate — agent-executed (the dispatcher reads real finished-goods
@@ -529,16 +529,16 @@ title_template = "Deliver"
 # the shipment becomes purely physical (ship-out date + scan
 # chain), with no GL movement.
 metadata_defaults = { direction = "outbound", origin = "loc-brewery-brewhouse", destination = "{subject.id}", carrier = "local-pickup", line_items = [
-    { sku = "FP-IPA-1-2-BBL", qty = 2, unit_price_cents = 30000, description = "IPA 1/2 BBL keg" },
-    { sku = "FP-IPA-1-6-BBL", qty = 3, unit_price_cents = 15000, description = "IPA 1/6 BBL keg" },
-    { sku = "FP-PALE-1-2-BBL", qty = 2, unit_price_cents = 30000, description = "Pale Ale 1/2 BBL keg" },
-    { sku = "FP-PALE-1-6-BBL", qty = 2, unit_price_cents = 15000, description = "Pale Ale 1/6 BBL keg" },
-    { sku = "FP-LAGER-1-2-BBL", qty = 1, unit_price_cents = 30000, description = "Lager 1/2 BBL keg" },
-    { sku = "FP-LAGER-1-6-BBL", qty = 1, unit_price_cents = 15000, description = "Lager 1/6 BBL keg" },
-    { sku = "FP-STOUT-1-2-BBL", qty = 1, unit_price_cents = 30000, description = "Stout 1/2 BBL keg" },
-    { sku = "FP-STOUT-1-6-BBL", qty = 1, unit_price_cents = 15000, description = "Stout 1/6 BBL keg" },
-    { sku = "FP-HAZY-1-2-BBL", qty = 1, unit_price_cents = 30000, description = "Hazy IPA 1/2 BBL keg" },
-    { sku = "FP-HAZY-1-6-BBL", qty = 1, unit_price_cents = 15000, description = "Hazy IPA 1/6 BBL keg" },
+    { sku = "FP-IPA-1-2-BBL", qty = 2, unit_price_cents = 14500, description = "IPA 1/2 BBL keg" },
+    { sku = "FP-IPA-1-6-BBL", qty = 3, unit_price_cents = 8500, description = "IPA 1/6 BBL keg" },
+    { sku = "FP-PALE-1-2-BBL", qty = 2, unit_price_cents = 14500, description = "Pale Ale 1/2 BBL keg" },
+    { sku = "FP-PALE-1-6-BBL", qty = 2, unit_price_cents = 8500, description = "Pale Ale 1/6 BBL keg" },
+    { sku = "FP-LAGER-1-2-BBL", qty = 1, unit_price_cents = 14500, description = "Lager 1/2 BBL keg" },
+    { sku = "FP-LAGER-1-6-BBL", qty = 1, unit_price_cents = 8500, description = "Lager 1/6 BBL keg" },
+    { sku = "FP-STOUT-1-2-BBL", qty = 1, unit_price_cents = 14500, description = "Stout 1/2 BBL keg" },
+    { sku = "FP-STOUT-1-6-BBL", qty = 1, unit_price_cents = 8500, description = "Stout 1/6 BBL keg" },
+    { sku = "FP-HAZY-1-2-BBL", qty = 1, unit_price_cents = 14500, description = "Hazy IPA 1/2 BBL keg" },
+    { sku = "FP-HAZY-1-6-BBL", qty = 1, unit_price_cents = 8500, description = "Hazy IPA 1/6 BBL keg" },
 ] }
 
 [[job_kind.step]]
@@ -560,17 +560,32 @@ authority_role = "bookkeeper"
 # the cost basis in the same tx as the invoice insert. The
 # shipment step's `consumes_products` array is no longer
 # load-bearing for COGS — billing is the single source of truth.
-metadata_defaults = { account_id = "{subject.id}", amount_cents = 181500, currency = "USD", line_items = [
-    { sku = "FP-IPA-1-2-BBL", qty = 2, amount_cents = 37000, revenue_category = "wholesale", description = "IPA 1/2 BBL × 2" },
-    { sku = "FP-IPA-1-6-BBL", qty = 3, amount_cents = 19500, revenue_category = "wholesale", description = "IPA 1/6 BBL × 3" },
-    { sku = "FP-PALE-1-2-BBL", qty = 2, amount_cents = 37000, revenue_category = "wholesale", description = "Pale Ale 1/2 BBL × 2" },
-    { sku = "FP-PALE-1-6-BBL", qty = 2, amount_cents = 13000, revenue_category = "wholesale", description = "Pale Ale 1/6 BBL × 2" },
-    { sku = "FP-LAGER-1-2-BBL", qty = 1, amount_cents = 18500, revenue_category = "wholesale", description = "Lager 1/2 BBL × 1" },
-    { sku = "FP-LAGER-1-6-BBL", qty = 1, amount_cents = 6500, revenue_category = "wholesale", description = "Lager 1/6 BBL × 1" },
-    { sku = "FP-STOUT-1-2-BBL", qty = 1, amount_cents = 18500, revenue_category = "wholesale", description = "Stout 1/2 BBL × 1" },
-    { sku = "FP-STOUT-1-6-BBL", qty = 1, amount_cents = 6500, revenue_category = "wholesale", description = "Stout 1/6 BBL × 1" },
-    { sku = "FP-HAZY-1-2-BBL", qty = 1, amount_cents = 18500, revenue_category = "wholesale", description = "Hazy IPA 1/2 BBL × 1" },
-    { sku = "FP-HAZY-1-6-BBL", qty = 1, amount_cents = 6500, revenue_category = "wholesale", description = "Hazy IPA 1/6 BBL × 1" },
+# Wholesale price list — brewery → distributor, the lowest-price
+# channel (taproom and retail mark the same liquid up several-fold).
+#
+# $145 per 1/2-bbl and $85 per 1/6-bbl. Both sit mid-range for
+# regional craft ($110-160 and $70-95), and the pair restores the
+# per-gallon premium a smaller package actually carries: $9.35/gal
+# vs $16.47/gal. The previous $185 / $65 priced them almost flat per
+# gallon ($11.94 vs $12.60) — a half-bbl above the top of its real
+# range subsidising a sixtel below the bottom of its own, which is
+# backwards: filling six sixtels costs far more than filling two
+# half-bbls for the same beer.
+#
+# Set from market prices, NOT from a target margin. Margin emerges
+# from these against the BOM + per-container packaging + absorbed
+# overhead.
+metadata_defaults = { account_id = "{subject.id}", amount_cents = 169500, currency = "USD", line_items = [
+    { sku = "FP-IPA-1-2-BBL", qty = 2, amount_cents = 29000, revenue_category = "wholesale", description = "IPA 1/2 BBL × 2" },
+    { sku = "FP-IPA-1-6-BBL", qty = 3, amount_cents = 25500, revenue_category = "wholesale", description = "IPA 1/6 BBL × 3" },
+    { sku = "FP-PALE-1-2-BBL", qty = 2, amount_cents = 29000, revenue_category = "wholesale", description = "Pale Ale 1/2 BBL × 2" },
+    { sku = "FP-PALE-1-6-BBL", qty = 2, amount_cents = 17000, revenue_category = "wholesale", description = "Pale Ale 1/6 BBL × 2" },
+    { sku = "FP-LAGER-1-2-BBL", qty = 1, amount_cents = 14500, revenue_category = "wholesale", description = "Lager 1/2 BBL × 1" },
+    { sku = "FP-LAGER-1-6-BBL", qty = 1, amount_cents = 8500, revenue_category = "wholesale", description = "Lager 1/6 BBL × 1" },
+    { sku = "FP-STOUT-1-2-BBL", qty = 1, amount_cents = 14500, revenue_category = "wholesale", description = "Stout 1/2 BBL × 1" },
+    { sku = "FP-STOUT-1-6-BBL", qty = 1, amount_cents = 8500, revenue_category = "wholesale", description = "Stout 1/6 BBL × 1" },
+    { sku = "FP-HAZY-1-2-BBL", qty = 1, amount_cents = 14500, revenue_category = "wholesale", description = "Hazy IPA 1/2 BBL × 1" },
+    { sku = "FP-HAZY-1-6-BBL", qty = 1, amount_cents = 8500, revenue_category = "wholesale", description = "Hazy IPA 1/6 BBL × 1" },
 ] }
 
 [[job_kind.step]]
