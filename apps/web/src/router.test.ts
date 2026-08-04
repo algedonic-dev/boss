@@ -134,3 +134,25 @@ describe('parseRoute — wildcard does not shadow specific cases', () => {
     expect(r.kind).toBe('jobKindDesign');
   });
 });
+
+describe('full-page step route', () => {
+  test('parses /jobs/{job}/steps/{step} to stepFocus', () => {
+    const r = parseRoute('/ux/jobs/job-123/steps/step-456');
+    expect(r.kind).toBe('stepFocus');
+    expect((r as { jobId: string }).jobId).toBe('job-123');
+    expect((r as { stepId: string }).stepId).toBe('step-456');
+  });
+
+  test('does not steal the plain job-detail route', () => {
+    // The greedy /jobs/(.+) branch sits right after this one; if the
+    // step pattern were looser (or ordered later) one of these two
+    // would swallow the other.
+    expect(parseRoute('/ux/jobs/job-123').kind).toBe('jobDetail');
+    expect((parseRoute('/ux/jobs/job-123') as { jobId: string }).jobId).toBe('job-123');
+  });
+
+  test('a job id containing "steps" still resolves to jobDetail', () => {
+    const r = parseRoute('/ux/jobs/steps');
+    expect(r.kind).toBe('jobDetail');
+  });
+});
