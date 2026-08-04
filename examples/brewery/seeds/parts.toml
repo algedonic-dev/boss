@@ -226,8 +226,18 @@ allocated = 0
 reorder_point = 17000
 reorder_qty = 22500
 trailing_90d_usage = 22500
-avg_cost_cents = 300
-vendor_price_cents = 300
+# Per-CONTAINER fill cost: clean + sanitise, seal + spear service,
+# CO2, and amortised keg loss/replacement. Real regional-craft
+# 1/2-bbl fill runs $8-15; this sits mid-range.
+#
+# Was $3.00, with the sixtel below at $1.20 — a 40% ratio that
+# tracked VOLUME (1/6 ÷ 1/2 = 33%). Packaging cost does not scale
+# with volume, it scales with the number of containers you handle:
+# a sixtel takes nearly the same wash, seal and CO2 as a half-bbl
+# for a third of the beer. Costing it by volume made small packages
+# look artificially cheap and inflated their margin.
+avg_cost_cents = 1100
+vendor_price_cents = 1100
 
 [[parts]]
 part_sku = "PKG-KEG-FILL-SIXTEL"
@@ -239,8 +249,11 @@ allocated = 0
 reorder_point = 25000
 reorder_qty = 34200
 trailing_90d_usage = 34200
-avg_cost_cents = 120
-vendor_price_cents = 120
+# Per-container, same basis as the 1/2-bbl above: $8.00 against a
+# real $6-12. ~73% of the half-bbl's fill cost for ~33% of the
+# volume — the handling-dominated ratio, not the volume ratio.
+avg_cost_cents = 800
+vendor_price_cents = 800
 
 [[parts]]
 # Case packaging bundle for the 12oz retail format: 24 cans + lids
