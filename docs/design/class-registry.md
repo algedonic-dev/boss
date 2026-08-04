@@ -260,12 +260,23 @@ fit:
    (e.g. arbitrary skill strings), a tags table is more appropriate
    than a registry. Registries are for vocabulary the tenant
    curates.
-3. **Per-row configuration.** Settings that vary per Subject
-   instance (e.g. the `tier` field on an Account) are Subject
-   attributes, not Class membership — even if they're drawn from a
-   short list of values. Use the Class registry only when the
-   *category* itself is the thing that has display + grouping
-   metadata.
+3. **Per-row configuration.** Settings whose value is specific to one
+   Subject instance and shares no vocabulary with any other — the
+   `reorder_point` / `reorder_qty` numbers on an inventory item, a
+   per-account credit limit — are Subject attributes, not Class
+   membership. Use the Class registry only when the *category* itself
+   is the thing that has display + grouping metadata.
+
+   The test is the second sentence, not "does it vary per row". A
+   short closed list that the tenant curates and the UI labels,
+   sorts, or groups by **is** Class material even though every
+   Subject carries exactly one of them. `account.tier`
+   (Platinum/Gold/Silver) and `account.account_type` are both
+   Classes for that reason, seeded in `01-registries.sql` with
+   display names and sort orders and validated on the accounts write
+   path. An earlier revision of this section cited `tier` as the
+   counter-example; that was wrong by this section's own test, and
+   the implementation never followed it.
 
 ## Retirement flow
 
