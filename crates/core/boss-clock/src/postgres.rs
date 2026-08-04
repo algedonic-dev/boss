@@ -20,7 +20,7 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::PgPool;
 
-use crate::types::SimClockParams;
+use crate::types::{BaselineProvenance, SimClockParams};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClockStorageError {
@@ -28,6 +28,27 @@ pub enum ClockStorageError {
     Query(#[from] sqlx::Error),
     #[error("sim_clock row not found — apply the schema + seed before starting sim-mode clock-api")]
     NotSeeded,
+}
+
+/// Read the seed baseline's provenance out of `sim_clock`.
+///
+/// All three columns are nullable: an install seeded before they
+/// existed, or one seeded on a host without git, reports what it
+/// knows and `None` for the rest. Absent provenance must read as
+/// "unknown" — never as "current" — because the whole point is to
+/// make a stale pin legible.
+pub async fn read_baseline(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+) -> Result<BaselineProvenance, ClockStorageError> {
+    let row: Option<(Option<i64>, Option<DateTime<Utc>>, Option<String>)> = sqlx::query_as(
+        "SELECT epoch_baseline_audit_id, baseline_cut_at, baseline_source_ref \
+         FROM sim_clock WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let (id, cut_at, source_ref) = row.unwrap_or((None, None, None));
+    Ok(BaselineProvenance::new(id, cut_at, source_ref, now))
 }
 
 /// Read sim_clock and project into formula parameters. Returns

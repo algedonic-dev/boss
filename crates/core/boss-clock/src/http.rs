@@ -40,7 +40,7 @@ use std::time::Duration;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::IntervalStream;
 
-use crate::types::{ClockMode, ClockNow, ConfigureRequest, SimClockParams};
+use crate::types::{BaselineProvenance, ClockMode, ClockNow, ConfigureRequest, SimClockParams};
 
 /// Shared state for the clock API. In sim mode the `params`
 /// RwLock holds the formula parameters; `/now` recomputes on
@@ -64,6 +64,7 @@ pub fn router(state: ClockApiState) -> Router {
     Router::new()
         .route("/api/clock/health", get(health))
         .route("/api/clock/now", get(now_handler))
+        .route("/api/clock/baseline", get(baseline_handler))
         .route("/api/clock/ticks", get(ticks_stream_handler))
         .route("/api/clock/configure", post(configure_handler))
         .route("/api/clock/pause", post(pause_handler))
@@ -127,6 +128,48 @@ async fn health(State(state): State<Arc<ClockApiState>>) -> Json<HealthResponse>
             },
         ),
     })
+}
+
+/// `GET /api/clock/baseline` — provenance of the seed baseline this
+/// tenant replays: which revision it was cut from, when, and how many
+/// days ago.
+///
+/// Separate from `/now` on purpose (see [`BaselineProvenance`]): `/now`
+/// is the hot path every service hits to stamp every event, and it is
+/// `Copy`. This is a question you ask an operator's question of, rarely.
+///
+/// Without a pool (wall mode, tests) there is no baseline to report, so
+/// every field is `None` — which reads as "unknown", the correct answer
+/// for a deployment that does not replay a seed at all.
+async fn baseline_handler(State(state): State<Arc<ClockApiState>>) -> Response {
+    #[cfg(feature = "postgres")]
+    if let Some(pool) = state.pool.as_ref() {
+        // WALL time, deliberately — never the sim clock. "How old is
+        // this baseline?" asks how long the pin has been drifting from
+        // the source tree, which is a real-world duration. Measuring it
+        // against sim-time compares a 2025 sim instant to a 2026 wall
+        // cut and yields a negative age that clamps to 0 — reporting
+        // every baseline as freshly cut, which is precisely the
+        // blindness this endpoint exists to remove.
+        return match crate::postgres::read_baseline(pool, chrono::Utc::now()).await {
+            Ok(p) => Json(p).into_response(),
+            Err(e) => {
+                tracing::warn!(error = %e, "reading baseline provenance");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("reading baseline provenance: {e}"),
+                )
+                    .into_response()
+            }
+        };
+    }
+    Json(BaselineProvenance::new(
+        None,
+        None,
+        None,
+        chrono::Utc::now(),
+    ))
+    .into_response()
 }
 
 async fn now_handler(State(state): State<Arc<ClockApiState>>) -> Response {
