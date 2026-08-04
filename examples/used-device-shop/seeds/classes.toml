@@ -1,7 +1,8 @@
 # Class registry seeds for the used-device-shop example tenant.
 #
 # Each [[class]] block is one row of the `classes` table. Same shape
-# as brewery's classes.toml — see that file's header for the schema.
+# as the brewery's classes.json — see docs/design/class-registry.md
+# for the schema.
 #
 # This file carries the asset category taxonomy
 # (`subject_kind='asset', member_attribute='category'`) — the

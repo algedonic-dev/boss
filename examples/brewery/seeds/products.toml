@@ -10,7 +10,7 @@
 # product_kind and package_unit are both tenant-defined and validated
 # on upsert against the Class registry's (subject_kind='product', code)
 # rows — the brewery seeds product_kind='beer' and package_units
-# 1/2-bbl-keg, 1/6-bbl-keg, 12oz-case (see classes.toml). A SKU whose
+# 1/2-bbl-keg, 1/6-bbl-keg, 12oz-case (see classes.json). A SKU whose
 # kind or unit isn't a registered `product` Class is rejected 400, so
 # classes.json loads before this file (prepare step 1).
 #

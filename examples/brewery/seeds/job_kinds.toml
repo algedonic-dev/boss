@@ -15,8 +15,9 @@
 # brewery-shaped fields (mash_temp_f, boil_minutes, og_gravity,
 # ibu_target, ferm_temp_c, …).
 #
-# Authority roles reference the brewery Roles seeded in
-# `classes.toml`. The shipped JobKindSpec validation does not yet
+# Authority roles reference the `employee` role Classes seeded in
+# `infra/postgres/schema/01-registries.sql`. The shipped JobKindSpec
+# validation does not yet
 # cross-check authority_role against the Class registry; when it
 # does, these rows must resolve.
 

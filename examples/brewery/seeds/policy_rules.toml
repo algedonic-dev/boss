@@ -16,7 +16,8 @@
 #   - "territory"               accounts on the caller's account team
 #   - "department:<name>"       rows scoped to a named department
 #
-# Department names follow the brewery's `classes.toml` department
+# Department names follow the `employee` department Classes seeded
+# platform-side in `infra/postgres/schema/01-registries.sql`:
 # slugs: executive / brewhouse / packaging / cellar / lab /
 # warehouse / distribution / taproom / sales / marketing / hr /
 # finance / it / maintenance.
