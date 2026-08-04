@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::port::{DocsError, DocsRepository};
 use crate::types::{
     DesignDoc, DesignQuestion, FlushJob, FlushJobPayload, JobStatus, JobStatusUpdate,
-    PendingDecision, PendingDecisionInput,
+    PendingDecision, PendingDecisionInput, RejectedDocRecord,
 };
 
 #[derive(Default)]
@@ -20,6 +20,7 @@ struct Inner {
     questions: HashMap<String, Vec<DesignQuestion>>, // keyed by doc_path
     pending: Vec<PendingDecision>,
     jobs: Vec<FlushJob>,
+    rejections: HashMap<String, RejectedDocRecord>, // keyed by path
 }
 
 pub struct InMemoryDocsRepo {
@@ -72,6 +73,40 @@ impl DocsRepository for InMemoryDocsRepo {
         let mut inner = self.inner.write().unwrap();
         inner.docs.insert(doc.path.clone(), doc.clone());
         inner.questions.insert(doc.path.clone(), questions.to_vec());
+        Ok(())
+    }
+
+    async fn all_rejections(&self) -> Result<Vec<RejectedDocRecord>, DocsError> {
+        let g = self.inner.read().expect("docs lock");
+        let mut out: Vec<RejectedDocRecord> = g.rejections.values().cloned().collect();
+        out.sort_by_key(|r| r.first_seen_at);
+        Ok(out)
+    }
+
+    async fn upsert_rejection(&self, path: &str, reason: &str) -> Result<(), DocsError> {
+        let mut g = self.inner.write().expect("docs lock");
+        let now = Utc::now();
+        g.rejections
+            .entry(path.to_string())
+            .and_modify(|r| {
+                r.reason = reason.to_string();
+                r.last_seen_at = now;
+            })
+            .or_insert_with(|| RejectedDocRecord {
+                path: path.to_string(),
+                reason: reason.to_string(),
+                first_seen_at: now,
+                last_seen_at: now,
+            });
+        Ok(())
+    }
+
+    async fn clear_rejection(&self, path: &str) -> Result<(), DocsError> {
+        self.inner
+            .write()
+            .expect("docs lock")
+            .rejections
+            .remove(path);
         Ok(())
     }
 

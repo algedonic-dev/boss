@@ -37,7 +37,20 @@
     title: string;
   };
 
+  type Rejection = {
+    path: string;
+    reason: string;
+    first_seen_at: string;
+    last_seen_at: string;
+  };
+
   let docs = $state<ReadonlyArray<DesignDoc>>([]);
+  // Docs on disk that are NOT in the list below, and why. Empty is the
+  // healthy state. Without this the panel silently showed a partial
+  // corpus: a rejected doc has no design_docs row, so its absence read
+  // as "nobody wrote it" — which is how transactional-audit-log.md
+  // stayed invisible for six days.
+  let rejections = $state<ReadonlyArray<Rejection>>([]);
   let openReviewsByPath = $state<Record<string, OpenReviewJob | undefined>>({});
   let loading = $state(true);
   let error = $state<string | null>(null);
@@ -53,6 +66,15 @@
     department: null,
   });
 
+  /// Whole days a doc has been out of the tracker. The age is what
+  /// makes a rejection actionable — "failed" invites a shrug, "absent
+  /// for 6 days" does not.
+  function daysSince(iso: string): number {
+    const then = new Date(iso).getTime();
+    if (Number.isNaN(then)) return 0;
+    return Math.max(0, Math.floor((Date.now() - then) / 86_400_000));
+  }
+
   async function load(): Promise<void> {
     loading = true;
     error = null;
@@ -60,6 +82,10 @@
       const docsResp = await fetch('/api/design/docs');
       if (!docsResp.ok) throw new Error(`docs: HTTP ${docsResp.status}`);
       docs = (await docsResp.json()) as DesignDoc[];
+
+      const rejResp = await fetch('/api/design/rejections');
+      if (!rejResp.ok) throw new Error(`rejections: HTTP ${rejResp.status}`);
+      rejections = (await rejResp.json()) as Rejection[];
 
       // Look up open design-doc-review Jobs. Subject is the
       // identity-first {subject_kind: 'custom', id: <doc-path>};
@@ -176,6 +202,33 @@
 {:else if error}
   <p class="empty">Error: {error}</p>
 {:else}
+  {#if rejections.length > 0}
+    <Section title={`Not indexed (${rejections.length})`} wide>
+      <p class="empty reject-lede">
+        These files are in <code>docs/design/</code> but are <strong>not</strong>
+        in the lists below — the reindexer refused them. Until each is
+        fixed, this panel is showing an incomplete corpus.
+      </p>
+      <table class="design-table">
+        <thead>
+          <tr><th>Doc</th><th>Invisible for</th><th>Why</th></tr>
+        </thead>
+        <tbody>
+          {#each rejections as r (r.path)}
+            <tr>
+              <td><code>{r.path}</code></td>
+              <td class="reject-age">
+                {daysSince(r.first_seen_at)}
+                {daysSince(r.first_seen_at) === 1 ? 'day' : 'days'}
+              </td>
+              <td class="reject-reason">{r.reason}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </Section>
+  {/if}
+
   <Section title={`In review & discussion (${reviewing.length})`} wide>
     {#if reviewing.length === 0}
       <p class="empty">
@@ -235,6 +288,17 @@
 {/snippet}
 
 <style>
+  .reject-lede {
+    margin-bottom: 0.75rem;
+  }
+  .reject-age {
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .reject-reason {
+    font-size: 0.85rem;
+    line-height: 1.4;
+  }
   .design-table {
     width: 100%;
     border-collapse: collapse;

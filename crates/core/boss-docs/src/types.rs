@@ -385,3 +385,19 @@ mod status_parse_tests {
         assert!(!DocStatus::InReview.forbids_open_questions());
     }
 }
+
+/// A doc on disk that failed to index, and why.
+///
+/// Rejection is correct behaviour — the reindexer refuses docs whose
+/// status contradicts their content. What was missing is durability:
+/// the reason was returned in the reindex API response and discarded,
+/// so a rejected doc was simply absent, indistinguishable from one
+/// nobody had written. `first_seen_at` is preserved across reindexes
+/// because the age is what makes it actionable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedDocRecord {
+    pub path: String,
+    pub reason: String,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+}

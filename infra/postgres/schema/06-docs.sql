@@ -55,6 +55,35 @@ CREATE INDEX IF NOT EXISTS design_docs_pending
     ON design_docs(pending_count) WHERE pending_count > 0;
 
 
+-- Docs that FAILED to index, and why.
+--
+-- A rejected doc has no design_docs row by definition — that is what
+-- rejection means — so without this table it is simply absent, and the
+-- absence looks identical to "nobody wrote that doc yet".
+--
+-- docs/design/transactional-audit-log.md sat rejected from 2026-07-29
+-- to 2026-08-04 for a real and correctly-detected reason (status
+-- `living`, which asserts no open discussion, while carrying two
+-- unresolved questions). The check worked; the message named the fix.
+-- Nobody saw it, because the reason was returned in the reindex API
+-- response and then discarded. A review process that silently drops
+-- work is missing its algedonic signal — a pointed omission in this
+-- codebase of all codebases.
+--
+-- Rows are owned by reindex: upserted when a doc fails, deleted the
+-- moment it indexes cleanly. So a non-empty table means "right now,
+-- these docs are not in the tracker", not "these once failed".
+CREATE TABLE IF NOT EXISTS design_doc_rejections (
+    path            TEXT PRIMARY KEY,
+    reason          TEXT NOT NULL,
+    -- When this doc started failing, preserved across reindexes so the
+    -- surface can say "invisible for six days" rather than just
+    -- "failed". Age is the part that makes it actionable.
+    first_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+
 -- Read-cache of extracted open questions per doc. Re-derived on every
 -- reindex via delete-and-insert per doc in a single transaction.
 CREATE TABLE IF NOT EXISTS design_questions (

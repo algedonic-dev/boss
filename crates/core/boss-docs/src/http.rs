@@ -35,6 +35,7 @@ pub fn router(state: DocsApiState) -> Router {
         // `boss-docs-api` as down even when running.
         .route("/api/docs/health", get(health))
         .route("/api/design/docs", get(list_docs))
+        .route("/api/design/rejections", get(list_rejections))
         .route("/api/design/docs/{*path}", get(get_doc))
         .route("/api/design/reindex", post(post_reindex))
         .route("/api/design/pending-decisions", post(post_pending_decision))
@@ -100,6 +101,19 @@ struct DocListRow {
     #[serde(flatten)]
     doc: DesignDoc,
     open_questions: usize,
+}
+
+/// `GET /api/design/rejections` — docs on disk that are NOT in the
+/// tracker, and why.
+///
+/// The review panel's algedonic signal. Empty is the healthy state;
+/// non-empty means the corpus you are looking at is incomplete, which
+/// is otherwise indistinguishable from a doc nobody wrote.
+async fn list_rejections(State(state): State<Arc<DocsApiState>>) -> Response {
+    match state.repo.all_rejections().await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => err_to_response(e),
+    }
 }
 
 async fn list_docs(State(state): State<Arc<DocsApiState>>) -> Response {
