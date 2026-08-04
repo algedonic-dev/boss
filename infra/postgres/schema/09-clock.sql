@@ -34,6 +34,28 @@ CREATE TABLE IF NOT EXISTS sim_clock (
     -- yet; in that case the restart endpoint errors out with
     -- a clear message.
     epoch_baseline_audit_id BIGINT,
+    -- ----- Baseline provenance -----
+    -- The baseline is a BUILD ARTIFACT with an age, and the demo
+    -- replays it forever: every restart-epoch trims back to
+    -- epoch_baseline_audit_id, so nothing merged after the cut —
+    -- seed values, JobKind specs, Class rows — exists in the running
+    -- tenant until someone re-cuts. That is a deliberate pin, not a
+    -- bug, but it is only safe if the pin is legible.
+    --
+    -- It was not: a playground baseline cut 2026-07-11 replayed for
+    -- 3.5 weeks while 6 seed files and 12 schema files moved under
+    -- it, and a packaging fix merged two days after the cut was read
+    -- back off the running demo as an open modeling gap. Answering
+    -- "what is this demo built from, and how old is it?" required
+    -- archaeology on audit_log.created_at.
+    --
+    -- Stamped together with epoch_baseline_audit_id by
+    -- infra/seed-brewery-tenant.sh; surfaced at GET /api/clock/baseline.
+    -- NULL on installs that predate this column or seed without git
+    -- (docker images ship no .git) — absent provenance reads as
+    -- "unknown", never as "current".
+    baseline_cut_at       TIMESTAMPTZ,
+    baseline_source_ref   TEXT,
     -- ----- Formula clock parameters -----
     -- Sim-time is derived by clock-api as:
     --   sim_now = epoch_start_date + (wall_now − wall_anchor − paused_offset) × warp_factor
