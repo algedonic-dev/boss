@@ -17,7 +17,7 @@
 #                          tax filings)
 #
 # When the shape-driven sim ships, it loads this file + the
-# job_kinds.toml + classes.toml + locations.toml + employees.json
+# job_kinds.toml + classes.json + locations.toml + employees.json
 # from the same `seeds/` directory and runs end-to-end without
 # brewery-specific Rust code.
 #
