@@ -113,6 +113,16 @@ export const PORTS: ReadonlyArray<PortRow> = [
     "scratch": null
   },
   {
+    "name": "campaigns",
+    "prod": 7845,
+    "scratch": null
+  },
+  {
+    "name": "customers",
+    "prod": 7855,
+    "scratch": null
+  },
+  {
     "name": "observability",
     "prod": 7880,
     "scratch": null
