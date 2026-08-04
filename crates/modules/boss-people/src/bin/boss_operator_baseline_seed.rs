@@ -73,15 +73,61 @@ fn resolve_bootstrap_admin_email() -> Option<String> {
     }
     let auth_file = std::env::var("BOSS_AUTH_FILE")
         .unwrap_or_else(|_| "/var/lib/boss/auth/credentials.toml".to_string());
-    let raw = std::fs::read_to_string(&auth_file).ok()?;
-    let parsed: toml::Value = raw.parse().ok()?;
-    parsed
-        .get("credential")?
-        .as_array()?
-        .first()?
-        .get("email")?
-        .as_str()
-        .map(|s| s.to_string())
+    let raw = match std::fs::read_to_string(&auth_file) {
+        Ok(raw) => raw,
+        Err(e) => {
+            // Loud, with the path and the reason. This fallback failing
+            // silently is what let a reset produce a demo with no
+            // platform-admin — and therefore no publishable JobKinds,
+            // since the Q7 owner gate rejects the bootstrap Job.
+            info!(
+                path = %auth_file,
+                error = %e,
+                "bootstrap-admin: credentials file unreadable"
+            );
+            return None;
+        }
+    };
+    match bootstrap_email_from_credentials(&raw) {
+        Some(email) => Some(email),
+        None => {
+            info!(
+                path = %auth_file,
+                "bootstrap-admin: credentials file has no [[credential]] email"
+            );
+            None
+        }
+    }
+}
+
+/// Pull the first `[[credential]]` row's `email` out of the gateway's
+/// auth file.
+///
+/// Split out of `resolve_bootstrap_admin_email` so the parse is
+/// testable without env vars or a real file — the untestability is
+/// why the bug below survived.
+///
+/// Deserializes into a typed struct rather than walking a
+/// `toml::Value`. Under `toml` 1.x a `[[credential]]` document parses
+/// to a `Value::Table` whose `get("credential")` the previous code
+/// chained through with `?`, and any single step returning `None`
+/// collapsed the whole thing to "no email" with no way to tell which.
+/// A `Deserialize` impl is both what the rest of the codebase does and
+/// impossible to silently mis-index.
+fn bootstrap_email_from_credentials(raw: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct AuthFile {
+        #[serde(default)]
+        credential: Vec<Credential>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Credential {
+        email: String,
+    }
+    let parsed: AuthFile = toml::from_str(raw).ok()?;
+    let email = parsed.credential.into_iter().next()?.email;
+    let trimmed = email.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn display_name_from_email(email: &str) -> String {
@@ -239,4 +285,65 @@ fn main() -> Result<()> {
 
     info!(inserted, skipped, "operator-baseline seed complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact shape the gateway's local_auth writes, byte-for-byte
+    /// from the playground's `/var/lib/boss/auth/credentials.toml`.
+    /// This file read as valid UTF-8 and parsed fine in other TOML
+    /// implementations, yet the old `toml::Value`-walking resolver
+    /// returned None for it — leaving a reset with no platform-admin,
+    /// which the Q7 owner gate then turned into "prepare publishes
+    /// zero JobKinds" and a demo that could only idle.
+    const REAL_CREDENTIALS: &str = r#"[[credential]]
+email = "david@algedonic.dev"
+password_hash = "$argon2id$v=19$m=19456,t=2,p=1$4LpQUAH90UxRT3D73PzcyQ$R6v2W4pFoHc9czv8L4cbvbr1vX3VYxGQZhkvNqRiegE"
+created_at = "2026-06-03T04:12:15.045062115Z"
+last_rotated = "2026-07-07T16:13:36.282845447Z"
+"#;
+
+    #[test]
+    fn reads_the_email_from_a_real_credentials_file() {
+        assert_eq!(
+            bootstrap_email_from_credentials(REAL_CREDENTIALS).as_deref(),
+            Some("david@algedonic.dev"),
+        );
+    }
+
+    #[test]
+    fn takes_the_first_credential_when_several_exist() {
+        let raw = r#"
+[[credential]]
+email = "first@example.com"
+password_hash = "x"
+
+[[credential]]
+email = "second@example.com"
+password_hash = "y"
+"#;
+        assert_eq!(
+            bootstrap_email_from_credentials(raw).as_deref(),
+            Some("first@example.com"),
+        );
+    }
+
+    #[test]
+    fn no_credentials_yields_none() {
+        assert_eq!(bootstrap_email_from_credentials(""), None);
+        assert_eq!(
+            bootstrap_email_from_credentials("[[credential]]\nemail = \"\"\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_toml_yields_none_rather_than_panicking() {
+        assert_eq!(
+            bootstrap_email_from_credentials("this is not = = toml"),
+            None
+        );
+    }
 }
