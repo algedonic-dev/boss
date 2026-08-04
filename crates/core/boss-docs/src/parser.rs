@@ -284,7 +284,7 @@ fn find_section_start(events: &[Event], target: &str) -> Option<usize> {
                 }
                 j += 1;
             }
-            if heading.trim().to_lowercase() == target {
+            if heading_names_section(&heading, &target) {
                 return Some(j + 1);
             }
             i = j + 1;
@@ -293,6 +293,33 @@ fn find_section_start(events: &[Event], target: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Does this H2 heading name the `target` section?
+///
+/// Exact match, or the target followed by a separator — so
+/// `## Open questions (recorded endgames — out of scope)` and
+/// `## Open questions: round two` both count, while
+/// `## Open questions we rejected` does not (no separator, and it
+/// names a different section).
+///
+/// This was an exact `==`. A heading with a parenthetical therefore
+/// named no section, so the tracker found zero questions in it —
+/// while `extract_unresolved_question_titles`, which scans doc-wide,
+/// found them and blocked the doc from indexing. A doc could be
+/// rejected for questions the tracker was structurally unable to
+/// display, which is how one sat invisible for a week.
+fn heading_names_section(heading: &str, target: &str) -> bool {
+    let h = heading.trim().to_lowercase();
+    if h == target {
+        return true;
+    }
+    let Some(rest) = h.strip_prefix(target) else {
+        return false;
+    };
+    // Whitespace between the name and its separator is the normal
+    // shape (`Open questions (…)`), so skip it before checking.
+    matches!(rest.trim_start().chars().next(), Some(c) if "(:—-–".contains(c))
 }
 
 /// Returns the index where the section ends (next H2 start, or len).
@@ -682,6 +709,47 @@ Irrelevant content.
             parsed.questions[1].proposal.as_deref(),
             Some("pick option B.")
         );
+    }
+
+    /// A doc whose Open-questions heading carries a parenthetical was
+    /// rejected for having open questions the tracker then could not
+    /// show: `extract_unresolved_question_titles` scans doc-wide (so it
+    /// saw them and blocked indexing), while the section lookup matched
+    /// the heading EXACTLY (so it found no section and returned none).
+    /// Two notions of "a question" in one parser, disagreeing.
+    ///
+    /// Found on docs/design/transactional-audit-log.md, whose heading is
+    /// `## Open questions (recorded endgames — out of scope, kept
+    /// visible)`. It sat un-indexed and invisible from 2026-07-29 until
+    /// 2026-08-04, rejected on every reindex, because the rejection is
+    /// only reported in the reindex API response nobody was reading.
+    #[test]
+    fn open_questions_heading_may_carry_a_parenthetical() {
+        let md = r#"# Test
+
+**Status**: reopened
+
+## Open questions (recorded endgames — out of scope, kept visible)
+
+### Q2: Does the pipeline keep insert-time chaining forever?
+
+Body for Q2.
+
+### Q6: Does the dispatcher consume the log instead of NATS?
+
+Body for Q6.
+"#;
+        let parsed = parse_doc("docs/design/test.md", md);
+        assert_eq!(
+            parsed.questions.len(),
+            2,
+            "questions under a suffixed Open-questions heading must still be tracked",
+        );
+        assert_eq!(parsed.questions[0].anchor, "Q2");
+        assert_eq!(parsed.questions[1].anchor, "Q6");
+        // The doc-wide unresolved scan and the section tracker must
+        // agree: anything that blocks indexing has to be displayable.
+        assert_eq!(parsed.unresolved_questions.len(), 2);
     }
 
     #[test]
