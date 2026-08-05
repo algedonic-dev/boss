@@ -13,6 +13,7 @@
   import { loadStepTypeRegistry } from './steps/surfaceRegistry.svelte';
   import { loadClasses } from '@boss/web-kit/session/classes.svelte';
   import AppShell from './shell/AppShell.svelte';
+  import { appForSection, type AppId } from './shell/nav-catalog';
   import PerspectiveTabs from '@boss/web-kit/PerspectiveTabs.svelte';
   import DebugGear from './debug/DebugGear.svelte';
   import MePage from './me/MePage.svelte';
@@ -201,19 +202,16 @@
       : 'me',
   );
 
-  // Top-level perspective for the PerspectiveTabs bar. The System Model
-  // surfaces (the IT / model-definition tools) are one perspective; the
-  // operator work surfaces are the other. (Simulator is its own app.)
-  // This is the seam for the eventual Model/User app split.
-  const MODEL_KINDS = new Set<Route['kind']>([
-    'systemModel', 'systemSubjects', 'systemKb', 'systemDesign',
-    'systemMonitoring', 'systemMonitoringPerf', 'systemMonitoringEvents', 'systemMonitoringAtlas',
-    'systemStepPlugins', 'systemStepPluginDetail',
-    'dispatcherRules', 'dispatcherRulesList', 'dispatcherRuleEdit',
-    'jobKinds', 'jobKindNew', 'jobKindDesign', 'jobKindDetail',
-    'policy', 'workflows', 'authAdmin', 'experiments',
-  ]);
-  let perspective: 'model' | 'user' = $derived(MODEL_KINDS.has(route.kind) ? 'model' : 'user');
+  // Which app tab is active. Derived from `activeSection` — the id
+  // the ternary above already resolves every route.kind down to — via
+  // the catalog's `app` field.
+  //
+  // This replaced a MODEL_KINDS set of Route['kind']s maintained here
+  // alongside a MODEL_ROUTES set of RouteNames in AppShell.svelte.
+  // Two lists in two vocabularies answering one question, which had
+  // to agree for every routed surface: miss one and the page rendered
+  // with the wrong tab highlighted and the wrong sidebar, silently.
+  let perspective: AppId = $derived(appForSection(activeSection));
 </script>
 
 {#if route.kind === 'login'}

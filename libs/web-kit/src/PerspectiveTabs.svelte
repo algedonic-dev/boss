@@ -1,36 +1,30 @@
 <script lang="ts">
-  // Top-level perspective switcher across the three BOSS surfaces, each
-  // (increasingly) its own app served by its own piece:
-  //   Simulator        — run/observe the sim          (boss-simulator, /simulator)
-  //   System Model      — define/understand the model  (the model-definition surfaces, /it)
-  //   User Experiences  — the interfaces actors work in (the operator surfaces, /)
+  // The chrome bar — the one thing every app shares.
   //
-  // Rendered fixed across the very top of every app's shell. It is the
-  // single home for the top chrome: the tenant wordmark (left), the
-  // perspective tabs (center), and the shared right-hand controls —
-  // the system-time indicator and the sign-in/out control. Switching
-  // perspective is a full navigation (the perspectives are served
-  // distinctly), so the tabs are plain anchors, not client-side routes.
-  // 44px tall — each shell offsets its chrome below it.
+  // Tenant wordmark (left), the app tabs (centre), and the shared
+  // right-hand controls: system time and the sign-in/out control.
+  // Everything below it belongs to whichever app is active; this bar
+  // is the only fixed furniture. 44px tall — each app's shell offsets
+  // its own chrome below it.
+  //
+  // The tab list is APPS from @boss/web-kit/nav, so the bar and the
+  // surface-to-app mapping cannot disagree about which apps exist.
+  // Tabs are plain anchors: Simulator is served by a different piece
+  // (boss-simulator) so switching to it is a real navigation, and for
+  // the same-SPA apps the router picks the change up on popstate.
   import SystemTime from './SystemTime.svelte';
   import SignInControl from './SignInControl.svelte';
+  import { APPS, type AppId } from './nav';
 
-  type Perspective = 'simulator' | 'model' | 'user';
   let {
     active,
     brandName = 'BOSS',
     brandSub = '',
   } = $props<{
-    active: Perspective;
+    active: AppId;
     brandName?: string;
     brandSub?: string;
   }>();
-
-  const TABS: ReadonlyArray<{ id: Perspective; label: string; href: string }> = [
-    { id: 'simulator', label: 'Simulator', href: '/simulator' },
-    { id: 'model', label: 'System Model', href: '/system' },
-    { id: 'user', label: 'User Experiences', href: '/ux' },
-  ];
 </script>
 
 <nav class="perspective-tabs" aria-label="Perspective">
@@ -39,7 +33,7 @@
     {#if brandSub}<span class="perspective-brand-sub">{brandSub}</span>{/if}
   </span>
   <div class="perspective-tablist">
-    {#each TABS as t (t.id)}
+    {#each APPS as t (t.id)}
       <a
         class="perspective-tab"
         class:active={active === t.id}

@@ -13,168 +13,69 @@
   import { workForRole } from '@boss/web-kit/session/work-by-role';
   import { navigate } from '../router';
   import PersonaSwitcher from '../session/PersonaSwitcher.svelte';
+  import {
+    ROUTE_CATALOG,
+    type AppId,
+    type NavItem,
+    type NavGroup,
+  } from './nav-catalog';
 
-  type NavItem = Readonly<{
-    id: string;
-    label: string;
-    path: string;
-    permKey?: RouteName;
-    /// Tenant module that this nav entry belongs to. When the
-    /// manifest disables the module (e.g. brewery turns off
-    /// `equipment` and `shipping`), the entry is hidden. Items
-    /// without a module field are always-on (e.g. /jobs).
-    module?: string;
-  }>;
-  type NavGroup = Readonly<{ label: string; items: ReadonlyArray<NavItem> }>;
-
-  // ROUTE_CATALOG is the single registry of every routable nav entry —
-  // its label, path, permKey, and tenant-module gate. Both Work
-  // (role-keyed) and Surfaces (department-keyed) compose entries from
-  // this catalog by RouteName, which keeps labels + module gates from
-  // drifting between the two groups.
-  const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
-    jobs:      { id: 'jobs',      label: 'All jobs',         path: '/ux/jobs',      permKey: 'jobs' },
-    sales:     { id: 'sales',     label: 'Sales pipeline',   path: '/ux/sales',     permKey: 'sales' },
-    service:   { id: 'service',   label: 'Service queue',    path: '/ux/service',   permKey: 'service',   module: 'support' },
-    refurb:    { id: 'refurb',    label: 'Refurbishment',    path: '/ux/refurb',    permKey: 'refurb',    module: 'support' },
-    qa:        { id: 'qa',        label: 'QA',               path: '/ux/qa',        permKey: 'qa',        module: 'qa' },
-    finance:   { id: 'finance',   label: 'Finance',          path: '/ux/finance',   permKey: 'finance',   module: 'finance' },
-    warehouse: { id: 'warehouse', label: 'Inventory',        path: '/ux/warehouse', permKey: 'warehouse', module: 'warehouse' },
-    shipping:  { id: 'shipping',  label: 'Shipments',        path: '/ux/shipping',  permKey: 'shipping',  module: 'shipping' },
-    support:   { id: 'support',   label: 'Support',          path: '/ux/support',   permKey: 'support',   module: 'support' },
-    ops:       { id: 'ops',       label: 'Operations',       path: '/ux/ops',       permKey: 'ops' },
-    exec:      { id: 'exec',      label: 'Exec',             path: '/ux/exec',      permKey: 'exec',      module: 'exec' },
-    'system-monitoring': { id: 'system-monitoring', label: 'Monitoring', path: '/system/monitoring', permKey: 'system-monitoring' },
-    schedule:  { id: 'schedule',  label: 'My schedule',      path: '/ux/calendar/me', permKey: 'schedule' },
-    catalog:   { id: 'catalog',   label: 'Equipment',        path: '/ux/catalog',   permKey: 'catalog',   module: 'equipment' },
-    parts:     { id: 'parts',     label: 'Ingredients & parts', path: '/ux/parts',  permKey: 'parts',     module: 'parts' },
-    products:  { id: 'products',  label: 'Products',         path: '/ux/products',  permKey: 'parts',     module: 'parts' },
-    accounts:  { id: 'accounts',  label: 'Accounts',         path: '/ux/accounts',  permKey: 'accounts' },
-    vendors:   { id: 'vendors',   label: 'Vendors',          path: '/ux/vendors',   permKey: 'vendors' },
-    people:    { id: 'people',    label: 'Employees',        path: '/ux/people',    permKey: 'people' },
-    assets:    { id: 'assets',    label: 'Assets',             path: '/ux/assets',    permKey: 'assets',    module: 'equipment' },
-    shop:      { id: 'shop',      label: 'Shop',             path: '/ux/shop',      permKey: 'shop' },
-    inbox:     { id: 'inbox',     label: 'Inbox',            path: '/ux/inbox',     permKey: 'inbox' },
-    // 'it-sim' retired 2026-05-03 with boss-sim-api (HumanWorker step 9b).
-    'marketing-assets': { id: 'marketing-assets', label: 'Marketing assets', path: '/ux/marketing-assets', permKey: 'marketing-assets', module: 'marketing-assets' },
-    calendar:  { id: 'calendar',  label: 'Release calendar', path: '/ux/calendar',  permKey: 'calendar',  module: 'calendar' },
-    // Modeling surfaces — operator-tier (no separate /admin tier).
-    // policy + job-kinds are dept-head + COO authority (per the
-    // "engineers are operators like anyone else" frame). Step
-    // plugins are JS bundle authoring → IT engineering work.
-    policy:               { id: 'policy',               label: 'Policy',              path: '/system/policy',  permKey: 'policy' },
-    'job-kinds':          { id: 'job-kinds',            label: 'Job kinds',           path: '/system/job-kinds', permKey: 'job-kinds' },
-    'system-step-plugins':    { id: 'system-step-plugins',      label: 'Step plugins',        path: '/system/step-plugins', permKey: 'system-step-plugins' },
-    'system-dispatcher':      { id: 'system-dispatcher',        label: 'Dispatcher rules',    path: '/system/dispatcher',  permKey: 'system-dispatcher' },
-    'system-model':          { id: 'system-model',            label: 'System Model',        path: '/system',             permKey: 'system-model' },
-    'system-subjects':        { id: 'system-subjects',          label: 'Subjects & Classes',  path: '/system/subjects',    permKey: 'system-subjects' },
-    // The rule-authoring list + editor are reached via a link FROM the
-    // cascade viz (the system-dispatcher Surface entry), not their own sidebar
-    // rows — so these catalog entries exist to satisfy the
-    // Record<RouteName,…> type but are intentionally absent from
-    // SURFACE_ORDER (no sidebar item ⇒ no sidebar-consistency entry).
-    'system-dispatcher-rules': { id: 'system-dispatcher-rules', label: 'Dispatcher rules — authoring', path: '/system/dispatcher/rules', permKey: 'system-dispatcher-rules' },
-    'system-dispatcher-rule':  { id: 'system-dispatcher-rule',  label: 'Dispatcher rule — editor',    path: '/system/dispatcher/rules', permKey: 'system-dispatcher-rule' },
-    'system-design':          { id: 'system-design',            label: 'Design review',       path: '/system/design',      permKey: 'system-design' },
-    // The "Evolve" surface — controlled, sandboxed model modifications
-    // (placeholder for now; visible to every role via canSeeRoute).
-    'system-experiments':     { id: 'system-experiments',       label: 'Experiments',         path: '/system/experiments', permKey: 'system-experiments' },
-    'system-kb':              { id: 'system-kb',                label: 'Knowledge Base',      path: '/system/kb',          permKey: 'system-kb' },
-    'auth-admin':         { id: 'auth-admin',           label: 'Auth admin',          path: '/system/auth-admin', permKey: 'auth-admin' },
-    // KB view of every active JobKind — read-only catalog,
-    // visible to every role via canSeeRoute() short-circuit.
-    // Editing lives at /job-kinds (Surface, gated to dept heads +
-    // COO who author their own dept's work types).
-    workflows:            { id: 'workflows',          label: 'Workflows',           path: '/system/workflows', permKey: 'workflows' },
-  };
+  // NavItem / NavGroup / ROUTE_CATALOG live in ./nav-catalog so both
+  // this shell and App.svelte read the same registry — and so the
+  // consistency test can import it instead of mirroring it by hand.
+  // `app` on each entry is the single answer to "which tab owns this
+  // surface"; it replaced this file's MODEL_ROUTES and App.svelte's
+  // MODEL_KINDS, which had to agree and could silently stop agreeing.
 
   // Surfaces — one entry per department-rooted dashboard, in the
   // order an operator would scan them. Rendered as-is; the visible()
   // filter then drops anything the role/manifest blocks. A
   // service-only persona simply sees Service + Inventory + Shipments.
-  const SURFACE_ORDER: ReadonlyArray<RouteName> = [
-    'exec',       // executive
-    'sales',      // sales department
-    'service',    // service department
-    'qa',         // quality
-    'warehouse',  // warehouse + inventory
-    'shipping',   // shipping department
-    'support',    // support department
-    'finance',    // finance department
-    'system-model', // System Model hub (the landing, leads the cluster)
-    'system-monitoring', // live state — service map, perf, events, atlas
-    'system-step-plugins', // custom step UX bundles
-    'system-dispatcher', // dispatcher rule cascade (read-only)
-    'system-subjects', // SubjectKind taxonomy + Class registry (read-only)
-    // 'it-sim' retired 2026-05-03 with boss-sim-api (HumanWorker step 9b).
-    'ops',        // operations
-    'policy',     // dept heads + COO — author role/scope policy
-    'job-kinds',  // dept heads + COO — model the dept's work types
-    'auth-admin', // dept heads + COO + IT — onboard / reset credentials
-  ];
-
-  const KNOW: NavGroup = {
-    label: 'Knowledge Bases',
-    items: [
-      ROUTE_CATALOG.catalog,
-      ROUTE_CATALOG.parts,
-      ROUTE_CATALOG.products,
-      ROUTE_CATALOG.accounts,
-      ROUTE_CATALOG.vendors,
-      ROUTE_CATALOG.people,
-      ROUTE_CATALOG['marketing-assets'],
-      ROUTE_CATALOG.calendar,
-      { id: 'manual', label: 'Company manual', path: '/ux/manual', permKey: 'inbox' },
-      // Workflows = KB of every active JobKind — everyone's
-      // read-only catalog of "what kinds of work does this place
-      // run?" Pairs with the /job-kinds Surface (editor), which
-      // is gated to dept heads + COO + the C-suite catch-all.
-      ROUTE_CATALOG.workflows,
-      // IT Knowledge Base — department-rooted KB carrying ADRs,
-      // architecture diagrams, hardware/software/provider
-      // reference. Replaces the old /design + /architecture
-      // entries: ADRs and the architecture diagrams now live
-      // under the IT department surface (paired with /it/monitoring
-      // for live state).
-      ROUTE_CATALOG['system-kb'],
-      // Design review — brings back the workflow that was retired
-      // 2026-05-03. Lists every docs/design/*.md with parsed open
-      // questions + the in-flight design-doc-review Job (if any).
-      // The "system modeling its own development" claim depends on
-      // this surface existing.
-      ROUTE_CATALOG['system-design'],
-    ],
-  };
-
-  const BROWSE: NavGroup = {
-    label: 'Surfaces',
-    items: SURFACE_ORDER.map((r) => ROUTE_CATALOG[r]),
-  };
-
-  // /admin tier removed entirely (2026-05-03). Engineers and
-  // platform operators are operators like anyone else; their
-  // surfaces sit alongside the rest in the same Surfaces group:
-  //   - /policy + /job-kinds → modeling surfaces, gated to
-  //     dept heads + COO + C-suite (NOT IT — those decisions
-  //     are operational, not technical).
-  //   - /it/monitoring + /it/kb + /it/step-plugins + /it/sim →
-  //     the IT department's surface set. Engineers run the
-  //     platform; their "Work" looks like everyone else's.
-  // Future surfaces should NOT bring back the Admin tier; pick
-  // a department-rooted slug and a role-gated permKey.
-
-  let { activeSection, perspective = 'user', children } = $props<{
+  let { activeSection, perspective = 'home', children } = $props<{
     activeSection: string;
-    // Which top-level perspective tab this shell renders under. Drives
-    // which surfaces appear in the sidebar.
-    perspective?: 'model' | 'user';
+    // Which app tab this shell renders under. Drives which surfaces
+    // appear in the sidebar. Typed as the full AppId — the shell
+    // speaks the same vocabulary as the catalog, so adding an app is
+    // a catalog change rather than a widening here.
+    perspective?: AppId;
     children: () => any;
   }>();
+
+  // Svelte's generated props type widens `perspective` to `any` through
+  // the default, which silently un-types every Record lookup below.
+  // Pin it once.
+  let activeApp = $derived(perspective as AppId);
 
   let user = $derived(
     session.value.kind === 'ready' ? session.value.user : null,
   );
   let role = $derived((user?.role ?? null) as Role | null);
+
+  // Per-app surface order. Each domain app owns one group; the order
+  // is how an operator in that app would scan it, not alphabetical.
+  // `visible()` then drops whatever the role or the tenant manifest
+  // blocks, so a support-only persona simply sees a shorter CRM list.
+  //
+  // This replaced a single flat SURFACE_ORDER plus a "Knowledge Bases"
+  // group — one 24-entry list every operator scrolled regardless of
+  // what they were doing. The knowledge-base surfaces (equipment,
+  // ingredients & parts, products) weren't a category of their own so
+  // much as Supply Chain's reference data, and they read that way now.
+  const APP_SURFACES: Readonly<Partial<Record<AppId, ReadonlyArray<RouteName>>>> = {
+    crm: ['accounts', 'sales', 'support', 'shop', 'marketing-assets'],
+    finance: ['finance', 'vendors'],
+    operations: ['ops', 'jobs', 'service', 'refurb', 'qa', 'calendar'],
+    'supply-chain': ['warehouse', 'shipping', 'parts', 'products', 'catalog', 'assets'],
+    people: ['people'],
+  };
+
+  const APP_GROUP_LABEL: Readonly<Partial<Record<AppId, string>>> = {
+    crm: 'Customers',
+    finance: 'Finance',
+    operations: 'Operations',
+    'supply-chain': 'Supply chain',
+    people: 'People',
+  };
 
   // Work group is role-keyed: each role gets a tailored 3-5 item
   // list of the surfaces they personally operate from. The same
@@ -229,29 +130,51 @@
     },
   ];
 
+  // Home — personal work, whichever domain it belongs to. The
+  // role-keyed Work list lives here rather than being repeated in
+  // every app: "what am I meant to be doing" is one question, and its
+  // answer crosses CRM, Operations and Finance freely.
+  const HOME_GROUPS = $derived<ReadonlyArray<NavGroup>>([
+    WORK,
+    {
+      label: 'Mine',
+      items: [
+        // Permkey-less: /` is App.svelte's `me` route, which has no
+        // catalog entry (it is everyone's, ungated).
+        { id: 'my-day', label: 'My Day', path: '/' },
+        ROUTE_CATALOG.inbox,
+        ROUTE_CATALOG.schedule,
+        ROUTE_CATALOG.exec,
+      ],
+    },
+  ]);
+
   let MAIN = $derived<ReadonlyArray<NavGroup>>(
-    perspective === 'model' ? MODEL_GROUPS : [WORK, BROWSE, KNOW],
+    activeApp === 'model'
+      ? MODEL_GROUPS
+      : activeApp === 'home'
+        ? HOME_GROUPS
+        : [
+            {
+              label: APP_GROUP_LABEL[activeApp] ?? '',
+              items: (APP_SURFACES[activeApp] ?? []).map(
+                (r: RouteName) => ROUTE_CATALOG[r],
+              ),
+            },
+          ],
   );
 
-  // Perspective split: which surfaces belong to the System Model tab
-  // (the model's configuration + how it's running — most of what used
-  // to be "IT") vs the User Experiences tab (the actor work surfaces +
-  // knowledge bases — Finance, Inventory, the KBs, …). Keyed by
-  // permKey/RouteName. Keep in sync with App.svelte's MODEL_KINDS,
-  // which classifies the same split by route kind to drive the active
-  // tab — the two must agree for every routed surface.
-  const MODEL_ROUTES = new Set<RouteName>([
-    'system-model', 'system-monitoring', 'system-step-plugins', 'system-dispatcher',
-    'system-subjects', 'system-dispatcher-rules', 'system-dispatcher-rule',
-    'system-kb', 'system-design', 'system-experiments', 'policy', 'job-kinds', 'workflows', 'auth-admin',
-  ]);
+  // A surface is in-perspective when its catalog `app` matches the
+  // app this shell is rendering. One comparison against one field —
+  // where this used to be a MODEL_ROUTES set here that had to agree
+  // with a MODEL_KINDS set in App.svelte, keyed off a different
+  // vocabulary (RouteName vs Route['kind']).
   function inPerspective(i: NavItem): boolean {
     // A permKey-less NavItem (e.g. a plain sub-page link like Audit
-    // Log / Atlas) carries no perspective classification — it belongs
-    // to whatever group it's placed in, so it's always in-perspective.
+    // Log / Atlas) carries no app of its own — it belongs to whatever
+    // group it's placed in, so it's always in-perspective.
     if (i.permKey === undefined) return true;
-    const isModel = MODEL_ROUTES.has(i.permKey);
-    return perspective === 'model' ? isModel : !isModel;
+    return (ROUTE_CATALOG[i.permKey]?.app ?? 'home') === activeApp;
   }
 
   function visible(items: ReadonlyArray<NavItem>): ReadonlyArray<NavItem> {
