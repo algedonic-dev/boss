@@ -84,30 +84,30 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
   // policy + job-kinds are dept-head + COO authority (per the
   // "engineers are operators like anyone else" frame). Step
   // plugins are JS bundle authoring → IT engineering work.
-  'system-monitoring':       { id: 'system-monitoring',       label: 'Monitoring',          path: '/system/monitoring',   permKey: 'system-monitoring',       app: 'model' },
-  policy:                    { id: 'policy',                  label: 'Policy',              path: '/system/policy',       permKey: 'policy',                  app: 'model' },
-  'job-kinds':               { id: 'job-kinds',               label: 'Job kinds',           path: '/system/job-kinds',    permKey: 'job-kinds',               app: 'model' },
-  'system-step-plugins':     { id: 'system-step-plugins',     label: 'Step plugins',        path: '/system/step-plugins', permKey: 'system-step-plugins',     app: 'model' },
-  'system-dispatcher':       { id: 'system-dispatcher',       label: 'Dispatcher rules',    path: '/system/dispatcher',   permKey: 'system-dispatcher',       app: 'model' },
-  'system-model':            { id: 'system-model',            label: 'System Model',        path: '/system',              permKey: 'system-model',            app: 'model' },
-  'system-subjects':         { id: 'system-subjects',         label: 'Subjects & Classes',  path: '/system/subjects',     permKey: 'system-subjects',         app: 'model' },
+  'system-monitoring':       { id: 'system-monitoring',       label: 'Monitoring',          path: '/system/monitoring',   permKey: 'system-monitoring',       app: 'it' },
+  policy:                    { id: 'policy',                  label: 'Policy',              path: '/system/policy',       permKey: 'policy',                  app: 'it' },
+  'job-kinds':               { id: 'job-kinds',               label: 'Job kinds',           path: '/system/job-kinds',    permKey: 'job-kinds',               app: 'it' },
+  'system-step-plugins':     { id: 'system-step-plugins',     label: 'Step plugins',        path: '/system/step-plugins', permKey: 'system-step-plugins',     app: 'it' },
+  'system-dispatcher':       { id: 'system-dispatcher',       label: 'Dispatcher rules',    path: '/system/dispatcher',   permKey: 'system-dispatcher',       app: 'it' },
+  'system-model':            { id: 'system-model',            label: 'System Model',        path: '/system',              permKey: 'system-model',            app: 'it' },
+  'system-subjects':         { id: 'system-subjects',         label: 'Subjects & Classes',  path: '/system/subjects',     permKey: 'system-subjects',         app: 'it' },
   // The rule-authoring list + editor are reached via a link FROM the
   // cascade viz (the system-dispatcher Surface entry), not their own
   // sidebar rows — so these catalog entries exist to satisfy the
   // Record<RouteName,…> type but are intentionally absent from
   // SURFACE_ORDER (no sidebar item ⇒ no sidebar-consistency entry).
-  'system-dispatcher-rules': { id: 'system-dispatcher-rules', label: 'Dispatcher rules — authoring', path: '/system/dispatcher/rules', permKey: 'system-dispatcher-rules', app: 'model' },
-  'system-dispatcher-rule':  { id: 'system-dispatcher-rule',  label: 'Dispatcher rule — editor',     path: '/system/dispatcher/rules', permKey: 'system-dispatcher-rule',  app: 'model' },
-  'system-design':           { id: 'system-design',           label: 'Design review',       path: '/system/design',       permKey: 'system-design',           app: 'model' },
+  'system-dispatcher-rules': { id: 'system-dispatcher-rules', label: 'Dispatcher rules — authoring', path: '/system/dispatcher/rules', permKey: 'system-dispatcher-rules', app: 'it' },
+  'system-dispatcher-rule':  { id: 'system-dispatcher-rule',  label: 'Dispatcher rule — editor',     path: '/system/dispatcher/rules', permKey: 'system-dispatcher-rule',  app: 'it' },
+  'system-design':           { id: 'system-design',           label: 'Design review',       path: '/system/design',       permKey: 'system-design',           app: 'it' },
   // The "Evolve" surface — controlled, sandboxed model modifications
   // (placeholder for now; visible to every role via canSeeRoute).
-  'system-experiments':      { id: 'system-experiments',      label: 'Experiments',         path: '/system/experiments',  permKey: 'system-experiments',      app: 'model' },
-  'system-kb':               { id: 'system-kb',               label: 'Knowledge Base',      path: '/system/kb',           permKey: 'system-kb',               app: 'model' },
-  'auth-admin':              { id: 'auth-admin',              label: 'Auth admin',          path: '/system/auth-admin',   permKey: 'auth-admin',              app: 'model' },
+  'system-experiments':      { id: 'system-experiments',      label: 'Experiments',         path: '/system/experiments',  permKey: 'system-experiments',      app: 'it' },
+  'system-kb':               { id: 'system-kb',               label: 'Knowledge Base',      path: '/system/kb',           permKey: 'system-kb',               app: 'it' },
+  'auth-admin':              { id: 'auth-admin',              label: 'Auth admin',          path: '/system/auth-admin',   permKey: 'auth-admin',              app: 'it' },
   // KB view of every active JobKind — read-only catalog, visible to
   // every role via canSeeRoute() short-circuit. Editing lives at
   // /system/job-kinds, reached FROM Workflows.
-  workflows:                 { id: 'workflows',               label: 'Workflows',           path: '/system/workflows',    permKey: 'workflows',               app: 'model' },
+  workflows:                 { id: 'workflows',               label: 'Workflows',           path: '/system/workflows',    permKey: 'workflows',               app: 'it' },
 };
 
 /// Which app a surface belongs to, looked up by the `activeSection`
@@ -139,7 +139,7 @@ export function appForSection(section: string): AppId {
 export const APP_SUBJECT_KINDS: Readonly<Record<AppId, ReadonlyArray<string>>> = {
   home: [],
   simulator: [],
-  model: ['job-kind', 'company'],
+  it: ['job-kind', 'company'],
   crm: ['account', 'customer', 'campaign', 'marketing-asset'],
   finance: ['invoice', 'vendor', 'vendor-invoice', 'purchase_order'],
   operations: ['job-kind', 'calendar', 'location'],

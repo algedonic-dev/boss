@@ -6,8 +6,10 @@
 // files (AppShell's `MODEL_ROUTES: Set<RouteName>` for the sidebar,
 // App.svelte's `MODEL_KINDS: Set<Route['kind']>` for the active tab),
 // which had to agree for every routed surface or a page rendered under
-// the wrong tab with nothing failing. The System Model app's
-// membership is still pinned verbatim against the deleted list.
+// the wrong tab with nothing failing. That membership set is still
+// pinned verbatim against the deleted list — it now belongs to the IT
+// app rather than a top-level System Model tab, but which surfaces
+// travel together has not changed.
 //
 // Second, the split itself: every surface belongs to exactly one app,
 // every app the tab bar advertises can actually be reached, and no
@@ -17,10 +19,15 @@ import { describe, it, expect } from 'bun:test';
 import { APPS, type AppId } from '@boss/web-kit/nav';
 import { ROUTE_CATALOG, appForSection, type NavItem } from './nav-catalog';
 
-/// Verbatim copy of AppShell.svelte's deleted `MODEL_ROUTES`. The
-/// System Model app is unchanged by the split, so this stays the
-/// regression pin — if a future change moves a surface into or out of
-/// it, this list is the thing to update, deliberately.
+/// Verbatim copy of AppShell.svelte's deleted `MODEL_ROUTES`. These
+/// surfaces have now moved wholesale from the retired `model` app
+/// into `it` — the review resolved that IT is the department and
+/// System Model lives inside it, rather than the two being separate
+/// tabs (home-workspace-and-department-apps.md, Q2). The MEMBERSHIP
+/// is still pinned verbatim: the app they belong to changed, which
+/// surfaces belong together did not. If a future change moves a
+/// surface into or out of the set, this list is the thing to update,
+/// deliberately.
 const LEGACY_MODEL_ROUTES: ReadonlyArray<string> = [
   'system-model', 'system-monitoring', 'system-step-plugins', 'system-dispatcher',
   'system-subjects', 'system-dispatcher-rules', 'system-dispatcher-rule',
@@ -40,9 +47,9 @@ describe('nav catalog — app assignment', () => {
     ).toEqual([]);
   });
 
-  it('the System Model app still contains exactly what MODEL_ROUTES listed', () => {
+  it('the IT app contains exactly what the System Model tab listed', () => {
     const derived = entries
-      .filter(([, v]) => v.app === 'model')
+      .filter(([, v]) => v.app === 'it')
       .map(([k]) => k)
       .sort();
     expect(derived).toEqual([...LEGACY_MODEL_ROUTES].sort());
@@ -68,6 +75,27 @@ describe('nav catalog — app assignment', () => {
     expect(stragglers).toEqual([]);
   });
 
+  it('no surface is left in the retired "model" app', () => {
+    // System Model stopped being a top-level app when the review made
+    // IT the department that owns it. A straggler here would render
+    // under a tab that no longer exists.
+    const stragglers = entries
+      .filter(([, v]) => (v.app as string) === 'model')
+      .map(([k]) => k);
+    expect(stragglers).toEqual([]);
+  });
+
+  it('IT is a department app, not a second model-facing tab', () => {
+    // The decision (Q2) was that IT is a department like Finance or
+    // People. Pinning its presence and Simulator's separateness keeps
+    // a later reshuffle from quietly recreating the two-model-tabs
+    // shape the review rejected.
+    const ids = APPS.map((a) => a.id);
+    expect(ids).toContain('it');
+    expect(ids).not.toContain('model');
+    expect(ids.indexOf('it')).toBeGreaterThan(ids.indexOf('simulator'));
+  });
+
   it('every domain app owns at least one surface', () => {
     // A tab that renders an empty sidebar is a dead end. Simulator is
     // exempt: it is a separate SPA with no surfaces in this catalog.
@@ -81,7 +109,7 @@ describe('nav catalog — app assignment', () => {
 
 describe('appForSection — the App.svelte tab derivation', () => {
   it('resolves surfaces to their app', () => {
-    expect(appForSection('system-model')).toBe('model');
+    expect(appForSection('system-model')).toBe('it');
     expect(appForSection('accounts')).toBe('crm');
     expect(appForSection('finance')).toBe('finance');
     expect(appForSection('jobs')).toBe('operations');

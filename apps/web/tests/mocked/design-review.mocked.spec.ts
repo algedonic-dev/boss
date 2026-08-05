@@ -198,6 +198,68 @@ test.describe('Design review list', () => {
     await expect(row).toContainText('no title heading');
   });
 
+  test('an in-review doc links to the full-page step surface, not the job page', async ({
+    page,
+  }) => {
+    // Reading the doc is the entire point of this Job. The job page
+    // renders the review plugin in a panel beside the sidebar, the job
+    // header and the step list; the step-focus route renders it under
+    // the chrome bar with the whole panel to itself. The list must
+    // link to the second one.
+    await page.route('**/api/jobs?*', (route) =>
+      route.fulfill({
+        json: {
+          data: [
+            {
+              id: 'job-review-9',
+              title: 'Review: Inventory value conservation',
+              status: 'open',
+              opened_on: '2026-08-01',
+              subject: { id: 'docs/design/inventory-value-conservation.md' },
+              steps: [
+                { id: 'step-other', kind: 'sign-off' },
+                { id: 'step-rd', kind: 'review-design' },
+              ],
+            },
+          ],
+          total: 1,
+        },
+      }),
+    );
+    await mountPage(page, '/system/design', { titleMatch: /design review/i });
+    const link = page.getByRole('link', { name: /in review/i });
+    await expect(link).toHaveAttribute('href', '/jobs/job-review-9/steps/step-rd');
+  });
+
+  test('falls back to the job page when the Job has no review step yet', async ({
+    page,
+  }) => {
+    // A Job caught before its steps materialize has no step id. Better
+    // the job page than a link to a step id we invented.
+    await page.route('**/api/jobs?*', (route) =>
+      route.fulfill({
+        json: {
+          data: [
+            {
+              id: 'job-review-9',
+              title: 'Review: Inventory value conservation',
+              status: 'open',
+              opened_on: '2026-08-01',
+              subject: { id: 'docs/design/inventory-value-conservation.md' },
+              steps: [],
+            },
+          ],
+          total: 1,
+        },
+      }),
+    );
+    await mountPage(page, '/system/design', { titleMatch: /design review/i });
+    await expect(page.getByRole('link', { name: /in review/i })).toHaveAttribute(
+      'href',
+      '/service/job-review-9',
+    );
+  });
+
   test('a failing rejections call does not blank the page', async ({
     page,
   }) => {

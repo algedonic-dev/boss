@@ -222,7 +222,12 @@
   <!-- Outside AppShell on purpose: a full-page step surface has no
        sidebar. The chrome bar stays — you can still switch apps —
        but everything below it belongs to the step. -->
-  <PerspectiveTabs active={perspective} brandName="Algedonic" brandSub="Ales" />
+  <PerspectiveTabs
+    active={perspective}
+    brandName="Algedonic"
+    brandSub="Ales"
+    searchAppKinds={APP_SUBJECT_KINDS[perspective] ?? []}
+  />
   <StepFocusPage jobId={route.jobId} stepId={route.stepId} />
 {:else}
   <PerspectiveTabs active={perspective} brandName="Algedonic" brandSub="Ales" searchAppKinds={APP_SUBJECT_KINDS[perspective] ?? []} />
