@@ -1,9 +1,7 @@
 # Design: Home as a personal workspace, and the Department App split
 
-**Status:** approved — the four open questions were resolved through
-the in-app review (`/system/design` → design-doc-review Job,
-2026-08-05) and are recorded under Decision history. Flips to
-`shipped` when the work lands.
+**Status:** shipped — the IT department app landed in #182 and the
+Views phase in #183/#184.
 
 The app-tab rearchitecture ([extending-boss.md](extending-boss.md),
 shipped in #178) split the SPA into eight apps. It left two things

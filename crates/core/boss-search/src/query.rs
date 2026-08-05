@@ -80,37 +80,12 @@ impl SearchScope {
             .scope_predicate(user, Resource::job())
             .await
             .map_err(|e| SearchError::storage_msg(format!("policy check failed: {e}")))?;
-        let job_owners = match predicate {
-            Predicate::Unrestricted => None,
-            Predicate::None => Some(Vec::new()),
-            Predicate::OwnerIs { user_id } => Some(vec![user_id]),
-            Predicate::OwnerIn { user_ids } => Some(user_ids),
-            Predicate::DepartmentIs { department } => {
-                if user.department.as_deref() == Some(department.as_str()) {
-                    None
-                } else {
-                    Some(Vec::new())
-                }
-            }
-            // AccountIn narrows by the Job's subject, which the index
-            // does not carry as an owner. Refuse rather than widen.
-            Predicate::AccountIn { .. } => Some(Vec::new()),
-        };
+        let job_owners = predicate.owner_allow_list(user);
         Ok(Self {
             job_owners,
             may_read_events: unrestricted_read(policy, user, Resource::event()).await?,
             may_read_subjects: unrestricted_read(policy, user, Resource::subject()).await?,
         })
-    }
-
-    /// Unrestricted — for callers that have already been authorized
-    /// elsewhere (tests, the reindexer).
-    pub fn unrestricted() -> Self {
-        Self {
-            job_owners: None,
-            may_read_events: true,
-            may_read_subjects: true,
-        }
     }
 }
 
@@ -415,13 +390,5 @@ mod tests {
             .await
             .expect("scope derives");
         assert!(!s.may_read_events);
-    }
-
-    #[test]
-    fn unrestricted_is_explicit_about_being_unrestricted() {
-        let s = SearchScope::unrestricted();
-        assert_eq!(s.job_owners, None);
-        assert!(s.may_read_events);
-        assert!(s.may_read_subjects);
     }
 }

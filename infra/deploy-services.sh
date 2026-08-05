@@ -234,6 +234,8 @@ description_of() {
         products)      echo "Finished Product Catalog API" ;;
         events)        echo "Audit Log Read API (tail / stream / export)" ;;
         accounts)      echo "Accounts API (notes / team / next-actions / risk / cases)" ;;
+        search)        echo "Global Search API (one index over Subjects, Jobs and events)" ;;
+        views)         echo "Views API (saved compositions over the information layer)" ;;
         dispatcher)    echo "Dispatch Service (auto-assigns ready Steps to role-matched Employees)" ;;
         simulator)     echo "Simulator UX service (SPA + control API)" ;;
         *)             echo "$1 API" ;;
@@ -375,6 +377,17 @@ EOF
 postgres_url = "$PROD_DB_URL"
 http_bind = "127.0.0.1:$port"
 nats_url = "$NATS_URL"
+EOF
+            ;;
+        search|views)
+            # boss-search-api / boss-views-api take everything from
+            # env vars + clap defaults (BOSS_POSTGRES_URL,
+            # BOSS_POLICY_URL). Stub config for uniformity; emit_unit
+            # injects the env and omits the --config flag.
+            cat <<EOF
+# Managed by infra/deploy-services.sh — edits will be overwritten.
+# ($name takes all settings from env vars.)
+port = $port
 EOF
             ;;
         clock)
@@ -572,6 +585,14 @@ emit_unit() {
         # `BOSS_SIM_TICK_INTERVAL_MS=10000` for the canonical
         # 1-day-per-10-wall-sec demo cadence.
         extra_env=$'Environment=BOSS_CLOCK_MODE=wall\nEnvironment=BOSS_SIM_TICK_SIZE_SECONDS=86400\nEnvironment=BOSS_SIM_TICK_INTERVAL_MS=0\nEnvironment=BOSS_POSTGRES_URL='"$PROD_DB_URL"
+    elif [[ "$name" == "search" || "$name" == "views" ]]; then
+        # Both are clap+env binaries: they take no --config (see the
+        # exec_start branch below) and require the Postgres URL from
+        # the environment. Without this the generated unit starts a
+        # binary with no `--postgres-url` and it exits immediately.
+        # The policy URL falls back to the boss_ports default, same as
+        # every other consumer.
+        extra_env="Environment=BOSS_POSTGRES_URL=$PROD_DB_URL"
     elif [[ "$name" == "dispatcher" ]]; then
         # boss-dispatcher reads everything from env vars: URLs for every
         # downstream API its handlers post into (commerce/products/
@@ -605,9 +626,16 @@ emit_unit() {
         extra_env="Environment=BOSS_SIM_STATIC_DIR=/var/lib/boss-simulator/dist"
     fi
 
-    # Env-driven services don't take a --config flag.
+    # Env-driven services don't take a --config flag. `search` and
+    # `views` are clap+env binaries like clock/dispatcher/simulator;
+    # omitting them here generated `--config /etc/boss-search-api.toml`,
+    # which those binaries reject outright ("unexpected argument
+    # '--config' found") — so the unit would have failed to start on
+    # the next deploy. Both only run today because their units were
+    # written by hand.
     local exec_start
-    if [[ "$name" == "clock" || "$name" == "dispatcher" || "$name" == "simulator" ]]; then
+    if [[ "$name" == "clock" || "$name" == "dispatcher" || "$name" == "simulator" \
+          || "$name" == "search" || "$name" == "views" ]]; then
         exec_start="ExecStart=/usr/local/bin/${stem}"
     else
         exec_start="ExecStart=/usr/local/bin/${stem} --config $cfg_path"
