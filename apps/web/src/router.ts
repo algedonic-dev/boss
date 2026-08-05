@@ -34,6 +34,9 @@ export type Route =
   /// Home is the cross-app surface — the chrome dropdown is scoped to
   /// the app you are in, this is the unscoped view it escalates to.
   | { kind: 'search'; q: string }
+  /// Personal Views — the Home-app surface for composing your own
+  /// reads over the information layer.
+  | { kind: 'views' }
   /// Full-page step surface. A step whose UX is a plugin gets the
   /// whole viewport instead of a panel inside the job page — review
   /// and authoring steps are reading tasks, and reading competes
@@ -147,6 +150,7 @@ export function parseRoute(pathname: string): Route {
   if (p === '/') return { kind: 'me' };
   if (p === '/me') return { kind: 'me' };
   if (p === '/inbox') return { kind: 'inbox' };
+  if (p === '/views') return { kind: 'views' };
   if (p === '/accounts') return { kind: 'accounts' };
   const cm = p.match(/^\/accounts\/(.+)$/);
   if (cm) return { kind: 'account', accountId: cm[1]! };

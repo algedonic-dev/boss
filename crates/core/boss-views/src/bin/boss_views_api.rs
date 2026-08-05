@@ -1,4 +1,6 @@
-//! `boss-search-api` — the global search read surface.
+//! `boss-views-api` — the View registry + the endpoint that runs one.
+
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -6,11 +8,11 @@ use sqlx::postgres::PgPoolOptions;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "boss-search-api", about = "Global search API", version)]
+#[command(name = "boss-views-api", about = "Views API", version)]
 struct Cli {
     #[arg(long, env = "BOSS_POSTGRES_URL")]
     postgres_url: String,
-    #[arg(long, default_value_t = boss_ports::prod("search"))]
+    #[arg(long, default_value_t = boss_ports::prod("views"))]
     http_port: u16,
     #[arg(long, env = "BOSS_POLICY_URL", default_value_t = boss_ports::url("policy"))]
     policy_url: String,
@@ -32,16 +34,21 @@ async fn main() -> Result<()> {
         .await
         .context("connecting to Postgres")?;
 
+    // A View reads policy-scoped tables, so the resolver needs the
+    // policy engine the same way every other scoped read surface does.
     // Same wrapping jobs-api uses: sim traffic is authorized at the
-    // boundary, real traffic enforced per-role by the inner client.
-    let policy: std::sync::Arc<dyn boss_policy_client::PolicyClient> =
-        std::sync::Arc::new(boss_policy_client::SimBypassPolicyClient::new(
-            std::sync::Arc::new(boss_policy_client::ReqwestPolicyClient::new(cli.policy_url)),
-        ));
+    // boundary, real traffic is enforced per-role by the inner client.
+    let policy: Arc<dyn boss_policy_client::PolicyClient> =
+        Arc::new(boss_policy_client::SimBypassPolicyClient::new(Arc::new(
+            boss_policy_client::ReqwestPolicyClient::new(cli.policy_url),
+        )));
 
-    let app = boss_search::http::router(boss_search::http::SearchApiState { pool, policy });
+    let app = boss_views::http::router(boss_views::http::ViewsApiState {
+        repo: Arc::new(boss_views::PgViewsRepo::new(pool.clone())),
+        resolver: Arc::new(boss_views::PgViewResolver::new(pool, policy)),
+    });
     let addr = format!("127.0.0.1:{}", cli.http_port);
-    tracing::info!(addr = %addr, "boss-search-api listening");
+    tracing::info!(addr = %addr, "boss-views-api listening");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

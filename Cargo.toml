@@ -40,6 +40,7 @@ members = [
     "crates/core/boss-calendar-client",
     "crates/core/boss-locations",
     "crates/core/boss-search",
+    "crates/core/boss-views",
     "crates/core/boss-locations-client",
     "crates/core/boss-subject-kinds",
     "crates/core/boss-subject-kinds-client",

@@ -54,6 +54,13 @@ pub fn shipped_resources() -> Vec<Resource> {
         Resource::policy_rule(),
         Resource::job_kind(),
         Resource::step_plugin(),
+        // Result-set access to the log and to identity. Adding them
+        // here is what makes the search/View gates data-driven: every
+        // platform role's grant below is generated from this list, so
+        // `audit-readonly` picks up Read on both without a special
+        // case, and a role with no grant is denied by default.
+        Resource::event(),
+        Resource::subject(),
     ]
 }
 
@@ -106,10 +113,14 @@ pub fn default_rules() -> Vec<Rule> {
     // ------------------------------------------------------------------
     // Audit-readonly — external auditors / OSS anonymous visitors /
     // the seeded `emp-audit` login. Read on every shipped resource;
-    // never Create/Update/Close/Publish/Retire/SignOff. The audit_log
-    // itself + integrity-check checkpoints are accessed out-of-band
-    // (boss-events tail-http + journal export), not through the policy
-    // gate, so they don't appear here.
+    // never Create/Update/Close/Publish/Retire/SignOff.
+    //
+    // The audit_log's own tail + integrity checkpoints are still
+    // out-of-band (boss-events tail-http + journal export). What IS
+    // gated now is being handed log rows back as a result set —
+    // `Resource::event()` above — because global search and Views
+    // both do exactly that, and both shipped doing it for anyone who
+    // asked.
     // ------------------------------------------------------------------
     for r in &resources {
         rules.push(Rule::new("audit-readonly", r.clone(), Read, Scope::All));
