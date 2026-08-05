@@ -190,7 +190,16 @@ splits the original question in two: personal → team is
 frictionless, team → company is submitted, and the ceremony lands
 only where something becomes the company's.
 
-## Open questions (all resolved — see Decision history)
+## Open questions
+
+All 4 were resolved 2026-08-05 through the in-app review and
+flushed to git; see the Decisions section below. Kept empty as the
+landing place for any new question that surfaces during
+implementation.
+
+---
+
+## Decisions
 
 ### Q1: May a View store anything of its own? (resolved)
 

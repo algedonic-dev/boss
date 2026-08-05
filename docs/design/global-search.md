@@ -104,7 +104,16 @@ rather than picking a side: the dropdown is the app's scoped search,
 the Home page is the cross-cutting one — which is also what makes Q1's
 third option land naturally.
 
-## Open questions (all resolved — see Decision history)
+## Open questions
+
+All 4 were resolved 2026-08-04 through the in-app review and
+flushed to git; see the Decisions section below. Kept empty as the
+landing place for any new question that surfaces during
+implementation.
+
+---
+
+## Decisions
 
 ### Q1: One `/api/search` endpoint, or a fan-out across domain APIs? (resolved)
 
