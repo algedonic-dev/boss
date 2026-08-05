@@ -183,7 +183,7 @@
       </div>
       <div>
         <div style="font-size:12px; color:#666; margin-bottom:2px">Description <span style="color:#888"> — optional</span></div>
-        <textarea bind:value={description} rows="3" style="padding:6px; font-size:13px; width:100%"></textarea>
+        <textarea bind:value={description} rows="3" placeholder="What this kind of Job accomplishes" style="padding:6px; font-size:13px; width:100%"></textarea>
       </div>
     </div>
   </Section>
