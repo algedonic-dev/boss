@@ -16,7 +16,7 @@
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import Link from '@boss/web-kit/ui/Link.svelte';
-  import { href } from '../../router';
+  import { navigate } from '../../router';
 
   type DesignDoc = {
     path: string;
@@ -35,7 +35,29 @@
     status: string;
     opened_on: string;
     title: string;
+    /// The `review-design` step, when the Job has materialized one.
+    /// Reading a design doc is the whole point of this Job, and the
+    /// job page renders the doc in a panel beside a sidebar, a job
+    /// header and a step list — so the link below goes straight to
+    /// the full-page step surface instead. Optional because a Job
+    /// caught mid-materialization has no steps yet; the link falls
+    /// back to the job page rather than 404ing on a step id we made
+    /// up.
+    reviewStepId?: string;
   };
+
+  /// Step kind backing the review surface (`step_plugins` row
+  /// 'review-design', tier 0 of the design-doc-review JobKind).
+  const REVIEW_STEP_KIND = 'review-design';
+
+  /// Where a review Job should open. The focused step route renders
+  /// outside AppShell — chrome bar on top, the whole panel below it
+  /// for the document.
+  function reviewHref(job: OpenReviewJob): string {
+    return job.reviewStepId
+      ? `/jobs/${job.id}/steps/${job.reviewStepId}`
+      : `/service/${job.id}`;
+  }
 
   type Rejection = {
     path: string;
@@ -101,18 +123,28 @@
       );
       if (!jobsResp.ok) throw new Error(`jobs: HTTP ${jobsResp.status}`);
       const jobsBody = await jobsResp.json();
+      // The list endpoint enriches each Job with its steps
+      // (boss-jobs http/jobs.rs), so the review step is already here —
+      // no per-Job follow-up fetch to find it.
       const jobs: Array<{
         id: string;
         title: string;
         status: string;
         opened_on: string;
         subject: { id?: string };
+        steps?: Array<{ id: string; kind: string }>;
       }> = Array.isArray(jobsBody) ? jobsBody : (jobsBody.data ?? []);
       const byPath: Record<string, OpenReviewJob> = {};
       for (const j of jobs) {
         const p = j.subject?.id;
         if (!p) continue;
-        byPath[p] = { id: j.id, status: j.status, opened_on: j.opened_on, title: j.title };
+        byPath[p] = {
+          id: j.id,
+          status: j.status,
+          opened_on: j.opened_on,
+          title: j.title,
+          reviewStepId: j.steps?.find((s) => s.kind === REVIEW_STEP_KIND)?.id,
+        };
       }
       openReviewsByPath = byPath;
     } catch (e) {
@@ -160,6 +192,14 @@
       // and terminal-metadata immutability then sealed the empty value
       // (the 2026-07-14 "doc_path is empty" incident).
       await load();
+      // Open the review where it is readable. Creating the Job and
+      // dropping the operator back on a table row means the next
+      // click lands on the job page, which renders the document in a
+      // panel beside the sidebar and step list — the reason reviewing
+      // a doc in-app felt cramped. If the Job has not materialized
+      // its steps yet, reviewHref falls back to the job page.
+      const opened = openReviewsByPath[doc.path];
+      if (opened) navigate(reviewHref(opened));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
@@ -278,7 +318,7 @@
           <td>{relTime(doc.last_modified)}</td>
           <td>
             {#if review}
-              <Link to={`/service/${review.id}`}>
+              <Link to={reviewHref(review)}>
                 In review — {review.status}
               </Link>
             {:else}
