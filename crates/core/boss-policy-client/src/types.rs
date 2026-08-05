@@ -105,6 +105,29 @@ impl Resource {
     pub fn job_kind() -> Self {
         Self::new("job-kind")
     }
+    /// Raw audit-log rows, wherever they are surfaced as results —
+    /// global search, a View over `events`, any future reader.
+    ///
+    /// The log itself is still written and tailed out-of-band; this
+    /// governs who may be handed its rows back as a *result set*,
+    /// which is a different question and one that used to have no
+    /// answer at all.
+    pub fn event() -> Self {
+        Self::new("event")
+    }
+
+    /// Identity rows — the `subjects` table, across every kind.
+    ///
+    /// Coarser than the per-kind resources (`account`, `employee`,
+    /// `asset`) on purpose: those govern a Subject's *detail*, this
+    /// governs whether you may enumerate identity at all. A surface
+    /// that lists Subjects of mixed kinds has no single per-kind
+    /// resource to ask about, and asking none was the previous
+    /// answer.
+    pub fn subject() -> Self {
+        Self::new("subject")
+    }
+
     pub fn step_plugin() -> Self {
         Self::new("step-plugin")
     }

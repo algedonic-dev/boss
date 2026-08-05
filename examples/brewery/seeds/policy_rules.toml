@@ -31,7 +31,7 @@ roles = ["ceo", "coo", "cfo", "cto"]
 resources = [
     "job", "step", "account", "employee", "invoice", "agreement",
     "shipment", "part", "purchase-order", "policy-rule",
-    "job-kind", "step-plugin",
+    "job-kind", "step-plugin", "event", "subject",
 ]
 action = "read"
 scope = "all"
@@ -576,4 +576,41 @@ scope = "all"
 role = "owner"
 resource = "step-signoff:owner"
 action = "sign-off"
+scope = "all"
+
+# ------------------------------------------------------------------
+# Identity + log access as result sets.
+#
+# `subject` and `event` govern being HANDED rows back — from global
+# search, from a View — as distinct from reading a particular
+# account or employee, which the per-kind resources above still
+# govern. Both were previously ungoverned: search returned identical
+# results to every caller, including one with no session at all.
+#
+# `subject` is broad. Enumerating identity is how anyone finds the
+# thing they are working on, and withholding it does not protect an
+# account whose detail the caller can already open — it just breaks
+# search. The per-kind resources remain the control on detail.
+#
+# `event` is narrow. Raw audit rows carry payloads from every domain,
+# so they go to the roles whose job is looking across the whole
+# system, not to everyone with a login.
+# ------------------------------------------------------------------
+
+[[grants]]
+roles = [
+    "account-manager", "ap-clerk", "ar-clerk", "benefits-coord",
+    "bookkeeper", "brewer", "cellar-tech", "controller",
+    "distribution-driver", "events-coord", "fp-analyst",
+    "head-brewer", "head-of-distribution", "head-of-marketing",
+    "head-of-people", "head-of-sales", "senior-brewer",
+]
+resource = "subject"
+action = "read"
+scope = "all"
+
+[[grants]]
+roles = ["controller", "head-of-people"]
+resource = "event"
+action = "read"
 scope = "all"

@@ -8,7 +8,7 @@
 
 use sqlx::{PgPool, Row};
 
-use boss_policy_client::{AccessTier, Predicate, Resource, User};
+use boss_policy_client::{Predicate, Resource, User};
 
 use crate::error::SearchError;
 use crate::types::{RefKind, SearchResults, SearchRow, SubjectHit};
@@ -53,18 +53,25 @@ pub struct SearchScope {
     pub job_owners: Option<Vec<String>>,
     /// Whether raw audit-log rows may be returned at all.
     pub may_read_events: bool,
+    /// Whether identity rows may be enumerated at all.
+    pub may_read_subjects: bool,
 }
 
 impl SearchScope {
     /// Derive the caller's scope from policy.
     ///
-    /// `jobs` has a real policy vocabulary, so job hits get the same
-    /// read-scope predicate `/api/jobs` applies. Events have no
-    /// policy resource at all — there is no `event` row in
-    /// `policy_rules` — so they are gated at operator/auditor tier,
-    /// the control `/system/monitoring` already applies to the audit
-    /// log it surfaces. Same split, and same reasoning, as
-    /// boss-views' resolver.
+    /// Every gate here is a policy question, not a hardcoded tier
+    /// check. `jobs` uses the same read-scope predicate `/api/jobs`
+    /// applies; `event` and `subject` are resources in the registry
+    /// like any other, so who may see log rows or enumerate identity
+    /// is tenant-authored data rather than a constant compiled into
+    /// this crate.
+    ///
+    /// Events and Subjects are all-or-nothing: their scope vocabulary
+    /// has no owner column to narrow by, so anything short of
+    /// `Unrestricted` is treated as a denial. That fails closed — a
+    /// tenant who writes `scope = "territory"` against `event` gets
+    /// nothing rather than everything, and finds out immediately.
     pub async fn for_user(
         policy: &dyn boss_policy_client::PolicyClient,
         user: &User,
@@ -91,7 +98,8 @@ impl SearchScope {
         };
         Ok(Self {
             job_owners,
-            may_read_events: matches!(user.access_tier, AccessTier::Operator | AccessTier::Auditor),
+            may_read_events: unrestricted_read(policy, user, Resource::event()).await?,
+            may_read_subjects: unrestricted_read(policy, user, Resource::subject()).await?,
         })
     }
 
@@ -101,8 +109,22 @@ impl SearchScope {
         Self {
             job_owners: None,
             may_read_events: true,
+            may_read_subjects: true,
         }
     }
+}
+
+/// True only when policy grants an unnarrowed Read on `resource`.
+async fn unrestricted_read(
+    policy: &dyn boss_policy_client::PolicyClient,
+    user: &User,
+    resource: Resource,
+) -> Result<bool, SearchError> {
+    let p = policy
+        .scope_predicate(user, resource)
+        .await
+        .map_err(|e| SearchError::storage_msg(format!("policy check failed: {e}")))?;
+    Ok(matches!(p, Predicate::Unrestricted))
 }
 
 pub async fn search(
@@ -143,15 +165,23 @@ pub async fn search(
     };
 
     // --- Subjects, each with its work and its history -------------
-    let subject_rows = sqlx::query(sql)
-        .bind(q)
-        .bind(RefKind::Subject.as_str())
-        .bind(app_subject_kinds)
-        .bind(GROUP_LIMIT)
-        .bind(scope.job_owners.as_deref())
-        .fetch_all(pool)
-        .await
-        .map_err(SearchError::storage)?;
+    // Subject hits are gated as a set: `subject` governs whether you
+    // may enumerate identity at all. This closes the residual the
+    // previous pass had to leave open for want of a resource to ask
+    // about.
+    let subject_rows = if scope.may_read_subjects {
+        sqlx::query(sql)
+            .bind(q)
+            .bind(RefKind::Subject.as_str())
+            .bind(app_subject_kinds)
+            .bind(GROUP_LIMIT)
+            .bind(scope.job_owners.as_deref())
+            .fetch_all(pool)
+            .await
+            .map_err(SearchError::storage)?
+    } else {
+        Vec::new()
+    };
 
     for r in &subject_rows {
         let row = row_to_search_row(r)?;
@@ -276,13 +306,17 @@ pub async fn search(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boss_policy_client::{Action, FakePolicyClient, Scope};
+    use boss_policy_client::{AccessTier, Action, FakePolicyClient, Scope};
 
-    fn user(id: &str, role: &str, tier: AccessTier) -> User {
+    /// Tier is irrelevant to these gates now — it is here only
+    /// because `User` requires it. That is the point of the change:
+    /// access is a policy question, not a property of the session's
+    /// tier field.
+    fn user(id: &str, role: &str) -> User {
         User {
             id: id.to_string(),
             role: role.to_string(),
-            access_tier: tier,
+            access_tier: AccessTier::User,
             territory_account_ids: vec![],
             direct_report_ids: vec![],
             department: None,
@@ -295,10 +329,12 @@ mod tests {
         // absent one — `None` means unrestricted, and getting that
         // backwards turns a denial into full access.
         let policy = FakePolicyClient::deny_all();
-        let scope = SearchScope::for_user(&policy, &user("bob", "guest", AccessTier::User))
+        let scope = SearchScope::for_user(&policy, &user("bob", "guest"))
             .await
             .expect("scope derives");
         assert_eq!(scope.job_owners, Some(Vec::new()));
+        assert!(!scope.may_read_events);
+        assert!(!scope.may_read_subjects);
     }
 
     #[tokio::test]
@@ -306,7 +342,7 @@ mod tests {
         let policy = FakePolicyClient::builder()
             .allow("brewer", Action::Read, Resource::job(), Scope::Self_)
             .build();
-        let scope = SearchScope::for_user(&policy, &user("emp-7", "brewer", AccessTier::User))
+        let scope = SearchScope::for_user(&policy, &user("emp-7", "brewer"))
             .await
             .expect("scope derives");
         assert_eq!(scope.job_owners, Some(vec!["emp-7".to_string()]));
@@ -317,35 +353,68 @@ mod tests {
         let policy = FakePolicyClient::builder()
             .allow("coo", Action::Read, Resource::job(), Scope::All)
             .build();
-        let scope = SearchScope::for_user(&policy, &user("emp-1", "coo", AccessTier::Operator))
+        let scope = SearchScope::for_user(&policy, &user("emp-1", "coo"))
             .await
             .expect("scope derives");
         assert_eq!(scope.job_owners, None, "None means unrestricted");
     }
 
     #[tokio::test]
-    async fn events_need_operator_or_auditor_tier() {
-        // The audit log has no policy resource, so tier is the only
-        // control available. A user-tier caller must not get raw
-        // event rows out of the search box.
-        let policy = FakePolicyClient::builder()
-            .allow("clerk", Action::Read, Resource::job(), Scope::All)
+    async fn reading_events_is_granted_by_policy_not_by_tier() {
+        // The whole point of the `event` resource: a user-tier caller
+        // WITH the grant may read log rows, and an operator-tier
+        // caller WITHOUT it may not. Tier is not consulted.
+        let granted = FakePolicyClient::builder()
+            .allow(
+                "audit-readonly",
+                Action::Read,
+                Resource::event(),
+                Scope::All,
+            )
             .build();
-
-        let low = SearchScope::for_user(&policy, &user("u", "clerk", AccessTier::User))
+        let s = SearchScope::for_user(&granted, &user("u", "audit-readonly"))
             .await
             .expect("scope derives");
-        assert!(!low.may_read_events);
+        assert!(s.may_read_events, "the grant, not the tier, decides");
 
-        let op = SearchScope::for_user(&policy, &user("u", "clerk", AccessTier::Operator))
+        let mut operator = user("u", "brewer");
+        operator.access_tier = AccessTier::Operator;
+        let ungranted = FakePolicyClient::builder()
+            .allow("brewer", Action::Read, Resource::job(), Scope::All)
+            .build();
+        let s = SearchScope::for_user(&ungranted, &operator)
             .await
             .expect("scope derives");
-        assert!(op.may_read_events);
+        assert!(
+            !s.may_read_events,
+            "operator tier must not substitute for the grant"
+        );
+    }
 
-        let auditor = SearchScope::for_user(&policy, &user("u", "clerk", AccessTier::Auditor))
+    #[tokio::test]
+    async fn enumerating_subjects_is_granted_by_policy() {
+        let policy = FakePolicyClient::builder()
+            .allow("sales-rep", Action::Read, Resource::subject(), Scope::All)
+            .build();
+        let s = SearchScope::for_user(&policy, &user("u", "sales-rep"))
             .await
             .expect("scope derives");
-        assert!(auditor.may_read_events);
+        assert!(s.may_read_subjects);
+        assert!(!s.may_read_events, "one grant does not imply the other");
+    }
+
+    #[tokio::test]
+    async fn a_narrowed_grant_on_an_all_or_nothing_resource_fails_closed() {
+        // `event` has no owner column to narrow by. A tenant writing
+        // scope = "self" against it gets nothing rather than
+        // everything — the failure a wrong guess should produce.
+        let policy = FakePolicyClient::builder()
+            .allow("clerk", Action::Read, Resource::event(), Scope::Self_)
+            .build();
+        let s = SearchScope::for_user(&policy, &user("u", "clerk"))
+            .await
+            .expect("scope derives");
+        assert!(!s.may_read_events);
     }
 
     #[test]
@@ -353,5 +422,6 @@ mod tests {
         let s = SearchScope::unrestricted();
         assert_eq!(s.job_owners, None);
         assert!(s.may_read_events);
+        assert!(s.may_read_subjects);
     }
 }
