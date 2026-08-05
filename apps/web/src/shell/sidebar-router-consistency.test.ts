@@ -17,16 +17,16 @@
 // router doesn't handle, or router removes a branch a sidebar
 // path depended on).
 //
-// Why a hand-maintained list instead of parsing AppShell.svelte:
-// the Svelte file embeds the nav as a TypeScript const inside a
-// `<script>` block; parsing it from a Bun test is fragile (the
-// nav definition mixes labels, paths, permKeys, modules; format
-// drift breaks the parser). Two files of truth with a mirroring
-// test is simpler than a brittle parser, and the test failure
-// message tells you exactly what to fix.
+// The path list is no longer hand-maintained: ROUTE_CATALOG moved out
+// of AppShell.svelte into ./nav-catalog as a plain module, so this
+// test imports the real registry. The previous version mirrored every
+// path by hand (a Bun test can't reliably parse a TypeScript const out
+// of a Svelte `<script>` block), which meant the drift-catching test
+// could itself drift.
 
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
 import { parseRoute } from '../router';
+import { ROUTE_CATALOG } from './nav-catalog';
 
 // parseRoute touches `window.location.search` inside its `/jobs`
 // branch. Stub a minimal Location for tests so we don't need
@@ -41,50 +41,22 @@ afterAll(() => {
   (globalThis as { window?: unknown }).window = originalWindow;
 });
 
-// Mirror of `ALL_NAV` paths from apps/web/src/shell/AppShell.svelte.
-// Keep in sync — see file header.
-const SIDEBAR_PATHS: ReadonlyArray<string> = [
-  '/ux/jobs',
-  '/ux/sales',
-  '/ux/service',
-  '/ux/refurb',
-  '/ux/qa',
-  '/ux/finance',
-  '/ux/warehouse',
-  '/ux/shipping',
-  '/ux/support',
-  '/ux/ops',
-  '/ux/exec',
-  '/system/monitoring',
+// Every catalog path, straight from the registry the sidebar renders.
+// Plus the plain sub-page links declared inline in nav groups (they
+// have no catalog entry of their own) and the two always-available
+// surfaces reachable outside the sidebar.
+const INLINE_SUBPAGE_PATHS: ReadonlyArray<string> = [
   '/system/monitoring/events', // "Audit Log" — plain sub-page link in the Run group
   '/system/monitoring/atlas', // "Atlas" — plain sub-page link in the Run group
-  '/ux/calendar/me', // "My schedule" — was /schedule (bug fixed 2026-05-22)
-  '/ux/catalog',
-  '/ux/parts',
-  '/ux/products',
-  '/ux/accounts',
-  '/ux/vendors',
-  '/ux/people',
-  '/ux/assets',
-  '/ux/shop',
-  '/ux/inbox',
-  '/ux/marketing-assets',
-  '/ux/calendar',
-  '/system/policy',
-  // '/system/job-kinds' removed: "Job kinds" is no longer a sidebar
-  // entry (Workflows is the single JobKind surface; authoring is
-  // reached from there). The route itself still resolves.
-  '/system/step-plugins',
-  '/system/dispatcher',
-  '/system/kb',
-  '/system/auth-admin',
-  '/system/workflows',
-  '/system',
-  '/system/subjects',
-  '/system/design',
-  '/system/experiments',
   '/ux/manual',
   '/ux/me',
+];
+
+const SIDEBAR_PATHS: ReadonlyArray<string> = [
+  ...new Set([
+    ...Object.values(ROUTE_CATALOG).map((i) => i.path),
+    ...INLINE_SUBPAGE_PATHS,
+  ]),
 ];
 
 describe('sidebar-router consistency', () => {
