@@ -46,7 +46,8 @@
   /// Mirrors query.rs SCAN_CEILING — shown, not enforced, here.
   const SCAN_CEILING_LABEL = '5,000';
   /// Mirrors EVENT_PUSHABLE in query.rs.
-  const PUSHABLE_LABEL = 'kind, source, subject_kind or subject_id';
+  const PUSHABLE_LABEL =
+    'kind, source, subject_kind, subject_id, or a timestamp range';
 
   let viewerId = $derived(session.value.kind === 'ready' ? session.value.user.id : '');
   let availableFields = $derived(SOURCE_FIELDS[draftSource]);

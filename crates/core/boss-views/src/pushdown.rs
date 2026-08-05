@@ -33,6 +33,37 @@
 //! That asymmetry is the entire subtlety here, and it is why
 //! [`Pushdown::Or`] is built only from a complete set of branches.
 //!
+//! # Why range bounds are pushed *loose*
+//!
+//! `occurred_at` is a real timestamp in SQL, but the residual compares
+//! the row's **rendered RFC3339 string** lexicographically, because
+//! that is what the JSON row carries. Those two orderings agree for
+//! well-formed same-offset timestamps and diverge at the edges — an
+//! unpadded month (`2026-1-05`), a literal that is a prefix of the
+//! rendered value (`2026-08-05` against
+//! `2026-08-05T00:00:00+00:00`), a differing offset.
+//!
+//! The relaxation is **inclusivity only**: `>` is pushed as `>=` and
+//! `<` as `<=`, at the exact parsed instant. That is enough, because
+//! the row side is always padded RFC3339 (`to_rfc3339` on a UTC
+//! instant), and lexicographic order on padded ISO-8601 IS
+//! chronological order. A malformed literal — an unpadded month like
+//! `2025-4-01` — makes the *residual* the stricter of the two, which
+//! is the safe direction: SQL returns rows, the residual drops them.
+//!
+//! An earlier version also widened the bound by a day, on the theory
+//! that more slack is safer. It was not. The scan is
+//! `ORDER BY audit_id DESC LIMIT n`, so widening the window moves the
+//! rows the limit keeps: a one-day query became a three-day window
+//! whose newest `n` rows were **entirely outside the day asked for**,
+//! and a filter matching 5,525 events answered 0. Slack is not free
+//! when a LIMIT sits on top of it — the bound must be as tight as
+//! soundness allows, not as loose as it can get away with.
+//!
+//! A literal that does not parse as a date or timestamp is not pushed
+//! at all — `occurred_at > "banana"` would make Postgres reject the
+//! statement, which is the 500 class again.
+//!
 //! # Why NOT is never pushed
 //!
 //! Negation inverts the direction of approximation: if `A'` is a
@@ -45,9 +76,25 @@
 //! just a new match arm.
 
 use boss_expr::{BinaryOp, Expr, UnaryOp, Value};
+use chrono::{DateTime, NaiveDate, Utc};
+
+/// What a pushable column holds, so a literal is only pushed where the
+/// database can compare it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnType {
+    Text,
+    Timestamp,
+}
+
+/// A value bound into the emitted statement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Bound {
+    Text(String),
+    Timestamp(DateTime<Utc>),
+}
 
 /// A condition SQL can serve, as a tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Pushdown {
     /// `<column> = <text literal>`.
     Eq {
@@ -55,6 +102,15 @@ pub enum Pushdown {
         /// mapping — never caller text.
         column: &'static str,
         value: String,
+    },
+    /// `<column> >= <ts>` or `<column> <= <ts>`. Only these two
+    /// operators: strict bounds are relaxed to inclusive ones so the
+    /// pushed condition can never be narrower than the residual's.
+    Range {
+        column: &'static str,
+        /// True for `>=`, false for `<=`.
+        lower: bool,
+        value: DateTime<Utc>,
     },
     All(Vec<Pushdown>),
     Any(Vec<Pushdown>),
@@ -64,7 +120,7 @@ impl Pushdown {
     /// Number of leaf comparisons — what `pushed_down` reports.
     pub fn term_count(&self) -> usize {
         match self {
-            Pushdown::Eq { .. } => 1,
+            Pushdown::Eq { .. } | Pushdown::Range { .. } => 1,
             Pushdown::All(cs) | Pushdown::Any(cs) => cs.iter().map(Self::term_count).sum(),
         }
     }
@@ -73,11 +129,22 @@ impl Pushdown {
     ///
     /// `next_param` is the 1-based index of the next free placeholder,
     /// advanced as terms are emitted.
-    pub fn to_sql(&self, next_param: &mut usize, binds: &mut Vec<String>) -> String {
+    pub fn to_sql(&self, next_param: &mut usize, binds: &mut Vec<Bound>) -> String {
         match self {
             Pushdown::Eq { column, value } => {
-                binds.push(value.clone());
+                binds.push(Bound::Text(value.clone()));
                 let s = format!("{column} = ${next_param}");
+                *next_param += 1;
+                s
+            }
+            Pushdown::Range {
+                column,
+                lower,
+                value,
+            } => {
+                binds.push(Bound::Timestamp(*value));
+                let op = if *lower { ">=" } else { "<=" };
+                let s = format!("{column} {op} ${next_param}");
                 *next_param += 1;
                 s
             }
@@ -90,7 +157,7 @@ impl Pushdown {
         parts: &[Pushdown],
         sep: &str,
         next_param: &mut usize,
-        binds: &mut Vec<String>,
+        binds: &mut Vec<Bound>,
     ) -> String {
         let rendered: Vec<String> = parts.iter().map(|p| p.to_sql(next_param, binds)).collect();
         // Always parenthesised: an unparenthesised OR inside an AND
@@ -106,12 +173,27 @@ impl Pushdown {
 /// operator text out of the statement: a filter selects among these,
 /// it can never name a new one.
 ///
-/// **Every column listed here must be `TEXT`.** Only string literals
-/// are pushed (see [`extract`]), so a non-text column would receive a
-/// text bind and Postgres would refuse the comparison outright —
-/// `operator does not exist: uuid = text` — turning a filter that used
-/// to answer into a 500.
-pub type PushableColumns = &'static [(&'static str, &'static str)];
+/// Each entry is `(filter name, column, column type)`. The type is not
+/// decoration: a literal is only pushed where the database can compare
+/// it. Binding a text value against a `uuid` column makes Postgres
+/// refuse the statement — `operator does not exist: uuid = text` —
+/// turning a filter that used to answer into a 500.
+pub type PushableColumns = &'static [(&'static str, &'static str, ColumnType)];
+
+/// Parse a filter literal as an instant.
+///
+/// Accepts a full RFC3339 timestamp or a plain `YYYY-MM-DD` date.
+/// Anything else is not pushed — a literal Postgres cannot cast would
+/// fail the statement rather than the row.
+fn parse_instant(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|naive| naive.and_utc())
+}
 
 /// Extract the largest condition SQL can answer, or `None`.
 pub fn extract(expr: &Expr, pushable: PushableColumns) -> Option<Pushdown> {
@@ -133,7 +215,12 @@ pub fn extract(expr: &Expr, pushable: PushableColumns) -> Option<Pushdown> {
             }
         }
         Expr::BinaryOp(BinaryOp::Eq, lhs, rhs) => as_eq(lhs, rhs, pushable),
-        // Inequalities, NOT, function calls, bare terms: residual.
+        Expr::BinaryOp(
+            op @ (BinaryOp::Lt | BinaryOp::Lte | BinaryOp::Gt | BinaryOp::Gte),
+            lhs,
+            rhs,
+        ) => as_range(*op, lhs, rhs, pushable),
+        // NOT, function calls, bare terms: residual.
         Expr::BinaryOp(_, _, _)
         | Expr::UnaryOp(UnaryOp::Not, _)
         | Expr::FunctionCall(_, _)
@@ -162,14 +249,60 @@ fn as_eq(lhs: &Expr, rhs: &Expr, pushable: PushableColumns) -> Option<Pushdown> 
     let Value::String(s) = value else {
         return None;
     };
+    // Text columns only. Equality against a timestamp column would
+    // need the same parse-and-widen care a range gets, and an exact
+    // instant is not a question anyone asks of an event log.
     let column = pushable
         .iter()
-        .find(|(filter_name, _)| filter_name == name)
-        .map(|(_, col)| *col)?;
+        .find(|(filter_name, _, ty)| filter_name == name && *ty == ColumnType::Text)
+        .map(|(_, col, _)| *col)?;
     Some(Pushdown::Eq {
         column,
         value: s.clone(),
     })
+}
+
+/// `<identifier> <op> <literal>` against a timestamp column.
+///
+/// The emitted bound is relaxed in exactly one way: strict operators
+/// become inclusive. The instant itself is NOT moved — see the module
+/// docs on why extra slack breaks a scan that carries a LIMIT.
+fn as_range(op: BinaryOp, lhs: &Expr, rhs: &Expr, pushable: PushableColumns) -> Option<Pushdown> {
+    // Normalise to `<identifier> <op> <literal>`, flipping the
+    // operator if the operands are reversed — `"x" < occurred_at` is a
+    // lower bound on the column, not an upper one.
+    let (path, value, op) = match (lhs, rhs) {
+        (Expr::Identifier(p), Expr::Literal(v)) => (p, v, op),
+        (Expr::Literal(v), Expr::Identifier(p)) => (p, v, flip(op)),
+        _ => return None,
+    };
+    let [name] = path.as_slice() else {
+        return None;
+    };
+    let Value::String(s) = value else {
+        return None;
+    };
+    let column = pushable
+        .iter()
+        .find(|(filter_name, _, ty)| filter_name == name && *ty == ColumnType::Timestamp)
+        .map(|(_, col, _)| *col)?;
+    let instant = parse_instant(s)?;
+    Some(Pushdown::Range {
+        column,
+        lower: matches!(op, BinaryOp::Gt | BinaryOp::Gte),
+        value: instant,
+    })
+}
+
+/// The operator as seen from the column's side.
+fn flip(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::Lte => BinaryOp::Gte,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::Gte => BinaryOp::Lte,
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -177,17 +310,18 @@ mod tests {
     use super::*;
 
     const EVENT_COLUMNS: PushableColumns = &[
-        ("kind", "kind"),
-        ("source", "source"),
-        ("subject_kind", "subject_kind"),
-        ("subject_id", "subject_id"),
+        ("kind", "kind", ColumnType::Text),
+        ("source", "source", ColumnType::Text),
+        ("subject_kind", "subject_kind", ColumnType::Text),
+        ("subject_id", "subject_id", ColumnType::Text),
+        ("timestamp", "occurred_at", ColumnType::Timestamp),
     ];
 
     fn ex(s: &str) -> Option<Pushdown> {
         extract(&boss_expr::parse(s).expect("parses"), EVENT_COLUMNS)
     }
 
-    fn sql_of(s: &str) -> (String, Vec<String>) {
+    fn sql_of(s: &str) -> (String, Vec<Bound>) {
         let p = ex(s).expect("pushes down");
         let mut n = 1;
         let mut binds = Vec::new();
@@ -199,7 +333,7 @@ mod tests {
     fn a_bare_equality_pushes_down() {
         let (sql, binds) = sql_of("kind = \"products.consumed\"");
         assert_eq!(sql, "kind = $1");
-        assert_eq!(binds, vec!["products.consumed".to_string()]);
+        assert_eq!(binds, vec![Bound::Text("products.consumed".into())]);
     }
 
     #[test]
@@ -215,7 +349,10 @@ mod tests {
         // a true 16.
         let (sql, binds) = sql_of("kind = \"a\" OR kind = \"b\"");
         assert_eq!(sql, "(kind = $1 OR kind = $2)");
-        assert_eq!(binds, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            binds,
+            vec![Bound::Text("a".into()), Bound::Text("b".into())]
+        );
     }
 
     #[test]
@@ -232,7 +369,7 @@ mod tests {
         // The dual: dropping a conjunct widens, which is safe.
         let (sql, binds) = sql_of("kind = \"a\" AND amount = \"5\"");
         assert_eq!(sql, "kind = $1");
-        assert_eq!(binds, vec!["a".to_string()]);
+        assert_eq!(binds, vec![Bound::Text("a".into())]);
     }
 
     #[test]
@@ -248,7 +385,7 @@ mod tests {
         let (sql, binds) =
             sql_of("subject_kind = \"account\" AND (kind = \"a\" OR amount = \"5\")");
         assert_eq!(sql, "subject_kind = $1");
-        assert_eq!(binds, vec!["account".to_string()]);
+        assert_eq!(binds, vec![Bound::Text("account".into())]);
     }
 
     #[test]
@@ -288,11 +425,94 @@ mod tests {
     }
 
     #[test]
-    fn inequality_does_not_push_down_yet() {
-        // A legitimate future widening; today it is residual-only,
-        // which is correct and merely slower.
+    fn inequality_on_a_text_column_does_not_push() {
+        // Ranges are for timestamps; a lexicographic bound on `kind`
+        // is not a question the index can answer usefully.
         assert_eq!(ex("kind != \"a\""), None);
         assert_eq!(ex("kind > \"a\""), None);
+    }
+
+    fn range_of(s: &str) -> (bool, DateTime<Utc>) {
+        match ex(s).expect("pushes down") {
+            Pushdown::Range { lower, value, .. } => (lower, value),
+            other => panic!("expected a range, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_strict_lower_bound_is_relaxed_to_inclusive_but_not_moved() {
+        // `>` becomes `>=` — that is the whole relaxation. Moving the
+        // instant outward as well made a bounded window return rows
+        // exclusively from OUTSIDE it, because the LIMIT keeps the
+        // newest rows of whatever window it is given.
+        let (lower, value) = range_of("timestamp > \"2026-08-05\"");
+        assert!(lower);
+        assert_eq!(value.to_rfc3339(), "2026-08-05T00:00:00+00:00");
+    }
+
+    #[test]
+    fn an_upper_bound_is_inclusive_and_not_moved() {
+        let (lower, value) = range_of("timestamp <= \"2026-08-05\"");
+        assert!(!lower);
+        assert_eq!(value.to_rfc3339(), "2026-08-05T00:00:00+00:00");
+    }
+
+    #[test]
+    fn a_bounded_window_pushes_the_exact_edges_not_widened_ones() {
+        // Regression. Widening these by a day turned a one-day query
+        // into a three-day window, and `ORDER BY audit_id DESC LIMIT n`
+        // then kept only the newest rows — all of them outside the day
+        // asked for. A filter matching 5,525 events answered 0.
+        let lo = range_of("timestamp >= \"2025-04-01\"");
+        let hi = range_of("timestamp <= \"2025-04-02\"");
+        assert_eq!(lo.1.to_rfc3339(), "2025-04-01T00:00:00+00:00");
+        assert_eq!(hi.1.to_rfc3339(), "2025-04-02T00:00:00+00:00");
+    }
+
+    #[test]
+    fn a_reversed_range_flips_the_operator() {
+        // `"x" < timestamp` is a LOWER bound on the column. Reading it
+        // as an upper bound would exclude everything the filter wants.
+        let (lower, _) = range_of("\"2026-08-05\" < timestamp");
+        assert!(lower, "literal-on-the-left must flip to a lower bound");
+        let (lower, _) = range_of("\"2026-08-05\" > timestamp");
+        assert!(!lower);
+    }
+
+    #[test]
+    fn a_full_rfc3339_literal_parses() {
+        let (lower, value) = range_of("timestamp >= \"2026-08-05T12:30:00+00:00\"");
+        assert!(lower);
+        assert_eq!(value.to_rfc3339(), "2026-08-05T12:30:00+00:00");
+    }
+
+    #[test]
+    fn an_unparseable_instant_is_not_pushed() {
+        // Would reach Postgres as `invalid input syntax for type
+        // timestamp with time zone` — the 500 class.
+        assert_eq!(ex("timestamp > \"banana\""), None);
+        assert_eq!(ex("timestamp > \"2026-13-45\""), None);
+        assert_eq!(ex("timestamp > 5"), None);
+    }
+
+    #[test]
+    fn a_range_combines_with_equality_under_and() {
+        let (sql, binds) = sql_of("kind = \"a\" AND timestamp > \"2026-08-05\"");
+        assert_eq!(sql, "(kind = $1 AND occurred_at >= $2)");
+        assert_eq!(binds.len(), 2);
+        assert!(matches!(binds[1], Bound::Timestamp(_)));
+    }
+
+    #[test]
+    fn a_bounded_window_pushes_both_ends() {
+        let (sql, _) = sql_of("timestamp >= \"2026-01-01\" AND timestamp <= \"2026-02-01\"");
+        assert_eq!(sql, "(occurred_at >= $1 AND occurred_at <= $2)");
+    }
+
+    #[test]
+    fn an_or_of_ranges_pushes_as_a_group() {
+        let (sql, _) = sql_of("timestamp < \"2026-01-01\" OR timestamp > \"2026-08-01\"");
+        assert_eq!(sql, "(occurred_at <= $1 OR occurred_at >= $2)");
     }
 
     #[test]
@@ -319,7 +539,11 @@ mod tests {
         );
         assert_eq!(
             binds,
-            vec!["k".to_string(), "sk".to_string(), "si".to_string()]
+            vec![
+                Bound::Text("k".into()),
+                Bound::Text("sk".into()),
+                Bound::Text("si".into())
+            ]
         );
     }
 }

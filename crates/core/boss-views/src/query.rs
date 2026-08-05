@@ -46,10 +46,25 @@ enum SourceScope {
 /// `event_id` is deliberately absent: it is UUID, and a text bind
 /// against it makes Postgres reject the statement rather than the row.
 pub const EVENT_PUSHABLE: crate::pushdown::PushableColumns = &[
-    ("kind", "kind"),
-    ("source", "source"),
-    ("subject_kind", "subject_kind"),
-    ("subject_id", "subject_id"),
+    ("kind", "kind", crate::pushdown::ColumnType::Text),
+    ("source", "source", crate::pushdown::ColumnType::Text),
+    (
+        "subject_kind",
+        "subject_kind",
+        crate::pushdown::ColumnType::Text,
+    ),
+    (
+        "subject_id",
+        "subject_id",
+        crate::pushdown::ColumnType::Text,
+    ),
+    // The row renders this field as `timestamp`; the column behind it
+    // is `occurred_at`, which is exactly what the mapping is for.
+    (
+        "timestamp",
+        "occurred_at",
+        crate::pushdown::ColumnType::Timestamp,
+    ),
 ];
 
 /// How many candidate rows a single View may scan before it stops.
@@ -259,7 +274,7 @@ impl PgViewResolver {
                             subject_kind, subject_id, payload \
                      FROM event_facts",
                 );
-                let mut binds: Vec<String> = Vec::new();
+                let mut binds: Vec<crate::pushdown::Bound> = Vec::new();
                 if let Some(p) = pushdown {
                     let mut next = 1usize;
                     sql.push_str(" WHERE ");
@@ -269,7 +284,10 @@ impl PgViewResolver {
 
                 let mut q = sqlx::query(&sql);
                 for b in &binds {
-                    q = q.bind(b.clone());
+                    q = match b {
+                        crate::pushdown::Bound::Text(s) => q.bind(s.clone()),
+                        crate::pushdown::Bound::Timestamp(ts) => q.bind(*ts),
+                    };
                 }
                 let rows = q.fetch_all(&self.pool).await.map_err(storage)?;
                 rows.iter()
