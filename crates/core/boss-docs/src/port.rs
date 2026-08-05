@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use crate::types::{
     DesignDoc, DesignQuestion, FlushJob, FlushJobPayload, JobStatus, JobStatusUpdate,
-    PendingDecision, PendingDecisionInput,
+    PendingDecision, PendingDecisionInput, RejectedDocRecord,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +41,19 @@ pub trait DocsRepository: Send + Sync {
     /// Remove a doc (and its questions + pending decisions) from the
     /// cache. Used when a file disappears from disk.
     async fn delete_doc(&self, path: &str) -> Result<(), DocsError>;
+
+    // ----- Rejections -----
+
+    /// Docs currently failing to index. Non-empty means "these are not
+    /// in the tracker right now", not "these once failed".
+    async fn all_rejections(&self) -> Result<Vec<RejectedDocRecord>, DocsError>;
+
+    /// Record a rejection, preserving `first_seen_at` if the doc was
+    /// already failing.
+    async fn upsert_rejection(&self, path: &str, reason: &str) -> Result<(), DocsError>;
+
+    /// Clear a rejection — the doc indexed cleanly.
+    async fn clear_rejection(&self, path: &str) -> Result<(), DocsError>;
 
     // ----- Pending decisions -----
 

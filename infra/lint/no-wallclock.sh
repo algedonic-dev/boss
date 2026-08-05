@@ -320,7 +320,13 @@ sql_allow_line() {
   # delivered_at is the event-outbox relay's bookkeeping stamp — the
   # audit row's `timestamp` comes from the Event's own clock-routed
   # field; delivered_at only drives the pending-row filter.
-  if echo "$line_content" | grep -qE '\b(updated_at|created_at|deleted_at|closed_at|settled_at|published|locked_at|paid_at|sent_at|read_at|expires_at|received_at|claimed_at|started_at|finished_at|completed_at|opened_at|seen_at|delivered_at)\s*=\s*NOW\s*\(\s*\)'; then
+  # first_seen_at/last_seen_at are spelled out because the `\b` above
+  # means a bare `seen_at` alternative does NOT match the prefixed
+  # forms (`_` is a word character, so there is no boundary before
+  # `seen`). They are the design-doc indexer's bookkeeping — which
+  # docs failed to parse and when it last tried — and are never read
+  # into an audit_log payload.
+  if echo "$line_content" | grep -qE '\b(updated_at|created_at|deleted_at|closed_at|settled_at|published|locked_at|paid_at|sent_at|read_at|expires_at|received_at|claimed_at|started_at|finished_at|completed_at|opened_at|seen_at|first_seen_at|last_seen_at|delivered_at)\s*=\s*NOW\s*\(\s*\)'; then
     return 0
   fi
   # The sim-clock epoch anchor: `wall_anchor` records the real-world

@@ -41,6 +41,12 @@ test.beforeEach(async ({ page }) => {
   await page.route('**/api/design/docs', (route) =>
     route.fulfill({ json: DOCS }),
   );
+  // Empty by default: the common case is a fully-indexed corpus, and
+  // it keeps the panel out of the way of the assertions below. The
+  // non-empty case has its own test.
+  await page.route('**/api/design/rejections', (route) =>
+    route.fulfill({ json: [] }),
+  );
   await page.route('**/api/jobs?*', (route) =>
     route.fulfill({ json: { jobs: [], total: 0 } }),
   );
@@ -165,5 +171,47 @@ test.describe('Design review list', () => {
     await expect(page.locator('.empty', { hasText: /HTTP 422/ })).toHaveCount(
       0,
     );
+  });
+
+  test('names docs the reindexer refused, and how long they have been invisible', async ({
+    page,
+  }) => {
+    const sixDaysAgo = new Date(Date.now() - 6 * 86_400_000).toISOString();
+    await page.route('**/api/design/rejections', (route) =>
+      route.fulfill({
+        json: [
+          {
+            path: 'docs/design/half-written.md',
+            reason: 'no title heading',
+            first_seen_at: sixDaysAgo,
+            last_seen_at: new Date().toISOString(),
+          },
+        ],
+      }),
+    );
+    await mountPage(page, '/system/design', { titleMatch: /design review/i });
+    await expect(
+      page.getByRole('heading', { name: /not indexed \(1\)/i }),
+    ).toBeVisible();
+    const row = page.locator('tr', { hasText: 'docs/design/half-written.md' });
+    await expect(row).toContainText('6 days');
+    await expect(row).toContainText('no title heading');
+  });
+
+  test('a failing rejections call does not blank the page', async ({
+    page,
+  }) => {
+    // Rejections are supplementary. Throwing on a non-OK response
+    // replaced the entire surface with an error banner — the docs
+    // list, the counts, every review button — over a panel that
+    // renders nothing when empty anyway.
+    await page.route('**/api/design/rejections', (route) =>
+      route.fulfill({ status: 500, body: 'boom' }),
+    );
+    await mountPage(page, '/system/design', { titleMatch: /design review/i });
+    await expect(
+      page.locator('tr', { hasText: 'Inventory value conservation' }),
+    ).toHaveCount(1);
+    await expect(page.locator('.empty', { hasText: /^Error:/ })).toHaveCount(0);
   });
 });
