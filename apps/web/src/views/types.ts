@@ -18,8 +18,10 @@ export type View = Readonly<{
   updated_at: string;
 }>;
 
+/// `owner_id` is deliberately absent: the server derives it from the
+/// authenticated caller. It used to be here, which made ownership a
+/// value the client could pick.
 export type ViewInput = Readonly<{
-  owner_id: string;
   title: string;
   source: ViewSource;
   filter: string;

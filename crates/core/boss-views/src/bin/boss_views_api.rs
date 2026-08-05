@@ -14,6 +14,8 @@ struct Cli {
     postgres_url: String,
     #[arg(long, default_value_t = boss_ports::prod("views"))]
     http_port: u16,
+    #[arg(long, env = "BOSS_POLICY_URL", default_value_t = boss_ports::url("policy"))]
+    policy_url: String,
 }
 
 #[tokio::main]
@@ -32,9 +34,18 @@ async fn main() -> Result<()> {
         .await
         .context("connecting to Postgres")?;
 
+    // A View reads policy-scoped tables, so the resolver needs the
+    // policy engine the same way every other scoped read surface does.
+    // Same wrapping jobs-api uses: sim traffic is authorized at the
+    // boundary, real traffic is enforced per-role by the inner client.
+    let policy: Arc<dyn boss_policy_client::PolicyClient> =
+        Arc::new(boss_policy_client::SimBypassPolicyClient::new(Arc::new(
+            boss_policy_client::ReqwestPolicyClient::new(cli.policy_url),
+        )));
+
     let app = boss_views::http::router(boss_views::http::ViewsApiState {
         repo: Arc::new(boss_views::PgViewsRepo::new(pool.clone())),
-        resolver: Arc::new(boss_views::PgViewResolver::new(pool)),
+        resolver: Arc::new(boss_views::PgViewResolver::new(pool, policy)),
     });
     let addr = format!("127.0.0.1:{}", cli.http_port);
     tracing::info!(addr = %addr, "boss-views-api listening");

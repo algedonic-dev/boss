@@ -139,10 +139,14 @@ pub struct View {
 }
 
 /// What a caller supplies to create or replace a View. Server owns
-/// `id` and the timestamps.
+/// `id`, the timestamps, and — deliberately — `owner_id`.
+///
+/// `owner_id` is NOT on the wire. It was, and that made ownership a
+/// caller-supplied string: anyone could POST a View attributed to
+/// anyone. Deriving it from the authenticated caller removes the
+/// spoof by construction rather than by validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewInput {
-    pub owner_id: String,
     pub title: String,
     pub source: ViewSource,
     #[serde(default)]

@@ -1671,6 +1671,7 @@ dependencies = [
  "axum",
  "boss-core",
  "boss-expr",
+ "boss-policy-client",
  "boss-ports",
  "boss-testing",
  "chrono",

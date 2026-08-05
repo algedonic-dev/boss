@@ -17,6 +17,7 @@ postgres = ["dep:sqlx"]
 boss-core = { path = "../boss-core" }
 boss-ports = { path = "../boss-ports" }
 boss-expr = { path = "../boss-expr" }
+boss-policy-client = { path = "../boss-policy-client" }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }

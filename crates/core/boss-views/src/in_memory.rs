@@ -58,22 +58,23 @@ impl ViewsRepo for InMemoryViewsRepo {
         Ok(out)
     }
 
-    async fn get(&self, id: &str) -> Result<View, ViewsError> {
+    async fn get_for_viewer(&self, id: &str, viewer_id: &str) -> Result<View, ViewsError> {
         let rows = self
             .rows
             .lock()
             .map_err(|_| ViewsError::Storage("lock poisoned".into()))?;
         rows.get(id)
+            .filter(|v| v.owner_id == viewer_id || v.visibility == Visibility::Shared)
             .cloned()
             .ok_or_else(|| ViewsError::NotFound(id.to_string()))
     }
 
-    async fn create(&self, input: &ViewInput) -> Result<View, ViewsError> {
+    async fn create(&self, owner_id: &str, input: &ViewInput) -> Result<View, ViewsError> {
         filter::compile(&input.filter)?;
         let id = self.mint_id()?;
         let view = View {
             id: id.clone(),
-            owner_id: input.owner_id.clone(),
+            owner_id: owner_id.to_string(),
             title: input.title.clone(),
             source: input.source,
             filter: input.filter.clone(),
@@ -91,19 +92,27 @@ impl ViewsRepo for InMemoryViewsRepo {
         Ok(view)
     }
 
-    async fn replace(&self, id: &str, input: &ViewInput) -> Result<View, ViewsError> {
+    async fn replace(
+        &self,
+        id: &str,
+        owner_id: &str,
+        input: &ViewInput,
+    ) -> Result<View, ViewsError> {
         filter::compile(&input.filter)?;
         let mut rows = self
             .rows
             .lock()
             .map_err(|_| ViewsError::Storage("lock poisoned".into()))?;
+        // Someone else's View is NotFound, not Forbidden — see the
+        // port docs.
         let existing = rows
             .get(id)
+            .filter(|v| v.owner_id == owner_id)
             .cloned()
             .ok_or_else(|| ViewsError::NotFound(id.to_string()))?;
         let updated = View {
             id: existing.id,
-            owner_id: input.owner_id.clone(),
+            owner_id: existing.owner_id,
             title: input.title.clone(),
             source: input.source,
             filter: input.filter.clone(),
@@ -119,14 +128,19 @@ impl ViewsRepo for InMemoryViewsRepo {
         Ok(updated)
     }
 
-    async fn delete(&self, id: &str) -> Result<(), ViewsError> {
+    async fn delete(&self, id: &str, owner_id: &str) -> Result<(), ViewsError> {
         let mut rows = self
             .rows
             .lock()
             .map_err(|_| ViewsError::Storage("lock poisoned".into()))?;
-        rows.remove(id)
-            .map(|_| ())
-            .ok_or_else(|| ViewsError::NotFound(id.to_string()))
+        match rows.get(id) {
+            Some(v) if v.owner_id == owner_id => {
+                rows.remove(id);
+                Ok(())
+            }
+            // Present but not yours, or absent: same answer.
+            _ => Err(ViewsError::NotFound(id.to_string())),
+        }
     }
 }
 
@@ -139,9 +153,8 @@ mod tests {
         InMemoryViewsRepo::new(DateTime::from_timestamp(1_700_000_000, 0).expect("valid ts"))
     }
 
-    fn input(owner: &str, title: &str, visibility: Visibility) -> ViewInput {
+    fn input(title: &str, visibility: Visibility) -> ViewInput {
         ViewInput {
-            owner_id: owner.to_string(),
             title: title.to_string(),
             source: ViewSource::Jobs,
             filter: String::new(),
@@ -154,7 +167,7 @@ mod tests {
     #[tokio::test]
     async fn a_private_view_is_visible_only_to_its_owner() {
         let r = repo();
-        r.create(&input("alice", "Mine", Visibility::Private))
+        r.create("alice", &input("Mine", Visibility::Private))
             .await
             .unwrap();
 
@@ -167,7 +180,7 @@ mod tests {
         // Q4: sharing takes no promotion Job. Marking it shared IS the
         // act of sharing.
         let r = repo();
-        r.create(&input("alice", "Ours", Visibility::Shared))
+        r.create("alice", &input("Ours", Visibility::Shared))
             .await
             .unwrap();
 
@@ -175,12 +188,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetching_someone_elses_private_view_is_not_found() {
+        // NotFound rather than Forbidden: a distinct 403 would confirm
+        // that a private View exists at this id, which is the leak the
+        // check exists to close.
+        let r = repo();
+        let made = r
+            .create("alice", &input("Mine", Visibility::Private))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            r.get_for_viewer(&made.id, "bob").await.unwrap_err(),
+            ViewsError::NotFound(_)
+        ));
+        assert!(r.get_for_viewer(&made.id, "alice").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_shared_view_can_be_fetched_by_anyone() {
+        let r = repo();
+        let made = r
+            .create("alice", &input("Ours", Visibility::Shared))
+            .await
+            .unwrap();
+        assert!(r.get_for_viewer(&made.id, "bob").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_stranger_cannot_delete_someone_elses_view() {
+        // Verified as a live defect before this check existed: an
+        // unauthenticated DELETE destroyed another user's View and
+        // returned 204.
+        let r = repo();
+        let made = r
+            .create("alice", &input("Mine", Visibility::Private))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            r.delete(&made.id, "bob").await.unwrap_err(),
+            ViewsError::NotFound(_)
+        ));
+        // Still there for its owner.
+        assert!(r.get_for_viewer(&made.id, "alice").await.is_ok());
+        assert!(r.delete(&made.id, "alice").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_stranger_cannot_edit_someone_elses_view_even_if_shared() {
+        // Shared means readable, not writable. Without this, "share
+        // with the team" would mean "let the team rewrite it".
+        let r = repo();
+        let made = r
+            .create("alice", &input("Ours", Visibility::Shared))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            r.replace(&made.id, "bob", &input("Hijacked", Visibility::Shared))
+                .await
+                .unwrap_err(),
+            ViewsError::NotFound(_)
+        ));
+        assert_eq!(
+            r.get_for_viewer(&made.id, "bob").await.unwrap().title,
+            "Ours"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_cannot_transfer_ownership() {
+        let r = repo();
+        let made = r
+            .create("alice", &input("First", Visibility::Private))
+            .await
+            .unwrap();
+        let updated = r
+            .replace(&made.id, "alice", &input("Second", Visibility::Shared))
+            .await
+            .unwrap();
+        assert_eq!(updated.owner_id, "alice");
+    }
+
+    #[tokio::test]
     async fn a_bad_filter_is_rejected_on_create_not_on_read() {
         let r = repo();
-        let mut bad = input("alice", "Broken", Visibility::Private);
+        let mut bad = input("Broken", Visibility::Private);
         bad.filter = "status =".to_string();
 
-        let err = r.create(&bad).await.unwrap_err();
+        let err = r.create("alice", &bad).await.unwrap_err();
         assert!(matches!(err, ViewsError::InvalidFilter(_)));
         // And nothing was stored, so nobody can open it later.
         assert_eq!(r.list_for_viewer("alice").await.unwrap().len(), 0);
@@ -190,12 +287,12 @@ mod tests {
     async fn replace_keeps_created_at_and_moves_updated_at() {
         let r = repo();
         let made = r
-            .create(&input("alice", "First", Visibility::Private))
+            .create("alice", &input("First", Visibility::Private))
             .await
             .unwrap();
 
         let updated = r
-            .replace(&made.id, &input("alice", "Second", Visibility::Shared))
+            .replace(&made.id, "alice", &input("Second", Visibility::Shared))
             .await
             .unwrap();
 
@@ -208,7 +305,7 @@ mod tests {
     async fn deleting_a_missing_view_is_not_found() {
         let r = repo();
         assert!(matches!(
-            r.delete("view-nope").await.unwrap_err(),
+            r.delete("view-nope", "alice").await.unwrap_err(),
             ViewsError::NotFound(_)
         ));
     }

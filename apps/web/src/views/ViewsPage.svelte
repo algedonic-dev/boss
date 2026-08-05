@@ -10,7 +10,6 @@
   // A View holds a query and a layout, never rows. Its content comes
   // from the same projections every other surface reads, which is why
   // two people running the same View see the same numbers.
-  import { onMount } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import { session } from '@boss/web-kit/session/session.svelte';
@@ -52,7 +51,10 @@
     loading = true;
     error = null;
     try {
-      const r = await fetch(`/api/views?viewer_id=${encodeURIComponent(viewerId)}`);
+      // No viewer_id: identity travels in the request the
+      // gateway stamps. Sending it as a param let any caller list
+      // any user's private Views by naming them.
+      const r = await fetch('/api/views');
       if (!r.ok) throw new Error(`views: HTTP ${r.status}`);
       views = (await r.json()) as View[];
     } catch (e) {
@@ -84,7 +86,8 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          owner_id: viewerId,
+          // owner_id is not on the wire — the server takes it from
+          // the authenticated caller.
           title: draftTitle.trim(),
           source: draftSource,
           filter: draftFilter.trim(),
@@ -137,11 +140,18 @@
     return String(value);
   }
 
-  onMount(load);
-  // Re-load when the session resolves — on a cold load the first
-  // render has no user yet, and without this the list stays empty.
+  // One trigger, not two. `onMount(load)` plus an effect that also
+  // called load() fired twice on any mount where the session was
+  // already resolved, racing two identical requests. The effect alone
+  // covers both cases: it runs once on mount and again if the session
+  // resolves later.
+  let loadedFor = $state<string | null>(null);
   $effect(() => {
-    if (viewerId) void load();
+    const id = viewerId;
+    if (id && loadedFor !== id) {
+      loadedFor = id;
+      void load();
+    }
   });
 </script>
 

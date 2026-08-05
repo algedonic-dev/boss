@@ -125,7 +125,7 @@ export async function installSmokeMocks(page: Page): Promise<void> {
   // Views — the Home composer surface. Two rows so the crawler renders
   // both visibility badges, and a results payload with `truncated` set
   // so the ceiling warning is exercised rather than only the happy path.
-  await page.route(/\/api\/views\?/, (r) =>
+  await page.route(/\/api\/views(\?|$)/, (r) =>
     json(r, [
       {
         id: 'view-1', owner_id: 'emp-1', title: 'Open jobs', source: 'jobs',

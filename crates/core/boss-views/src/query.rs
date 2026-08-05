@@ -11,7 +11,10 @@
 //! predicates in dispatcher rules and step `ready_when`, and no part
 //! of an operator's text is ever concatenated into a statement.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
+use boss_policy_client::{AccessTier, Predicate, Resource, User};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row, postgres::PgRow};
 
@@ -19,6 +22,21 @@ use crate::error::ViewsError;
 use crate::filter;
 use crate::port::ViewResolver;
 use crate::types::{View, ViewResults, ViewSource};
+
+/// How a source is scoped to the caller.
+///
+/// A View reads `jobs`, `subjects` and `audit_log` directly, and those
+/// are policy-scoped wherever else they are read. Without this the
+/// feature is a way to read rows your role cannot open through any
+/// surface — which is what the first version was.
+enum SourceScope {
+    /// Every candidate row.
+    All,
+    /// Jobs whose owner is one of these.
+    JobOwners(Vec<String>),
+    /// Nothing. The caller may not read this source at all.
+    None,
+}
 
 /// How many candidate rows a single View may scan before it stops.
 ///
@@ -71,11 +89,69 @@ fn opt_date(r: &PgRow, col: &str) -> Result<Option<String>, ViewsError> {
 
 pub struct PgViewResolver {
     pool: PgPool,
+    policy: Arc<dyn boss_policy_client::PolicyClient>,
 }
 
 impl PgViewResolver {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, policy: Arc<dyn boss_policy_client::PolicyClient>) -> Self {
+        Self { pool, policy }
+    }
+
+    /// Translate the caller's policy into a scope for this source.
+    ///
+    /// `jobs` has a real policy vocabulary — 70 seeded rules across
+    /// `self`, `territory` and `department:*` — so it gets the same
+    /// read-scope predicate `/api/jobs` applies.
+    ///
+    /// `subjects` and `audit_log` have NO policy resource: there is no
+    /// `subject` or `event` in `policy_rules`, so there is nothing to
+    /// ask the engine. Row-level scoping for them needs new Resource
+    /// kinds and seeded rules, which is a design decision and not one
+    /// to invent inline. Until then they are gated coarsely at
+    /// operator/auditor tier — the same control `/system/monitoring`
+    /// already applies to the audit log it surfaces. That is blunter
+    /// than the jobs path and deliberately so: refusing a whole source
+    /// is a visible limitation, whereas silently returning rows the
+    /// caller cannot otherwise see is the bug being fixed.
+    async fn scope_for(&self, source: ViewSource, user: &User) -> Result<SourceScope, ViewsError> {
+        match source {
+            ViewSource::Jobs => {
+                let predicate = self
+                    .policy
+                    .scope_predicate(user, Resource::job())
+                    .await
+                    .map_err(|e| ViewsError::Storage(format!("policy check failed: {e}")))?;
+                Ok(match predicate {
+                    Predicate::Unrestricted => SourceScope::All,
+                    Predicate::None => SourceScope::None,
+                    Predicate::OwnerIs { user_id } => SourceScope::JobOwners(vec![user_id]),
+                    Predicate::OwnerIn { user_ids } => SourceScope::JobOwners(user_ids),
+                    // Jobs carry no department column, so a
+                    // department-scoped rule is all-or-nothing on
+                    // whether the caller is in it — the same
+                    // resolution boss-jobs/src/http/jobs.rs makes.
+                    Predicate::DepartmentIs { department } => {
+                        if user.department.as_deref() == Some(department.as_str()) {
+                            SourceScope::All
+                        } else {
+                            SourceScope::None
+                        }
+                    }
+                    // AccountIn narrows by the Job's subject, which
+                    // this scan does not model. Refuse rather than
+                    // widen: returning everything to an
+                    // account-scoped caller is the exact leak.
+                    Predicate::AccountIn { .. } => SourceScope::None,
+                })
+            }
+            ViewSource::Subjects | ViewSource::Events => {
+                if matches!(user.access_tier, AccessTier::Operator | AccessTier::Auditor) {
+                    Ok(SourceScope::All)
+                } else {
+                    Ok(SourceScope::None)
+                }
+            }
+        }
     }
 
     /// Candidate rows for a source, newest first, as JSON objects.
@@ -84,8 +160,16 @@ impl PgViewResolver {
     /// operator can predict without being told, and a View whose row
     /// order depends on an unstated rule is a View whose results
     /// change for reasons nobody can see.
-    async fn candidates(&self, source: ViewSource) -> Result<Vec<Value>, ViewsError> {
+    async fn candidates(
+        &self,
+        source: ViewSource,
+        scope: &SourceScope,
+    ) -> Result<Vec<Value>, ViewsError> {
         let storage = |e: sqlx::Error| ViewsError::Storage(e.to_string());
+        // Denied sources never reach the database at all.
+        if matches!(scope, SourceScope::None) {
+            return Ok(Vec::new());
+        }
         match source {
             ViewSource::Subjects => {
                 let rows = sqlx::query(
@@ -109,12 +193,23 @@ impl PgViewResolver {
                     .collect()
             }
             ViewSource::Jobs => {
+                // The owner scope is a bound array, never interpolated:
+                // NULL means unrestricted, otherwise the row's owner
+                // must be in it. One statement covers both cases so
+                // the scoped path cannot drift from the unscoped one.
+                let owners: Option<Vec<String>> = match scope {
+                    SourceScope::JobOwners(ids) => Some(ids.clone()),
+                    _ => None,
+                };
                 let rows = sqlx::query(
                     "SELECT id, kind, subject_kind, subject_id, title, owner_id, status, \
                             priority, opened_on, closed_on, tags, created_at \
-                     FROM jobs ORDER BY created_at DESC LIMIT $1",
+                     FROM jobs \
+                     WHERE ($2::text[] IS NULL OR owner_id = ANY($2)) \
+                     ORDER BY created_at DESC LIMIT $1",
                 )
                 .bind(SCAN_CEILING)
+                .bind(owners.as_deref())
                 .fetch_all(&self.pool)
                 .await
                 .map_err(storage)?;
@@ -188,9 +283,18 @@ fn project(row: &Value, columns: &[String]) -> Value {
 
 #[async_trait]
 impl ViewResolver for PgViewResolver {
-    async fn resolve(&self, view: &View, limit: usize) -> Result<ViewResults, ViewsError> {
+    async fn resolve(
+        &self,
+        view: &View,
+        user: &User,
+        limit: usize,
+    ) -> Result<ViewResults, ViewsError> {
         let compiled = filter::compile(&view.filter)?;
-        let candidates = self.candidates(view.source).await?;
+        // Scope is computed from the CALLER, not the View's author: a
+        // shared View run by someone with narrower access shows them
+        // their own rows, not its author's.
+        let scope = self.scope_for(view.source, user).await?;
+        let candidates = self.candidates(view.source, &scope).await?;
         let scanned = candidates.len();
 
         let matching: Vec<Value> = candidates
