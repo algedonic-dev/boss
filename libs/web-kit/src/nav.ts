@@ -41,7 +41,7 @@ export function href(relative: string): string {
 export type AppId =
   | 'home'
   | 'simulator'
-  | 'model'
+  | 'it'
   | 'crm'
   | 'finance'
   | 'operations'
@@ -60,15 +60,23 @@ export type AppTab = Readonly<{
 
 /// Tab order, left to right. Home first: it is where sign-in lands
 /// and where personal work lives regardless of which domain it
-/// belongs to. Simulator and System Model follow as the two
-/// model-facing apps, then the domain apps.
+/// belongs to. Simulator second — it is the one app that is not a
+/// department, because it drives the model rather than doing work
+/// inside it. Then the **department apps**.
+///
+/// IT is a department like the rest, and System Model lives inside it
+/// (home-workspace-and-department-apps.md, Q2). The earlier shape had
+/// a top-level "System Model" tab sitting beside Simulator as a
+/// second model-facing app; the review rejected splitting platform
+/// work away from the department that does it. It sits last so the
+/// five domain tabs keep the positions operators already know.
 export const APPS: ReadonlyArray<AppTab> = [
   { id: 'home', label: 'Home', href: '/' },
   { id: 'simulator', label: 'Simulator', href: '/simulator' },
-  { id: 'model', label: 'System Model', href: '/system' },
   { id: 'crm', label: 'CRM', href: '/ux/accounts' },
   { id: 'finance', label: 'Finance', href: '/ux/finance' },
   { id: 'operations', label: 'Operations', href: '/ux/ops' },
   { id: 'supply-chain', label: 'Supply Chain', href: '/ux/warehouse' },
   { id: 'people', label: 'People', href: '/ux/people' },
+  { id: 'it', label: 'IT', href: '/system' },
 ];

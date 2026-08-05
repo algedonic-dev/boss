@@ -92,7 +92,7 @@
   // Platform (reference + admin). The User Experiences perspective
   // keeps Work / Surfaces / Knowledge Bases (below). Selected via the
   // `perspective` prop.
-  const MODEL_GROUPS: ReadonlyArray<NavGroup> = [
+  const IT_GROUPS: ReadonlyArray<NavGroup> = [
     {
       label: 'Run',
       items: [
@@ -150,8 +150,8 @@
   ]);
 
   let MAIN = $derived<ReadonlyArray<NavGroup>>(
-    activeApp === 'model'
-      ? MODEL_GROUPS
+    activeApp === 'it'
+      ? IT_GROUPS
       : activeApp === 'home'
         ? HOME_GROUPS
         : [
