@@ -14,16 +14,22 @@
   // the same-SPA apps the router picks the change up on popstate.
   import SystemTime from './SystemTime.svelte';
   import SignInControl from './SignInControl.svelte';
+  import GlobalSearch from './GlobalSearch.svelte';
   import { APPS, type AppId } from './nav';
 
   let {
     active,
     brandName = 'BOSS',
     brandSub = '',
+    searchAppKinds = [] as ReadonlyArray<string>,
   } = $props<{
     active: AppId;
     brandName?: string;
     brandSub?: string;
+    /// Subject kinds of the active app, passed to global search as a
+    /// ranking hint. web-kit deliberately does not know the mapping —
+    /// the host owns which surfaces belong to which app.
+    searchAppKinds?: ReadonlyArray<string>;
   }>();
 </script>
 
@@ -43,6 +49,7 @@
     {/each}
   </div>
   <div class="perspective-right">
+    <GlobalSearch appKinds={searchAppKinds} />
     <SystemTime />
     <SignInControl />
   </div>

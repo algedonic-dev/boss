@@ -13,7 +13,7 @@
   import { loadStepTypeRegistry } from './steps/surfaceRegistry.svelte';
   import { loadClasses } from '@boss/web-kit/session/classes.svelte';
   import AppShell from './shell/AppShell.svelte';
-  import { appForSection, type AppId } from './shell/nav-catalog';
+  import { appForSection, APP_SUBJECT_KINDS, type AppId } from './shell/nav-catalog';
   import PerspectiveTabs from '@boss/web-kit/PerspectiveTabs.svelte';
   import DebugGear from './debug/DebugGear.svelte';
   import MePage from './me/MePage.svelte';
@@ -80,6 +80,7 @@
   import ShopHome from './shop/ShopHome.svelte';
   import ShopProductPage from './shop/ShopProductPage.svelte';
   import LandingPage from './landing/LandingPage.svelte';
+  import SearchResultsPage from './search/SearchResultsPage.svelte';
   import LoginPage from './auth/LoginPage.svelte';
   import AuthAdminPage from './auth/AuthAdminPage.svelte';
   import ModuleDisabled from './shell/ModuleDisabled.svelte';
@@ -217,12 +218,14 @@
 {#if route.kind === 'login'}
   <LoginPage />
 {:else}
-  <PerspectiveTabs active={perspective} brandName="Algedonic" brandSub="Ales" />
+  <PerspectiveTabs active={perspective} brandName="Algedonic" brandSub="Ales" searchAppKinds={APP_SUBJECT_KINDS[perspective] ?? []} />
 <AppShell {activeSection} {perspective}>
   {#if blockedModule}
     <ModuleDisabled module={blockedModule.id} label={blockedModule.label} />
   {:else if route.kind === 'home'}
       <LandingPage />
+    {:else if route.kind === 'search'}
+      <SearchResultsPage q={route.q} />
     {:else if route.kind === 'authAdmin'}
       <AuthAdminPage />
     {:else if route.kind === 'me'}

@@ -127,6 +127,10 @@ else
         # service so sim runs + real-human runs go through the same
         # assignment path (no sim-side dispatch).
         "dispatcher:7950"
+        # search:7960 — global search read surface (boss-search).
+        # Mirrors the PortSpec in boss-ports; the two lists are kept
+        # in step by hand, per that crate's header.
+        "search:7960"
         "classes:7800"
         "locations:7820"
         "subject-kinds:7830"

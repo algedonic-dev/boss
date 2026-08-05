@@ -122,3 +122,27 @@ export function appForSection(section: string): AppId {
   // belongs now that there is an app for them.
   return entry?.app ?? 'home';
 }
+
+/// Subject kinds each app is "about".
+///
+/// Feeds `app_kinds` on `/api/search`, which floats these to the top of
+/// the dropdown — Q4's "prioritise results from the immediate app".
+/// It is a ranking hint, never a filter: the whole value of a global
+/// box is that it still finds the thing when you are looking in the
+/// wrong app, so a CRM search for a part number must still surface the
+/// part, just below the accounts.
+///
+/// Kinds may repeat across apps. An invoice is Finance's to reconcile
+/// and CRM's to chase, and both are right — this maps attention, not
+/// ownership. Home lists nothing: it is the cross-app surface, so it
+/// prioritises nothing and shows the unweighted ranking.
+export const APP_SUBJECT_KINDS: Readonly<Record<AppId, ReadonlyArray<string>>> = {
+  home: [],
+  simulator: [],
+  model: ['job-kind', 'company'],
+  crm: ['account', 'customer', 'campaign', 'marketing-asset'],
+  finance: ['invoice', 'vendor', 'vendor-invoice', 'purchase_order'],
+  operations: ['job-kind', 'calendar', 'location'],
+  'supply-chain': ['product', 'asset', 'purchase_order', 'shipment', 'vendor'],
+  people: ['employee'],
+};
