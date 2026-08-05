@@ -135,6 +135,26 @@ describe('parseRoute — wildcard does not shadow specific cases', () => {
   });
 });
 
+describe('global search results route', () => {
+  test('/search carries the query through', () => {
+    (globalThis as { window?: { location: { search: string; pathname: string } } }).window = {
+      location: { search: '?q=cascade', pathname: '/ux/search' },
+    };
+    const r = parseRoute('/ux/search');
+    expect(r.kind).toBe('search');
+    expect((r as { q: string }).q).toBe('cascade');
+  });
+
+  test('/search with no query is still the search route, not the catch-all', () => {
+    (globalThis as { window?: { location: { search: string; pathname: string } } }).window = {
+      location: { search: '', pathname: '/ux/search' },
+    };
+    const r = parseRoute('/ux/search');
+    expect(r.kind).toBe('search');
+    expect((r as { q: string }).q).toBe('');
+  });
+});
+
 describe('full-page step route', () => {
   test('parses /jobs/{job}/steps/{step} to stepFocus', () => {
     const r = parseRoute('/ux/jobs/job-123/steps/step-456');

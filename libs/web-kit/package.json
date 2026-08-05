@@ -11,7 +11,10 @@
     "./sim-clock-types": "./src/sim-clock-types.ts",
     "./SystemTime.svelte": "./src/SystemTime.svelte",
     "./SignInControl.svelte": "./src/SignInControl.svelte",
-    "./PerspectiveTabs.svelte": "./src/PerspectiveTabs.svelte"
+    "./PerspectiveTabs.svelte": "./src/PerspectiveTabs.svelte",
+    "./GlobalSearch.svelte": "./src/GlobalSearch.svelte"
   },
-  "peerDependencies": { "svelte": "^5.55.9" }
+  "peerDependencies": {
+    "svelte": "^5.55.9"
+  }
 }

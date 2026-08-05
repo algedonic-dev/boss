@@ -20,8 +20,15 @@ test.describe('JobKind authoring workspace — graph + inspector', () => {
     await mountPage(page, WORKSPACE, { titleMatch: /Authoring/i });
 
     // Spec fields are seeded from the publish step's job_kind_spec.
-    // Inputs in order: slug (disabled) · label · category.
-    await expect(page.locator('input').nth(1)).toHaveValue('Seasonal Release', { timeout: 10_000 });
+    // Located by placeholder, not by index: this used to be
+    // `locator('input').nth(1)` with a comment pinning the DOM order
+    // (slug · label · category), which silently counted every input
+    // on the page — including the chrome bar's. Adding global search
+    // to the chrome shifted the index by one and broke it.
+    await expect(page.getByPlaceholder('Warranty Rework')).toHaveValue(
+      'Seasonal Release',
+      { timeout: 10_000 },
+    );
 
     // The graph (lazy-loaded Svelte Flow) renders the two seeded steps.
     await expect(page.locator('.jk-node')).toHaveCount(2, { timeout: 15_000 });

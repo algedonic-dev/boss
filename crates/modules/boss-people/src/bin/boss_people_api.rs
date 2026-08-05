@@ -143,7 +143,6 @@ async fn main() -> Result<()> {
         publisher.clone(),
         clock.clone(),
     )
-    .merge(boss_people::search::search_router(pool.clone()))
     .merge(boss_people::requisitions::requisitions_router(
         pool.clone(),
         publisher.clone(),

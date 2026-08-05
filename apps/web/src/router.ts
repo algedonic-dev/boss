@@ -30,6 +30,10 @@ export type Route =
       newJobSubjectId?: string;
     }
   | { kind: 'jobDetail'; jobId: string }
+  /// Full results for a global-search query. Lives in Home because
+  /// Home is the cross-app surface — the chrome dropdown is scoped to
+  /// the app you are in, this is the unscoped view it escalates to.
+  | { kind: 'search'; q: string }
   /// Full-page step surface. A step whose UX is a plugin gets the
   /// whole viewport instead of a panel inside the job page — review
   /// and authoring steps are reading tasks, and reading competes
@@ -202,6 +206,11 @@ export function parseRoute(pathname: string): Route {
   if (p === '/shop') return { kind: 'shop' };
   const shopM = p.match(/^\/shop\/(.+)$/);
   if (shopM) return { kind: 'shopProduct', sku: decodeURIComponent(shopM[1]!) };
+
+  if (p === '/search') {
+    const sp = new URLSearchParams(window.location.search);
+    return { kind: 'search', q: sp.get('q') ?? '' };
+  }
 
   if (p === '/hr') return { kind: 'hr' };
   if (p === '/qa') return { kind: 'qa' };

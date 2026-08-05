@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 boss-subject-kinds = { path = "../../core/boss-subject-kinds", features = ["postgres"] }
+boss-search = { path = "../../core/boss-search", features = ["postgres"] }
 anyhow = { workspace = true }
 clap = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres"] }

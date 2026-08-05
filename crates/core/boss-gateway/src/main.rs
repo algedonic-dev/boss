@@ -178,6 +178,20 @@ async fn main() -> Result<()> {
             "/api/assets/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::ASSETS)),
         )
+        // Global search. BOTH the bare path and the sub-path, for the
+        // reason spelled out on /api/assets above: the endpoint is
+        // `/api/search?q=…` with no sub-path, and without the bare
+        // route it misses the proxy and falls through to the SPA
+        // static handler — which answers HTML, so the dropdown would
+        // fail parsing JSON rather than 404.
+        .route(
+            "/api/search",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::SEARCH)),
+        )
+        .route(
+            "/api/search/{*rest}",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::SEARCH)),
+        )
         // Dispatcher rule-registry surface (read-only) — backs the
         // /system/dispatcher cascade visualization.
         .route(

@@ -285,6 +285,7 @@ pub static ASSETS: ProxyConfig = ProxyConfig::new("assets");
 pub static INVENTORY: ProxyConfig = ProxyConfig::new("inventory");
 pub static JOBS: ProxyConfig = ProxyConfig::new("jobs");
 pub static DISPATCHER: ProxyConfig = ProxyConfig::new("dispatcher");
+pub static SEARCH: ProxyConfig = ProxyConfig::new("search");
 pub static CATALOG: ProxyConfig = ProxyConfig::new("catalog");
 pub static LEDGER: ProxyConfig = ProxyConfig::new("ledger");
 pub static MESSAGES: ProxyConfig = ProxyConfig::new("messages");

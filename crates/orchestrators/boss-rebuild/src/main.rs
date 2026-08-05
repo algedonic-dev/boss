@@ -225,6 +225,11 @@ async fn main() -> Result<()> {
         boss_ledger::rebuild_bank_settlements(&pool)
     );
 
+    // Search index LAST: it reads `subjects`, `jobs` and `audit_log`,
+    // so it must see every other rebuilder's replayed output rather
+    // than whatever those tables held before this run.
+    step!("search", boss_search::rebuild_search(&pool));
+
     let total_elapsed_ms = started_at.elapsed().as_millis();
     info!(
         elapsed_ms = total_elapsed_ms,

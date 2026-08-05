@@ -21,7 +21,6 @@ pub mod requisitions;
 #[cfg(feature = "postgres")]
 pub mod scope;
 #[cfg(feature = "postgres")]
-pub mod search;
 pub mod types;
 #[cfg(feature = "postgres")]
 pub mod workflows;
