@@ -42,12 +42,14 @@ enum SourceScope {
 /// their `event_facts` columns. Both halves are compile-time constants:
 /// a filter selects among these, it can never name a new one, so no
 /// operator text reaches the statement.
+/// Every entry must name a TEXT column — see `pushdown::PushableColumns`.
+/// `event_id` is deliberately absent: it is UUID, and a text bind
+/// against it makes Postgres reject the statement rather than the row.
 pub const EVENT_PUSHABLE: crate::pushdown::PushableColumns = &[
     ("kind", "kind"),
     ("source", "source"),
     ("subject_kind", "subject_kind"),
     ("subject_id", "subject_id"),
-    ("event_id", "event_id"),
 ];
 
 /// How many candidate rows a single View may scan before it stops.
@@ -169,7 +171,7 @@ impl PgViewResolver {
         &self,
         source: ViewSource,
         scope: &SourceScope,
-        constraints: &[crate::pushdown::Constraint],
+        pushdown: Option<&crate::pushdown::Pushdown>,
     ) -> Result<Vec<Value>, ViewsError> {
         let storage = |e: sqlx::Error| ViewsError::Storage(e.to_string());
         // Denied sources never reach the database at all.
@@ -255,16 +257,19 @@ impl PgViewResolver {
                 let mut sql = String::from(
                     "SELECT audit_id, event_id, kind, source, occurred_at, \
                             subject_kind, subject_id, payload \
-                     FROM event_facts WHERE 1 = 1",
+                     FROM event_facts",
                 );
-                for (i, c) in constraints.iter().enumerate() {
-                    sql.push_str(&format!(" AND {} = ${}", c.column, i + 1));
+                let mut binds: Vec<String> = Vec::new();
+                if let Some(p) = pushdown {
+                    let mut next = 1usize;
+                    sql.push_str(" WHERE ");
+                    sql.push_str(&p.to_sql(&mut next, &mut binds));
                 }
-                sql.push_str(&format!(" ORDER BY audit_id DESC LIMIT {}", SCAN_CEILING));
+                sql.push_str(&format!(" ORDER BY audit_id DESC LIMIT {SCAN_CEILING}"));
 
                 let mut q = sqlx::query(&sql);
-                for c in constraints {
-                    q = bind_value(q, c.value.clone());
+                for b in &binds {
+                    q = q.bind(b.clone());
                 }
                 let rows = q.fetch_all(&self.pool).await.map_err(storage)?;
                 rows.iter()
@@ -335,17 +340,19 @@ impl ViewResolver for PgViewResolver {
         // predicate as the residual below. Pushdown is an optimization
         // and never a substitute — an extractor that misses a term
         // costs a wider scan, not a wrong answer.
-        let constraints = match (&compiled, view.source) {
+        let pushdown = match (&compiled, view.source) {
             (Some(expr), ViewSource::Events) => crate::pushdown::extract(expr, EVENT_PUSHABLE),
             // jobs + subjects still read their base tables; they get
             // their own descriptors when they get projections.
-            _ => Vec::new(),
+            _ => None,
         };
         // Scope is computed from the CALLER, not the View's author: a
         // shared View run by someone with narrower access shows them
         // their own rows, not its author's.
         let scope = self.scope_for(view.source, user).await?;
-        let candidates = self.candidates(view.source, &scope, &constraints).await?;
+        let candidates = self
+            .candidates(view.source, &scope, pushdown.as_ref())
+            .await?;
         let scanned = candidates.len();
 
         let matching: Vec<Value> = candidates
@@ -369,7 +376,7 @@ impl ViewResolver for PgViewResolver {
             layout: view.layout,
             rows,
             matched,
-            pushed_down: constraints.len(),
+            pushed_down: pushdown.as_ref().map_or(0, |p| p.term_count()),
             truncated: scanned as i64 >= SCAN_CEILING,
         })
     }
