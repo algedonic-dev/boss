@@ -1499,6 +1499,7 @@ dependencies = [
  "async-trait",
  "axum",
  "boss-core",
+ "boss-policy-client",
  "boss-ports",
  "boss-testing",
  "chrono",

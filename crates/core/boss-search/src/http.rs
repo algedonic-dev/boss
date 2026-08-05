@@ -13,6 +13,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, routing::get};
+use boss_policy_client::{CurrentUser, PolicyClient};
 use serde::Deserialize;
 use sqlx::PgPool;
 
@@ -21,6 +22,11 @@ use crate::error::SearchError;
 #[derive(Clone)]
 pub struct SearchApiState {
     pub pool: PgPool,
+    /// Results are policy-scoped to the caller. Search reads `jobs`
+    /// and `audit_log`, both scoped wherever else they are read;
+    /// without this the box is a way to see records a role cannot
+    /// open — which is what it was.
+    pub policy: Arc<dyn PolicyClient>,
 }
 
 #[derive(Deserialize)]
@@ -47,6 +53,7 @@ async fn health() -> Response {
 
 async fn search_handler(
     State(state): State<Arc<SearchApiState>>,
+    CurrentUser(user): CurrentUser,
     Query(q): Query<SearchQuery>,
 ) -> Response {
     let app_kinds: Vec<String> = q
@@ -61,7 +68,18 @@ async fn search_handler(
         })
         .unwrap_or_default();
 
-    match crate::query::search(&state.pool, &q.q, &app_kinds).await {
+    let scope = match crate::query::SearchScope::for_user(state.policy.as_ref(), &user).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "search policy scope failed");
+            // Fail closed. A search box that answers unscoped when
+            // the policy engine is unreachable is worse than one that
+            // says it cannot answer.
+            return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response();
+        }
+    };
+
+    match crate::query::search(&state.pool, &q.q, &app_kinds, &scope).await {
         Ok(results) => Json(results).into_response(),
         Err(SearchError::BadRequest(m)) => (StatusCode::BAD_REQUEST, m).into_response(),
         Err(e) => {
