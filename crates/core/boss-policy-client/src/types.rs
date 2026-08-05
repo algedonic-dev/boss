@@ -397,7 +397,114 @@ impl Predicate {
         matches!(self, Self::Unrestricted)
     }
 
+    /// Collapse this predicate to an **owner allow-list** for a
+    /// surface whose only narrowing column is `owner_id`.
+    ///
+    /// `None` means unrestricted; `Some(list)` means "owner must be
+    /// in this list", and an empty list therefore means nothing
+    /// matches. That asymmetry is the trap this method exists to
+    /// stop being retyped: `None` reads like "no access" and means
+    /// the opposite, so every copy of the translation is a chance to
+    /// turn a denial into full access.
+    ///
+    /// `AccountIn` narrows by a Subject rather than an owner and so
+    /// cannot be expressed here; it collapses to deny rather than
+    /// widening to allow. `DepartmentIs` is all-or-nothing on whether
+    /// the caller is in that department, since these surfaces carry
+    /// no department column.
+    ///
+    /// boss-search and boss-views had byte-identical copies of this,
+    /// differing only in the wrapper type they returned. jobs-api
+    /// keeps its own translation: it maps `AccountIn` onto a real
+    /// subject join, so it genuinely does more than this.
+    pub fn owner_allow_list(&self, user: &User) -> Option<Vec<String>> {
+        match self {
+            Self::Unrestricted => Option::None,
+            Self::None => Some(Vec::new()),
+            Self::OwnerIs { user_id } => Some(vec![user_id.clone()]),
+            Self::OwnerIn { user_ids } => Some(user_ids.clone()),
+            Self::DepartmentIs { department } => {
+                if user.department.as_deref() == Some(department.as_str()) {
+                    Option::None
+                } else {
+                    Some(Vec::new())
+                }
+            }
+            Self::AccountIn { .. } => Some(Vec::new()),
+        }
+    }
+
     pub fn matches_none(&self) -> bool {
         matches!(self, Self::None)
+    }
+}
+
+#[cfg(test)]
+mod owner_allow_list_tests {
+    use super::*;
+
+    fn user(id: &str, department: Option<&str>) -> User {
+        User {
+            id: id.to_string(),
+            role: "r".to_string(),
+            access_tier: AccessTier::User,
+            territory_account_ids: vec![],
+            direct_report_ids: vec![],
+            department: department.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn unrestricted_is_none_and_deny_is_empty_not_the_other_way_round() {
+        // The whole reason this lives in one place.
+        let u = user("emp-1", None);
+        assert_eq!(Predicate::Unrestricted.owner_allow_list(&u), None);
+        assert_eq!(Predicate::None.owner_allow_list(&u), Some(vec![]));
+    }
+
+    #[test]
+    fn owner_predicates_become_the_allow_list() {
+        let u = user("emp-1", None);
+        assert_eq!(
+            Predicate::OwnerIs {
+                user_id: "emp-1".into()
+            }
+            .owner_allow_list(&u),
+            Some(vec!["emp-1".to_string()])
+        );
+        assert_eq!(
+            Predicate::OwnerIn {
+                user_ids: vec!["a".into(), "b".into()]
+            }
+            .owner_allow_list(&u),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn department_is_all_or_nothing_on_membership() {
+        let inside = user("emp-1", Some("brewhouse"));
+        let outside = user("emp-2", Some("sales"));
+        let p = Predicate::DepartmentIs {
+            department: "brewhouse".into(),
+        };
+        assert_eq!(p.owner_allow_list(&inside), None, "in the department → all");
+        assert_eq!(p.owner_allow_list(&outside), Some(vec![]));
+        // No department at all is not membership.
+        assert_eq!(p.owner_allow_list(&user("emp-3", None)), Some(vec![]));
+    }
+
+    #[test]
+    fn account_scope_collapses_to_deny_never_to_allow() {
+        // It narrows by Subject, which these surfaces cannot express.
+        // Widening would hand an account-scoped caller everything.
+        let u = user("emp-1", None);
+        assert_eq!(
+            Predicate::AccountIn {
+                account_ids: vec!["acc-1".into()]
+            }
+            .owner_allow_list(&u),
+            Some(vec![])
+        );
     }
 }

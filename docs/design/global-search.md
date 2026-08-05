@@ -1,9 +1,7 @@
 # Design: Global search
 
-**Status:** approved — the four open questions were resolved through
-the in-app review (`/system/design` → design-doc-review Job, 2026-08-04)
-and are recorded under Decision history. Flips to `shipped` when the
-work lands.
+**Status:** shipped — the index, endpoint, chrome dropdown and Home
+results surface landed in #180; policy scoping in #184.
 
 Global search is the last piece of the app-tab rearchitecture (the
 chrome bar's third element, alongside the app tabs and the sign-in
@@ -106,7 +104,16 @@ rather than picking a side: the dropdown is the app's scoped search,
 the Home page is the cross-cutting one — which is also what makes Q1's
 third option land naturally.
 
-## Open questions (all resolved — see Decision history)
+## Open questions
+
+All 4 were resolved 2026-08-04 through the in-app review and
+flushed to git; see the Decisions section below. Kept empty as the
+landing place for any new question that surfaces during
+implementation.
+
+---
+
+## Decisions
 
 ### Q1: One `/api/search` endpoint, or a fan-out across domain APIs? (resolved)
 

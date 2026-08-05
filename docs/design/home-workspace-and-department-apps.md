@@ -1,9 +1,7 @@
 # Design: Home as a personal workspace, and the Department App split
 
-**Status:** approved — the four open questions were resolved through
-the in-app review (`/system/design` → design-doc-review Job,
-2026-08-05) and are recorded under Decision history. Flips to
-`shipped` when the work lands.
+**Status:** shipped — the IT department app landed in #182 and the
+Views phase in #183/#184.
 
 The app-tab rearchitecture ([extending-boss.md](extending-boss.md),
 shipped in #178) split the SPA into eight apps. It left two things
@@ -192,7 +190,16 @@ splits the original question in two: personal → team is
 frictionless, team → company is submitted, and the ceremony lands
 only where something becomes the company's.
 
-## Open questions (all resolved — see Decision history)
+## Open questions
+
+All 4 were resolved 2026-08-05 through the in-app review and
+flushed to git; see the Decisions section below. Kept empty as the
+landing place for any new question that surfaces during
+implementation.
+
+---
+
+## Decisions
 
 ### Q1: May a View store anything of its own? (resolved)
 

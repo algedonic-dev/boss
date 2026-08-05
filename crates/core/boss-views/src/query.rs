@@ -118,27 +118,14 @@ impl PgViewResolver {
                     .scope_predicate(user, Resource::job())
                     .await
                     .map_err(|e| ViewsError::Storage(format!("policy check failed: {e}")))?;
-                Ok(match predicate {
-                    Predicate::Unrestricted => SourceScope::All,
-                    Predicate::None => SourceScope::None,
-                    Predicate::OwnerIs { user_id } => SourceScope::JobOwners(vec![user_id]),
-                    Predicate::OwnerIn { user_ids } => SourceScope::JobOwners(user_ids),
-                    // Jobs carry no department column, so a
-                    // department-scoped rule is all-or-nothing on
-                    // whether the caller is in it — the same
-                    // resolution boss-jobs/src/http/jobs.rs makes.
-                    Predicate::DepartmentIs { department } => {
-                        if user.department.as_deref() == Some(department.as_str()) {
-                            SourceScope::All
-                        } else {
-                            SourceScope::None
-                        }
-                    }
-                    // AccountIn narrows by the Job's subject, which
-                    // this scan does not model. Refuse rather than
-                    // widen: returning everything to an
-                    // account-scoped caller is the exact leak.
-                    Predicate::AccountIn { .. } => SourceScope::None,
+                // One translation, shared with boss-search: `None`
+                // means unrestricted and an empty list means deny,
+                // which is exactly the asymmetry worth having in one
+                // place rather than two.
+                Ok(match predicate.owner_allow_list(user) {
+                    None => SourceScope::All,
+                    Some(ids) if ids.is_empty() => SourceScope::None,
+                    Some(ids) => SourceScope::JobOwners(ids),
                 })
             }
             ViewSource::Subjects | ViewSource::Events => {
