@@ -83,9 +83,15 @@
       if (!docsResp.ok) throw new Error(`docs: HTTP ${docsResp.status}`);
       docs = (await docsResp.json()) as DesignDoc[];
 
-      const rejResp = await fetch('/api/design/rejections');
-      if (!rejResp.ok) throw new Error(`rejections: HTTP ${rejResp.status}`);
-      rejections = (await rejResp.json()) as Rejection[];
+      // Rejections are supplementary — they name docs the indexer
+      // could not parse. If that call fails, the page still has
+      // everything an operator came for, so degrade to an empty list
+      // rather than replacing the whole surface with an error. (It
+      // did throw here once, which blanked the page whenever the
+      // route was unavailable.)
+      rejections = await fetch('/api/design/rejections')
+        .then((r) => (r.ok ? (r.json() as Promise<Rejection[]>) : []))
+        .catch(() => []);
 
       // Look up open design-doc-review Jobs. Subject is the
       // identity-first {subject_kind: 'custom', id: <doc-path>};
