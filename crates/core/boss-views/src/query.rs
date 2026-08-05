@@ -38,6 +38,18 @@ enum SourceScope {
     None,
 }
 
+/// Filter fields the `events` source can push into SQL, mapped to
+/// their `event_facts` columns. Both halves are compile-time constants:
+/// a filter selects among these, it can never name a new one, so no
+/// operator text reaches the statement.
+pub const EVENT_PUSHABLE: crate::pushdown::PushableColumns = &[
+    ("kind", "kind"),
+    ("source", "source"),
+    ("subject_kind", "subject_kind"),
+    ("subject_id", "subject_id"),
+    ("event_id", "event_id"),
+];
+
 /// How many candidate rows a single View may scan before it stops.
 ///
 /// The filter runs in this process, so the scan has to be bounded by
@@ -157,6 +169,7 @@ impl PgViewResolver {
         &self,
         source: ViewSource,
         scope: &SourceScope,
+        constraints: &[crate::pushdown::Constraint],
     ) -> Result<Vec<Value>, ViewsError> {
         let storage = |e: sqlx::Error| ViewsError::Storage(e.to_string());
         // Denied sources never reach the database at all.
@@ -229,23 +242,41 @@ impl PgViewResolver {
                     .collect()
             }
             ViewSource::Events => {
-                let rows = sqlx::query(
-                    "SELECT id, event_id, kind, source, timestamp, payload \
-                     FROM audit_log ORDER BY id DESC LIMIT $1",
-                )
-                .bind(SCAN_CEILING)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(storage)?;
+                // Reads the projection, not audit_log: `kind` and the
+                // subject columns are real columns here, so a filter
+                // naming them becomes an index scan instead of a
+                // capped sequential read.
+                //
+                // Constraints are bound, never interpolated. The
+                // column names come from EVENT_PUSHABLE (compile-time
+                // constants) and the values ride as parameters, so the
+                // statement shape is fixed no matter what an operator
+                // typed.
+                let mut sql = String::from(
+                    "SELECT audit_id, event_id, kind, source, occurred_at, \
+                            subject_kind, subject_id, payload \
+                     FROM event_facts WHERE 1 = 1",
+                );
+                for (i, c) in constraints.iter().enumerate() {
+                    sql.push_str(&format!(" AND {} = ${}", c.column, i + 1));
+                }
+                sql.push_str(&format!(" ORDER BY audit_id DESC LIMIT {}", SCAN_CEILING));
+
+                let mut q = sqlx::query(&sql);
+                for c in constraints {
+                    q = bind_value(q, c.value.clone());
+                }
+                let rows = q.fetch_all(&self.pool).await.map_err(storage)?;
                 rows.iter()
                     .map(|r| {
                         Ok(json!({
-                            "id": r.try_get::<i64, _>("id").map_err(dec)?,
-                            // audit_log.event_id is a UUID column.
+                            "id": r.try_get::<i64, _>("audit_id").map_err(dec)?,
                             "event_id": uuid_text(r, "event_id")?,
                             "kind": text(r, "kind")?,
                             "source": opt_text(r, "source")?,
-                            "timestamp": ts(r, "timestamp")?,
+                            "timestamp": ts(r, "occurred_at")?,
+                            "subject_kind": opt_text(r, "subject_kind")?,
+                            "subject_id": opt_text(r, "subject_id")?,
                             "payload": r
                                 .try_get::<Option<Value>, _>("payload")
                                 .map_err(dec)?,
@@ -254,6 +285,23 @@ impl PgViewResolver {
                     .collect()
             }
         }
+    }
+}
+
+/// Bind one extracted literal. The DSL's value set is small, which is
+/// part of why pushdown is tractable at all.
+fn bind_value<'q>(
+    q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    v: boss_expr::Value,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    match v {
+        boss_expr::Value::String(s) => q.bind(s),
+        boss_expr::Value::Int(i) => q.bind(i),
+        boss_expr::Value::Float(f) => q.bind(f),
+        boss_expr::Value::Bool(b) => q.bind(b),
+        // extract() never emits a Null constraint; binding one would
+        // mean `= NULL`, which matches nothing.
+        boss_expr::Value::Null => q.bind(Option::<String>::None),
     }
 }
 
@@ -283,11 +331,21 @@ impl ViewResolver for PgViewResolver {
         limit: usize,
     ) -> Result<ViewResults, ViewsError> {
         let compiled = filter::compile(&view.filter)?;
+        // Push what SQL can answer into the query; keep the WHOLE
+        // predicate as the residual below. Pushdown is an optimization
+        // and never a substitute — an extractor that misses a term
+        // costs a wider scan, not a wrong answer.
+        let constraints = match (&compiled, view.source) {
+            (Some(expr), ViewSource::Events) => crate::pushdown::extract(expr, EVENT_PUSHABLE),
+            // jobs + subjects still read their base tables; they get
+            // their own descriptors when they get projections.
+            _ => Vec::new(),
+        };
         // Scope is computed from the CALLER, not the View's author: a
         // shared View run by someone with narrower access shows them
         // their own rows, not its author's.
         let scope = self.scope_for(view.source, user).await?;
-        let candidates = self.candidates(view.source, &scope).await?;
+        let candidates = self.candidates(view.source, &scope, &constraints).await?;
         let scanned = candidates.len();
 
         let matching: Vec<Value> = candidates
@@ -311,6 +369,7 @@ impl ViewResolver for PgViewResolver {
             layout: view.layout,
             rows,
             matched,
+            pushed_down: constraints.len(),
             truncated: scanned as i64 >= SCAN_CEILING,
         })
     }

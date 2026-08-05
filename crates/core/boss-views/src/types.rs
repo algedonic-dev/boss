@@ -173,6 +173,17 @@ pub struct ViewResults {
     /// How many rows matched the filter. For `count` layouts this is
     /// the whole answer.
     pub matched: usize,
+    /// How many filter terms were answered by the database.
+    ///
+    /// Zero with a non-empty filter means nothing could be narrowed —
+    /// the scan read the newest `SCAN_CEILING` rows and filtered them
+    /// in-process, so a match older than that window is invisible.
+    /// That combination is the least trustworthy answer this endpoint
+    /// gives, and callers cannot tell it from a confident zero unless
+    /// it is reported. `kind = "a" OR kind = "b"` is the everyday case:
+    /// no term is pushable under OR, so a filter matching 16 old
+    /// events reports 0.
+    pub pushed_down: usize,
     /// True when the scan hit its ceiling before running out of
     /// candidate rows, so `matched` is a floor rather than a total.
     ///

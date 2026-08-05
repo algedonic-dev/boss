@@ -182,6 +182,7 @@ mod tests {
                     "scoped_for": user.id.clone(),
                 })],
                 matched: 1,
+                pushed_down: 0,
                 truncated: false,
             })
         }

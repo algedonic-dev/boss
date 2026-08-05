@@ -36,6 +36,10 @@ export type ViewResults = Readonly<{
   layout: ViewLayout;
   rows: ReadonlyArray<Record<string, unknown>>;
   matched: number;
+  /// Filter terms the database answered. Zero with a filter set means
+  /// nothing could be narrowed, so the count is over the newest rows
+  /// only — a different and much weaker claim than a plain truncation.
+  pushed_down: number;
   /// The scan hit its ceiling before running out of candidates, so
   /// `matched` is a floor. Surfaced in the UI rather than swallowed —
   /// a count presented as complete when it isn't is worse than no

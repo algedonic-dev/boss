@@ -43,6 +43,11 @@
   let saving = $state(false);
   let saveError = $state<string | null>(null);
 
+  /// Mirrors query.rs SCAN_CEILING — shown, not enforced, here.
+  const SCAN_CEILING_LABEL = '5,000';
+  /// Mirrors EVENT_PUSHABLE in query.rs.
+  const PUSHABLE_LABEL = 'kind, source, subject_kind or subject_id';
+
   let viewerId = $derived(session.value.kind === 'ready' ? session.value.user.id : '');
   let availableFields = $derived(SOURCE_FIELDS[draftSource]);
 
@@ -274,9 +279,19 @@
         <p class="v-count">
           {res.matched}
           {res.matched === 1 ? 'match' : 'matches'}
-          {#if res.truncated}
+          {#if res.truncated && res.pushed_down === 0 && v.filter}
+            <!-- The weak case: nothing in the filter could be answered
+                 by the database, so this counted only the newest rows.
+                 A match older than that window is simply absent, and
+                 "0 matches" here does not mean none exist. -->
             <strong class="v-trunc">
-              — scan ceiling reached, so this is a floor, not a total
+              — this filter could not be narrowed in the database, so only the
+              newest {SCAN_CEILING_LABEL} events were examined. Older matches are
+              not counted. Filtering on {PUSHABLE_LABEL} narrows it.
+            </strong>
+          {:else if res.truncated}
+            <strong class="v-trunc">
+              — more than this matched; the count is a floor, not a total
             </strong>
           {/if}
         </p>

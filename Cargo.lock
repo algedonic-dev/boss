@@ -1484,6 +1484,7 @@ dependencies = [
  "boss-search",
  "boss-shipping",
  "boss-subject-kinds",
+ "boss-views",
  "clap",
  "sqlx",
  "tokio",
