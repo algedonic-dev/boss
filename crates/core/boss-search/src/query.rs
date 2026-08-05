@@ -8,6 +8,8 @@
 
 use sqlx::{PgPool, Row};
 
+use boss_policy_client::{Predicate, Resource, User};
+
 use crate::error::SearchError;
 use crate::types::{RefKind, SearchResults, SearchRow, SubjectHit};
 
@@ -39,10 +41,97 @@ fn row_to_search_row(r: &sqlx::postgres::PgRow) -> Result<SearchRow, SearchError
 /// to the top — Q4's "prioritise results from the app you are in". It
 /// filters nothing: the whole point of a global box is that it still
 /// finds the thing when you are looking in the wrong place.
+/// What this caller may see, per result kind.
+///
+/// The design doc for this feature said it plainly: "A result the
+/// caller could not open must not appear — a search box is an
+/// excellent way to leak the existence of records a role cannot
+/// read." It shipped without that. This is it.
+pub struct SearchScope {
+    /// Job owners the caller may read. `None` = unrestricted. An
+    /// empty vec = nothing, which `= ANY('{}')` renders as no rows.
+    pub job_owners: Option<Vec<String>>,
+    /// Whether raw audit-log rows may be returned at all.
+    pub may_read_events: bool,
+    /// Whether identity rows may be enumerated at all.
+    pub may_read_subjects: bool,
+}
+
+impl SearchScope {
+    /// Derive the caller's scope from policy.
+    ///
+    /// Every gate here is a policy question, not a hardcoded tier
+    /// check. `jobs` uses the same read-scope predicate `/api/jobs`
+    /// applies; `event` and `subject` are resources in the registry
+    /// like any other, so who may see log rows or enumerate identity
+    /// is tenant-authored data rather than a constant compiled into
+    /// this crate.
+    ///
+    /// Events and Subjects are all-or-nothing: their scope vocabulary
+    /// has no owner column to narrow by, so anything short of
+    /// `Unrestricted` is treated as a denial. That fails closed — a
+    /// tenant who writes `scope = "territory"` against `event` gets
+    /// nothing rather than everything, and finds out immediately.
+    pub async fn for_user(
+        policy: &dyn boss_policy_client::PolicyClient,
+        user: &User,
+    ) -> Result<Self, SearchError> {
+        let predicate = policy
+            .scope_predicate(user, Resource::job())
+            .await
+            .map_err(|e| SearchError::storage_msg(format!("policy check failed: {e}")))?;
+        let job_owners = match predicate {
+            Predicate::Unrestricted => None,
+            Predicate::None => Some(Vec::new()),
+            Predicate::OwnerIs { user_id } => Some(vec![user_id]),
+            Predicate::OwnerIn { user_ids } => Some(user_ids),
+            Predicate::DepartmentIs { department } => {
+                if user.department.as_deref() == Some(department.as_str()) {
+                    None
+                } else {
+                    Some(Vec::new())
+                }
+            }
+            // AccountIn narrows by the Job's subject, which the index
+            // does not carry as an owner. Refuse rather than widen.
+            Predicate::AccountIn { .. } => Some(Vec::new()),
+        };
+        Ok(Self {
+            job_owners,
+            may_read_events: unrestricted_read(policy, user, Resource::event()).await?,
+            may_read_subjects: unrestricted_read(policy, user, Resource::subject()).await?,
+        })
+    }
+
+    /// Unrestricted — for callers that have already been authorized
+    /// elsewhere (tests, the reindexer).
+    pub fn unrestricted() -> Self {
+        Self {
+            job_owners: None,
+            may_read_events: true,
+            may_read_subjects: true,
+        }
+    }
+}
+
+/// True only when policy grants an unnarrowed Read on `resource`.
+async fn unrestricted_read(
+    policy: &dyn boss_policy_client::PolicyClient,
+    user: &User,
+    resource: Resource,
+) -> Result<bool, SearchError> {
+    let p = policy
+        .scope_predicate(user, resource)
+        .await
+        .map_err(|e| SearchError::storage_msg(format!("policy check failed: {e}")))?;
+    Ok(matches!(p, Predicate::Unrestricted))
+}
+
 pub async fn search(
     pool: &PgPool,
     query: &str,
     app_subject_kinds: &[String],
+    scope: &SearchScope,
 ) -> Result<SearchResults, SearchError> {
     let q = query.trim();
     if q.is_empty() {
@@ -60,6 +149,10 @@ pub async fn search(
                OR ref_id ILIKE '%' || $1 || '%' \
                OR title ILIKE '%' || $1 || '%') \
           AND ref_kind = $2 \
+          AND ($5::text[] IS NULL OR ref_kind <> 'job' OR EXISTS ( \
+                SELECT 1 FROM jobs j \
+                WHERE j.id::text = search_index.ref_id \
+                  AND j.owner_id = ANY($5))) \
         ORDER BY \
           CASE WHEN $3::text[] IS NULL OR cardinality($3::text[]) = 0 THEN 0 \
                WHEN subject_kind = ANY($3::text[]) THEN 0 ELSE 1 END, \
@@ -72,14 +165,23 @@ pub async fn search(
     };
 
     // --- Subjects, each with its work and its history -------------
-    let subject_rows = sqlx::query(sql)
-        .bind(q)
-        .bind(RefKind::Subject.as_str())
-        .bind(app_subject_kinds)
-        .bind(GROUP_LIMIT)
-        .fetch_all(pool)
-        .await
-        .map_err(SearchError::storage)?;
+    // Subject hits are gated as a set: `subject` governs whether you
+    // may enumerate identity at all. This closes the residual the
+    // previous pass had to leave open for want of a resource to ask
+    // about.
+    let subject_rows = if scope.may_read_subjects {
+        sqlx::query(sql)
+            .bind(q)
+            .bind(RefKind::Subject.as_str())
+            .bind(app_subject_kinds)
+            .bind(GROUP_LIMIT)
+            .bind(scope.job_owners.as_deref())
+            .fetch_all(pool)
+            .await
+            .map_err(SearchError::storage)?
+    } else {
+        Vec::new()
+    };
 
     for r in &subject_rows {
         let row = row_to_search_row(r)?;
@@ -88,41 +190,57 @@ pub async fn search(
             _ => continue,
         };
 
+        // Scoped identically to the standalone job hits below —
+        // without this the leak simply moves inside a SubjectHit,
+        // which is the same rows in a different shape.
         let jobs = sqlx::query(
             "SELECT ref_kind, ref_id, subject_kind, subject_id, title, body, occurred_at \
              FROM search_index \
              WHERE ref_kind = 'job' AND subject_kind = $1 AND subject_id = $2 \
+               AND ($4::text[] IS NULL OR EXISTS ( \
+                     SELECT 1 FROM jobs j \
+                     WHERE j.id::text = search_index.ref_id \
+                       AND j.owner_id = ANY($4))) \
              ORDER BY occurred_at DESC NULLS LAST LIMIT $3",
         )
         .bind(&sk)
         .bind(&si)
         .bind(GROUP_LIMIT)
+        .bind(scope.job_owners.as_deref())
         .fetch_all(pool)
         .await
         .map_err(SearchError::storage)?;
 
-        let events = sqlx::query(
-            "SELECT ref_kind, ref_id, subject_kind, subject_id, title, body, occurred_at \
-             FROM search_index \
-             WHERE ref_kind = 'event' AND subject_kind = $1 AND subject_id = $2 \
-             ORDER BY occurred_at DESC NULLS LAST LIMIT $3",
-        )
-        .bind(&sk)
-        .bind(&si)
-        .bind(EVENT_PREVIEW)
-        .fetch_all(pool)
-        .await
-        .map_err(SearchError::storage)?;
+        let (events, event_count) = if scope.may_read_events {
+            let rows = sqlx::query(
+                "SELECT ref_kind, ref_id, subject_kind, subject_id, title, body, occurred_at \
+                 FROM search_index \
+                 WHERE ref_kind = 'event' AND subject_kind = $1 AND subject_id = $2 \
+                 ORDER BY occurred_at DESC NULLS LAST LIMIT $3",
+            )
+            .bind(&sk)
+            .bind(&si)
+            .bind(EVENT_PREVIEW)
+            .fetch_all(pool)
+            .await
+            .map_err(SearchError::storage)?;
 
-        let event_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM search_index \
-             WHERE ref_kind = 'event' AND subject_kind = $1 AND subject_id = $2",
-        )
-        .bind(&sk)
-        .bind(&si)
-        .fetch_one(pool)
-        .await
-        .map_err(SearchError::storage)?;
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM search_index \
+                 WHERE ref_kind = 'event' AND subject_kind = $1 AND subject_id = $2",
+            )
+            .bind(&sk)
+            .bind(&si)
+            .fetch_one(pool)
+            .await
+            .map_err(SearchError::storage)?;
+            (rows, count)
+        } else {
+            // The COUNT goes too. "412 events" told a caller who may
+            // read none of them exactly how much happened here, which
+            // is the existence disclosure the gate exists to stop.
+            (Vec::new(), 0)
+        };
 
         out.subjects.push(SubjectHit {
             subject_kind: sk,
@@ -154,6 +272,7 @@ pub async fn search(
         .bind(RefKind::Job.as_str())
         .bind(app_subject_kinds)
         .bind(GROUP_LIMIT)
+        .bind(scope.job_owners.as_deref())
         .fetch_all(pool)
         .await
         .map_err(SearchError::storage)?
@@ -165,18 +284,144 @@ pub async fn search(
         }
     }
 
-    for r in sqlx::query(sql)
-        .bind(q)
-        .bind(RefKind::Event.as_str())
-        .bind(app_subject_kinds)
-        .bind(GROUP_LIMIT)
-        .fetch_all(pool)
-        .await
-        .map_err(SearchError::storage)?
-        .iter()
-    {
-        out.events.push(row_to_search_row(r)?);
+    if scope.may_read_events {
+        for r in sqlx::query(sql)
+            .bind(q)
+            .bind(RefKind::Event.as_str())
+            .bind(app_subject_kinds)
+            .bind(GROUP_LIMIT)
+            .bind(scope.job_owners.as_deref())
+            .fetch_all(pool)
+            .await
+            .map_err(SearchError::storage)?
+            .iter()
+        {
+            out.events.push(row_to_search_row(r)?);
+        }
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boss_policy_client::{AccessTier, Action, FakePolicyClient, Scope};
+
+    /// Tier is irrelevant to these gates now — it is here only
+    /// because `User` requires it. That is the point of the change:
+    /// access is a policy question, not a property of the session's
+    /// tier field.
+    fn user(id: &str, role: &str) -> User {
+        User {
+            id: id.to_string(),
+            role: role.to_string(),
+            access_tier: AccessTier::User,
+            territory_account_ids: vec![],
+            direct_report_ids: vec![],
+            department: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_role_with_no_job_rules_sees_no_jobs() {
+        // Deny-by-default has to mean an EMPTY owner list, not an
+        // absent one — `None` means unrestricted, and getting that
+        // backwards turns a denial into full access.
+        let policy = FakePolicyClient::deny_all();
+        let scope = SearchScope::for_user(&policy, &user("bob", "guest"))
+            .await
+            .expect("scope derives");
+        assert_eq!(scope.job_owners, Some(Vec::new()));
+        assert!(!scope.may_read_events);
+        assert!(!scope.may_read_subjects);
+    }
+
+    #[tokio::test]
+    async fn a_self_scoped_role_sees_only_its_own_jobs() {
+        let policy = FakePolicyClient::builder()
+            .allow("brewer", Action::Read, Resource::job(), Scope::Self_)
+            .build();
+        let scope = SearchScope::for_user(&policy, &user("emp-7", "brewer"))
+            .await
+            .expect("scope derives");
+        assert_eq!(scope.job_owners, Some(vec!["emp-7".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn an_all_scoped_role_is_unrestricted() {
+        let policy = FakePolicyClient::builder()
+            .allow("coo", Action::Read, Resource::job(), Scope::All)
+            .build();
+        let scope = SearchScope::for_user(&policy, &user("emp-1", "coo"))
+            .await
+            .expect("scope derives");
+        assert_eq!(scope.job_owners, None, "None means unrestricted");
+    }
+
+    #[tokio::test]
+    async fn reading_events_is_granted_by_policy_not_by_tier() {
+        // The whole point of the `event` resource: a user-tier caller
+        // WITH the grant may read log rows, and an operator-tier
+        // caller WITHOUT it may not. Tier is not consulted.
+        let granted = FakePolicyClient::builder()
+            .allow(
+                "audit-readonly",
+                Action::Read,
+                Resource::event(),
+                Scope::All,
+            )
+            .build();
+        let s = SearchScope::for_user(&granted, &user("u", "audit-readonly"))
+            .await
+            .expect("scope derives");
+        assert!(s.may_read_events, "the grant, not the tier, decides");
+
+        let mut operator = user("u", "brewer");
+        operator.access_tier = AccessTier::Operator;
+        let ungranted = FakePolicyClient::builder()
+            .allow("brewer", Action::Read, Resource::job(), Scope::All)
+            .build();
+        let s = SearchScope::for_user(&ungranted, &operator)
+            .await
+            .expect("scope derives");
+        assert!(
+            !s.may_read_events,
+            "operator tier must not substitute for the grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn enumerating_subjects_is_granted_by_policy() {
+        let policy = FakePolicyClient::builder()
+            .allow("sales-rep", Action::Read, Resource::subject(), Scope::All)
+            .build();
+        let s = SearchScope::for_user(&policy, &user("u", "sales-rep"))
+            .await
+            .expect("scope derives");
+        assert!(s.may_read_subjects);
+        assert!(!s.may_read_events, "one grant does not imply the other");
+    }
+
+    #[tokio::test]
+    async fn a_narrowed_grant_on_an_all_or_nothing_resource_fails_closed() {
+        // `event` has no owner column to narrow by. A tenant writing
+        // scope = "self" against it gets nothing rather than
+        // everything — the failure a wrong guess should produce.
+        let policy = FakePolicyClient::builder()
+            .allow("clerk", Action::Read, Resource::event(), Scope::Self_)
+            .build();
+        let s = SearchScope::for_user(&policy, &user("u", "clerk"))
+            .await
+            .expect("scope derives");
+        assert!(!s.may_read_events);
+    }
+
+    #[test]
+    fn unrestricted_is_explicit_about_being_unrestricted() {
+        let s = SearchScope::unrestricted();
+        assert_eq!(s.job_owners, None);
+        assert!(s.may_read_events);
+        assert!(s.may_read_subjects);
+    }
 }

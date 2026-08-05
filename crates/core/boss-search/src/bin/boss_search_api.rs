@@ -12,6 +12,8 @@ struct Cli {
     postgres_url: String,
     #[arg(long, default_value_t = boss_ports::prod("search"))]
     http_port: u16,
+    #[arg(long, env = "BOSS_POLICY_URL", default_value_t = boss_ports::url("policy"))]
+    policy_url: String,
 }
 
 #[tokio::main]
@@ -30,7 +32,14 @@ async fn main() -> Result<()> {
         .await
         .context("connecting to Postgres")?;
 
-    let app = boss_search::http::router(boss_search::http::SearchApiState { pool });
+    // Same wrapping jobs-api uses: sim traffic is authorized at the
+    // boundary, real traffic enforced per-role by the inner client.
+    let policy: std::sync::Arc<dyn boss_policy_client::PolicyClient> =
+        std::sync::Arc::new(boss_policy_client::SimBypassPolicyClient::new(
+            std::sync::Arc::new(boss_policy_client::ReqwestPolicyClient::new(cli.policy_url)),
+        ));
+
+    let app = boss_search::http::router(boss_search::http::SearchApiState { pool, policy });
     let addr = format!("127.0.0.1:{}", cli.http_port);
     tracing::info!(addr = %addr, "boss-search-api listening");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
