@@ -23,4 +23,5 @@
 40-ledger.sql
 41-dispatcher.sql
 42-views.sql
+43-event-facts.sql
 99-search.sql

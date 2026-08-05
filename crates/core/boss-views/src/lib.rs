@@ -19,6 +19,7 @@ pub mod error;
 pub mod filter;
 pub mod in_memory;
 pub mod port;
+pub mod pushdown;
 pub mod types;
 
 #[cfg(feature = "postgres")]
@@ -27,6 +28,8 @@ pub mod http;
 pub mod postgres;
 #[cfg(feature = "postgres")]
 pub mod query;
+#[cfg(feature = "postgres")]
+pub mod rebuild_event_facts;
 
 pub use error::ViewsError;
 pub use in_memory::InMemoryViewsRepo;
@@ -37,3 +40,5 @@ pub use types::{View, ViewInput, ViewLayout, ViewResults, ViewSource, Visibility
 pub use postgres::PgViewsRepo;
 #[cfg(feature = "postgres")]
 pub use query::PgViewResolver;
+#[cfg(feature = "postgres")]
+pub use rebuild_event_facts::{RebuildEventFactsReport, catch_up_event_facts, rebuild_event_facts};

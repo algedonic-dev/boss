@@ -230,6 +230,12 @@ async fn main() -> Result<()> {
     // than whatever those tables held before this run.
     step!("search", boss_search::rebuild_search(&pool));
 
+    // event_facts alongside search, and for the same reason: it is a
+    // projection OF audit_log, so it only needs the log itself to be
+    // settled. Kept as its own step so a Views problem is diagnosable
+    // without re-running the search index, and vice versa.
+    step!("event-facts", boss_views::rebuild_event_facts(&pool));
+
     let total_elapsed_ms = started_at.elapsed().as_millis();
     info!(
         elapsed_ms = total_elapsed_ms,
