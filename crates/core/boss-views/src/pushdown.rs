@@ -262,9 +262,12 @@ pub fn extract(expr: &Expr, pushable: PushableColumns) -> Option<Pushdown> {
             lhs,
             rhs,
         ) => as_range(*op, lhs, rhs, pushable),
-        // NOT, function calls, bare terms: residual.
-        Expr::BinaryOp(_, _, _)
-        | Expr::UnaryOp(UnaryOp::Not, _)
+        // NOT, function calls, bare terms: residual. Every BinaryOp
+        // variant is handled above, so there is deliberately no
+        // catch-all for them here — adding a new operator to the DSL
+        // should fail this match rather than silently land in the
+        // residual, where it would cost a full scan nobody noticed.
+        Expr::UnaryOp(UnaryOp::Not, _)
         | Expr::FunctionCall(_, _)
         | Expr::Identifier(_)
         | Expr::Literal(_) => None,

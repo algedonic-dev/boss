@@ -312,23 +312,6 @@ impl PgViewResolver {
     }
 }
 
-/// Bind one extracted literal. The DSL's value set is small, which is
-/// part of why pushdown is tractable at all.
-fn bind_value<'q>(
-    q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
-    v: boss_expr::Value,
-) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
-    match v {
-        boss_expr::Value::String(s) => q.bind(s),
-        boss_expr::Value::Int(i) => q.bind(i),
-        boss_expr::Value::Float(f) => q.bind(f),
-        boss_expr::Value::Bool(b) => q.bind(b),
-        // extract() never emits a Null constraint; binding one would
-        // mean `= NULL`, which matches nothing.
-        boss_expr::Value::Null => q.bind(Option::<String>::None),
-    }
-}
-
 /// Keep only the columns a View asked for. An empty column list means
 /// the whole row — the source's own shape is the default, so a View
 /// author who does not care about columns does not have to name them.
