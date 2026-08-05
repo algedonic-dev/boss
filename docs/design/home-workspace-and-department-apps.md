@@ -1,6 +1,9 @@
 # Design: Home as a personal workspace, and the Department App split
 
-**Status:** draft — not yet reviewed. Four open questions below.
+**Status:** approved — the four open questions were resolved through
+the in-app review (`/system/design` → design-doc-review Job,
+2026-08-05) and are recorded under Decision history. Flips to
+`shipped` when the work lands.
 
 The app-tab rearchitecture ([extending-boss.md](extending-boss.md),
 shipped in #178) split the SPA into eight apps. It left two things
@@ -134,6 +137,12 @@ This is partly a restoration. An `/it` hub existed before the surfaces
 were folded into System Model; the fold lost a distinction worth
 having.
 
+**The review resolved this differently — see Q2 below.** The two-app
+split argued for here was rejected in favour of a single IT department
+app that *contains* System Model. The section is kept because the
+inventory of what those fourteen surfaces do is still the useful part;
+the proposed dividing line is not.
+
 Two things this is not. It is not a permissions tier — engineers are
 operators like anyone else, and the split is about *what the surface
 is for*, not who may see it. And it is not tenant-specific: every BOSS
@@ -141,9 +150,51 @@ deployment has someone operating BOSS, so the IT app belongs in the
 core catalog even though "IT" is also a department Class of `employee`
 Subjects in a given tenant.
 
-## Open questions
+## Decision history
 
-### Q1: May a View store anything of its own?
+Resolved 2026-08-05 through the in-app review flow — a
+`design-doc-review` Job, answered in the `review-design` step surface,
+flushed here by the queued flush job.
+
+**Q1 — local state is allowed while it stays local.** State may live
+temporarily inside a Step until that Step completes, and personal
+annotations and scratch work get the same treatment: if it does not
+affect the rest of the system, it can be held locally. This is
+narrower than the gadget's private durable state and wider than the
+strict reading of "a View holds nothing" — the test is not *whether*
+state exists but whether anything outside depends on it. A View's
+scratch is invisible to the rest of the system until it flows into a
+Job, a Step, or an Event, and at that moment it is subject to the same
+rules as everything else.
+
+**Q2 — IT is the Department App; System Model is inside it.** Rather
+than splitting fourteen surfaces across two tabs, IT becomes the
+department and System Model and platform functionality become part of
+IT's domain. This dissolves the contested cases in the original
+question — dispatcher rules, step plugins and experiments no longer
+have to be assigned to one side of a line, because there is no line.
+IT is a department like Finance or People, and modeling the company is
+work that department does.
+
+**Q3 — agent-authored apps, but a later phase.** Users should be able
+to lean on agents to build their own apps, with IT controlling read
+and write policy and the scope that provides the guardrails. That is
+the eventual target, not this phase: it needs infrastructure for
+running user code safely, and that infrastructure does not exist yet.
+The declarative composition is what ships first, and it is a first
+phase rather than a permanent answer.
+
+**Q4 — sharing is free; inclusion is submitted.** A View should be
+shareable without a promotion Job. What needs a process is *inclusion
+in a department's views* — a submission, not a gate on sharing. The
+individual curates their own list of shareable assets from Home. This
+splits the original question in two: personal → team is
+frictionless, team → company is submitted, and the ceremony lands
+only where something becomes the company's.
+
+## Open questions (all resolved — see Decision history)
+
+### Q1: May a View store anything of its own? (resolved)
 
 The proposal says a View is a query plus a layout and holds no
 records. But the moment someone wants a personal annotation on a
@@ -157,7 +208,7 @@ using. Or treat annotations as first-class events on the log — which
 preserves the protocol but means a personal scribble becomes a
 permanent public fact, which may be exactly wrong for a scratchpad.
 
-### Q2: Where does the IT / System Model line actually fall?
+### Q2: Where does the IT / System Model line actually fall? (resolved)
 
 Monitoring and Auth admin are clearly IT. Job kinds and Subjects &
 Classes are clearly the model. The contested ones:
@@ -173,7 +224,7 @@ Splitting each contested surface between two apps (health in IT,
 authoring in System Model) is possible but doubles the number of
 places to look.
 
-### Q3: Does a View get an agent that writes code, or a declarative composition?
+### Q3: Does a View get an agent that writes code, or a declarative composition? (resolved)
 
 Cloudflare's answer is unambiguous: an agent writes real full-stack
 code and the user asks it for changes in prose. That is far more
@@ -188,7 +239,7 @@ A declarative composition (pick a source, filter, group, choose a
 layout) is reviewable, diffable, deterministic, and rebuildable, and
 is strictly less powerful.
 
-### Q4: Is promotion a Job?
+### Q4: Is promotion a Job? (resolved)
 
 Making promotion a Job with a sign-off Step is the obvious BOSS
 answer: it gets provenance, an owner, an audit trail, and a
