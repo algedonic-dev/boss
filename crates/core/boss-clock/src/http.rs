@@ -142,6 +142,11 @@ async fn health(State(state): State<Arc<ClockApiState>>) -> Json<HealthResponse>
 /// every field is `None` — which reads as "unknown", the correct answer
 /// for a deployment that does not replay a seed at all.
 async fn baseline_handler(State(state): State<Arc<ClockApiState>>) -> Response {
+    // Without `postgres` the whole body below is cfg'd out and `state`
+    // goes unread — a warning `clippy --all-features` cannot see,
+    // because that build always has the feature on.
+    #[cfg(not(feature = "postgres"))]
+    let _ = &state;
     #[cfg(feature = "postgres")]
     if let Some(pool) = state.pool.as_ref() {
         // WALL time, deliberately — never the sim clock. "How old is
