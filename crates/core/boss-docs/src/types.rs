@@ -159,6 +159,12 @@ pub struct DesignQuestion {
     pub body_md: String,            // full markdown body of the question
     pub proposal: Option<String>,   // parsed from '**Proposal**: ...'
     pub context_md: Option<String>, // surrounding paragraphs for display
+    /// Heading carries `(resolved)`. The question stays parsed — the
+    /// doc keeps its decision record — but it is no longer counted as
+    /// open. Without this the panel counted every parsed question as
+    /// open, so a doc whose review had just been flushed still
+    /// reported its questions outstanding.
+    pub resolved: bool,
 }
 
 /// Metadata snapshot for a design doc.
@@ -384,4 +390,20 @@ mod status_parse_tests {
         assert!(!DocStatus::Reopened.forbids_open_questions());
         assert!(!DocStatus::InReview.forbids_open_questions());
     }
+}
+
+/// A doc on disk that failed to index, and why.
+///
+/// Rejection is correct behaviour — the reindexer refuses docs whose
+/// status contradicts their content. What was missing is durability:
+/// the reason was returned in the reindex API response and discarded,
+/// so a rejected doc was simply absent, indistinguishable from one
+/// nobody had written. `first_seen_at` is preserved across reindexes
+/// because the age is what makes it actionable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RejectedDocRecord {
+    pub path: String,
+    pub reason: String,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
 }

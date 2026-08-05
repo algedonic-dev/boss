@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::port::{DocsError, DocsRepository};
 use crate::types::{
     DecisionKind, DesignDoc, DesignQuestion, DocStatus, FlushJob, FlushJobPayload, JobStatus,
-    JobStatusUpdate, PendingDecision, PendingDecisionInput,
+    JobStatusUpdate, PendingDecision, PendingDecisionInput, RejectedDocRecord,
 };
 
 pub struct PgDocsRepo {
@@ -56,6 +56,7 @@ fn question_from_row(row: &PgRow) -> Result<DesignQuestion, DocsError> {
         body_md: row.try_get("body_md").map_err(storage)?,
         proposal: row.try_get("proposal").map_err(storage)?,
         context_md: row.try_get("context_md").map_err(storage)?,
+        resolved: row.try_get("resolved").map_err(storage)?,
     })
 }
 
@@ -185,8 +186,8 @@ impl DocsRepository for PgDocsRepo {
             sqlx::query(
                 "INSERT INTO design_questions (
                     id, doc_path, anchor, ordinal, title, body_md,
-                    proposal, context_md
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                    proposal, context_md, resolved
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
             )
             .bind(&q.id)
             .bind(&q.doc_path)
@@ -196,12 +197,58 @@ impl DocsRepository for PgDocsRepo {
             .bind(&q.body_md)
             .bind(&q.proposal)
             .bind(&q.context_md)
+            .bind(q.resolved)
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
         }
 
         tx.commit().await.map_err(storage)?;
+        Ok(())
+    }
+
+    async fn all_rejections(&self) -> Result<Vec<RejectedDocRecord>, DocsError> {
+        let rows: Vec<(String, String, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT path, reason, first_seen_at, last_seen_at \
+             FROM design_doc_rejections ORDER BY first_seen_at",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(path, reason, first_seen_at, last_seen_at)| RejectedDocRecord {
+                    path,
+                    reason,
+                    first_seen_at,
+                    last_seen_at,
+                },
+            )
+            .collect())
+    }
+
+    async fn upsert_rejection(&self, path: &str, reason: &str) -> Result<(), DocsError> {
+        // first_seen_at deliberately NOT updated on conflict: a doc
+        // failing for six days should say six days, not "just now".
+        sqlx::query(
+            "INSERT INTO design_doc_rejections (path, reason) VALUES ($1, $2) \
+             ON CONFLICT (path) DO UPDATE SET reason = EXCLUDED.reason, last_seen_at = NOW()",
+        )
+        .bind(path)
+        .bind(reason)
+        .execute(&self.pool)
+        .await
+        .map_err(storage)?;
+        Ok(())
+    }
+
+    async fn clear_rejection(&self, path: &str) -> Result<(), DocsError> {
+        sqlx::query("DELETE FROM design_doc_rejections WHERE path = $1")
+            .bind(path)
+            .execute(&self.pool)
+            .await
+            .map_err(storage)?;
         Ok(())
     }
 
@@ -533,6 +580,7 @@ mod tests {
             body_md: "body".to_string(),
             proposal: Some("proposal".to_string()),
             context_md: None,
+            resolved: false,
         }
     }
 

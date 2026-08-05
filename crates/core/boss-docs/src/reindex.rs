@@ -73,11 +73,23 @@ pub async fn reindex(
         match reindex_one(repo, repo_root, abs_path, &rel_path).await {
             Ok(()) => {
                 stats.docs_indexed += 1;
+                // Indexed cleanly — drop any standing rejection.
+                if let Err(e) = repo.clear_rejection(&rel_path).await {
+                    warn!(path = %rel_path, error = %e, "clearing stale rejection");
+                }
                 indexed_paths.push(rel_path);
             }
             Err(e) => {
                 let reason = e.to_string();
                 warn!(path = %rel_path, error = %reason, "failed to reindex doc");
+                // Persist it. A warn! in a log nobody tails is how a
+                // doc stayed invisible for six days: the reason went
+                // into the reindex response and was discarded, and a
+                // rejected doc has no design_docs row by definition,
+                // so its absence looked like nobody had written it.
+                if let Err(e) = repo.upsert_rejection(&rel_path, &reason).await {
+                    warn!(path = %rel_path, error = %e, "recording rejection");
+                }
                 stats.rejected.push(RejectedDoc {
                     path: rel_path.clone(),
                     reason,
@@ -290,5 +302,60 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// A rejected doc must leave a durable trace. Before this, the
+    /// reason went into the reindex API response and was discarded —
+    /// and since a rejected doc has no design_docs row by definition,
+    /// its absence was indistinguishable from "nobody wrote it".
+    /// docs/design/transactional-audit-log.md sat that way for six
+    /// days.
+    #[tokio::test]
+    async fn a_rejected_doc_is_recorded_and_cleared_when_it_indexes() {
+        // Scoped temp dir rather than a dev-dependency for one test.
+        let root = std::env::temp_dir().join(format!("boss-docs-reindex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let design = root.join("docs/design");
+        std::fs::create_dir_all(&design).expect("mkdir");
+        let doc = design.join("bad.md");
+
+        // `living` asserts no open discussion, but carries one.
+        std::fs::write(
+            &doc,
+            "# Bad\n\n**Status:** living\n\n## Open questions\n\n### Q1: Unsettled?\n\nBody.\n",
+        )
+        .expect("write");
+
+        let repo = crate::in_memory::InMemoryDocsRepo::default();
+        let stats = reindex(&repo, &root).await.expect("reindex");
+        assert_eq!(stats.rejected.len(), 1, "the doc should be rejected");
+
+        let recorded = repo.all_rejections().await.expect("rejections");
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the rejection must be persisted, not just returned"
+        );
+        assert_eq!(recorded[0].path, "docs/design/bad.md");
+        assert!(
+            recorded[0].reason.contains("living"),
+            "the reason must name the problem, got: {}",
+            recorded[0].reason,
+        );
+
+        // Fix the doc the way the error message says to.
+        std::fs::write(
+            &doc,
+            "# Bad\n\n**Status:** reopened\n\n## Open questions\n\n### Q1: Unsettled?\n\nBody.\n",
+        )
+        .expect("rewrite");
+        let stats = reindex(&repo, &root).await.expect("reindex");
+        assert!(stats.rejected.is_empty(), "should index cleanly now");
+        assert!(
+            repo.all_rejections().await.expect("rejections").is_empty(),
+            "a doc that indexes cleanly must clear its standing rejection",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

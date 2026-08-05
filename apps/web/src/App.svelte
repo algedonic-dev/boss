@@ -14,6 +14,7 @@
   import { loadClasses } from '@boss/web-kit/session/classes.svelte';
   import AppShell from './shell/AppShell.svelte';
   import { appForSection, APP_SUBJECT_KINDS, type AppId } from './shell/nav-catalog';
+  import StepFocusPage from './steps/StepFocusPage.svelte';
   import PerspectiveTabs from '@boss/web-kit/PerspectiveTabs.svelte';
   import DebugGear from './debug/DebugGear.svelte';
   import MePage from './me/MePage.svelte';
@@ -217,6 +218,12 @@
 
 {#if route.kind === 'login'}
   <LoginPage />
+{:else if route.kind === 'stepFocus'}
+  <!-- Outside AppShell on purpose: a full-page step surface has no
+       sidebar. The chrome bar stays — you can still switch apps —
+       but everything below it belongs to the step. -->
+  <PerspectiveTabs active={perspective} brandName="Algedonic" brandSub="Ales" />
+  <StepFocusPage jobId={route.jobId} stepId={route.stepId} />
 {:else}
   <PerspectiveTabs active={perspective} brandName="Algedonic" brandSub="Ales" searchAppKinds={APP_SUBJECT_KINDS[perspective] ?? []} />
 <AppShell {activeSection} {perspective}>

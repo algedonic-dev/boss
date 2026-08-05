@@ -1,11 +1,16 @@
 # Transactional audit log — the event write path
 
-**Status:** living contract (the arc that established it completed
-2026-07-29; decision history folded into
-[docs/architecture-decisions.md](../architecture-decisions.md)
-§Correctness protocol & the audit log). Every new write path in
-BOSS follows this contract; `infra/lint/outbox-migration-ratchet.sh`
-fails CI on any deviation.
+**Status:** reopened — the contract below is settled and in force (the
+arc that established it completed 2026-07-29; decision history folded
+into [docs/architecture-decisions.md](../architecture-decisions.md)
+§Correctness protocol & the audit log), but Q2 and Q6 under Open
+questions are genuinely undecided, and `living` asserts a doc carries
+none. Every new write path in BOSS follows this contract;
+`infra/lint/outbox-migration-ratchet.sh` fails CI on any deviation.
+
+Flip back to `living` when Q2 and Q6 are resolved — or mark them
+`(resolved)` in their headings if they turn out to be settled and
+merely un-annotated.
 
 ## The invariant
 

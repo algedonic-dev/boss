@@ -79,6 +79,14 @@
 </script>
 
 {#if pluginAvailable === true}
+  <!-- Plugin-backed steps can also take the whole viewport. Reading
+       tasks (a design review is a document plus decisions) compete
+       badly with the job chrome and step list around this panel. -->
+  <div class="step-surface-expand">
+    <a class="step-surface-expand-link" href={`/ux/jobs/${jobId}/steps/${step.id}`}>
+      Open full page ↗
+    </a>
+  </div>
   <StepPluginMount
     kind={step.kind}
     {step}
@@ -125,6 +133,18 @@
 </div>
 
 <style>
+  .step-surface-expand { display: flex; justify-content: flex-end; }
+  .step-surface-expand-link {
+    font-size: 12px;
+    color: var(--text-dim, #78716c);
+    text-decoration: none;
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+  .step-surface-expand-link:hover {
+    background: var(--bg, #f5f5f4);
+    color: var(--text, #1c1917);
+  }
   .step-attachments {
     margin-top: 12px;
     padding: 8px 12px;

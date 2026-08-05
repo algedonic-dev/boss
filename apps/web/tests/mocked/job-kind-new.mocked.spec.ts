@@ -15,11 +15,14 @@ test.describe('Admin new job kind — name-it entry', () => {
   test('identity fields render and persist input', async ({ page }) => {
     await mountPage(page, '/system/job-kinds/new');
 
-    const slug = page.locator('input.mono').first();
+    const slug = page.getByPlaceholder('seasonal-release');
     await slug.fill(KIND_SLUG);
     await expect(slug).toHaveValue(KIND_SLUG);
 
-    const label = page.locator('input').nth(1);
+    // By placeholder, not index. `locator('input').nth(1)` counted
+    // every input on the page, chrome included, so adding the global
+    // search box to the chrome bar shifted this onto the slug field.
+    const label = page.getByPlaceholder('Seasonal Release');
     await label.fill('Seasonal Release');
     await expect(label).toHaveValue('Seasonal Release');
 
@@ -39,8 +42,8 @@ test.describe('Admin new job kind — name-it entry', () => {
   test('Create & author → creates the design Job and opens the workspace', async ({ page }) => {
     await mountPage(page, '/system/job-kinds/new');
 
-    await page.locator('input.mono').first().fill(KIND_SLUG);
-    await page.locator('input').nth(1).fill('Seasonal Release');
+    await page.getByPlaceholder('seasonal-release').fill(KIND_SLUG);
+    await page.getByPlaceholder('Seasonal Release').fill('Seasonal Release');
 
     const create = page.getByRole('button', { name: /create & author/i });
     await expect(create).toBeEnabled();

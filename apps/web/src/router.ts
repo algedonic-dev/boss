@@ -34,6 +34,11 @@ export type Route =
   /// Home is the cross-app surface — the chrome dropdown is scoped to
   /// the app you are in, this is the unscoped view it escalates to.
   | { kind: 'search'; q: string }
+  /// Full-page step surface. A step whose UX is a plugin gets the
+  /// whole viewport instead of a panel inside the job page — review
+  /// and authoring steps are reading tasks, and reading competes
+  /// badly with a sidebar and a step list.
+  | { kind: 'stepFocus'; jobId: string; stepId: string }
   | { kind: 'service' }
   | { kind: 'sales' }
   | { kind: 'refurb' }
@@ -249,6 +254,11 @@ export function parseRoute(pathname: string): Route {
     if (sid) (r as { newJobSubjectId?: string }).newJobSubjectId = sid;
     return r;
   }
+  // Before the greedy /jobs/(.+) below, which would otherwise swallow
+  // the whole `{id}/steps/{stepId}` tail as a job id.
+  const sfm = p.match(/^\/jobs\/([^/]+)\/steps\/([^/]+)$/);
+  if (sfm) return { kind: 'stepFocus', jobId: sfm[1]!, stepId: sfm[2]! };
+
   const jm = p.match(/^\/jobs\/(.+)$/);
   if (jm) return { kind: 'jobDetail', jobId: jm[1]! };
 
