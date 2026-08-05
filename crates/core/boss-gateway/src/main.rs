@@ -192,6 +192,18 @@ async fn main() -> Result<()> {
             "/api/search/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::SEARCH)),
         )
+        // Views. Both paths, same reason as /api/search above: the
+        // list + create endpoint is the bare `/api/views`, so without
+        // the bare route it falls through to the SPA static handler
+        // and answers HTML to a fetch expecting JSON.
+        .route(
+            "/api/views",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::VIEWS)),
+        )
+        .route(
+            "/api/views/{*rest}",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::VIEWS)),
+        )
         // Dispatcher rule-registry surface (read-only) — backs the
         // /system/dispatcher cascade visualization.
         .route(

@@ -131,6 +131,9 @@ else
         # Mirrors the PortSpec in boss-ports; the two lists are kept
         # in step by hand, per that crate's header.
         "search:7960"
+        # views:7961 — the View registry + the endpoint that runs one
+        # (boss-views). Same hand-kept pairing with boss-ports.
+        "views:7961"
         "classes:7800"
         "locations:7820"
         "subject-kinds:7830"

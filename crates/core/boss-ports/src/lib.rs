@@ -102,6 +102,15 @@ pub const SOLO: &[PortSpec] = &[
         prod: 7960,
         scratch: None,
     },
+    // views — the View registry + the endpoint that runs one
+    // (boss-views). Core: a View reads subjects/jobs/audit_log, which
+    // every deployment has, and the registry is the personal rung of
+    // the extensibility ladder rather than anything tenant-shaped.
+    PortSpec {
+        name: "views",
+        prod: 7961,
+        scratch: None,
+    },
     // `simulator` hosts the /simulator UX — the SPA bundle + the
     // /simulator/api/* control+status surface (boss-simulator service).
     PortSpec {

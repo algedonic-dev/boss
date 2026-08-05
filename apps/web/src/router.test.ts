@@ -155,6 +155,18 @@ describe('global search results route', () => {
   });
 });
 
+describe('personal Views route', () => {
+  test('/views resolves to the Home Views surface', () => {
+    expect(parseRoute('/ux/views').kind).toBe('views');
+  });
+
+  test('the bare alias resolves too', () => {
+    // Every /ux/* surface is reachable without the prefix; the router
+    // strips it before matching, and Views should be no exception.
+    expect(parseRoute('/views').kind).toBe('views');
+  });
+});
+
 describe('full-page step route', () => {
   test('parses /jobs/{job}/steps/{step} to stepFocus', () => {
     const r = parseRoute('/ux/jobs/job-123/steps/step-456');
