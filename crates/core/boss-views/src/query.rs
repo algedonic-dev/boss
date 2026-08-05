@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use boss_policy_client::{AccessTier, Predicate, Resource, User};
+use boss_policy_client::{Predicate, Resource, User};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row, postgres::PgRow};
 
@@ -99,20 +99,17 @@ impl PgViewResolver {
 
     /// Translate the caller's policy into a scope for this source.
     ///
-    /// `jobs` has a real policy vocabulary — 70 seeded rules across
-    /// `self`, `territory` and `department:*` — so it gets the same
-    /// read-scope predicate `/api/jobs` applies.
+    /// Every source is a policy question. `jobs` uses the same
+    /// read-scope predicate `/api/jobs` applies. `subjects` and
+    /// `events` ask about `Resource::subject()` and
+    /// `Resource::event()` — registry rows like any other, so who may
+    /// enumerate identity or be handed log rows is tenant-authored
+    /// data rather than a tier check compiled into this crate.
     ///
-    /// `subjects` and `audit_log` have NO policy resource: there is no
-    /// `subject` or `event` in `policy_rules`, so there is nothing to
-    /// ask the engine. Row-level scoping for them needs new Resource
-    /// kinds and seeded rules, which is a design decision and not one
-    /// to invent inline. Until then they are gated coarsely at
-    /// operator/auditor tier — the same control `/system/monitoring`
-    /// already applies to the audit log it surfaces. That is blunter
-    /// than the jobs path and deliberately so: refusing a whole source
-    /// is a visible limitation, whereas silently returning rows the
-    /// caller cannot otherwise see is the bug being fixed.
+    /// Those two are all-or-nothing: neither has an owner column to
+    /// narrow by, so anything short of `Unrestricted` is a denial.
+    /// That fails closed — a tenant writing `scope = "territory"`
+    /// against `event` gets nothing rather than everything.
     async fn scope_for(&self, source: ViewSource, user: &User) -> Result<SourceScope, ViewsError> {
         match source {
             ViewSource::Jobs => {
@@ -145,11 +142,20 @@ impl PgViewResolver {
                 })
             }
             ViewSource::Subjects | ViewSource::Events => {
-                if matches!(user.access_tier, AccessTier::Operator | AccessTier::Auditor) {
-                    Ok(SourceScope::All)
+                let resource = if matches!(source, ViewSource::Subjects) {
+                    Resource::subject()
                 } else {
-                    Ok(SourceScope::None)
-                }
+                    Resource::event()
+                };
+                let predicate = self
+                    .policy
+                    .scope_predicate(user, resource)
+                    .await
+                    .map_err(|e| ViewsError::Storage(format!("policy check failed: {e}")))?;
+                Ok(match predicate {
+                    Predicate::Unrestricted => SourceScope::All,
+                    _ => SourceScope::None,
+                })
             }
         }
     }
