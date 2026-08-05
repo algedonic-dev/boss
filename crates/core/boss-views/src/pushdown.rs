@@ -90,6 +90,7 @@ pub enum ColumnType {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Bound {
     Text(String),
+    TextList(Vec<String>),
     Timestamp(DateTime<Utc>),
 }
 
@@ -102,6 +103,28 @@ pub enum Pushdown {
         /// mapping — never caller text.
         column: &'static str,
         value: String,
+    },
+    /// `<column> IS DISTINCT FROM <text literal>`.
+    ///
+    /// Not `<>`. The residual treats a missing field as *different
+    /// from* any string — `values_equal(Null, String)` is false, so
+    /// `!=` evaluates true — while SQL's `<>` yields NULL against a
+    /// NULL column and drops the row. `IS DISTINCT FROM` is the
+    /// operator that agrees with the residual; `<>` would be the
+    /// stricter of the two and lose rows the filter wants.
+    Neq {
+        column: &'static str,
+        value: String,
+    },
+    /// `<column> = ANY(<array>)` — a set membership.
+    ///
+    /// The DSL has no `IN` keyword, so this is never parsed directly:
+    /// it is a collapse of `a = "x" OR a = "y" OR …` on one column,
+    /// which is how a filter author spells set membership. Same rows
+    /// as the OR it replaces, one bind instead of N.
+    In {
+        column: &'static str,
+        values: Vec<String>,
     },
     /// `<column> >= <ts>` or `<column> <= <ts>`. Only these two
     /// operators: strict bounds are relaxed to inclusive ones so the
@@ -120,7 +143,10 @@ impl Pushdown {
     /// Number of leaf comparisons — what `pushed_down` reports.
     pub fn term_count(&self) -> usize {
         match self {
-            Pushdown::Eq { .. } | Pushdown::Range { .. } => 1,
+            Pushdown::Eq { .. } | Pushdown::Neq { .. } | Pushdown::Range { .. } => 1,
+            // One term per value: `pushed_down` counts what the filter
+            // author wrote, and they wrote N equalities.
+            Pushdown::In { values, .. } => values.len(),
             Pushdown::All(cs) | Pushdown::Any(cs) => cs.iter().map(Self::term_count).sum(),
         }
     }
@@ -134,6 +160,18 @@ impl Pushdown {
             Pushdown::Eq { column, value } => {
                 binds.push(Bound::Text(value.clone()));
                 let s = format!("{column} = ${next_param}");
+                *next_param += 1;
+                s
+            }
+            Pushdown::Neq { column, value } => {
+                binds.push(Bound::Text(value.clone()));
+                let s = format!("{column} IS DISTINCT FROM ${next_param}");
+                *next_param += 1;
+                s
+            }
+            Pushdown::In { column, values } => {
+                binds.push(Bound::TextList(values.clone()));
+                let s = format!("{column} = ANY(${next_param})");
                 *next_param += 1;
                 s
             }
@@ -210,11 +248,15 @@ pub fn extract(expr: &Expr, pushable: PushableColumns) -> Option<Pushdown> {
         // OR: all-or-nothing. A missing branch would narrow.
         Expr::BinaryOp(BinaryOp::Or, lhs, rhs) => {
             match (extract(lhs, pushable), extract(rhs, pushable)) {
-                (Some(a), Some(b)) => Some(Pushdown::Any(vec![a, b])),
+                (Some(a), Some(b)) => Some(collapse_any(a, b)),
                 _ => None,
             }
         }
         Expr::BinaryOp(BinaryOp::Eq, lhs, rhs) => as_eq(lhs, rhs, pushable),
+        Expr::BinaryOp(BinaryOp::Neq, lhs, rhs) => as_eq(lhs, rhs, pushable).map(|p| match p {
+            Pushdown::Eq { column, value } => Pushdown::Neq { column, value },
+            other => other,
+        }),
         Expr::BinaryOp(
             op @ (BinaryOp::Lt | BinaryOp::Lte | BinaryOp::Gt | BinaryOp::Gte),
             lhs,
@@ -226,6 +268,59 @@ pub fn extract(expr: &Expr, pushable: PushableColumns) -> Option<Pushdown> {
         | Expr::FunctionCall(_, _)
         | Expr::Identifier(_)
         | Expr::Literal(_) => None,
+    }
+}
+
+/// Fold two OR branches, collapsing same-column equalities into a
+/// single `= ANY(...)`.
+///
+/// Purely a rewrite: `a = "x" OR a = "y"` and `a = ANY(['x','y'])`
+/// select the same rows. It exists because set membership is what
+/// filter authors are actually expressing when they chain equalities,
+/// and saying so in one term reads better in a plan than an OR chain.
+fn collapse_any(a: Pushdown, b: Pushdown) -> Pushdown {
+    match (a, b) {
+        (
+            Pushdown::Eq {
+                column: ca,
+                value: va,
+            },
+            Pushdown::Eq {
+                column: cb,
+                value: vb,
+            },
+        ) if ca == cb => Pushdown::In {
+            column: ca,
+            values: vec![va, vb],
+        },
+        // Left-associated chains arrive as In-then-Eq.
+        (
+            Pushdown::In {
+                column: ca,
+                mut values,
+            },
+            Pushdown::Eq {
+                column: cb,
+                value: vb,
+            },
+        ) if ca == cb => {
+            values.push(vb);
+            Pushdown::In { column: ca, values }
+        }
+        (
+            Pushdown::Eq {
+                column: ca,
+                value: va,
+            },
+            Pushdown::In {
+                column: cb,
+                mut values,
+            },
+        ) if ca == cb => {
+            values.insert(0, va);
+            Pushdown::In { column: ca, values }
+        }
+        (x, y) => Pushdown::Any(vec![x, y]),
     }
 }
 
@@ -346,13 +441,11 @@ mod tests {
     fn an_or_of_two_pushable_branches_now_pushes() {
         // The case this extension exists for: previously it pushed
         // nothing, fell back to a capped scan, and reported 0 against
-        // a true 16.
-        let (sql, binds) = sql_of("kind = \"a\" OR kind = \"b\"");
-        assert_eq!(sql, "(kind = $1 OR kind = $2)");
-        assert_eq!(
-            binds,
-            vec![Bound::Text("a".into()), Bound::Text("b".into())]
-        );
+        // a true 16. Same-column equalities then collapse to a set —
+        // see the dedicated test below; asserting rows-selected rather
+        // than exact SQL keeps this one about the OR itself.
+        assert!(ex("kind = \"a\" OR kind = \"b\"").is_some());
+        assert_eq!(ex("kind = \"a\" OR kind = \"b\"").unwrap().term_count(), 2);
     }
 
     #[test]
@@ -375,8 +468,10 @@ mod tests {
     #[test]
     fn an_or_nested_under_an_and_pushes_as_a_group() {
         let (sql, binds) = sql_of("subject_kind = \"account\" AND (kind = \"a\" OR kind = \"b\")");
-        assert_eq!(sql, "(subject_kind = $1 AND (kind = $2 OR kind = $3))");
-        assert_eq!(binds.len(), 3);
+        // The same-column OR collapses to a set; the AND still binds
+        // both halves.
+        assert_eq!(sql, "(subject_kind = $1 AND kind = ANY($2))");
+        assert_eq!(binds.len(), 2);
     }
 
     #[test]
@@ -392,9 +487,11 @@ mod tests {
     fn or_groups_are_parenthesised_inside_an_and() {
         // Unparenthesised, `a AND b OR c` binds as `(a AND b) OR c`
         // and silently returns rows the filter excludes.
-        let (sql, _) = sql_of("kind = \"a\" AND (subject_id = \"s\" OR subject_id = \"t\")");
+        // Two DIFFERENT columns, so the disjunction survives rather
+        // than collapsing to a set — the parenthesisation is the point.
+        let (sql, _) = sql_of("kind = \"a\" AND (subject_id = \"s\" OR source = \"x\")");
         assert!(
-            sql.contains("(subject_id = $2 OR subject_id = $3)"),
+            sql.contains("(subject_id = $2 OR source = $3)"),
             "got: {sql}"
         );
     }
@@ -425,11 +522,70 @@ mod tests {
     }
 
     #[test]
-    fn inequality_on_a_text_column_does_not_push() {
+    fn an_ordering_comparison_on_a_text_column_does_not_push() {
         // Ranges are for timestamps; a lexicographic bound on `kind`
         // is not a question the index can answer usefully.
-        assert_eq!(ex("kind != \"a\""), None);
         assert_eq!(ex("kind > \"a\""), None);
+        assert_eq!(ex("kind <= \"a\""), None);
+    }
+
+    #[test]
+    fn neq_pushes_as_is_distinct_from_not_as_not_equals() {
+        // THE soundness case for `!=`. The residual treats a missing
+        // field as different from any string —
+        // `values_equal(Null, String)` is false, so `!=` evaluates
+        // true. SQL's `<>` yields NULL against a NULL column and drops
+        // the row, which would make SQL the stricter of the two and
+        // lose rows the filter wants. `IS DISTINCT FROM` agrees.
+        let (sql, binds) = sql_of("subject_id != \"acc-1\"");
+        assert_eq!(sql, "subject_id IS DISTINCT FROM $1");
+        assert_eq!(binds, vec![Bound::Text("acc-1".into())]);
+        assert!(!sql.contains("<>"), "`<>` would drop NULL rows");
+    }
+
+    #[test]
+    fn neq_respects_the_column_type_like_equality_does() {
+        assert_eq!(ex("kind != 5"), None);
+        assert_eq!(ex("timestamp != \"2025-01-01\""), None);
+    }
+
+    #[test]
+    fn an_or_of_equalities_on_one_column_collapses_to_any() {
+        // The DSL has no IN keyword, so this is how a filter author
+        // spells set membership. Same rows as the OR chain, one bind.
+        let (sql, binds) = sql_of("kind = \"a\" OR kind = \"b\"");
+        assert_eq!(sql, "kind = ANY($1)");
+        assert_eq!(binds, vec![Bound::TextList(vec!["a".into(), "b".into()])]);
+    }
+
+    #[test]
+    fn a_longer_chain_collapses_into_one_set() {
+        let (sql, binds) = sql_of("kind = \"a\" OR kind = \"b\" OR kind = \"c\"");
+        assert_eq!(sql, "kind = ANY($1)");
+        assert_eq!(
+            binds,
+            vec![Bound::TextList(vec!["a".into(), "b".into(), "c".into()])]
+        );
+    }
+
+    #[test]
+    fn an_or_across_different_columns_stays_a_disjunction() {
+        // Collapsing these would be wrong — they are not a set on one
+        // column.
+        let (sql, _) = sql_of("kind = \"a\" OR subject_id = \"s\"");
+        assert_eq!(sql, "(kind = $1 OR subject_id = $2)");
+    }
+
+    #[test]
+    fn a_collapsed_set_still_counts_every_term_it_replaced() {
+        // pushed_down reports what the author wrote, not how many
+        // binds it took.
+        assert_eq!(
+            ex("kind = \"a\" OR kind = \"b\" OR kind = \"c\"")
+                .unwrap()
+                .term_count(),
+            3
+        );
     }
 
     fn range_of(s: &str) -> (bool, DateTime<Utc>) {

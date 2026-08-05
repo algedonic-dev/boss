@@ -286,6 +286,7 @@ impl PgViewResolver {
                 for b in &binds {
                     q = match b {
                         crate::pushdown::Bound::Text(s) => q.bind(s.clone()),
+                        crate::pushdown::Bound::TextList(v) => q.bind(v.clone()),
                         crate::pushdown::Bound::Timestamp(ts) => q.bind(*ts),
                     };
                 }
