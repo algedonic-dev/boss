@@ -126,8 +126,13 @@ async fn list_docs(State(state): State<Arc<DocsApiState>>) -> Response {
     // worth the port churn yet.
     let mut rows = Vec::with_capacity(docs.len());
     for doc in docs {
+        // OPEN questions — not "questions parsed". A question marked
+        // `(resolved)` stays a row so the doc keeps its decision
+        // record, but counting it here made a doc whose review had
+        // just been flushed still report its questions outstanding,
+        // which read as "the flush did nothing".
         let open_questions = match state.repo.questions_for_doc(&doc.path).await {
-            Ok(qs) => qs.len(),
+            Ok(qs) => qs.iter().filter(|q| !q.resolved).count(),
             Err(e) => return err_to_response(e),
         };
         rows.push(DocListRow {
@@ -552,6 +557,7 @@ mod tests {
             body_md: "Prefer **value-primary** rows.".to_string(),
             proposal: None,
             context_md: None,
+            resolved: false,
         };
         state.repo.upsert_doc(&doc, &[q]).await.unwrap();
         let app = router(state);

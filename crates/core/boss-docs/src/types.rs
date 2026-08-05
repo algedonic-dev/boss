@@ -159,6 +159,12 @@ pub struct DesignQuestion {
     pub body_md: String,            // full markdown body of the question
     pub proposal: Option<String>,   // parsed from '**Proposal**: ...'
     pub context_md: Option<String>, // surrounding paragraphs for display
+    /// Heading carries `(resolved)`. The question stays parsed — the
+    /// doc keeps its decision record — but it is no longer counted as
+    /// open. Without this the panel counted every parsed question as
+    /// open, so a doc whose review had just been flushed still
+    /// reported its questions outstanding.
+    pub resolved: bool,
 }
 
 /// Metadata snapshot for a design doc.

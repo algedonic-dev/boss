@@ -345,6 +345,7 @@ mod tests {
             body_md: "body".to_string(),
             proposal: Some("proposal".to_string()),
             context_md: None,
+            resolved: false,
         }
     }
 

@@ -96,8 +96,16 @@ CREATE TABLE IF NOT EXISTS design_questions (
     body_md         TEXT NOT NULL,
     proposal        TEXT,
     context_md      TEXT,
+    -- Heading carries `(resolved)`. The question stays a row — the doc
+    -- keeps its decision record — but stops counting as open. Without
+    -- it every parsed question counted as open, so a doc whose review
+    -- had just been flushed still reported its questions outstanding.
+    resolved        BOOLEAN NOT NULL DEFAULT false,
     indexed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE design_questions
+    ADD COLUMN IF NOT EXISTS resolved BOOLEAN NOT NULL DEFAULT false;
 
 
 CREATE INDEX IF NOT EXISTS design_questions_doc ON design_questions(doc_path);
