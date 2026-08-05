@@ -95,6 +95,13 @@ pub const PAIRED: &[PortSpec] = &[
 /// + ledger / ml / docs / content. Mirrors `SOLO_SERVICES` in
 ///   `infra/deploy-services.sh`.
 pub const SOLO: &[PortSpec] = &[
+    // search — the global search read surface (boss-search). Core:
+    // it reads subjects/jobs/audit_log, which every deployment has.
+    PortSpec {
+        name: "search",
+        prod: 7960,
+        scratch: None,
+    },
     // `simulator` hosts the /simulator UX — the SPA bundle + the
     // /simulator/api/* control+status surface (boss-simulator service).
     PortSpec {

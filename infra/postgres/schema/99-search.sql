@@ -1,113 +1,93 @@
 -- =========================================================================
--- 99-search.sql — Cross-domain full-text search function (applies LAST).
+-- 99-search.sql — Global search index (applies LAST).
 -- =========================================================================
 
+-- A projection of `audit_log`, like `jobs` or `financial_facts` — NOT a
+-- query over the domain tables.
+--
+-- Recorded in docs/design/global-search.md §Decision history (Q2).
+-- Reading `accounts`/`assets`/`employees` in place is cheaper and is
+-- what the previous implementation did, but it means anything that has
+-- fallen out of a domain projection is unfindable — the wrong answer
+-- for a system whose log is the record. This rebuilds from the log, so
+-- search reproduces rather than drifts.
+--
+-- One row per findable thing, across the three kinds the design names
+-- as the unified result set:
+--   subject  — the identity-bearing things (accounts, employees, …)
+--   job      — the work
+--   event    — what happened
+--
+-- `subject_kind` / `subject_id` are the join key that makes the unified
+-- answer possible: a hit on a Subject pulls the Jobs about it and the
+-- events behind those, because all three carry the same reference.
+-- Without that column this is three search boxes in a trenchcoat, which
+-- is exactly what the design says it must not be.
+CREATE TABLE IF NOT EXISTS search_index (
+    ref_kind      TEXT NOT NULL CHECK (ref_kind IN ('subject', 'job', 'event')),
+    -- '{kind}:{id}' for subjects, the job id for jobs, the audit_log id
+    -- for events.
+    ref_id        TEXT NOT NULL,
+    -- What this row is ABOUT — the join key described above.
+    subject_kind  TEXT,
+    subject_id    TEXT,
+    -- What a human reads in a result row.
+    title         TEXT NOT NULL,
+    -- Secondary matchable text (job kind, event kind, id fragments).
+    -- Separate from `title` so ranking can weight them apart.
+    body          TEXT NOT NULL DEFAULT '',
+    -- Sim-time of the underlying fact. The design refuses to score
+    -- across kinds — Subjects, then Jobs, then Events — so recency only
+    -- ever breaks ties WITHIN a kind.
+    occurred_at   TIMESTAMPTZ,
+    indexed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (ref_kind, ref_id)
+);
+
+
+-- Generated, not trigger-maintained: the rebuild is a bulk
+-- TRUNCATE-then-insert, and a generated column cannot drift from the
+-- row it summarises. Weights follow the design's ranking rule — 'A' for
+-- the title (what you typed is probably a name), 'B' for the body.
+ALTER TABLE search_index
+    ADD COLUMN IF NOT EXISTS tsv tsvector
+    GENERATED ALWAYS AS (
+        setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+        setweight(to_tsvector('english', coalesce(body, '')), 'B')
+    ) STORED;
+
+CREATE INDEX IF NOT EXISTS search_index_tsv ON search_index USING GIN (tsv);
+
+-- The unified-result join: given a matching Subject, find its Jobs and
+-- events without a second scan.
+CREATE INDEX IF NOT EXISTS search_index_subject
+    ON search_index (subject_kind, subject_id);
+
+-- Prefix matching on ids and codes, which English tokenising handles
+-- badly — an operator pasting `inv-step-c9cd8f…` is not writing prose.
+CREATE INDEX IF NOT EXISTS search_index_ref_id_trgm
+    ON search_index (ref_id text_pattern_ops);
+
+CREATE INDEX IF NOT EXISTS search_index_kind ON search_index (ref_kind);
+
 
 -- -----------------------------------------------------------------------------
--- Cross-domain full-text search function
--- Used by the Omnibox and /api/people/search endpoint.
--- Defined last so every referenced table exists when the function is
--- created on a fresh schema apply.
+-- Retired: search_all()
 -- -----------------------------------------------------------------------------
-
-CREATE OR REPLACE FUNCTION search_all(query text, max_results integer DEFAULT 10)
-RETURNS TABLE(
-    entity_type text,
-    entity_id   text,
-    label       text,
-    detail      text,
-    path        text,
-    rank        real
-) LANGUAGE sql STABLE AS $$
-  SELECT * FROM (
-    SELECT 'employee'::text AS entity_type, e.id AS entity_id, e.name AS label,
-           e.role || ' — ' || e.department AS detail,
-           '/people/' || e.id AS path,
-           ts_rank(to_tsvector('english', e.name || ' ' || e.email || ' ' || e.role || ' ' || e.department),
-                   plainto_tsquery('english', query))::real AS rank
-    FROM employees e
-    WHERE to_tsvector('english', e.name || ' ' || e.email || ' ' || e.role || ' ' || e.department)
-          @@ plainto_tsquery('english', query)
-       OR e.name ILIKE '%' || query || '%'
-       OR e.id ILIKE '%' || query || '%'
-    UNION ALL
-    SELECT 'model'::text, m.sku, m.name, m.manufacturer || ' — ' || m.category,
-           '/catalog/' || m.sku,
-           ts_rank(to_tsvector('english', m.name || ' ' || m.manufacturer || ' ' || m.sku || ' ' || m.category),
-                   plainto_tsquery('english', query))::real
-    FROM asset_models m
-    WHERE to_tsvector('english', m.name || ' ' || m.manufacturer || ' ' || m.sku || ' ' || m.category)
-          @@ plainto_tsquery('english', query)
-       OR m.name ILIKE '%' || query || '%'
-       OR m.sku ILIKE '%' || query || '%'
-    UNION ALL
-    SELECT 'asset'::text, d.asset_id, d.asset_id, d.sku || ' — ' || d.phase,
-           '/assets/' || d.asset_id,
-           (CASE WHEN d.asset_id ILIKE query || '%' THEN 1.0 ELSE 0.5 END)::real
-    FROM assets d
-    WHERE d.asset_id ILIKE '%' || query || '%'
-    UNION ALL
-    SELECT 'account'::text, c.id, c.name, c.city || ', ' || c.state || ' — ' || c.tier,
-           '/accounts/' || c.id,
-           ts_rank(to_tsvector('english', c.name || ' ' || c.director || ' ' || c.city),
-                   plainto_tsquery('english', query))::real
-    FROM accounts c
-    WHERE to_tsvector('english', c.name || ' ' || c.director || ' ' || c.city)
-          @@ plainto_tsquery('english', query)
-       OR c.name ILIKE '%' || query || '%'
-       OR c.id ILIKE '%' || query || '%'
-    UNION ALL
-    -- Open service tickets: id prefix match ranks highest (operators
-    -- type "tkt-1234" → go straight to the ticket), summary full-text
-    -- search second (operators type "cooling alarm" → find every
-    -- open ticket matching that failure mode).
-    SELECT 'ticket'::text, t.ticket_id, t.ticket_id,
-           t.summary || ' — ' || t.asset_id,
-           '/service/' || t.ticket_id,
-           GREATEST(
-             CASE WHEN t.ticket_id ILIKE query || '%' THEN 1.0 ELSE 0.0 END,
-             ts_rank(to_tsvector('english', t.summary || ' ' || t.ticket_id),
-                     plainto_tsquery('english', query))
-           )::real
-    FROM asset_open_tickets t
-    WHERE t.ticket_id ILIKE '%' || query || '%'
-       OR to_tsvector('english', t.summary || ' ' || t.ticket_id)
-          @@ plainto_tsquery('english', query)
-    UNION ALL
-    -- Active bulletins: title-prefix match ranks highest, title+body
-    -- FTS second. Expired bulletins drop out. Audience filtering is
-    -- the reader surface's job — search is permissive.
-    SELECT 'bulletin'::text, b.id::text, b.title,
-           left(b.body, 100),
-           '/me',
-           GREATEST(
-             CASE WHEN b.title ILIKE query || '%' THEN 1.0 ELSE 0.0 END,
-             ts_rank(to_tsvector('english', b.title || ' ' || b.body),
-                     plainto_tsquery('english', query))
-           )::real
-    FROM bulletins b
-    WHERE (b.expires_on IS NULL OR b.expires_on >= CURRENT_DATE)
-      AND (b.title ILIKE '%' || query || '%'
-           OR to_tsvector('english', b.title || ' ' || b.body)
-              @@ plainto_tsquery('english', query))
-    UNION ALL
-    -- Published manual sections: FTS over title+body, slug prefix
-    -- match for operators who remember the URL.
-    SELECT 'manual_section'::text, m.slug, m.title,
-           left(m.body, 100),
-           '/manual/' || m.slug,
-           GREATEST(
-             CASE WHEN m.slug ILIKE query || '%' THEN 1.0 ELSE 0.0 END,
-             ts_rank(to_tsvector('english', m.title || ' ' || m.body),
-                     plainto_tsquery('english', query))
-           )::real
-    FROM manual_sections m
-    WHERE m.published = true
-      AND (m.slug ILIKE '%' || query || '%'
-           OR to_tsvector('english', m.title || ' ' || m.body)
-              @@ plainto_tsquery('english', query))
-  ) results
-  ORDER BY rank DESC
-  LIMIT max_results
-$$;
-
+--
+-- The previous global search: one SQL function UNION-ing seven Tier-2
+-- domain tables (employees, asset_models, assets, accounts, tickets,
+-- bulletins, manual_sections), called from boss-people's
+-- /api/people/search, for an Omnibox that no longer exists in the SPA.
+--
+-- Superseded rather than extended. Every decision in
+-- docs/design/global-search.md points away from it: it read domain
+-- tables directly (Q2 chose a log-rooted projection), it lived in a
+-- Tier-2 crate (Q1 put core identity in core), and it covered no Jobs
+-- and no events at all — which is the entire unified-layer claim (Q3).
+-- Its seven entity types are all reachable through `subjects` here.
+--
+-- Dropped rather than left dormant: two differently-shaped searches
+-- over one tenant is the exact incoherence this system exists to avoid,
+-- and a dormant one is the kind that gets called by accident.
+DROP FUNCTION IF EXISTS search_all(text, integer);
