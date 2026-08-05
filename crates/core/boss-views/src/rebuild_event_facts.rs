@@ -42,6 +42,30 @@ fn storage(e: sqlx::Error) -> ViewsError {
 /// rather than at read time — that lift is the entire point of the
 /// table, since `payload->>'subject_id'` cannot use an index but a
 /// column can.
+///
+/// The lift resolves a Subject three ways, in order:
+///
+/// 1. **Flat keys** — `payload.subject_id`. The pre-v1.1.0 shape,
+///    still emitted by domain events.
+/// 2. **Nested identity-first** — `payload.subject.id`, the shape
+///    v1.1.0 moved Subjects to (`{"id": …, "subject_kind": …}`).
+///    Reading only the flat keys dropped 21,979 events that carried
+///    perfectly good identity: the model had moved and the projection
+///    had not.
+/// 3. **Through the Job** — `payload.job_id` → `jobs.subject_id`.
+///    Step events name the Job they belong to, and a Job knows its
+///    Subject. Without this hop 449,859 events — every step
+///    transition, the largest kinds in the log — were unlinked
+///    despite their Subject being one join away.
+///
+/// Together these take linkage from 16% of the log to roughly 77%,
+/// which is the difference between "everything that happened to this
+/// Subject" being a claim and being a query.
+///
+/// The join compares `j.id::text` rather than casting the payload
+/// value to uuid: a `job_id` that is not a valid uuid would fail the
+/// cast and take down the whole batch, where this simply does not
+/// match.
 async fn project_window(
     pool: &PgPool,
     from_exclusive: i64,
@@ -51,8 +75,19 @@ async fn project_window(
         "INSERT INTO event_facts \
             (audit_id, event_id, kind, source, occurred_at, subject_kind, subject_id, payload) \
          SELECT a.id, a.event_id, a.kind, a.source, a.timestamp, \
-                a.payload->>'subject_kind', a.payload->>'subject_id', a.payload \
+                COALESCE( \
+                    a.payload->>'subject_kind', \
+                    a.payload->'subject'->>'subject_kind', \
+                    j.subject_kind \
+                ), \
+                COALESCE( \
+                    a.payload->>'subject_id', \
+                    a.payload->'subject'->>'id', \
+                    j.subject_id \
+                ), \
+                a.payload \
          FROM audit_log a \
+         LEFT JOIN jobs j ON j.id::text = a.payload->>'job_id' \
          WHERE a.id > $1 AND a.id <= $2 \
          ON CONFLICT (audit_id) DO NOTHING",
     )

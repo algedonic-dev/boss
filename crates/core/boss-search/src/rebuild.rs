@@ -89,6 +89,12 @@ pub async fn rebuild_search(pool: &PgPool) -> Result<RebuildSearchReport, Search
     // names no subject are skipped rather than indexed subject-less:
     // an event you cannot trace to a thing is not a search result, it
     // is noise.
+    // Subject resolution matches boss-views' event_facts exactly:
+    // flat keys, then the nested identity-first `subject` object that
+    // v1.1.0 moved to, then the Job the event names. Reading only the
+    // flat keys left this index holding 3,694 event rows against
+    // 776,629 in the log — half a percent — so "what happened to this
+    // Subject" was answerable for almost nothing.
     let events = sqlx::query(
         "INSERT INTO search_index \
             (ref_kind, ref_id, subject_kind, subject_id, title, body, occurred_at) \
@@ -97,14 +103,33 @@ pub async fn rebuild_search(pool: &PgPool) -> Result<RebuildSearchReport, Search
                 ranked.timestamp \
          FROM ( \
              SELECT a.id, a.kind, a.timestamp, \
-                    a.payload->>'subject_kind' AS subject_kind, \
-                    a.payload->>'subject_id'   AS subject_id, \
+                    COALESCE( \
+                        a.payload->>'subject_kind', \
+                        a.payload->'subject'->>'subject_kind', \
+                        j.subject_kind \
+                    ) AS subject_kind, \
+                    COALESCE( \
+                        a.payload->>'subject_id', \
+                        a.payload->'subject'->>'id', \
+                        j.subject_id \
+                    ) AS subject_id, \
                     ROW_NUMBER() OVER ( \
-                        PARTITION BY a.payload->>'subject_kind', a.payload->>'subject_id' \
+                        PARTITION BY COALESCE( \
+                                a.payload->>'subject_kind', \
+                                a.payload->'subject'->>'subject_kind', \
+                                j.subject_kind), \
+                            COALESCE( \
+                                a.payload->>'subject_id', \
+                                a.payload->'subject'->>'id', \
+                                j.subject_id) \
                         ORDER BY a.id DESC \
                     ) AS rn \
              FROM audit_log a \
-             WHERE a.payload->>'subject_id' IS NOT NULL \
+             LEFT JOIN jobs j ON j.id::text = a.payload->>'job_id' \
+             WHERE COALESCE( \
+                     a.payload->>'subject_id', \
+                     a.payload->'subject'->>'id', \
+                     j.subject_id) IS NOT NULL \
          ) ranked \
          WHERE ranked.rn <= $1",
     )
