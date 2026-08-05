@@ -22,4 +22,5 @@
 30-customers.sql
 40-ledger.sql
 41-dispatcher.sql
+42-views.sql
 99-search.sql

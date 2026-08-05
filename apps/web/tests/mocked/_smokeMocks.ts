@@ -122,6 +122,31 @@ export async function installSmokeMocks(page: Page): Promise<void> {
   await page.route(/\/api\/catalog\/marketing-assets\/[^/]+$/, (r) => json(r, MARKETING_ASSET));
 
   // Shipments (carrier omitted).
+  // Views — the Home composer surface. Two rows so the crawler renders
+  // both visibility badges, and a results payload with `truncated` set
+  // so the ceiling warning is exercised rather than only the happy path.
+  await page.route(/\/api\/views\?/, (r) =>
+    json(r, [
+      {
+        id: 'view-1', owner_id: 'emp-1', title: 'Open jobs', source: 'jobs',
+        filter: 'status = "open"', columns: ['id', 'status'], layout: 'table',
+        visibility: 'private', created_at: '2026-08-01T00:00:00Z',
+        updated_at: '2026-08-01T00:00:00Z',
+      },
+      {
+        id: 'view-2', owner_id: 'emp-other', title: 'Recent events', source: 'events',
+        filter: '', columns: [], layout: 'count', visibility: 'shared',
+        created_at: '2026-08-01T00:00:00Z', updated_at: '2026-08-01T00:00:00Z',
+      },
+    ]),
+  );
+  await page.route(/\/api\/views\/[^/]+\/results/, (r) =>
+    json(r, {
+      view_id: 'view-1', source: 'jobs', layout: 'table',
+      rows: [{ id: 'j-1', status: 'open' }],
+      matched: 1, truncated: false,
+    }),
+  );
   await page.route(/\/api\/shipping\/shipments(\?|$)/, (r) => json(r, [SHIPMENT]));
   await page.route(/\/api\/shipping\/shipments\/[^/]+$/, (r) => json(r, SHIPMENT));
 }

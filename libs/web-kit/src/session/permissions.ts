@@ -21,7 +21,7 @@ export type Role = string;
 export type RouteName =
   | 'shop' | 'exec' | 'catalog' | 'accounts' | 'assets' | 'sales' | 'service'
   | 'refurb' | 'parts' | 'products' | 'finance' | 'people' | 'qa' | 'warehouse' | 'support' | 'ops'
-  | 'system-monitoring' | 'inbox' | 'shipping'
+  | 'system-monitoring' | 'inbox' | 'shipping' | 'views'
   | 'vendors' | 'marketing-assets' | 'calendar' | 'schedule' | 'jobs'
   // Platform-administration surfaces. Same `permKey: 'it'` gate
   // as the legacy ADMIN footer; these route names exist so the
@@ -194,6 +194,10 @@ export const ROUTE_ACCESS: Record<Role, ReadonlyArray<RouteName>> = {
 
 export function canSeeRoute(role: Role, route: RouteName): boolean {
   if (route === 'shop' || route === 'inbox' || route === 'workflows' || route === 'system-experiments') return true;
+  // Views are personal by construction — everyone has their own, so
+  // there is nothing to gate. What a View can READ is still policed
+  // by the endpoints it reads through.
+  if (route === 'views') return true;
   // Defensive default: a role we don't know about (a freshly-added
   // class registry entry the SPA hasn't been re-bundled for) sees
   // nothing rather than crashing on `.includes` of undefined.
