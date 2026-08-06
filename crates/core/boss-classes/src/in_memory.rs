@@ -53,6 +53,23 @@ impl ClassRepository for InMemoryClasses {
         }))
     }
 
+    async fn update(&self, class: &Class) -> Result<bool, ClassError> {
+        let mut rows = self.rows.write().expect("rwlock poisoned");
+        match rows
+            .iter_mut()
+            .find(|c| c.subject_kind == class.subject_kind && c.code == class.code)
+        {
+            Some(existing) => {
+                // Key and retirement are not part of the editable body.
+                let retired_at = existing.retired_at;
+                *existing = class.clone();
+                existing.retired_at = retired_at;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     async fn batch_upsert(&self, incoming: &[Class]) -> Result<u64, ClassError> {
         // Mirror the Postgres `ON CONFLICT (subject_kind, code) DO
         // NOTHING`: a row whose composite key already exists is left

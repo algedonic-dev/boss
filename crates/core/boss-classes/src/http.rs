@@ -27,7 +27,10 @@ pub fn router(state: ClassesApiState) -> Router {
         .route("/api/classes/health", get(health))
         .route("/api/classes", get(list_classes))
         .route("/api/classes/batch", post(batch_upsert))
-        .route("/api/classes/{subject_kind}/{code}", get(get_class))
+        .route(
+            "/api/classes/{subject_kind}/{code}",
+            get(get_class).put(update_class),
+        )
         .route(
             "/api/classes/{subject_kind}/{code}/exists",
             get(class_exists),
@@ -75,6 +78,43 @@ async fn get_class(
     match state.classes.get(&class_ref).await {
         Ok(Some(c)) => Json(c).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "no such class").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `PUT /api/classes/{subject_kind}/{code}` — edit an existing Class.
+///
+/// `batch_upsert` is insert-if-absent by design, so that a re-run of a
+/// seed cannot clobber operator edits. The consequence nobody noticed
+/// was that once a Class was seeded, NOTHING could change it: the
+/// registry CLAUDE.md §9 calls tenant-editable data was write-once.
+/// This is the edit path.
+///
+/// The composite key is taken from the URL and never from the body, so
+/// a rename is impossible here — a code is an identity other rows point
+/// at (`employees.role`), and rewriting it in place would orphan them
+/// silently. Renaming is a retire-and-create, deliberately louder.
+async fn update_class(
+    State(state): State<ClassesApiState>,
+    CurrentUser(user): CurrentUser,
+    Path((subject_kind, code)): Path<(String, String)>,
+    Json(body): Json<ClassInput>,
+) -> Response {
+    let sim = boss_core::sim_origin::is_in_sim_chain();
+    let tier_ok = matches!(user.access_tier, AccessTier::Operator);
+    if !(sim || tier_ok) {
+        return (StatusCode::FORBIDDEN, "operator tier required").into_response();
+    }
+
+    let mut class: Class = body.into();
+    // URL wins. A body that disagrees is a caller error, not an
+    // instruction to move the row.
+    class.subject_kind = subject_kind;
+    class.code = code;
+
+    match state.classes.update(&class).await {
+        Ok(true) => Json(class).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such class").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -288,6 +328,146 @@ mod tests {
             b = b.header("x-boss-user", h);
         }
         b.body(axum::body::Body::from(body.to_string())).unwrap()
+    }
+
+    fn put_request(
+        user_header: Option<&str>,
+        subject_kind: &str,
+        code: &str,
+        body: Value,
+    ) -> Request<axum::body::Body> {
+        let mut b = Request::builder()
+            .method("PUT")
+            .uri(format!("/api/classes/{subject_kind}/{code}"))
+            .header("content-type", "application/json");
+        if let Some(h) = user_header {
+            b = b.header("x-boss-user", h);
+        }
+        b.body(axum::body::Body::from(body.to_string())).unwrap()
+    }
+
+    fn seeded() -> Arc<InMemoryClasses> {
+        Arc::new(InMemoryClasses::new(vec![Class {
+            subject_kind: "employee".into(),
+            code: "platform-admin".into(),
+            display_name: "Platform admin".into(),
+            parent_code: None,
+            member_attribute: Some("role".into()),
+            metadata: json!({"is_executive": true, "is_system_role": true}),
+            sort_order: 3,
+            retired_at: None,
+        }]))
+    }
+
+    /// The gap this closes: `batch_upsert` is insert-if-absent, so a
+    /// seeded Class could never be edited by anything. A taxonomy the
+    /// tenant cannot change is not data.
+    #[tokio::test]
+    async fn put_edits_an_existing_class() {
+        let repo = seeded();
+        let app = router(ClassesApiState {
+            classes: repo.clone(),
+        });
+        let resp = app
+            .oneshot(put_request(
+                Some(&operator_header()),
+                "employee",
+                "platform-admin",
+                json!({
+                    "subject_kind": "employee",
+                    "code": "platform-admin",
+                    "display_name": "Platform admin",
+                    "member_attribute": "role",
+                    "sort_order": 3,
+                    "metadata": {"is_system_role": true}
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let stored = repo
+            .get(&ClassRef::new("employee", "platform-admin"))
+            .await
+            .unwrap()
+            .expect("row still present");
+        assert_eq!(stored.metadata, json!({"is_system_role": true}));
+    }
+
+    /// The key comes from the URL, never the body. A code is an
+    /// identity other rows point at, so honouring a body that
+    /// disagreed would move the row and orphan them silently.
+    #[tokio::test]
+    async fn put_ignores_a_key_in_the_body() {
+        let repo = seeded();
+        let app = router(ClassesApiState {
+            classes: repo.clone(),
+        });
+        let resp = app
+            .oneshot(put_request(
+                Some(&operator_header()),
+                "employee",
+                "platform-admin",
+                json!({
+                    "subject_kind": "vendor",
+                    "code": "somebody-else",
+                    "display_name": "Renamed",
+                    "member_attribute": "role",
+                    "sort_order": 3,
+                    "metadata": {}
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(
+            repo.get(&ClassRef::new("vendor", "somebody-else"))
+                .await
+                .unwrap()
+                .is_none(),
+            "a body key must not create or move a row"
+        );
+        let stored = repo
+            .get(&ClassRef::new("employee", "platform-admin"))
+            .await
+            .unwrap()
+            .expect("original row edited in place");
+        assert_eq!(stored.display_name, "Renamed");
+    }
+
+    #[tokio::test]
+    async fn put_on_a_missing_class_is_not_found() {
+        let app = router(ClassesApiState {
+            classes: Arc::new(InMemoryClasses::new(vec![])),
+        });
+        let resp = app
+            .oneshot(put_request(
+                Some(&operator_header()),
+                "employee",
+                "ghost",
+                json!({"subject_kind": "employee", "code": "ghost", "display_name": "Ghost", "member_attribute": "role", "sort_order": 1, "metadata": {}}),
+            ))
+            .await
+            .unwrap();
+        // Not an implicit create: PUT here edits, and a silent insert
+        // would let a typo'd code become a real Class.
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn put_requires_operator_tier() {
+        let app = router(ClassesApiState { classes: seeded() });
+        let resp = app
+            .oneshot(put_request(
+                None,
+                "employee",
+                "platform-admin",
+                json!({"subject_kind": "employee", "code": "platform-admin", "display_name": "x", "member_attribute": "role", "sort_order": 3, "metadata": {}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

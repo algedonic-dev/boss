@@ -95,6 +95,31 @@ impl ClassRepository for PgClasses {
         Ok(exists)
     }
 
+    async fn update(&self, class: &Class) -> Result<bool, ClassError> {
+        // The composite key is deliberately absent from the SET list:
+        // a code is an identity other rows point at, so renaming it in
+        // place would orphan them silently. `retired_at` is likewise
+        // untouched — retiring a Class is its own action, not a side
+        // effect of editing a label.
+        let result = sqlx::query(
+            "UPDATE classes SET \
+             display_name = $3, parent_code = $4, member_attribute = $5, \
+             metadata = $6, sort_order = $7, updated_at = now() \
+             WHERE subject_kind = $1 AND code = $2",
+        )
+        .bind(&class.subject_kind)
+        .bind(&class.code)
+        .bind(&class.display_name)
+        .bind(&class.parent_code)
+        .bind(&class.member_attribute)
+        .bind(&class.metadata)
+        .bind(class.sort_order)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ClassError::Storage(e.to_string()))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn batch_upsert(&self, rows: &[Class]) -> Result<u64, ClassError> {
         // One `ON CONFLICT DO NOTHING` per row inside a single
         // transaction, mirroring the idempotent semantics of the seed

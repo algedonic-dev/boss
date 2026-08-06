@@ -59,4 +59,20 @@ pub trait ClassRepository: Send + Sync {
     /// and `boss-rebuild-all` never rebuilds or truncates it — so this
     /// write goes straight to the table without emitting an event.
     async fn batch_upsert(&self, rows: &[Class]) -> Result<u64, ClassError>;
+
+    /// Replace an existing Class's editable body — display name,
+    /// parent, member attribute, metadata, sort order. Returns `false`
+    /// if no row matches the composite key; the key itself is never
+    /// rewritten, because a code is an identity that other rows point
+    /// at (`employees.role`, `subject_edges.target_kind`) and renaming
+    /// it in place would silently orphan them.
+    ///
+    /// Distinct from `batch_upsert` on purpose. That one is
+    /// insert-if-absent by design — re-running a seed must not clobber
+    /// operator edits — which also meant nothing could edit a Class at
+    /// all once seeded. A registry the tenant cannot change is not
+    /// data, it is a hardcoded list with extra steps, and the whole
+    /// point of the Class registry (CLAUDE.md §9) is that taxonomies
+    /// are tenant-editable without forking core.
+    async fn update(&self, class: &Class) -> Result<bool, ClassError>;
 }
