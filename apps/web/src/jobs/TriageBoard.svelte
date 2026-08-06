@@ -66,6 +66,7 @@
   let me = $derived(session.value.kind === 'ready' ? session.value.user.id : '');
 
   const WAITING = '__waiting__';
+  const CLOSED = '__closed__';
 
   /// The step a Job is parked on: the one gated on human authority.
   /// Found by that property rather than by matching a step kind —
@@ -81,10 +82,20 @@
   /// The fork step ON A JOB — the gated step that asks for a
   /// disposition. Identified by carrying the enum field, so it stays
   /// correct if the spec renames or reorders steps.
+  ///
+  /// Falls back to the gated step when the Job has no field-bearing
+  /// one. That is not defensive padding: a Job materialises its steps
+  /// at open and keeps them, so Jobs opened before the fork existed
+  /// carry the old shape forever. Without the fallback their cards
+  /// render but every control silently does nothing, which is the
+  /// worst failure available — the board would look fine and refuse
+  /// to work.
   function forkStep(j: Job): Step | undefined {
     const field = fork?.field;
-    if (!field) return gatedStep(j);
-    return j.steps?.find((s) => s.fields?.some((f) => f.name === field));
+    const byField = field
+      ? j.steps?.find((s) => s.fields?.some((f) => f.name === field))
+      : undefined;
+    return byField ?? gatedStep(j);
   }
 
   function isTerminal(s: Step | undefined): boolean {
@@ -101,28 +112,37 @@
     return typeof v === 'string' ? v : null;
   }
 
+  let routeIds = $derived(new Set((fork?.options ?? []).map((o) => o.value)));
+
   /// Which column a Job sits in — derived, never stored. Untriaged
   /// items wait; triaged ones sit under the route they were sent to.
+  ///
+  /// A triaged item whose disposition is not a current route lands in
+  /// `CLOSED` rather than vanishing: Jobs opened before the fork have
+  /// no disposition at all, and a route the registry later drops would
+  /// otherwise take its cards off the board with it.
   function columnOf(j: Job): string {
     const s = forkStep(j);
     if (!isTerminal(s)) return WAITING;
     const chosen = fork ? s?.metadata?.[fork.field] : undefined;
-    return typeof chosen === 'string' ? chosen : 'done';
+    return typeof chosen === 'string' && routeIds.has(chosen) ? chosen : CLOSED;
   }
 
   let columns = $derived.by(() => {
-    const head = [{ id: WAITING, label: 'Waiting on triage', hint: 'Nobody has routed these yet.' }];
-    if (!fork) {
-      return [...head, { id: 'done', label: 'Done', hint: 'Closed out.' }];
-    }
-    return [
-      ...head,
-      ...fork.options.map((o) => ({
-        id: o.value,
-        label: o.label,
-        hint: `Routed here at triage.`,
-      })),
+    const head = [
+      { id: WAITING, label: 'Waiting on triage', hint: 'Nobody has routed these yet.' },
     ];
+    const routes = (fork?.options ?? []).map((o) => ({
+      id: o.value,
+      label: o.label,
+      hint: 'Routed here at triage.',
+    }));
+    // Only shown when something is in it — an always-empty trailing
+    // column is noise on a board that already scrolls.
+    const closed = jobs.some((j) => columnOf(j) === CLOSED)
+      ? [{ id: CLOSED, label: 'Closed', hint: 'Triaged before these routes existed, or closed outright.' }]
+      : [];
+    return [...head, ...routes, ...closed];
   });
 
   let byColumn = $derived.by(() => {
@@ -258,7 +278,9 @@
   /// un-complete, so a routed card cannot be re-routed by dragging —
   /// offering a gesture that silently did nothing would be worse than
   /// offering none.
-  const canDrag = (j: Job): boolean => columnOf(j) === WAITING;
+  /// No routes means nothing to drag TO, so the card does not lift and
+  /// the buttons are the only path.
+  const canDrag = (j: Job): boolean => routeIds.size > 0 && columnOf(j) === WAITING;
 
   function startDrag(e: DragEvent, j: Job): void {
     if (!canDrag(j)) return;
@@ -272,8 +294,10 @@
     dragOver = null;
   }
 
-  /// Every column except `waiting` is a route a lifted card can take.
-  const isDropTarget = (col: string): boolean => dragging !== null && col !== WAITING;
+  /// Only real routes accept a drop. `Closed` is a place cards END UP,
+  /// not a decision anyone can make, so it must not advertise itself
+  /// as a target and then quietly ignore the drop.
+  const isDropTarget = (col: string): boolean => dragging !== null && routeIds.has(col);
 
   function onDragOver(e: DragEvent, col: string): void {
     if (!isDropTarget(col)) return;

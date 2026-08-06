@@ -227,6 +227,58 @@ test.describe('feedback triage board', () => {
     await expect(waiting).toHaveAttribute('draggable', 'true');
   });
 
+  // A Job materialises its steps at open and keeps them, so Jobs
+  // opened before the fork existed carry the old shape forever — a
+  // gated triage step with no `disposition` field. They must stay
+  // routable. Without a fallback the board renders their cards and
+  // every control silently does nothing, which is the worst failure
+  // available: it looks fine and refuses to work.
+  test('items opened before the fork existed are still routable', async ({ page }) => {
+    const legacy = {
+      ...job('fb-legacy', 'Filed before the fork', { status: 'ready' }),
+      steps: [
+        { id: 'fb-legacy-t', kind: 'trigger', status: 'completed', fields: [], metadata: {} },
+        {
+          id: 'fb-legacy-a',
+          kind: 'task',
+          status: 'ready',
+          fields: [], // the pre-fork shape
+          metadata: { authority_role: 'platform-admin' },
+        },
+        { id: 'fb-legacy-o', kind: 'outcome', status: 'pending', fields: [], metadata: {} },
+      ],
+    };
+    await page.route(/\/api\/jobs\?kind=user-feedback/, (r) =>
+      r.fulfill({ json: { data: [legacy], total: 1 } }),
+    );
+
+    let body: Record<string, unknown> | null = null;
+    let url = '';
+    await page.route(/\/api\/jobs\/[^/]+\/steps\/[^/]+$/, async (route) => {
+      if (route.request().method() !== 'PUT') return route.fallback();
+      url = route.request().url();
+      body = route.request().postDataJSON() as Record<string, unknown>;
+      return route.fulfill({ json: {} });
+    });
+
+    await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
+
+    const card = page.locator('article', { hasText: 'Filed before the fork' });
+    await expect(page.locator('section[aria-label="Waiting on triage"]')).toContainText(
+      'Filed before the fork',
+    );
+    await card.getByLabel('Route this item').selectOption('decline');
+    await card.getByRole('button', { name: /^route$/i }).click();
+
+    await expect.poll(() => body !== null).toBe(true);
+    // It targets the gated step it does have, and still records the
+    // decision rather than closing anonymously.
+    expect(url).toContain('fb-legacy-a');
+    const sent = body as unknown as { status: string; metadata: Record<string, unknown> };
+    expect(sent.status).toBe('completed');
+    expect(sent.metadata['disposition']).toBe('decline');
+  });
+
   test('handing to an agent records a durable request without deciding', async ({ page }) => {
     let body: Record<string, unknown> | null = null;
     await page.route(/\/api\/jobs\/[^/]+\/steps\/[^/]+$/, async (route) => {
