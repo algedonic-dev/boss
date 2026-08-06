@@ -167,7 +167,12 @@ code. Ordered by what to reach for first.
       and Events — three of the four primitives. Steps is 160,254 rows
       and is where work state lives; "my ready steps" cannot be
       expressed as a View.
-- [ ] **F2 — Views' other two sources are still capped.** Only
+- [x] **F2 — Views' other two sources are still capped.** Done
+      2026-08-06 (#189): `jobs` and `subjects` have pushdown
+      descriptors, so all four sources narrow in the database. Every
+      pushable job column is already indexed; `subjects` is keyed
+      `(kind, id)` and both are TEXT, so a filter on either rides the
+      primary key. Original finding: Only
       `events` received a projection in #186. `subjects` and `jobs`
       still read base tables under the 5,000-row scan with no
       pushdown, carrying the same silent-truncation behaviour `events`

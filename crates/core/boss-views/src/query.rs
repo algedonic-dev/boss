@@ -93,6 +93,52 @@ pub const STEP_PUSHABLE: crate::pushdown::PushableColumns = &[
     ),
 ];
 
+/// Filter fields the `jobs` source can push into SQL.
+///
+/// Every one is indexed — `jobs_kind`, `jobs_status`, `jobs_owner`,
+/// `jobs_subject (subject_kind, subject_id)` — so a narrowed View is
+/// an index scan rather than the newest-N slice it used to be. `id`
+/// is absent: uuid, and only text literals are pushed.
+pub const JOB_PUSHABLE: crate::pushdown::PushableColumns = &[
+    ("kind", "kind", crate::pushdown::ColumnType::Text),
+    ("status", "status", crate::pushdown::ColumnType::Text),
+    ("owner_id", "owner_id", crate::pushdown::ColumnType::Text),
+    (
+        "subject_kind",
+        "subject_kind",
+        crate::pushdown::ColumnType::Text,
+    ),
+    (
+        "subject_id",
+        "subject_id",
+        crate::pushdown::ColumnType::Text,
+    ),
+    ("priority", "priority", crate::pushdown::ColumnType::Text),
+    (
+        "created_at",
+        "created_at",
+        crate::pushdown::ColumnType::Timestamp,
+    ),
+];
+
+/// Filter fields the `subjects` source can push into SQL.
+///
+/// `subjects` is keyed `(kind, id)` and both are TEXT, so a filter on
+/// either rides the primary key. This is the source the cap bit
+/// hardest: at 133,933 rows a 5,000-row scan reached under 4% of the
+/// identity layer, and a View for a Subject created before that window
+/// simply reported nothing.
+pub const SUBJECT_PUSHABLE: crate::pushdown::PushableColumns = &[
+    ("kind", "kind", crate::pushdown::ColumnType::Text),
+    ("id", "id", crate::pushdown::ColumnType::Text),
+    ("label", "label", crate::pushdown::ColumnType::Text),
+    (
+        "created_at",
+        "created_at",
+        crate::pushdown::ColumnType::Timestamp,
+    ),
+];
+
 /// How many candidate rows a single View may scan before it stops.
 ///
 /// The filter runs in this process, so the scan has to be bounded by
@@ -238,14 +284,28 @@ impl PgViewResolver {
         }
         match source {
             ViewSource::Subjects => {
-                let rows = sqlx::query(
-                    "SELECT kind, id, label, created_at, retired_at \
-                     FROM subjects ORDER BY created_at DESC LIMIT $1",
-                )
-                .bind(SCAN_CEILING)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(storage)?;
+                // No scope clause on this source — `subject` access is
+                // all-or-nothing and already resolved above — so
+                // pushdown placeholders start at $2.
+                let mut sql =
+                    String::from("SELECT kind, id, label, created_at, retired_at FROM subjects");
+                let mut binds: Vec<crate::pushdown::Bound> = Vec::new();
+                if let Some(p) = pushdown {
+                    let mut next = 2usize;
+                    sql.push_str(" WHERE ");
+                    sql.push_str(&p.to_sql(&mut next, &mut binds));
+                }
+                sql.push_str(" ORDER BY created_at DESC LIMIT $1");
+
+                let mut q = sqlx::query(&sql).bind(SCAN_CEILING);
+                for b in &binds {
+                    q = match b {
+                        crate::pushdown::Bound::Text(s) => q.bind(s.clone()),
+                        crate::pushdown::Bound::TextList(v) => q.bind(v.clone()),
+                        crate::pushdown::Bound::Timestamp(ts) => q.bind(*ts),
+                    };
+                }
+                let rows = q.fetch_all(&self.pool).await.map_err(storage)?;
                 rows.iter()
                     .map(|r| {
                         Ok(json!({
@@ -267,18 +327,30 @@ impl PgViewResolver {
                     SourceScope::Owners(ids) => Some(ids.clone()),
                     _ => None,
                 };
-                let rows = sqlx::query(
+                let mut sql = String::from(
                     "SELECT id, kind, subject_kind, subject_id, title, owner_id, status, \
                             priority, opened_on, closed_on, tags, created_at \
                      FROM jobs \
-                     WHERE ($2::text[] IS NULL OR owner_id = ANY($2)) \
-                     ORDER BY created_at DESC LIMIT $1",
-                )
-                .bind(SCAN_CEILING)
-                .bind(owners.as_deref())
-                .fetch_all(&self.pool)
-                .await
-                .map_err(storage)?;
+                     WHERE ($2::text[] IS NULL OR owner_id = ANY($2))",
+                );
+                let mut binds: Vec<crate::pushdown::Bound> = Vec::new();
+                if let Some(p) = pushdown {
+                    // $1 is the limit and $2 the owner scope.
+                    let mut next = 3usize;
+                    sql.push_str(" AND ");
+                    sql.push_str(&p.to_sql(&mut next, &mut binds));
+                }
+                sql.push_str(" ORDER BY created_at DESC LIMIT $1");
+
+                let mut q = sqlx::query(&sql).bind(SCAN_CEILING).bind(owners.as_deref());
+                for b in &binds {
+                    q = match b {
+                        crate::pushdown::Bound::Text(s) => q.bind(s.clone()),
+                        crate::pushdown::Bound::TextList(v) => q.bind(v.clone()),
+                        crate::pushdown::Bound::Timestamp(ts) => q.bind(*ts),
+                    };
+                }
+                let rows = q.fetch_all(&self.pool).await.map_err(storage)?;
                 rows.iter()
                     .map(|r| {
                         Ok(json!({
@@ -446,9 +518,9 @@ impl ViewResolver for PgViewResolver {
         let pushdown = match (&compiled, view.source) {
             (Some(expr), ViewSource::Events) => crate::pushdown::extract(expr, EVENT_PUSHABLE),
             (Some(expr), ViewSource::Steps) => crate::pushdown::extract(expr, STEP_PUSHABLE),
-            // jobs + subjects still read their base tables with no
-            // pushdown; they get descriptors when someone needs them
-            // (TODO.md F2).
+            (Some(expr), ViewSource::Jobs) => crate::pushdown::extract(expr, JOB_PUSHABLE),
+            (Some(expr), ViewSource::Subjects) => crate::pushdown::extract(expr, SUBJECT_PUSHABLE),
+            // No filter, or a filter that parsed to nothing pushable.
             _ => None,
         };
         // Scope is computed from the CALLER, not the View's author: a
