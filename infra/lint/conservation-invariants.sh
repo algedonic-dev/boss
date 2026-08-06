@@ -649,7 +649,13 @@ SQL
 # aggregation that breaks the equation fires here.
 echo
 LEDGER_BASE="${LEDGER_BASE:-http://127.0.0.1:7080}"
-bs_response=$(curl -sS --fail "$LEDGER_BASE/api/ledger/balance-sheet" 2>&1) || {
+# `/api/ledger/*` is policy-gated (a `ledger` read grant), so this
+# sweep has to present an identity like any other reader. It used to
+# call bare, which stopped working the day the gate landed and turned
+# a real invariant into a permanently-erroring check — a sweep that
+# always errors is a sweep nobody reads.
+LEDGER_READER='{"id":"automation:conservation-sweep","role":"audit-readonly","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
+bs_response=$(curl -sS --fail -H "x-boss-user: $LEDGER_READER" "$LEDGER_BASE/api/ledger/balance-sheet" 2>&1) || {
     echo "[ERROR] S. Balance-sheet endpoint — fetch failed:"
     echo "$bs_response" | sed 's/^/    /'
     violations=$((violations + 1))

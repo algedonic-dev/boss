@@ -10,7 +10,7 @@
 //! ready step — no role-wide fan-out. Steps with no `authority_role`
 //! (generic / outcome kinds an operator picks off a queue) are a no-op.
 
-use super::common::{StepEvent, dispatcher_actor_header};
+use super::common::{StepEvent, dispatcher_actor_header, dispatcher_reader_header};
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::Value;
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
@@ -88,6 +88,7 @@ impl Handler for MessagesNotify {
         let resp = self
             .client
             .get(&people_url)
+            .header("x-boss-user", dispatcher_reader_header())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {people_url}: {e}")))?;

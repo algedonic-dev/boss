@@ -110,6 +110,27 @@ pub(crate) fn overhead_source_id(step_id: &str, credit_account: &str) -> String 
 /// API calls. Per the rule-as-actor model in the dispatcher design
 /// doc: every dispatcher-fired event names the rule as actor, with
 /// `executed_by = automation:dispatcher` distinct from `actor`.
+/// The dispatcher's identity for a READ.
+///
+/// Writes stamp the specific rule (`dispatcher_actor_header`) because
+/// the rule is provenance on the event that results. A read produces
+/// no event, so the honest actor is the dispatcher itself — and a
+/// read still has to present SOMEBODY, or it breaks the day the
+/// service it calls grows a policy gate. That is not hypothetical:
+/// one unstamped ledger read halted the whole WIP→FG→COGS chain when
+/// `/api/ledger/*` became gated.
+pub fn dispatcher_reader_header() -> String {
+    serde_json::json!({
+        "id": "automation:dispatcher",
+        "role": "platform-admin",
+        "access_tier": "operator",
+        "territory_account_ids": [],
+        "direct_report_ids": [],
+        "department": "platform",
+    })
+    .to_string()
+}
+
 pub fn dispatcher_actor_header(rule_name: &str) -> String {
     serde_json::json!({
         "id": format!("rule:{}", rule_name),

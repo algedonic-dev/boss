@@ -32,7 +32,7 @@ use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext, 
 use serde_json::json;
 use std::sync::Arc;
 
-use super::common::dispatcher_actor_header;
+use super::common::{dispatcher_actor_header, dispatcher_reader_header};
 
 pub struct JobsSubjobResolve {
     client: reqwest::Client,
@@ -65,6 +65,7 @@ impl JobsSubjobResolve {
         let resp = self
             .client
             .get(&url)
+            .header("x-boss-user", dispatcher_reader_header())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;

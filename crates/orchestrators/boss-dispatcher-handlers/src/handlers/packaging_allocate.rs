@@ -53,7 +53,7 @@ use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 use serde_json::{Value as JsonValue, json};
 use std::sync::Arc;
 
-use super::common::{StepEvent, dispatcher_actor_header};
+use super::common::{StepEvent, dispatcher_actor_header, dispatcher_reader_header};
 
 /// One finished-good format a brewed batch can be packaged into. All
 /// fields come from the allocation step's seed metadata + a live stock
@@ -175,6 +175,7 @@ impl PackagingAllocate {
         let resp = self
             .client
             .get(&url)
+            .header("x-boss-user", dispatcher_reader_header())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
@@ -197,6 +198,7 @@ impl PackagingAllocate {
         let resp = self
             .client
             .get(&url)
+            .header("x-boss-user", dispatcher_reader_header())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
@@ -223,6 +225,7 @@ impl PackagingAllocate {
         let resp = self
             .client
             .get(&url)
+            .header("x-boss-user", dispatcher_reader_header())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;

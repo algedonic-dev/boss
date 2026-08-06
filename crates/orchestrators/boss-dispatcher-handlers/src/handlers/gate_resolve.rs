@@ -28,7 +28,7 @@ use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::common::{StepEvent, dispatcher_actor_header};
+use super::common::{StepEvent, dispatcher_actor_header, dispatcher_reader_header};
 
 pub struct GateResolve {
     client: reqwest::Client,
@@ -86,6 +86,7 @@ impl GateResolve {
         let resp = self
             .client
             .get(&url)
+            .header("x-boss-user", dispatcher_reader_header())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
@@ -115,6 +116,7 @@ impl GateResolve {
         let resp = self
             .client
             .get(&url)
+            .header("x-boss-user", dispatcher_reader_header())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
@@ -146,6 +148,7 @@ impl GateResolve {
         let resp = self
             .client
             .get(&url)
+            .header("x-boss-user", dispatcher_reader_header())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
