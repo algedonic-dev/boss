@@ -46,21 +46,51 @@ def agent_request(job):
             return md
     return None
 
+# The step that asks for a disposition. Found by the enum field it
+# declares, which is the same data the board reads — not a second copy
+# of the rule for which step is the triage step. A pipe-shaped
+# field_type IS the fork marker; the JobKind lint reads it the same way
+# to prove every value has a successor.
+#
+# NOTE: this whole program is embedded in a double-quoted shell string,
+# so a literal double quote here silently truncates it. That is exactly
+# how this function broke on first write.
+def fork_step(job):
+    for s in job.get('steps', []):
+        for f in s.get('fields') or []:
+            if f.get('required') and '|' in (f.get('field_type') or ''):
+                return s, f['name']
+    # Jobs opened before the fork existed keep their old steps forever
+    # — a gated step with no disposition field. Same fallback the board
+    # uses, for the same reason: without it a routed legacy item reads
+    # as still waiting, which is a queue reader lying about the queue.
+    for s in job.get('steps', []):
+        if (s.get('metadata') or {}).get('authority_role'):
+            return s, 'disposition'
+    return None, None
+
 def column(job):
-    # The Job's own status is the authority on whether it is finished
-    # — no step-kind knowledge required, and it cannot disagree with
-    # the Job the way a re-derived guess can.
+    # A routed item is NOT waiting. Reporting it as waiting is how this
+    # script hid two in-flight items during a triage session — the
+    # opposite of what a queue reader is for.
     if job.get('status') == 'closed':
         return 'done'
+    step, field = fork_step(job)
+    if step and step.get('status') in ('completed', 'skipped'):
+        chosen = (step.get('metadata') or {}).get(field)
+        return f'routed:{chosen}' if chosen else 'routed'
     return 'with-agent' if agent_request(job) else 'waiting'
 
 buckets = {'waiting': [], 'with-agent': [], 'done': []}
 for j in rows:
-    buckets[column(j)].append(j)
+    buckets.setdefault(column(j), []).append(j)
 
-order = ['waiting', 'with-agent', 'done'] if want == 'all' else [want]
+# Routed buckets are discovered from the data, so a new disposition in
+# the registry shows up here without editing this script.
+routed = sorted(k for k in buckets if k.startswith('routed'))
+order = ['waiting', 'with-agent'] + routed + ['done'] if want == 'all' else [want]
 if want != 'all' and want not in buckets:
-    sys.exit(f'unknown column {want!r} — waiting | with-agent | done')
+    sys.exit(f'unknown column {want!r} — one of: ' + ', '.join(sorted(buckets)))
 
 for col in order:
     items = buckets[col]
