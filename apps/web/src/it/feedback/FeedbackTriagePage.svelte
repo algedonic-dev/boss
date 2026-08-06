@@ -51,8 +51,24 @@
   let me = $derived(session.value.kind === 'ready' ? session.value.user.id : '');
 
   /// The triage step is where a feedback Job lives until someone acts.
+  ///
+  /// Found by the PROPERTY that makes it wait for a person — an
+  /// `authority_role` on the step — rather than by its kind name. Kind
+  /// names are registry data and a kind is a bundle of properties, so
+  /// matching one here would hardcode today's spelling of a spec the
+  /// registry is free to re-author (architecture-decisions.md §Step
+  /// types are property bundles; `infra/lint/no-step-kind-match.sh`).
+  ///
+  /// It also states the real dependency. This board exists to show
+  /// work parked on an authorized human; if the spec swapped
+  /// `acknowledgment` for another kind the board would still be
+  /// correct, and if it dropped the authority gate the board SHOULD
+  /// break loudly, because the sim workforce would then be closing
+  /// feedback nobody read.
   function triageStep(j: FeedbackJob): Step | undefined {
-    return j.steps?.find((s) => s.kind === 'acknowledgment');
+    return j.steps?.find(
+      (s) => (s.metadata as Record<string, unknown> | undefined)?.['authority_role'],
+    );
   }
 
   /// Which column a Job belongs in — derived from the step, never
@@ -111,6 +127,11 @@
   /// PUT semantics on a step are read-overlay-write, and top-level
   /// metadata is replaced wholesale — so merge with what is already
   /// there or the other keys are wiped.
+  ///
+  /// The merge is load-bearing, not hygiene: `authority_role` lives in
+  /// this same metadata and is how `triageStep` finds the step at all.
+  /// A write that replaced metadata instead of merging would make the
+  /// card vanish from the board on its first hand-off.
   async function patchStep(
     j: FeedbackJob,
     patch: Record<string, unknown>,

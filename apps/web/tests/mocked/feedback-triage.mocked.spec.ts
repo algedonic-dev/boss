@@ -17,7 +17,7 @@ const MANIFEST = { display_name: 'Algedonic Ales', modules: {}, labels: {} };
 function job(
   id: string,
   message: string,
-  triage: { status: string; metadata?: Record<string, unknown> },
+  triage: { status: string; metadata?: Record<string, unknown>; kind?: string },
 ) {
   return {
     id,
@@ -32,9 +32,14 @@ function job(
       { id: `${id}-t`, kind: 'trigger', status: 'completed' },
       {
         id: `${id}-a`,
-        kind: 'acknowledgment',
+        // `authority_role` is what the JobKind puts on this step to
+        // keep it waiting for a person, and it is how the board finds
+        // the step — so the fixture carries it exactly as a real Job
+        // does. Omitting it here would make every card read as
+        // triaged, which is the failure the board must not have.
+        kind: triage.kind ?? 'acknowledgment',
         status: triage.status,
-        metadata: triage.metadata ?? {},
+        metadata: { authority_role: 'platform-admin', ...(triage.metadata ?? {}) },
       },
       { id: `${id}-o`, kind: 'outcome', status: 'pending' },
     ],
@@ -70,6 +75,30 @@ test.describe('feedback triage board', () => {
     // recorded agent request, which is the only difference.
     await expect(withAgent).toContainText('Typo on the vendors page');
     await expect(done).toContainText('Already handled');
+  });
+
+  // What the board actually depends on is the authority gate, not the
+  // spelling of the step kind. Kinds are registry data and a kind is a
+  // bundle of properties, so the registry is free to re-author this
+  // spec onto a different one; the board must keep sorting when it
+  // does. Pinning it here is what stops the kind name creeping back
+  // in as a lookup.
+  test('sorts by the authority gate, not the step kind name', async ({ page }) => {
+    const renamed = [
+      job('fb-renamed', 'Still needs a person', { status: 'ready', kind: 'sign-off' }),
+    ];
+    await page.route(/\/api\/jobs\?kind=user-feedback/, (r) =>
+      r.fulfill({ json: { data: renamed, total: renamed.length } }),
+    );
+
+    await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
+
+    await expect(page.locator('section[aria-label="Waiting on triage"]')).toContainText(
+      'Still needs a person',
+    );
+    await expect(page.locator('section[aria-label="Triaged"]')).not.toContainText(
+      'Still needs a person',
+    );
   });
 
   test('handing to an agent records a durable request on the step', async ({ page }) => {
