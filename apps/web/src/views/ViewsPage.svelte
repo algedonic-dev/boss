@@ -46,8 +46,11 @@
   /// Mirrors query.rs SCAN_CEILING — shown, not enforced, here.
   const SCAN_CEILING_LABEL = '5,000';
   /// Mirrors EVENT_PUSHABLE in query.rs.
-  const PUSHABLE_LABEL =
-    'kind, source, subject_kind, subject_id, or a timestamp range';
+  /// Mirrors EVENT_PUSHABLE / STEP_PUSHABLE in query.rs.
+  const PUSHABLE_BY_SOURCE: Readonly<Record<string, string>> = {
+    events: 'kind, source, subject_kind, subject_id, or a timestamp range',
+    steps: 'status, kind or assignee_id',
+  };
 
   let viewerId = $derived(session.value.kind === 'ready' ? session.value.user.id : '');
   let availableFields = $derived(SOURCE_FIELDS[draftSource]);
@@ -177,6 +180,7 @@
       <span>Source</span>
       <select bind:value={draftSource}>
         <option value="jobs">Jobs — the work</option>
+        <option value="steps">Steps — what the work is made of</option>
         <option value="subjects">Subjects — the things work is about</option>
         <option value="events">Events — what happened</option>
       </select>
@@ -288,7 +292,7 @@
             <strong class="v-trunc">
               — this filter could not be narrowed in the database, so only the
               newest {SCAN_CEILING_LABEL} events were examined. Older matches are
-              not counted. Filtering on {PUSHABLE_LABEL} narrows it.
+              not counted. Filtering on {PUSHABLE_BY_SOURCE[v.source] ?? 'a different field'} narrows it.
             </strong>
           {:else if res.truncated}
             <strong class="v-trunc">

@@ -131,6 +131,11 @@ else
         # Mirrors the PortSpec in boss-ports; the two lists are kept
         # in step by hand, per that crate's header.
         "search:7960"
+        # observability:7880 + simulator:7010 were in the port registry
+        # and missing here — caught by the agreement test in
+        # boss-ports, which is the point of that test existing.
+        "observability:7880"
+        "simulator:7010"
         # views:7961 — the View registry + the endpoint that runs one
         # (boss-views). Same hand-kept pairing with boss-ports.
         "views:7961"
@@ -164,6 +169,10 @@ TIMERS=(
     "boss-ml-inference-batch:ml"
     "boss-conservation-invariants:lint"
     "boss-files-gc:."
+    # event_facts is a projection of audit_log with no other refresh
+    # path — before this it only moved on a full boss-rebuild-all, and
+    # sat tens of thousands of events behind on a live box.
+    "boss-views-catchup:."
     # boss-backup deferred — backup script destination + retention
     # policy needs review before enabling on a fresh deploy.
 )

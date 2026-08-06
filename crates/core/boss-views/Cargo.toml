@@ -9,6 +9,11 @@ name = "boss-views-api"
 path = "src/bin/boss_views_api.rs"
 required-features = ["postgres"]
 
+[[bin]]
+name = "boss-views-catchup"
+path = "src/bin/boss_views_catchup.rs"
+required-features = ["postgres"]
+
 [features]
 default = ["postgres"]
 postgres = ["dep:sqlx"]

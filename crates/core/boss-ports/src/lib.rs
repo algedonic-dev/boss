@@ -345,3 +345,82 @@ mod tests {
         assert_eq!(prod("policy"), 7250);
     }
 }
+
+#[cfg(test)]
+mod deploy_fallback_agreement {
+    use super::{PAIRED, SOLO};
+
+    /// `deploy-services.sh` derives its service lists from this crate
+    /// via `boss-ports-list`, but carries hardcoded fallback arrays for
+    /// the case where that binary has not been built. Two copies of one
+    /// fact, kept in step by a comment — and they drifted:
+    /// `observability` and `simulator` reached the registry and never
+    /// reached the fallback, so a deploy from a machine without the
+    /// binary would silently skip two services with nothing to say so.
+    ///
+    /// This is the third instance of the pattern found in one session
+    /// (the others: `manifest.txt` vs `SCHEMA_FILES`, and
+    /// `MODEL_ROUTES` vs `MODEL_KINDS`). A fact that lives twice gets
+    /// an equality test; that is the convention this encodes.
+    ///
+    /// `sim-control` is the one legitimate absence: it is the sim
+    /// daemon's embedded port, alive only while the daemon runs, and
+    /// the script filters it out of the derived list at the source.
+    const DEPLOY_SH: &str = include_str!("../../../../infra/deploy-services.sh");
+
+    /// Pull `NAME=( "a:1" "b:2" )` entries out of the fallback block.
+    fn fallback_entries(array_name: &str) -> Vec<String> {
+        let start = DEPLOY_SH
+            .find(&format!("{array_name}=("))
+            .unwrap_or_else(|| panic!("{array_name} not found in deploy-services.sh"));
+        let rest = &DEPLOY_SH[start..];
+        let end = rest.find("\n    )").expect("array terminator");
+        rest[..end]
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                l.strip_prefix('"')
+                    .and_then(|l| l.strip_suffix('"'))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn solo_fallback_matches_the_registry() {
+        let mut expected: Vec<String> = SOLO
+            .iter()
+            .filter(|s| s.name != "sim-control")
+            .map(|s| format!("{}:{}", s.name, s.prod))
+            .collect();
+        let mut actual = fallback_entries("SOLO_SERVICES");
+        expected.sort();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "deploy-services.sh SOLO_SERVICES has drifted from boss-ports"
+        );
+    }
+
+    #[test]
+    fn paired_fallback_matches_the_registry() {
+        let mut expected: Vec<String> = PAIRED
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}:{}:{}",
+                    s.name,
+                    s.prod,
+                    s.scratch.expect("a paired service has a scratch port")
+                )
+            })
+            .collect();
+        let mut actual = fallback_entries("PAIRED_SERVICES");
+        expected.sort();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "deploy-services.sh PAIRED_SERVICES has drifted from boss-ports"
+        );
+    }
+}

@@ -186,11 +186,11 @@ pub fn seed_brewery_subjects(state: &mut ShapeDrivenState) {
     for i in 0..50 {
         state.seed_subject("account", &format!("acc-bigseed-{i:04}"));
     }
-    // Keep in sync with boss_brewery_data_seed::VENDOR_COUNT — the
-    // auto-restock vendor resolver can pick any seeded vendor (incl.
-    // the packaging supplier at index 12), and each must be a Subject
-    // so the restock Job's subject resolves.
-    for i in 0..13 {
+    // The auto-restock vendor resolver can pick any seeded vendor
+    // (incl. the packaging supplier at index 12), and each must be a
+    // Subject so the restock Job's subject resolves. Reads the seed's
+    // own constant rather than repeating the number.
+    for i in 0..crate::prepare::tenant_data::VENDOR_COUNT {
         state.seed_subject("vendor", &format!("vnd-bigseed-{i:03}"));
     }
     // Campaign Subjects for the tap-launch + seasonal-release

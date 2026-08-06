@@ -1,7 +1,7 @@
 // Wire types for Views. Mirrors crates/core/boss-views/src/types.rs;
 // deserialized once, here, at the fetch call site.
 
-export type ViewSource = 'subjects' | 'jobs' | 'events';
+export type ViewSource = 'subjects' | 'jobs' | 'steps' | 'events';
 export type ViewLayout = 'table' | 'list' | 'count';
 export type Visibility = 'private' | 'shared';
 
@@ -66,6 +66,20 @@ export const SOURCE_FIELDS: Readonly<Record<ViewSource, ReadonlyArray<string>>> 
     'closed_on',
     'tags',
     'created_at',
+  ],
+  steps: [
+    'id',
+    'job_id',
+    'kind',
+    'title',
+    'assignee_id',
+    'status',
+    'sort_order',
+    'blocked_by',
+    'completed_on',
+    'notes',
+    'created_at',
+    'updated_at',
   ],
   events: ['id', 'event_id', 'kind', 'source', 'timestamp', 'payload'],
 };

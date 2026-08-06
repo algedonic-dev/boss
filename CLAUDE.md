@@ -169,6 +169,28 @@ New work types, new step UX, new posting rules — they land as **data in append
 
 The same principle applies one level down to **taxonomies**. Closed Rust enums for roles, departments, account types, asset models, etc. force every tenant to fork core to add a value. The BOSS answer is the **Class registry** ([docs/design/class-registry.md](docs/design/class-registry.md)) — one `classes` table keyed `(subject_kind, code)` with rows for every taxonomy in the system. Roles are Classes of `employee`-kind Subjects; AccountTypes are Classes of `account` Subjects; catalog asset models are Classes of `asset` Subjects. When you reach for a closed enum to model a tenant-extensible category, reach for the Class registry instead. Move things to data that can be data.
 
+### 9a. A fact that lives twice gets an equality test
+
+Some facts genuinely cannot live in one place: a Rust registry and the
+shell script that reads it, a schema manifest and the `include_str!`
+list a test harness compiles in. When that happens, **collapse it if
+you can, and pin it with a test if you cannot.** A comment asking the
+next person to keep two lists in sync is not a mechanism.
+
+This is not theoretical. Three such pairs drifted and each caused a
+real failure:
+
+| pair | what broke |
+|---|---|
+| `boss-ports` ↔ `deploy-services.sh` fallback arrays | two services silently absent from a deploy |
+| `manifest.txt` ↔ `boss-testing::SCHEMA_FILES` | every DB-backed test ran without two tables |
+| `MODEL_ROUTES` ↔ `MODEL_KINDS` | pages rendered under the wrong tab, silently |
+
+All three now either collapsed to one definition or pinned by a test
+that names the offending entry when it drifts. Prefer collapsing:
+`VENDOR_COUNT` was two hardcoded `13`s under a sync comment and is now
+one `pub const`, because one constant cannot drift from itself.
+
 ### 10. Core vs. Example Tenant
 The core state-machine OS lives under `crates/core/` (27 crates —
 `boss-core`, `boss-events`, `boss-jobs`, `boss-policy`,

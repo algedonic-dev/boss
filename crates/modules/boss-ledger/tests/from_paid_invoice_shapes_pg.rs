@@ -79,6 +79,8 @@ async fn both_trigger_shapes_settle_and_converge_on_one_row() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
+        // No read gate in tests; production wires one.
+        policy: None,
     });
 
     // Shape 1: the counterparty chain.

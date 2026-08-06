@@ -11,9 +11,14 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// What a View reads. The same three the search index unifies —
-/// Subjects (identity), Jobs (work), events (what happened) — because
-/// they are three projections of one log rather than three systems.
+/// What a View reads — the four foundational primitives.
+///
+/// Subjects (identity), Jobs (bounded work), Steps (the typed
+/// transitions inside a Job), events (what happened). Steps was the
+/// last one missing, which mattered more than the count suggests: a
+/// Step's `status` is the program counter of the state machine, so
+/// "what am I meant to be doing" is a question about Steps and could
+/// not be asked.
 ///
 /// Domain detail (an account's tier, a vendor's category) is
 /// deliberately absent in this phase: Q1 of the global-search review
@@ -25,6 +30,7 @@ use serde::{Deserialize, Serialize};
 pub enum ViewSource {
     Subjects,
     Jobs,
+    Steps,
     Events,
 }
 
@@ -33,6 +39,7 @@ impl ViewSource {
         match self {
             ViewSource::Subjects => "subjects",
             ViewSource::Jobs => "jobs",
+            ViewSource::Steps => "steps",
             ViewSource::Events => "events",
         }
     }
@@ -41,6 +48,7 @@ impl ViewSource {
         match s {
             "subjects" => Some(ViewSource::Subjects),
             "jobs" => Some(ViewSource::Jobs),
+            "steps" => Some(ViewSource::Steps),
             "events" => Some(ViewSource::Events),
             _ => None,
         }
