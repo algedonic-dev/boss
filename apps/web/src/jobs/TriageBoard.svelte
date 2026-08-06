@@ -169,6 +169,67 @@
   const recall = (j: Job) =>
     patchStep(j, {}, { agent_requested_at: null, agent_requested_by: null });
 
+  // ---- dragging ----------------------------------------------------
+  //
+  // Dragging a card IS the action the buttons perform — there is no
+  // separate "move" concept, because a column is not a place a card
+  // can be put. It is a rendering of the gated step's state, so the
+  // only way to change which column a card is in is to change the
+  // step. Every drop below routes to the same handlers the buttons
+  // call.
+  //
+  // The buttons stay. Drag is an accelerator for the mouse, and it is
+  // unusable by keyboard and awkward with a screen reader; removing
+  // the buttons would make the board operable only by pointer. This
+  // way the accessible path is the primary one and drag is additive.
+
+  let dragging = $state<string | null>(null);
+  let dragOver = $state<Column | null>(null);
+
+  /// `done` is terminal — a completed step does not un-complete, so
+  /// those cards do not lift and no drop targets them.
+  const canDrag = (j: Job): boolean => columnOf(j) !== 'done';
+
+  function startDrag(e: DragEvent, j: Job): void {
+    if (!canDrag(j)) return;
+    dragging = j.id;
+    // Firefox refuses to start a drag without payload.
+    e.dataTransfer?.setData('text/plain', j.id);
+    if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+  }
+
+  function endDrag(): void {
+    dragging = null;
+    dragOver = null;
+  }
+
+  function onDragOver(e: DragEvent, col: Column): void {
+    if (!dragging) return;
+    // Preventing default is what marks this a valid drop target.
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+    dragOver = col;
+  }
+
+  function onDrop(e: DragEvent, col: Column): void {
+    e.preventDefault();
+    const id = dragging ?? e.dataTransfer?.getData('text/plain');
+    endDrag();
+    const j = jobs.find((x) => x.id === id);
+    if (j) void moveTo(j, col);
+  }
+
+  /// Translate a drop into the step transition it means. Anything
+  /// that is not a real transition is a no-op rather than an error —
+  /// dropping a card back where it started is the common case.
+  function moveTo(j: Job, target: Column): Promise<void> | void {
+    const from = columnOf(j);
+    if (from === target || from === 'done') return;
+    if (target === 'done') return markTriaged(j);
+    if (target === 'with-agent') return handToAgent(j);
+    return recall(j);
+  }
+
   onMount(load);
 </script>
 
@@ -184,7 +245,15 @@
   <div class="tb-board">
     {#each COLUMNS as col (col.id)}
       {@const cards = byColumn[col.id]}
-      <section class="tb-col" aria-label={col.label}>
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <section
+        class="tb-col"
+        class:tb-col-over={dragOver === col.id && dragging !== null}
+        aria-label={col.label}
+        ondragover={(e) => onDragOver(e, col.id)}
+        ondragleave={() => (dragOver = null)}
+        ondrop={(e) => onDrop(e, col.id)}
+      >
         <header class="tb-col-head">
           <h3>{col.label}</h3>
           <span class="tb-count">{cards.length}</span>
@@ -192,7 +261,14 @@
         <p class="tb-col-hint">{col.hint}</p>
 
         {#each cards as j (j.id)}
-          <article class="tb-card">
+          <article
+            class="tb-card"
+            class:tb-card-draggable={canDrag(j)}
+            class:tb-card-dragging={dragging === j.id}
+            draggable={canDrag(j)}
+            ondragstart={(e) => startDrag(e, j)}
+            ondragend={endDrag}
+          >
             {#if card}
               {@render card(j)}
             {:else}
@@ -278,6 +354,10 @@
     color: var(--text-dim, #a8a29e);
     margin: 0 0 4px;
   }
+  .tb-col-over {
+    border-color: #78716c;
+    background: var(--card, #fff);
+  }
   .tb-card {
     background: var(--card, #fff);
     border: 1px solid var(--border, #e7e5e4);
@@ -286,6 +366,24 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
+  }
+  .tb-card-draggable {
+    cursor: grab;
+  }
+  .tb-card-draggable:active {
+    cursor: grabbing;
+  }
+  .tb-card-dragging {
+    opacity: 0.45;
+  }
+  /* Dragging is a pointer accelerator; the buttons remain the
+     operable path. Anyone who has asked not to see motion still gets
+     the drag, they just do not get the fade. */
+  @media (prefers-reduced-motion: reduce) {
+    .tb-card-dragging {
+      opacity: 1;
+      outline: 2px dashed #78716c;
+    }
   }
   .tb-card-title {
     margin: 0;

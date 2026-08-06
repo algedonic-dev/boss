@@ -142,6 +142,68 @@ test.describe('feedback triage board', () => {
     expect((body as unknown as { status: string }).status).toBe('completed');
   });
 
+  // Dragging is not a second way to move a card — a column is not a
+  // place a card can be put, it is a rendering of the gated step's
+  // state. So a drop has to issue exactly the write the corresponding
+  // button issues, or the board would have two notions of what a
+  // column means.
+  test('dragging to the agent column records the same request the button does', async ({
+    page,
+  }) => {
+    let body: Record<string, unknown> | null = null;
+    await page.route(/\/api\/jobs\/[^/]+\/steps\/[^/]+$/, async (route) => {
+      if (route.request().method() !== 'PUT') return route.fallback();
+      body = route.request().postDataJSON() as Record<string, unknown>;
+      return route.fulfill({ json: {} });
+    });
+
+    await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
+    await page
+      .locator('article', { hasText: 'Column picker forgets my choice' })
+      .dragTo(page.locator('section[aria-label="With an agent"]'));
+
+    await expect.poll(() => body !== null).toBe(true);
+    const sent = body as unknown as { metadata: Record<string, unknown> };
+    expect(sent.metadata['agent_requested_at']).toBeTruthy();
+    expect(sent.metadata['agent_requested_by']).toBeTruthy();
+    // Still not a decision, however the card got there.
+    expect(body).not.toHaveProperty('status');
+    // The merge that keeps the step findable must survive the drag too.
+    expect(sent.metadata['authority_role']).toBe('platform-admin');
+  });
+
+  test('dragging to the triaged column completes the step', async ({ page }) => {
+    let body: Record<string, unknown> | null = null;
+    await page.route(/\/api\/jobs\/[^/]+\/steps\/[^/]+$/, async (route) => {
+      if (route.request().method() !== 'PUT') return route.fallback();
+      body = route.request().postDataJSON() as Record<string, unknown>;
+      return route.fulfill({ json: {} });
+    });
+
+    await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
+    await page
+      .locator('article', { hasText: 'Column picker forgets my choice' })
+      .dragTo(page.locator('section[aria-label="Triaged"]'));
+
+    await expect.poll(() => body !== null).toBe(true);
+    expect((body as unknown as { status: string }).status).toBe('completed');
+  });
+
+  // A completed step does not un-complete, so those cards must not
+  // lift at all — offering a drag that silently does nothing is worse
+  // than offering none.
+  test('a triaged card cannot be dragged back out', async ({ page }) => {
+    await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
+    const done = page.locator('section[aria-label="Triaged"]').locator('article').first();
+    await expect(done).toHaveAttribute('draggable', 'false');
+
+    const waiting = page
+      .locator('section[aria-label="Waiting on triage"]')
+      .locator('article')
+      .first();
+    await expect(waiting).toHaveAttribute('draggable', 'true');
+  });
+
   test('offers no actions on an already-triaged item', async ({ page }) => {
     await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
     const done = page.locator('section[aria-label="Triaged"]');
