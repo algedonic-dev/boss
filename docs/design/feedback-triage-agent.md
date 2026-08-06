@@ -60,6 +60,9 @@ catalog, and the open-PR list have reached the same disposition?
 | `50f70a1f` | `/system/feedback` | defect | `color: inherit` on a bar that sets no colour; 1.06:1 in light theme. Fixed + pinned | **No** — needed to read four components' CSS |
 | `41afd152` | `/system/feedback` | capability request | Drag-and-drop triage; raises whether the board should be generic. Decision is the owner's | **Partly** — routing yes, the insight no |
 | `811c5dc5` | `/system` | defect | `/api/*` miss falls through to the SPA as 200 HTML instead of a JSON 404 | **No** — needed gateway routing |
+| `8c55d799` | step focus | defect | Full-page step route demanded a plugin; fell back to the platform surface | **No** — needed the surface dispatcher |
+| `bd500848` | job page | defect | Same cause as above, older link shape | **Partly** — a dedupe rule could have paired them |
+| `74cbe627` | `/system/job-kinds` | defect (agent-filed) | Version pin defeated by in-place reconcile; both halves fixed | **No** — needed reconcile + re-eval together |
 
 ### Notes per item
 
@@ -132,6 +135,28 @@ from the text alone ("this button is the wrong colour" needs no
 investigation if the reporter names the button), or feature requests
 that turn out to need real analysis to route. Neither has appeared
 yet, and five items is not enough to say.
+
+### A repeated shape of incident is itself a signal
+
+The strongest finding of the session is not in the table. Three
+separate items — a step kind that could never complete, a board that
+could not find its fork step, and two Jobs that would not close — were
+dispositioned as three unrelated bugs. They were one: **a Job
+materializes its steps once and keeps them, so anything that changes
+the JobKind underneath it strands the Job.** The root cause was a
+JobKind refresh rewriting a live version in place while Jobs pinned to
+it kept resolving that version.
+
+Each item on its own looked like a one-off, and triaging item-by-item
+is what kept it looking that way. Nothing in the feedback text could
+have revealed it; it only appeared by noticing that three dispositions
+rhymed.
+
+That is an argument about what a triage agent is FOR. Classifying and
+routing one item at a time — the part a rule does well — is precisely
+the part that cannot see this. Whatever we build should be able to ask
+"have I seen this shape before", which means it needs the history of
+dispositions, not just the item in front of it.
 
 ### What the loop keeps costing
 
