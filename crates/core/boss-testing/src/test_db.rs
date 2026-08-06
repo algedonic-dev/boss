@@ -142,6 +142,14 @@ const SCHEMA_FILES: &[(&str, &str)] = &[
         include_str!("../../../../infra/postgres/schema/41-dispatcher.sql"),
     ),
     (
+        "42-views",
+        include_str!("../../../../infra/postgres/schema/42-views.sql"),
+    ),
+    (
+        "43-event-facts",
+        include_str!("../../../../infra/postgres/schema/43-event-facts.sql"),
+    ),
+    (
         "99-search",
         include_str!("../../../../infra/postgres/schema/99-search.sql"),
     ),
@@ -286,4 +294,35 @@ async fn drop_database(admin_url: &str, db_name: &str) {
     let _ = conn
         .execute(format!(r#"DROP DATABASE IF EXISTS "{db_name}""#).as_str())
         .await;
+}
+
+#[cfg(test)]
+mod manifest_agreement {
+    use super::SCHEMA_FILES;
+
+    /// The manifest and this list must name the same files, in the
+    /// same order.
+    ///
+    /// They are two copies of one fact, kept in step by a comment
+    /// asking nicely — and they drifted: `42-views.sql` and
+    /// `43-event-facts.sql` reached the manifest and never reached
+    /// here, so every TestDb-backed test ran against a schema missing
+    /// those tables. The failure reads as "relation does not exist" in
+    /// a test that has nothing to do with schema loading, which is a
+    /// long way from the cause.
+    #[test]
+    fn schema_files_matches_the_manifest() {
+        let manifest = include_str!("../../../../infra/postgres/schema/manifest.txt");
+        let expected: Vec<&str> = manifest
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.trim_end_matches(".sql"))
+            .collect();
+        let actual: Vec<&str> = SCHEMA_FILES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            actual, expected,
+            "SCHEMA_FILES has drifted from schema/manifest.txt"
+        );
+    }
 }

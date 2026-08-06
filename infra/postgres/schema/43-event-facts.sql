@@ -53,3 +53,34 @@ CREATE INDEX IF NOT EXISTS event_facts_subject
 
 -- Time-windowed reads ("what happened last week").
 CREATE INDEX IF NOT EXISTS event_facts_occurred ON event_facts (occurred_at DESC);
+
+-- -----------------------------------------------------------------------------
+-- Subject edges for kinds that name their Subject by DOMAIN id.
+--
+-- `subject_edges` already declares how an event names its Subject —
+-- `products.consumed` points at `sku`, `jobs.job.created` at
+-- `subject.id`. These three kinds were simply never registered, so
+-- 330,566 events about Subjects that plainly exist (100% of their ids
+-- resolve) projected as unlinked.
+--
+-- Registering them is the whole fix. The projection reads this table;
+-- it has no per-kind knowledge of its own, which is what keeps
+-- "teach the system about a new event" a row rather than a branch.
+-- -----------------------------------------------------------------------------
+
+INSERT INTO subject_edges (source_kind, field_path, target_kind, target_kind_path) VALUES
+    -- A message IS a Subject (75,878 of them); the event carries its id.
+    ('messages.message.sent', 'id', 'message', NULL),
+    -- Tracking events name the shipment they advance.
+    ('shipping.tracking.recorded', 'shipment_id', 'shipment', NULL),
+    -- Nested identity-first, like the jobs.* edges: the kind travels
+    -- in the payload beside the id.
+    ('calendar.reservation.reserved', 'subject.id', NULL, 'subject.subject_kind'),
+    -- A shipment IS a Subject; the creation event carries its id.
+    ('shipping.shipment.created', 'id', 'shipment', NULL),
+    -- A payment is about the invoice it settles. `account_id` is also
+    -- present and also true, but the invoice is the specific thing —
+    -- and one event resolves to one Subject.
+    ('ledger.payment.received', 'invoice_id', 'invoice', NULL),
+    ('ledger.payment.settled', 'invoice_id', 'invoice', NULL)
+ON CONFLICT (source_kind, field_path) DO NOTHING;
