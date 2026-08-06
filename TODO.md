@@ -120,7 +120,10 @@ code. Ordered by what to reach for first.
       via `ROW_NUMBER`, so it has no incremental form today — a
       periodic full rebuild (~77s at 1.4M events) is the honest
       interim.
-- [ ] **C2 — the ledger read surface is unscoped.** `boss-ledger`
+- [x] **C2 — the ledger read surface is unscoped.** Done 2026-08-06
+      (#188): `Resource::ledger()` in the registry, enforced by a
+      router-wide layer rather than another per-handler check.
+      Original finding: `boss-ledger`
       carries exactly one authorization check across its whole HTTP
       surface (`user.role == "auditor"`) over 211,512 `financial_facts`
       rows plus the GL and bank settlements. It reads `CurrentUser` in

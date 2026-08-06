@@ -231,6 +231,8 @@ fn build_router(db: &TestDb) -> Router {
         pool: db.pool.clone(),
         publisher: None,
         clock: Arc::new(boss_clock_client::WallClockClient),
+        // No read gate in tests; production wires one.
+        policy: None,
     })
 }
 

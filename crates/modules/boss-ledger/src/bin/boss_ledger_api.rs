@@ -97,6 +97,14 @@ async fn main() -> Result<()> {
         pool: pool.clone(),
         publisher,
         clock,
+        // Read gate on the whole surface. Same wrapping the other
+        // policy consumers use: sim traffic authorized at the
+        // boundary, real traffic enforced per-role.
+        policy: Some(Arc::new(boss_policy_client::SimBypassPolicyClient::new(
+            Arc::new(boss_policy_client::ReqwestPolicyClient::new(
+                std::env::var("BOSS_POLICY_URL").unwrap_or_else(|_| boss_ports::url("policy")),
+            )),
+        ))),
     };
     let app = router(state);
     // Sim-origin middleware: extract x-sim-origin header and set the

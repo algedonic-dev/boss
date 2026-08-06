@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -76,6 +77,62 @@ pub struct LedgerApiState {
     /// clock-api. Services never inspect headers or env vars to
     /// learn whether time is sim or wall — the Clock decides.
     pub clock: Arc<dyn boss_clock_client::ClockClient>,
+    /// Policy engine for the read gate below. `None` leaves the
+    /// surface open, which is what tests want and what production
+    /// must never be — `boss-ledger-api` always wires one.
+    pub policy: Option<Arc<dyn boss_policy_client::PolicyClient>>,
+}
+
+/// Router-wide gate on READING `/api/ledger/*`.
+///
+/// Everything here is the company's finances: the trial balance, all
+/// three statements, every journal entry, tax liability, bills. None
+/// of it had any read gate at all — `reject_if_auditor` is a WRITE
+/// gate (it stops an auditor session curling a POST past the hidden
+/// UI buttons), so a caller who could reach the port could read the
+/// whole ledger.
+///
+/// A layer rather than a per-handler check on purpose. The write gate
+/// is called from 21 handlers by hand; that shape works right up until
+/// someone adds a route and forgets, and a forgotten read gate is
+/// invisible until it is someone else's incident. A layer cannot be
+/// forgotten by a new route.
+///
+/// `/health` is exempt: monitoring probes it without a session, and it
+/// returns no financial data.
+async fn require_ledger_read(
+    State(state): State<Arc<LedgerApiState>>,
+    boss_policy_client::CurrentUser(user): boss_policy_client::CurrentUser,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if req.uri().path().ends_with("/health") {
+        return next.run(req).await;
+    }
+    let Some(policy) = state.policy.as_ref() else {
+        return next.run(req).await;
+    };
+    match policy
+        .check(
+            &user,
+            boss_policy_client::Action::Read,
+            boss_policy_client::Resource::ledger(),
+        )
+        .await
+    {
+        Ok(d) if d.is_allowed() => next.run(req).await,
+        Ok(_) => (
+            StatusCode::FORBIDDEN,
+            "reading /api/ledger/* requires a `ledger` read grant",
+        )
+            .into_response(),
+        Err(e) => {
+            // Fail closed. An unreachable policy engine must not open
+            // the company's books.
+            tracing::warn!(error = %e, "ledger read gate: policy check failed");
+            (StatusCode::SERVICE_UNAVAILABLE, "policy engine unavailable").into_response()
+        }
+    }
 }
 
 /// Build the enrichment stamp for in-tx event recording (outbox
@@ -205,6 +262,10 @@ pub fn router(state: LedgerApiState) -> Router {
             axum::routing::post(batch_pay_bills),
         )
         .route("/api/ledger/bills/{id}/pay", axum::routing::post(pay_bill))
+        .layer(axum::middleware::from_fn_with_state(
+            shared.clone(),
+            require_ledger_read,
+        ))
         .with_state(shared)
 }
 

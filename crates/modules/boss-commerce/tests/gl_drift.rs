@@ -32,6 +32,8 @@ async fn manual_revenue_credit_flows_into_commerce_summary() {
         pool: db.pool.clone(),
         publisher: None,
         clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
+        // No read gate in tests; production wires one.
+        policy: None,
     });
 
     let posted_on = Utc::now().date_naive();

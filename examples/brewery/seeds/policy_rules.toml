@@ -31,7 +31,7 @@ roles = ["ceo", "coo", "cfo", "cto"]
 resources = [
     "job", "step", "account", "employee", "invoice", "agreement",
     "shipment", "part", "purchase-order", "policy-rule",
-    "job-kind", "step-plugin", "event", "subject",
+    "job-kind", "step-plugin", "event", "subject", "ledger",
 ]
 action = "read"
 scope = "all"
@@ -612,5 +612,28 @@ scope = "all"
 [[grants]]
 roles = ["controller", "head-of-people"]
 resource = "event"
+action = "read"
+scope = "all"
+
+# ------------------------------------------------------------------
+# The finance read surface.
+#
+# `/api/ledger/*` — accounts, trial balance, the three statements,
+# journal entries, tax liability, bills — had NO read gate at all:
+# `reject_if_auditor` guards writes, so anyone who could reach the
+# port could read the company's books. `ledger` is all-or-nothing by
+# nature; a balance sheet is a company-wide aggregate with no owner to
+# narrow by.
+#
+# Granted to the roles whose work is the books, plus audit-readonly
+# (which picks it up from the platform defaults, not here).
+# ------------------------------------------------------------------
+
+[[grants]]
+roles = [
+    "controller", "bookkeeper", "ap-clerk", "ar-clerk", "fp-analyst",
+    "head-of-people",
+]
+resource = "ledger"
 action = "read"
 scope = "all"

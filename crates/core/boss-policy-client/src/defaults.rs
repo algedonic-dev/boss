@@ -61,6 +61,10 @@ pub fn shipped_resources() -> Vec<Resource> {
         // case, and a role with no grant is denied by default.
         Resource::event(),
         Resource::subject(),
+        // The finance read surface. Platform-admin gets everything and
+        // audit-readonly gets Read from the loops below; tenants grant
+        // it to their finance roles.
+        Resource::ledger(),
     ]
 }
 

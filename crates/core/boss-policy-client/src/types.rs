@@ -116,6 +116,19 @@ impl Resource {
         Self::new("event")
     }
 
+    /// The general ledger as a readable surface: accounts, the trial
+    /// balance, the three statements, journal entries, tax liability,
+    /// bills.
+    ///
+    /// All-or-nothing by nature. A financial statement is a
+    /// company-wide aggregate with no owner to narrow by — there is no
+    /// such thing as "my share of the balance sheet" — so the only
+    /// meaningful question is whether this caller may see the
+    /// company's finances at all.
+    pub fn ledger() -> Self {
+        Self::new("ledger")
+    }
+
     /// Identity rows — the `subjects` table, across every kind.
     ///
     /// Coarser than the per-kind resources (`account`, `employee`,
