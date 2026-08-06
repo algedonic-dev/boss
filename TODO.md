@@ -207,7 +207,15 @@ code. Ordered by what to reach for first.
       kind, so global search never floats messages. `person` alongside
       `employee` with no surface is either a duplicate or an
       unfinished kind.
-- [ ] **F5 — pushdown residuals.** `NOT` needs an exactness proof
+- [x] **F5 — pushdown residuals.** Done 2026-08-06 (#189) for the
+      one that was not merely scan cost: payload paths.
+      `payload.sku = "…"` pushed nothing, so the scan took the
+      newest N rows and filtered in-process — it reported **0
+      against a true 351**, the same silent-zero class #186 fixed
+      for column terms. Dotted paths now push as
+      `payload #>> $1::text[]`, with the path bound rather than
+      interpolated. `NOT` and text-ordering remain residual and
+      genuinely are only scan cost. Original finding: `NOT` needs an exactness proof
       before it can be pushed (negation inverts the direction of
       approximation, turning a superset into a subset). Ordering
       comparisons on text columns and any term reaching into `payload`

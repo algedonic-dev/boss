@@ -68,6 +68,12 @@ pub const EVENT_PUSHABLE: crate::pushdown::PushableColumns = &[
         "occurred_at",
         crate::pushdown::ColumnType::Timestamp,
     ),
+    // Dotted paths reach inside the payload: `payload.sku` becomes
+    // `payload #>> '{sku}'`. Without this a payload filter pushed
+    // nothing, so the scan took the newest N rows and filtered them
+    // in-process — `payload.sku = "FP-HAZY-1-2-BBL"` reported 0
+    // against a true 351.
+    ("payload", "payload", crate::pushdown::ColumnType::Json),
 ];
 
 /// Filter fields the `steps` source can push into SQL.
