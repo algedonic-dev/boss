@@ -131,6 +131,11 @@ else
         # Mirrors the PortSpec in boss-ports; the two lists are kept
         # in step by hand, per that crate's header.
         "search:7960"
+        # observability:7880 + simulator:7010 were in the port registry
+        # and missing here — caught by the agreement test in
+        # boss-ports, which is the point of that test existing.
+        "observability:7880"
+        "simulator:7010"
         # views:7961 — the View registry + the endpoint that runs one
         # (boss-views). Same hand-kept pairing with boss-ports.
         "views:7961"

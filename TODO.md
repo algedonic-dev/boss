@@ -133,7 +133,12 @@ code. Ordered by what to reach for first.
       using `CurrentUser` directly. `boss-subject-kinds` and
       `boss-customers` read no caller at all but expose only registry
       data and 73 customer rows. The ledger is the real gap.
-- [ ] **C3 — duplicated facts kept in step by comment.** Three
+- [x] **C3 — duplicated facts kept in step by comment.** Done
+      2026-08-06 (#188): convention recorded in CLAUDE.md §9a; the
+      ports ↔ deploy-array pair pinned by a test that immediately
+      caught live drift (`observability`, `simulator` missing from the
+      fallback); `VENDOR_COUNT` collapsed from two hardcoded 13s to one
+      `pub const`. Original finding: Three
       instances caused real failures in a single session: `boss-ports`
       ↔ the `deploy-services.sh` fallback arrays (search and views were
       not deployable at all), `MODEL_ROUTES` ↔ `MODEL_KINDS` (pages

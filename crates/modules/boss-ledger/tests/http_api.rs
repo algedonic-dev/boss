@@ -998,9 +998,9 @@ async fn bank_settlement_sweep_settles_only_due_rows() {
             pool: db.pool.clone(),
             publisher: None,
             clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
-    });
+            // No read gate in tests; production wires one.
+            policy: None,
+        });
         // set-today → expected_settle_on = 2026-03-20 (ach default = +1 day)
         // set-tomorrow → expected_settle_on = 2026-03-21
         let received = if set_id == "set-today" {
@@ -1083,9 +1083,9 @@ async fn bank_settlement_create_is_idempotent_on_id() {
             pool: db.pool.clone(),
             publisher: None,
             clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
-    });
+            // No read gate in tests; production wires one.
+            policy: None,
+        });
         let (status, _) = post_json(
             r,
             "/api/ledger/bank-settlements",
@@ -1278,9 +1278,9 @@ async fn payroll_run_is_idempotent_on_id() {
             pool: db.pool.clone(),
             publisher: None,
             clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
-    });
+            // No read gate in tests; production wires one.
+            policy: None,
+        });
         let (status, _) = post_json(r, "/api/ledger/payroll-runs", body.clone()).await;
         assert_eq!(status, StatusCode::OK);
     }
@@ -1565,9 +1565,9 @@ async fn tax_filing_remit_is_idempotent() {
             pool: db.pool.clone(),
             publisher: None,
             clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
-    });
+            // No read gate in tests; production wires one.
+            policy: None,
+        });
         let (status, _) = post_json(
             r,
             "/api/ledger/tax-filings/tf-idem/remit",
@@ -1633,9 +1633,9 @@ async fn tax_filing_upsert_is_idempotent_on_period() {
             pool: db.pool.clone(),
             publisher: None,
             clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
-    });
+            // No read gate in tests; production wires one.
+            policy: None,
+        });
         let (status, _) = post_json(r, "/api/ledger/tax-filings", b).await;
         assert_eq!(status, StatusCode::OK);
     }
@@ -1920,9 +1920,9 @@ async fn auditor_role_is_rejected_from_every_ledger_write() {
             pool: db.pool.clone(),
             publisher: None,
             clock: std::sync::Arc::new(boss_clock_client::WallClockClient),
-        // No read gate in tests; production wires one.
-        policy: None,
-    })
+            // No read gate in tests; production wires one.
+            policy: None,
+        })
     };
 
     // Use a valid-shape payload where possible; when it's wrong the

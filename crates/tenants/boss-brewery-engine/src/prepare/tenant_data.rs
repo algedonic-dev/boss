@@ -98,9 +98,15 @@ const ACCOUNT_COUNT: u32 = 50;
 // matches the part's `vendor_category` (parts.toml) against
 // `vendors.category`. The packaging parts (PKG-*) need a
 // `packaging`-category vendor, the first of which sits at
-// vendors.toml index 12. Keep this in sync with the vendor-Subject
-// seed count in `lib::seed_brewery_subjects`.
-const VENDOR_COUNT: u32 = 13;
+// vendors.toml index 12.
+//
+// `pub` because `seed_brewery_subjects` mints one vendor Subject per
+// vendor and must mint exactly this many — the auto-restock resolver
+// can pick any seeded vendor, and one without a Subject makes the
+// restock Job's subject fail to resolve. That used to be a second
+// hardcoded `13` under a "keep this in sync" comment; one constant
+// cannot drift from itself.
+pub const VENDOR_COUNT: u32 = 13;
 
 /// Pre-seeded prospect Accounts that the `sale` JobKind targets
 /// (the wholesale-account-acquisition funnel: cold outreach →
