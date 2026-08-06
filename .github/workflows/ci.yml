@@ -132,6 +132,13 @@ jobs:
       - name: Outbox migration ratchet (events record in-tx)
         run: infra/lint/outbox-migration-ratchet.sh
 
+      # Idempotence: the bus is at-least-once, so an accumulating write
+      # (`col = col + $n`) double-applies on redelivery. Ratchet, not
+      # ban — the two known stock sites are reviewed; a third fails
+      # until someone looks at it.
+      - name: Idempotence ratchet (accumulating writes are reviewed)
+        run: infra/lint/idempotence-ratchet.sh
+
   web:
     runs-on: ubuntu-latest
     steps:

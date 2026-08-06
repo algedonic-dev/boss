@@ -149,7 +149,14 @@ code. Ordered by what to reach for first.
       is not. Wants a convention — a fact that lives twice gets an
       equality test — and possibly a lint on the comment phrasing that
       marks them.
-- [ ] **C4 — idempotence has no static guard.** Guard coverage across
+- [x] **C4 — idempotence has no static guard.** Done 2026-08-06
+      (#189): `infra/lint/idempotence-ratchet.sh`, wired into CI.
+      Flags accumulating writes (`col = col + $n`), which
+      double-apply under at-least-once redelivery — the 2026-06-16
+      class where `on_hand` mutations decoupled GL 1300/1320 from
+      physical stock and raised nothing. A ratchet, not a ban: the
+      two known stock sites are listed with why they are safe, and
+      a third fails until reviewed. Original finding: Guard coverage across
       the five properties: conservation 3 tests / 4 lints, provenance
       4 / 1, closure 1 / 2, determinism 2 / 0, idempotence 2 / 0.
       Determinism is well covered at runtime by the replay-check
@@ -167,25 +174,55 @@ code. Ordered by what to reach for first.
       and Events — three of the four primitives. Steps is 160,254 rows
       and is where work state lives; "my ready steps" cannot be
       expressed as a View.
-- [ ] **F2 — Views' other two sources are still capped.** Only
+- [x] **F2 — Views' other two sources are still capped.** Done
+      2026-08-06 (#189): `jobs` and `subjects` have pushdown
+      descriptors, so all four sources narrow in the database. Every
+      pushable job column is already indexed; `subjects` is keyed
+      `(kind, id)` and both are TEXT, so a filter on either rides the
+      primary key. Original finding: Only
       `events` received a projection in #186. `subjects` and `jobs`
       still read base tables under the 5,000-row scan with no
       pushdown, carrying the same silent-truncation behaviour `events`
       had before. Jobs is 20,555 rows, so the cap does not bite yet.
-- [ ] **F3 — the app tabs are code while the org is data.** Eleven
+- [x] **F3 — the app tabs are code while the org is data.** Done
+      2026-08-06 (#189): `DEPARTMENT_APP` maps all 19 department
+      Classes to an app, pinned by a test that reads the seed files
+      rather than restating them. Tabs are deliberately NOT derived —
+      that would produce 19 and undo the app split. Surfaced a
+      follow-up: departments come from two sources (12 core, 8
+      tenant), so `apps/web` maps departments a tenant invented; a
+      second in-tree tenant needs a real extension point.
+      Original finding: Eleven
       employee departments in the Class registry; eight apps
       hand-authored in `libs/web-kit/src/nav.ts`. Four departments
       collapse into Operations and `audit` has no app at all. Nothing
       keeps the two in step and no test fails when they diverge —
       Principle 9 sitting in the one layer the app split did not put
       on data.
-- [ ] **F4 — five Subject kinds no app claims:** `custom`,
+- [x] **F4 — five Subject kinds no app claims:** Done 2026-08-06
+      (#189). Only TWO were real gaps — `message` (13,483 rows,
+      surfaced by Inbox) and `custom` (the design-doc-review Job
+      subject). The other three are ABSTRACT ROOTS of the
+      subject-kind taxonomy (`person`, `object`, `intangible`);
+      nothing is ever an instance of them, so no app should claim
+      them. The audit's guess that `person` duplicated `employee`
+      was wrong — `employee` specializes `person`. Pinned by a test
+      that exempts roots-with-children structurally. Original
+      finding: `custom`,
       `intangible`, `message`, `object`, `person`. `message` is the
       notable one — Inbox exists as a surface, but no app claims the
       kind, so global search never floats messages. `person` alongside
       `employee` with no surface is either a duplicate or an
       unfinished kind.
-- [ ] **F5 — pushdown residuals.** `NOT` needs an exactness proof
+- [x] **F5 — pushdown residuals.** Done 2026-08-06 (#189) for the
+      one that was not merely scan cost: payload paths.
+      `payload.sku = "…"` pushed nothing, so the scan took the
+      newest N rows and filtered in-process — it reported **0
+      against a true 351**, the same silent-zero class #186 fixed
+      for column terms. Dotted paths now push as
+      `payload #>> $1::text[]`, with the path bound rather than
+      interpolated. `NOT` and text-ordering remain residual and
+      genuinely are only scan cost. Original finding: `NOT` needs an exactness proof
       before it can be pushed (negation inverts the direction of
       approximation, turning a superset into a subset). Ordering
       comparisons on text columns and any term reaching into `payload`

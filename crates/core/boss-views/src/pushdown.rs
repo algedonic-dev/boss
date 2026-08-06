@@ -84,6 +84,9 @@ use chrono::{DateTime, NaiveDate, Utc};
 pub enum ColumnType {
     Text,
     Timestamp,
+    /// A JSONB column. A filter reaches inside it with a dotted path
+    /// (`payload.sku`), which `#>>` extracts as text.
+    Json,
 }
 
 /// A value bound into the emitted statement.
@@ -116,6 +119,24 @@ pub enum Pushdown {
         column: &'static str,
         value: String,
     },
+    /// `<column> #>> <path> = <text literal>` — a term reaching into
+    /// a JSONB column.
+    ///
+    /// `#>>` yields TEXT, while the residual compares the JSON value
+    /// at its own type. Where they differ — a numeric `5` in the
+    /// payload against a `"5"` literal — SQL matches and the residual
+    /// rejects, so SQL is the looser of the two. That is the safe
+    /// direction, and it is why this is not exact and cannot be
+    /// negated.
+    JsonEq {
+        column: &'static str,
+        path: Vec<String>,
+        value: String,
+        /// `IS DISTINCT FROM` rather than `=`, for the same NULL
+        /// reason as [`Pushdown::Neq`]: a missing path extracts NULL,
+        /// and the residual counts that as different from any string.
+        negated: bool,
+    },
     /// `<column> = ANY(<array>)` — a set membership.
     ///
     /// The DSL has no `IN` keyword, so this is never parsed directly:
@@ -143,7 +164,10 @@ impl Pushdown {
     /// Number of leaf comparisons — what `pushed_down` reports.
     pub fn term_count(&self) -> usize {
         match self {
-            Pushdown::Eq { .. } | Pushdown::Neq { .. } | Pushdown::Range { .. } => 1,
+            Pushdown::Eq { .. }
+            | Pushdown::Neq { .. }
+            | Pushdown::JsonEq { .. }
+            | Pushdown::Range { .. } => 1,
             // One term per value: `pushed_down` counts what the filter
             // author wrote, and they wrote N equalities.
             Pushdown::In { values, .. } => values.len(),
@@ -166,6 +190,21 @@ impl Pushdown {
             Pushdown::Neq { column, value } => {
                 binds.push(Bound::Text(value.clone()));
                 let s = format!("{column} IS DISTINCT FROM ${next_param}");
+                *next_param += 1;
+                s
+            }
+            Pushdown::JsonEq {
+                column,
+                path,
+                value,
+                negated,
+            } => {
+                binds.push(Bound::TextList(path.clone()));
+                let path_param = *next_param;
+                *next_param += 1;
+                binds.push(Bound::Text(value.clone()));
+                let op = if *negated { "IS DISTINCT FROM" } else { "=" };
+                let s = format!("{column} #>> ${path_param}::text[] {op} ${next_param}");
                 *next_param += 1;
                 s
             }
@@ -255,6 +294,17 @@ pub fn extract(expr: &Expr, pushable: PushableColumns) -> Option<Pushdown> {
         Expr::BinaryOp(BinaryOp::Eq, lhs, rhs) => as_eq(lhs, rhs, pushable),
         Expr::BinaryOp(BinaryOp::Neq, lhs, rhs) => as_eq(lhs, rhs, pushable).map(|p| match p {
             Pushdown::Eq { column, value } => Pushdown::Neq { column, value },
+            Pushdown::JsonEq {
+                column,
+                path,
+                value,
+                ..
+            } => Pushdown::JsonEq {
+                column,
+                path,
+                value,
+                negated: true,
+            },
             other => other,
         }),
         Expr::BinaryOp(
@@ -282,6 +332,9 @@ pub fn extract(expr: &Expr, pushable: PushableColumns) -> Option<Pushdown> {
 /// filter authors are actually expressing when they chain equalities,
 /// and saying so in one term reads better in a plan than an OR chain.
 fn collapse_any(a: Pushdown, b: Pushdown) -> Pushdown {
+    // Only plain column equalities collapse into `= ANY(...)`. A
+    // JsonEq carries its own path, so two of them on the same column
+    // are not a set on one value.
     match (a, b) {
         (
             Pushdown::Eq {
@@ -335,8 +388,24 @@ fn as_eq(lhs: &Expr, rhs: &Expr, pushable: PushableColumns) -> Option<Pushdown> 
         (Expr::Literal(v), Expr::Identifier(p)) => (p, v),
         _ => return None,
     };
-    // Single-segment only. A dotted path reaches inside the JSON
-    // payload, which has no column behind it.
+    // A dotted path reaches inside a JSONB column, if the head names
+    // one. `payload.sku` becomes `payload #>> '{sku}'`.
+    if path.len() > 1 {
+        let (head, rest) = path.split_first()?;
+        let column = pushable
+            .iter()
+            .find(|(filter_name, _, ty)| filter_name == head && *ty == ColumnType::Json)
+            .map(|(_, col, _)| *col)?;
+        let Value::String(s) = value else {
+            return None;
+        };
+        return Some(Pushdown::JsonEq {
+            column,
+            path: rest.to_vec(),
+            value: s.clone(),
+            negated: false,
+        });
+    }
     let [name] = path.as_slice() else {
         return None;
     };
@@ -408,6 +477,7 @@ mod tests {
     use super::*;
 
     const EVENT_COLUMNS: PushableColumns = &[
+        ("payload", "payload", ColumnType::Json),
         ("kind", "kind", ColumnType::Text),
         ("source", "source", ColumnType::Text),
         ("subject_kind", "subject_kind", ColumnType::Text),
@@ -519,9 +589,66 @@ mod tests {
     }
 
     #[test]
-    fn an_unmapped_or_dotted_field_does_not_push() {
+    fn an_unmapped_field_does_not_push() {
         assert_eq!(ex("amount = \"5\""), None);
-        assert_eq!(ex("payload.total = \"5\""), None);
+        // A dotted path whose head is not a declared JSON column has
+        // no column behind it either.
+        assert_eq!(ex("nosuch.total = \"5\""), None);
+    }
+
+    #[test]
+    fn a_payload_path_pushes_as_a_json_extraction() {
+        // The case this exists for: without it a payload filter pushed
+        // nothing, the scan took the newest N rows, and the count came
+        // back 0 against a true 351.
+        let (sql, binds) = sql_of("payload.sku = \"KEG-HALF\"");
+        assert_eq!(sql, "payload #>> $1::text[] = $2");
+        assert_eq!(
+            binds,
+            vec![
+                Bound::TextList(vec!["sku".into()]),
+                Bound::Text("KEG-HALF".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_deep_payload_path_keeps_every_segment() {
+        let (_, binds) = sql_of("payload.subject.id = \"acc-1\"");
+        assert_eq!(
+            binds[0],
+            Bound::TextList(vec!["subject".into(), "id".into()])
+        );
+    }
+
+    #[test]
+    fn a_negated_payload_path_uses_is_distinct_from() {
+        // Same NULL reason as plain `!=`: a missing path extracts NULL,
+        // and the residual counts that as different from any string.
+        let (sql, _) = sql_of("payload.sku != \"KEG-HALF\"");
+        assert_eq!(sql, "payload #>> $1::text[] IS DISTINCT FROM $2");
+    }
+
+    #[test]
+    fn a_non_text_literal_against_a_payload_path_does_not_push() {
+        // `#>>` yields text; binding an int would compare text to
+        // bigint and fail the statement.
+        assert_eq!(ex("payload.qty = 4"), None);
+    }
+
+    #[test]
+    fn payload_paths_do_not_collapse_into_a_set() {
+        // Two JsonEq on the same column are not a set on one value —
+        // they carry different paths.
+        let (sql, _) = sql_of("payload.sku = \"a\" OR payload.other = \"b\"");
+        assert!(sql.contains(" OR "), "must stay a disjunction, got: {sql}");
+    }
+
+    #[test]
+    fn a_payload_path_combines_with_a_column_term() {
+        let (sql, binds) = sql_of("kind = \"products.consumed\" AND payload.sku = \"KEG\"");
+        assert_eq!(sql, "(kind = $1 AND payload #>> $2::text[] = $3)");
+        assert_eq!(binds.len(), 3);
     }
 
     #[test]

@@ -17,7 +17,14 @@
 
 import { describe, it, expect } from 'bun:test';
 import { APPS, type AppId } from '@boss/web-kit/nav';
-import { ROUTE_CATALOG, appForSection, type NavItem } from './nav-catalog';
+import {
+  APP_SUBJECT_KINDS,
+  DEPARTMENT_APP,
+  ROUTE_CATALOG,
+  appForSection,
+  type NavItem,
+} from './nav-catalog';
+import { readFileSync } from 'node:fs';
 
 /// Verbatim copy of AppShell.svelte's deleted `MODEL_ROUTES`. These
 /// surfaces have now moved wholesale from the retired `model` app
@@ -124,5 +131,169 @@ describe('appForSection — the App.svelte tab derivation', () => {
     // surfaces live, so that is the right landing for the fallback.
     expect(appForSection('me')).toBe('home');
     expect(appForSection('definitely-not-a-section')).toBe('home');
+  });
+});
+
+describe('departments map to apps', () => {
+  /// Department Classes, read from the files that seed them rather
+  /// than restated here — restating is the drift this test exists to
+  /// catch.
+  ///
+  /// They come from TWO places, which is itself worth knowing: the
+  /// platform ships twelve (`01-registries.sql`), and the tenant adds
+  /// its own (`examples/brewery/seeds/classes.json` adds production,
+  /// packaging, taproom, maintenance, distribution, it, admin, audit).
+  /// So `apps/web` — which is core — has to map departments a tenant
+  /// invented. That works while one tenant ships in-tree; a second
+  /// tenant with its own departments needs a real extension point.
+  function registryDepartments(): ReadonlyArray<string> {
+    const core = readFileSync(
+      new URL('../../../../infra/postgres/schema/01-registries.sql', import.meta.url),
+      'utf8',
+    );
+    const coreCodes = [
+      ...core.matchAll(/\(\s*'employee',\s*'([a-z-]+)',\s*'[^']*',\s*'department'/g),
+    ].map((m) => m[1]!);
+
+    const tenant = JSON.parse(
+      readFileSync(
+        new URL('../../../../examples/brewery/seeds/classes.json', import.meta.url),
+        'utf8',
+      ),
+    ) as ReadonlyArray<{ member_attribute?: string; code?: string }>;
+    const tenantCodes = tenant
+      .filter((c) => c.member_attribute === 'department' && c.code)
+      .map((c) => c.code!);
+
+    const all = [...new Set([...coreCodes, ...tenantCodes])];
+    // A parser that silently matched nothing would make every
+    // assertion below vacuous.
+    expect(coreCodes.length).toBeGreaterThan(10);
+    expect(tenantCodes.length).toBeGreaterThan(0);
+    return all;
+  }
+
+  it('every department in the registry is served by some app', () => {
+    // `audit` had no app at all and nothing failed. A new department
+    // row should be a decision about where its people work, not a
+    // silent omission.
+    const missing = registryDepartments().filter((d) => !(d in DEPARTMENT_APP));
+    expect(
+      missing,
+      `these departments are seeded but map to no app: ${missing.join(', ')}`,
+    ).toEqual([]);
+  });
+
+  it('every mapping target is an app the chrome bar offers', () => {
+    const tabbed = new Set<AppId>(APPS.map((a) => a.id));
+    for (const [dept, app] of Object.entries(DEPARTMENT_APP)) {
+      expect(
+        tabbed.has(app),
+        `department "${dept}" maps to app "${app}", which has no tab`,
+      ).toBe(true);
+    }
+  });
+
+  it('maps no department the registry does not have', () => {
+    // The other direction: a mapping for a department that was renamed
+    // or retired is dead weight that reads as coverage.
+    const known = new Set(registryDepartments());
+    const stale = Object.keys(DEPARTMENT_APP).filter((d) => !known.has(d));
+    expect(stale, `mapped but not in the registry: ${stale.join(', ')}`).toEqual([]);
+  });
+});
+
+describe('every concrete Subject kind is claimed by an app', () => {
+  /// The subject-kind registry is a taxonomy, not a flat list: rows
+  /// carry a `parent_kind`, and the roots with children (`person`,
+  /// `object`, `intangible`) are abstract — `account` specializes
+  /// `person`, and nothing is ever of kind `person` itself. So this
+  /// exempts roots-with-children structurally rather than naming them,
+  /// which means a future abstract root is exempt automatically and a
+  /// future concrete kind is not.
+  ///
+  /// Rows look like:
+  ///   ('account', 'Account', 'desc…', 'platform', 10, 'person'),
+  /// with the kind first and parent_kind last. Descriptions contain
+  /// commas and parentheses, so this anchors on those two positions
+  /// rather than splitting fields.
+  function taxonomy(): ReadonlyArray<{ kind: string; parent: string | null }> {
+    const sql = readFileSync(
+      new URL('../../../../infra/postgres/schema/01-registries.sql', import.meta.url),
+      'utf8',
+    );
+    // Walk lines from the INSERT to the statement terminator. Slicing
+    // on the first `;` truncated the block at a semicolon INSIDE a
+    // description ("one row per tenant; the subject…"), which silently
+    // yielded only the six root rows.
+    const lines = sql.slice(sql.indexOf('INSERT INTO subject_kinds')).split('\n');
+    const rows: Array<{ kind: string; parent: string | null }> = [];
+    for (const line of lines) {
+      const isLast = line.trimEnd().endsWith(';');
+      // Kind is the first quoted token; parent_kind is the last field.
+      // Parsed positionally rather than by one big regex — the
+      // descriptions carry commas, parens, quotes and em-dashes, and a
+      // regex threading past all of them matched only the rows ending
+      // in NULL.
+      const kind = /^\s*\('([a-z_-]+)'/.exec(line)?.[1];
+      if (!kind) {
+        if (isLast) break;
+        continue;
+      }
+      // Strip the row's closing `),` FIRST — otherwise the last comma
+      // in the line is the trailing one and the field comes back empty.
+      const inner = line.trim().replace(/\),?$/, '');
+      const last = inner.slice(inner.lastIndexOf(',') + 1).trim();
+      const parent = last.startsWith('NULL')
+        ? null
+        : (/^'([a-z_-]+)'/.exec(last)?.[1] ?? null);
+      rows.push({ kind, parent });
+      // Terminator checked AFTER parsing: the final row ends `NULL);`,
+      // so breaking first silently dropped it — and it was `custom`,
+      // one of the two kinds this whole test exists to catch.
+      if (isLast) break;
+    }
+    // A parser that silently matched nothing — or only some rows —
+    // would make every assertion below vacuous. It did exactly that
+    // once.
+    expect(rows.length).toBeGreaterThan(15);
+    expect(rows.filter((r) => r.parent !== null).length).toBeGreaterThan(5);
+    return rows;
+  }
+
+  it('claims every kind that is not an abstract root', () => {
+    const rows = taxonomy();
+    const hasChildren = new Set(rows.map((r) => r.parent).filter(Boolean) as string[]);
+    const claimed = new Set(Object.values(APP_SUBJECT_KINDS).flat());
+
+    const unclaimed = rows
+      .filter((r) => !(r.parent === null && hasChildren.has(r.kind)))
+      .map((r) => r.kind)
+      .filter((k) => !claimed.has(k));
+
+    expect(
+      unclaimed,
+      `concrete Subject kinds no app claims, so search never floats them: ` +
+        unclaimed.join(', '),
+    ).toEqual([]);
+  });
+
+  it('claims nothing the registry does not define', () => {
+    const known = new Set(taxonomy().map((r) => r.kind));
+    const stale = [...new Set(Object.values(APP_SUBJECT_KINDS).flat())].filter(
+      (k) => !known.has(k),
+    );
+    expect(stale, `claimed but not a registered kind: ${stale.join(', ')}`).toEqual([]);
+  });
+
+  it('leaves the abstract roots unclaimed', () => {
+    // The other direction: claiming `person` would rank a kind that
+    // has no instances, which is noise in every result set.
+    const claimed = new Set(Object.values(APP_SUBJECT_KINDS).flat());
+    for (const root of ['person', 'object', 'intangible']) {
+      expect(claimed.has(root), `${root} is abstract and should not be claimed`).toBe(
+        false,
+      );
+    }
   });
 });
