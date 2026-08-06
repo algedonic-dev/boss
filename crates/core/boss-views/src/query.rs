@@ -32,8 +32,11 @@ use crate::types::{View, ViewResults, ViewSource};
 enum SourceScope {
     /// Every candidate row.
     All,
-    /// Jobs whose owner is one of these.
-    JobOwners(Vec<String>),
+    /// Rows whose owning user is one of these. Which COLUMN carries
+    /// that is the source's business — `jobs.owner_id`, but
+    /// `steps.assignee_id`, because a Step's owner is whoever it is
+    /// assigned to.
+    Owners(Vec<String>),
     /// Nothing. The caller may not read this source at all.
     None,
 }
@@ -64,6 +67,29 @@ pub const EVENT_PUSHABLE: crate::pushdown::PushableColumns = &[
         "timestamp",
         "occurred_at",
         crate::pushdown::ColumnType::Timestamp,
+    ),
+];
+
+/// Filter fields the `steps` source can push into SQL.
+///
+/// `status`, `kind` and `assignee_id` are the three a filter actually
+/// names, and Postgres already indexes them — including
+/// `steps_assignee (assignee_id) WHERE status IN ('ready','active')`,
+/// a partial index built for precisely the question this source
+/// exists to answer. So Steps needs no projection: unlike audit_log,
+/// whose subject lived inside a JSON payload, every field worth
+/// filtering on is already a column.
+///
+/// `job_id` and `id` are absent because they are uuid, and only text
+/// literals are pushed — a text bind against uuid makes Postgres
+/// reject the statement rather than the row.
+pub const STEP_PUSHABLE: crate::pushdown::PushableColumns = &[
+    ("status", "status", crate::pushdown::ColumnType::Text),
+    ("kind", "kind", crate::pushdown::ColumnType::Text),
+    (
+        "assignee_id",
+        "assignee_id",
+        crate::pushdown::ColumnType::Text,
     ),
 ];
 
@@ -154,7 +180,24 @@ impl PgViewResolver {
                 Ok(match predicate.owner_allow_list(user) {
                     None => SourceScope::All,
                     Some(ids) if ids.is_empty() => SourceScope::None,
-                    Some(ids) => SourceScope::JobOwners(ids),
+                    Some(ids) => SourceScope::Owners(ids),
+                })
+            }
+            ViewSource::Steps => {
+                // Steps have their own policy resource — 73 seeded
+                // rules across self/department/territory — so they get
+                // their own predicate rather than inheriting the Job's.
+                // The owner allow-list lands on `assignee_id`: a
+                // Step's owner is whoever it is assigned to.
+                let predicate = self
+                    .policy
+                    .scope_predicate(user, Resource::step())
+                    .await
+                    .map_err(|e| ViewsError::Storage(format!("policy check failed: {e}")))?;
+                Ok(match predicate.owner_allow_list(user) {
+                    None => SourceScope::All,
+                    Some(ids) if ids.is_empty() => SourceScope::None,
+                    Some(ids) => SourceScope::Owners(ids),
                 })
             }
             ViewSource::Subjects | ViewSource::Events => {
@@ -221,7 +264,7 @@ impl PgViewResolver {
                 // must be in it. One statement covers both cases so
                 // the scoped path cannot drift from the unscoped one.
                 let owners: Option<Vec<String>> = match scope {
-                    SourceScope::JobOwners(ids) => Some(ids.clone()),
+                    SourceScope::Owners(ids) => Some(ids.clone()),
                     _ => None,
                 };
                 let rows = sqlx::query(
@@ -254,6 +297,64 @@ impl PgViewResolver {
                                 .try_get::<Option<Vec<String>>, _>("tags")
                                 .map_err(dec)?,
                             "created_at": ts(r, "created_at")?,
+                        }))
+                    })
+                    .collect()
+            }
+            ViewSource::Steps => {
+                let owners: Option<Vec<String>> = match scope {
+                    SourceScope::Owners(ids) => Some(ids.clone()),
+                    _ => None,
+                };
+                // Pushdown terms follow the scope clause, so their
+                // placeholders start at $3.
+                let mut sql = String::from(
+                    "SELECT id, job_id, kind, title, assignee_id, status, sort_order, \
+                            blocked_by, completed_on, notes, created_at, updated_at \
+                     FROM steps \
+                     WHERE ($2::text[] IS NULL OR assignee_id = ANY($2))",
+                );
+                let mut binds: Vec<crate::pushdown::Bound> = Vec::new();
+                if let Some(p) = pushdown {
+                    let mut next = 3usize;
+                    sql.push_str(" AND ");
+                    sql.push_str(&p.to_sql(&mut next, &mut binds));
+                }
+                // Newest first, like every other source.
+                sql.push_str(" ORDER BY created_at DESC LIMIT $1");
+
+                let mut q = sqlx::query(&sql).bind(SCAN_CEILING).bind(owners.as_deref());
+                for b in &binds {
+                    q = match b {
+                        crate::pushdown::Bound::Text(s) => q.bind(s.clone()),
+                        crate::pushdown::Bound::TextList(v) => q.bind(v.clone()),
+                        crate::pushdown::Bound::Timestamp(ts) => q.bind(*ts),
+                    };
+                }
+                let rows = q.fetch_all(&self.pool).await.map_err(storage)?;
+                rows.iter()
+                    .map(|r| {
+                        Ok(json!({
+                            "id": uuid_text(r, "id")?,
+                            "job_id": uuid_text(r, "job_id")?,
+                            "kind": text(r, "kind")?,
+                            "title": opt_text(r, "title")?,
+                            "assignee_id": opt_text(r, "assignee_id")?,
+                            "status": text(r, "status")?,
+                            "sort_order": r.try_get::<i32, _>("sort_order").map_err(dec)?,
+                            // UUID[], not TEXT[] — rendered as strings so
+                            // a filter compares them the way an operator
+                            // writes them.
+                            "blocked_by": r
+                                .try_get::<Option<Vec<uuid::Uuid>>, _>("blocked_by")
+                                .map_err(dec)?
+                                .map(|v| {
+                                    v.into_iter().map(|u| u.to_string()).collect::<Vec<_>>()
+                                }),
+                            "completed_on": opt_date(r, "completed_on")?,
+                            "notes": opt_text(r, "notes")?,
+                            "created_at": ts(r, "created_at")?,
+                            "updated_at": ts(r, "updated_at")?,
                         }))
                     })
                     .collect()
@@ -344,8 +445,10 @@ impl ViewResolver for PgViewResolver {
         // costs a wider scan, not a wrong answer.
         let pushdown = match (&compiled, view.source) {
             (Some(expr), ViewSource::Events) => crate::pushdown::extract(expr, EVENT_PUSHABLE),
-            // jobs + subjects still read their base tables; they get
-            // their own descriptors when they get projections.
+            (Some(expr), ViewSource::Steps) => crate::pushdown::extract(expr, STEP_PUSHABLE),
+            // jobs + subjects still read their base tables with no
+            // pushdown; they get descriptors when someone needs them
+            // (TODO.md F2).
             _ => None,
         };
         // Scope is computed from the CALLER, not the View's author: a

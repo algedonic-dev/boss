@@ -150,7 +150,12 @@ code. Ordered by what to reach for first.
 
 ### Features
 
-- [ ] **F1 — Steps has no read surface.** Views offers Subjects, Jobs
+- [x] **F1 — Steps has no read surface.** Done 2026-08-06 (#189):
+      `steps` is a View source, scoped on `Resource::step()` with the
+      owner allow-list landing on `assignee_id`, and pushdown on
+      `status` / `kind` / `assignee_id`. No projection needed — those
+      three are already indexed, including a partial index built for
+      exactly this question. Original finding: Views offers Subjects, Jobs
       and Events — three of the four primitives. Steps is 160,254 rows
       and is where work state lives; "my ready steps" cannot be
       expressed as a View.
