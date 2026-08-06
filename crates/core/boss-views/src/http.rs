@@ -27,6 +27,46 @@ const MAX_LIMIT: usize = 500;
 pub struct ViewsApiState {
     pub repo: Arc<dyn ViewsRepo>,
     pub resolver: Arc<dyn ViewResolver>,
+    /// The Operating System map. Optional so a deployment without a
+    /// Postgres-backed views service still serves the rest of the
+    /// surface rather than failing to construct.
+    pub os_map: Option<Arc<dyn crate::os_map::OsMapRepo>>,
+}
+
+#[derive(Deserialize)]
+pub struct OsMapQuery {
+    /// How many recent step completions to build the map from.
+    /// Bounded by recency rather than time because `occurred_at` runs
+    /// on the sim clock, which moves at warp — "the last N handoffs"
+    /// means the same thing at any speed.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// `GET /api/views/os-map` — the executor network.
+///
+/// A read of who is moving work and where it goes, per
+/// `docs/design/operating-system-view.md`. Cheap enough to poll,
+/// which is what makes it a live instrument rather than a snapshot.
+async fn os_map(State(state): State<Arc<ViewsApiState>>, Query(q): Query<OsMapQuery>) -> Response {
+    let Some(repo) = state.os_map.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "os-map needs a postgres-backed views service",
+        )
+            .into_response();
+    };
+    // Clamp rather than reject: a caller asking for everything gets a
+    // large map, not an error, and the ceiling keeps one request from
+    // scanning the whole log.
+    let limit = q
+        .limit
+        .unwrap_or(crate::os_map::DEFAULT_LIMIT)
+        .clamp(1, 100_000);
+    match repo.os_map(limit).await {
+        Ok(map) => Json(map).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -44,6 +84,7 @@ pub fn router(state: ViewsApiState) -> Router {
             get(get_view).put(replace_view).delete(delete_view),
         )
         .route("/api/views/{id}/results", get(view_results))
+        .route("/api/views/os-map", get(os_map))
         .with_state(Arc::new(state))
 }
 
@@ -190,6 +231,9 @@ mod tests {
 
     fn app() -> Router {
         router(ViewsApiState {
+            // These tests exercise the View surface; the map has its
+            // own coverage and needs Postgres.
+            os_map: None,
             repo: Arc::new(InMemoryViewsRepo::new(
                 DateTime::from_timestamp(1_700_000_000, 0).expect("valid ts"),
             )),

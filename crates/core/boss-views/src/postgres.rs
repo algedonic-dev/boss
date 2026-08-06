@@ -151,3 +151,106 @@ impl ViewsRepo for PgViewsRepo {
         Ok(())
     }
 }
+
+#[async_trait::async_trait]
+impl crate::os_map::OsMapRepo for PgViewsRepo {
+    async fn os_map(&self, limit: i64) -> Result<crate::os_map::OsMap, ViewsError> {
+        use crate::os_map::{OsMap, OsMapEdge, classify, nodes_from_edges};
+
+        // One pass: take the most recent `limit` step completions,
+        // pair each with the previous completion on the SAME Job
+        // (that pairing IS the handoff), resolve both actors to a
+        // department, and aggregate.
+        //
+        // `lag` partitions by job_id so a handoff never spans two
+        // Jobs. Automation collapses to one `dispatcher` node rather
+        // than one node per rule — `/it/dispatcher` is the drill-down
+        // for what is inside it.
+        let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
+            "WITH recent AS (
+                 SELECT audit_id,
+                        payload->>'job_id'   AS job_id,
+                        payload->>'_actor'   AS actor,
+                        COALESCE((payload->>'_simulated')::boolean, false) AS simulated
+                 FROM event_facts
+                 WHERE kind = 'jobs.step.completed'
+                   AND payload->>'job_id' IS NOT NULL
+                 ORDER BY audit_id DESC
+                 LIMIT $1
+             ),
+             paired AS (
+                 SELECT actor,
+                        simulated,
+                        LAG(actor) OVER (PARTITION BY job_id ORDER BY audit_id) AS prev_actor
+                 FROM recent
+             ),
+             resolved AS (
+                 SELECT
+                     COALESCE(ep.department,
+                              CASE WHEN p.prev_actor LIKE 'automation:%'
+                                   THEN 'dispatcher' ELSE 'unresolved' END) AS src,
+                     COALESCE(ea.department,
+                              CASE WHEN p.actor LIKE 'automation:%'
+                                   THEN 'dispatcher' ELSE 'unresolved' END) AS dst,
+                     p.simulated
+                 FROM paired p
+                 LEFT JOIN employees ep ON ep.id = p.prev_actor
+                 LEFT JOIN employees ea ON ea.id = p.actor
+                 WHERE p.prev_actor IS NOT NULL
+             )
+             SELECT src, dst,
+                    COUNT(*)::bigint AS handoffs,
+                    COUNT(*) FILTER (WHERE simulated)::bigint AS simulated
+             FROM resolved
+             GROUP BY src, dst
+             ORDER BY handoffs DESC",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ViewsError::Storage(e.to_string()))?;
+
+        let edges: Vec<OsMapEdge> = rows
+            .into_iter()
+            .map(|(source, target, handoffs, simulated)| OsMapEdge {
+                source,
+                target,
+                handoffs,
+                simulated,
+            })
+            .collect();
+
+        // Labels come from the Class registry, which already owns the
+        // tenant's department vocabulary — `it` is "IT" and `qa` is
+        // "QA" there. Humanising the code here instead produced "It"
+        // and "Qa": a second, worse copy of a fact the registry
+        // already holds (CLAUDE.md §9a). `classify` stays as the
+        // fallback for the reserved ids and for a department with no
+        // Class row.
+        let labels: Vec<(String, String)> = sqlx::query_as(
+            "SELECT code, display_name FROM classes
+             WHERE subject_kind = 'employee' AND member_attribute = 'department'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ViewsError::Storage(e.to_string()))?;
+        let labels: std::collections::HashMap<String, String> = labels.into_iter().collect();
+
+        let handoffs_considered = edges.iter().map(|e| e.handoffs).sum();
+        let high_water: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(audit_id), 0) FROM event_facts")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| ViewsError::Storage(e.to_string()))?;
+
+        Ok(OsMap {
+            nodes: nodes_from_edges(&edges, |id| match labels.get(id) {
+                Some(display) => (display.clone(), crate::os_map::NodeKind::Department),
+                None => classify(id),
+            }),
+            edges,
+            handoffs_considered,
+            high_water,
+        })
+    }
+}
