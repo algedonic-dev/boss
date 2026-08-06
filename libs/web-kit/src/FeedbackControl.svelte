@@ -136,19 +136,33 @@
     display: flex;
     align-items: center;
   }
+  /* The chrome bar is an unconditionally dark surface (#0c0a09) that
+     sets no `color`, so anything inside it must declare its own. This
+     button used `color: inherit` and therefore picked up the DOCUMENT
+     text colour: fine in dark theme, near-black on near-black in
+     light theme. Reported as "I can't read this feedback button" —
+     and correctly diagnosed as a light/dark issue.
+
+     Matching `.signin-btn` rather than inventing another treatment:
+     the two are the only bordered buttons in the bar, and they sat
+     one gap apart with different borders, radii, and padding. */
   .fb-trigger {
-    background: none;
-    border: 1px solid rgba(255, 255, 255, 0.22);
-    color: inherit;
-    font: inherit;
+    background: transparent;
+    border: 1px solid #44403c;
+    border-radius: 6px;
+    padding: 4px 11px;
+    font-family: inherit;
     font-size: 12px;
-    padding: 3px 10px;
-    border-radius: 4px;
+    font-weight: 500;
+    line-height: 1.4;
+    color: #e7e5e4;
     cursor: pointer;
     white-space: nowrap;
   }
   .fb-trigger:hover {
-    background: rgba(255, 255, 255, 0.1);
+    background: #292524;
+    color: #fff;
+    border-color: #57534e;
   }
   .fb-trigger:focus-visible,
   .fb-send:focus-visible {
