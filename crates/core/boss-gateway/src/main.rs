@@ -139,6 +139,49 @@ async fn main() -> Result<()> {
         demo_mode,
     });
 
+    let app = build_router(local_auth_state.clone());
+
+    let app = app
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            timing::request_timer,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            role_headers::inject_role_headers,
+        ))
+        // Outermost: when BOSS_DEMO_MODE=1, mint a synthetic
+        // `audit-readonly` session for anonymous visitors so the
+        // playground shows live data without forcing signup. No-op
+        // when demo_mode=false or when a valid cookie is already
+        // present.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            demo_session::session_minter,
+        ))
+        .with_state(state);
+
+    tracing::info!(listen = %listen, static_dir = %static_files::static_dir(), "boss-gateway starting");
+    let listener = TcpListener::bind(&listen).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+/// Build the gateway route table.
+///
+/// Extracted from `main` so the routing itself can be tested. It
+/// could not be before: the table was 400 lines inline in an async
+/// `main` that also reads env, builds a session key, and binds a
+/// socket, so the only way to ask "what does this path resolve to"
+/// was to run the binary and curl it. Route precedence is exactly
+/// the kind of claim that needs asserting rather than eyeballing —
+/// a catch-all that quietly shadowed a real service would look
+/// fine in review and 404 a working endpoint in production.
+///
+/// Middleware layers and `.with_state` stay in `main`: they need the
+/// live `AppState`, and tests supply their own.
+fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<Arc<AppState>> {
     let app = axum::Router::new()
         .route("/health", axum::routing::get(handle_health))
         .route("/api/session", axum::routing::get(api::session))
@@ -505,6 +548,12 @@ async fn main() -> Result<()> {
         // Step UX plugin bundles — served from the plugins dir on
         // disk. See docs/architecture-decisions.md §Step UX & frontend.
         .route("/plugins/{*rest}", axum::routing::get(plugin_files::handle))
+        // Catch-all for /api misses. Must sit above the SPA fallback
+        // conceptually; matchit resolves by specificity rather than
+        // registration order, so every service route declared above
+        // still wins and only genuine misses arrive here.
+        .route("/api", axum::routing::any(api_not_found))
+        .route("/api/{*rest}", axum::routing::any(api_not_found))
         // Root-level: SPA static files. Auth-gated like /dashboard.
         .route("/", axum::routing::get(static_files::handle))
         .route("/{*rest}", axum::routing::get(static_files::handle));
@@ -513,7 +562,7 @@ async fn main() -> Result<()> {
     // local-auth. These handlers carry their own state (the
     // CredentialStore + the session_key + an http client for
     // bootstrap_email lookups against boss-people-api).
-    let app = if let Some(la) = local_auth_state.clone() {
+    if let Some(la) = local_auth_state {
         app.route(
             "/api/auth/login",
             axum::routing::post(local_auth::login).with_state(la.clone()),
@@ -537,37 +586,38 @@ async fn main() -> Result<()> {
         )
     } else {
         app
-    };
-
-    let app = app
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            timing::request_timer,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            role_headers::inject_role_headers,
-        ))
-        // Outermost: when BOSS_DEMO_MODE=1, mint a synthetic
-        // `audit-readonly` session for anonymous visitors so the
-        // playground shows live data without forcing signup. No-op
-        // when demo_mode=false or when a valid cookie is already
-        // present.
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            demo_session::session_minter,
-        ))
-        .with_state(state);
-
-    tracing::info!(listen = %listen, static_dir = %static_files::static_dir(), "boss-gateway starting");
-    let listener = TcpListener::bind(&listen).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
+    }
 }
 
 async fn handle_health() -> &'static str {
     "ok"
+}
+
+/// Anything under `/api` that matched no service above is a routing
+/// miss, and says so in JSON.
+///
+/// Without this it fell through to the `/{*rest}` SPA route and came
+/// back as `200 text/html` — the whole index.html. A client then fails
+/// deserializing at column 1 with a parser error that names JSON and
+/// never mentions the route, which is how `/api/job-kinds` (the
+/// plausible-looking spelling of `/api/jobs/kinds`) cost two detours
+/// before anyone suspected the URL.
+///
+/// The repo already knew about this class: several services carry a
+/// bare `/api/<name>` matcher purely because axum's `{*rest}` needs
+/// at least one segment, each added after the SPA swallowed a list
+/// endpoint. That is per-service whack-a-mole for a routing-shaped
+/// problem. This closes it once — a static or longer-prefix route
+/// still wins under matchit, so every real service keeps its match
+/// and only genuine misses land here.
+async fn api_not_found(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        axum::Json(serde_json::json!({
+            "error": "no such API route",
+            "path": uri.path(),
+        })),
+    )
 }
 
 /// Returns a JSON snapshot of per-endpoint latency percentiles
@@ -676,5 +726,150 @@ mod tests {
         let first = load_or_create_session_key(&path).unwrap();
         let second = load_or_create_session_key(&path).unwrap();
         assert_eq!(first, second);
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    //! Routing tests. They live in the binary because the route table
+    //! does: `api`, `proxy`, and `static_files` are bin-local modules,
+    //! so an integration test under `tests/` cannot reach them.
+
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    /// The catch-all's signature. Asserting on the body rather than
+    /// the status is deliberate — a proxied route whose upstream is
+    /// down also answers 404-ish, and the question here is *which
+    /// handler ran*, not what it thought of the request.
+    const MISS: &str = "no such API route";
+
+    fn app_with(local_auth: Option<Arc<LocalAuthState>>) -> axum::Router {
+        let state = Arc::new(AppState {
+            session_key: vec![0u8; 32],
+            proxy_client: reqwest::Client::new(),
+            perf: Arc::new(PerfCollector::new()),
+            demo_mode: false,
+        });
+        build_router(local_auth).with_state(state)
+    }
+
+    fn app() -> axum::Router {
+        app_with(None)
+    }
+
+    async fn get(app: axum::Router, path: &str) -> (StatusCode, String) {
+        let resp = app
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn unmatched_api_path_is_a_json_404() {
+        // The real miss that prompted this: the plausible-looking
+        // spelling of `/api/jobs/kinds`.
+        let (status, body) = get(app(), "/api/job-kinds").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+        assert!(body.contains(MISS), "body: {body}");
+        assert!(
+            body.contains("/api/job-kinds"),
+            "the 404 should name the path that missed: {body}"
+        );
+        assert!(
+            !body.to_lowercase().contains("<!doctype html"),
+            "an /api miss must never return the SPA — that is the bug: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_api_root_is_also_a_miss() {
+        let (status, body) = get(app(), "/api").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+        assert!(body.contains(MISS), "body: {body}");
+    }
+
+    /// The whole risk of a catch-all: that it quietly swallows a real
+    /// route. matchit resolves by specificity rather than registration
+    /// order, which is the assumption this pins — including the two
+    /// shapes that motivated the per-service bare matchers (a list
+    /// endpoint with no trailing segment, and a nested path).
+    #[tokio::test]
+    async fn no_service_route_is_shadowed_by_the_catch_all() {
+        const REAL: &[&str] = &[
+            "/api/session",
+            "/api/tenant/manifest",
+            "/api/finance/revenue-categories",
+            "/api/gateway/perf",
+            "/api/jobs",
+            "/api/jobs/kinds",
+            "/api/jobs/summary",
+            "/api/classes",
+            "/api/classes/employee",
+            "/api/locations",
+            "/api/subject-kinds",
+            "/api/people",
+            "/api/people/accounts",
+            "/api/views",
+            // `/api/events/tail`, not bare `/api/events` — the events
+            // service has no list endpoint there, so the bare path is
+            // a genuine miss and SHOULD reach the catch-all. Writing
+            // it into this list first was my error, and the failure
+            // was the test doing its job: it cannot tell a route I
+            // wrongly believe exists from one the catch-all stole.
+            "/api/events/tail",
+            "/api/design/docs",
+            "/api/it/health",
+        ];
+        for path in REAL {
+            let (_, body) = get(app(), path).await;
+            assert!(
+                !body.contains(MISS),
+                "`{path}` fell through to the /api catch-all — the catch-all is \
+                 shadowing a real service route"
+            );
+        }
+    }
+
+    /// Local-auth routes are registered AFTER the catch-all, on a
+    /// conditionally-built router. Static paths still win, but that is
+    /// worth asserting rather than assuming, since these are the only
+    /// `/api` routes added outside the main chain.
+    #[tokio::test]
+    async fn local_auth_routes_survive_the_catch_all() {
+        // `load` on a path that does not exist yields an empty store,
+        // which is all the routing test needs.
+        let store = CredentialStore::load("/nonexistent/boss-test-credentials.toml")
+            .expect("empty credential store");
+        let la = Arc::new(LocalAuthState {
+            store,
+            session_key: vec![0u8; 32],
+            http: reqwest::Client::new(),
+        });
+
+        for path in ["/api/auth/me", "/api/auth/login"] {
+            let (_, body) = get(app_with(Some(la.clone())), path).await;
+            assert!(
+                !body.contains(MISS),
+                "`{path}` fell through to the /api catch-all"
+            );
+        }
+    }
+
+    /// Non-API paths must still reach the SPA — the fix narrows the
+    /// fallback, it does not remove it.
+    #[tokio::test]
+    async fn non_api_paths_still_reach_the_spa_fallback() {
+        let (_, body) = get(app(), "/ux/jobs").await;
+        assert!(
+            !body.contains(MISS),
+            "a page route must not be treated as an API miss: {body}"
+        );
     }
 }
