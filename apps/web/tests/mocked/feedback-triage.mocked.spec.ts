@@ -1,18 +1,62 @@
-// The triage board. What these pin is that columns are DERIVED from
-// the triage step rather than from a status field the board keeps —
-// a card that could disagree with its Job is the whole failure mode
-// this design avoids — and that the agent hand-off records something
-// durable rather than firing and forgetting.
+// The triage board.
 //
-// The hand-off shape matters beyond the button: an agent taking an
-// automatic first pass later writes the same `agent_requested_at`
-// record without a human clicking, so the board reads both the same
-// way.
+// What these pin is that the board is a rendering of the JobKind, not
+// a screen with opinions. Columns come from the registry's fork
+// vocabulary — add a disposition to the spec and a column appears —
+// and routing an item is completing the fork step with that
+// disposition, which is what opens the next step. A card therefore
+// cannot disagree with the Job behind it.
+//
+// The earlier version of this board had three hardcoded columns
+// ending in "Triaged", which made triage a synonym for closing. These
+// tests exist partly to stop that coming back.
 
 import { test, expect } from '@playwright/test';
 import { mountPage } from '../smoke/_helpers';
 
 const MANIFEST = { display_name: 'Algedonic Ales', modules: {}, labels: {} };
+
+const DISPOSITIONS = 'reproduce|design|build|duplicate|needs-info|decline';
+
+/// Mirrors `user_feedback_spec()`. The board reads the fork out of
+/// this, so the shape here is the contract under test: a required
+/// pipe-shaped field marks the fork, and each successor's
+/// `title_template` names the route.
+const KIND = {
+  kind: 'user-feedback',
+  version: 1,
+  status: 'active',
+  steps: [
+    {
+      title: 'submitted',
+      kind: 'trigger',
+      ready_when: 'true',
+      title_template: 'Feedback submitted',
+      fields: [],
+    },
+    {
+      title: 'triage',
+      kind: 'task',
+      ready_when: 'steps.submitted.done',
+      title_template: 'Triage feedback',
+      fields: [{ name: 'disposition', field_type: DISPOSITIONS, required: true }],
+    },
+    ...[
+      ['investigate', 'reproduce', 'Reproduce and investigate'],
+      ['design-review', 'design', 'Decide the design'],
+      ['build', 'build', 'Build the change'],
+      ['needs-info', 'needs-info', 'Waiting on the reporter'],
+      ['duplicate', 'duplicate', 'Closed as a duplicate'],
+      ['declined', 'decline', 'Closed without action'],
+    ].map(([title, disposition, label]) => ({
+      title,
+      kind: 'task',
+      ready_when: `steps.triage.done AND steps.triage.metadata.disposition = "${disposition}"`,
+      title_template: label,
+      fields: [],
+    })),
+  ],
+};
 
 function job(
   id: string,
@@ -22,26 +66,25 @@ function job(
   return {
     id,
     kind: 'user-feedback',
-    title: `Feedback on /ux/jobs`,
+    title: 'Feedback on /ux/jobs',
     status: triage.status === 'completed' ? 'closed' : 'open',
-    subject_kind: 'custom',
-    subject_id: '/ux/jobs',
+    subject: { subject_kind: 'custom', id: '/ux/jobs' },
     owner_id: 'emp-bootstrap-admin',
     metadata: { message, route: '/ux/jobs' },
     steps: [
-      { id: `${id}-t`, kind: 'trigger', status: 'completed' },
+      { id: `${id}-t`, kind: 'trigger', status: 'completed', fields: [], metadata: {} },
       {
         id: `${id}-a`,
-        // `authority_role` is what the JobKind puts on this step to
-        // keep it waiting for a person, and it is how the board finds
-        // the step — so the fixture carries it exactly as a real Job
-        // does. Omitting it here would make every card read as
-        // triaged, which is the failure the board must not have.
+        // `authority_role` keeps the step waiting for a person, and
+        // the `disposition` field is how the board identifies the
+        // fork. A real Job carries both; omitting either here would
+        // make the fixture lie about what the board keys on.
         kind: triage.kind ?? 'task',
         status: triage.status,
+        fields: [{ name: 'disposition', field_type: DISPOSITIONS, required: true }],
         metadata: { authority_role: 'platform-admin', ...(triage.metadata ?? {}) },
       },
-      { id: `${id}-o`, kind: 'outcome', status: 'pending' },
+      { id: `${id}-o`, kind: 'outcome', status: 'pending', fields: [], metadata: {} },
     ],
   };
 }
@@ -52,81 +95,61 @@ const JOBS = [
     status: 'ready',
     metadata: { agent_requested_at: '2026-08-06T10:00:00Z', agent_requested_by: 'emp-1' },
   }),
-  job('fb-done', 'Already handled', { status: 'completed' }),
+  job('fb-routed', 'Needs a design call', {
+    status: 'completed',
+    metadata: { disposition: 'design' },
+  }),
 ];
 
 test.describe('feedback triage board', () => {
   test.beforeEach(async ({ page }) => {
     await page.route(/\/api\/tenant\/manifest$/, (r) => r.fulfill({ json: MANIFEST }));
+    await page.route(/\/api\/jobs\/kinds$/, (r) => r.fulfill({ json: [KIND] }));
     await page.route(/\/api\/jobs\?kind=user-feedback/, (r) =>
       r.fulfill({ json: { data: JOBS, total: JOBS.length } }),
     );
   });
 
-  test('sorts each item by its triage step, not a stored column', async ({ page }) => {
+  test('builds its columns from the JobKind fork, labelled by each next step', async ({
+    page,
+  }) => {
+    await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
+
+    await expect(page.locator('section[aria-label="Waiting on triage"]')).toBeVisible();
+    // One column per disposition, named for the step it opens — not
+    // for the disposition slug. "Reproduce and investigate" tells a
+    // triager what happens; "reproduce" does not.
+    for (const label of [
+      'Reproduce and investigate',
+      'Decide the design',
+      'Build the change',
+      'Waiting on the reporter',
+      'Closed as a duplicate',
+      'Closed without action',
+    ]) {
+      await expect(page.locator(`section[aria-label="${label}"]`)).toBeVisible();
+    }
+    // The old model's column must not survive.
+    await expect(page.locator('section[aria-label="Triaged"]')).toHaveCount(0);
+  });
+
+  test('sorts each item by its fork step, not a stored column', async ({ page }) => {
     await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
 
     const waiting = page.locator('section[aria-label="Waiting on triage"]');
-    const withAgent = page.locator('section[aria-label="With an agent"]');
-    const done = page.locator('section[aria-label="Triaged"]');
-
     await expect(waiting).toContainText('Column picker forgets my choice');
-    // Same step status as the first card — what moves it is the
-    // recorded agent request, which is the only difference.
-    await expect(withAgent).toContainText('Typo on the vendors page');
-    await expect(done).toContainText('Already handled');
-  });
+    // Handed to an agent is an annotation, not a destination — this
+    // card is still waiting on a human decision.
+    await expect(waiting).toContainText('Typo on the vendors page');
+    await expect(waiting).toContainText(/with an agent/i);
 
-  // What the board actually depends on is the authority gate, not the
-  // spelling of the step kind. Kinds are registry data and a kind is a
-  // bundle of properties, so the registry is free to re-author this
-  // spec onto a different one; the board must keep sorting when it
-  // does. Pinning it here is what stops the kind name creeping back
-  // in as a lookup.
-  test('sorts by the authority gate, not the step kind name', async ({ page }) => {
-    const renamed = [
-      job('fb-renamed', 'Still needs a person', { status: 'ready', kind: 'sign-off' }),
-    ];
-    await page.route(/\/api\/jobs\?kind=user-feedback/, (r) =>
-      r.fulfill({ json: { data: renamed, total: renamed.length } }),
-    );
-
-    await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
-
-    await expect(page.locator('section[aria-label="Waiting on triage"]')).toContainText(
-      'Still needs a person',
-    );
-    await expect(page.locator('section[aria-label="Triaged"]')).not.toContainText(
-      'Still needs a person',
+    // Routed at triage, so it sits under the route it was sent to.
+    await expect(page.locator('section[aria-label="Decide the design"]')).toContainText(
+      'Needs a design call',
     );
   });
 
-  test('handing to an agent records a durable request on the step', async ({ page }) => {
-    let put: { url: string; body: Record<string, unknown> } | null = null;
-    await page.route(/\/api\/jobs\/[^/]+\/steps\/[^/]+$/, async (route) => {
-      if (route.request().method() !== 'PUT') return route.fallback();
-      put = {
-        url: route.request().url(),
-        body: route.request().postDataJSON() as Record<string, unknown>,
-      };
-      return route.fulfill({ json: {} });
-    });
-
-    await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
-    const card = page.locator('article', { hasText: 'Column picker forgets my choice' });
-    await card.getByRole('button', { name: /hand to agent/i }).click();
-
-    await expect.poll(() => put !== null).toBe(true);
-    const body = (put as unknown as { body: { metadata: Record<string, unknown> } }).body;
-    // A recorded request, not a fired action — so a reload still shows
-    // it and an automatic first pass can write the same shape.
-    expect(body.metadata['agent_requested_at']).toBeTruthy();
-    expect(body.metadata['agent_requested_by']).toBeTruthy();
-    // Handing off is not a decision: the step must stay open.
-    expect(body).not.toHaveProperty('status');
-  });
-
-  test('marking triaged completes the step', async ({ page }) => {
+  test('routing an item completes the fork step with that disposition', async ({ page }) => {
     let body: Record<string, unknown> | null = null;
     await page.route(/\/api\/jobs\/[^/]+\/steps\/[^/]+$/, async (route) => {
       if (route.request().method() !== 'PUT') return route.fallback();
@@ -136,43 +159,20 @@ test.describe('feedback triage board', () => {
 
     await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
     const card = page.locator('article', { hasText: 'Column picker forgets my choice' });
-    await card.getByRole('button', { name: /mark triaged/i }).click();
+    await card.getByLabel('Route this item').selectOption('build');
+    await card.getByRole('button', { name: /^route$/i }).click();
 
     await expect.poll(() => body !== null).toBe(true);
-    expect((body as unknown as { status: string }).status).toBe('completed');
-  });
-
-  // Dragging is not a second way to move a card — a column is not a
-  // place a card can be put, it is a rendering of the gated step's
-  // state. So a drop has to issue exactly the write the corresponding
-  // button issues, or the board would have two notions of what a
-  // column means.
-  test('dragging to the agent column records the same request the button does', async ({
-    page,
-  }) => {
-    let body: Record<string, unknown> | null = null;
-    await page.route(/\/api\/jobs\/[^/]+\/steps\/[^/]+$/, async (route) => {
-      if (route.request().method() !== 'PUT') return route.fallback();
-      body = route.request().postDataJSON() as Record<string, unknown>;
-      return route.fulfill({ json: {} });
-    });
-
-    await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
-    await page
-      .locator('article', { hasText: 'Column picker forgets my choice' })
-      .dragTo(page.locator('section[aria-label="With an agent"]'));
-
-    await expect.poll(() => body !== null).toBe(true);
-    const sent = body as unknown as { metadata: Record<string, unknown> };
-    expect(sent.metadata['agent_requested_at']).toBeTruthy();
-    expect(sent.metadata['agent_requested_by']).toBeTruthy();
-    // Still not a decision, however the card got there.
-    expect(body).not.toHaveProperty('status');
-    // The merge that keeps the step findable must survive the drag too.
+    const sent = body as unknown as { status: string; metadata: Record<string, unknown> };
+    // Routing IS triaging: one write that both records the decision
+    // and completes the step, so the next step opens.
+    expect(sent.status).toBe('completed');
+    expect(sent.metadata['disposition']).toBe('build');
+    // The merge that keeps the step findable must survive.
     expect(sent.metadata['authority_role']).toBe('platform-admin');
   });
 
-  test('dragging to the triaged column completes the step', async ({ page }) => {
+  test('dragging onto a route does exactly what picking it does', async ({ page }) => {
     let body: Record<string, unknown> | null = null;
     await page.route(/\/api\/jobs\/[^/]+\/steps\/[^/]+$/, async (route) => {
       if (route.request().method() !== 'PUT') return route.fallback();
@@ -183,19 +183,42 @@ test.describe('feedback triage board', () => {
     await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
     await page
       .locator('article', { hasText: 'Column picker forgets my choice' })
-      .dragTo(page.locator('section[aria-label="Triaged"]'));
+      .dragTo(page.locator('section[aria-label="Reproduce and investigate"]'));
 
     await expect.poll(() => body !== null).toBe(true);
-    expect((body as unknown as { status: string }).status).toBe('completed');
+    const sent = body as unknown as { status: string; metadata: Record<string, unknown> };
+    expect(sent.status).toBe('completed');
+    expect(sent.metadata['disposition']).toBe('reproduce');
   });
 
-  // A completed step does not un-complete, so those cards must not
-  // lift at all — offering a drag that silently does nothing is worse
-  // than offering none.
-  test('a triaged card cannot be dragged back out', async ({ page }) => {
+  test('lifting a card offers every route as a drop target', async ({ page }) => {
     await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
-    const done = page.locator('section[aria-label="Triaged"]').locator('article').first();
-    await expect(done).toHaveAttribute('draggable', 'false');
+    await expect(page.locator('.tb-drop-zone')).toHaveCount(0);
+
+    const card = page.locator('article', { hasText: 'Column picker forgets my choice' });
+    const box = await card.boundingBox();
+    if (!box) throw new Error('card has no box');
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(box.x + box.width / 2, box.y + 140, { steps: 8 });
+
+    // Six routes offered, and the column it came from is not one of
+    // them — dropping back where you started is not a disposition.
+    await expect(page.locator('.tb-drop-zone')).toHaveCount(6);
+    await expect(
+      page.locator('section[aria-label="Waiting on triage"]').locator('.tb-drop-zone'),
+    ).toHaveCount(0);
+
+    await page.mouse.up();
+  });
+
+  test('an already-routed card cannot be dragged or re-routed', async ({ page }) => {
+    await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
+
+    const routed = page.locator('section[aria-label="Decide the design"]').locator('article');
+    // A completed fork step does not un-complete.
+    await expect(routed.first()).toHaveAttribute('draggable', 'false');
+    await expect(routed.getByRole('button', { name: /^route$/i })).toHaveCount(0);
 
     const waiting = page
       .locator('section[aria-label="Waiting on triage"]')
@@ -204,10 +227,23 @@ test.describe('feedback triage board', () => {
     await expect(waiting).toHaveAttribute('draggable', 'true');
   });
 
-  test('offers no actions on an already-triaged item', async ({ page }) => {
+  test('handing to an agent records a durable request without deciding', async ({ page }) => {
+    let body: Record<string, unknown> | null = null;
+    await page.route(/\/api\/jobs\/[^/]+\/steps\/[^/]+$/, async (route) => {
+      if (route.request().method() !== 'PUT') return route.fallback();
+      body = route.request().postDataJSON() as Record<string, unknown>;
+      return route.fulfill({ json: {} });
+    });
+
     await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
-    const done = page.locator('section[aria-label="Triaged"]');
-    await expect(done.getByRole('button', { name: /mark triaged/i })).toHaveCount(0);
-    await expect(done.getByRole('button', { name: /hand to agent/i })).toHaveCount(0);
+    const card = page.locator('article', { hasText: 'Column picker forgets my choice' });
+    await card.getByRole('button', { name: /hand to agent/i }).click();
+
+    await expect.poll(() => body !== null).toBe(true);
+    const sent = body as unknown as { metadata: Record<string, unknown> };
+    expect(sent.metadata['agent_requested_at']).toBeTruthy();
+    // An agent looking is not a decision — no status, no disposition.
+    expect(body).not.toHaveProperty('status');
+    expect(sent.metadata['disposition']).toBeUndefined();
   });
 });

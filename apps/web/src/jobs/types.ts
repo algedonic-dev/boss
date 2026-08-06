@@ -74,6 +74,20 @@ export function isInFlight(status: StepStatus): boolean {
   return status === 'active';
 }
 
+/// One field of a step's completion contract (mirrors
+/// `boss_core::job::StepField`).
+///
+/// `field_type` is either a scalar name (`string`, `date-time`) or a
+/// pipe-shaped enum domain (`reproduce|design|build`). The enum form
+/// is what makes a step a FORK: the JobKind's viability lint proves
+/// every value has a successor gated on it, and a triage surface can
+/// read the domain to know which routes exist without hardcoding them.
+export type StepField = {
+  name: string;
+  field_type: string;
+  required?: boolean;
+};
+
 export type Step = {
   id: string;
   job_id: string;
@@ -83,6 +97,10 @@ export type Step = {
   status: StepStatus;
   sort_order: number;
   blocked_by: string[];
+  /// Step-authored fields, validated in union with the kind bundle's.
+  /// Present on the wire; optional here because older callers may not
+  /// request enriched steps.
+  fields?: StepField[];
   sign_offs_required?: string[];
   sign_offs?: {
     authority_id: string;
