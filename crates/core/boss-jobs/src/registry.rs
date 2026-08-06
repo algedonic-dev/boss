@@ -318,7 +318,97 @@ fn job_kind_design_spec() -> JobKindSpec {
 /// never as TOML-loader exceptions, never as direct
 /// `INSERT INTO job_kinds` SQL.
 pub fn platform_kinds() -> Vec<JobKindSpec> {
-    vec![job_kind_design_spec(), design_doc_review_spec()]
+    vec![
+        job_kind_design_spec(),
+        design_doc_review_spec(),
+        user_feedback_spec(),
+    ]
+}
+
+/// Build the canonical `user-feedback` JobKindSpec.
+///
+/// Feedback is work, so it is a Job — not a table with its own
+/// surface. That choice is what makes it inherit everything the
+/// platform already does with work: an owner, a policy-gated
+/// transition, an audit trail of who triaged it and when, and a place
+/// in the same queues operators already read. A separate feedback
+/// store would have needed all of that rebuilt, and would have been
+/// the one kind of work the system could not see.
+///
+/// The Subject is the surface the feedback is ABOUT — a `custom`
+/// Subject whose id is the route path (`/ux/jobs`, `/system/design`).
+/// Same shape design-doc-review uses for a doc path. That makes "what
+/// have people said about this page" a Subject-history question, which
+/// the event linkage work already answers.
+///
+/// Step graph:
+///  -1. `trigger`   — someone submitted it from the chrome bar
+///   0. `triage`    — an operator reads it and decides
+///   999. `outcome` — closed
+fn user_feedback_spec() -> JobKindSpec {
+    let steps = vec![
+        StepSpec {
+            title: "submitted".into(),
+            kind: "trigger".into(),
+            ready_when: "true".into(),
+            title_template: "Feedback submitted".into(),
+            metadata_defaults: serde_json::json!({
+                "trigger_kind": "operator",
+                "trigger_name": "user-submits-feedback",
+            }),
+            ..Default::default()
+        },
+        StepSpec {
+            title: "triage".into(),
+            kind: "acknowledgment".into(),
+            ready_when: "steps.submitted.done".into(),
+            title_template: "Triage feedback".into(),
+            // Authority is what keeps this waiting for a person.
+            // Without it the dispatcher role-matches the ready step to
+            // whichever employee fits and the simulated workforce
+            // completes it — observed on the live box, where a
+            // feedback Job went from submitted to closed in one tick
+            // with `emp-aa-286` recorded as the actor. Feedback nobody
+            // read is worse than no feedback mechanism, because the
+            // audit trail says it was handled.
+            authority_role: Some("platform-admin".into()),
+            ..Default::default()
+        },
+        StepSpec {
+            title: "closed".into(),
+            kind: "outcome".into(),
+            ready_when: "steps.triage.done".into(),
+            title_template: "Feedback closed".into(),
+            metadata_defaults: serde_json::json!({ "outcome_kind": "completed" }),
+            terminal: Some(Terminal {
+                outcome: "completed".into(),
+            }),
+            ..Default::default()
+        },
+    ];
+
+    let mut spec = JobKindSpec::platform_seed(
+        "user-feedback",
+        "User feedback",
+        "platform",
+        vec!["custom".into()],
+        steps,
+    );
+    // Platform meta-work is owned by the operator baseline, same as
+    // the other two meta-kinds. Without this the Job materializes with
+    // no resolvable human owner and sits unassignable — the
+    // human_owner_gate test exists for exactly that, and caught this
+    // spec missing it.
+    spec.metadata = serde_json::json!({ "owner_role": "platform-admin" });
+    spec.description = Some(
+        "Feedback a user sent from the chrome bar. The Subject is the surface it is about \
+         (a `custom` Subject whose id is the route path), so \"what have people said about \
+         this page\" is a Subject-history question rather than a report someone has to build. \
+         Modelled as a Job deliberately: feedback is work, and work that lives outside the \
+         Job model is work the system cannot route, own, or audit."
+            .to_string(),
+    );
+    spec
 }
 
 /// Build the canonical `design-doc-review` JobKindSpec.
@@ -2689,9 +2779,13 @@ mod tests {
     // -----------------------------------------------------------
 
     #[test]
-    fn platform_kinds_carries_job_kind_design_and_design_doc_review() {
+    fn platform_kinds_carries_the_shipped_meta_kinds() {
         let kinds = platform_kinds();
-        assert_eq!(kinds.len(), 2, "ships job-kind-design + design-doc-review");
+        assert_eq!(
+            kinds.len(),
+            3,
+            "ships job-kind-design + design-doc-review + user-feedback"
+        );
 
         let design = kinds
             .iter()
@@ -2708,6 +2802,24 @@ mod tests {
             .expect("design-doc-review present");
         assert_eq!(review.version, 1);
         assert_eq!(review.status, JobKindStatus::Active);
+
+        // Feedback is a Job like any other work: its Subject is the
+        // surface it is about, which is what makes "what have people
+        // said about this page" answerable from Subject history.
+        let feedback = kinds
+            .iter()
+            .find(|k| k.kind == "user-feedback")
+            .expect("user-feedback present");
+        assert_eq!(feedback.version, 1);
+        assert_eq!(feedback.status, JobKindStatus::Active);
+        assert_eq!(feedback.subject_kinds, vec!["custom".to_string()]);
+        // trigger -> triage -> outcome. A terminal step is what lets
+        // the Job close rather than sitting open forever.
+        assert_eq!(feedback.steps.len(), 3);
+        assert!(
+            feedback.steps.iter().any(|s| s.terminal.is_some()),
+            "must have a terminal step or feedback Jobs never close"
+        );
     }
 
     #[test]

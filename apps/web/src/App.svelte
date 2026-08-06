@@ -215,6 +215,12 @@
   // to agree for every routed surface: miss one and the page rendered
   // with the wrong tab highlighted and the wrong sidebar, silently.
   let perspective: AppId = $derived(appForSection(activeSection));
+
+  // Both chrome render sites read this. They previously repeated the
+  // prop list, and drifted: the step-focus bar shipped without
+  // `searchAppKinds`, so global search silently lost its app scoping
+  // on exactly the surface built for focused reading.
+  let appKinds: ReadonlyArray<string> = $derived(APP_SUBJECT_KINDS[perspective] ?? []);
 </script>
 
 {#if route.kind === 'login'}
@@ -223,15 +229,10 @@
   <!-- Outside AppShell on purpose: a full-page step surface has no
        sidebar. The chrome bar stays — you can still switch apps —
        but everything below it belongs to the step. -->
-  <PerspectiveTabs
-    active={perspective}
-    brandName="Algedonic"
-    brandSub="Ales"
-    searchAppKinds={APP_SUBJECT_KINDS[perspective] ?? []}
-  />
+  <PerspectiveTabs active={perspective} searchAppKinds={appKinds} />
   <StepFocusPage jobId={route.jobId} stepId={route.stepId} />
 {:else}
-  <PerspectiveTabs active={perspective} brandName="Algedonic" brandSub="Ales" searchAppKinds={APP_SUBJECT_KINDS[perspective] ?? []} />
+  <PerspectiveTabs active={perspective} searchAppKinds={appKinds} />
 <AppShell {activeSection} {perspective}>
   {#if blockedModule}
     <ModuleDisabled module={blockedModule.id} label={blockedModule.label} />

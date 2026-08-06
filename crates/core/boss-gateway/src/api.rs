@@ -54,8 +54,22 @@ fn extract_session(headers: &HeaderMap, key: &[u8]) -> Option<Session> {
     Session::decode(raw, key).ok()
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct TenantMeta {
+    /// The tenant's own name for itself. The SPA chrome had
+    /// "Algedonic" / "Ales" hardcoded at three render sites, so the
+    /// used-device-shop tenant rendered a brewery's name in its top
+    /// bar. Branding is tenant data; core should not know it.
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct TenantToml {
+    #[serde(default)]
+    meta: TenantMeta,
     #[serde(default)]
     modules: std::collections::BTreeMap<String, bool>,
     #[serde(default)]
@@ -64,6 +78,13 @@ struct TenantToml {
 
 #[derive(Debug, Serialize)]
 pub struct TenantManifest {
+    /// Tenant display name, e.g. "Algedonic Ales". Absent when the
+    /// tenant.toml has no `[meta]` — the SPA falls back to "BOSS",
+    /// which is right for a deployment that has not named itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
     pub modules: std::collections::BTreeMap<String, bool>,
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub labels: std::collections::BTreeMap<String, String>,
@@ -83,11 +104,15 @@ pub struct TenantManifest {
 pub async fn tenant_manifest() -> Response {
     match load_tenant_toml() {
         Some(parsed) => Json(TenantManifest {
+            display_name: parsed.meta.display_name,
+            tenant_id: parsed.meta.tenant_id,
             modules: parsed.modules,
             labels: parsed.labels,
         })
         .into_response(),
         None => Json(TenantManifest {
+            display_name: None,
+            tenant_id: None,
             modules: Default::default(),
             labels: Default::default(),
         })

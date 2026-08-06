@@ -7,7 +7,16 @@
   // mirror the User Experiences Work / Surfaces / Knowledge-Bases
   // grouping. New sim surfaces slot in as more NAV entries.
   import PerspectiveTabs from '@boss/web-kit/PerspectiveTabs.svelte';
+  import { loadManifest } from '@boss/web-kit/session/manifest.svelte';
+  import { onMount } from 'svelte';
   import { href, navigate, type Route } from '../router';
+
+  // The Simulator is a separate SPA and never loaded the manifest —
+  // it did not need to while its chrome carried a hardcoded brand.
+  // Now that the brand is tenant data, this app has to fetch it too or
+  // its bar would read "BOSS" while every other app reads the tenant's
+  // name. Same endpoint, same store; the gateway serves it to both.
+  onMount(loadManifest);
 
   let { route, children } = $props<{
     route: Route;
@@ -28,7 +37,10 @@
 </script>
 
 <div class="sim-shell">
-  <PerspectiveTabs active="simulator" brandName="Algedonic" brandSub="Ales" />
+  <!-- Brand comes from the tenant manifest; the Simulator app has no
+       Subject kinds of its own, so search here is unscoped by design
+       rather than by omission. -->
+  <PerspectiveTabs active="simulator" searchAppKinds={[]} />
   <aside class="sim-sidebar">
     <nav class="sim-nav" aria-label="Simulator sections">
       <div class="sim-nav-group-label">Simulator</div>
