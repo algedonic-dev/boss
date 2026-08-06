@@ -28,6 +28,10 @@ export type RouteName =
   // surfaces can land in role-keyed Work lists per the
   // three-axis IA simplifier ("administering is someone's job").
   | 'policy' | 'job-kinds' | 'system-step-plugins' | 'system-dispatcher' | 'system-design'
+  // The executor network — who moves work and where it goes.
+  // Sits beside the dispatcher cascade: same IT audience, different
+  // question (job traffic, not rule wiring).
+  | 'system-os-map'
   // The model-vocabulary surface — SubjectKind taxonomy + Class registry
   // (read-only). Same `it-*` audience as the dispatcher cascade it sits beside.
   | 'system-subjects'
@@ -49,7 +53,7 @@ const ALL: ReadonlyArray<RouteName> = [
   'shipping', 'vendors', 'marketing-assets', 'calendar',
   'schedule', 'jobs',
   'policy', 'job-kinds', 'system-step-plugins', 'system-dispatcher',
-  'system-dispatcher-rules', 'system-dispatcher-rule', 'system-design', 'system-subjects', 'system-model', 'system-kb', 'auth-admin',
+  'system-dispatcher-rules', 'system-dispatcher-rule', 'system-design', 'system-os-map', 'system-subjects', 'system-model', 'system-kb', 'auth-admin',
   'system-experiments',
   'workflows',
 ];

@@ -64,6 +64,10 @@ describe('nav catalog — app assignment', () => {
     // The feedback triage board — user-feedback Jobs, worked Kanban
     // style. New surface, not a moved one.
     'system-feedback',
+    // The Operating System map — the executor network. Sits beside
+    // the dispatcher cascade: same IT audience, different question
+    // (job traffic, not rule wiring).
+    'system-os-map',
   ];
 
   it('the IT app contains the System Model set plus what we added deliberately', () => {

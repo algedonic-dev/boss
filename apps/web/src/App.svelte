@@ -58,6 +58,7 @@
   import DispatcherRuleEditPage from './dispatcher/DispatcherRuleEditPage.svelte';
   import SubjectsClassesPage from './it/subjects/SubjectsClassesPage.svelte';
   import SystemModelPage from './it/system/SystemModelPage.svelte';
+  import OsMapPage from './it/osmap/OsMapPage.svelte';
   import DesignReviewPage from './it/design/DesignReviewPage.svelte';
   import ExperimentsPage from './it/experiments/ExperimentsPage.svelte';
   import InboxPage from './inbox/InboxPage.svelte';
@@ -346,6 +347,8 @@
       <StepPluginDetailPage pluginSlug={route.pluginSlug} />
     {:else if route.kind === 'systemDesign'}
       <DesignReviewPage />
+    {:else if route.kind === 'systemOsMap'}
+      <OsMapPage />
     {:else if route.kind === 'experiments'}
       <ExperimentsPage />
     {:else if route.kind === 'dispatcherRules'}
