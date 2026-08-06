@@ -9,6 +9,14 @@ name = "boss-search-api"
 path = "src/bin/boss_search_api.rs"
 required-features = ["postgres"]
 
+# Periodic full reindex. `search_index` had no refresh path outside
+# `boss-rebuild-all`, so global search was stale within minutes on a
+# live box.
+[[bin]]
+name = "boss-search-reindex"
+path = "src/bin/boss_search_reindex.rs"
+required-features = ["postgres"]
+
 [features]
 default = ["postgres"]
 postgres = ["dep:sqlx"]

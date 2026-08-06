@@ -173,6 +173,11 @@ TIMERS=(
     # path — before this it only moved on a full boss-rebuild-all, and
     # sat tens of thousands of events behind on a live box.
     "boss-views-catchup:."
+    # search_index has no incremental form — events are capped per
+    # Subject, so an append cannot be correct — and outside
+    # boss-rebuild-all nothing refreshed it. Measured stale at 0.5% job
+    # coverage on a live box: search could not find 99% of the corpus.
+    "boss-search-reindex:."
     # boss-backup deferred — backup script destination + retention
     # policy needs review before enabling on a fresh deploy.
 )

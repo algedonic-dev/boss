@@ -1,0 +1,22 @@
+# Managed by infra/deploy-services.sh — edits will be overwritten.
+[Unit]
+Description=Keep search_index from going stale
+
+[Timer]
+# Every ten minutes, and the cadence is set by COST rather than by
+# staleness tolerance. Unlike the views catch-up this is a full
+# TRUNCATE-and-replay — the index caps events per Subject via
+# ROW_NUMBER, so "the most recent 50 for this Subject" changes as
+# events arrive and there is no watermark that makes an append
+# correct. Measured on the playground: 27s for 54k rows, of which
+# 20s is the event pass. Ten minutes keeps that under a 5% duty
+# cycle while bounding staleness to a few hundred Jobs on a busy
+# sim — against the two hours it drifted before this existed.
+OnBootSec=3min
+OnUnitActiveSec=10min
+# A missed window just runs late. Every tick is a full rebuild, so
+# there is nothing to catch up on and no benefit to replaying.
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
