@@ -149,7 +149,14 @@ code. Ordered by what to reach for first.
       is not. Wants a convention — a fact that lives twice gets an
       equality test — and possibly a lint on the comment phrasing that
       marks them.
-- [ ] **C4 — idempotence has no static guard.** Guard coverage across
+- [x] **C4 — idempotence has no static guard.** Done 2026-08-06
+      (#189): `infra/lint/idempotence-ratchet.sh`, wired into CI.
+      Flags accumulating writes (`col = col + $n`), which
+      double-apply under at-least-once redelivery — the 2026-06-16
+      class where `on_hand` mutations decoupled GL 1300/1320 from
+      physical stock and raised nothing. A ratchet, not a ban: the
+      two known stock sites are listed with why they are safe, and
+      a third fails until reviewed. Original finding: Guard coverage across
       the five properties: conservation 3 tests / 4 lints, provenance
       4 / 1, closure 1 / 2, determinism 2 / 0, idempotence 2 / 0.
       Determinism is well covered at runtime by the replay-check
