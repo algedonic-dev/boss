@@ -2,7 +2,8 @@
   // The chrome bar — the one thing every app shares.
   //
   // Tenant wordmark (left), the app tabs (centre), and the shared
-  // right-hand controls: system time and the sign-in/out control.
+  // right-hand controls: global search, feedback, system time and the
+  // sign-in/out control.
   // Everything below it belongs to whichever app is active; this bar
   // is the only fixed furniture. 44px tall — each app's shell offsets
   // its own chrome below it.
@@ -15,6 +16,7 @@
   import SystemTime from './SystemTime.svelte';
   import SignInControl from './SignInControl.svelte';
   import GlobalSearch from './GlobalSearch.svelte';
+  import FeedbackControl from './FeedbackControl.svelte';
   import { APPS, type AppId } from './nav';
   import { manifest } from './session/manifest.svelte';
 
@@ -81,6 +83,7 @@
   </div>
   <div class="perspective-right">
     <GlobalSearch appKinds={searchAppKinds} />
+    <FeedbackControl />
     <SystemTime />
     <SignInControl />
   </div>
