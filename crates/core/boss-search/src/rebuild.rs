@@ -114,7 +114,8 @@ pub async fn rebuild_search(pool: &PgPool) -> Result<RebuildSearchReport, Search
                  FROM subject_edges WHERE source_kind = a.kind \
                  ORDER BY field_path LIMIT 1 \
              ) se ON TRUE \
-             LEFT JOIN jobs j ON j.id::text = a.payload->>'job_id' \
+             LEFT JOIN jobs j \
+               ON j.id::text = COALESCE(a.payload->>'job_id', a.payload->>'id') \
              LEFT JOIN LATERAL ( \
                  SELECT k AS subject_kind, i AS subject_id \
                  FROM (VALUES \

@@ -55,11 +55,22 @@ fn storage(e: sqlx::Error) -> ViewsError {
 ///    shape). This crate holds NO per-kind knowledge: teaching the
 ///    system about a new event is a registry row, not a branch here,
 ///    which is the point of the registry existing.
-/// 3. **Through the Job** — `payload.job_id` → `jobs.subject_id`.
-///    Step events name the Job they belong to, and a Job knows its
-///    Subject. Without this hop every step transition — the largest
-///    kinds in the log — sat one join from a Subject with nothing
-///    materialising it.
+/// 3. **Through the Job** — `payload.job_id` OR `payload.id` →
+///    `jobs.subject_id`. Step events name their Job as `job_id`;
+///    job-lifecycle events (`jobs.job.closed`,
+///    `jobs.job.status_changed`) name it as their own `id`. Without
+///    this hop every step transition — the largest kinds in the log —
+///    sat one join from a Subject with nothing materialising it.
+///
+///    Reading `id` as a possible Job reference sounds like a guess and
+///    is not: **the join is the evidence**. Job ids are v4 uuids and
+///    share their id space with nothing, so a payload `id` that
+///    matches a `jobs` row *is* that Job. Verified on 1.16M live
+///    events — the only kinds whose `id` matches a job are the
+///    `jobs.job.*` family, and every other kind's `id` is prefixed
+///    (`msg-`, `ship-step-`, `inv-step-`) and cannot collide. An
+///    entity that later shares uuids with jobs would break this, and
+///    would be a deeper problem than this projection.
 ///
 /// Together these take linkage from 16% of the log to ~90%, which is
 /// the difference between "everything that happened to this Subject"
@@ -101,7 +112,8 @@ async fn project_window(
              ORDER BY field_path \
              LIMIT 1 \
          ) se ON TRUE \
-         LEFT JOIN jobs j ON j.id::text = a.payload->>'job_id' \
+         LEFT JOIN jobs j \
+           ON j.id::text = COALESCE(a.payload->>'job_id', a.payload->>'id') \
          LEFT JOIN LATERAL ( \
              SELECT k AS subject_kind, i AS subject_id \
              FROM (VALUES \

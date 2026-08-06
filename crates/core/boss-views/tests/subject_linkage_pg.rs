@@ -198,6 +198,78 @@ async fn a_registered_domain_id_resolves_through_the_registry() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_job_lifecycle_event_resolves_through_its_own_id() {
+    // `jobs.job.closed` and `jobs.job.status_changed` name their Job as
+    // their own `id`, not as `job_id`. Keying the hop only on `job_id`
+    // left them unlinked despite being about a Job that knows its
+    // Subject.
+    //
+    // Reading `id` as a Job reference is safe because the join is the
+    // evidence: a value that matches a `jobs` row IS that Job. The two
+    // negatives below are the guard.
+    let db = TestDb::new().await;
+    let pool = &db.pool;
+
+    let job_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO jobs \
+            (id, kind, subject_kind, subject_id, title, owner_id, priority, status, opened_on) \
+         VALUES ($1, 'wholesale-keg-order', 'account', 'acc-closed', 'T', 'emp-1', 'standard', \
+                 'closed', CURRENT_DATE)",
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .expect("job inserts");
+
+    let closed = write_event(
+        pool,
+        "jobs.job.closed",
+        serde_json::json!({"id": job_id.to_string(), "outcome": "delivered"}),
+    )
+    .await;
+
+    // A prefixed `id` on a kind with no registered edge must not link.
+    // (Deliberately not `messages.message.sent` — that kind IS
+    // registered against `id`, so it resolves through the registry and
+    // proves nothing about the hop.)
+    let unrelated = write_event(
+        pool,
+        "some.unregistered.thing",
+        serde_json::json!({"id": "msg-not-a-job", "body": "hi"}),
+    )
+    .await;
+
+    // A uuid `id` that matches no job must not link either.
+    let stray_uuid = write_event(
+        pool,
+        "some.other.thing",
+        serde_json::json!({"id": uuid::Uuid::new_v4().to_string()}),
+    )
+    .await;
+
+    boss_views::rebuild_event_facts(pool)
+        .await
+        .expect("rebuild succeeds");
+
+    assert_eq!(
+        linkage(pool, closed).await,
+        (Some("account".into()), Some("acc-closed".into())),
+        "a job-lifecycle event resolves through the Job named by its id"
+    );
+    assert_eq!(
+        linkage(pool, unrelated).await,
+        (None, None),
+        "an unregistered kind with a prefixed id links to nothing"
+    );
+    assert_eq!(
+        linkage(pool, stray_uuid).await,
+        (None, None),
+        "a uuid matching no job links to nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_direct_subject_wins_over_the_job_hop() {
     // Precedence matters: an event that carries its own Subject AND
     // names a Job is about the Subject it names. Resolving through the
