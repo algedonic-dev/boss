@@ -186,10 +186,27 @@ export function appForSection(section: string): AppId {
 /// and CRM's to chase, and both are right — this maps attention, not
 /// ownership. Home lists nothing: it is the cross-app surface, so it
 /// prioritises nothing and shows the unweighted ranking.
+/// Subject kinds each app claims, for search's app-scoped ranking.
+///
+/// Must cover every **concrete** kind. The subject-kind registry is a
+/// taxonomy: `person`, `object` and `intangible` are abstract roots
+/// that nothing is ever an instance of — `account` and `employee`
+/// specialize `person` — so they are deliberately unclaimed, and the
+/// test beside this exempts roots-with-children on that basis rather
+/// than by name.
+///
+/// Everything else must land somewhere or search silently never
+/// floats it for the app whose surface shows it. That is what happened
+/// to `message`: Inbox is a Home surface listing 13,483 message
+/// Subjects, and no app claimed the kind.
 export const APP_SUBJECT_KINDS: Readonly<Record<AppId, ReadonlyArray<string>>> = {
-  home: [],
+  // Inbox lives here, and messages are what it lists.
+  home: ['message'],
   simulator: [],
-  it: ['job-kind', 'company'],
+  // `custom` is the escape hatch for Jobs about things that are not
+  // domain Subjects — a design doc is the shipped example, and
+  // /system/design is an IT surface.
+  it: ['job-kind', 'company', 'custom'],
   crm: ['account', 'customer', 'campaign', 'marketing-asset'],
   finance: ['invoice', 'vendor', 'vendor-invoice', 'purchase_order'],
   operations: ['job-kind', 'calendar', 'location'],

@@ -192,7 +192,16 @@ code. Ordered by what to reach for first.
       keeps the two in step and no test fails when they diverge —
       Principle 9 sitting in the one layer the app split did not put
       on data.
-- [ ] **F4 — five Subject kinds no app claims:** `custom`,
+- [x] **F4 — five Subject kinds no app claims:** Done 2026-08-06
+      (#189). Only TWO were real gaps — `message` (13,483 rows,
+      surfaced by Inbox) and `custom` (the design-doc-review Job
+      subject). The other three are ABSTRACT ROOTS of the
+      subject-kind taxonomy (`person`, `object`, `intangible`);
+      nothing is ever an instance of them, so no app should claim
+      them. The audit's guess that `person` duplicated `employee`
+      was wrong — `employee` specializes `person`. Pinned by a test
+      that exempts roots-with-children structurally. Original
+      finding: `custom`,
       `intangible`, `message`, `object`, `person`. `message` is the
       notable one — Inbox exists as a surface, but no app claims the
       kind, so global search never floats messages. `person` alongside
