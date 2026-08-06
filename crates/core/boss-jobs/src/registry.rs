@@ -360,7 +360,28 @@ fn user_feedback_spec() -> JobKindSpec {
         },
         StepSpec {
             title: "triage".into(),
-            kind: "acknowledgment".into(),
+            // `task` — "simple assigned task for HR, IT, admin", which
+            // is literally what triaging feedback is, and it requires
+            // no metadata to complete.
+            //
+            // This was `acknowledgment` and could never be closed.
+            // That kind means "confirm receipt or understanding of a
+            // policy or document" and requires `document_title`;
+            // metadata validators run at `completed`, so the step
+            // materialized fine and every attempt to triage failed with
+            // `required field 'document_title' is missing`. Feedback
+            // triage acknowledges no document, so there was no honest
+            // value to supply — the kind was simply the wrong one.
+            //
+            // No lint catches this: the viability lint type-checks the
+            // defaults a spec DOES set, and it cannot demand that a
+            // spec pre-fill every required field, because required-at-
+            // done fields are normally what the operator supplies at
+            // completion (`scheduling` wants a `location`). What broke
+            // here is semantic fit between the work and the kind, which
+            // only a reader can judge. Pick the kind whose field schema
+            // describes the work, not the one whose label sounds close.
+            kind: "task".into(),
             ready_when: "steps.submitted.done".into(),
             title_template: "Triage feedback".into(),
             // Authority is what keeps this waiting for a person.
@@ -2262,6 +2283,61 @@ mod tests {
         // job_id threaded through.
         for s in &steps {
             assert_eq!(s.job_id, job_id);
+        }
+    }
+
+    /// Every step of `user-feedback` must satisfy its kind's
+    /// completion contract from its own defaults alone.
+    ///
+    /// Nothing in the feedback flow collects fields from an operator.
+    /// The chrome-bar control posts a message; the triage board closes
+    /// the step with a bare `{"status":"completed"}`. So a required
+    /// field this spec does not pre-fill is not a field someone types
+    /// in later — it is a step that can never close, and a Job that
+    /// can never leave the board.
+    ///
+    /// Regression: triage shipped as `acknowledgment`, which requires
+    /// `document_title`. Validators run at `completed`, so the Job
+    /// materialized cleanly and looked perfectly healthy in the
+    /// waiting column; the only symptom was a 400 the first time a
+    /// human tried to triage real feedback. This fails at the spec
+    /// instead, where the wrong kind is visible.
+    #[test]
+    fn user_feedback_steps_close_without_operator_supplied_fields() {
+        let spec = user_feedback_spec();
+        let registry = crate::step_registry::StepRegistry::v1();
+        let subject = Subject::new("custom", "/system");
+        let job_metadata = serde_json::Value::Object(Default::default());
+        let mut i = 0u32;
+        let steps = materialize_steps(&spec, &subject, JobId::new(), &job_metadata, || {
+            i += 1;
+            StepId::from_uuid(Uuid::from_u128(i as u128))
+        });
+        assert!(!steps.is_empty(), "user-feedback materialized no steps");
+
+        for s in &steps {
+            // Both halves of the contract the completion path applies:
+            // the kind's field bundle and any inline authored fields.
+            let result = registry
+                .validate_metadata(&s.kind, &s.metadata)
+                .and_then(|()| {
+                    crate::step_registry::StepRegistry::validate_authored_fields(
+                        &s.fields,
+                        &s.metadata,
+                    )
+                });
+            if let Err(errors) = result {
+                panic!(
+                    "step `{}` (kind `{}`) can never be completed as materialized — {}",
+                    s.title,
+                    s.kind,
+                    errors
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                );
+            }
         }
     }
 

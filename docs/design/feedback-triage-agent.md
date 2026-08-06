@@ -56,6 +56,7 @@ catalog, and the open-PR list have reached the same disposition?
 | Item | Route | Class | Disposition | Rule? |
 |---|---|---|---|---|
 | `efc423f2` | `/system` | capability request | Satisfied by #190 + #191; no code change | **No** — needed to know what shipped |
+| (unfiled) | `/system/feedback` | defect | Triage step used a kind it could never satisfy; fixed at the spec | **No** — needed the StepType registry |
 
 ### Notes per item
 
@@ -74,6 +75,29 @@ nothing useful to say about it.
 Caveat on n=1: this is the least representative item the corpus will
 ever contain — it is feedback about the feedback system, filed by the
 person building it. It should carry almost no weight in the verdict.
+
+**The unfiled defect** — trying to close the item above returned
+`400 invalid step metadata: document_title: required field
+'document_title' is missing`. The triage step had shipped as an
+`acknowledgment`, a kind meaning "confirm receipt of a policy or
+document", and metadata validators run at `completed` — so the Job
+materialized cleanly, sat in the waiting column looking healthy, and
+failed only when a human first tried to triage it. Fixed by moving
+the step to `task`, which is what the work actually is and requires
+no metadata; pinned by a spec test that reproduces the operator's
+exact error at authoring time.
+
+Worth noting for Q1: dispositioning this needed the StepType field
+schema, the JobKind spec, and the rule that validators fire at
+completion. None of that is in the feedback text, and no amount of
+classifying the text would have reached it. But also note what
+*found* it — an operator clicking a button, not an agent reading a
+queue. An agent of either kind would likely have filed this under
+"works as intended" until it tried the write itself.
+
+Standing caveat: both rows are still the feedback system talking
+about itself. The verdict needs items about the rest of BOSS before
+it means anything.
 
 ## Open questions
 

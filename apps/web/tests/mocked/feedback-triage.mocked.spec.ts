@@ -37,7 +37,7 @@ function job(
         // the step — so the fixture carries it exactly as a real Job
         // does. Omitting it here would make every card read as
         // triaged, which is the failure the board must not have.
-        kind: triage.kind ?? 'acknowledgment',
+        kind: triage.kind ?? 'task',
         status: triage.status,
         metadata: { authority_role: 'platform-admin', ...(triage.metadata ?? {}) },
       },
