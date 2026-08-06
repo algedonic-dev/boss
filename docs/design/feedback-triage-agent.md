@@ -57,6 +57,9 @@ catalog, and the open-PR list have reached the same disposition?
 |---|---|---|---|---|
 | `efc423f2` | `/system` | capability request | Satisfied by #190 + #191; no code change | **No** — needed to know what shipped |
 | (unfiled) | `/system/feedback` | defect | Triage step used a kind it could never satisfy; fixed at the spec | **No** — needed the StepType registry |
+| `50f70a1f` | `/system/feedback` | defect | `color: inherit` on a bar that sets no colour; 1.06:1 in light theme. Fixed + pinned | **No** — needed to read four components' CSS |
+| `41afd152` | `/system/feedback` | capability request | Drag-and-drop triage; raises whether the board should be generic. Decision is the owner's | **Partly** — routing yes, the insight no |
+| `811c5dc5` | `/system` | defect | `/api/*` miss falls through to the SPA as 200 HTML instead of a JSON 404 | **No** — needed gateway routing |
 
 ### Notes per item
 
@@ -95,9 +98,50 @@ classifying the text would have reached it. But also note what
 queue. An agent of either kind would likely have filed this under
 "works as intended" until it tried the write itself.
 
-Standing caveat: both rows are still the feedback system talking
-about itself. The verdict needs items about the rest of BOSS before
-it means anything.
+Standing caveat: the rows are still mostly the feedback system
+talking about itself. The verdict needs items about the rest of BOSS
+before it means anything.
+
+### The split that is starting to show
+
+Five hand-processed items in, the "can a rule do it" answer is not
+uniform — it separates cleanly by **class**, which is more useful
+than a single verdict:
+
+- **Defects need repo comprehension.** Every one so far was
+  dispositioned by reading code the feedback text never mentions —
+  a StepType field schema, four components' CSS, gateway route
+  fallthrough. The reporter describes a *symptom*; the disposition
+  lives in the cause, and nothing in the text points at it. No rule
+  bridges that gap, and a model without repo access would not either.
+- **Capability requests mostly need routing.** `41afd152` wants
+  drag-and-drop. A rule could classify it, route it to IT, and stop —
+  and that would be the *correct* handling, because the decision it
+  needs is a human's, not an analyst's. Nothing is gained by having
+  something clever read it first.
+
+If that holds, the shape is not "simple vs LLM" but a triage on the
+triage: classify cheaply, route mechanically, and spend
+comprehension only on the items whose disposition is a claim about
+the code. That would also make the expensive path auditable, since
+every model invocation would be attached to a defect with a named
+cause.
+
+What would falsify it: a run of defect reports whose fix is obvious
+from the text alone ("this button is the wrong colour" needs no
+investigation if the reporter names the button), or feature requests
+that turn out to need real analysis to route. Neither has appeared
+yet, and five items is not enough to say.
+
+### What the loop keeps costing
+
+Every pass so far has produced a paragraph of reasoning with nowhere
+to go — see Q2. It has now bitten twice: the disposition for
+`50f70a1f` includes the actual root cause, and the card shows only
+the original complaint. Anyone else opening the board sees three
+untouched-looking items and no sign that two are diagnosed and one is
+fixed. This is the strongest evidence so far that Q2 is not
+cosmetic.
 
 ## Open questions
 
