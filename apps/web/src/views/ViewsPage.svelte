@@ -50,6 +50,8 @@
   const PUSHABLE_BY_SOURCE: Readonly<Record<string, string>> = {
     events: 'kind, source, subject_kind, subject_id, or a timestamp range',
     steps: 'status, kind or assignee_id',
+    jobs: 'kind, status, owner_id, subject_kind, subject_id, priority, or a created_at range',
+    subjects: 'kind, id, label, or a created_at range',
   };
 
   let viewerId = $derived(session.value.kind === 'ready' ? session.value.user.id : '');
