@@ -1,0 +1,19 @@
+# Managed by infra/deploy-services.sh — edits will be overwritten.
+[Unit]
+Description=Keep event_facts level with audit_log
+
+[Timer]
+# Every five minutes. The unit is incremental — it inserts only rows
+# past the watermark, which is usually a few hundred and often zero —
+# so the cadence is bounded by how stale a View may be, not by cost.
+# Five minutes is short enough that a count is never visibly wrong and
+# long enough that a slow tick cannot overlap the next.
+OnBootSec=2min
+OnUnitActiveSec=5min
+# A missed window (host down, long rebuild) catches up on the next
+# fire rather than replaying: the watermark makes every run
+# self-correcting.
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

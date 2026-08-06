@@ -96,6 +96,89 @@ first-contact fixes (#74). Sorted by dependency, not size.
       through drain-actual-wip automatically — no stamped amounts
       anywhere (per #77).
 
+## Read-surface + coherence audit (2026-08-06)
+
+A measured audit of the read surfaces after the app-split, global-search
+and Views arcs (#178–#187). Every item below carries the measurement it
+came from, taken against the live playground rather than read off the
+code. Ordered by what to reach for first.
+
+### Correctness
+
+- [ ] **C1 — `event_facts` and `search_index` have no refresh path.**
+      Both are rebuild-only. Measured mid-session: the log head was at
+      `6,948,127` and `event_facts` at `6,894,632` — **53,495 events
+      behind**, and climbing continuously while the sim runs. Seven
+      systemd timers exist (conservation invariants, ledger
+      replay-check, audit integrity, recognition, ML batch, messages
+      purge, files GC) and **none refreshes a projection**.
+      `catch_up_event_facts` is written, tested and exported; nothing
+      calls it. Views and global search are the two surfaces an
+      operator most expects to be live, and both are correct only in
+      the minutes after a manual `boss-rebuild-all`.
+      *Search needs its own answer:* its index caps events per Subject
+      via `ROW_NUMBER`, so it has no incremental form today — a
+      periodic full rebuild (~77s at 1.4M events) is the honest
+      interim.
+- [ ] **C2 — the ledger read surface is unscoped.** `boss-ledger`
+      carries exactly one authorization check across its whole HTTP
+      surface (`user.role == "auditor"`) over 211,512 `financial_facts`
+      rows plus the GL and bank settlements. It reads `CurrentUser` in
+      seven files but never scopes rows to the caller.
+      *Note:* an earlier pass over-reported this as four unpoliced
+      crates by grepping for `scope_predicate`; that misses the crates
+      using `CurrentUser` directly. `boss-subject-kinds` and
+      `boss-customers` read no caller at all but expose only registry
+      data and 73 customer rows. The ledger is the real gap.
+- [ ] **C3 — duplicated facts kept in step by comment.** Three
+      instances caused real failures in a single session: `boss-ports`
+      ↔ the `deploy-services.sh` fallback arrays (search and views were
+      not deployable at all), `MODEL_ROUTES` ↔ `MODEL_KINDS` (pages
+      rendering under the wrong tab), `manifest.txt` ↔ `SCHEMA_FILES`
+      (every DB-backed test running without two tables). A scan finds
+      12+ more sites carrying "keep this in sync" / "must match"
+      comments. Two of the three are now pinned by tests; the pattern
+      is not. Wants a convention — a fact that lives twice gets an
+      equality test — and possibly a lint on the comment phrasing that
+      marks them.
+- [ ] **C4 — idempotence has no static guard.** Guard coverage across
+      the five properties: conservation 3 tests / 4 lints, provenance
+      4 / 1, closure 1 / 2, determinism 2 / 0, idempotence 2 / 0.
+      Determinism is well covered at runtime by the replay-check
+      timer; idempotence is the genuinely thin one, and it is the
+      property that produced the JetStream double-side-effect class.
+
+### Features
+
+- [ ] **F1 — Steps has no read surface.** Views offers Subjects, Jobs
+      and Events — three of the four primitives. Steps is 160,254 rows
+      and is where work state lives; "my ready steps" cannot be
+      expressed as a View.
+- [ ] **F2 — Views' other two sources are still capped.** Only
+      `events` received a projection in #186. `subjects` and `jobs`
+      still read base tables under the 5,000-row scan with no
+      pushdown, carrying the same silent-truncation behaviour `events`
+      had before. Jobs is 20,555 rows, so the cap does not bite yet.
+- [ ] **F3 — the app tabs are code while the org is data.** Eleven
+      employee departments in the Class registry; eight apps
+      hand-authored in `libs/web-kit/src/nav.ts`. Four departments
+      collapse into Operations and `audit` has no app at all. Nothing
+      keeps the two in step and no test fails when they diverge —
+      Principle 9 sitting in the one layer the app split did not put
+      on data.
+- [ ] **F4 — five Subject kinds no app claims:** `custom`,
+      `intangible`, `message`, `object`, `person`. `message` is the
+      notable one — Inbox exists as a surface, but no app claims the
+      kind, so global search never floats messages. `person` alongside
+      `employee` with no surface is either a duplicate or an
+      unfinished kind.
+- [ ] **F5 — pushdown residuals.** `NOT` needs an exactness proof
+      before it can be pushed (negation inverts the direction of
+      approximation, turning a superset into a subset). Ordering
+      comparisons on text columns and any term reaching into `payload`
+      stay residual-only. None of these can affect correctness — the
+      residual is always the whole predicate — they are scan cost.
+
 ## Subject-model audit residuals (2026-07-14 appendix, re-homed 2026-07-29)
 
 The R1–R4 workstream + both edge PRs (#137, #159) shipped; the

@@ -164,6 +164,10 @@ TIMERS=(
     "boss-ml-inference-batch:ml"
     "boss-conservation-invariants:lint"
     "boss-files-gc:."
+    # event_facts is a projection of audit_log with no other refresh
+    # path — before this it only moved on a full boss-rebuild-all, and
+    # sat tens of thousands of events behind on a live box.
+    "boss-views-catchup:."
     # boss-backup deferred — backup script destination + retention
     # policy needs review before enabling on a fresh deploy.
 )
