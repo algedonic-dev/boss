@@ -21,7 +21,7 @@ export type Role = string;
 export type RouteName =
   | 'shop' | 'exec' | 'catalog' | 'accounts' | 'assets' | 'sales' | 'service'
   | 'refurb' | 'parts' | 'products' | 'finance' | 'people' | 'qa' | 'warehouse' | 'support' | 'ops'
-  | 'system-monitoring' | 'inbox' | 'shipping' | 'views'
+  | 'system-monitoring' | 'inbox' | 'shipping' | 'views' | 'system-feedback'
   | 'vendors' | 'marketing-assets' | 'calendar' | 'schedule' | 'jobs'
   // Platform-administration surfaces. Same `permKey: 'it'` gate
   // as the legacy ADMIN footer; these route names exist so the
@@ -198,6 +198,9 @@ export function canSeeRoute(role: Role, route: RouteName): boolean {
   // there is nothing to gate. What a View can READ is still policed
   // by the endpoints it reads through.
   if (route === 'views') return true;
+  // Feedback triage is IT work; the board itself is readable by any
+  // operator, and the Job/step writes behind it are policy-gated.
+  if (route === 'system-feedback') return true;
   // Defensive default: a role we don't know about (a freshly-added
   // class registry entry the SPA hasn't been re-bundled for) sees
   // nothing rather than crashing on `.includes` of undefined.

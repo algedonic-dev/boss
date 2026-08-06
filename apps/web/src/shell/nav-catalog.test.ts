@@ -54,12 +54,33 @@ describe('nav catalog — app assignment', () => {
     ).toEqual([]);
   });
 
-  it('the IT app contains exactly what the System Model tab listed', () => {
+  /// IT surfaces added SINCE the app split, listed explicitly.
+  ///
+  /// The pin below is about surfaces not silently CHANGING app; it was
+  /// never meant to freeze IT at its 2026-08-05 size. Growth goes here
+  /// deliberately, one line per surface, so the two properties stay
+  /// separable: nothing drifted, and this is what we added.
+  const IT_SURFACES_ADDED_SINCE: ReadonlyArray<string> = [
+    // The feedback triage board — user-feedback Jobs, worked Kanban
+    // style. New surface, not a moved one.
+    'system-feedback',
+  ];
+
+  it('the IT app contains the System Model set plus what we added deliberately', () => {
     const derived = entries
       .filter(([, v]) => v.app === 'it')
       .map(([k]) => k)
       .sort();
-    expect(derived).toEqual([...LEGACY_MODEL_ROUTES].sort());
+    const expected = [...LEGACY_MODEL_ROUTES, ...IT_SURFACES_ADDED_SINCE].sort();
+    expect(derived).toEqual(expected);
+  });
+
+  it('nothing from the original System Model set has left the IT app', () => {
+    // The half of the pin that matters most: a surface silently
+    // changing app is the failure this list was written for.
+    const inIt = new Set(entries.filter(([, v]) => v.app === 'it').map(([k]) => k));
+    const missing = LEGACY_MODEL_ROUTES.filter((r) => !inIt.has(r));
+    expect(missing, `these left the IT app: ${missing.join(', ')}`).toEqual([]);
   });
 
   it('every surface lands in an app the chrome bar actually offers', () => {

@@ -37,6 +37,8 @@ export type Route =
   /// Personal Views — the Home-app surface for composing your own
   /// reads over the information layer.
   | { kind: 'views' }
+  /// IT feedback triage board.
+  | { kind: 'systemFeedback' }
   /// Full-page step surface. A step whose UX is a plugin gets the
   /// whole viewport instead of a panel inside the job page — review
   /// and authoring steps are reading tasks, and reading competes
@@ -120,6 +122,7 @@ export function parseRoute(pathname: string): Route {
     if (p === '/monitoring/atlas') return { kind: 'systemMonitoringAtlas' };
     if (p === '/kb') return { kind: 'systemKb' };
     if (p === '/design') return { kind: 'systemDesign' };
+    if (p === '/feedback') return { kind: 'systemFeedback' };
     if (p === '/experiments') return { kind: 'experiments' };
     if (p === '/subjects') return { kind: 'systemSubjects' };
     if (p === '/policy') return { kind: 'policy' };

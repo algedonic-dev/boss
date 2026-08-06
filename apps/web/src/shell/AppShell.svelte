@@ -122,7 +122,11 @@
     },
     {
       label: 'Evolve',
-      items: [ROUTE_CATALOG['system-experiments'], ROUTE_CATALOG['system-design']],
+      items: [
+        ROUTE_CATALOG['system-experiments'],
+        ROUTE_CATALOG['system-design'],
+        ROUTE_CATALOG['system-feedback'],
+      ],
     },
     {
       label: 'Platform',

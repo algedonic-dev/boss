@@ -83,6 +83,7 @@
   import LandingPage from './landing/LandingPage.svelte';
   import SearchResultsPage from './search/SearchResultsPage.svelte';
   import ViewsPage from './views/ViewsPage.svelte';
+  import FeedbackTriagePage from './it/feedback/FeedbackTriagePage.svelte';
   import LoginPage from './auth/LoginPage.svelte';
   import AuthAdminPage from './auth/AuthAdminPage.svelte';
   import ModuleDisabled from './shell/ModuleDisabled.svelte';
@@ -242,6 +243,8 @@
       <SearchResultsPage q={route.q} />
     {:else if route.kind === 'views'}
       <ViewsPage />
+    {:else if route.kind === 'systemFeedback'}
+      <FeedbackTriagePage />
     {:else if route.kind === 'authAdmin'}
       <AuthAdminPage />
     {:else if route.kind === 'me'}
