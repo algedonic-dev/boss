@@ -143,6 +143,61 @@ async fn every_subject_shape_projects_with_linkage() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_registered_edge_whose_field_is_absent_yields_no_kind_either() {
+    // Kind and id must resolve as a PAIR. `products.inventory.upserted`
+    // is registered against `product_sku` -> product, so resolving the
+    // two independently stamped `subject_kind = product` on an event
+    // with no `product_sku` at all — a row claiming to be about a
+    // Subject it could not name. Downstream that reads as a product
+    // with a missing id rather than as an unlinked event.
+    let db = TestDb::new().await;
+    let pool = &db.pool;
+
+    let absent = write_event(
+        pool,
+        "products.inventory.upserted",
+        serde_json::json!({"sku": "KEG-HALF", "qty": 4}),
+    )
+    .await;
+
+    boss_views::rebuild_event_facts(pool)
+        .await
+        .expect("rebuild succeeds");
+
+    assert_eq!(
+        linkage(pool, absent).await,
+        (None, None),
+        "no id means no kind — never a half-resolved Subject"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registered_domain_id_resolves_through_the_registry() {
+    // The domain-id case: the event names its Subject by `product_sku`,
+    // and `subject_edges` is what says so. This crate holds no per-kind
+    // knowledge — adding a kind is a row, not a branch.
+    let db = TestDb::new().await;
+    let pool = &db.pool;
+
+    let ev = write_event(
+        pool,
+        "products.inventory.upserted",
+        serde_json::json!({"product_sku": "FP-HAZY-1-2-BBL", "on_hand": 12}),
+    )
+    .await;
+
+    boss_views::rebuild_event_facts(pool)
+        .await
+        .expect("rebuild succeeds");
+
+    assert_eq!(
+        linkage(pool, ev).await,
+        (Some("product".into()), Some("FP-HAZY-1-2-BBL".into())),
+        "resolved via the subject_edges registry"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_direct_subject_wins_over_the_job_hop() {
     // Precedence matters: an event that carries its own Subject AND
     // names a Job is about the Subject it names. Resolving through the

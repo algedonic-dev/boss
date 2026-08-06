@@ -90,11 +90,12 @@ pub async fn rebuild_search(pool: &PgPool) -> Result<RebuildSearchReport, Search
     // an event you cannot trace to a thing is not a search result, it
     // is noise.
     // Subject resolution matches boss-views' event_facts exactly:
-    // flat keys, then the nested identity-first `subject` object that
-    // v1.1.0 moved to, then the Job the event names. Reading only the
-    // flat keys left this index holding 3,694 event rows against
-    // 776,629 in the log — half a percent — so "what happened to this
-    // Subject" was answerable for almost nothing.
+    // flat keys, then the `subject_edges` registry, then the Job the
+    // event names — with kind and id taken as a pair from whichever
+    // source produced the id. Reading only the flat keys left this
+    // index holding 3,694 event rows against 776,629 in the log, so
+    // "what happened to this Subject" was answerable for almost
+    // nothing.
     let events = sqlx::query(
         "INSERT INTO search_index \
             (ref_kind, ref_id, subject_kind, subject_id, title, body, occurred_at) \
@@ -102,34 +103,30 @@ pub async fn rebuild_search(pool: &PgPool) -> Result<RebuildSearchReport, Search
                 ranked.kind, ranked.subject_kind || ' ' || ranked.subject_id, \
                 ranked.timestamp \
          FROM ( \
-             SELECT a.id, a.kind, a.timestamp, \
-                    COALESCE( \
-                        a.payload->>'subject_kind', \
-                        a.payload->'subject'->>'subject_kind', \
-                        j.subject_kind \
-                    ) AS subject_kind, \
-                    COALESCE( \
-                        a.payload->>'subject_id', \
-                        a.payload->'subject'->>'id', \
-                        j.subject_id \
-                    ) AS subject_id, \
+             SELECT a.id, a.kind, a.timestamp, sub.subject_kind, sub.subject_id, \
                     ROW_NUMBER() OVER ( \
-                        PARTITION BY COALESCE( \
-                                a.payload->>'subject_kind', \
-                                a.payload->'subject'->>'subject_kind', \
-                                j.subject_kind), \
-                            COALESCE( \
-                                a.payload->>'subject_id', \
-                                a.payload->'subject'->>'id', \
-                                j.subject_id) \
+                        PARTITION BY sub.subject_kind, sub.subject_id \
                         ORDER BY a.id DESC \
                     ) AS rn \
              FROM audit_log a \
+             LEFT JOIN LATERAL ( \
+                 SELECT field_path, target_kind, target_kind_path \
+                 FROM subject_edges WHERE source_kind = a.kind \
+                 ORDER BY field_path LIMIT 1 \
+             ) se ON TRUE \
              LEFT JOIN jobs j ON j.id::text = a.payload->>'job_id' \
-             WHERE COALESCE( \
-                     a.payload->>'subject_id', \
-                     a.payload->'subject'->>'id', \
-                     j.subject_id) IS NOT NULL \
+             LEFT JOIN LATERAL ( \
+                 SELECT k AS subject_kind, i AS subject_id \
+                 FROM (VALUES \
+                     (a.payload->>'subject_kind', a.payload->>'subject_id'), \
+                     (COALESCE(se.target_kind, \
+                               a.payload #>> string_to_array(se.target_kind_path, '.')), \
+                      a.payload #>> string_to_array(se.field_path, '.')), \
+                     (j.subject_kind, j.subject_id) \
+                 ) AS candidates(k, i) \
+                 WHERE i IS NOT NULL LIMIT 1 \
+             ) sub ON TRUE \
+             WHERE sub.subject_id IS NOT NULL \
          ) ranked \
          WHERE ranked.rn <= $1",
     )
