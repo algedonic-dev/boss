@@ -111,6 +111,55 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
   workflows:                 { id: 'workflows',               label: 'Workflows',           path: '/system/workflows',    permKey: 'workflows',               app: 'it' },
 };
 
+/// Which app each employee **department** is served by.
+///
+/// Departments are Class-registry data — 19 of them, seeded in
+/// `infra/postgres/schema/01-registries.sql` with
+/// `member_attribute='department'`. The eight apps are a presentation
+/// decision, deliberately not one-per-department: production,
+/// packaging, taproom, maintenance, qa, service, support and refurb
+/// all work the same surfaces, so they share Operations.
+///
+/// So this is not a derivation, it is a **mapping that must stay
+/// exhaustive**. Deriving tabs from departments would produce
+/// nineteen of them and undo the app split the review settled;
+/// leaving the relationship implicit is how `audit` ended up with no
+/// app at all and nothing failing. The test beside this asserts every
+/// registry department lands somewhere, so adding one is a decision
+/// somebody makes rather than an omission nobody notices.
+export const DEPARTMENT_APP: Readonly<Record<string, AppId>> = {
+  // Runs the BOSS deployment itself, and the model that describes it.
+  platform: 'it',
+  it: 'it',
+  admin: 'it',
+  // Reads everything, writes nothing — its work is the audit log and
+  // the books, both of which live under IT's model surfaces.
+  audit: 'it',
+
+  executive: 'home',
+
+  finance: 'finance',
+
+  sales: 'crm',
+  marketing: 'crm',
+  support: 'crm',
+
+  // The floor: everything that turns inputs into product, plus the
+  // service and rework flows that share the Jobs/Steps surfaces.
+  production: 'operations',
+  packaging: 'operations',
+  taproom: 'operations',
+  maintenance: 'operations',
+  qa: 'operations',
+  service: 'operations',
+  refurb: 'operations',
+
+  warehouse: 'supply-chain',
+  distribution: 'supply-chain',
+
+  people: 'people',
+};
+
 /// Which app a surface belongs to, looked up by the `activeSection`
 /// id `App.svelte` derives from the current route. Unknown ids (the
 /// `me` fallback, plain sub-pages) fall back to `user` — the same

@@ -17,7 +17,13 @@
 
 import { describe, it, expect } from 'bun:test';
 import { APPS, type AppId } from '@boss/web-kit/nav';
-import { ROUTE_CATALOG, appForSection, type NavItem } from './nav-catalog';
+import {
+  DEPARTMENT_APP,
+  ROUTE_CATALOG,
+  appForSection,
+  type NavItem,
+} from './nav-catalog';
+import { readFileSync } from 'node:fs';
 
 /// Verbatim copy of AppShell.svelte's deleted `MODEL_ROUTES`. These
 /// surfaces have now moved wholesale from the retired `model` app
@@ -124,5 +130,74 @@ describe('appForSection — the App.svelte tab derivation', () => {
     // surfaces live, so that is the right landing for the fallback.
     expect(appForSection('me')).toBe('home');
     expect(appForSection('definitely-not-a-section')).toBe('home');
+  });
+});
+
+describe('departments map to apps', () => {
+  /// Department Classes, read from the files that seed them rather
+  /// than restated here — restating is the drift this test exists to
+  /// catch.
+  ///
+  /// They come from TWO places, which is itself worth knowing: the
+  /// platform ships twelve (`01-registries.sql`), and the tenant adds
+  /// its own (`examples/brewery/seeds/classes.json` adds production,
+  /// packaging, taproom, maintenance, distribution, it, admin, audit).
+  /// So `apps/web` — which is core — has to map departments a tenant
+  /// invented. That works while one tenant ships in-tree; a second
+  /// tenant with its own departments needs a real extension point.
+  function registryDepartments(): ReadonlyArray<string> {
+    const core = readFileSync(
+      new URL('../../../../infra/postgres/schema/01-registries.sql', import.meta.url),
+      'utf8',
+    );
+    const coreCodes = [
+      ...core.matchAll(/\(\s*'employee',\s*'([a-z-]+)',\s*'[^']*',\s*'department'/g),
+    ].map((m) => m[1]!);
+
+    const tenant = JSON.parse(
+      readFileSync(
+        new URL('../../../../examples/brewery/seeds/classes.json', import.meta.url),
+        'utf8',
+      ),
+    ) as ReadonlyArray<{ member_attribute?: string; code?: string }>;
+    const tenantCodes = tenant
+      .filter((c) => c.member_attribute === 'department' && c.code)
+      .map((c) => c.code!);
+
+    const all = [...new Set([...coreCodes, ...tenantCodes])];
+    // A parser that silently matched nothing would make every
+    // assertion below vacuous.
+    expect(coreCodes.length).toBeGreaterThan(10);
+    expect(tenantCodes.length).toBeGreaterThan(0);
+    return all;
+  }
+
+  it('every department in the registry is served by some app', () => {
+    // `audit` had no app at all and nothing failed. A new department
+    // row should be a decision about where its people work, not a
+    // silent omission.
+    const missing = registryDepartments().filter((d) => !(d in DEPARTMENT_APP));
+    expect(
+      missing,
+      `these departments are seeded but map to no app: ${missing.join(', ')}`,
+    ).toEqual([]);
+  });
+
+  it('every mapping target is an app the chrome bar offers', () => {
+    const tabbed = new Set<AppId>(APPS.map((a) => a.id));
+    for (const [dept, app] of Object.entries(DEPARTMENT_APP)) {
+      expect(
+        tabbed.has(app),
+        `department "${dept}" maps to app "${app}", which has no tab`,
+      ).toBe(true);
+    }
+  });
+
+  it('maps no department the registry does not have', () => {
+    // The other direction: a mapping for a department that was renamed
+    // or retired is dead weight that reads as coverage.
+    const known = new Set(registryDepartments());
+    const stale = Object.keys(DEPARTMENT_APP).filter((d) => !known.has(d));
+    expect(stale, `mapped but not in the registry: ${stale.join(', ')}`).toEqual([]);
   });
 });

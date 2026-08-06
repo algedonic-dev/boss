@@ -172,7 +172,15 @@ code. Ordered by what to reach for first.
       still read base tables under the 5,000-row scan with no
       pushdown, carrying the same silent-truncation behaviour `events`
       had before. Jobs is 20,555 rows, so the cap does not bite yet.
-- [ ] **F3 — the app tabs are code while the org is data.** Eleven
+- [x] **F3 — the app tabs are code while the org is data.** Done
+      2026-08-06 (#189): `DEPARTMENT_APP` maps all 19 department
+      Classes to an app, pinned by a test that reads the seed files
+      rather than restating them. Tabs are deliberately NOT derived —
+      that would produce 19 and undo the app split. Surfaced a
+      follow-up: departments come from two sources (12 core, 8
+      tenant), so `apps/web` maps departments a tenant invented; a
+      second in-tree tenant needs a real extension point.
+      Original finding: Eleven
       employee departments in the Class registry; eight apps
       hand-authored in `libs/web-kit/src/nav.ts`. Four departments
       collapse into Operations and `audit` has no app at all. Nothing
