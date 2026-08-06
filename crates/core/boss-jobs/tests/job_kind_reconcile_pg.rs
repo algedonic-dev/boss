@@ -41,7 +41,7 @@ async fn pg_inserts_missing_kinds_as_bootstrap_owned() {
         stats,
         KindReconcileStats {
             inserted: 1,
-            refreshed: 0,
+            republished: 0,
             preserved: 0,
             unchanged: 0,
         }
@@ -62,7 +62,7 @@ async fn pg_inserts_missing_kinds_as_bootstrap_owned() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pg_refreshes_drifted_bootstrap_rows() {
+async fn pg_republishes_drifted_bootstrap_rows_as_a_new_version() {
     let db = TestDb::new().await;
     let registry = PgJobKinds::new(db.pool.clone());
 
@@ -70,29 +70,42 @@ async fn pg_refreshes_drifted_bootstrap_rows() {
         .bootstrap_reconcile(&[spec("job-kind-design", "Old Label")])
         .await
         .expect("seed bootstrap");
-    let original_created_at = registry
-        .get_active("job-kind-design")
-        .await
-        .unwrap()
-        .created_at;
 
     let stats = registry
         .bootstrap_reconcile(&[spec("job-kind-design", "New Label")])
         .await
-        .expect("refresh");
+        .expect("republish");
 
     assert_eq!(stats.inserted, 0);
-    assert_eq!(stats.refreshed, 1);
+    assert_eq!(stats.republished, 1);
     assert_eq!(stats.preserved, 0);
     assert_eq!(stats.unchanged, 0);
 
     let live = registry.get_active("job-kind-design").await.unwrap();
     assert_eq!(live.label, "New Label", "drift should self-heal");
-    assert_eq!(live.version, 1, "refresh must not bump version");
-    assert_eq!(
-        live.created_at, original_created_at,
-        "refresh must preserve created_at — a fixup is not a publish event"
-    );
+    // This asserted the opposite — that a refresh preserves the
+    // version — which is exactly what defeated the pin: a Job holding
+    // v1 kept resolving v1 while v1's body changed underneath it.
+    assert_eq!(live.version, 2, "a changed body publishes a version");
+
+    // The superseded version must survive, retired but readable, or a
+    // Job pinned to it has nothing to resolve.
+    let pinned = registry
+        .get_version("job-kind-design", 1)
+        .await
+        .expect("v1 still resolvable");
+    assert_eq!(pinned.label, "Old Label");
+    assert_eq!(pinned.status, JobKindStatus::Retired);
+
+    // One active row per kind is a unique index; a republish that left
+    // two actives would fail the insert rather than corrupt the table.
+    let actives: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM job_kinds WHERE kind = $1 AND status = 'active'")
+            .bind("job-kind-design")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count actives");
+    assert_eq!(actives, 1);
     assert_eq!(
         created_by(&db, "job-kind-design").await.as_deref(),
         Some("bootstrap"),
@@ -127,7 +140,7 @@ async fn pg_preserves_operator_edits() {
         .expect("reconcile");
 
     assert_eq!(stats.inserted, 0);
-    assert_eq!(stats.refreshed, 0);
+    assert_eq!(stats.republished, 0);
     assert_eq!(stats.preserved, 1);
     assert_eq!(stats.unchanged, 0);
 
@@ -159,7 +172,7 @@ async fn pg_no_op_when_already_matching() {
         .expect("reconcile");
 
     assert_eq!(stats.inserted, 0);
-    assert_eq!(stats.refreshed, 0);
+    assert_eq!(stats.republished, 0);
     assert_eq!(stats.preserved, 0);
     assert_eq!(stats.unchanged, 1);
 }

@@ -1238,9 +1238,12 @@ pub trait JobKindRegistry: Send + Sync {
 pub struct KindReconcileStats {
     /// New rows inserted as `created_by = 'bootstrap'`.
     pub inserted: usize,
-    /// Bootstrap-owned rows whose body was refreshed to match the
-    /// current default.
-    pub refreshed: usize,
+    /// Bootstrap-owned rows whose body drifted from the default and
+    /// were republished as a NEW version. Never an in-place rewrite:
+    /// a Job pins the version it opened under, so mutating a live
+    /// version's body re-points every in-flight Job at a spec it never
+    /// agreed to.
+    pub republished: usize,
     /// Operator-edited rows left untouched
     /// (`created_by != 'bootstrap'`).
     pub preserved: usize,
@@ -1483,15 +1486,36 @@ impl JobKindRegistry for InMemoryJobKinds {
                     let existing = rows.get(&key).expect("just located it").clone();
                     if owned.contains(&key) {
                         if !kind_body_matches(&existing, default) {
-                            // Refresh the body in place. Preserve
-                            // version + created_at so a fixup never
-                            // looks like a new publish.
-                            let mut updated = default.clone();
-                            updated.version = existing.version;
-                            updated.status = JobKindStatus::Active;
-                            updated.created_at = existing.created_at;
-                            rows.insert(key, updated);
-                            stats.refreshed += 1;
+                            // Publish a NEW version and retire the old
+                            // one. This used to rewrite the body in
+                            // place and keep the version, on the theory
+                            // that a fixup should not look like a
+                            // publish — but a Job pins the version it
+                            // opened under, so an in-place rewrite
+                            // silently re-points every in-flight Job at
+                            // a spec it never agreed to. Two feedback
+                            // Jobs were stranded exactly that way: their
+                            // steps stayed the old shape while closure
+                            // came to depend on branch steps they never
+                            // had.
+                            let next = rows
+                                .keys()
+                                .filter(|(k, _)| k == &default.kind)
+                                .map(|(_, v)| *v)
+                                .max()
+                                .unwrap_or(0)
+                                + 1;
+                            let mut retired = existing.clone();
+                            retired.status = JobKindStatus::Retired;
+                            rows.insert(key.clone(), retired);
+
+                            let mut published = default.clone();
+                            published.version = next;
+                            published.status = JobKindStatus::Active;
+                            let new_key = (published.kind.clone(), next);
+                            rows.insert(new_key.clone(), published);
+                            owned.insert(new_key);
+                            stats.republished += 1;
                         } else {
                             stats.unchanged += 1;
                         }
@@ -1975,10 +1999,14 @@ mod pg {
                         let existing = row_to_spec(body)?;
                         if created_by == "bootstrap" {
                             if !kind_body_matches(&existing, default) {
-                                // Refresh body in place. Preserve
-                                // version + created_at; restamp
-                                // created_by = 'bootstrap' so the
-                                // discriminator stays accurate.
+                                // Publish a NEW version and retire the
+                                // live one. This used to UPDATE the body
+                                // in place and keep the version, so a Job
+                                // pinned to that version silently began
+                                // resolving a spec it never agreed to —
+                                // which stranded in-flight Jobs whose
+                                // materialized steps no longer matched
+                                // the predicates closure now depended on.
                                 let subject_kinds_json =
                                     serde_json::to_value(&default.subject_kinds)
                                         .map_err(|e| JobKindError::Invalid(e.to_string()))?;
@@ -1988,23 +2016,45 @@ mod pg {
                                     serde_json::to_value(&default.on_complete_create)
                                         .map_err(|e| JobKindError::Invalid(e.to_string()))?;
 
+                                let mut tx = self
+                                    .pool
+                                    .begin()
+                                    .await
+                                    .map_err(|e| JobKindError::Storage(e.to_string()))?;
+
+                                // Retire first: `job_kinds_one_active_per_kind`
+                                // is a unique index over active rows, so the
+                                // two cannot both be active even mid-transaction.
                                 sqlx::query(
-                                    "UPDATE job_kinds SET
-                                        label = $3,
-                                        description = $4,
-                                        category = $5,
-                                        subject_kinds = $6,
-                                        steps = $7,
-                                        metadata_schema = $8,
-                                        entitlements = $9,
-                                        metadata = $10,
-                                        on_complete_create = $11,
-                                        owning_team = $12,
-                                        created_by = 'bootstrap'
+                                    "UPDATE job_kinds SET status = 'retired'
                                      WHERE kind = $1 AND version = $2",
                                 )
                                 .bind(&default.kind)
                                 .bind(version)
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(|e| JobKindError::Storage(e.to_string()))?;
+
+                                let next: i32 = sqlx::query_scalar(
+                                    "SELECT COALESCE(MAX(version), 0) + 1
+                                     FROM job_kinds WHERE kind = $1",
+                                )
+                                .bind(&default.kind)
+                                .fetch_one(&mut *tx)
+                                .await
+                                .map_err(|e| JobKindError::Storage(e.to_string()))?;
+
+                                sqlx::query(
+                                    "INSERT INTO job_kinds
+                                        (kind, version, status, label, description, category,
+                                         subject_kinds, steps, metadata_schema, entitlements,
+                                         metadata, on_complete_create, owning_team,
+                                         authoring_job_id, created_by, created_at)
+                                     VALUES ($1, $2, 'active', $3, $4, $5, $6, $7, $8, $9,
+                                             $10, $11, $12, NULL, 'bootstrap', NOW())",
+                                )
+                                .bind(&default.kind)
+                                .bind(next)
                                 .bind(&default.label)
                                 .bind(&default.description)
                                 .bind(&default.category)
@@ -2015,11 +2065,15 @@ mod pg {
                                 .bind(&default.metadata)
                                 .bind(&on_complete_create_json)
                                 .bind(&default.owning_team)
-                                .execute(&self.pool)
+                                .execute(&mut *tx)
                                 .await
                                 .map_err(|e| JobKindError::Storage(e.to_string()))?;
 
-                                stats.refreshed += 1;
+                                tx.commit()
+                                    .await
+                                    .map_err(|e| JobKindError::Storage(e.to_string()))?;
+
+                                stats.republished += 1;
                             } else {
                                 stats.unchanged += 1;
                             }
@@ -2825,7 +2879,7 @@ mod tests {
         let defaults = vec![reconcile_spec("job-kind-design", "Design a JobKind")];
         let stats = registry.bootstrap_reconcile(&defaults).await.unwrap();
         assert_eq!(stats.inserted, 1);
-        assert_eq!(stats.refreshed, 0);
+        assert_eq!(stats.republished, 0);
         assert_eq!(stats.preserved, 0);
         assert_eq!(stats.unchanged, 0);
         let live = registry.get_active("job-kind-design").await.unwrap();
@@ -2835,7 +2889,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_reconcile_refreshes_drifted_bootstrap_rows() {
+    async fn bootstrap_reconcile_republishes_drift_as_a_new_version() {
         let registry = InMemoryJobKinds::new();
         // Seed a stale bootstrap row.
         let stale = reconcile_spec("job-kind-design", "Old Label");
@@ -2848,15 +2902,57 @@ mod tests {
         let stats = registry
             .bootstrap_reconcile(&[updated])
             .await
-            .expect("refresh");
+            .expect("republish");
         assert_eq!(stats.inserted, 0);
-        assert_eq!(stats.refreshed, 1);
+        assert_eq!(stats.republished, 1);
         assert_eq!(stats.preserved, 0);
         assert_eq!(stats.unchanged, 0);
+
         let live = registry.get_active("job-kind-design").await.unwrap();
         assert_eq!(live.label, "Design a JobKind", "drift should self-heal");
-        // Refresh preserves version — never publishes a new one.
-        assert_eq!(live.version, 1, "refresh must not bump version");
+        // A changed body is a NEW version, not a rewrite of the old
+        // one. This used to assert the opposite, and that is precisely
+        // what defeated the version pin: Jobs opened under v1 kept
+        // pointing at v1 while v1's body changed underneath them.
+        assert_eq!(live.version, 2, "a changed body publishes a version");
+
+        // The old version must still be readable, or a Job pinned to
+        // it has nothing to resolve.
+        let pinned = registry
+            .get_version("job-kind-design", 1)
+            .await
+            .expect("v1 still resolvable");
+        assert_eq!(pinned.label, "Old Label", "v1 keeps the body it had");
+        assert_eq!(pinned.status, JobKindStatus::Retired);
+    }
+
+    /// Reconcile runs on EVERY boot. If an unchanged default still
+    /// published, a restart loop would mint versions forever.
+    #[tokio::test]
+    async fn bootstrap_reconcile_republishes_only_on_a_real_change() {
+        let registry = InMemoryJobKinds::new();
+        let spec = reconcile_spec("job-kind-design", "Design a JobKind");
+        registry
+            .bootstrap_reconcile(std::slice::from_ref(&spec))
+            .await
+            .expect("seed");
+        for _ in 0..3 {
+            let stats = registry
+                .bootstrap_reconcile(std::slice::from_ref(&spec))
+                .await
+                .expect("reboot");
+            assert_eq!(stats.republished, 0);
+            assert_eq!(stats.unchanged, 1);
+        }
+        assert_eq!(
+            registry
+                .get_active("job-kind-design")
+                .await
+                .unwrap()
+                .version,
+            1,
+            "three boots with no change must not mint versions"
+        );
     }
 
     #[tokio::test]
@@ -2872,7 +2968,7 @@ mod tests {
         let updated = reconcile_spec("job-kind-design", "Default Label");
         let stats = registry.bootstrap_reconcile(&[updated]).await.unwrap();
         assert_eq!(stats.inserted, 0);
-        assert_eq!(stats.refreshed, 0);
+        assert_eq!(stats.republished, 0);
         assert_eq!(stats.preserved, 1);
         assert_eq!(stats.unchanged, 0);
         let live = registry.get_active("job-kind-design").await.unwrap();
@@ -2892,7 +2988,7 @@ mod tests {
             .expect("seed");
         let stats = registry.bootstrap_reconcile(&[spec]).await.unwrap();
         assert_eq!(stats.inserted, 0);
-        assert_eq!(stats.refreshed, 0);
+        assert_eq!(stats.republished, 0);
         assert_eq!(stats.preserved, 0);
         assert_eq!(stats.unchanged, 1);
     }
