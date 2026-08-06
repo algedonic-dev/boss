@@ -1207,6 +1207,89 @@ impl JobsRepository for PgJobs {
 /// (the live-tick accumulation), then run the per-service
 /// rebuilders to replay the surviving (smaller) audit_log into
 /// fresh projections. ~30s typical.
+/// Trim `audit_log` back to the seed baseline for an epoch restart,
+/// preserving platform meta-work.
+///
+/// Extracted from `run_restart_epoch_background` so the preservation
+/// rule can be tested: the rest of that routine waits on quiescence,
+/// talks to NATS and drives every rebuilder, none of which a test of
+/// "what survives the trim" should have to stand up.
+pub async fn trim_epoch_audit_log(pool: &PgPool, baseline: i64) -> Result<u64, JobsError> {
+    // Trim audit_log past the seed baseline. The append-only
+    // trigger (DELETE rejection per the correctness-protocol
+    // invariant) has to be disabled briefly — this is the one
+    // controlled exception, scoped to the demo-loop reset path.
+    // The per-service rebuilders below wipe their own projection
+    // tables in their replay transactions, so projections clear
+    // and re-derive in one pass.
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| JobsError::Storage(format!("begin trim tx: {e}")))?;
+    // Outbox first, deliberately: at restart time every outbox row is
+    // the finished epoch's by definition, so pending rows must die
+    // with it rather than relay into the new epoch. TRUNCATE takes
+    // ACCESS EXCLUSIVE, so it queues behind any in-flight relay batch
+    // (its FOR UPDATE row locks) — and any audit rows that batch
+    // committed carry ids ≤ this moment, so the DELETE below removes
+    // them. Ordering the truncate before the audit trim is what makes
+    // a racing relay harmless.
+    sqlx::query("TRUNCATE event_outbox")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(format!("truncate event_outbox: {e}")))?;
+    sqlx::query("ALTER TABLE audit_log DISABLE TRIGGER audit_log_reject_row_mutation_trg")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(format!("disable trigger: {e}")))?;
+    // Platform meta-work survives the lap. The epoch restart exists to
+    // reset the SIMULATED company — a year of brewing, selling and
+    // shipping that is meant to be disposable. Feedback a person typed,
+    // a design doc under review, a JobKind someone authored: those are
+    // real operator input that happens to be stored in the same log,
+    // and trimming them was destroying the only record of them. It
+    // cost an entire session's feedback corpus, filed by a real user,
+    // when the lap rolled at 21:18.
+    //
+    // A Job and its steps must travel TOGETHER or the rebuild aborts on
+    // `steps_job_id_fkey` — the exact failure that manufactured orphan
+    // steps once before. `payload->>'id'` catches the `jobs.job.created`
+    // event and `payload->>'job_id'` catches every step event, so the
+    // pair is preserved atomically.
+    //
+    // `jobs` has no FK to `subjects`, so a preserved Job whose Subject
+    // row is re-derived from the trimmed log stays structurally valid;
+    // its subject columns are plain text on the row.
+    let platform_kinds: Vec<String> = crate::registry::platform_kinds()
+        .into_iter()
+        .map(|spec| spec.kind)
+        .collect();
+    let trimmed = sqlx::query(
+        "DELETE FROM audit_log
+          WHERE id > $1
+            AND NOT EXISTS (
+                SELECT 1 FROM jobs j
+                 WHERE j.kind = ANY($2)
+                   AND j.id::text = COALESCE(
+                           audit_log.payload->>'job_id',
+                           audit_log.payload->>'id')
+            )",
+    )
+    .bind(baseline)
+    .bind(&platform_kinds)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| JobsError::Storage(format!("trim audit_log: {e}")))?;
+    sqlx::query("ALTER TABLE audit_log ENABLE TRIGGER audit_log_reject_row_mutation_trg")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(format!("re-enable trigger: {e}")))?;
+    tx.commit()
+        .await
+        .map_err(|e| JobsError::Storage(format!("commit trim tx: {e}")))?;
+    Ok(trimmed.rows_affected())
+}
+
 async fn run_restart_epoch_background(
     pool: &PgPool,
     db_url: &str,
@@ -1268,47 +1351,9 @@ async fn run_restart_epoch_background(
         }
     }
 
-    // Trim audit_log past the seed baseline. The append-only
-    // trigger (DELETE rejection per the correctness-protocol
-    // invariant) has to be disabled briefly — this is the one
-    // controlled exception, scoped to the demo-loop reset path.
-    // The per-service rebuilders below wipe their own projection
-    // tables in their replay transactions, so projections clear
-    // and re-derive in one pass.
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| JobsError::Storage(format!("begin trim tx: {e}")))?;
-    // Outbox first, deliberately: at restart time every outbox row is
-    // the finished epoch's by definition, so pending rows must die
-    // with it rather than relay into the new epoch. TRUNCATE takes
-    // ACCESS EXCLUSIVE, so it queues behind any in-flight relay batch
-    // (its FOR UPDATE row locks) — and any audit rows that batch
-    // committed carry ids ≤ this moment, so the DELETE below removes
-    // them. Ordering the truncate before the audit trim is what makes
-    // a racing relay harmless.
-    sqlx::query("TRUNCATE event_outbox")
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| JobsError::Storage(format!("truncate event_outbox: {e}")))?;
-    sqlx::query("ALTER TABLE audit_log DISABLE TRIGGER audit_log_reject_row_mutation_trg")
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| JobsError::Storage(format!("disable trigger: {e}")))?;
-    let trimmed = sqlx::query("DELETE FROM audit_log WHERE id > $1")
-        .bind(baseline)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| JobsError::Storage(format!("trim audit_log: {e}")))?;
-    sqlx::query("ALTER TABLE audit_log ENABLE TRIGGER audit_log_reject_row_mutation_trg")
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| JobsError::Storage(format!("re-enable trigger: {e}")))?;
-    tx.commit()
-        .await
-        .map_err(|e| JobsError::Storage(format!("commit trim tx: {e}")))?;
+    let trimmed = trim_epoch_audit_log(pool, baseline).await?;
     tracing::info!(
-        rows_trimmed = trimmed.rows_affected(),
+        rows_trimmed = trimmed,
         baseline,
         "restart_epoch: audit_log trimmed past seed baseline"
     );
