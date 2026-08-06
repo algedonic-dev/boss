@@ -125,6 +125,17 @@ export async function installSmokeMocks(page: Page): Promise<void> {
   // Views — the Home composer surface. Two rows so the crawler renders
   // both visibility badges, and a results payload with `truncated` set
   // so the ceiling warning is exercised rather than only the happy path.
+  // The tenant manifest now carries the tenant's own name, which the
+  // chrome bar renders. Mocked so the brand assertions below have
+  // something deterministic to read.
+  await page.route(/\/api\/tenant\/manifest$/, (r) =>
+    json(r, {
+      display_name: 'Algedonic Ales',
+      tenant_id: 'brewery',
+      modules: {},
+      labels: {},
+    }),
+  );
   await page.route(/\/api\/views(\?|$)/, (r) =>
     json(r, [
       {

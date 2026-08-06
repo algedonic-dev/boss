@@ -14,11 +14,19 @@
 //
 // Labels are pure presentation: the brewery's `assets.entity_singular =
 // "vessel"` doesn't change what's stored, only what the SPA prints.
+//
+// `[meta].display_name` rides along for the same reason: the chrome
+// had the brewery's name hardcoded at three render sites, so a second
+// tenant rendered someone else's brand in its top bar.
 
 type ManifestState =
   | { kind: 'loading' }
   | {
       kind: 'ready';
+      /// What the tenant calls itself, from tenant.toml `[meta]`.
+      /// Undefined for a deployment that has not named itself.
+      displayName?: string;
+      tenantId?: string;
       modules: Readonly<Record<string, boolean>>;
       labels: Readonly<Record<string, string>>;
     }
@@ -36,11 +44,15 @@ export async function loadManifest(): Promise<void> {
       return;
     }
     const body = (await r.json()) as {
+      display_name?: string;
+      tenant_id?: string;
       modules?: Record<string, boolean>;
       labels?: Record<string, string>;
     };
     manifest.value = {
       kind: 'ready',
+      displayName: body.display_name,
+      tenantId: body.tenant_id,
       modules: body.modules ?? {},
       labels: body.labels ?? {},
     };

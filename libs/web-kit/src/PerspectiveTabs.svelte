@@ -16,14 +16,19 @@
   import SignInControl from './SignInControl.svelte';
   import GlobalSearch from './GlobalSearch.svelte';
   import { APPS, type AppId } from './nav';
+  import { manifest } from './session/manifest.svelte';
 
   let {
     active,
-    brandName = 'BOSS',
-    brandSub = '',
+    brandName: brandNameProp,
+    brandSub: brandSubProp,
     searchAppKinds = [] as ReadonlyArray<string>,
   } = $props<{
     active: AppId;
+    /// Overrides the tenant's own name. Left unset everywhere in the
+    /// shipped apps — the brand comes from the manifest, because
+    /// hardcoding it is how three render sites came to disagree and
+    /// how a second tenant ended up showing a brewery's name.
     brandName?: string;
     brandSub?: string;
     /// Subject kinds of the active app, passed to global search as a
@@ -31,6 +36,32 @@
     /// the host owns which surfaces belong to which app.
     searchAppKinds?: ReadonlyArray<string>;
   }>();
+
+  /// The tenant's own name, split on its last word so "Algedonic Ales"
+  /// still renders as a wordmark plus a lighter suffix — the shape the
+  /// hardcoded props produced, now derived rather than repeated.
+  ///
+  /// Falls back to "BOSS" while the manifest loads and for a
+  /// deployment that has not named itself. A prop still wins, for a
+  /// host that genuinely needs to override.
+  let brand = $derived.by(() => {
+    const name =
+      brandNameProp !== undefined
+        ? undefined
+        : manifest.value.kind === 'ready'
+          ? manifest.value.displayName
+          : undefined;
+    if (brandNameProp !== undefined) {
+      return { name: brandNameProp, sub: brandSubProp ?? '' };
+    }
+    if (!name) return { name: 'BOSS', sub: '' };
+    const words = name.trim().split(/\s+/);
+    return words.length > 1
+      ? { name: words.slice(0, -1).join(' '), sub: words[words.length - 1]! }
+      : { name, sub: '' };
+  });
+  let brandName = $derived(brand.name);
+  let brandSub = $derived(brand.sub);
 </script>
 
 <nav class="perspective-tabs" aria-label="Perspective">
