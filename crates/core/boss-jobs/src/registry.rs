@@ -346,6 +346,67 @@ pub fn platform_kinds() -> Vec<JobKindSpec> {
 ///   0. `triage`    — an operator reads it and decides
 ///   999. `outcome` — closed
 fn user_feedback_spec() -> JobKindSpec {
+    // Triage is a FORK, not a checkbox. Its output is a decision about
+    // what happens next, and the whole point of recording it on the
+    // step is that the successors gate on it — so "triaged" stops
+    // meaning "someone closed it" and starts meaning "someone chose a
+    // route". The first cut of this spec had a single successor, which
+    // made triage a step whose only possible outcome was closure; the
+    // board built on it was a to-do list wearing a Kanban.
+    //
+    // The vocabulary is an INLINE field on the step rather than a new
+    // StepType. `task`'s bundle stays generic and this JobKind carries
+    // its own completion contract, which is what inline authoring is
+    // for. The viability lint reads the pipe-shaped `field_type` as an
+    // enum domain and proves every value has a successor, so a
+    // disposition with nowhere to go fails at authoring time instead
+    // of stranding a Job at runtime.
+    const DISPOSITIONS: &str = "reproduce|design|build|duplicate|needs-info|decline";
+
+    /// A branch that leaves the Job open for someone to do the work.
+    /// Authority-gated for the same reason triage is: `task` has no
+    /// required roles, so without a gate the simulated workforce
+    /// role-matches it and "investigates" real feedback on its own.
+    fn branch(title: &str, label: &str, disposition: &str) -> StepSpec {
+        StepSpec {
+            title: title.into(),
+            kind: "task".into(),
+            ready_when: format!(
+                "steps.triage.done AND steps.triage.metadata.disposition = \"{disposition}\""
+            ),
+            title_template: label.into(),
+            authority_role: Some("platform-admin".into()),
+            ..Default::default()
+        }
+    }
+
+    /// A branch that ends the Job immediately. `outcome_kind` is a
+    /// closed enum on the StepType (`completed|skipped|aborted|
+    /// withdrawn`), so the domain-specific label rides on `terminal`,
+    /// which is free-form — a Job that ended as a duplicate reads that
+    /// way in its outcome without inventing a new outcome_kind.
+    fn closing_branch(
+        title: &str,
+        label: &str,
+        disposition: &str,
+        outcome_kind: &str,
+        outcome: &str,
+    ) -> StepSpec {
+        StepSpec {
+            title: title.into(),
+            kind: "outcome".into(),
+            ready_when: format!(
+                "steps.triage.done AND steps.triage.metadata.disposition = \"{disposition}\""
+            ),
+            title_template: label.into(),
+            metadata_defaults: serde_json::json!({ "outcome_kind": outcome_kind }),
+            terminal: Some(Terminal {
+                outcome: outcome.into(),
+            }),
+            ..Default::default()
+        }
+    }
+
     let steps = vec![
         StepSpec {
             title: "submitted".into(),
@@ -361,26 +422,14 @@ fn user_feedback_spec() -> JobKindSpec {
         StepSpec {
             title: "triage".into(),
             // `task` — "simple assigned task for HR, IT, admin", which
-            // is literally what triaging feedback is, and it requires
-            // no metadata to complete.
-            //
-            // This was `acknowledgment` and could never be closed.
-            // That kind means "confirm receipt or understanding of a
-            // policy or document" and requires `document_title`;
-            // metadata validators run at `completed`, so the step
-            // materialized fine and every attempt to triage failed with
-            // `required field 'document_title' is missing`. Feedback
-            // triage acknowledges no document, so there was no honest
-            // value to supply — the kind was simply the wrong one.
-            //
-            // No lint catches this: the viability lint type-checks the
-            // defaults a spec DOES set, and it cannot demand that a
-            // spec pre-fill every required field, because required-at-
-            // done fields are normally what the operator supplies at
-            // completion (`scheduling` wants a `location`). What broke
-            // here is semantic fit between the work and the kind, which
-            // only a reader can judge. Pick the kind whose field schema
-            // describes the work, not the one whose label sounds close.
+            // is what triaging is, and it requires no metadata of its
+            // own. This was `acknowledgment` and could never be closed:
+            // that kind means "confirm receipt of a policy or document"
+            // and requires `document_title`. Validators run at
+            // `completed`, so the step materialized fine and every
+            // attempt to triage failed. Pick the kind whose field
+            // schema describes the work, not the one whose label
+            // sounds close.
             kind: "task".into(),
             ready_when: "steps.submitted.done".into(),
             title_template: "Triage feedback".into(),
@@ -393,12 +442,42 @@ fn user_feedback_spec() -> JobKindSpec {
             // read is worse than no feedback mechanism, because the
             // audit trail says it was handled.
             authority_role: Some("platform-admin".into()),
+            fields: vec![boss_core::job::StepField {
+                name: "disposition".into(),
+                field_type: DISPOSITIONS.into(),
+                // Required at done: there is no such thing as
+                // completing triage without deciding where it goes.
+                required: true,
+            }],
             ..Default::default()
         },
+        branch("investigate", "Reproduce and investigate", "reproduce"),
+        branch("design-review", "Decide the design", "design"),
+        branch("build", "Build the change", "build"),
+        branch("needs-info", "Waiting on the reporter", "needs-info"),
+        closing_branch(
+            "duplicate",
+            "Closed as a duplicate",
+            "duplicate",
+            "withdrawn",
+            "duplicate",
+        ),
+        closing_branch(
+            "declined",
+            "Closed without action",
+            "decline",
+            "aborted",
+            "declined",
+        ),
         StepSpec {
             title: "closed".into(),
             kind: "outcome".into(),
-            ready_when: "steps.triage.done".into(),
+            // Any branch that did real work lands here. The two
+            // closing branches terminate on their own and never reach
+            // this one.
+            ready_when: "steps.investigate.done OR steps.design-review.done \
+                         OR steps.build.done OR steps.needs-info.done"
+                .into(),
             title_template: "Feedback closed".into(),
             metadata_defaults: serde_json::json!({ "outcome_kind": "completed" }),
             terminal: Some(Terminal {
@@ -426,7 +505,8 @@ fn user_feedback_spec() -> JobKindSpec {
          (a `custom` Subject whose id is the route path), so \"what have people said about \
          this page\" is a Subject-history question rather than a report someone has to build. \
          Modelled as a Job deliberately: feedback is work, and work that lives outside the \
-         Job model is work the system cannot route, own, or audit."
+         Job model is work the system cannot route, own, or audit. Triage forks on a \
+         disposition, so routing an item is a recorded decision that opens the next step."
             .to_string(),
     );
     spec
@@ -2286,24 +2366,23 @@ mod tests {
         }
     }
 
-    /// Every step of `user-feedback` must satisfy its kind's
-    /// completion contract from its own defaults alone.
+    /// The feedback flow collects exactly ONE thing from an operator —
+    /// the triage disposition — so every step must close on its own
+    /// defaults plus that.
     ///
-    /// Nothing in the feedback flow collects fields from an operator.
-    /// The chrome-bar control posts a message; the triage board closes
-    /// the step with a bare `{"status":"completed"}`. So a required
-    /// field this spec does not pre-fill is not a field someone types
-    /// in later — it is a step that can never close, and a Job that
-    /// can never leave the board.
+    /// Both halves matter. A required field anywhere else is a step
+    /// nothing in this flow can satisfy, because no surface asks for
+    /// it: the chrome control posts a message and the board sends a
+    /// status flip. And triage must genuinely require the disposition,
+    /// or routing becomes optional and the fork decorative.
     ///
-    /// Regression: triage shipped as `acknowledgment`, which requires
-    /// `document_title`. Validators run at `completed`, so the Job
-    /// materialized cleanly and looked perfectly healthy in the
+    /// Regression this came from: triage shipped as `acknowledgment`,
+    /// which requires `document_title`. Validators run at `completed`,
+    /// so the Job materialized cleanly and looked healthy in the
     /// waiting column; the only symptom was a 400 the first time a
-    /// human tried to triage real feedback. This fails at the spec
-    /// instead, where the wrong kind is visible.
+    /// human tried to triage real feedback.
     #[test]
-    fn user_feedback_steps_close_without_operator_supplied_fields() {
+    fn user_feedback_collects_only_the_triage_disposition() {
         let spec = user_feedback_spec();
         let registry = crate::step_registry::StepRegistry::v1();
         let subject = Subject::new("custom", "/system");
@@ -2315,15 +2394,31 @@ mod tests {
         });
         assert!(!steps.is_empty(), "user-feedback materialized no steps");
 
+        let mut operator_supplied: Vec<String> = Vec::new();
+
         for s in &steps {
-            // Both halves of the contract the completion path applies:
-            // the kind's field bundle and any inline authored fields.
+            let mut metadata = s.metadata.clone();
+
+            // Stand in for what the operator types. A pipe-shaped
+            // field_type is an enum, so the first value is a legal
+            // answer; anything else required here would be a field no
+            // surface in this flow collects.
+            for f in s.fields.iter().filter(|f| f.required) {
+                operator_supplied.push(format!("{}.{}", s.title, f.name));
+                let sample = f.field_type.split('|').next().unwrap_or("x");
+                if let serde_json::Value::Object(m) = &mut metadata {
+                    m.insert(
+                        f.name.clone(),
+                        serde_json::Value::String(sample.to_string()),
+                    );
+                }
+            }
+
             let result = registry
-                .validate_metadata(&s.kind, &s.metadata)
+                .validate_metadata(&s.kind, &metadata)
                 .and_then(|()| {
                     crate::step_registry::StepRegistry::validate_authored_fields(
-                        &s.fields,
-                        &s.metadata,
+                        &s.fields, &metadata,
                     )
                 });
             if let Err(errors) = result {
@@ -2339,6 +2434,13 @@ mod tests {
                 );
             }
         }
+
+        assert_eq!(
+            operator_supplied,
+            vec!["Triage feedback.disposition".to_string()],
+            "the feedback flow has exactly one field an operator fills in; anything \
+             else here is a step no surface can complete"
+        );
     }
 
     #[test]
@@ -2889,9 +2991,43 @@ mod tests {
         assert_eq!(feedback.version, 1);
         assert_eq!(feedback.status, JobKindStatus::Active);
         assert_eq!(feedback.subject_kinds, vec!["custom".to_string()]);
-        // trigger -> triage -> outcome. A terminal step is what lets
-        // the Job close rather than sitting open forever.
-        assert_eq!(feedback.steps.len(), 3);
+        // submitted -> triage -> one branch per disposition -> a
+        // terminal. Asserting the fork rather than a step count: what
+        // matters is that triage HAS somewhere to route to, since a
+        // triage step with a single successor is a checkbox, which is
+        // what this spec shipped as first.
+        let triage = feedback
+            .steps
+            .iter()
+            .find(|s| s.title == "triage")
+            .expect("triage step present");
+        let disposition = triage
+            .fields
+            .iter()
+            .find(|f| f.name == "disposition")
+            .expect("triage declares a disposition field");
+        assert!(
+            disposition.required,
+            "triage must not be completable without choosing a route"
+        );
+        let values: Vec<&str> = disposition.field_type.split('|').collect();
+        assert!(
+            values.len() >= 2,
+            "a fork needs at least two dispositions, got {values:?}"
+        );
+        // Every declared disposition has a step gated on it. The
+        // viability lint proves this too; asserting it here names the
+        // offending value instead of failing a whole-registry check.
+        for v in &values {
+            let needle = format!("disposition = \"{v}\"");
+            assert!(
+                feedback
+                    .steps
+                    .iter()
+                    .any(|s| s.ready_when.contains(&needle)),
+                "disposition `{v}` has no successor — a Job routed there would strand"
+            );
+        }
         assert!(
             feedback.steps.iter().any(|s| s.terminal.is_some()),
             "must have a terminal step or feedback Jobs never close"

@@ -155,85 +155,122 @@ fn submit_feedback_body() -> String {
     .to_string()
 }
 
+/// Every disposition a triager can choose must drive the Job to
+/// closed. That is the property a fork actually needs: the viability
+/// lint proves each enum value HAS a successor, and this proves the
+/// successor is reachable, completable, and terminates.
+///
+/// Fields are read from the step's own `fields` array rather than
+/// hardcoded, which is what a real UI does — so a new required field
+/// on any step is exercised here instead of surfacing as a 400 the
+/// first time someone triages.
 #[tokio::test]
-async fn feedback_submitted_from_the_chrome_bar_can_be_triaged_to_closed() {
-    let app = app();
+async fn every_disposition_drives_the_job_to_closed() {
+    for disposition in [
+        "reproduce",
+        "design",
+        "build",
+        "needs-info",
+        "duplicate",
+        "decline",
+    ] {
+        let app = app();
 
-    // 1. Someone sends feedback.
-    let (status, job) = send(
-        &app,
-        Request::builder()
-            .method("POST")
-            .uri("/api/jobs")
-            .header("content-type", "application/json")
-            .header("x-boss-user", admin_header())
-            .body(Body::from(submit_feedback_body()))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "create rejected: {job}");
-    let job_id = job["id"].as_str().expect("job id").to_string();
-
-    // 2. Drive every actionable step the way the triage board does —
-    //    a bare status flip carrying no operator-supplied fields,
-    //    because no surface in this flow collects any. Looping until
-    //    nothing is actionable covers the steps that only become ready
-    //    once triage completes.
-    for round in 0..8 {
-        let (status, current) = send(
+        let (status, job) = send(
             &app,
             Request::builder()
-                .method("GET")
-                .uri(format!("/api/jobs/{job_id}"))
+                .method("POST")
+                .uri("/api/jobs")
+                .header("content-type", "application/json")
                 .header("x-boss-user", admin_header())
-                .body(Body::empty())
+                .body(Body::from(submit_feedback_body()))
                 .unwrap(),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "read failed: {current}");
+        assert_eq!(status, StatusCode::CREATED, "create rejected: {job}");
+        let job_id = job["id"].as_str().expect("job id").to_string();
 
-        if current["status"] == "closed" {
-            return;
-        }
-
-        let steps = current["steps"].as_array().cloned().unwrap_or_default();
-        let actionable: Vec<&serde_json::Value> = steps
-            .iter()
-            .filter(|s| s["status"] == "ready" || s["status"] == "active")
-            .collect();
-        assert!(
-            !actionable.is_empty(),
-            "round {round}: Job is neither closed nor actionable — no step is \
-             ready and none can be, so this feedback would sit on the board \
-             forever. Steps: {steps:#?}"
-        );
-
-        for step in actionable {
-            let step_id = step["id"].as_str().expect("step id");
-            let (status, body) = send(
+        let mut closed = false;
+        for round in 0..8 {
+            let (status, current) = send(
                 &app,
                 Request::builder()
-                    .method("PUT")
-                    .uri(format!("/api/jobs/{job_id}/steps/{step_id}"))
-                    .header("content-type", "application/json")
+                    .method("GET")
+                    .uri(format!("/api/jobs/{job_id}"))
                     .header("x-boss-user", admin_header())
-                    .body(Body::from(
-                        serde_json::json!({ "status": "completed" }).to_string(),
-                    ))
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await;
-            assert!(
-                status.is_success(),
-                "completing step `{}` (kind `{}`) failed with {status} — the \
-                 feedback flow supplies no metadata beyond what the JobKind \
-                 sets, so a step needing more can never be closed by an \
-                 operator: {body}",
-                step["title"].as_str().unwrap_or("?"),
-                step["kind"].as_str().unwrap_or("?"),
-            );
-        }
-    }
+            assert_eq!(status, StatusCode::OK, "read failed: {current}");
 
-    panic!("feedback Job did not reach `closed` after 8 rounds of completing every ready step");
+            if current["status"] == "closed" {
+                closed = true;
+                break;
+            }
+
+            let steps = current["steps"].as_array().cloned().unwrap_or_default();
+            let actionable: Vec<&serde_json::Value> = steps
+                .iter()
+                .filter(|s| s["status"] == "ready" || s["status"] == "active")
+                .collect();
+            assert!(
+                !actionable.is_empty(),
+                "`{disposition}` round {round}: Job is neither closed nor actionable — \
+                 nothing is ready and nothing can become ready, so an item routed here \
+                 would sit on the board forever. Steps: {steps:#?}"
+            );
+
+            for step in actionable {
+                let step_id = step["id"].as_str().expect("step id");
+
+                // Merge, never replace: `authority_role` shares this
+                // object and is what keeps the step gated.
+                let mut metadata = step["metadata"].clone();
+                for f in step["fields"].as_array().into_iter().flatten() {
+                    if f["required"].as_bool() != Some(true) {
+                        continue;
+                    }
+                    let name = f["name"].as_str().unwrap_or_default();
+                    let declared = f["field_type"].as_str().unwrap_or_default();
+                    // The disposition under test where the step asks
+                    // for it; otherwise the first legal enum value.
+                    let value = if declared.split('|').any(|v| v == disposition) {
+                        disposition
+                    } else {
+                        declared.split('|').next().unwrap_or("x")
+                    };
+                    metadata[name] = serde_json::Value::String(value.to_string());
+                }
+
+                let (status, body) = send(
+                    &app,
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/api/jobs/{job_id}/steps/{step_id}"))
+                        .header("content-type", "application/json")
+                        .header("x-boss-user", admin_header())
+                        .body(Body::from(
+                            serde_json::json!({ "status": "completed", "metadata": metadata })
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await;
+                assert!(
+                    status.is_success(),
+                    "`{disposition}`: completing step `{}` (kind `{}`) failed with \
+                     {status}: {body}",
+                    step["title"].as_str().unwrap_or("?"),
+                    step["kind"].as_str().unwrap_or("?"),
+                );
+            }
+        }
+
+        assert!(
+            closed,
+            "`{disposition}` did not reach `closed` after 8 rounds of completing every \
+             ready step"
+        );
+    }
 }
