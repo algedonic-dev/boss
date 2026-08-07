@@ -30,6 +30,9 @@
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { session } from '@boss/web-kit/session/session.svelte';
   import type { Job, Step } from './types';
+  // The fork rule lives in one module — it drifted once between this
+  // board and the terminal queue reader. See jobs/fork.ts.
+  import { type Fork, forkStep as forkStepOf, gatedStep, readFork } from './fork';
 
   type Props = Readonly<{
     /// Which queue this board shows. One JobKind today because that is
@@ -53,9 +56,6 @@
     card,
   }: Props = $props();
 
-  type Option = Readonly<{ value: string; label: string }>;
-  type Fork = Readonly<{ field: string; options: ReadonlyArray<Option> }>;
-
   let jobs = $state<ReadonlyArray<Job>>([]);
   let fork = $state<Fork | null>(null);
   let loading = $state(true);
@@ -68,34 +68,10 @@
   const WAITING = '__waiting__';
   const CLOSED = '__closed__';
 
-  /// The step a Job is parked on: the one gated on human authority.
-  /// Found by that property rather than by matching a step kind —
-  /// kinds are registry data and a kind is a bundle of properties, so
-  /// matching one would pin today's spelling of a spec the registry is
-  /// free to re-author.
-  function gatedStep(j: Job): Step | undefined {
-    return j.steps?.find(
-      (s) => (s.metadata as Record<string, unknown> | undefined)?.['authority_role'],
-    );
-  }
-
-  /// The fork step ON A JOB — the gated step that asks for a
-  /// disposition. Identified by carrying the enum field, so it stays
-  /// correct if the spec renames or reorders steps.
-  ///
-  /// Falls back to the gated step when the Job has no field-bearing
-  /// one. That is not defensive padding: a Job materialises its steps
-  /// at open and keeps them, so Jobs opened before the fork existed
-  /// carry the old shape forever. Without the fallback their cards
-  /// render but every control silently does nothing, which is the
-  /// worst failure available — the board would look fine and refuse
-  /// to work.
+  /// `forkStep` bound to this board's fork. The rule itself is in
+  /// jobs/fork.ts; this is just the partial application.
   function forkStep(j: Job): Step | undefined {
-    const field = fork?.field;
-    const byField = field
-      ? j.steps?.find((s) => s.fields?.some((f) => f.name === field))
-      : undefined;
-    return byField ?? gatedStep(j);
+    return forkStepOf(j, fork);
   }
 
   function isTerminal(s: Step | undefined): boolean {
@@ -155,35 +131,6 @@
     return out;
   });
 
-  /// Read the queue's fork out of the JobKind registry: the step with
-  /// a required pipe-shaped field is the fork, its values are the
-  /// dispositions, and each successor's `title_template` is that
-  /// route's human name. Deriving the label from the successor rather
-  /// than humanising the slug means the column says what the next step
-  /// IS — "Reproduce and investigate", not "Reproduce".
-  function readFork(spec: unknown): Fork | null {
-    const steps = (spec as { steps?: unknown[] })?.steps;
-    if (!Array.isArray(steps)) return null;
-
-    for (const step of steps) {
-      const fields = (step as { fields?: unknown[] }).fields ?? [];
-      for (const f of fields) {
-        const field = f as { name?: string; field_type?: string; required?: boolean };
-        if (!field.required || !field.name || !field.field_type?.includes('|')) continue;
-        const options = field.field_type.split('|').map((value) => {
-          const successor = steps.find((s) =>
-            (s as { ready_when?: string }).ready_when?.includes(`${field.name} = "${value}"`),
-          ) as { title_template?: string; title?: string } | undefined;
-          return {
-            value,
-            label: successor?.title_template || successor?.title || value,
-          };
-        });
-        return { field: field.name, options };
-      }
-    }
-    return null;
-  }
 
   async function load(): Promise<void> {
     loading = true;

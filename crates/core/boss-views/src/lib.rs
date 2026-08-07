@@ -17,6 +17,7 @@
 
 pub mod error;
 pub mod filter;
+pub mod flow;
 pub mod in_memory;
 pub mod os_map;
 pub mod port;
@@ -33,6 +34,7 @@ pub mod query;
 pub mod rebuild_event_facts;
 
 pub use error::ViewsError;
+pub use flow::{Flow, FlowJob, FlowRepo, FlowStep};
 pub use in_memory::InMemoryViewsRepo;
 pub use os_map::{OsMap, OsMapEdge, OsMapNode, OsMapRepo};
 pub use port::{ViewResolver, ViewsRepo};

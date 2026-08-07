@@ -96,6 +96,10 @@
     {
       label: 'Run',
       items: [
+        // Flow first: the team's own dashboard. System Monitoring
+        // below it answers the other question — what the machine is
+        // doing, rather than what the people are getting through.
+        ROUTE_CATALOG['system-flow'],
         ROUTE_CATALOG['system-model'],
         ROUTE_CATALOG['system-monitoring'],
         // Audit Log + Atlas are sub-pages of monitoring with no

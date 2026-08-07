@@ -36,6 +36,11 @@ const ROUTES: ReadonlyArray<string> = [
   // Modeling + admin surfaces (System Model).
   '/system/workflows', '/system/job-kinds', '/system/job-kinds/new',
   '/system/job-kinds/seasonal-release', '/system/policy', '/system/auth-admin',
+  // IT surfaces added since the app split. They were absent for three
+  // releases and the crawl reported success the whole time — see the
+  // drift test at the bottom of this file for why that can no longer
+  // happen quietly.
+  '/system/feedback', '/system/flow',
 ];
 
 // DEFERRED, group 1 — aggregation dashboards that read OBJECT-shaped
@@ -131,5 +136,62 @@ test.describe('route smoke — every surface renders without a runtime crash', (
     await page.waitForTimeout(2_000);
 
     expect(errors, `pageerrors in the authoring workspace:\n${errors.join('\n')}`).toEqual([]);
+  });
+});
+
+// A crawl that silently omits a surface reports success for a page it
+// never loaded. That is not hypothetical: `/system/feedback`,
+// `/system/os-map` and `/system/flow` were each added to the app, each
+// wired into the sidebar, and none of them appeared here — the harness
+// stayed green across all three because a hardcoded list cannot know
+// what it is missing.
+//
+// So the list gets pinned against the route catalog, which is the one
+// place a surface must be registered to exist at all. A new route is
+// crawled by default; skipping one is a line in DEFERRED with a
+// reason, not an omission.
+test.describe('the crawl covers every registered surface', () => {
+  /// Routes the crawl cannot cover yet, each with why. Shrinking this
+  /// list is the work; adding to it is a decision.
+  const DEFERRED: ReadonlyMap<string, string> = new Map([
+    ['/system/monitoring', 'aggregation dashboard: snapshot .length needs a faithful fixture'],
+    // Surfaced by this drift test on its first run: the route was
+    // registered and never crawled. Under the generic [] catch-all it
+    // throws reading .length off an object-shaped snapshot — the same
+    // fixture gap as /system/monitoring, not a defect in the page.
+    ['/ux/ops', 'reads an object-shaped ops snapshot; needs a faithful fixture'],
+    ['/ux/finance', 'statements .reduce needs object-shaped fixtures'],
+    ['/ux/warehouse', 'summary.below_reorder_count needs a faithful fixture'],
+    ['/ux/exec', '.find/.length over object-shaped summaries'],
+    ['/system/os-map', 'graph view: the generic [] catch-all cannot fake an OsMap object'],
+  ]);
+
+  test('no deferral names a route that does not exist', async () => {
+    const { ROUTE_CATALOG } = await import('../../src/shell/nav-catalog');
+    const registered = new Set(
+      Object.values(ROUTE_CATALOG).map((r) => (r as { path: string }).path),
+    );
+    const ghosts = [...DEFERRED.keys()].filter((p) => !registered.has(p)).sort();
+    expect(
+      ghosts,
+      'a deferral for an unregistered route reads as "covered elsewhere" while ' +
+        'excusing nothing — drop it, or fix the path',
+    ).toEqual([]);
+  });
+
+  test('every catalog route is crawled or deferred with a reason', async () => {
+    const { ROUTE_CATALOG } = await import('../../src/shell/nav-catalog');
+    const crawled = new Set(ROUTES);
+    const missing = Object.values(ROUTE_CATALOG)
+      .map((r) => (r as { path: string }).path)
+      // Parameterised paths are covered by the detail routes above.
+      .filter((p) => typeof p === 'string' && !p.includes(':'))
+      .filter((p) => !crawled.has(p) && !DEFERRED.has(p))
+      .sort();
+    expect(
+      missing,
+      `these surfaces are registered but never rendered by any test — add them to ROUTES, ` +
+        `or to DEFERRED with the reason they cannot be crawled yet`,
+    ).toEqual([]);
   });
 });

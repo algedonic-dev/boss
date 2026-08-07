@@ -14,6 +14,7 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 
 const source = readFileSync(new URL('./TriageBoard.svelte', import.meta.url), 'utf8');
+const forkSource = readFileSync(new URL('./fork.ts', import.meta.url), 'utf8');
 
 /// Comments deliberately discuss feedback — it is where the component
 /// came from and why the seam exists. Only executable code is pinned.
@@ -40,12 +41,39 @@ describe('TriageBoard stays queue-agnostic', () => {
     expect(code).toMatch(/kind=\$\{encodeURIComponent\(kind\)\}/);
   });
 
+  test('does not reimplement the fork rule', () => {
+    // The rule moved to ./fork.ts so Flow could share it rather than
+    // carry a second copy — it had already drifted once between this
+    // board and the terminal queue reader. The board must import it,
+    // not grow its own again.
+    expect(code).toMatch(/from '\.\/fork'/);
+    expect(code).not.toMatch(/function\s+(readFork|gatedStep)\b/);
+  });
+
+  // A STEP-kind comparison is the regression this guards. Scoped to
+  // step-shaped receivers on purpose: `session.value.kind === 'ready'`
+  // is a discriminated-union tag, not a registry kind name, and a
+  // bare /\.kind ===/ flags it.
+  const NO_STEP_KIND_MATCH = /\b(s|step|st)\.kind\s*===\s*['"]/;
+
+  test('the board matches no step kind', () => {
+    expect(code).not.toMatch(NO_STEP_KIND_MATCH);
+  });
+});
+
+describe('the fork rule', () => {
   test('finds the parked step by its authority gate, not a step kind', () => {
-    expect(code).toMatch(/authority_role/);
-    // A STEP-kind comparison is the regression this guards. Scoped to
-    // step-shaped receivers on purpose: `session.value.kind === 'ready'`
-    // is a discriminated-union tag, not a registry kind name, and a
-    // bare /\.kind ===/ flags it.
-    expect(code).not.toMatch(/\b(s|step|st)\.kind\s*===\s*['"]/);
+    expect(forkSource).toMatch(/authority_role/);
+    expect(forkSource).not.toMatch(/\b(s|step|st)\.kind\s*===\s*['"]/);
+  });
+
+  test('names no specific JobKind or disposition', () => {
+    // Every value it works on comes from the registry. A literal here
+    // would mean adding a disposition needs a code change.
+    const forkCode = forkSource
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/(^|[^:])\/\/.*$/gm, '$1');
+    expect(forkCode).not.toContain('user-feedback');
+    expect(forkCode).not.toMatch(/['"](reproduce|decline|duplicate|needs-info)['"]/);
   });
 });
