@@ -1,37 +1,30 @@
-//! The epoch restart deletes what the SIMULATOR did and keeps what
-//! people did.
+//! The epoch restart deletes the simulated company and keeps the real
+//! one.
 //!
-//! The demo loop resets a simulated company — a year of brewing,
-//! selling and shipping that is meant to be disposable — by deleting
-//! `audit_log` past the seed baseline and replaying the rebuilders.
-//! Real operator input lives in the same log: feedback typed from the
-//! chrome bar, a design doc under review, a step a person completed.
-//! The trim was destroying it, and did: a lap rolled mid-session and
-//! took an entire day's feedback corpus, filed by a real user, with
-//! it. Nothing failed and nothing was logged; the Jobs were simply
-//! gone the next time the board was read.
+//! Sim-ness is a property of the JOB, decided from the origin of the
+//! request that opened it and immutable thereafter. Everything
+//! associated with a simulated Job is simulated — including a real
+//! operator clicking around one. A fake brew order does not become
+//! real because somebody looked at it.
 //!
-//! The rule keys on `_simulated`, which is stamped from the event's
-//! ORIGIN — the request carried `x-sim-origin`, or the dispatcher
-//! inherited it from the event it reacted to. An earlier version of
-//! this exempted three hardcoded platform kinds instead, which could
-//! only ever be right by accident: a tenant Job a human worked was
-//! still destroyed.
+//! That framing is what makes the trim simple. Deciding per EVENT gave
+//! a Job a mixed history, which forced the trim to preserve any Job a
+//! human had touched or risk orphaning steps and aborting the rebuild
+//! on `steps_job_id_fkey`. Carrying the bit on the Job removes the
+//! case rather than handling it: a Job's rows all share one fate, so
+//! no partial deletion is possible.
 //!
-//! The subtle half is mixed origin. A Job's events do NOT share one:
-//! a person can complete a step on a Job the simulator created.
-//! Keeping that person's event while deleting the simulated create
-//! leaves an orphan step, and `steps_job_id_fkey` then aborts the
-//! whole jobs rebuild — a failure this path has already had once.
+//! Why any of this exists: a lap rolled mid-session and took an entire
+//! day's feedback corpus, filed by a real user, with it. Nothing
+//! failed and nothing was logged; the Jobs were simply gone the next
+//! time the board was read.
 
 #![cfg(feature = "postgres")]
 
 use boss_jobs::postgres::trim_epoch_audit_log;
 use boss_testing::TestDb;
 
-/// Insert an audit row directly. The append-only trigger rejects
-/// UPDATE/DELETE, not INSERT, so seeding this way is fine.
-async fn seed(db: &TestDb, kind: &str, payload: serde_json::Value) -> i64 {
+async fn seed_event(db: &TestDb, kind: &str, payload: serde_json::Value) -> i64 {
     sqlx::query_scalar(
         "INSERT INTO audit_log (event_id, kind, source, timestamp, payload)
          VALUES (gen_random_uuid(), $1, 'test', now(), $2)
@@ -44,12 +37,29 @@ async fn seed(db: &TestDb, kind: &str, payload: serde_json::Value) -> i64 {
     .expect("seed audit row")
 }
 
-/// An event belonging to `job`, from the simulator or from a person.
-async fn job_event(db: &TestDb, job: &str, simulated: bool, key: &str) -> i64 {
-    seed(
+async fn seed_job(db: &TestDb, id: &str, kind: &str, simulated: bool) {
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, job_kind_version, subject_kind, subject_id, title,
+                           owner_id, status, priority, opened_on, simulated)
+         VALUES ($1::uuid, $2, 1, 'custom', '/x', 'T', 'emp-1', 'open', 'standard',
+                 '2025-06-01', $3)",
+    )
+    .bind(id)
+    .bind(kind)
+    .bind(simulated)
+    .execute(&db.pool)
+    .await
+    .expect("seed job");
+}
+
+/// An event on `job`. The `_simulated` marker on the event is
+/// deliberately WRONG in several tests — the Job decides, not the
+/// event.
+async fn job_event(db: &TestDb, job: &str, event_says: bool) -> i64 {
+    seed_event(
         db,
         "jobs.step.completed",
-        serde_json::json!({ key: job, "_simulated": simulated }),
+        serde_json::json!({ "job_id": job, "_simulated": event_says }),
     )
     .await
 }
@@ -62,99 +72,133 @@ async fn surviving(db: &TestDb) -> Vec<i64> {
 }
 
 #[tokio::test]
-async fn simulated_work_goes_and_real_work_stays() {
+async fn a_simulated_job_goes_and_a_real_one_stays() {
     let db = TestDb::new().await;
-    let baseline = seed(&db, "seed.marker", serde_json::json!({})).await;
+    let baseline = seed_event(&db, "seed.marker", serde_json::json!({})).await;
 
     let feedback = "11111111-1111-1111-1111-111111111111";
     let brew = "22222222-2222-2222-2222-222222222222";
+    seed_job(&db, feedback, "user-feedback", false).await;
+    seed_job(&db, brew, "morning-brew", true).await;
 
-    let human_created = seed(
+    let real_created = seed_event(
         &db,
         "jobs.job.created",
         serde_json::json!({ "id": feedback, "_simulated": false }),
     )
     .await;
-    let human_step = job_event(&db, feedback, false, "job_id").await;
-    let sim_created = seed(
+    let real_step = job_event(&db, feedback, false).await;
+    let sim_created = seed_event(
         &db,
         "jobs.job.created",
         serde_json::json!({ "id": brew, "_simulated": true }),
     )
     .await;
-    let sim_step = job_event(&db, brew, true, "job_id").await;
+    let sim_step = job_event(&db, brew, true).await;
 
     let trimmed = trim_epoch_audit_log(&db.pool, baseline)
         .await
         .expect("trim");
-    assert_eq!(trimmed, 2, "exactly the simulator's two rows");
+    assert_eq!(trimmed, 2);
 
     let left = surviving(&db).await;
-    assert!(
-        left.contains(&baseline),
-        "the seed baseline is never touched"
-    );
-    assert!(left.contains(&human_created) && left.contains(&human_step));
+    assert!(left.contains(&baseline));
+    assert!(left.contains(&real_created) && left.contains(&real_step));
     assert!(!left.contains(&sim_created) && !left.contains(&sim_step));
 }
 
-/// The orphan-step trap. A person acting on a simulated Job makes that
-/// Job's history mixed — and deleting half of it aborts the rebuild.
+/// The whole point of the simplification. A person completing a step
+/// on a simulated Job does NOT rescue it — and crucially, does not
+/// leave half a Job behind, which is what orphans steps and aborts the
+/// rebuild.
 #[tokio::test]
-async fn a_job_a_person_touched_survives_whole() {
+async fn a_person_acting_on_a_simulated_job_does_not_make_it_real() {
     let db = TestDb::new().await;
-    let baseline = seed(&db, "seed.marker", serde_json::json!({})).await;
+    let baseline = seed_event(&db, "seed.marker", serde_json::json!({})).await;
 
-    let job = "33333333-3333-3333-3333-333333333333";
-    // The simulator opened it and did most of the work…
-    let created = seed(
+    let brew = "33333333-3333-3333-3333-333333333333";
+    seed_job(&db, brew, "morning-brew", true).await;
+
+    let created = seed_event(
         &db,
         "jobs.job.created",
-        serde_json::json!({ "id": job, "_simulated": true }),
+        serde_json::json!({ "id": brew, "_simulated": true }),
     )
     .await;
-    let sim_a = job_event(&db, job, true, "job_id").await;
-    let sim_b = job_event(&db, job, true, "job_id").await;
-    // …then a person completed a step on it.
-    let human = job_event(&db, job, false, "job_id").await;
+    let by_sim = job_event(&db, brew, true).await;
+    // A real operator worked this simulated Job — the event honestly
+    // records that it came from a person.
+    let by_person = job_event(&db, brew, false).await;
 
     let trimmed = trim_epoch_audit_log(&db.pool, baseline)
         .await
         .expect("trim");
-    assert_eq!(trimmed, 0, "one human event preserves the whole Job");
+    assert_eq!(trimmed, 3, "the Job's whole history shares one fate");
 
     let left = surviving(&db).await;
-    for (id, what) in [
-        (created, "the create event"),
-        (sim_a, "a simulated step"),
-        (sim_b, "another simulated step"),
-        (human, "the human's step"),
-    ] {
+    for id in [created, by_sim, by_person] {
         assert!(
-            left.contains(&id),
-            "{what} must survive: deleting part of a mixed-origin Job orphans steps \
-             and aborts the jobs rebuild on steps_job_id_fkey"
+            !left.contains(&id),
+            "every row of a simulated Job goes together — a partial delete is what \
+             orphans steps and aborts the jobs rebuild"
         );
     }
+    assert!(left.contains(&baseline));
 }
 
-/// Absence is treated as real. The conservative direction for a DELETE
-/// is to keep, and every publisher stamps the field — so an unflagged
-/// row above the baseline is a bug to notice, not data to destroy.
+/// The mirror: a simulated ACTOR touching a real Job cannot delete it.
+/// The dispatcher assigns and completes steps on Jobs a person opened,
+/// and those rows must not disappear underneath the Job.
 #[tokio::test]
-async fn an_unflagged_event_is_kept() {
+async fn automation_acting_on_a_real_job_does_not_make_it_simulated() {
     let db = TestDb::new().await;
-    let baseline = seed(&db, "seed.marker", serde_json::json!({})).await;
-    let unflagged = seed(
+    let baseline = seed_event(&db, "seed.marker", serde_json::json!({})).await;
+
+    let feedback = "44444444-4444-4444-4444-444444444444";
+    seed_job(&db, feedback, "user-feedback", false).await;
+
+    let created = seed_event(
         &db,
-        "assets.asset.installed",
-        serde_json::json!({ "id": "asset-1" }),
+        "jobs.job.created",
+        serde_json::json!({ "id": feedback, "_simulated": false }),
     )
     .await;
-    let simulated = seed(
+    // The event claims simulated; the Job says otherwise and wins.
+    let by_automation = job_event(&db, feedback, true).await;
+
+    let trimmed = trim_epoch_audit_log(&db.pool, baseline)
+        .await
+        .expect("trim");
+    assert_eq!(trimmed, 0);
+
+    let left = surviving(&db).await;
+    assert!(left.contains(&created) && left.contains(&by_automation));
+}
+
+/// Events with no Job — ledger postings, asset receipts — are not
+/// Job-scoped, so they fall back to their own marker. Absence still
+/// means keep: the conservative direction for a DELETE is to keep.
+#[tokio::test]
+async fn jobless_events_fall_back_to_their_own_marker() {
+    let db = TestDb::new().await;
+    let baseline = seed_event(&db, "seed.marker", serde_json::json!({})).await;
+
+    let sim = seed_event(
         &db,
-        "assets.asset.installed",
-        serde_json::json!({ "id": "asset-2", "_simulated": true }),
+        "ledger.entry.posted",
+        serde_json::json!({ "id": "je-1", "_simulated": true }),
+    )
+    .await;
+    let real = seed_event(
+        &db,
+        "ledger.entry.posted",
+        serde_json::json!({ "id": "je-2", "_simulated": false }),
+    )
+    .await;
+    let unflagged = seed_event(
+        &db,
+        "assets.asset.received",
+        serde_json::json!({ "id": "asset-1" }),
     )
     .await;
 
@@ -163,38 +207,30 @@ async fn an_unflagged_event_is_kept() {
         .expect("trim");
 
     let left = surviving(&db).await;
+    assert!(!left.contains(&sim));
+    assert!(left.contains(&real));
     assert!(
         left.contains(&unflagged),
         "unflagged is kept, not destroyed"
     );
-    assert!(!left.contains(&simulated));
 }
 
-/// Nothing at or below the baseline is ever touched, however it is
-/// marked — that is the seed the new epoch replays from.
 #[tokio::test]
 async fn the_baseline_is_untouchable() {
     let db = TestDb::new().await;
-    let seed_row = seed(
-        &db,
-        "jobs.job.created",
-        serde_json::json!({ "id": "seeded", "_simulated": true }),
-    )
-    .await;
-    let baseline = seed(&db, "seed.marker", serde_json::json!({})).await;
-    let after = seed(
-        &db,
-        "jobs.job.created",
-        serde_json::json!({ "id": "later", "_simulated": true }),
-    )
-    .await;
+    let brew = "55555555-5555-5555-5555-555555555555";
+    seed_job(&db, brew, "morning-brew", true).await;
+
+    let before = job_event(&db, brew, true).await;
+    let baseline = seed_event(&db, "seed.marker", serde_json::json!({})).await;
+    let after = job_event(&db, brew, true).await;
 
     trim_epoch_audit_log(&db.pool, baseline)
         .await
         .expect("trim");
 
     let left = surviving(&db).await;
-    assert!(left.contains(&seed_row), "below the baseline is seed data");
+    assert!(left.contains(&before), "below the baseline is seed data");
     assert!(left.contains(&baseline));
     assert!(!left.contains(&after));
 }

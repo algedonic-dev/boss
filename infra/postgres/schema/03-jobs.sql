@@ -154,6 +154,23 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS job_kind_version INT NOT NULL DEFAULT 
 CREATE INDEX IF NOT EXISTS jobs_kind_version ON jobs (kind, job_kind_version);
 
 
+-- Whether this Job belongs to the simulated company. Decided ONCE, at
+-- creation, from the origin of the request that opened it — and then
+-- immutable. A real operator can click around a simulated Job all day
+-- without making it real: a fake brew order does not become a real one
+-- because somebody looked at it.
+--
+-- This is what the epoch restart trims on. Deciding per EVENT instead
+-- made a Job's history mixed, which meant the trim had to preserve any
+-- Job a human had touched or risk orphaning steps and aborting the
+-- rebuild. Carrying it on the Job removes that case rather than
+-- handling it.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS simulated BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- The trim's access pattern: every simulated Job, by id.
+CREATE INDEX IF NOT EXISTS jobs_simulated ON jobs (simulated) WHERE simulated;
+
+
 -- ---------------------------------------------------------------------------
 -- Step UX Plugin Registry — see docs/architecture-decisions.md
 -- (Step UX & frontend)

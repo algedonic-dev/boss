@@ -313,8 +313,8 @@ impl JobsRepository for PgJobs {
             r#"
             INSERT INTO jobs (id, kind, subject_kind, subject_id, title, owner_id,
                               status, priority, opened_on, due_on, closed_on, metadata, tags,
-                              job_kind_version, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)
+                              job_kind_version, created_at, updated_at, simulated)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15, $16)
             ON CONFLICT (id) DO NOTHING
             "#,
         )
@@ -333,6 +333,11 @@ impl JobsRepository for PgJobs {
         .bind(&job.tags)
         .bind(job.job_kind_version)
         .bind(now)
+        // Decided once, here, from the origin of the request that
+        // opened the Job — and never revisited. Everything downstream
+        // (steps, side effects, an operator poking at it later) is
+        // simulated iff the Job is.
+        .bind(boss_core::sim_origin::is_in_sim_chain())
         .execute(&mut *tx)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -1242,59 +1247,37 @@ pub async fn trim_epoch_audit_log(pool: &PgPool, baseline: i64) -> Result<u64, J
         .execute(&mut *tx)
         .await
         .map_err(|e| JobsError::Storage(format!("disable trigger: {e}")))?;
-    // Delete what the SIMULATOR did; keep what people did.
+    // Delete the simulated company; keep the real one.
     //
-    // `_simulated` is stamped from the event's origin — the request
-    // carried `x-sim-origin`, or the dispatcher inherited it from the
-    // event it was reacting to — so it answers exactly the question
-    // this trim needs: was this activity synthetic. It replaces an
-    // earlier exemption for three hardcoded platform kinds, which was
-    // a closed list that could only ever be right by accident (a
-    // tenant Job a human worked was still destroyed).
+    // Sim-ness is a property of the JOB, decided from the origin of the
+    // request that opened it and immutable thereafter. Everything
+    // associated with a simulated Job is simulated — including a real
+    // operator clicking around one. A fake brew order does not become
+    // real because somebody looked at it.
     //
-    // Absence is treated as real. The conservative direction for a
-    // DELETE is to keep, and every publisher stamps the field, so an
-    // unflagged row above the baseline is a bug worth noticing rather
-    // than data worth destroying.
+    // That framing is what makes this simple. Deciding per EVENT gave a
+    // Job a mixed history, which forced the trim to preserve any Job a
+    // human had touched or risk orphaning steps and aborting the
+    // rebuild on `steps_job_id_fkey`. Carrying the bit on the Job
+    // removes the case instead of handling it: a Job's rows all share
+    // one fate, so no partial deletion is possible.
     //
-    // The second clause is the one that stops a rebuild aborting. A
-    // Job's events do not share an origin: a person can complete a
-    // step on a Job the simulator created. Deleting the simulated
-    // create while keeping the human's step event leaves an orphan
-    // step, and `steps_job_id_fkey` then fails the whole jobs rebuild
-    // — a failure this reset path has had before. So a Job that ANY
-    // real event touches is preserved whole.
-    // Materialize the human-touched Job set into an indexed temp table
-    // and anti-join against it, rather than a correlated `NOT IN`.
-    // Shape matters at this size: the `NOT IN` form did not finish in
-    // ten minutes against a 10M-row log, and this runs inside the
-    // transaction that blocks the epoch restart. The set itself is
-    // tiny — only Jobs a person touched — so the join is cheap once
-    // it exists.
-    sqlx::query(
-        "CREATE TEMP TABLE _human_touched_jobs ON COMMIT DROP AS
-         SELECT DISTINCT COALESCE(payload->>'job_id', payload->>'id') AS job_id
-           FROM audit_log
-          WHERE id > $1
-            AND payload->>'_simulated' IS DISTINCT FROM 'true'
-            AND COALESCE(payload->>'job_id', payload->>'id') IS NOT NULL",
-    )
-    .bind(baseline)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| JobsError::Storage(format!("collect human-touched jobs: {e}")))?;
-    sqlx::query("CREATE INDEX ON _human_touched_jobs (job_id)")
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| JobsError::Storage(format!("index human-touched jobs: {e}")))?;
-
+    // Events with no Job fall back to their own marker — ledger
+    // postings, asset receipts and the like are not Job-scoped, and
+    // absence still means keep, because the conservative direction for
+    // a DELETE is to keep.
     let trimmed = sqlx::query(
         "DELETE FROM audit_log a
           WHERE a.id > $1
-            AND a.payload->>'_simulated' = 'true'
-            AND NOT EXISTS (
-                    SELECT 1 FROM _human_touched_jobs h
-                     WHERE h.job_id = COALESCE(a.payload->>'job_id', a.payload->>'id'))",
+            AND CASE
+                  WHEN COALESCE(a.payload->>'job_id', a.payload->>'id') IN
+                       (SELECT id::text FROM jobs)
+                  THEN EXISTS (
+                       SELECT 1 FROM jobs j
+                        WHERE j.id::text = COALESCE(a.payload->>'job_id', a.payload->>'id')
+                          AND j.simulated)
+                  ELSE a.payload->>'_simulated' = 'true'
+                END",
     )
     .bind(baseline)
     .execute(&mut *tx)
