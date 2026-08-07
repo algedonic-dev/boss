@@ -442,13 +442,41 @@ fn user_feedback_spec() -> JobKindSpec {
             // read is worse than no feedback mechanism, because the
             // audit trail says it was handled.
             authority_role: Some("platform-admin".into()),
-            fields: vec![boss_core::job::StepField {
-                name: "disposition".into(),
-                field_type: DISPOSITIONS.into(),
-                // Required at done: there is no such thing as
-                // completing triage without deciding where it goes.
-                required: true,
-            }],
+            fields: vec![
+                boss_core::job::StepField {
+                    name: "disposition".into(),
+                    field_type: DISPOSITIONS.into(),
+                    // Required at done: there is no such thing as
+                    // completing triage without deciding where it goes.
+                    required: true,
+                },
+                // What triage FOUND, as opposed to where it routed.
+                //
+                // The board recorded that an agent had been asked and
+                // never what it came back with, so a diagnosed item and
+                // an untouched one looked identical — three items sat
+                // in "waiting" for a whole session with their causes
+                // known and their fixes shipped.
+                //
+                // Free text, because that is what eight hand-processed
+                // items actually produced: a root cause (a claim about
+                // the code the feedback text never mentions) and what
+                // was done about it. Never a structured verdict. A
+                // schema here would have been invented rather than
+                // observed.
+                //
+                // Optional: a finding is evidence, and triage can
+                // legitimately route something obvious without one.
+                // Declared on the step rather than kept as loose
+                // metadata so it is self-describing — the generic step
+                // surface renders it from the contract, with no second
+                // place teaching a UI about feedback.
+                boss_core::job::StepField {
+                    name: "finding".into(),
+                    field_type: "string".into(),
+                    required: false,
+                },
+            ],
             ..Default::default()
         },
         branch("investigate", "Reproduce and investigate", "reproduce"),

@@ -39,7 +39,10 @@ const KIND = {
       kind: 'task',
       ready_when: 'steps.submitted.done',
       title_template: 'Triage feedback',
-      fields: [{ name: 'disposition', field_type: DISPOSITIONS, required: true }],
+      fields: [
+        { name: 'disposition', field_type: DISPOSITIONS, required: true },
+        { name: 'finding', field_type: 'string', required: false },
+      ],
     },
     ...[
       ['investigate', 'reproduce', 'Reproduce and investigate'],
@@ -81,7 +84,10 @@ function job(
         // make the fixture lie about what the board keys on.
         kind: triage.kind ?? 'task',
         status: triage.status,
-        fields: [{ name: 'disposition', field_type: DISPOSITIONS, required: true }],
+        fields: [
+        { name: 'disposition', field_type: DISPOSITIONS, required: true },
+        { name: 'finding', field_type: 'string', required: false },
+      ],
         metadata: { authority_role: 'platform-admin', ...(triage.metadata ?? {}) },
       },
       { id: `${id}-o`, kind: 'outcome', status: 'pending', fields: [], metadata: {} },
@@ -277,6 +283,84 @@ test.describe('feedback triage board', () => {
     const sent = body as unknown as { status: string; metadata: Record<string, unknown> };
     expect(sent.status).toBe('completed');
     expect(sent.metadata['disposition']).toBe('decline');
+  });
+
+  // A card whose cause is known must not look like an untouched one.
+  // That is not cosmetic: three diagnosed items with shipped fixes sat
+  // in "waiting" for an entire session because the board could only
+  // record that an agent had been ASKED, never what it came back with.
+  test('a recorded finding shows on the card', async ({ page }) => {
+    const withFinding = [
+      job('fb-found', 'Button is unreadable', {
+        status: 'ready',
+        metadata: {
+          finding: 'color: inherit on a bar that sets none — 1.06:1 in light theme.',
+          finding_by: 'emp-bootstrap-admin',
+        },
+      }),
+    ];
+    await page.route(/\/api\/jobs\?kind=user-feedback/, (r) =>
+      r.fulfill({ json: { data: withFinding, total: 1 } }),
+    );
+    await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
+
+    const card = page.locator('article', { hasText: 'Button is unreadable' });
+    await expect(card).toContainText('color: inherit on a bar that sets none');
+    // Evidence without an author is a rumour.
+    await expect(card).toContainText(/found by emp-bootstrap-admin/i);
+  });
+
+  test('recording a finding writes it with provenance, and decides nothing', async ({
+    page,
+  }) => {
+    let body: Record<string, unknown> | null = null;
+    await page.route(/\/api\/jobs\/[^/]+\/steps\/[^/]+$/, async (route) => {
+      if (route.request().method() !== 'PUT') return route.fallback();
+      body = route.request().postDataJSON() as Record<string, unknown>;
+      return route.fulfill({ json: {} });
+    });
+
+    await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
+    const card = page.locator('article', { hasText: 'Column picker forgets my choice' });
+    await card.getByRole('button', { name: /record finding/i }).click();
+    await card.getByLabel(/what did you find/i).fill('Root cause: the picker never persists.');
+    await card.getByRole('button', { name: /save finding/i }).click();
+
+    await expect.poll(() => body !== null).toBe(true);
+    const sent = body as unknown as { metadata: Record<string, unknown> };
+    expect(sent.metadata['finding']).toContain('never persists');
+    expect(sent.metadata['finding_by']).toBeTruthy();
+    // Finding something is not deciding what to do about it — the item
+    // stays in triage until somebody routes it.
+    expect(body).not.toHaveProperty('status');
+    expect(sent.metadata['disposition']).toBeUndefined();
+    // The gate that keeps the step findable must survive.
+    expect(sent.metadata['authority_role']).toBe('platform-admin');
+  });
+
+  // The finding is evidence for the routing decision, so it has to
+  // outlive it — otherwise the reason a card went where it went is
+  // gone the moment it gets there.
+  test('a finding survives routing and shows on the routed card', async ({ page }) => {
+    const routed = [
+      job('fb-routed-found', 'Needs a design call', {
+        status: 'completed',
+        metadata: {
+          disposition: 'design',
+          finding: 'Generalises past feedback — this is the shape of every triage queue.',
+          finding_by: 'automation:triage-agent',
+        },
+      }),
+    ];
+    await page.route(/\/api\/jobs\?kind=user-feedback/, (r) =>
+      r.fulfill({ json: { data: routed, total: 1 } }),
+    );
+    await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });
+
+    const column = page.locator('section[aria-label="Decide the design"]');
+    await expect(column).toContainText('Generalises past feedback');
+    // An agent-written finding renders exactly like a human one.
+    await expect(column).toContainText(/found by automation:triage-agent/i);
   });
 
   test('handing to an agent records a durable request without deciding', async ({ page }) => {

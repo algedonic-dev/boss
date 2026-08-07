@@ -264,6 +264,52 @@
   const recall = (j: Job) =>
     patchStep(j, {}, { agent_requested_at: null, agent_requested_by: null });
 
+  // ---- findings ----------------------------------------------------
+  //
+  // What triage FOUND, as opposed to where it routed it. The board used
+  // to record only that an agent had been ASKED, so a diagnosed item
+  // and an untouched one looked identical — three items sat here for a
+  // whole session with their causes known and their fixes shipped.
+  //
+  // Written to the same step metadata as the hand-off record, and in
+  // the same shape an automatic agent would write later. That symmetry
+  // is the point: the surface does not care whether a person or an
+  // agent filled it in.
+
+  let draft = $state<Record<string, string>>({});
+  let editing = $state<Record<string, boolean>>({});
+
+  function finding(j: Job): string | null {
+    const v = forkStep(j)?.metadata?.['finding'];
+    return typeof v === 'string' && v.trim() !== '' ? v : null;
+  }
+  function findingBy(j: Job): string | null {
+    const v = forkStep(j)?.metadata?.['finding_by'];
+    return typeof v === 'string' ? v : null;
+  }
+
+  async function saveFinding(j: Job): Promise<void> {
+    const text = (draft[j.id] ?? '').trim();
+    if (text === '') return;
+    await patchStep(
+      j,
+      {},
+      {
+        finding: text,
+        // Provenance: a finding is evidence, and evidence without an
+        // author is a rumour.
+        finding_by: me || 'anonymous',
+        finding_at: new Date().toISOString(),
+      },
+    );
+    editing = { ...editing, [j.id]: false };
+  }
+
+  function startEditing(j: Job): void {
+    draft = { ...draft, [j.id]: finding(j) ?? '' };
+    editing = { ...editing, [j.id]: true };
+  }
+
   // ---- dragging ----------------------------------------------------
   //
   // Dragging a card is the same act as picking a route from the menu —
@@ -373,11 +419,48 @@
               <span class="tb-by">{j.owner_id || 'unassigned'}</span>
             </div>
 
+            <!-- The finding renders on EVERY card, routed or not. A
+                 card whose cause is known should not look like an
+                 untouched one, which is exactly how three diagnosed
+                 items sat in "waiting" for a session. -->
+            {#if finding(j) && !editing[j.id]}
+              <div class="tb-finding">
+                <p class="tb-finding-text">{finding(j)}</p>
+                {#if findingBy(j)}
+                  <span class="tb-finding-by">found by {findingBy(j)}</span>
+                {/if}
+              </div>
+            {/if}
+
             {#if col.id === WAITING}
               {#if agentRequestedAt(j)}
                 <p class="tb-agent">
                   With an agent{#if agentRequestedBy(j)} — {agentRequestedBy(j)}{/if}
                 </p>
+              {/if}
+
+              {#if editing[j.id]}
+                <label class="tb-sr" for={`finding-${j.id}`}>What did you find?</label>
+                <textarea
+                  id={`finding-${j.id}`}
+                  class="tb-finding-input"
+                  rows="3"
+                  placeholder="What is actually causing this?"
+                  bind:value={draft[j.id]}
+                ></textarea>
+                <div class="tb-actions">
+                  <button
+                    class="tb-btn tb-btn-primary"
+                    type="button"
+                    disabled={busy[j.id] || !(draft[j.id] ?? '').trim()}
+                    onclick={() => saveFinding(j)}>Save finding</button
+                  >
+                  <button
+                    class="tb-btn"
+                    type="button"
+                    onclick={() => (editing = { ...editing, [j.id]: false })}>Cancel</button
+                  >
+                </div>
               {/if}
 
               <div class="tb-actions">
@@ -421,6 +504,11 @@
                     type="button"
                     disabled={busy[j.id]}
                     onclick={() => handToAgent(j)}>Hand to agent</button
+                  >
+                {/if}
+                {#if !editing[j.id]}
+                  <button class="tb-btn" type="button" onclick={() => startEditing(j)}
+                    >{finding(j) ? 'Edit finding' : 'Record finding'}</button
                   >
                 {/if}
               </div>
@@ -547,6 +635,33 @@
   }
   .tb-by {
     margin-left: auto;
+  }
+  .tb-finding {
+    border-left: 2px solid #0f766e;
+    padding-left: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .tb-finding-text {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+  }
+  .tb-finding-by {
+    font-size: 10px;
+    color: var(--text-dim, #a8a29e);
+  }
+  .tb-finding-input {
+    font: inherit;
+    font-size: 12px;
+    padding: 6px;
+    border: 1px solid var(--border, #e7e5e4);
+    border-radius: 4px;
+    resize: vertical;
+    width: 100%;
+    box-sizing: border-box;
   }
   .tb-agent {
     margin: 0;
