@@ -39,7 +39,7 @@ const LEGACY_MODEL_ROUTES: ReadonlyArray<string> = [
   'system-model', 'system-monitoring', 'system-step-plugins', 'system-dispatcher',
   'system-subjects', 'system-dispatcher-rules', 'system-dispatcher-rule',
   'system-kb', 'system-design', 'system-experiments', 'policy',
-  // One entry, not two. `job-kinds` (the authoring row, already
+  // One entry, not two. `workflows` (the authoring row, already
   // dropped from the sidebar) and `workflows` (the catalog) were
   // separate keys pointing at the same path; the rename collapsed
   // them, which is what surfaced the redundancy.

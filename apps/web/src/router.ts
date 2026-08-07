@@ -133,8 +133,8 @@ export function parseRoute(pathname: string): Route {
     if (p === '/workflows') return { kind: 'workflows' };
     if (p === '/auth-admin') return { kind: 'authAdmin' };
     if (p === '/workflows/new') return { kind: 'workflowNew' };
-    // The admin index. Was `/system/job-kinds` before the rename;
-    // it and the catalog collapsed onto one path when `job-kinds`
+    // The admin index. Was `/system/workflows` before the rename;
+    // it and the catalog collapsed onto one path when `workflows`
     // became `workflows`, and they are two different surfaces.
     if (p === '/workflows/authoring') return { kind: 'workflowsAdmin' };
     const jkDesignM = p.match(/^\/workflows\/authoring\/(.+)$/);

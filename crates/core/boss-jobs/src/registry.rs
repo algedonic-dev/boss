@@ -1532,7 +1532,8 @@ pub trait WorkflowRegistry: Send + Sync {
     async fn get_version(&self, kind: &str, version: i32) -> Result<WorkflowSpec, WorkflowError>;
 
     /// List every active spec, optionally filtered by category.
-    async fn list_active(&self, category: Option<&str>) -> Result<Vec<WorkflowSpec>, WorkflowError>;
+    async fn list_active(&self, category: Option<&str>)
+    -> Result<Vec<WorkflowSpec>, WorkflowError>;
 
     /// Every version of a single kind, oldest first. Includes drafts
     /// and retired rows.
@@ -1747,7 +1748,10 @@ impl WorkflowRegistry for InMemoryWorkflows {
             .ok_or_else(|| WorkflowError::NotFound(format!("{kind}@v{version}")))
     }
 
-    async fn list_active(&self, category: Option<&str>) -> Result<Vec<WorkflowSpec>, WorkflowError> {
+    async fn list_active(
+        &self,
+        category: Option<&str>,
+    ) -> Result<Vec<WorkflowSpec>, WorkflowError> {
         let mut rows: Vec<WorkflowSpec> = self
             .snapshot()
             .into_iter()
@@ -2018,7 +2022,11 @@ mod pg {
                 .ok_or_else(|| WorkflowError::NotFound(format!("no active kind: {kind}")))
         }
 
-        async fn get_version(&self, kind: &str, version: i32) -> Result<WorkflowSpec, WorkflowError> {
+        async fn get_version(
+            &self,
+            kind: &str,
+            version: i32,
+        ) -> Result<WorkflowSpec, WorkflowError> {
             let row: Option<Row> = sqlx::query_as(
                 "SELECT kind, version, status, label, description, category,
                         subject_kinds, steps, metadata_schema, entitlements, metadata,
@@ -2087,7 +2095,10 @@ mod pg {
             rows.into_iter().map(row_to_spec).collect()
         }
 
-        async fn create_draft(&self, mut spec: WorkflowSpec) -> Result<WorkflowSpec, WorkflowError> {
+        async fn create_draft(
+            &self,
+            mut spec: WorkflowSpec,
+        ) -> Result<WorkflowSpec, WorkflowError> {
             let mut tx = self
                 .pool
                 .begin()
@@ -3674,8 +3685,8 @@ mod tests {
 
     #[test]
     fn platform_workflows_passes_validate_all() {
-        use crate::workflow_lint::validate_all;
         use crate::step_registry::StepRegistry;
+        use crate::workflow_lint::validate_all;
 
         let kinds = platform_workflows();
         let registry = StepRegistry::v1();

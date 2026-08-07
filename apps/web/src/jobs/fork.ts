@@ -1,4 +1,4 @@
-// Reading a queue's fork out of the JobKind registry, and finding the
+// Reading a queue's fork out of the Workflow registry, and finding the
 // step that carries it on a given Job.
 //
 // This lives in one module because it has already drifted once. The
@@ -10,7 +10,7 @@
 //
 // Everything here derives from registry data. Nothing hardcodes a
 // disposition, a step kind, or a field name: add a disposition to the
-// JobKind and the callers pick it up with no change.
+// Workflow and the callers pick it up with no change.
 
 import type { Job, Step } from './types';
 
@@ -59,7 +59,7 @@ export function disposition(j: Job, fork: Fork | null): string | null {
   return typeof v === 'string' && v.length > 0 ? v : null;
 }
 
-/// Read the queue's fork out of the JobKind registry: the step with a
+/// Read the queue's fork out of the Workflow registry: the step with a
 /// required pipe-shaped field is the fork, its values are the
 /// dispositions, and each successor's `title_template` is that route's
 /// human name. Deriving the label from the successor rather than

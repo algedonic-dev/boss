@@ -761,22 +761,22 @@ mod routing_tests {
 
     #[tokio::test]
     async fn unmatched_api_path_is_a_json_404() {
-        // A path that looks right and is not. `/api/job-kinds` is the
+        // A path that looks right and is not. `/api/workflows` is the
         // pre-rename spelling of `/api/workflows`, so it is exactly
         // what a stale client or a habit types — and it must miss
         // loudly rather than be answered with the SPA.
         //
-        // The probe used to BE `/api/job-kinds`, chosen for the same
-        // reason when the real route was `/api/jobs/kinds`. The
+        // The probe used to BE `/api/workflows`, chosen for the same
+        // reason when the real route was `/api/workflows`. The
         // rename turned the deliberately-wrong path into the correct
         // one and the test asserted a 404 on a live route; a probe
         // for "this must not resolve" has to be re-chosen whenever
         // the thing it was avoiding moves.
-        let (status, body) = get(app(), "/api/job-kinds").await;
+        let (status, body) = get(app(), "/api/workflows").await;
         assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
         assert!(body.contains(MISS), "body: {body}");
         assert!(
-            body.contains("/api/job-kinds"),
+            body.contains("/api/workflows"),
             "the 404 should name the path that missed: {body}"
         );
         assert!(

@@ -279,7 +279,7 @@ impl crate::flow::FlowRepo for PgViewsRepo {
         // of `event_facts`, because `event_facts` keeps only
         // `occurred_at` and drops the wall clock entirely.
         //
-        // Which kinds count comes from the registry: a JobKind naming
+        // Which kinds count comes from the registry: a Workflow naming
         // one of `owner_roles` as its owner is this team's work. No
         // list of kinds lives in code (CLAUDE.md §9), and a Job with
         // no declared owner never enters — which is what keeps 85
@@ -294,7 +294,7 @@ impl crate::flow::FlowRepo for PgViewsRepo {
         )> = sqlx::query_as(
             "WITH team_kinds AS (
                      SELECT DISTINCT k.kind, k.metadata->>'owner_role' AS owner_role
-                     FROM job_kinds k
+                     FROM workflows k
                      WHERE k.metadata->>'owner_role' = ANY($1)
                  ),
                  filed AS (

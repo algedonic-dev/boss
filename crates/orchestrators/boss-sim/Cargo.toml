@@ -39,7 +39,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Brewery / UDS batch dev-deps retired 2026-05-06 alongside the
 # BatchEngine rip (TODO.md "Strip BatchEngine"). The brewery_e2e
 # integration test that wired `[batch.*]` tenant.toml rows is
-# being rewritten to use the `[periodic.*]` + JobKind path that
+# being rewritten to use the `[periodic.*]` + Workflow path that
 # replaces it.
 
 [lints]

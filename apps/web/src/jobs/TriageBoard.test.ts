@@ -67,7 +67,7 @@ describe('the fork rule', () => {
     expect(forkSource).not.toMatch(/\b(s|step|st)\.kind\s*===\s*['"]/);
   });
 
-  test('names no specific JobKind or disposition', () => {
+  test('names no specific Workflow or disposition', () => {
     // Every value it works on comes from the registry. A literal here
     // would mean adding a disposition needs a code change.
     const forkCode = forkSource
