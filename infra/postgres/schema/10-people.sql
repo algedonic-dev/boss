@@ -176,3 +176,16 @@ CREATE TABLE IF NOT EXISTS webauthn_challenges (
   expires_at      TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '5 minutes'
 );
 
+
+-- ---------------------------------------------------------------------------
+-- Subject edges: an employee's own lifecycle.
+--
+-- Every employee is a Subject, but the events that CREATE and update
+-- one named no Subject, so 815 rows sat unlinked and an employee's
+-- history began at whatever first referenced them. The payload carries
+-- the employee id at the top level as `id`.
+-- ---------------------------------------------------------------------------
+INSERT INTO subject_edges (source_kind, field_path, target_kind) VALUES
+    ('people.employee.created', 'id', 'employee'),
+    ('people.employee.updated', 'id', 'employee')
+ON CONFLICT (source_kind, field_path) DO NOTHING;

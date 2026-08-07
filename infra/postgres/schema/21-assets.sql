@@ -147,9 +147,17 @@ CREATE INDEX IF NOT EXISTS asset_accessories_installed
 
 
 -- ---------------------------------------------------------------------------
--- Subject edges (R2 PR2): the asset events' subject references. The
--- AssetEvent payload nests its variant fields under "kind" (the
--- internally-tagged AssetEventKind), so every path here is dotted.
+-- Subject edges (R2 PR2): the asset events' subject references.
+--
+-- Paths are TOP-LEVEL. `AssetEvent` declares `#[serde(flatten)] kind:
+-- AssetEventKind`, so the variant's fields land beside `asset_id`
+-- rather than under a `kind` object — `kind` on the wire is just the
+-- tag string ("Installed"). These were originally authored as
+-- `kind.holder_id`, matching the Rust field name instead of the wire,
+-- and every one of them resolved to NULL: 170 `asset.installed`
+-- events sat unlinked with a rule that looked correct in the
+-- registry. The comment here asserted the nesting as fact and was
+-- never checked against a payload.
 --
 -- - Custody pair (Q5): shipped/installed carry the typed
 --   (holder_kind, holder_id) — the target kind is the event's own
@@ -159,9 +167,13 @@ CREATE INDEX IF NOT EXISTS asset_accessories_installed
 --   ownership_transferred names both sides. Fixed target kind.
 -- ---------------------------------------------------------------------------
 INSERT INTO subject_edges (source_kind, field_path, target_kind, target_kind_path) VALUES
-    ('asset.shipped',               'kind.holder_id',       NULL,      'kind.holder_kind'),
-    ('asset.installed',             'kind.holder_id',       NULL,      'kind.holder_kind'),
-    ('asset.sold',                  'kind.account_id',      'account', NULL),
-    ('asset.ownership_transferred', 'kind.from_account_id', 'account', NULL),
-    ('asset.ownership_transferred', 'kind.to_account_id',   'account', NULL)
+    ('asset.shipped',               'holder_id'      ,       NULL,      'holder_kind'),
+    ('asset.installed',             'holder_id'      ,       NULL,      'holder_kind'),
+    ('asset.sold',                  'account_id'      ,      'account', NULL),
+    ('asset.ownership_transferred', 'from_account_id', 'account', NULL),
+    ('asset.ownership_transferred', 'to_account_id'  ,   'account', NULL),
+    -- Receipt names the unit it received. 170 of these were unlinked
+    -- for want of a rule, so "what happened to this asset" skipped the
+    -- moment it entered the building.
+    ('asset.received',              'asset_id',            'asset',   NULL)
 ON CONFLICT (source_kind, field_path) DO NOTHING;

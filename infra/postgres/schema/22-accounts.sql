@@ -205,6 +205,12 @@ INSERT INTO subject_edges (source_kind, field_path, target_kind) VALUES
     ('commerce.invoice.created',      'account_id',  'account'),
     ('commerce.invoice.paid',         'account_id',  'account'),
     ('commerce.invoice.past_due',     'account_id',  'account'),
-    ('commerce.invoice.written_off',  'account_id',  'account')
+    ('commerce.invoice.written_off',  'account_id',  'account'),
+    -- The account's OWN lifecycle. Without these, an account Subject
+    -- had commerce history but no record of its own creation or team
+    -- assignment — the events that make it an account in the first
+    -- place were the ones missing from its history.
+    ('accounts.account.created',       'id',          'account'),
+    ('accounts.account.team-assigned', 'account_id',  'account')
 ON CONFLICT (source_kind, field_path) DO NOTHING;
 
