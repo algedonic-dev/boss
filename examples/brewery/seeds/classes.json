@@ -330,13 +330,6 @@
   },
   {
     "subject_kind": "employee",
-    "code": "it",
-    "display_name": "IT",
-    "member_attribute": "department",
-    "sort_order": 260
-  },
-  {
-    "subject_kind": "employee",
     "code": "audit",
     "display_name": "Audit",
     "member_attribute": "department",

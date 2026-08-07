@@ -135,9 +135,11 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
 /// somebody makes rather than an omission nobody notices.
 export const DEPARTMENT_APP: Readonly<Record<string, AppId>> = {
   // Runs the BOSS deployment itself, and the model that describes it.
-  platform: 'it',
+  // `platform` and `admin` used to appear here too. Both are gone as
+  // departments — `admin` folded into finance, and `platform` was
+  // renamed to `it`, because the people who run the deployment work in
+  // IT rather than in a department invented to hold them.
   it: 'it',
-  admin: 'it',
   // Reads everything, writes nothing — its work is the audit log and
   // the books, both of which live under IT's model surfaces.
   audit: 'it',
