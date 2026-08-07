@@ -609,13 +609,13 @@ mod tests {
         // which silently fails the "required at done" contract.
         //
         // Tenant-specific kinds live in per-tenant TOMLs, linted at
-        // load time by the seed_loader test. `platform_kinds()` carries
+        // load time by the seed_loader test. `platform_workflows()` carries
         // just `workflow-design`.
         let reg = StepRegistry::v1();
         let defined: std::collections::HashSet<&str> = reg.all().iter().map(|t| t.kind).collect();
 
         let mut missing: Vec<(String, String)> = Vec::new();
-        for spec in crate::registry::platform_kinds() {
+        for spec in crate::registry::platform_workflows() {
             for step in &spec.steps {
                 if !defined.contains(step.kind.as_str()) {
                     missing.push((spec.kind.clone(), step.kind.clone()));

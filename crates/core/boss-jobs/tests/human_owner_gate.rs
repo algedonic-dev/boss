@@ -207,7 +207,7 @@ async fn platform_meta_kinds_declare_a_resolvable_owner_role() {
     // design-Job create was rejected, no brewery kind ever
     // published, and the whole from-empty stack starved. The
     // platform meta-kinds must name a real role explicitly.
-    for spec in boss_jobs::registry::platform_kinds() {
+    for spec in boss_jobs::registry::platform_workflows() {
         let owner_role = spec.metadata.get("owner_role").and_then(|v| v.as_str());
         assert_eq!(
             owner_role,

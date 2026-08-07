@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
         ));
         let kind_registry: Arc<dyn boss_jobs::WorkflowRegistry> =
             Arc::new(boss_jobs::PgWorkflows::new(pool.clone()));
-        reconcile_platform_kinds(kind_registry.as_ref()).await;
+        reconcile_platform_workflows(kind_registry.as_ref()).await;
         let plugin_registry: Arc<dyn boss_jobs::StepPluginRegistry> =
             Arc::new(boss_jobs::PgStepPlugins::new(pool.clone()));
         let scheduling: Arc<dyn boss_jobs::scheduling::SchedulingRepository> =
@@ -195,7 +195,7 @@ async fn main() -> Result<()> {
         Arc::new(boss_jobs::InMemoryWorkflows::new());
     let plugin_registry: Arc<dyn boss_jobs::StepPluginRegistry> =
         Arc::new(boss_jobs::InMemoryStepPlugins::new());
-    reconcile_platform_kinds(kind_registry.as_ref()).await;
+    reconcile_platform_workflows(kind_registry.as_ref()).await;
     // No subjects table without Postgres — the in-memory spike path
     // skips the existence gate, same as before.
     let subject_existence: Option<Arc<dyn boss_jobs::subject_existence::SubjectExistenceCheck>> =
@@ -353,9 +353,9 @@ async fn run_server<R: JobsRepository + 'static>(
 /// short (just one kind in v1) so a missing default surfaces
 /// instantly: the next boot logs `inserted=1` if someone
 /// retired the meta-kind by hand.
-async fn reconcile_platform_kinds(registry: &dyn boss_jobs::WorkflowRegistry) {
-    use boss_jobs::registry::platform_kinds;
-    let defaults = platform_kinds();
+async fn reconcile_platform_workflows(registry: &dyn boss_jobs::WorkflowRegistry) {
+    use boss_jobs::registry::platform_workflows;
+    let defaults = platform_workflows();
     match registry.bootstrap_reconcile(&defaults).await {
         Ok(stats) => {
             info!(

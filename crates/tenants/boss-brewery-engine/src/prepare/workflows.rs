@@ -11,7 +11,7 @@
 //! Tenant kinds arrive with full provenance this way: audit_log
 //! captures the meta-Job that authored each, including author /
 //! approver / published-at. See
-//! `crates/boss-jobs/src/registry.rs::platform_kinds()` for the
+//! `crates/boss-jobs/src/registry.rs::platform_workflows()` for the
 //! meta-kind itself.
 //!
 //! Idempotent: if a `workflow-design` Job has already published a
@@ -93,7 +93,7 @@ pub fn publish_workflows(
         // Skip if already operator-published. The registry's
         // `created_by` discriminator is the source of truth: rows
         // landed via a Job have `created_by = "job-<uuid>"`,
-        // rows that came from `platform_kinds()` carry
+        // rows that came from `platform_workflows()` carry
         // `created_by = "bootstrap"`.
         match active_kind_provenance(&client, api_base, &headers, &spec.kind)? {
             Provenance::OperatorPublished if !force_republish => {
@@ -125,7 +125,7 @@ fn jobs_url(api_base: &str, path: &str) -> String {
 }
 
 /// Where the active row for `kind` came from. `Missing` means no
-/// row exists; `BootstrapOwned` is from `platform_kinds()`;
+/// row exists; `BootstrapOwned` is from `platform_workflows()`;
 /// `OperatorPublished` is from a real Job (or an admin PUT).
 enum Provenance {
     Missing,

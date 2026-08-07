@@ -24,7 +24,7 @@ pub mod rebuild;
 pub mod registry;
 pub mod scheduling;
 pub mod workflow_lint;
-// Platform Workflows live in `registry::platform_kinds()` (currently
+// Platform Workflows live in `registry::platform_workflows()` (currently
 // just `workflow-design`); tenant Workflows live in
 // `examples/<tenant>/seeds/workflows.toml` and load via `seed_loader`.
 // See docs/design/platform-vs-tenant-jobkinds.md.

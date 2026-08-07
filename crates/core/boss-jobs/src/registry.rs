@@ -495,6 +495,187 @@ fn ship_a_change_spec() -> WorkflowSpec {
     spec
 }
 
+/// Build the canonical `regenerate-deployment` WorkflowSpec.
+///
+/// A regen drops the database and rebuilds it: schema, seed, six
+/// months of backfilled history, then live. It is the highest-stakes
+/// routine operation the platform has — it destroys data on purpose,
+/// takes hours, and every step of it lived in one person's head and a
+/// shell script until now.
+///
+/// The Subject is the DEPLOYMENT (`custom`, id `/deployment/<name>`),
+/// so "what regens has this box had, and why" is a Subject-history
+/// question rather than something reconstructed from journald.
+///
+/// Every required field here is a thing that actually went wrong on
+/// 2026-08-07, which is the only defensible reason to make a person
+/// fill something in:
+///
+/// - `artifacts` exists because five separate stale-binary incidents
+///   happened that day — a library built instead of a binary, a
+///   binary that survived two build attempts, one copied over itself,
+///   seventeen seed binaries that would have written the old schema
+///   into the new database, and one whose mtime was NEWER than the
+///   source change it was missing. Verifying artifacts is the step
+///   everyone skips because the build said "Finished".
+/// - `reset.destroying` is required because "clean start" should be a
+///   decision recorded with the numbers, not a shrug. Say what is
+///   being destroyed before destroying it.
+/// - `backfill.went_live` is required because the transition is the
+///   load-bearing claim of the whole design, and the temptation is to
+///   assert it from a clean compile. It is confirmed by warp reaching
+///   1.0 on a running clock or it is not confirmed.
+/// - `verify.checks` is required because a sweep can pass vacuously —
+///   the ledger replay-check went green that day on data that no
+///   longer contained the case it had been failing on.
+///
+/// Step graph:
+///  -1. `requested` — someone asked for a regen
+///   0. `scope`     — why, and what it destroys (human-gated)
+///   1. `build`     — release artifacts
+///   2. `artifacts` — prove the built thing is the deployed thing
+///   3. `deploy`    — install, including the non-service binaries
+///   4. `reset`     — the destructive step (human-gated)
+///   5. `backfill`  — synthetic past, then the go-live transition
+///   6. `verify`    — schema, registry, invariants
+///   999. `complete` / `abandoned`
+fn regenerate_deployment_spec() -> WorkflowSpec {
+    /// A step in the chain, gated on its predecessor, carrying one
+    /// required record of what was done.
+    fn linked(title: &str, after: &str, label: &str, field: &str, human: bool) -> StepSpec {
+        StepSpec {
+            title: title.into(),
+            kind: "task".into(),
+            ready_when: format!("steps.{after}.done"),
+            title_template: label.into(),
+            authority_role: if human {
+                Some("platform-admin".into())
+            } else {
+                None
+            },
+            fields: vec![boss_core::job::StepField {
+                name: field.into(),
+                field_type: "string".into(),
+                required: true,
+            }],
+            ..Default::default()
+        }
+    }
+
+    let steps = vec![
+        StepSpec {
+            title: "requested".into(),
+            kind: "trigger".into(),
+            ready_when: "true".into(),
+            title_template: "Regen requested".into(),
+            metadata_defaults: serde_json::json!({
+                "trigger_kind": "operator",
+                "trigger_name": "operator-requests-a-regen",
+            }),
+            ..Default::default()
+        },
+        // Human-gated: a regen is destructive and nobody should be
+        // able to start one without saying why.
+        StepSpec {
+            title: "scope".into(),
+            kind: "task".into(),
+            ready_when: "steps.requested.done".into(),
+            title_template: "Why, and what it destroys".into(),
+            authority_role: Some("platform-admin".into()),
+            fields: vec![
+                boss_core::job::StepField {
+                    name: "reason".into(),
+                    field_type: "string".into(),
+                    required: true,
+                },
+                boss_core::job::StepField {
+                    name: "destroying".into(),
+                    field_type: "string".into(),
+                    required: true,
+                },
+            ],
+            ..Default::default()
+        },
+        linked(
+            "build",
+            "scope",
+            "Build release artifacts",
+            "source_ref",
+            false,
+        ),
+        linked(
+            "artifacts",
+            "build",
+            "Prove the built thing is the deployed thing",
+            "verified",
+            false,
+        ),
+        linked("deploy", "artifacts", "Install", "deployed", false),
+        // The destructive one. Gated on a person even though every
+        // step around it can be automated: the whole Workflow exists
+        // so this moment is a recorded decision.
+        linked("reset", "deploy", "Drop and reseed", "baseline", true),
+        linked(
+            "backfill",
+            "reset",
+            "Backfill, then go live",
+            "went_live",
+            false,
+        ),
+        linked(
+            "verify",
+            "backfill",
+            "Verify the new world",
+            "checks",
+            false,
+        ),
+        StepSpec {
+            title: "complete".into(),
+            kind: "outcome".into(),
+            ready_when: "steps.verify.done".into(),
+            title_template: "Regen complete".into(),
+            metadata_defaults: serde_json::json!({ "outcome_kind": "completed" }),
+            terminal: Some(Terminal {
+                outcome: "regenerated".into(),
+            }),
+            ..Default::default()
+        },
+        // A regen that fails partway is the normal bad case, and it
+        // leaves a deployment in a known-broken state. Ready from
+        // `scope` onward so it can be reached from wherever it died.
+        StepSpec {
+            title: "abandoned".into(),
+            kind: "outcome".into(),
+            ready_when: "steps.scope.done".into(),
+            title_template: "Abandoned".into(),
+            metadata_defaults: serde_json::json!({ "outcome_kind": "aborted" }),
+            terminal: Some(Terminal {
+                outcome: "abandoned".into(),
+            }),
+            ..Default::default()
+        },
+    ];
+
+    let mut spec = WorkflowSpec::platform_seed(
+        "regenerate-deployment",
+        "Regenerate a deployment",
+        "platform",
+        vec!["custom".into()],
+        steps,
+    );
+    spec.metadata = serde_json::json!({ "owner_role": "platform-admin" });
+    spec.description = Some(
+        "Drop a deployment's database and rebuild it: schema, seed, backfilled history, \
+         then live. The Subject is the deployment, so \"what regens has this box had, and \
+         why\" answers from Subject history. Two steps are gated on a person — declaring \
+         why it is happening, and the destructive reset itself — and the rest record what \
+         was done at each stage. Note the bootstrap gap: a deployment cannot run the \
+         Workflow that regenerates it, so the Job lives wherever the operator is."
+            .to_string(),
+    );
+    spec
+}
+
 /// Every Workflow that ships baked into the platform binary. Read by
 /// `boss-jobs-api`'s startup reconciler — `kind_registry
 /// .bootstrap_reconcile(&platform_workflows())` runs on every boot,
@@ -512,6 +693,7 @@ pub fn platform_workflows() -> Vec<WorkflowSpec> {
         design_doc_review_spec(),
         user_feedback_spec(),
         ship_a_change_spec(),
+        regenerate_deployment_spec(),
     ]
 }
 
@@ -3275,8 +3457,9 @@ mod tests {
         let kinds = platform_workflows();
         assert_eq!(
             kinds.len(),
-            4,
-            "ships workflow-design + design-doc-review + user-feedback + ship-a-change"
+            5,
+            "ships workflow-design + design-doc-review + user-feedback + ship-a-change \
+             + regenerate-deployment"
         );
 
         // The boundary declaration is the whole point of the kind, so
@@ -3306,6 +3489,42 @@ mod tests {
                 .find(|f| f.name == field)
                 .unwrap_or_else(|| panic!("scope declares `{field}`"));
             assert!(f.required, "`{field}` is required at done");
+        }
+
+        // The step this Workflow exists for. Five stale-binary
+        // incidents in one day is what "verify the artifacts" is
+        // guarding, and an optional field would be skipped under
+        // exactly the conditions that produce them.
+        let regen = kinds
+            .iter()
+            .find(|k| k.kind == "regenerate-deployment")
+            .expect("regenerate-deployment present");
+        let artifacts = regen
+            .steps
+            .iter()
+            .find(|s| s.title == "artifacts")
+            .expect("artifacts step present");
+        assert!(
+            artifacts
+                .fields
+                .iter()
+                .any(|f| f.name == "verified" && f.required),
+            "`verified` must be required at done"
+        );
+        // The two moments that must not happen without a person: the
+        // decision to regenerate, and the destruction itself.
+        for gated in ["scope", "reset"] {
+            let step = regen
+                .steps
+                .iter()
+                .find(|s| s.title == gated)
+                .unwrap_or_else(|| panic!("`{gated}` step present"));
+            assert_eq!(
+                step.authority_role.as_deref(),
+                Some("platform-admin"),
+                "`{gated}` must wait for a person — an ungated step gets role-matched \
+                 and completed by the simulated workforce"
+            );
         }
 
         let design = kinds
