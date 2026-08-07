@@ -26,12 +26,32 @@
 # fact-that-lives-twice failure in CLAUDE.md §9a; the fix is not a
 # comment telling the next person to sync them, it is not needing the
 # rule here at all.
+#
+# Reads jobs-api directly rather than through the gateway. The gateway
+# is the BROWSER edge: it authenticates a session cookie and strips
+# every inbound `x-boss-*` header, so an operator script has no way to
+# present itself there. Terminal tooling goes to the service port with
+# an actor header — the same path verify-smoke.sh and verify-replay.sh
+# take.
+#
+# This script used to curl the gateway anonymously. That worked only
+# because demo mode minted an `audit-readonly` session for anyone who
+# asked; when that was removed the reader started returning 401 and a
+# stack trace. Anonymous read was never the contract, it was a side
+# effect.
 set -euo pipefail
 
-BASE="${BOSS_GATEWAY_URL:-http://127.0.0.1:4443}"
+# jobs-api. Port from boss-ports (`name: "jobs", prod: 7900`); six
+# infra scripts hardcode it the same way.
+BASE="${BOSS_JOBS_URL:-http://127.0.0.1:7900}"
 WANT="${1:-all}"
 
-curl -fsS "$BASE/api/jobs?kind=user-feedback&limit=200" | python3 -c "
+# Reads are policy-gated; an unheadered call lands as `guest`, which
+# holds JobKind read and nothing else. Reading is all this does — the
+# docstring above is the reason writes are not added here.
+BOSS_USER='{"id":"it-triage-queue","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
+
+curl -fsS -H "x-boss-user: $BOSS_USER" "$BASE/api/jobs?kind=user-feedback&limit=200" | python3 -c "
 import json, sys
 
 want = sys.argv[1] if len(sys.argv) > 1 else 'all'
