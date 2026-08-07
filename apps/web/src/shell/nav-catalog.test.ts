@@ -79,6 +79,49 @@ describe('nav catalog — app assignment', () => {
     expect(derived).toEqual(expected);
   });
 
+  // A route can sit in the catalog with `app: 'it'` and still be
+  // unreachable, because AppShell builds the sidebar from its OWN
+  // explicit list of groups. That is the same fact in two places, and
+  // it drifted: the Operating System map shipped with a route, a
+  // permission key and a catalog entry, and no way to click to it.
+  //
+  // Source-level because the groups live inside a component. Crude,
+  // but it fails when someone adds an IT surface and forgets the
+  // sidebar, which is exactly the mistake it exists for.
+  it('every IT surface is reachable from the IT sidebar', () => {
+    const shell = readFileSync(
+      new URL('./AppShell.svelte', import.meta.url),
+      'utf8',
+    );
+    const groups = shell.slice(
+      shell.indexOf('const IT_GROUPS'),
+      shell.indexOf('// Home —'),
+    );
+    // Surfaces deliberately reached FROM another page rather than
+    // from the sidebar. Each needs a parent that links to it.
+    const REACHED_FROM_A_PARENT: ReadonlyArray<string> = [
+      // Authoring is reached from Workflows, by design — see the
+      // comment on the Define group.
+      'job-kinds',
+      // Sub-pages of the dispatcher cascade.
+      'system-dispatcher-rules',
+      'system-dispatcher-rule',
+    ];
+
+    const unreachable = entries
+      .filter(([, v]) => v.app === 'it')
+      .map(([k]) => k)
+      .filter((k) => !REACHED_FROM_A_PARENT.includes(k))
+      // The shell references entries BOTH ways — `ROUTE_CATALOG.policy`
+      // and `ROUTE_CATALOG['system-design']` — so check both spellings.
+      // Matching only the bracket form is how this test first reported
+      // five false positives.
+      .filter((k) => !groups.includes(`'${k}'`) && !groups.includes(`ROUTE_CATALOG.${k}`));
+    expect(unreachable, `IT routes with no sidebar entry: ${unreachable.join(', ')}`).toEqual(
+      [],
+    );
+  });
+
   it('nothing from the original System Model set has left the IT app', () => {
     // The half of the pin that matters most: a surface silently
     // changing app is the failure this list was written for.

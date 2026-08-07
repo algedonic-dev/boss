@@ -103,6 +103,10 @@
         // visible + always in-perspective; see visible()/inPerspective()).
         { id: 'system-audit', label: 'Audit Log', path: '/system/monitoring/events' },
         { id: 'system-atlas', label: 'Atlas', path: '/system/monitoring/atlas' },
+        // The executor network — who moves work and where it goes.
+        // Belongs with the other live instruments rather than under
+        // Define: it shows the system RUNNING, not how it is authored.
+        ROUTE_CATALOG['system-os-map'],
       ],
     },
     {
