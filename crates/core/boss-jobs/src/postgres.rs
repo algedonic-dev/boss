@@ -1242,41 +1242,61 @@ pub async fn trim_epoch_audit_log(pool: &PgPool, baseline: i64) -> Result<u64, J
         .execute(&mut *tx)
         .await
         .map_err(|e| JobsError::Storage(format!("disable trigger: {e}")))?;
-    // Platform meta-work survives the lap. The epoch restart exists to
-    // reset the SIMULATED company — a year of brewing, selling and
-    // shipping that is meant to be disposable. Feedback a person typed,
-    // a design doc under review, a JobKind someone authored: those are
-    // real operator input that happens to be stored in the same log,
-    // and trimming them was destroying the only record of them. It
-    // cost an entire session's feedback corpus, filed by a real user,
-    // when the lap rolled at 21:18.
+    // Delete what the SIMULATOR did; keep what people did.
     //
-    // A Job and its steps must travel TOGETHER or the rebuild aborts on
-    // `steps_job_id_fkey` — the exact failure that manufactured orphan
-    // steps once before. `payload->>'id'` catches the `jobs.job.created`
-    // event and `payload->>'job_id'` catches every step event, so the
-    // pair is preserved atomically.
+    // `_simulated` is stamped from the event's origin — the request
+    // carried `x-sim-origin`, or the dispatcher inherited it from the
+    // event it was reacting to — so it answers exactly the question
+    // this trim needs: was this activity synthetic. It replaces an
+    // earlier exemption for three hardcoded platform kinds, which was
+    // a closed list that could only ever be right by accident (a
+    // tenant Job a human worked was still destroyed).
     //
-    // `jobs` has no FK to `subjects`, so a preserved Job whose Subject
-    // row is re-derived from the trimmed log stays structurally valid;
-    // its subject columns are plain text on the row.
-    let platform_kinds: Vec<String> = crate::registry::platform_kinds()
-        .into_iter()
-        .map(|spec| spec.kind)
-        .collect();
-    let trimmed = sqlx::query(
-        "DELETE FROM audit_log
+    // Absence is treated as real. The conservative direction for a
+    // DELETE is to keep, and every publisher stamps the field, so an
+    // unflagged row above the baseline is a bug worth noticing rather
+    // than data worth destroying.
+    //
+    // The second clause is the one that stops a rebuild aborting. A
+    // Job's events do not share an origin: a person can complete a
+    // step on a Job the simulator created. Deleting the simulated
+    // create while keeping the human's step event leaves an orphan
+    // step, and `steps_job_id_fkey` then fails the whole jobs rebuild
+    // — a failure this reset path has had before. So a Job that ANY
+    // real event touches is preserved whole.
+    // Materialize the human-touched Job set into an indexed temp table
+    // and anti-join against it, rather than a correlated `NOT IN`.
+    // Shape matters at this size: the `NOT IN` form did not finish in
+    // ten minutes against a 10M-row log, and this runs inside the
+    // transaction that blocks the epoch restart. The set itself is
+    // tiny — only Jobs a person touched — so the join is cheap once
+    // it exists.
+    sqlx::query(
+        "CREATE TEMP TABLE _human_touched_jobs ON COMMIT DROP AS
+         SELECT DISTINCT COALESCE(payload->>'job_id', payload->>'id') AS job_id
+           FROM audit_log
           WHERE id > $1
-            AND NOT EXISTS (
-                SELECT 1 FROM jobs j
-                 WHERE j.kind = ANY($2)
-                   AND j.id::text = COALESCE(
-                           audit_log.payload->>'job_id',
-                           audit_log.payload->>'id')
-            )",
+            AND payload->>'_simulated' IS DISTINCT FROM 'true'
+            AND COALESCE(payload->>'job_id', payload->>'id') IS NOT NULL",
     )
     .bind(baseline)
-    .bind(&platform_kinds)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| JobsError::Storage(format!("collect human-touched jobs: {e}")))?;
+    sqlx::query("CREATE INDEX ON _human_touched_jobs (job_id)")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(format!("index human-touched jobs: {e}")))?;
+
+    let trimmed = sqlx::query(
+        "DELETE FROM audit_log a
+          WHERE a.id > $1
+            AND a.payload->>'_simulated' = 'true'
+            AND NOT EXISTS (
+                    SELECT 1 FROM _human_touched_jobs h
+                     WHERE h.job_id = COALESCE(a.payload->>'job_id', a.payload->>'id'))",
+    )
+    .bind(baseline)
     .execute(&mut *tx)
     .await
     .map_err(|e| JobsError::Storage(format!("trim audit_log: {e}")))?;
