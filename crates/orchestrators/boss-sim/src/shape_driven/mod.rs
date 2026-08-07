@@ -1,7 +1,7 @@
-//! Shape-driven simulator — reads JobKind / StepType / SubjectKind /
+//! Shape-driven simulator — reads Workflow / StepType / SubjectKind /
 //! Class registries + a tenant config and synthesizes plausible
 //! activity without per-domain Rust generators. The *behavior* is
-//! data, not code: a new tenant ships JobKinds + tenant.toml + Class
+//! data, not code: a new tenant ships Workflows + tenant.toml + Class
 //! seeds and the sim runs against them with no Rust changes,
 //! producing Jobs, Steps, Subjects, and events on the wire.
 //!
@@ -11,7 +11,7 @@
 //!   equivalent file for other tenants. The TOML shape is the
 //!   contract — every tenant authors one of these.
 //! - `sampler`: pure functions that compute "how many Jobs of this
-//!   JobKind should be created today" from a `JobRate` + a
+//!   Workflow should be created today" from a `JobRate` + a
 //!   `NaiveDate` (handles ramps + weekday/weekend multipliers +
 //!   Poisson sampling).
 //! - `engine`: the day loop that ties the registries + tenant +

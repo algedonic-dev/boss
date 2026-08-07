@@ -221,11 +221,11 @@ fn coarse_fires_today(
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PeriodicAction {
-    /// Open a Job of `job_kind`. The engine emits a
+    /// Open a Job of `workflow`. The engine emits a
     /// `periodic.job_requested` event carrying the kind + subject,
     /// which the live runner routes to `POST /api/jobs`.
     OpenJob {
-        job_kind: String,
+        workflow: String,
         #[serde(default)]
         subject_kind: Option<String>,
         #[serde(default)]
@@ -315,12 +315,12 @@ impl SimEngine for PeriodicEngine {
             }
             match &spec.action {
                 PeriodicAction::OpenJob {
-                    job_kind,
+                    workflow,
                     subject_kind,
                     subject_id,
                 } => {
                     let mut payload = serde_json::json!({
-                        "job_kind": job_kind,
+                        "workflow": workflow,
                         "subject_kind": subject_kind,
                         "subject_id": subject_id,
                         "spec": spec.name,
@@ -502,7 +502,7 @@ mod tests {
                 anchor_date: d(2026, 4, 15),
                 business_calendar: None,
                 action: PeriodicAction::OpenJob {
-                    job_kind: "equipment-preventive-maintenance".into(),
+                    workflow: "equipment-preventive-maintenance".into(),
                     subject_kind: Some("location".into()),
                     subject_id: Some("loc-brewery-brewhouse".into()),
                 },
@@ -513,7 +513,7 @@ mod tests {
         assert_eq!(out.events.len(), 1);
         assert_eq!(out.events[0].0, "periodic.job_requested");
         assert_eq!(
-            out.events[0].1["job_kind"],
+            out.events[0].1["workflow"],
             "equipment-preventive-maintenance"
         );
         assert_eq!(out.events[0].1["spec"], "monthly-preventive-maintenance");

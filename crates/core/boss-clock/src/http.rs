@@ -231,28 +231,45 @@ async fn configure_handler(
             p.paused_offset_seconds = 0.0;
             p.paused_at = None;
         }
+        // Absent leaves the cap alone; explicit `null` removes it.
+        // Removing it is what a run needs when it stops being bounded
+        // — `now()` clamps at epoch_end, so a capped clock at warp 1.0
+        // is a frozen clock, not a live one.
         if let Some(ee) = req.epoch_end {
-            p.epoch_end = Some(ee);
+            p.epoch_end = ee;
         }
         if let Some(w) = req.warp_factor
             && w > 0.0
         {
             // Live-changing warp_factor: re-anchor so the running
-            // sim-time doesn't teleport. New sim-time at the new
-            // rate starts from the current sim-time as of wall-now.
+            // sim-time doesn't teleport.
+            //
+            // `epoch_start` is NOT touched. It used to be moved to the
+            // current sim date so that "elapsed" was only the
+            // within-day remainder — arithmetically fine, and it threw
+            // away the one thing epoch_start is for. It records where
+            // the run began, which is how anyone reading the clock
+            // later knows what window the synthetic history covers. A
+            // mid-run warp change would silently rewrite that to
+            // "wherever we happened to be", and the record would look
+            // authoritative while being wrong.
+            //
+            // Inverting the formula against the true epoch_start costs
+            // nothing. `now` is
+            //   epoch_start_midnight + (wall_now − wall_anchor
+            //                           − paused_offset) × warp
+            // so holding `now` fixed across a warp change means
+            //   wall_anchor = wall_now − sim_elapsed / warp_new
+            // with `sim_elapsed` measured from the real epoch_start.
             let current = p.now();
-            p.epoch_start = current.now.date_naive();
-            // Preserve sub-day position by setting wall_anchor to
-            // (wall_now − (current_within_day_seconds / new_warp)).
-            let within_day_secs = (current.now
-                - p.epoch_start
-                    .and_hms_opt(0, 0, 0)
-                    .expect("midnight valid")
-                    .and_utc())
-            .num_milliseconds()
-            .max(0) as f64
-                / 1000.0;
-            let wall_offset_secs = within_day_secs / w;
+            let epoch_start_dt = p
+                .epoch_start
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight valid")
+                .and_utc();
+            let sim_elapsed_secs =
+                (current.now - epoch_start_dt).num_milliseconds().max(0) as f64 / 1000.0;
+            let wall_offset_secs = sim_elapsed_secs / w;
             p.wall_anchor =
                 Utc::now() - chrono::Duration::milliseconds((wall_offset_secs * 1000.0) as i64);
             p.warp_factor = w;
@@ -464,6 +481,168 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, body)
+    }
+
+    /// Changing warp mid-run must not rewrite where the run began.
+    ///
+    /// `epoch_start` is the record of the window a run covers — for
+    /// the brewery it says how far back the synthetic history reaches.
+    /// The re-anchor used to move it to the current sim date, because
+    /// that made the arithmetic a within-day remainder. The clock
+    /// stayed correct and the provenance silently became "wherever we
+    /// happened to be when someone changed the speed".
+    ///
+    /// Caught live: a backfill seeded at 2026-02-06 reported
+    /// epoch_start 2026-04-01 after one warp change, while still
+    /// holding six months of history.
+    #[tokio::test]
+    async fn changing_warp_preserves_where_the_run_began() {
+        let state = sim_state();
+        let app = router(state);
+
+        // Warp high enough that a short sleep moves sim-time by DAYS.
+        // 86_400_000 is one sim-day per wall-millisecond.
+        //
+        // This matters, and it is why the assertion below is worth
+        // anything: the first version of this test used the
+        // playground's warp and read back immediately, so sim-time had
+        // not left epoch_start and `current.now.date_naive()` equalled
+        // it. It could not tell the two implementations apart and
+        // passed against the bug it was written to catch.
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/clock/configure",
+            serde_json::json!({
+                "epoch_start": "2026-02-06",
+                "epoch_end": "2026-08-07",
+                "warp_factor": 86_400_000.0
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (_, before) = get_json(app.clone(), "/api/clock/now").await;
+        let sim_before = before["now"].as_str().expect("now").to_string();
+        assert_ne!(
+            &sim_before[..10],
+            "2026-02-06",
+            "precondition: sim-time must have left epoch_start, else this test cannot \
+             distinguish preserving epoch_start from overwriting it with today"
+        );
+
+        let (st, after_cfg) = post_json(
+            app.clone(),
+            "/api/clock/configure",
+            serde_json::json!({ "warp_factor": 1500.0 }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            after_cfg["epoch_start"], "2026-02-06",
+            "the warp change rewrote where the run began"
+        );
+
+        // And the point of the re-anchor still holds: sim-time must
+        // not jump. Compared to the second, since the formula is
+        // millisecond-quantised and a teleport would be days.
+        let (_, after) = get_json(app, "/api/clock/now").await;
+        let sim_after = after["now"].as_str().expect("now");
+        assert_eq!(
+            &sim_before[..19],
+            &sim_after[..19],
+            "sim-time teleported across the warp change: {sim_before} -> {sim_after}"
+        );
+    }
+
+    /// Going live must UNFREEZE the clock, not just change the rate.
+    ///
+    /// `epoch_end` is a hard cap inside `now()`: sim-time clamps at it
+    /// and stops. So a run that reaches its epoch_end and drops to
+    /// warp 1.0 with the cap still set has a frozen clock, and every
+    /// consumer that waits on time waits forever. The playground did
+    /// exactly this — pinned at `2026-08-07T00:00:00` while the
+    /// simulator failed its readiness gate on a loop.
+    ///
+    /// The earlier reasoning was that the cap "stops being a cap the
+    /// sim acts on" once the guard sees warp 1.0. True of the guard,
+    /// irrelevant to the formula. This asserts the formula.
+    #[tokio::test]
+    async fn clearing_the_epoch_end_unfreezes_the_clock() {
+        let state = sim_state();
+        let app = router(state);
+
+        // A window that is already over: epoch_end in the past means
+        // `now()` is pinned at the cap from the first read.
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/clock/configure",
+            serde_json::json!({
+                "epoch_start": "2026-02-06",
+                "epoch_end": "2026-02-07",
+                "warp_factor": 86_400_000.0
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let (_, capped) = get_json(app.clone(), "/api/clock/now").await;
+        let a = capped["now"].as_str().expect("now").to_string();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let (_, still) = get_json(app.clone(), "/api/clock/now").await;
+        assert_eq!(
+            a,
+            still["now"].as_str().expect("now"),
+            "precondition: a capped clock does not advance"
+        );
+
+        // Go live: real time, and the cap removed. `null` has to be
+        // distinguishable from absent for this to be sayable at all.
+        let (st, cfg) = post_json(
+            app.clone(),
+            "/api/clock/configure",
+            serde_json::json!({ "warp_factor": 1.0, "epoch_end": null }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(
+            cfg["epoch_end"].is_null(),
+            "the cap must be gone, not merely ignored: {cfg}"
+        );
+
+        let (_, before) = get_json(app.clone(), "/api/clock/now").await;
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let (_, after) = get_json(app, "/api/clock/now").await;
+        assert_ne!(
+            before["now"].as_str(),
+            after["now"].as_str(),
+            "the clock is still frozen after going live"
+        );
+    }
+
+    /// An ABSENT epoch_end still means "leave it alone". Without this
+    /// the double-Option would be a silent way to wipe the cap on any
+    /// unrelated configure call.
+    #[tokio::test]
+    async fn an_absent_epoch_end_leaves_the_cap_alone() {
+        let state = sim_state();
+        let app = router(state);
+        let (_, _) = post_json(
+            app.clone(),
+            "/api/clock/configure",
+            serde_json::json!({ "epoch_start": "2026-02-06", "epoch_end": "2026-08-07",
+                                "warp_factor": 1000.0 }),
+        )
+        .await;
+        let (_, cfg) = post_json(
+            app,
+            "/api/clock/configure",
+            serde_json::json!({ "warp_factor": 500.0 }),
+        )
+        .await;
+        assert_eq!(cfg["epoch_end"], "2026-08-07");
     }
 
     async fn post_json(

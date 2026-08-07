@@ -10,7 +10,7 @@
 use anyhow::Result;
 use chrono::NaiveDate;
 
-use boss_jobs::registry::JobKindSpec;
+use boss_jobs::registry::WorkflowSpec;
 use boss_jobs::step_registry::StepRegistry;
 
 use crate::engines::{
@@ -39,7 +39,7 @@ pub struct RunReport {
     /// OpenJob.
     pub periodic_fires: u64,
     /// Jobs materialized from `periodic.job_requested` events (a
-    /// strict subset of `periodic_fires` — fires whose JobKind
+    /// strict subset of `periodic_fires` — fires whose Workflow
     /// resolved against the registry). The remainder are dropped
     /// with `state.counters.jobs_skipped_unknown_kind`.
     pub jobs_opened_from_periodic: u64,
@@ -59,7 +59,7 @@ pub struct RunReport {
 pub fn run_days(
     start: NaiveDate,
     end: NaiveDate,
-    job_kinds: &[JobKindSpec],
+    workflows: &[WorkflowSpec],
     step_registry: &StepRegistry,
     tenant: &TenantConfig,
     state: &mut ShapeDrivenState,
@@ -73,7 +73,7 @@ pub fn run_days(
         end,
         1, // ticks_per_day = 1 → bit-for-bit equivalent to the
         //                       legacy day-tick path.
-        job_kinds,
+        workflows,
         step_registry,
         tenant,
         state,
@@ -109,7 +109,7 @@ pub fn run_ticks_with_handlers(
     start: NaiveDate,
     end: NaiveDate,
     ticks_per_day: u32,
-    job_kinds: &[JobKindSpec],
+    workflows: &[WorkflowSpec],
     step_registry: &StepRegistry,
     tenant: &TenantConfig,
     state: &mut ShapeDrivenState,
@@ -149,7 +149,7 @@ pub fn run_ticks_with_handlers(
                 day,
                 tick_idx,
                 ticks_per_day,
-                job_kinds,
+                workflows,
                 step_registry,
                 tenant,
                 state,
@@ -203,7 +203,7 @@ pub fn run_one_tick_with_handlers(
     day: NaiveDate,
     tick_idx: u32,
     ticks_per_day: u32,
-    job_kinds: &[JobKindSpec],
+    workflows: &[WorkflowSpec],
     step_registry: &StepRegistry,
     tenant: &TenantConfig,
     state: &mut ShapeDrivenState,
@@ -235,10 +235,10 @@ pub fn run_one_tick_with_handlers(
     //
     // (Step 2 — BatchEngine — retired 2026-05-06; was a
     // back-door that produced canonical events without going
-    // through the JobKind / Step / audit-trail. The Periodic
-    // engine above now opens JobKinds for those flows
+    // through the Workflow / Step / audit-trail. The Periodic
+    // engine above now opens Workflows for those flows
     // (sales-tax-filing already; payroll-run / payroll-941 /
-    // income-tax JobKinds in Stage 4) and the terminal step's
+    // income-tax Workflows in Stage 4) and the terminal step's
     // side-effect handler emits the canonical event through
     // the same /api/ledger/* POST the BatchEngine used to hit.)
     {
@@ -260,7 +260,7 @@ pub fn run_one_tick_with_handlers(
     //    (Phase B-2 will add a `time_of_day` field for sub-day
     //    cadence anchoring).
     let summary = simulate_tick_with_handlers(
-        job_kinds,
+        workflows,
         step_registry,
         tenant,
         day,
@@ -285,7 +285,7 @@ pub fn run_one_tick_with_handlers(
         for payload in requests {
             if open_job_from_request(
                 &payload,
-                job_kinds,
+                workflows,
                 tenant,
                 day,
                 state,
@@ -403,7 +403,7 @@ mod tests {
     /// closes Jobs, counterparty queues + drains.
     #[test]
     fn end_to_end_runner_drives_all_three_engines() {
-        let mut spec = JobKindSpec::platform_seed(
+        let mut spec = WorkflowSpec::platform_seed(
             "morning-bake",
             "Morning Bake",
             "production",
@@ -566,7 +566,7 @@ mod tests {
             periodic: HashMap::new(),
             batch: HashMap::new(),
         };
-        let kinds: Vec<JobKindSpec> = vec![];
+        let kinds: Vec<WorkflowSpec> = vec![];
         let registry = StepRegistry::v1();
         let mut state = ShapeDrivenState::new();
         let mut rng = Rng::new(7);
@@ -608,10 +608,10 @@ mod tests {
     /// shape_driven::open_job_from_request. Before this wiring the
     /// emitted `periodic.job_requested` events were no-ops; the
     /// regression here is that a daily OpenJob for a known
-    /// JobKind produces N Jobs over N operating days.
+    /// Workflow produces N Jobs over N operating days.
     #[test]
     fn periodic_open_job_action_materializes_jobs() {
-        let mut spec = JobKindSpec::platform_seed(
+        let mut spec = WorkflowSpec::platform_seed(
             "equipment-preventive-maintenance",
             "Equipment preventive maintenance",
             "ops",
@@ -655,7 +655,7 @@ mod tests {
                 anchor_date: d(2026, 4, 27),
                 business_calendar: None,
                 action: PeriodicAction::OpenJob {
-                    job_kind: "equipment-preventive-maintenance".into(),
+                    workflow: "equipment-preventive-maintenance".into(),
                     subject_kind: Some("location".into()),
                     subject_id: Some("loc-1".into()),
                 },
@@ -690,14 +690,14 @@ mod tests {
         );
     }
 
-    /// `periodic.job_requested` for an unknown JobKind drops the
+    /// `periodic.job_requested` for an unknown Workflow drops the
     /// request and bumps jobs_skipped_unknown_kind without
     /// crashing. Defends against tenant.toml drift where a
-    /// PeriodicAction::OpenJob references a JobKind the registry
+    /// PeriodicAction::OpenJob references a Workflow the registry
     /// didn't seed.
     #[test]
     fn periodic_open_job_for_unknown_kind_is_skipped() {
-        let kinds: Vec<JobKindSpec> = vec![];
+        let kinds: Vec<WorkflowSpec> = vec![];
         let tenant = TenantConfig {
             meta: TenantMeta {
                 tenant_id: "drift".into(),
@@ -731,7 +731,7 @@ mod tests {
                 anchor_date: d(2026, 4, 27),
                 business_calendar: None,
                 action: PeriodicAction::OpenJob {
-                    job_kind: "no-such-kind".into(),
+                    workflow: "no-such-kind".into(),
                     subject_kind: Some("location".into()),
                     subject_id: Some("loc-1".into()),
                 },
@@ -789,7 +789,7 @@ mod tests {
         // Poisson std-dev = sqrt(300) ≈ 17, so a 4-sigma band is
         // ±70. Both engines should land well inside.
         let scenario = || {
-            let mut spec = JobKindSpec::platform_seed(
+            let mut spec = WorkflowSpec::platform_seed(
                 "morning-bake",
                 "Morning Bake",
                 "production",

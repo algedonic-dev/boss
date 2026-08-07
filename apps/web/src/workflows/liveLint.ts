@@ -2,10 +2,10 @@
 // /_validate endpoint, which runs the same `validate_all` the publish
 // path enforces — WITHOUT persisting. "ok: true" here means the spec
 // publishes cleanly (the server reuses the same StepType registry, per
-// architecture-decisions.md §Jobs, JobKinds, Steps). The graph editor
+// architecture-decisions.md §Jobs, Workflows, Steps). The graph editor
 // paints `problems` onto the offending nodes live.
 
-import type { StepSpec } from './jobKindTypes';
+import type { StepSpec } from './workflowTypes';
 
 export type LintProblem = {
   /// Offending step slug; empty for whole-spec problems (no trigger, …).
@@ -23,7 +23,7 @@ export async function validateDraft(
   kind: string,
   steps: ReadonlyArray<StepSpec>,
 ): Promise<LintResult> {
-  const r = await fetch('/api/jobs/kinds/_validate', {
+  const r = await fetch('/api/workflows/_validate', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ kind, steps }),

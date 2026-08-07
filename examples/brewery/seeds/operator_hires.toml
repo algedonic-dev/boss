@@ -3,7 +3,7 @@
 # (`boss-brewery-sim prepare`), which POSTs each hire to
 # /api/people before any seeding that references these ids
 # (account-manager attachments, operator-baseline conversations,
-# executive sign-off rows on JobKinds).
+# executive sign-off rows on Workflows).
 #
 # These are TENANT identities, not
 # platform-baseline ones. They moved out of

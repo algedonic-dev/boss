@@ -1,11 +1,11 @@
-# Extending BOSS — JobKinds, StepTypes, and Step UX plugins
+# Extending BOSS — Workflows, StepTypes, and Step UX plugins
 
-**Status**: stable — describes the JobKind v2 extensibility model.
+**Status**: stable — describes the Workflow v2 extensibility model.
 **Audience**: anyone modeling a new workflow on top of BOSS, or
 adding a new bespoke step surface to the SPA.
 
 This doc ties together three **extensibility registries** —
-**JobKinds**, **StepTypes**, and **Step UX plugins** — and explains
+**Workflows**, **StepTypes**, and **Step UX plugins** — and explains
 the extensibility ladder operators climb when they need BOSS to do
 something new. The detailed technical references live alongside:
 
@@ -31,12 +31,12 @@ Job      — bounded unit of coordinated work, anchored on a Subject
 Step     — typed transition inside a Job
 StepType — entry in the registry that defines a Step's metadata
             schema + default UX (the alphabet of legal transitions)
-JobKind  — entry in the registry that defines a workflow as a
+Workflow  — entry in the registry that defines a workflow as a
             flat set of Steps + metadata schema + entitlements (the
             program written in the StepType alphabet)
 ```
 
-A JobKind lists a flat set of Steps, each gated by a `ready_when`
+A Workflow lists a flat set of Steps, each gated by a `ready_when`
 predicate; the DAG is implicit in those predicates (an edge A → B
 exists iff B's `ready_when` references A), not an author-drawn
 graph. A Step's `kind` points at a StepType, which dictates the
@@ -44,7 +44,7 @@ metadata schema, the default UX treatment, and any side effect the
 dispatcher fires on completion.
 
 Layered on top: **Step UX plugins** let an operator override the
-default render for a StepType (or a JobKind step) with a custom
+default render for a StepType (or a Workflow step) with a custom
 surface — a checklist, a launch calendar, a triage form, a
 per-tap quality check.
 
@@ -58,7 +58,7 @@ ladder as you actually need:
 | You want to… | You author… | Code? | Where? |
 |---|---|---|---|
 | Run an existing workflow against a new Subject pool | Just open a Job | No | SPA, `/ux/jobs` |
-| Compose a new workflow from existing StepTypes | A JobKind row | No (data only) | `/system/job-kinds` |
+| Compose a new workflow from existing StepTypes | A Workflow row | No (data only) | `/system/workflows` |
 | Add a new step kind with a custom UX surface | A StepPlugin (JS bundle) | JavaScript only | `infra/step-plugins/` |
 | Add a new domain entity (Subject kind) | A new crate | Rust | `crates/modules/` |
 | Add a new event topic + projection | Cross-service contract | Rust | `crates/core/boss-core` events |
@@ -69,10 +69,10 @@ rare and only justified when you're modeling a fundamentally new
 
 ---
 
-## Level 2 — JobKind authoring
+## Level 2 — Workflow authoring
 
-A JobKind is a row in the `job_kinds` table (authored at
-`/system/job-kinds`). It declares:
+A Workflow is a row in the `workflows` table (authored at
+`/system/workflows`). It declares:
 
 - `kind` — unique slug (e.g. `wholesale-keg-order`).
 - `subject_kinds` — which Subject types the Job can target.
@@ -87,7 +87,7 @@ Every step references an existing StepType by its `kind` string.
 **Adding a new workflow does not need new code** — you compose
 what's already in the StepType registry.
 
-Example brewery JobKinds:
+Example brewery Workflows:
 
 - `morning-brew` — daily production cycle on the brewhouse.
   Steps: `trigger` (periodic) → `demand-gate` (demand-check,
@@ -116,30 +116,30 @@ Example brewery JobKinds:
 
 ### Trigger + outcome conventions
 
-The `boss-jobs` JobKind lint (`job_kind_lint.rs`) enforces two
+The `boss-jobs` Workflow lint (`workflow_lint.rs`) enforces two
 structural rules at load:
 
-- **Triggers are the `ready_when = "true"` steps.** A JobKind's
+- **Triggers are the `ready_when = "true"` steps.** A Workflow's
   trigger steps are the entry-point alternatives — different ways
   the same workflow can open (periodic schedule fires, an external
   event arrives, an operator opens it manually, another Job spawns
   it). Their predicate is `"true"`, so the materializer marks them
   `Ready` at Job open; they represent a present fact (what opened
-  this Job), not work to do. A JobKind needs at least one.
+  this Job), not work to do. A Workflow needs at least one.
 - **Outcomes are the steps carrying a `terminal` marker.** A
   step authored with `terminal = { outcome = "..." }` is a legal
   closure shape. Reaching `Completed` on it closes the Job and
-  stamps that outcome label. Multiple terminals per JobKind is
+  stamps that outcome label. Multiple terminals per Workflow is
   normal (e.g. `brewed` + `skipped`): authoring two models a
   branching workflow whose decision point isn't a step-kind
   change — it's a metadata fork. Point each branch's `ready_when`
   at the deciding step's outcome metadata (e.g.
   `steps.demand-check.metadata.outcome = "oversupply"`) so the
-  implicit DAG renders the fork at the right place. A JobKind
+  implicit DAG renders the fork at the right place. A Workflow
   needs at least one terminal.
 
 The lint also proves every step is reachable forward from some
-trigger and backward from some terminal — no dead code. A JobKind
+trigger and backward from some terminal — no dead code. A Workflow
 that fails any of these checks does not load.
 
 ### Provably-skipped branches
@@ -153,8 +153,8 @@ branch reaches a terminal `Completed`, the Job closes and the
 siblings settle as `Skipped`, so a Job's open-step count drops to
 zero naturally instead of parking a dead branch forever.
 
-The brewery's `seeds/job_kinds.toml` is the worked-example for a
-tenant whose JobKinds get published from data on first load (via the
+The brewery's `seeds/workflows.toml` is the worked-example for a
+tenant whose Workflows get published from data on first load (via the
 converged prepare step, `boss-brewery-sim prepare`).
 
 ---
@@ -265,7 +265,7 @@ a `postgres` feature, HTTP surface in a binary. The brewery's
 Adaptability lives in **registries, not branches**. If you find
 yourself adding a `match kind { ... }` in core code to handle a
 new tenant's flavor, the answer is almost always "lift this into
-a registry the tenant authors against." The JobKind registry is
+a registry the tenant authors against." The Workflow registry is
 data the tenant authors; the Class registry handles tenant-varying
 taxonomies (roles, account_type, asset-model categories) as data;
 the StepType catalog ships as `step_types.toml` (still

@@ -8,7 +8,7 @@
 //!   - Literals: string "...", integer 123, boolean true/false, null
 //!   - Identifiers: bareword — resolved against caller-supplied state
 //!     (typically a JSON-shaped event payload, or a synthesized
-//!     step-state bag for JobKind v2 predicates)
+//!     step-state bag for Workflow v2 predicates)
 //!   - Function calls: name(arg, ...) — resolved against a helper-function
 //!     table the caller registers
 //!
@@ -209,7 +209,7 @@ pub fn parse(src: &str) -> Result<Expr, ParseError> {
 ///
 /// This is what lets a predicate be read as a set of dependencies:
 /// `boss-jobs` filters the returned paths for `steps.<title>.…` to
-/// build the JobKind dependency index (D11) and the viability lint's
+/// build the Workflow dependency index (D11) and the viability lint's
 /// reachability graph; `subject.…` / `job.…` paths are inputs the
 /// graph doesn't gate on. Pure structure walk — no evaluation, no
 /// payload needed.

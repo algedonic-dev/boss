@@ -100,8 +100,8 @@ category = "coordination"
 ux = "inline"
 version = 1
 description = """
-Delegation fork (JobKind v2 / D7): when this step becomes Ready it
-spawns a child Job of `subjob_kind` and pauses; when that child Job
+Delegation fork (Workflow v2 / D7): when this step becomes Ready it
+spawns a child Job of `subworkflow` and pauses; when that child Job
 hits a terminal outcome the dispatcher writes the outcome back into
 `subjob_outcome` and flips this step to Completed. The structural
 parent-step → child-Job link rides on `Step.embedded_job`; the
@@ -115,10 +115,10 @@ typical_duration_jitter = 0.3
 required_roles = []
 
   [[step_type.fields]]
-  name = "subjob_kind"
+  name = "subworkflow"
   field_type = "string"
   required = true
-  description = "Which child JobKind to spawn when this step becomes Ready"
+  description = "Which child Workflow to spawn when this step becomes Ready"
 
   [[step_type.fields]]
   name = "subjob_outcome"
@@ -179,7 +179,7 @@ version = 1
 description = """
 Decision gate: read finished-goods inventory and decide whether to
 run today's production batch. The `outcome` enum (brew | oversupply)
-is the fork discriminator the JobKind branches on — declaring it as
+is the fork discriminator the Workflow branches on — declaring it as
 an enum rather than free-text lets the viability lint prove the fork
 covers every outcome. Used by the brewery morning-brew family.
 """
@@ -198,7 +198,7 @@ completion = "agent"
   name = "outcome"
   field_type = "brew|oversupply"
   required = true
-  description = "Brew-today decision — the outcome the JobKind forks on."
+  description = "Brew-today decision — the outcome the Workflow forks on."
   faker_hint = "enum:brew|oversupply"
 
 [[step_type]]
@@ -210,7 +210,7 @@ version = 1
 description = """
 Decision gate: read finished-goods inventory and decide whether an order
 can be fulfilled from stock now (fulfill) or must be backordered
-(backorder). The `outcome` enum is the fork discriminator the JobKind
+(backorder). The `outcome` enum is the fork discriminator the Workflow
 branches on. Agent-executed — the dispatcher reads real stock and stamps
 the outcome at computer speed on step.ready, no human in the loop. See
 docs/architecture-decisions.md.
@@ -224,7 +224,7 @@ completion = "agent"
   name = "outcome"
   field_type = "fulfill|backorder"
   required = true
-  description = "Fulfillment decision the JobKind forks on."
+  description = "Fulfillment decision the Workflow forks on."
   faker_hint = "enum:fulfill|backorder"
 
   [[step_type.fields]]
@@ -246,7 +246,7 @@ Agent-executed — on step.ready the dispatcher reads real finished-goods
 stock (crediting in-flight brews), splits the whole batch across its
 formats in proportion to each format's shortfall, writes the packaged
 quantities + excise onto the produce steps, and stamps a per-format
-`outcome_<fork_key>` = package|skip the JobKind forks on. The whole batch
+`outcome_<fork_key>` = package|skip the Workflow forks on. The whole batch
 always packages, so WIP drains fully to finished goods; a format at/above
 target gets zero and routes to its skip successor. Config is all metadata
 (batch_bbl, target_skus, per-format demand + batch_yield + default_kegs +
@@ -277,7 +277,7 @@ category = "coordination"
 ux = "inline"
 version = 1
 description = """
-Terminal node — the JobKind's possible end states. Each `outcome`
+Terminal node — the Workflow's possible end states. Each `outcome`
 step represents one legal closure shape (completed, aborted,
 skipped, withdrawn). Exactly one outcome step lands Completed per
 Job; siblings are Aborted by the engine when the chosen outcome
@@ -748,7 +748,7 @@ typical_duration_hours = 4.0
 typical_duration_jitter = 0.4
 required_roles = ["ar-clerk", "bookkeeper"]
 # Agent-executed: issuing an invoice is software, not human labor — the
-# dispatcher auto-completes it on step.ready (the JobKind defaults the
+# dispatcher auto-completes it on step.ready (the Workflow defaults the
 # required account_id / amount_cents / currency / line_items) and the
 # invoice-issue side-effect fires on step.done.billing as before. See
 # docs/architecture-decisions.md.
@@ -890,7 +890,7 @@ required_roles = ["controller", "ap-clerk", "bookkeeper"]
   # by the ledger — NOT the inventory parts vendor-invoice. The free-text
   # `bill_category` routes the GL debit via bill_accounts.toml; the credit is
   # always 2100 A/P. Drives the `ledger.bill.approve` dispatcher handler
-  # (POST /api/ledger/bills). Adding a new kind of spend is a JobKind writing
+  # (POST /api/ledger/bills). Adding a new kind of spend is a Workflow writing
   # a `bill_category` + a bill_accounts.toml row — zero code.
 [[step_type]]
 kind = "expense-bill"
@@ -985,7 +985,7 @@ required_roles = ["bookkeeper"]
   # computes amount from the actual liability-account credit
   # balance over the period. Synthesizing random dates here
   # produced period_end < period_start failures every quarter
-  # (the faker is independent per field). JobKind authors that
+  # (the faker is independent per field). Workflow authors that
   # need a custom period override via metadata_defaults; the
   # bridge respects whatever is set there.
 
@@ -1096,7 +1096,7 @@ label = "HR — Hire"
 category = "operations"
 ux = "expanded"
 version = 1
-description = "Onboarding sign-off step. Done-transition fires `people.hire`, which POSTs the new-hire payload to /api/people. Hiring-manager approval is per-JobKind via authority_role metadata; required_roles here is the generic assignee pool."
+description = "Onboarding sign-off step. Done-transition fires `people.hire`, which POSTs the new-hire payload to /api/people. Hiring-manager approval is per-Workflow via authority_role metadata; required_roles here is the generic assignee pool."
 typical_duration_hours = 1.0
 typical_duration_jitter = 0.5
 required_roles = ["head-of-people", "hr-generalist"]
@@ -1739,21 +1739,21 @@ required_roles = ["sysadmin", "it-director"]
   description = "Most-recent failure diagnostic"
 
 [[step_type]]
-kind = "job-kind-publish"
-label = "Publish JobKind"
+kind = "workflow-publish"
+label = "Publish Workflow"
 category = "admin"
 ux = "inline"
 version = 1
-description = "Publish a JobKindSpec into the registry. Terminal step of `job-kind-design` Jobs."
+description = "Publish a WorkflowSpec into the registry. Terminal step of `workflow-design` Jobs."
 typical_duration_hours = 0.05
 typical_duration_jitter = 0.0
 required_roles = ["it-director", "platform-admin"]
 
   [[step_type.fields]]
-  name = "job_kind_spec"
+  name = "workflow_spec"
   field_type = "object"
   required = true
-  description = "Full JobKindSpec blob to publish"
+  description = "Full WorkflowSpec blob to publish"
 
   [[step_type.fields]]
   name = "previous_kind_version"
@@ -1808,7 +1808,7 @@ category = "coordination"
 ux = "expanded"
 version = 1
 description = """
-Custom Step UX for the `design-doc-review` JobKind. The plugin
+Custom Step UX for the `design-doc-review` Workflow. The plugin
 fetches `/api/design/docs/{doc_path}`, lists every `### Qn:` open
 question parsed by boss-docs-api, and renders a per-question
 resolution textarea. Step completion is gated on every question

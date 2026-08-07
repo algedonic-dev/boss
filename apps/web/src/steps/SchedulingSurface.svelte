@@ -1,6 +1,6 @@
 <script lang="ts">
   // Scheduling step surface — slot a Job into a calendar window.
-  // The morning-brew JobKind opens with a scheduling step
+  // The morning-brew Workflow opens with a scheduling step
   // ("plan today's brew"), wholesale-keg-order's tier 2 schedules
   // the production batch, equipment-preventive-maintenance schedules the technician
   // visit.

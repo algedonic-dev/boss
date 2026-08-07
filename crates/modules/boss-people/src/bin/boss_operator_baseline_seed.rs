@@ -78,7 +78,7 @@ fn resolve_bootstrap_admin_email() -> Option<String> {
         Err(e) => {
             // Loud, with the path and the reason. This fallback failing
             // silently is what let a reset produce a demo with no
-            // platform-admin — and therefore no publishable JobKinds,
+            // platform-admin — and therefore no publishable Workflows,
             // since the Q7 owner gate rejects the bootstrap Job.
             info!(
                 path = %auth_file,
@@ -297,7 +297,7 @@ mod tests {
     /// implementations, yet the old `toml::Value`-walking resolver
     /// returned None for it — leaving a reset with no platform-admin,
     /// which the Q7 owner gate then turned into "prepare publishes
-    /// zero JobKinds" and a demo that could only idle.
+    /// zero Workflows" and a demo that could only idle.
     const REAL_CREDENTIALS: &str = r#"[[credential]]
 email = "david@algedonic.dev"
 password_hash = "$argon2id$v=19$m=19456,t=2,p=1$4LpQUAH90UxRT3D73PzcyQ$R6v2W4pFoHc9czv8L4cbvbr1vX3VYxGQZhkvNqRiegE"

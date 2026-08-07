@@ -38,7 +38,7 @@ actually needs.
 Fetch once when the route mounts; don't re-fetch.
 
 **Use when**: the data is *configuration* that doesn't change
-during a session — JobKind catalog, ADR catalog, architecture
+during a session — Workflow catalog, ADR catalog, architecture
 diagrams, design-doc text.
 
 ## Decision criteria
@@ -53,7 +53,7 @@ Choose by answering, in order:
    so we deliberately don't enumerate it here.)
 2. **Does the view show data that doesn't change during a
    session?** → On-mount only. (Examples: architecture diagrams,
-   ADR catalog, JobKind step graphs.)
+   ADR catalog, Workflow step graphs.)
 3. **Otherwise** → Periodic poll, with a cadence based on the
    underlying signal:
    - sub-second cadence underlying → poll at 2-5s

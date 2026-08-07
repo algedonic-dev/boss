@@ -45,7 +45,7 @@ DENYLIST=(
 # Known stop-gaps. Each entry is a file path *relative to the
 # repo root*. Removing an entry should cause the lint to flag
 # the violation — the workflow is: complete the matching
-# JobKind protocol-proof, delete the stop-gap seed, drop the
+# Workflow protocol-proof, delete the stop-gap seed, drop the
 # allowlist entry. Tracked under "Job-level financial fact
 # production (close the GL gap)" in TODO.
 ALLOWLIST=(
@@ -128,7 +128,7 @@ seed-bypass-smell: bypass detected.
 The flagged seed files insert rows into projection tables that
 should come from a Job step.done emitting a financial_fact (or
 similar). Per docs/design/seed-vs-emergent-state.md, seeds set
-initial conditions only. Fix: extend a JobKind so the simulator
+initial conditions only. Fix: extend a Workflow so the simulator
 produces this artifact, or accept the empty view until the
 model catches up.
 

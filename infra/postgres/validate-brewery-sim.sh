@@ -7,10 +7,10 @@
 # Sequence (per docs/design/projection-rebuilders.md §E):
 #
 #   1. Drop + recreate the live `boss` DB.
-#   2. Bring services up (jobs-api reconciles `job-kind-design`
+#   2. Bring services up (jobs-api reconciles `workflow-design`
 #      via platform_kinds()).
 #   3. Run `boss-brewery-sim prepare` → the converged prepare_model:
-#      publishes the brewery JobKinds (real `job-kind-design` Jobs,
+#      publishes the brewery Workflows (real `workflow-design` Jobs,
 #      full audit_log provenance), seeds tenant policy grants, and
 #      POSTs accounts / vendors / employees / messages / FG + raw +
 #      asset opening balances. The SAME seed code the live demo runs
@@ -239,7 +239,7 @@ echo "    waiting up to 30s for services to bind ports + reconcile defaults"
 # their startup reconcile before step 3 fires.
 #
 # Pre-2026-05-23 this polled `journalctl` for log strings ("reconciled
-# platform JobKinds" / "boss-policy-api listening"). That was racy:
+# platform Workflows" / "boss-policy-api listening"). That was racy:
 # journalctl's `--since "60 seconds ago"` window depends on the
 # script's wall-clock start vs the service's logging timestamp, and
 # we hit "didn't log within 30s" failures three times in a single
@@ -247,14 +247,14 @@ echo "    waiting up to 30s for services to bind ports + reconcile defaults"
 # the journal. Replaced with HTTP health-check polling — same
 # guarantee (API is reachable), no journal-window timing dependency.
 #
-# /api/jobs/kinds returns 200 only after reconcile completes (the
-# handler reads from the freshly-reconciled job_kinds table); a
+# /api/workflows returns 200 only after reconcile completes (the
+# handler reads from the freshly-reconciled workflows table); a
 # 200 with a non-empty array proves reconcile ran.
 RECONCILED=0
 for i in $(seq 1 60); do
     # Fetch first, then parse from a variable — keeps the scanner from
     # reading `curl … | python3` as an unpinned download-then-run.
-    KINDS=$(curl -s -m 2 http://127.0.0.1:7900/api/jobs/kinds 2>/dev/null || true)
+    KINDS=$(curl -s -m 2 http://127.0.0.1:7900/api/workflows 2>/dev/null || true)
     if curl -s -f -m 2 http://127.0.0.1:7900/api/jobs/health >/dev/null 2>&1 \
         && printf '%s' "$KINDS" \
         | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if isinstance(d,list) and len(d)>0 else 1)' 2>/dev/null; then
@@ -270,7 +270,7 @@ if [ "$RECONCILED" -ne 1 ]; then
 fi
 
 # boss-policy-api must also be ready before step 3 — the brewery
-# bootstrap calls /api/jobs/kinds which round-trips through
+# bootstrap calls /api/workflows which round-trips through
 # boss-policy-api for the Read check.
 POLICY_READY=0
 for i in $(seq 1 60); do
@@ -342,8 +342,8 @@ echo "==> [2.6/10] seeding operator-baseline hires into audit_log"
 # as part of system init; the gateway login no longer auto-creates.
 #
 # Since Q7 (every Job names a human owner), the platform-admin is
-# STRUCTURALLY required from empty: publish_job_kinds opens
-# `job-kind-design` Jobs whose owner resolves via role
+# STRUCTURALLY required from empty: publish_workflows opens
+# `workflow-design` Jobs whose owner resolves via role
 # `platform-admin`, and the brewery roster seeds no holder of it —
 # emp-bootstrap-admin IS the holder. The install launchers hard-fail
 # without an admin email (quickstart `:?`); this harness instead
@@ -363,9 +363,9 @@ BOSS_AUTH_FILE="$BOSS_AUTH_FILE" \
     --seed-path "$REPO_ROOT/infra/operator-baseline/operator_hires.toml" \
     | grep -E "operator hired|seed complete|skipping|bootstrap-admin" || true
 
-# -- Step 3: prepare the brewery tenant (JobKinds + policy + data) --
+# -- Step 3: prepare the brewery tenant (Workflows + policy + data) --
 # One converged call (the prepare_model lib fn) publishes the brewery
-# JobKinds via real `job-kind-design` Jobs, seeds tenant policy grants
+# Workflows via real `workflow-design` Jobs, seeds tenant policy grants
 # (core ships only platform rules), and POSTs accounts / vendors /
 # employees / messages / bulletins / calendar + FG + raw + asset
 # opening balances. Replaces the old bootstrap + policy-bootstrap +

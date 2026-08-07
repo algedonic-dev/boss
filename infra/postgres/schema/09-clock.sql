@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS sim_clock (
     -- The baseline is a BUILD ARTIFACT with an age, and the demo
     -- replays it forever: every restart-epoch trims back to
     -- epoch_baseline_audit_id, so nothing merged after the cut —
-    -- seed values, JobKind specs, Class rows — exists in the running
+    -- seed values, Workflow specs, Class rows — exists in the running
     -- tenant until someone re-cuts. That is a deliberate pin, not a
     -- bug, but it is only safe if the pin is legible.
     --

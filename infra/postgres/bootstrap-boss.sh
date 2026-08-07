@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Bootstrap the primary `boss` database. Drops + recreates +
-# applies the per-module schema + grants + seeds the JobKind registry. Thin
+# applies the per-module schema + grants + seeds the Workflow registry. Thin
 # wrapper over bootstrap-db.sh.
 #
 # Usage:

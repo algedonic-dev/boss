@@ -1,4 +1,4 @@
-//! Delegate-subjob (JobKind v2, D7) smoke test.
+//! Delegate-subjob (Workflow v2, D7) smoke test.
 //!
 //! Exercises the two dispatcher rules that drive the spawn → link →
 //! resolve loop through the real match-then-dispatch path (the same
@@ -22,7 +22,7 @@ name = "spawn-subjob-on-delegate-subjob-step-ready"
 on_event = "step.ready.delegate-subjob"
 [[rule.do]]
 handler = "jobs.spawn"
-args = { kind = "metadata.subjob_kind", subject_kind = "subject_kind", subject = "subject_id", parent_step_id = "step_id" }
+args = { kind = "metadata.subworkflow", subject_kind = "subject_kind", subject = "subject_id", parent_step_id = "step_id" }
 
 [[rule]]
 name = "resolve-subjob-on-child-job-closed"
@@ -39,14 +39,14 @@ async fn step_ready_delegate_subjob_fires_spawn_with_resolved_args() {
     // The `step.ready.delegate-subjob` marker payload, mirroring what
     // boss-jobs `emit_step_ready` publishes: job/step ids, subject
     // identity from the parent Job, and the step metadata carrying the
-    // child JobKind to spawn.
+    // child Workflow to spawn.
     let payload = json!({
         "job_id": "parent-job-1",
         "step_id": "parent-step-1",
         "kind": "delegate-subjob",
         "subject_kind": "asset",
         "subject_id": "SYS-42",
-        "metadata": { "subjob_kind": "equipment-repair" }
+        "metadata": { "subworkflow": "equipment-repair" }
     });
 
     let matched = match_event(&reg, "step.ready.delegate-subjob", &payload, &NoHelpers).unwrap();

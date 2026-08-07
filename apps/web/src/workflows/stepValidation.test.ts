@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { lintSteps } from './stepValidation';
-import type { StepSpec } from './jobKindTypes';
+import type { StepSpec } from './workflowTypes';
 
 const step = (over: Partial<StepSpec>): StepSpec => ({
   title: 'x',

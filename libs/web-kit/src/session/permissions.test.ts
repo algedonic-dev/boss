@@ -7,10 +7,10 @@ describe('canSeeRoute — platform-admin is the super-admin and sees every surfa
   // Regression: `platform-admin` was missing from ROUTE_ACCESS, so the
   // sidebar collapsed to the always-on routes only — even though the
   // policy layer grants it Scope::All on every resource, and it's the
-  // role the job-kind-design approve step requires. It must surface the
+  // role the workflow-design approve step requires. It must surface the
   // full set (esp. the admin/KB surfaces an operator needs to author).
   const surfaces: RouteName[] = [
-    'job-kinds', 'policy', 'system-kb', 'system-design', 'system-step-plugins',
+    'workflows', 'policy', 'system-kb', 'system-design', 'system-step-plugins',
     'people', 'catalog', 'accounts', 'finance', 'exec', 'auth-admin',
   ];
   for (const r of surfaces) {
@@ -26,7 +26,7 @@ describe('canSeeRoute — platform-admin is the super-admin and sees every surfa
 
 describe('canSeeRoute — unknown roles fall through safely', () => {
   test('an unrecognized role sees only the always-on routes', () => {
-    expect(canSeeRoute('totally-made-up-role', 'job-kinds')).toBe(false);
+    expect(canSeeRoute('totally-made-up-role', 'workflows')).toBe(false);
     expect(canSeeRoute('totally-made-up-role', 'workflows')).toBe(true);
     expect(canSeeRoute('totally-made-up-role', 'inbox')).toBe(true);
   });

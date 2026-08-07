@@ -11,9 +11,9 @@
   import { expiringCerts } from '../people/utils';
   import { humanizeClassCode, type Employee } from '../people/types';
   import {
-    jobKindSurfaces,
-    type JobKindSpec,
-  } from '../job-kinds/jobKindTypes';
+    workflowSurfaces,
+    type WorkflowSpec,
+  } from '../workflows/workflowTypes';
   import { href } from '../router';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
 
@@ -39,8 +39,8 @@
   let roster = $state<Employee[]>([]);
   let counts = $state<JobCounts>({});
   let recentJobs = $state<LiveJob[]>([]);
-  // Kind-slugs whose JobKind declares `metadata.surfaces ⊇ ['qa']`.
-  // Discovered from /api/jobs/kinds so this page tracks the registry
+  // Kind-slugs whose Workflow declares `metadata.surfaces ⊇ ['qa']`.
+  // Discovered from /api/workflows so this page tracks the registry
   // instead of hardcoding brewery slugs. Drives both the open-job
   // counts and the recent-jobs feed below.
   let qaKinds = $state<Set<string>>(new Set());
@@ -56,19 +56,19 @@
           fetch('/api/people'),
           fetch('/api/jobs/summary?status=open'),
           fetch('/api/jobs/live'),
-          fetch('/api/jobs/kinds'),
+          fetch('/api/workflows'),
         ]);
         const pBody = pResp.ok ? ((await pResp.json()) as Employee[]) : [];
         const sBody = sResp.ok ? await sResp.json() : { counts: {} };
         const lBody = lResp.ok ? await lResp.json() : { recent: [] };
-        const kBody = kResp.ok ? ((await kResp.json()) as JobKindSpec[]) : [];
+        const kBody = kResp.ok ? ((await kResp.json()) as WorkflowSpec[]) : [];
         if (!cancelled) {
           roster = pBody;
           counts = (sBody.counts ?? {}) as JobCounts;
           recentJobs = (lBody.recent ?? []) as LiveJob[];
           qaKinds = new Set(
             kBody
-              .filter((k) => jobKindSurfaces(k).includes('qa'))
+              .filter((k) => workflowSurfaces(k).includes('qa'))
               .map((k) => k.kind),
           );
           loading = false;
@@ -178,7 +178,7 @@
             <dd><strong>{labStaff.length}</strong></dd>
           </dl>
           <p class="prose" style="margin-top:8px">
-            Quality work rides on the JobKinds this tenant flags for
+            Quality work rides on the Workflows this tenant flags for
             QA — gravity, pH, IBU, ABV, sensory passes and equipment
             walkdowns, all tracked as Steps on those Jobs.
             <Link to={href('/ux/jobs?status=open')}>

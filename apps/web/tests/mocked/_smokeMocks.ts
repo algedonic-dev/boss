@@ -23,10 +23,10 @@ const EMP = {
   location: 'HQ', employment_type: 'full-time', skills: [], certifications: [],
 };
 
-// A JobKind whose first step OMITS `terminal` (the adversarial serde
+// A Workflow whose first step OMITS `terminal` (the adversarial serde
 // shape) and whose second carries one. Renders on the hub, atlas,
 // workflows list, and the detail page.
-const JOB_KIND = {
+const WORKFLOW = {
   kind: 'seasonal-release', version: 1, status: 'active', label: 'Seasonal Release',
   description: null, category: 'production', subject_kinds: ['asset'],
   steps: [
@@ -80,10 +80,10 @@ export async function installSmokeMocks(page: Page): Promise<void> {
   await page.route(/\/api\/jobs\/live$/, (r) => json(r, { counts: {}, open_total: 0, recent: [], sim_clock: {} }));
   await page.route(/\/api\/jobs\/summary(\?|$)/, (r) => json(r, { counts: {}, total: 0 }));
 
-  // JobKind registry + the adversarial kind (omitted-terminal step).
-  await page.route(/\/api\/jobs\/kinds$/, (r) => json(r, [JOB_KIND]));
-  await page.route(/\/api\/jobs\/kinds\/[^/]+$/, (r) => json(r, JOB_KIND));
-  await page.route(/\/api\/jobs\/kinds\/[^/]+\/versions$/, (r) => json(r, [JOB_KIND]));
+  // Workflow registry + the adversarial kind (omitted-terminal step).
+  await page.route(/\/api\/workflows$/, (r) => json(r, [WORKFLOW]));
+  await page.route(/\/api\/workflows\/[^/]+$/, (r) => json(r, WORKFLOW));
+  await page.route(/\/api\/workflows\/[^/]+\/versions$/, (r) => json(r, [WORKFLOW]));
   await page.route(/\/api\/jobs\/step-types$/, (r) => json(r, [
     { kind: 'generic', label: 'Generic', category: 'generic', ux: 'inline', description: '' },
     { kind: 'task', label: 'Task', category: 'generic', ux: 'inline', description: '' },

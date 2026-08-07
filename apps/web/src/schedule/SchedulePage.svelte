@@ -27,7 +27,7 @@
     status: AssignmentStatus;
     target_job_id: string;
     target_job_title: string | null;
-    target_job_kind: string | null;
+    target_workflow: string | null;
     starts_at: string;
     ends_at: string;
     notes: string | null;

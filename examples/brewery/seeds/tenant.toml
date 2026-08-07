@@ -3,12 +3,12 @@
 # Drives the shape-driven simulator. Sections:
 #
 #   1. [meta]            — tenant identity + sim window
-#   2. [job_rates]       — JobKind creation rates (rows mirror
-#                          job_kinds.toml entries; rate is jobs/day,
+#   2. [job_rates]       — Workflow creation rates (rows mirror
+#                          workflows.toml entries; rate is jobs/day,
 #                          Poisson-sampled)
 #   3. [subject_rates]   — Subject birth rates for the Subject kinds
 #                          the brewery uses
-#   4. [anomalies]       — per-JobKind anomaly probabilities
+#   4. [anomalies]       — per-Workflow anomaly probabilities
 #                          (delays, blocks, cancels, batch losses)
 #   5. [counterparty.*]  — external actors (banks, suppliers,
 #                          distributor courier, tax authority)
@@ -17,7 +17,7 @@
 #                          tax filings)
 #
 # When the shape-driven sim ships, it loads this file + the
-# job_kinds.toml + classes.json + locations.toml + employees.json
+# workflows.toml + classes.json + locations.toml + employees.json
 # from the same `seeds/` directory and runs end-to-end without
 # brewery-specific Rust code.
 #
@@ -158,7 +158,7 @@ calendar    = false  # The "Release calendar" sidebar entry shows
                      # forward-scheduled marketing-launch / tap-launch /
                      # seasonal-release Jobs with explicit release_date
                      # metadata. The brewery operates event-driven —
-                     # JobKinds fire on Poisson schedules, no
+                     # Workflows fire on Poisson schedules, no
                      # forward-dated launch calendar. The reservations
                      # primitive (used by /me/calendar for assignee
                      # scheduling) is a separate surface and stays on.
@@ -206,7 +206,7 @@ sim         = true   # Simulator surface (admin-gated)
 it          = true   # IT integrations panel (Chase / Stripe / ADP / DOR)
 
 # ---------------------------------------------------------------------------
-# JobKind creation rates (jobs/day at steady state).
+# Workflow creation rates (jobs/day at steady state).
 #
 # Sim Poisson-samples each rate per day. Ramps (rate increases over
 # time as the brewery grows) are captured per-kind with [[ramp]]
@@ -340,7 +340,7 @@ subject_distribution = { "acc-prospect-000" = 0.034, "acc-prospect-001" = 0.034,
 [job_rates.wholesale-keg-order]
 # 48 wholesale orders/day at steady state. wholesale-keg-order
 # metadata_defaults are re-priced to realistic self-distributed draft
-# (half-BBL $185, sixtel $65 → ~$1,570/invoice avg; see job_kinds.toml),
+# (half-BBL $185, sixtel $65 → ~$1,570/invoice avg; see workflows.toml),
 # so 48 × ~$1,570 × 365 ≈ $27.5M/yr wholesale. Margin is an emergent
 # output of realistic inputs, never a tuned target. Pre-2025-04 rates
 # ramp from launch through growth so the historical chart shows arc.
@@ -444,7 +444,7 @@ month_multipliers = { 1 = 0.5, 2 = 0.7, 3 = 1.3, 4 = 1.2, 5 = 1.0, 6 = 0.9, 7 = 
 # fired purely by the dispatcher's `spawn-restock-on-low-inventory`
 # rule (`on_hand <= reorder_point AND NOT open_po_exists`), which
 # delivers ~a month of consumption per order (see the restock
-# JobKind's expected_items). A periodic baseline here is actively
+# Workflow's expected_items). A periodic baseline here is actively
 # harmful: its open PO trips the open-PO dedup and *caps* the
 # demand-driven reorder at the periodic rate — which starves the
 # realistic 250-BBL grain bill and drains raw inventory to zero
@@ -524,7 +524,7 @@ subject_distribution = { "acc-bigseed-0000" = 1.0 }
 
 # brewery-hire + brewery-terminate are RATE = 0 today.
 #
-# The JobKind has `subject_kinds = ["employee"]`, which means the
+# The Workflow has `subject_kinds = ["employee"]`, which means the
 # engine picks an EXISTING employee as the Job subject. That's the
 # wrong shape for a hire — a hire job should target a candidate
 # (no employee yet) and bind to a new id at the offer step. With
@@ -538,11 +538,11 @@ subject_distribution = { "acc-bigseed-0000" = 1.0 }
 # Same shape problem for brewery-terminate. The 750-employee
 # roster from `examples/brewery/seeds/employees.json` already
 # delivers the demo's "real-brewery headcount" feel; sim-driven
-# turnover doesn't add visible value until the hire JobKind is
+# turnover doesn't add visible value until the hire Workflow is
 # rewritten to target candidates instead of existing employees
 # (filed as TODO under "Fix duplicate executive hires").
 #
-# Rates set to 0 keeps the JobKinds in the registry (so an
+# Rates set to 0 keeps the Workflows in the registry (so an
 # operator can still walk one through the SPA manually) while
 # stopping the sim from emitting them.
 [job_rates.brewery-hire]
@@ -585,7 +585,7 @@ rate = 0.02
 created_event_kind = "inventory.vendor.created"
 
 [subject_rates.employee]
-# Sim-driven hiring is owned by the brewery-hire JobKind; this rate
+# Sim-driven hiring is owned by the brewery-hire Workflow; this rate
 # is for non-Job employee creation (e.g., backfilling the seeded
 # roster). Set to zero — employees come from `employees.json` +
 # brewery-hire Jobs. No `created_event_kind` because rate=0 means
@@ -614,7 +614,7 @@ rate = 0.3
 created_event_kind = "customers.customer.created"
 
 # ---------------------------------------------------------------------------
-# Anomaly probabilities — likelihood that a Step on a given JobKind
+# Anomaly probabilities — likelihood that a Step on a given Workflow
 # experiences a given anomaly during its execution. Sim rolls these
 # at step in-progress → done time.
 # ---------------------------------------------------------------------------
@@ -678,7 +678,7 @@ post_offer_decline_probability = 0.10
 #   `account_team_members`; SPA route `/practices` → `/accounts`;
 #   28+ Rust crates and the SPA had `practice` → `account` /
 #   `Practice` → `Account` rewritten in one mechanical pass. The
-#   brewery's wholesale-keg-order + seasonal-release JobKinds now
+#   brewery's wholesale-keg-order + seasonal-release Workflows now
 #   target `subject_kinds = ["account"]` directly, no more
 #   "Account is close-but-not-quite" framing.
 #
@@ -700,16 +700,16 @@ post_offer_decline_probability = 0.10
 #   directly off `StepRegistry::get(kind)` instead of carrying
 #   per-domain Rust generators.
 #
-# GAP 5: JobKind doesn't declare cross-Job triggers.
-#   RESOLVED (data shape) — `JobKindSpec` gained
-#   `on_complete_create: Vec<JobTrigger>` and the `job_kinds` table
+# GAP 5: Workflow doesn't declare cross-Job triggers.
+#   RESOLVED (data shape) — `WorkflowSpec` gained
+#   `on_complete_create: Vec<JobTrigger>` and the `workflows` table
 #   gained an `on_complete_create JSONB` column with `[]` default.
 #   Each `JobTrigger` carries a kind + subject_source +
 #   metadata_seed; round-trips through JSON cleanly.
 #
 #   The runtime that actually fires triggers when a Job closes is
 #   shipped separately — likely a NATS subscriber inside
-#   boss-jobs-api that reads the closing Job's JobKind, walks
+#   boss-jobs-api that reads the closing Job's Workflow, walks
 #   on_complete_create, and spawns child Jobs. Brewery doesn't yet
 #   need it (billing tier closes the loop in-Job); the data shape
 #   is here so a follow-up tenant or the used-device-shop migration
@@ -717,7 +717,7 @@ post_offer_decline_probability = 0.10
 
 # ---------------------------------------------------------------------------
 # Random shocks — quarterly probabilistic events that bump a
-# JobKind's rate (or one Subject's draws) for a fixed window.
+# Workflow's rate (or one Subject's draws) for a fixed window.
 # Models real-world disruption that a steady Poisson rate misses.
 # Empty `target.subject_id` + empty `subject_id_pattern` =
 # kind-wide multiplier. With `subject_id_pattern` the engine picks
@@ -863,7 +863,7 @@ emit_probability = 1.0
 # "delivered" scan), which is the honest behavior. Trigger is the
 # per-step-kind topic the shape-driven engine emits when a
 # `shipment` step transitions to done — the wholesale-keg-order
-# JobKind's tier-5 "Deliver" step lands the courier on the bus
+# Workflow's tier-5 "Deliver" step lands the courier on the bus
 # naturally.
 # Success-gated (step.completed.shipment) — the shipment step's
 # `shipping.create` side-effect creates the row that tracking
@@ -936,7 +936,7 @@ cadence = "daily"
 anchor_date = "2025-04-02"
 business_calendar = "us-banking"
 action.kind = "open_job"
-action.job_kind = "ap-payment-run"
+action.workflow = "ap-payment-run"
 action.subject_kind = "company"
 action.subject_id = "brewery"
 
@@ -944,7 +944,7 @@ action.subject_id = "brewery"
 cadence = "monthly"
 anchor_date = "2024-01-15"
 action.kind = "open_job"
-action.job_kind = "equipment-preventive-maintenance"
+action.workflow = "equipment-preventive-maintenance"
 action.subject_kind = "company"
 action.subject_id = "brewery"
 
@@ -955,14 +955,14 @@ action.subject_id = "brewery"
 # the roster warms, and the dispatcher doesn't retry a missed assignment —
 # tracked as a follow-up). Day-5 fires once the roster is loaded and still
 # leaves ample runway to close inside a 14-day window. Opens
-# facility-overhead on the brewery location; the JobKind approves rent
+# facility-overhead on the brewery location; the Workflow approves rent
 # (→6200) + utilities (→6300) through the ledger AP subledger, then pays
 # them. ~$3.6M/yr of OpEx the brewery's P&L was previously missing.
 [periodic.monthly-facility-overhead]
 cadence = "monthly"
 anchor_date = "2024-01-05"
 action.kind = "open_job"
-action.job_kind = "facility-overhead"
+action.workflow = "facility-overhead"
 action.subject_kind = "company"
 action.subject_id = "brewery"
 
@@ -973,7 +973,7 @@ action.subject_id = "brewery"
 # this; caught 2026-05-06 during Stage 4 of the BatchEngine
 # rip). The four finance-cadence specs below all anchor on
 # `(company, brewery)` — Q6: org-level work is about the
-# organization itself; their JobKinds declare
+# organization itself; their Workflows declare
 # `subject_kinds = ["company"]`.
 # Quarterly sales-tax filing. Re-enabled 2026-06-13: the billing
 # dispatcher rule (invoice-issue-on-billing-step-done) now threads CA
@@ -990,11 +990,11 @@ cadence = "quarterly"
 anchor_date = "2024-01-31"
 business_calendar = "us-tax"
 action.kind = "open_job"
-action.job_kind = "sales-tax-filing"
+action.workflow = "sales-tax-filing"
 action.subject_kind = "company"
 action.subject_id = "brewery"
 
-# Biweekly payroll-run. Opens the payroll-run JobKind on
+# Biweekly payroll-run. Opens the payroll-run Workflow on
 # Thursdays starting 2024-01-04. Steps walk calculate → review
 # → release; the terminal `payroll-release` step's
 # `ledger.payroll.run.submit` side-effect (rules.toml) posts the
@@ -1006,12 +1006,12 @@ cadence = "biweekly"
 anchor_date = "2024-01-04"
 business_calendar = "us-banking"
 action.kind = "open_job"
-action.job_kind = "payroll-run"
+action.workflow = "payroll-run"
 action.subject_kind = "company"
 action.subject_id = "brewery"
 
 # Quarterly federal payroll tax filing (Form 941). One filing
-# per closed quarter. Opens the payroll-941-filing JobKind whose
+# per closed quarter. Opens the payroll-941-filing Workflow whose
 # terminal tax-remittance step's existing ledger.tax.remit
 # handler emits the canonical TaxFilingSnapshot.
 [periodic.quarterly-payroll-941]
@@ -1019,31 +1019,31 @@ cadence = "quarterly"
 anchor_date = "2024-01-15"
 business_calendar = "us-banking"
 action.kind = "open_job"
-action.job_kind = "payroll-941-filing"
+action.workflow = "payroll-941-filing"
 action.subject_kind = "company"
 action.subject_id = "brewery"
 
 # Quarterly estimated income tax. Same shape as payroll-941;
-# routes through the income-tax-filing JobKind's tax-remittance
+# routes through the income-tax-filing Workflow's tax-remittance
 # step.
 [periodic.quarterly-income-tax]
 cadence = "quarterly"
 anchor_date = "2024-01-15"
 business_calendar = "us-banking"
 action.kind = "open_job"
-action.job_kind = "income-tax-filing"
+action.workflow = "income-tax-filing"
 action.subject_kind = "company"
 action.subject_id = "brewery"
 
 # Quarterly federal beer excise tax (TTB). Same shape as payroll-941;
-# routes through the excise-tax-filing JobKind's tax-remittance step,
+# routes through the excise-tax-filing Workflow's tax-remittance step,
 # draining the 2320 Excise Tax Payable balance accrued per brew batch.
 [periodic.quarterly-excise]
 cadence = "quarterly"
 anchor_date = "2024-01-15"
 business_calendar = "us-banking"
 action.kind = "open_job"
-action.job_kind = "excise-tax-filing"
+action.workflow = "excise-tax-filing"
 action.subject_kind = "company"
 action.subject_id = "brewery"
 
@@ -1051,15 +1051,15 @@ action.subject_id = "brewery"
 # Batch [batch.*] specs retired 2026-05-06 — see TODO.md
 # "Strip BatchEngine" for the why. The four batch rows that lived
 # here (payroll, sales-tax, payroll-941, income-tax) bypassed the
-# JobKind / Step / audit-trail by emitting canonical events
+# Workflow / Step / audit-trail by emitting canonical events
 # directly — a developer-convenience back door that produced
 # financial entries no operator could review. Replaced by
-# `[periodic.*]` specs (above) that open honest JobKinds whose
+# `[periodic.*]` specs (above) that open honest Workflows whose
 # terminal step's side-effect handler POSTs to the canonical
 # `/api/ledger/*` endpoints. All five tax/payroll filings
 # (payroll-run, payroll-941-filing, income-tax-filing,
 # sales-tax-filing, excise-tax-filing) now run through that
-# periodic + JobKind + ledger path.
+# periodic + Workflow + ledger path.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------

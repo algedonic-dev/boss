@@ -54,7 +54,7 @@ impl PgJobs {
 struct JobRow {
     id: uuid::Uuid,
     kind: String,
-    job_kind_version: i32,
+    workflow_version: i32,
     subject_kind: String,
     subject_id: String,
     title: String,
@@ -90,13 +90,13 @@ struct StepRow {
 
 /// Joined row backing [`PgJobs::list_assignments`] — a `StepRow`
 /// (flattened) plus the minimum Job context the pull surface needs.
-/// `j.kind` is aliased to `job_kind` so it doesn't collide with the
+/// `j.kind` is aliased to `workflow` so it doesn't collide with the
 /// flattened `StepRow.kind` (the step kind).
 #[derive(sqlx::FromRow)]
 struct AssignmentRowSql {
     #[sqlx(flatten)]
     step: StepRow,
-    job_kind: String,
+    workflow: String,
     subject_kind: String,
     subject_id: String,
     priority: String,
@@ -110,7 +110,7 @@ fn row_to_job(r: JobRow) -> Job {
     Job {
         id: JobId::from_uuid(r.id),
         kind: r.kind,
-        job_kind_version: r.job_kind_version,
+        workflow_version: r.workflow_version,
         subject: parse_subject(&r.subject_kind, &r.subject_id),
         title: r.title,
         owner_id: r.owner_id,
@@ -284,7 +284,7 @@ impl JobsRepository for PgJobs {
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
         // Birth-by-job subject kinds (`metadata.birth = "job"` in the
-        // SubjectKind registry: `job-kind`, `custom`) have no domain
+        // SubjectKind registry: `workflow`, `custom`) have no domain
         // table — this Job IS the subject's birth record, so its
         // identity row is minted here, in the same transaction as the
         // job insert (Q1 write-through). Domain kinds don't match the
@@ -313,7 +313,7 @@ impl JobsRepository for PgJobs {
             r#"
             INSERT INTO jobs (id, kind, subject_kind, subject_id, title, owner_id,
                               status, priority, opened_on, due_on, closed_on, metadata, tags,
-                              job_kind_version, created_at, updated_at, simulated)
+                              workflow_version, created_at, updated_at, simulated)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15, $16)
             ON CONFLICT (id) DO NOTHING
             "#,
@@ -331,7 +331,7 @@ impl JobsRepository for PgJobs {
         .bind(job.closed_on)
         .bind(&job.metadata)
         .bind(&job.tags)
-        .bind(job.job_kind_version)
+        .bind(job.workflow_version)
         .bind(now)
         // Decided once, here, from the origin of the request that
         // opened the Job — and never revisited. Everything downstream
@@ -360,7 +360,7 @@ impl JobsRepository for PgJobs {
 
     async fn get_job(&self, id: &JobId) -> Result<Option<Job>, JobsError> {
         let row = sqlx::query_as::<_, JobRow>(
-            "SELECT id, kind, job_kind_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, due_on, closed_on, metadata, tags FROM jobs WHERE id = $1",
+            "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, due_on, closed_on, metadata, tags FROM jobs WHERE id = $1",
         )
         .bind(*id.inner().as_uuid())
         .fetch_optional(&self.pool)
@@ -466,7 +466,7 @@ impl JobsRepository for PgJobs {
         // and returned the full policy-scoped set — which is why
         // /api/jobs?account_id=foo looked empty on every detail page.
         let list_sql = r#"
-            SELECT id, kind, job_kind_version, subject_kind, subject_id, title, owner_id, status,
+            SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status,
                    priority, opened_on, due_on, closed_on, metadata, tags
             FROM jobs
             WHERE ($1::text IS NULL OR kind = $1)
@@ -768,7 +768,7 @@ impl JobsRepository for PgJobs {
                     s.sort_order, s.blocked_by, s.sign_offs_required, s.sign_offs, \
                     s.fields, s.completed_on, s.metadata, s.notes, \
                     s.step_plugin_version, s.embedded_job, \
-                    j.kind AS job_kind, j.subject_kind, j.subject_id, j.priority \
+                    j.kind AS workflow, j.subject_kind, j.subject_id, j.priority \
              FROM steps s \
              JOIN jobs j ON s.job_id = j.id \
              WHERE j.status = 'open' \
@@ -791,7 +791,7 @@ impl JobsRepository for PgJobs {
             .map(|r| {
                 Ok(AssignmentRow {
                     job_id: JobId::from_uuid(r.step.job_id),
-                    job_kind: r.job_kind,
+                    workflow: r.workflow,
                     subject_kind: r.subject_kind,
                     subject_id: r.subject_id,
                     priority: parse_priority(&r.priority),
@@ -811,7 +811,7 @@ impl JobsRepository for PgJobs {
                     s.sort_order, s.blocked_by, s.sign_offs_required, s.sign_offs, \
                     s.fields, s.completed_on, s.metadata, s.notes, \
                     s.step_plugin_version, s.embedded_job, \
-                    j.kind AS job_kind, j.subject_kind, j.subject_id, j.priority \
+                    j.kind AS workflow, j.subject_kind, j.subject_id, j.priority \
              FROM steps s \
              JOIN jobs j ON s.job_id = j.id \
              WHERE j.status = 'open' \
@@ -828,7 +828,7 @@ impl JobsRepository for PgJobs {
             .map(|r| {
                 Ok(AssignmentRow {
                     job_id: JobId::from_uuid(r.step.job_id),
-                    job_kind: r.job_kind,
+                    workflow: r.workflow,
                     subject_kind: r.subject_kind,
                     subject_id: r.subject_id,
                     priority: parse_priority(&r.priority),

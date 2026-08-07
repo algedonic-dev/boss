@@ -6,7 +6,7 @@
 //! `excise_bbl × rate_cents_per_bbl` ($3.50/bbl TTB small-brewer rate)
 //! as DR 6550 Excise Tax Expense / CR 2320 Excise Tax Payable, exactly
 //! the way sales tax accrues per invoice line. The quarterly
-//! excise-tax-filing JobKind later drains 2320 → 1000 Cash. The
+//! excise-tax-filing Workflow later drains 2320 → 1000 Cash. The
 //! liability is credited by this production source fact, not at filing
 //! time, so the filing's `period-excise` derive_basis sums the 2320
 //! credit balance for the period.

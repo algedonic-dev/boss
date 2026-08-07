@@ -65,7 +65,7 @@ tools, buys three things the patchwork can't:
   the way they reason about the operation, because they're the
   same shape.
 - **Adaptability — the model bends as the business does, in
-  data, not code.** New work types are JobKind rows; new
+  data, not code.** New work types are Workflow rows; new
   categories — roles, account tiers, asset models — are registry
   entries; new step UX is a plugin. Reshaping the model is
   editing data, not forking a codebase — which is what keeps a
@@ -114,7 +114,7 @@ by the local install on `:4443`):
 | The full event log streaming as the sim ticks | <http://localhost:4443/system/monitoring/events> |
 | The System Atlas — every service + its event topics | <http://localhost:4443/system/monitoring/atlas> |
 | The brewery's people, with role-based scoped views | <http://localhost:4443/ux/people> |
-| A workflow's anatomy (JobKind authoring surface) | <http://localhost:4443/system/job-kinds> |
+| A workflow's anatomy (Workflow authoring surface) | <http://localhost:4443/system/workflows> |
 
 Both install paths land on `:4443` (gateway in demo mode +
 local-auth). What you see is the head of `main` plus the data
@@ -142,7 +142,7 @@ The workspace splits into four tiers (see CLAUDE.md):
 
 - **Core state-machine OS** — `crates/core/`. The generic primitives every deployment uses:
   Subjects, Jobs, Steps, the audit log + projection rebuilders,
-  the JobKind / StepType / StepPlugin registries, policy,
+  the Workflow / StepType / StepPlugin registries, policy,
   gateway/auth/NATS, calendar, and the two taxonomy registries.
   Tenant-neutral.
 - **Company-modeling layer** — `crates/modules/`. Useful for modeling a company on top of the core:
@@ -156,7 +156,7 @@ The workspace splits into four tiers (see CLAUDE.md):
 - **Tenants** — `crates/tenants/`.
   - **Algedonic Ales** (`boss-brewery-engine`) — the public OSS
     demo tenant. Data-first seeds at `examples/brewery/` (TOML +
-    JSON) plus the brewery-specific JobKinds. Industrial-scale
+    JSON) plus the brewery-specific Workflows. Industrial-scale
     brewer modeled across 5 beer styles.
   - **Used-device-shop** (`boss-used-device-shop-engine`) — sells,
     services, and resells used physical devices needing
@@ -199,7 +199,7 @@ Open `http://127.0.0.1:4443`.
 
 Either way, the bootstrap-admin email you provide becomes the
 seed `platform-admin` Employee, the install seeds the brewery
-tenant (JobKinds, accounts, vendors, reference data), and the live
+tenant (Workflows, accounts, vendors, reference data), and the live
 brewery sim ticks ~1 sim-day per ~43 wall-seconds (warp-2000 demo
 default), building the demo from there. Full runbook + troubleshooting at
 [`infra/oss-quickstart/README.md`](infra/oss-quickstart/README.md).
@@ -255,7 +255,7 @@ The summary:
 |---|---|---|
 | Static checks | `cargo clippy --workspace --all-features --tests -- -D warnings`, `cargo fmt --check`, `bun run typecheck` (svelte-check, strict TS) | CI on every push + PR |
 | Unit + integration tests | ~1,640 Rust `#[test]` cases across the workspace + Svelte component tests; `cargo test --all-features` | CI + local |
-| Lints beyond the type system | `infra/lint/seed-bypass-smell.sh` rejects seed scripts that bypass the JobKind path; `cargo clippy` lint set is the strict superset | CI |
+| Lints beyond the type system | `infra/lint/seed-bypass-smell.sh` rejects seed scripts that bypass the Workflow path; `cargo clippy` lint set is the strict superset | CI |
 | Audit-log integrity | `boss-audit-integrity-check` verifies the per-row hash chain on `audit_log` and the `REVOKE UPDATE, DELETE, TRUNCATE` schema-level append-only enforcement | systemd timer (daily) in prod |
 | Conservation invariants | `infra/lint/conservation-invariants.sh` proves the five-property correctness protocol — provenance, conservation, closure, idempotence, determinism — across every projection vs. the `audit_log` it derives from | systemd timer in prod, on-demand locally |
 | Replay rebuild | `boss-rebuild-all` reconstructs every projection from `audit_log` alone and `infra/verify-replay.sh` diffs the result against live state | on-demand; in CI via `validate-brewery-sim.sh` (runs a sim-year, then asserts a clean rebuild) |

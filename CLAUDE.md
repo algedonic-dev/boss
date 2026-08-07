@@ -95,7 +95,7 @@ BOSS is the software layer of a state machine whose executors are humans
 it *describes* it as a state machine and gives the executors
 instrumentation to run it safely. Concretely: the event log + projections
 are the machine's memory; the StepType registry is the alphabet of legal
-transitions; JobKind is the program written in that alphabet; a Step's
+transitions; Workflow is the program written in that alphabet; a Step's
 `status` is the program counter; Messages + My Day are the work-routing
 surface (not to be confused with the `boss-dispatcher` core service,
 which runs step side-effect rules off `step.done.<kind>` topics);
@@ -110,7 +110,7 @@ The five-property correctness protocol (provenance, conservation,
 closure, idempotence, determinism) named in §Founding ideas above is
 detailed at [docs/design/correctness-protocol.md](docs/design/correctness-protocol.md);
 the seed-side corollary ("if you're writing `INSERT INTO invoices` in
-a seed file, the answer is to fix the JobKind, not the seed") is at
+a seed file, the answer is to fix the Workflow, not the seed") is at
 [docs/design/seed-vs-emergent-state.md](docs/design/seed-vs-emergent-state.md).
 
 For the example domain, see [examples/used-device-shop/DOMAIN.md](examples/used-device-shop/DOMAIN.md).
@@ -222,12 +222,12 @@ The identity-bearing things work is *about*. BOSS treats Subject as a trait: eac
 ### Jobs
 A **Job** is a bounded unit of coordinated work — a sale, a service visit, a hiring pipeline, an onboarding, a vendor-payment chase. Jobs give every piece of work a stable identity, an owner, a subject, a status, and a structured list of Steps.
 
-The **JobKind registry** (`boss-jobs`, backed by the `job_kinds` table) is append-only and versioned. Each kind declares:
+The **Workflow registry** (`boss-jobs`, backed by the `workflows` table) is append-only and versioned. Each kind declares:
 - `subject_kinds` — what the Job can be about
 - `steps` — a flat set of Steps; the DAG is implicit in each step's `ready_when` predicate (an edge A → B exists iff B's `ready_when` references A), not an author-drawn graph
 - `metadata_schema` + `entitlements` — typed fields and policy hooks on the Job itself
 
-**Adding a new workflow means adding a JobKind row**, not touching core code. New versions supersede old ones; in-flight Jobs stay pinned to the version they were opened under. Authoring lives at `/system/job-kinds`.
+**Adding a new workflow means adding a Workflow row**, not touching core code. New versions supersede old ones; in-flight Jobs stay pinned to the version they were opened under. Authoring lives at `/system/workflows`.
 
 ### Steps
 A **Step** is the typed unit of work inside a Job. Each step has a `kind` (from the StepType registry), `status` (pending → ready → active → completed (+ skipped)), optional assignee, `blocked_by` (a predicate-derived denormalized edge list for DAG rendering — recovered from the step's `ready_when` references, not an author-specified gate), optional sign-off, and free-form `metadata`.
@@ -252,7 +252,7 @@ These three hang off the four primitives. They are load-bearing infrastructure, 
 ### How to add a new thing
 The shape of an "add a new thing" change follows the primitives:
 
-1. **New work type** → add a JobKind row (authoring at `/system/job-kinds`), declaring its `steps` (the DAG implicit in their `ready_when` predicates). Usually no Rust code change.
+1. **New work type** → add a Workflow row (authoring at `/system/workflows`), declaring its `steps` (the DAG implicit in their `ready_when` predicates). Usually no Rust code change.
 2. **New step behavior** → add a StepType entry (if the schema is new) + a StepPlugin row + a JS bundle. No core frontend change.
 3. **New domain entity** → a new crate following hexagonal structure: domain types + traits in `boss-core` or a `*-client` port crate, implementation in the service crate, HTTP surface in the service binary.
 4. **New cross-service contract** → extend `boss-core` events or add a `*-client` port shared between consumers.
@@ -319,7 +319,7 @@ the tier it touches.**
 - **`crates/tenants/` — Tier 3: Tenants** (2). Tenant-specific
   binaries. Crates: `boss-brewery-engine` (Algedonic Ales public
   demo) and `boss-used-device-shop-engine` (used-device-shop).
-  Data-side seeds + JobKinds for the brewery tenant live under
+  Data-side seeds + Workflows for the brewery tenant live under
   `examples/brewery/`.
 
 The `infra/lint/tier-import-audit.sh` script enforces the
@@ -439,6 +439,6 @@ Resolutions flush into the source doc's Decision-history section via the tracker
 - No "just in case" code — delete it; the working tree is the canonical record
 - No framework lock-in — frameworks are adapters, not architecture
 - No blocking I/O in async contexts
-- No bespoke workflow code paths — new work types are **JobKind rows**, not `match` branches in core code
+- No bespoke workflow code paths — new work types are **Workflow rows**, not `match` branches in core code
 - No bespoke step UX in `apps/web` core — new surfaces ship as **StepPlugin rows + a JS bundle**
 - No tenant-specific assumptions in BOSS core — keep used-device-shop logic in the example crates

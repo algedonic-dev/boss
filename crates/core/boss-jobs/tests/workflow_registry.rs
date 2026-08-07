@@ -1,4 +1,4 @@
-//! End-to-end proof that the JobKind registry HTTP surface works:
+//! End-to-end proof that the Workflow registry HTTP surface works:
 //! create → draft visible → publish → active → publish-again
 //! transitions versioning correctly → retire hides the kind.
 
@@ -10,9 +10,9 @@ use axum::http::{Request, StatusCode};
 use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
 use boss_jobs::http::{JobsApiState, router};
-use boss_jobs::registry::{JobKindRegistry, JobKindSpec, JobKindStatus, StepSpec, Terminal};
+use boss_jobs::registry::{StepSpec, Terminal, WorkflowRegistry, WorkflowSpec, WorkflowStatus};
 use boss_jobs::step_registry::StepRegistry;
-use boss_jobs::{InMemoryJobKinds, InMemoryJobs};
+use boss_jobs::{InMemoryJobs, InMemoryWorkflows};
 use boss_policy_client::{AccessTier, Action, Resource, Scope, User};
 use boss_policy_client::{FakePolicyClient, PolicyClient};
 use boss_testing::RecordingEventBus;
@@ -45,8 +45,8 @@ fn user_header(u: &User) -> String {
     serde_json::to_string(u).unwrap()
 }
 
-fn draft_spec(kind: &str) -> JobKindSpec {
-    JobKindSpec::platform_seed(
+fn draft_spec(kind: &str) -> WorkflowSpec {
+    WorkflowSpec::platform_seed(
         kind,
         format!("Test {kind}"),
         "test",
@@ -55,7 +55,7 @@ fn draft_spec(kind: &str) -> JobKindSpec {
     )
 }
 
-fn build_app(registry: Arc<dyn JobKindRegistry>) -> Router {
+fn build_app(registry: Arc<dyn WorkflowRegistry>) -> Router {
     let jobs = Arc::new(InMemoryJobs::new());
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
@@ -63,11 +63,11 @@ fn build_app(registry: Arc<dyn JobKindRegistry>) -> Router {
     let step_registry = Arc::new(StepRegistry::v1());
     let policy: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
-            .allow("cto", Action::Read, Resource::job_kind(), Scope::All)
-            .allow("cto", Action::Create, Resource::job_kind(), Scope::All)
-            .allow("cto", Action::Update, Resource::job_kind(), Scope::All)
-            .allow("cto", Action::Publish, Resource::job_kind(), Scope::All)
-            .allow("cto", Action::Retire, Resource::job_kind(), Scope::All)
+            .allow("cto", Action::Read, Resource::workflow(), Scope::All)
+            .allow("cto", Action::Create, Resource::workflow(), Scope::All)
+            .allow("cto", Action::Update, Resource::workflow(), Scope::All)
+            .allow("cto", Action::Publish, Resource::workflow(), Scope::All)
+            .allow("cto", Action::Retire, Resource::workflow(), Scope::All)
             .build(),
     );
     let state = JobsApiState {
@@ -108,7 +108,7 @@ async fn send_json(
     app.oneshot(builder.body(body).unwrap()).await.unwrap()
 }
 
-// --- author-time dry-run lint (POST /api/jobs/kinds/_validate) ---
+// --- author-time dry-run lint (POST /api/workflows/_validate) ---
 
 fn trigger_step() -> StepSpec {
     StepSpec {
@@ -131,11 +131,11 @@ fn terminal_step() -> StepSpec {
     }
 }
 
-async fn dry_run(app: Router, spec: &JobKindSpec) -> serde_json::Value {
+async fn dry_run(app: Router, spec: &WorkflowSpec) -> serde_json::Value {
     let resp = send_json(
         app,
         "POST",
-        "/api/jobs/kinds/_validate",
+        "/api/workflows/_validate",
         &cto(),
         Some(serde_json::json!({ "kind": spec.kind, "steps": spec.steps })),
     )
@@ -147,7 +147,7 @@ async fn dry_run(app: Router, spec: &JobKindSpec) -> serde_json::Value {
 
 #[tokio::test]
 async fn dry_run_validate_passes_a_viable_spec() {
-    let registry: Arc<dyn JobKindRegistry> = Arc::new(InMemoryJobKinds::new());
+    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
     let app = build_app(registry);
     let mut spec = draft_spec("viable");
     spec.steps = vec![trigger_step(), terminal_step()];
@@ -163,7 +163,7 @@ async fn dry_run_validate_passes_a_viable_spec() {
 
 #[tokio::test]
 async fn dry_run_validate_flags_missing_terminal_without_persisting() {
-    let registry: Arc<dyn JobKindRegistry> = Arc::new(InMemoryJobKinds::new());
+    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
     let app = build_app(registry.clone());
     let mut spec = draft_spec("no-terminal");
     spec.steps = vec![trigger_step()]; // trigger only — no terminal
@@ -190,24 +190,24 @@ async fn dry_run_validate_flags_missing_terminal_without_persisting() {
 
 #[tokio::test]
 async fn full_create_publish_retire_cycle() {
-    let registry: Arc<dyn JobKindRegistry> = Arc::new(InMemoryJobKinds::new());
+    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
     let app = build_app(registry.clone());
 
     // 1. Create draft.
     let body = serde_json::to_value(draft_spec("warranty-rework")).unwrap();
-    let resp = send_json(app.clone(), "POST", "/api/jobs/kinds", &cto(), Some(body)).await;
+    let resp = send_json(app.clone(), "POST", "/api/workflows", &cto(), Some(body)).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let returned: JobKindSpec = serde_json::from_slice(&body_bytes).unwrap();
+    let returned: WorkflowSpec = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(returned.version, 1);
-    assert_eq!(returned.status, JobKindStatus::Draft);
+    assert_eq!(returned.status, WorkflowStatus::Draft);
 
-    // 2. GET /api/jobs/kinds/warranty-rework returns 404 — no active yet.
+    // 2. GET /api/workflows/warranty-rework returns 404 — no active yet.
     let resp = send_json(
         app.clone(),
         "GET",
-        "/api/jobs/kinds/warranty-rework",
+        "/api/workflows/warranty-rework",
         &cto(),
         None,
     )
@@ -218,7 +218,7 @@ async fn full_create_publish_retire_cycle() {
     let resp = send_json(
         app.clone(),
         "POST",
-        "/api/jobs/kinds/warranty-rework/publish",
+        "/api/workflows/warranty-rework/publish",
         &cto(),
         None,
     )
@@ -229,15 +229,15 @@ async fn full_create_publish_retire_cycle() {
     let resp = send_json(
         app.clone(),
         "GET",
-        "/api/jobs/kinds/warranty-rework",
+        "/api/workflows/warranty-rework",
         &cto(),
         None,
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let active: JobKindSpec = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(active.status, JobKindStatus::Active);
+    let active: WorkflowSpec = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(active.status, WorkflowStatus::Active);
     assert_eq!(active.version, 1);
 
     // 5. PUT a new version (draft v2) and publish → v1 retires, v2 active.
@@ -250,7 +250,7 @@ async fn full_create_publish_retire_cycle() {
     let resp = send_json(
         app.clone(),
         "PUT",
-        "/api/jobs/kinds/warranty-rework",
+        "/api/workflows/warranty-rework",
         &cto(),
         Some(v2_body),
     )
@@ -259,7 +259,7 @@ async fn full_create_publish_retire_cycle() {
     let resp = send_json(
         app.clone(),
         "POST",
-        "/api/jobs/kinds/warranty-rework/publish",
+        "/api/workflows/warranty-rework/publish",
         &cto(),
         None,
     )
@@ -270,24 +270,24 @@ async fn full_create_publish_retire_cycle() {
     let resp = send_json(
         app.clone(),
         "GET",
-        "/api/jobs/kinds/warranty-rework/versions",
+        "/api/workflows/warranty-rework/versions",
         &cto(),
         None,
     )
     .await;
     let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let versions: Vec<JobKindSpec> = serde_json::from_slice(&body_bytes).unwrap();
+    let versions: Vec<WorkflowSpec> = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(versions.len(), 2);
     assert_eq!(versions[0].version, 1);
-    assert_eq!(versions[0].status, JobKindStatus::Retired);
+    assert_eq!(versions[0].status, WorkflowStatus::Retired);
     assert_eq!(versions[1].version, 2);
-    assert_eq!(versions[1].status, JobKindStatus::Active);
+    assert_eq!(versions[1].status, WorkflowStatus::Active);
 
     // 7. Retire the active kind.
     let resp = send_json(
         app.clone(),
         "POST",
-        "/api/jobs/kinds/warranty-rework/retire",
+        "/api/workflows/warranty-rework/retire",
         &cto(),
         None,
     )
@@ -295,7 +295,7 @@ async fn full_create_publish_retire_cycle() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // 8. Active lookup now 404s.
-    let resp = send_json(app, "GET", "/api/jobs/kinds/warranty-rework", &cto(), None).await;
+    let resp = send_json(app, "GET", "/api/workflows/warranty-rework", &cto(), None).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -303,7 +303,7 @@ async fn full_create_publish_retire_cycle() {
 async fn guest_cannot_publish_even_if_they_could_create() {
     // A policy where guests can create drafts but can't publish. Verifies
     // that Publish is independently gated from Create, per the design.
-    let registry: Arc<dyn JobKindRegistry> = Arc::new(InMemoryJobKinds::new());
+    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
     let jobs = Arc::new(InMemoryJobs::new());
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
@@ -311,8 +311,8 @@ async fn guest_cannot_publish_even_if_they_could_create() {
     let step_registry = Arc::new(StepRegistry::v1());
     let policy: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
-            .allow("guest", Action::Read, Resource::job_kind(), Scope::All)
-            .allow("guest", Action::Create, Resource::job_kind(), Scope::All)
+            .allow("guest", Action::Read, Resource::workflow(), Scope::All)
+            .allow("guest", Action::Create, Resource::workflow(), Scope::All)
             .build(),
     );
     let state = JobsApiState {
@@ -335,7 +335,7 @@ async fn guest_cannot_publish_even_if_they_could_create() {
     let resp = send_json(
         app.clone(),
         "POST",
-        "/api/jobs/kinds",
+        "/api/workflows",
         &guest(),
         Some(serde_json::to_value(draft_spec("exploratory")).unwrap()),
     )
@@ -346,7 +346,7 @@ async fn guest_cannot_publish_even_if_they_could_create() {
     let resp = send_json(
         app,
         "POST",
-        "/api/jobs/kinds/exploratory/publish",
+        "/api/workflows/exploratory/publish",
         &guest(),
         None,
     )
@@ -356,32 +356,32 @@ async fn guest_cannot_publish_even_if_they_could_create() {
 
 #[tokio::test]
 async fn list_kinds_filters_by_category() {
-    let registry = Arc::new(InMemoryJobKinds::new());
+    let registry = Arc::new(InMemoryWorkflows::new());
     // Seed two actives across two categories — use the raw seed helper
     // so we don't have to drive publish for every one.
     let mut refurb = draft_spec("refurb-test");
-    refurb.status = JobKindStatus::Active;
+    refurb.status = WorkflowStatus::Active;
     refurb.category = "refurb".into();
     registry.seed(refurb).unwrap();
     let mut sale = draft_spec("sale-test");
-    sale.status = JobKindStatus::Active;
+    sale.status = WorkflowStatus::Active;
     sale.category = "sales".into();
     registry.seed(sale).unwrap();
 
-    let registry_dyn: Arc<dyn JobKindRegistry> = registry;
+    let registry_dyn: Arc<dyn WorkflowRegistry> = registry;
     let app = build_app(registry_dyn);
 
     let resp = send_json(
         app.clone(),
         "GET",
-        "/api/jobs/kinds?category=sales",
+        "/api/workflows?category=sales",
         &cto(),
         None,
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let kinds: Vec<JobKindSpec> = serde_json::from_slice(&body_bytes).unwrap();
+    let kinds: Vec<WorkflowSpec> = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(kinds.len(), 1);
     assert_eq!(kinds[0].kind, "sale-test");
 }

@@ -16,7 +16,7 @@
 //!    holders yet stays deterministic across replays.
 //! 3. No `owner_role`? Fall back to the first role-bearing step's
 //!    `authority_role` — the platform meta-kinds resolve this way
-//!    (job-kind-design → a job-kind-approver holder).
+//!    (workflow-design → a workflow-approver holder).
 //! 4. Nothing resolves → the create is rejected. A Job with no
 //!    responsible human is the modeling error Q7 exists to end.
 //!
@@ -282,8 +282,8 @@ mod tests {
 
     #[tokio::test]
     async fn step_authority_role_is_the_fallback() {
-        let roster = InMemoryRoster::new().with_holder("job-kind-approver", "emp-lead-1");
-        let owner = resolve_owner(&roster, "system-sim", "j", None, Some("job-kind-approver"))
+        let roster = InMemoryRoster::new().with_holder("workflow-approver", "emp-lead-1");
+        let owner = resolve_owner(&roster, "system-sim", "j", None, Some("workflow-approver"))
             .await
             .unwrap();
         assert_eq!(owner, "emp-lead-1");

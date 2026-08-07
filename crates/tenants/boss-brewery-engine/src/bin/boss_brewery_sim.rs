@@ -250,7 +250,7 @@ async fn main() -> Result<()> {
     let seeds_path = PathBuf::from(&seeds_dir);
 
     // One-shot `prepare` subcommand: seed the whole brewery tenant
-    // model (classes → JobKinds → policy → data) through the public
+    // model (classes → Workflows → policy → data) through the public
     // API, then exit. This is the converged prepare phase — reset /
     // launchers / CI call it instead of the old scattered
     // bootstrap + policy-bootstrap + data-seed + classes-curl steps,
@@ -392,9 +392,9 @@ async fn main() -> Result<()> {
     //
     // Recurring financial work (payroll, 941, income-tax) runs as
     // `[periodic.*]` specs in tenant.toml that open honest
-    // JobKinds whose terminal step's side-effect POSTs to the
+    // Workflows whose terminal step's side-effect POSTs to the
     // canonical `/api/ledger/*` endpoint — every such event has a
-    // JobKind / Step / audit-trail behind it.
+    // Workflow / Step / audit-trail behind it.
     // Vendor behaviors from the model (boss-inventory) — the simulator reads
     // each vendor's supply profile and synthesizes one supplier counterparty
     // chain per vendor (paced by its lead time + fulfilment), so the vendor
@@ -545,7 +545,7 @@ async fn main() -> Result<()> {
             .map(|id| (id.clone(), brewery_account_class(id)))
             .collect();
         // The storefront / taproom aggregate account is hardcoded in the
-        // order JobKinds' metadata, not sampled from the demand pool.
+        // order Workflows' metadata, not sampled from the demand pool.
         m.entry("acc-direct-shop".to_string())
             .or_insert_with(|| "retail".to_string());
         m
@@ -720,21 +720,53 @@ async fn main() -> Result<()> {
         // instead of looping. Fallback: if the endpoint isn't
         // reachable, set paused=true so the loop idles gracefully
         // and an operator can run `reset-to-baseline.sh` by hand.
+        // End of the BACKFILL window: go live, do not lap.
+        //
+        // The epoch used to restart here — trim the audit_log back to
+        // the seed baseline and replay the same year forever. That is
+        // what made warp a permanent condition, and the lap is what
+        // destroyed real work: a year-end close a person posted, and a
+        // day of a real user's feedback, both taken by a restart
+        // nobody asked for.
+        //
+        // Warp is a startup PHASE now. The sim runs fast once to lay
+        // down a synthetic past, reaches today, and then keeps going
+        // at wall speed with real people writing alongside it. The log
+        // is append-only from the seed forward; nothing is ever
+        // trimmed.
+        //
+        // Warp itself is the phase marker, which is why this needs no
+        // new state. `epoch_end` cannot be cleared through
+        // `configure` (an absent field means "leave it"), so a naive
+        // condition would re-fire every tick once the date passed. At
+        // wall speed warp is 1.0 and the guard is simply false — the
+        // transition is one-way by construction rather than by a flag
+        // someone has to remember to set.
         if let Some(end) = clock.epoch_end_date
             && clock.current_sim_date >= end
-            && !clock.restart_in_progress
+            && clock.warp_factor.unwrap_or(1.0) > 1.0
         {
             info!(
                 current_sim_date = %clock.current_sim_date,
                 epoch_end_date = %end,
-                "sim epoch complete — triggering auto-restart"
+                "backfill complete — going live at wall speed"
             );
-            match trigger_restart_epoch(&api_base).await {
-                Ok(()) => info!(
-                    "restart-epoch dispatched; daemon will idle until restart_in_progress clears"
-                ),
+            match go_live().await {
+                Ok(()) => {
+                    info!("clock re-anchored to warp 1.0; the sim now runs in real time");
+                    // Close the regen's `backfill` step from here.
+                    //
+                    // This is the one step whose completion nobody
+                    // else can honestly assert. A build finishing or a
+                    // deploy landing is observable from outside; "the
+                    // backfill reached today and the clock is now
+                    // real" is known only to the process that did it.
+                    // Recording it anywhere else would be a report of
+                    // a transition rather than the transition itself.
+                    record_backfill_complete(&api_base).await;
+                }
                 Err(e) => {
-                    warn!(error = %e, "restart-epoch dispatch failed; pausing for manual reset");
+                    warn!(error = %e, "go-live failed; pausing rather than looping the epoch");
                     set_paused(true).await?;
                 }
             }
@@ -770,6 +802,28 @@ async fn main() -> Result<()> {
         let ticks_per_day = {
             let guard = engine.lock().expect("engine mutex poisoned");
             guard.tenant.meta.ticks_per_day()
+        };
+        // Backfill runs at DAY granularity; live runs at the tenant's
+        // own (hourly). Warp is the phase marker again — the same one
+        // the go-live guard reads — so there is no second knob and no
+        // way for the two to disagree about which phase we are in.
+        //
+        // This is not a speed-up by itself: `per_tick_sleep_ms`
+        // divides one wall budget N ways, so 24 ticks and 1 tick cost
+        // the same per sim-day. What it buys is HEADROOM — one batch
+        // of work per sim-day instead of 24 — and headroom is what
+        // makes a shorter budget (higher warp) sustainable. Warp past
+        // ~2000 was previously "chase dead" at hourly granularity for
+        // exactly this reason: the day's work stopped fitting in the
+        // day's budget and the sim fell behind its own clock.
+        //
+        // Intra-day detail in fabricated history is the thing being
+        // traded away, and nothing evaluates it. The live segment —
+        // where the real measurement happens — keeps full resolution.
+        let ticks_per_day = if clock.warp_factor.unwrap_or(1.0) > 1.0 {
+            1
+        } else {
+            ticks_per_day
         };
         assert!(ticks_per_day > 0);
         let per_tick_sleep_ms =
@@ -1236,31 +1290,90 @@ fn cadence_of(clock: &Clock, day: Option<NaiveDate>) -> sim_control::Cadence {
 /// SimClockBadge "Restart epoch" button hits. Returns Ok on
 /// 200/202; any other status (or a connection failure) becomes
 /// an error so the caller can fall back to pause-and-wait.
-async fn trigger_restart_epoch(api_base: &str) -> Result<()> {
-    // api_base is either `direct://127.0.0.1` (in-process loopback
-    // marker) or a real http(s) origin. Translate the loopback to
-    // the canonical jobs-api port; everything else gets a literal
-    // POST.
-    let base = if let Some(host) = api_base.strip_prefix("direct://") {
-        format!("http://{host}:7900")
-    } else {
-        api_base.trim_end_matches('/').to_string()
-    };
-    let url = format!("{base}/api/jobs/sim-clock/restart-epoch");
-    let client = reqwest::Client::builder()
+/// Close the open regen's `backfill` step, if there is one.
+///
+/// Best-effort by construction: the sim must not stop simulating
+/// because a Job could not be updated. A missing record is a gap in
+/// the audit trail; a sim that halts on bookkeeping is an outage.
+///
+/// Shells out to `boss-step.sh` rather than reimplementing
+/// find-open-Job-then-merge-metadata in Rust. That rule already lives
+/// in one place, and the merge half of it is the kind that bites
+/// quietly — `PUT` swaps `metadata` wholesale, so a partial write
+/// silently drops `authority_role` and ungates a gated step.
+async fn record_backfill_complete(api_base: &str) {
+    let script = std::env::var("BOSS_STEP_SCRIPT")
+        .unwrap_or_else(|_| "/opt/boss/infra/boss-step.sh".to_string());
+    if !std::path::Path::new(&script).exists() {
+        return;
+    }
+    let went_live = format!("went_live={}", chrono::Utc::now().to_rfc3339());
+    let out = tokio::process::Command::new(&script)
+        .args(["regenerate-deployment", "backfill", &went_live])
+        .env("BOSS_STEP_ACTOR", "automation:brewery-sim")
+        .env("BOSS_JOBS_URL", jobs_base_for(api_base))
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            info!("recorded backfill completion on the open regen Job")
+        }
+        Ok(o) => warn!(
+            stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+            "could not record backfill completion; the sim is live regardless"
+        ),
+        Err(e) => warn!(error = %e, "could not run boss-step.sh"),
+    }
+}
+
+/// jobs-api origin for a given api_base, mirroring the loopback
+/// translation the other callers do.
+fn jobs_base_for(api_base: &str) -> String {
+    match api_base.strip_prefix("direct://") {
+        Some(host) => format!("http://{host}:7900"),
+        None => api_base.trim_end_matches('/').to_string(),
+    }
+}
+
+/// Hand the clock over to real time.
+///
+/// `POST /api/clock/configure { warp_factor: 1.0 }` — the handler
+/// re-anchors so sim-time does not teleport, and `SimClockParams`
+/// documents 1.0 as real time. Sim mode at warp 1.0 anchored to now
+/// IS wall-clock; there is no mode to flip and no service to restart.
+///
+/// Goes to clock-api directly, like `set_paused` — clock-api owns
+/// clock state and the simulator is a pure consumer. jobs-api
+/// proxies pause/resume/restart-epoch but not configure, and adding
+/// a proxy route for one caller would put the clock's contract in
+/// two services.
+///
+/// `epoch_end` is CLEARED, and that is not optional.
+///
+/// I originally left it, reasoning that it stopped being a cap the sim
+/// acts on once the guard saw warp 1.0. That was wrong in a way the
+/// guard cannot see: `epoch_end` is also a hard cap inside the clock
+/// formula. Sim-time clamps at it, so going live at warp 1.0 with the
+/// cap still set produces a FROZEN clock, not a live one — observed on
+/// the playground, stuck at `2026-08-07T00:00:00` while the simulator
+/// failed its readiness gate on a loop.
+///
+/// Clearing it needs the double-Option on `ConfigureRequest`: an
+/// absent field means "leave it", so `null` had to become expressible
+/// before this call could say what it means.
+async fn go_live() -> Result<()> {
+    let clock_url = std::env::var("BOSS_CLOCK_URL").unwrap_or_else(|_| boss_ports::url("clock"));
+    let url = format!("{}/api/clock/configure", clock_url.trim_end_matches('/'));
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
-        .build()?;
-    let resp = client
+        .build()?
         .post(&url)
-        .header("x-boss-user", "{\"id\":\"system\",\"role\":\"platform-admin\",\"access_tier\":\"operator\",\"territory_account_ids\":[],\"direct_report_ids\":[],\"department\":\"platform\"}")
+        .json(&serde_json::json!({ "warp_factor": 1.0, "epoch_end": null }))
         .send()
         .await
+        .with_context(|| format!("POST {url}"))?
+        .error_for_status()
         .with_context(|| format!("POST {url}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("restart-epoch returned {status}: {body}");
-    }
     Ok(())
 }
 

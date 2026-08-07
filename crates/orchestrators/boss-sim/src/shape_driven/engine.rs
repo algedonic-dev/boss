@@ -1,12 +1,12 @@
 //! `simulate_day` — the day-loop primitive for the shape-driven
-//! sim. Composes tenant config + JobKind registry + StepRegistry +
+//! sim. Composes tenant config + Workflow registry + StepRegistry +
 //! Subject pool + RNG into a list of "things that happened today"
 //! plus state mutations.
 //!
 //! Stages 2 + 3: Job creation, eager Step materialization at
 //! Job-open time, daily Step advancement (Ready → Completed with
 //! metadata filled by the faker), and Job closure when every Step is
-//! terminal. The sim is a JobKind-v2 executor client: it posts
+//! terminal. The sim is a Workflow-v2 executor client: it posts
 //! job-create + step-completions to the live boss-jobs-api and the
 //! SERVER owns step re-evaluation (Pending→Ready / Pending→Skipped /
 //! terminal→close); the sim runs the shared `reevaluate` locally only
@@ -16,7 +16,7 @@
 
 use boss_core::job::{Job, JobId, JobStatus, Priority, Subject};
 use boss_core::primitives::Subject as SubjectTrait;
-use boss_jobs::registry::JobKindSpec;
+use boss_jobs::registry::WorkflowSpec;
 use boss_jobs::step_registry::StepRegistry;
 
 use crate::engines::{SimEventBus, Tick};
@@ -33,7 +33,7 @@ use crate::shape_driven::tenant::{SubjectRate, TenantConfig};
 pub const HUMAN_WORKER_SOURCE: &str = "human-worker";
 
 /// Advance the sim by one day. Reads tenant rates against the
-/// JobKind registry, samples per-kind Job counts, picks a Subject
+/// Workflow registry, samples per-kind Job counts, picks a Subject
 /// for each new Job from the state's pool, and inserts the Job
 /// into state.
 ///
@@ -43,17 +43,17 @@ pub const HUMAN_WORKER_SOURCE: &str = "human-worker";
 ///
 /// Skips:
 /// - Days outside the tenant's operating_days list.
-/// - JobKinds whose subject_kinds is empty (degenerate — the
+/// - Workflows whose subject_kinds is empty (degenerate — the
 ///   author left them off).
-/// - JobKinds whose first subject_kind has no available Subjects
+/// - Workflows whose first subject_kind has no available Subjects
 ///   in the pool. The summary records the skip in
 ///   `jobs_skipped_no_subject` so the test surfaces missing
 ///   seeds.
-/// - JobKinds whose slug doesn't match any spec in `job_kinds`.
+/// - Workflows whose slug doesn't match any spec in `workflows`.
 ///   Counts go to `jobs_skipped_unknown_kind`.
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_day(
-    job_kinds: &[JobKindSpec],
+    workflows: &[WorkflowSpec],
     step_registry: &StepRegistry,
     tenant: &TenantConfig,
     day: chrono::NaiveDate,
@@ -63,7 +63,7 @@ pub fn simulate_day(
     bus: &mut SimEventBus,
 ) -> DaySummary {
     simulate_tick_with_handlers(
-        job_kinds,
+        workflows,
         step_registry,
         tenant,
         day,
@@ -92,7 +92,7 @@ pub fn simulate_day(
 /// bit-for-bit equivalent.
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_tick_with_handlers(
-    job_kinds: &[JobKindSpec],
+    workflows: &[WorkflowSpec],
     step_registry: &StepRegistry,
     tenant: &TenantConfig,
     day: chrono::NaiveDate,
@@ -143,7 +143,7 @@ pub fn simulate_tick_with_handlers(
     //    expected birth count is invariant.
     birth_subjects(tenant, day, tick, state, rng, output, &mut summary);
 
-    // 3. Sample new Jobs from the JobKind registry's tenant rates.
+    // 3. Sample new Jobs from the Workflow registry's tenant rates.
     //    The sampler's weekday/weekend/holiday demand multipliers read
     //    the `us-banking` calendar DATA carried on state (seeded by the
     //    daemon from boss-calendar; the `Default` carries the 2026
@@ -156,7 +156,7 @@ pub fn simulate_tick_with_handlers(
     kinds.sort_by(|a, b| a.0.cmp(b.0));
 
     for (kind, rate) in kinds {
-        let Some(spec) = job_kinds.iter().find(|jk| &jk.kind == kind) else {
+        let Some(spec) = workflows.iter().find(|jk| &jk.kind == kind) else {
             // Unknown kind: bookkeep the Poisson draw the same way
             // we did before the cadence path was added. Tick-scaled
             // so an unknown kind doesn't 24x its drop count at
@@ -254,14 +254,14 @@ pub fn simulate_tick_with_handlers(
     summary
 }
 
-/// Open one Job, materialize its Steps from the JobKind step_graph,
+/// Open one Job, materialize its Steps from the Workflow step_graph,
 /// leave the earliest-eligible Steps Ready, roll any
-/// per-JobKind anomaly probabilities, and insert everything into
+/// per-Workflow anomaly probabilities, and insert everything into
 /// state.
 #[allow(clippy::too_many_arguments)] // engine internals; explicit > a context struct here
-/// Roll a Priority for a new Job based on the JobKind. Mirrors a
+/// Roll a Priority for a new Job based on the Workflow. Mirrors a
 /// realistic operating distribution rather than the prior
-/// "everything is Standard" sim flatness. The mix is JobKind-aware
+/// "everything is Standard" sim flatness. The mix is Workflow-aware
 /// so e.g. `equipment-preventive-maintenance` skews toward Scheduled (planned preventive maintenance
 /// visits), `morning-brew` skews Standard (it's the daily
 /// production heartbeat), and ad-hoc gets a richer mix because
@@ -295,7 +295,7 @@ fn priority_for_kind(kind: &str, rng: &mut crate::rng::Rng) -> Priority {
 
 #[allow(clippy::too_many_arguments)]
 fn create_job_with_steps(
-    spec: &JobKindSpec,
+    spec: &WorkflowSpec,
     subject_kind: &str,
     subject_id: &str,
     day: chrono::NaiveDate,
@@ -312,7 +312,7 @@ fn create_job_with_steps(
     _step_registry: &StepRegistry,
 ) -> JobId {
     // Anomalies fire at Job-open time. Each `*_probability` in the
-    // JobKind's anomaly table rolls once per Job — if hit, the
+    // Workflow's anomaly table rolls once per Job — if hit, the
     // counters tick. This v0 doesn't yet translate fires into
     // structural state changes (cancel / delay / branch); that's
     // anomaly-handling Stage 6.
@@ -362,7 +362,7 @@ fn create_job_with_steps(
     job.status = JobStatus::Open;
 
     // Post the Job and let the SERVER materialize its steps from the
-    // JobKind step_graph — the server runs the open-time readiness pass
+    // Workflow step_graph — the server runs the open-time readiness pass
     // and emits `step.ready.<kind>` for the tier-0 steps, which the
     // workforce (and the notifier) pick up. The sim holds no step or
     // job mirror; the live system is the source of truth. Errors are
@@ -411,19 +411,19 @@ fn create_job_with_steps(
 /// Open a Job in response to a request event (today's bus carries
 /// `periodic.job_requested` payloads from PeriodicAction::OpenJob,
 /// future BatchSpec preventive maintenance rules will publish on the same shape).
-/// The payload must carry `job_kind`, `subject_kind`, and
-/// `subject_id`; everything else is looked up against `job_kinds`
+/// The payload must carry `workflow`, `subject_kind`, and
+/// `subject_id`; everything else is looked up against `workflows`
 /// and `tenant`. Anomalies fire the same way as for rate-driven
 /// Jobs so a periodic-opened Job is indistinguishable downstream.
 ///
 /// Returns `Ok(true)` if a Job was materialized, `Ok(false)` if
-/// the request was malformed or named a JobKind not in the
+/// the request was malformed or named a Workflow not in the
 /// registry. Counters land on `state.counters` exactly like
 /// `simulate_day`'s rate-driven Job creation.
 #[allow(clippy::too_many_arguments)]
 pub fn open_job_from_request(
     payload: &serde_json::Value,
-    job_kinds: &[JobKindSpec],
+    workflows: &[WorkflowSpec],
     tenant: &TenantConfig,
     day: chrono::NaiveDate,
     state: &mut ShapeDrivenState,
@@ -439,11 +439,11 @@ pub fn open_job_from_request(
     // producing zero Jobs (caught 2026-05-06). Now: log loudly
     // + bump a counter so misconfiguration surfaces on the
     // first fire instead of only at audit time.
-    let Some(job_kind) = payload.get("job_kind").and_then(|v| v.as_str()) else {
+    let Some(workflow) = payload.get("workflow").and_then(|v| v.as_str()) else {
         state.counters.jobs_skipped_missing_field += 1;
         tracing::warn!(
             payload = ?payload,
-            "open_job_from_request: payload missing `job_kind` — \
+            "open_job_from_request: payload missing `workflow` — \
              check your `[periodic.*]` action spec"
         );
         return false;
@@ -451,19 +451,19 @@ pub fn open_job_from_request(
     let Some(subject_kind) = payload.get("subject_kind").and_then(|v| v.as_str()) else {
         state.counters.jobs_skipped_missing_field += 1;
         tracing::warn!(
-            job_kind = %job_kind,
+            workflow = %workflow,
             payload = ?payload,
             "open_job_from_request: payload missing `subject_kind` — \
              your `[periodic.*]` open_job action must set \
              `action.subject_kind` (e.g. \"location\", \"account\") \
-             matching the JobKind's `subject_kinds` declaration"
+             matching the Workflow's `subject_kinds` declaration"
         );
         return false;
     };
     let Some(subject_id) = payload.get("subject_id").and_then(|v| v.as_str()) else {
         state.counters.jobs_skipped_missing_field += 1;
         tracing::warn!(
-            job_kind = %job_kind,
+            workflow = %workflow,
             subject_kind = %subject_kind,
             payload = ?payload,
             "open_job_from_request: payload missing `subject_id` — \
@@ -472,13 +472,13 @@ pub fn open_job_from_request(
         );
         return false;
     };
-    let Some(spec) = job_kinds.iter().find(|jk| jk.kind == job_kind) else {
+    let Some(spec) = workflows.iter().find(|jk| jk.kind == workflow) else {
         state.counters.jobs_skipped_unknown_kind += 1;
         tracing::warn!(
-            job_kind = %job_kind,
-            "open_job_from_request: unknown job_kind — either the \
-             JobKind isn't registered in the live registry, or your \
-             `[periodic.*]` action.job_kind has a typo"
+            workflow = %workflow,
+            "open_job_from_request: unknown workflow — either the \
+             Workflow isn't registered in the live registry, or your \
+             `[periodic.*]` action.workflow has a typo"
         );
         return false;
     };
@@ -494,7 +494,7 @@ pub fn open_job_from_request(
         day,
         state,
         &mut summary,
-        job_kind,
+        workflow,
         tenant,
         rng,
         output,
@@ -506,7 +506,7 @@ pub fn open_job_from_request(
 
 /// Birth new Subjects per `tenant.subject_rates`. Each kind's rate
 /// is a Poisson mean for the number of new Subjects to add that
-/// day; ramps work the same way as for JobKinds (latest ramp where
+/// day; ramps work the same way as for Workflows (latest ramp where
 /// `date <= day` wins, falls back to base `rate`).
 ///
 /// Subject ids are synthesized as `{kind}-{counter:05}` where the
@@ -558,7 +558,7 @@ fn birth_subjects(
             //
             // Pre-2026-05-04 the order was inverted: the pool grew
             // first and the emit was best-effort. A failed emit then
-            // left a phantom id — pickable by JobKinds but unbacked
+            // left a phantom id — pickable by Workflows but unbacked
             // by an audit_log row, which downstream events
             // (commerce.invoice.created, etc.) referenced as a
             // dangling FK. The 2026-05-04 subject audit of the live
@@ -882,7 +882,7 @@ fn roll_and_prune_shocks(
     }
 }
 
-/// Resolve the multiplier for a JobKind + optional Subject draw.
+/// Resolve the multiplier for a Workflow + optional Subject draw.
 /// Returns the product of every active shock that matches.
 /// `subject_id == None` matches kind-wide shocks only.
 fn active_shock_multiplier(state: &ShapeDrivenState, kind: &str, subject_id: Option<&str>) -> f64 {
@@ -1019,7 +1019,7 @@ fn build_subject(kind: &str, id: &str) -> Subject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boss_jobs::registry::{JobKindSpec, StepSpec, Terminal};
+    use boss_jobs::registry::{StepSpec, Terminal, WorkflowSpec};
 
     fn brewery_tenant() -> TenantConfig {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1030,12 +1030,12 @@ mod tests {
         TenantConfig::load(&path).expect("brewery tenant.toml parses")
     }
 
-    /// Rate-test JobKind: no steps. A degenerate (stepless) JobKind
+    /// Rate-test Workflow: no steps. A degenerate (stepless) Workflow
     /// opens and immediately closes via the `no_steps` short-circuit
     /// in `create_job_with_steps` — exactly what the Job-creation-rate
     /// tests want (they assert on counts, not step lifecycle).
-    fn jk(kind: &str, label: &str, subject_kinds: &[&str]) -> JobKindSpec {
-        JobKindSpec::platform_seed(
+    fn jk(kind: &str, label: &str, subject_kinds: &[&str]) -> WorkflowSpec {
+        WorkflowSpec::platform_seed(
             kind,
             label,
             "test",
@@ -1120,7 +1120,7 @@ mod tests {
         );
     }
 
-    /// JobKinds the registry doesn't know about don't panic — they
+    /// Workflows the registry doesn't know about don't panic — they
     /// get counted as `unknown_kind` and the run proceeds.
     #[test]
     fn unknown_jobkind_falls_through() {
@@ -1129,7 +1129,7 @@ mod tests {
         let mut output = crate::output::InMemoryOutput::default();
         // Empty registry — every tenant rate is "unknown" relative
         // to it.
-        let kinds: Vec<JobKindSpec> = vec![];
+        let kinds: Vec<WorkflowSpec> = vec![];
 
         let mut state = ShapeDrivenState::new();
         let mut rng = Rng::new(123);
@@ -1148,7 +1148,7 @@ mod tests {
         assert!(summary.jobs_skipped_unknown_kind > 0);
     }
 
-    /// JobKinds whose subject pool is empty don't fabricate — they
+    /// Workflows whose subject pool is empty don't fabricate — they
     /// count as `skipped_no_subject` and the test surfaces the
     /// missing seed. Run 7 days so a Poisson(1.0) draw of 0 on
     /// any single day doesn't false-negative.
@@ -1452,7 +1452,7 @@ mod tests {
             jk("tap-launch", "Tap Launch", &["campaign"]),
             jk("brewery-hire", "Brewery Hire", &["employee"]),
             jk("brewery-terminate", "Brewery Terminate", &["employee"]),
-            // Periodic / cadence JobKinds fired by tenant.toml's
+            // Periodic / cadence Workflows fired by tenant.toml's
             // [periodic.*] / [batch.*] sections on the brewhouse
             // location — include them so the 30-day run has zero
             // unknown-kind skips.
@@ -1529,7 +1529,7 @@ mod tests {
         );
 
         // brewery-hire is RATE = 0 in tenant.toml today — the
-        // JobKind's `subject_kinds = ["employee"]` shape picks an
+        // Workflow's `subject_kinds = ["employee"]` shape picks an
         // existing employee as subject (wrong for a hire), which
         // produced noise + occasional duplicate Jobs. Tracked as
         // a TODO ("Fix duplicate executive hires" — sim-config
@@ -1545,10 +1545,10 @@ mod tests {
             "brewery-hire is rate=0 today; tenant.toml regression if non-zero, got {bh}"
         );
 
-        // No skips — every JobKind has a Subject pool seeded.
+        // No skips — every Workflow has a Subject pool seeded.
         assert_eq!(state.counters.jobs_skipped_no_subject, 0);
         // The `kinds` list above is the curated set this count test
-        // asserts on; tenant.toml also fires a few cadence JobKinds it
+        // asserts on; tenant.toml also fires a few cadence Workflows it
         // doesn't model (they open against seeded subjects but aren't in
         // the list), so a bounded number skip as unknown-kind. The full
         // 21-kind set is exercised end-to-end by the regen, not here.
@@ -1577,8 +1577,8 @@ mod tests {
         let tenant = brewery_tenant();
         let registry = StepRegistry::v1();
         let mut output = crate::output::InMemoryOutput::default();
-        // No JobKinds — focus the test on Subject birth alone.
-        let kinds: Vec<JobKindSpec> = vec![];
+        // No Workflows — focus the test on Subject birth alone.
+        let kinds: Vec<WorkflowSpec> = vec![];
 
         let mut state = ShapeDrivenState::new();
         let mut rng = Rng::new(0xb1d75); // "births"
@@ -1645,7 +1645,7 @@ mod tests {
 
         // employee rate 0.0 ⇒ no births. The brewery overrides
         // employee birth specifically because hires happen via the
-        // brewery-hire JobKind, not as standalone Subject creation.
+        // brewery-hire Workflow, not as standalone Subject creation.
         assert_eq!(
             state
                 .counters
@@ -1755,7 +1755,7 @@ mod tests {
 
         let registry = StepRegistry::v1();
         let mut output = crate::output::InMemoryOutput::default();
-        let kinds: Vec<JobKindSpec> = vec![];
+        let kinds: Vec<WorkflowSpec> = vec![];
         let mut state = ShapeDrivenState::new();
         let mut rng = Rng::new(0xb1d75);
 
@@ -1798,8 +1798,8 @@ mod tests {
     }
 
     /// Anomaly injection: the brewery's tenant.toml declares
-    /// per-JobKind anomaly probabilities. Each Job-open rolls
-    /// every probability for that JobKind once; hits increment the
+    /// per-Workflow anomaly probabilities. Each Job-open rolls
+    /// every probability for that Workflow once; hits increment the
     /// `anomalies_fired` counter. v0 doesn't yet translate fires
     /// into structural state changes — that's anomaly-handling
     /// Stage 6. This test pins the count path.
@@ -1836,7 +1836,7 @@ mod tests {
         // depend on RNG; the assertion is "the path produces non-
         // zero hits". 180 days (was 60) was needed after the 2026-
         // 05-02 federal-holiday-as-non-business-day change in
-        // sampler.rs — that shifts every other JobKind's RNG draws
+        // sampler.rs — that shifts every other Workflow's RNG draws
         // on holidays, so the seasonal-release seed lands a longer
         // run of 0s within a 60-day window for some seeds.
         assert!(
@@ -1938,7 +1938,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let mut spec = JobKindSpec::platform_seed(
+        let mut spec = WorkflowSpec::platform_seed(
             "morning-brew",
             "Morning Brew",
             "production",

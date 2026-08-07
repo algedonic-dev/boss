@@ -35,7 +35,7 @@
 //!
 //! ## What counts as the team's work
 //!
-//! JobKinds that declare an `owner_role` this app owns — read from the
+//! Workflows that declare an `owner_role` this app owns — read from the
 //! registry, never a list in code. Adding an IT workflow to the
 //! registry puts it on this page with no change here (CLAUDE.md §9).
 //!
@@ -50,7 +50,7 @@
 //!
 //! This returns one row per step, not a computed disposition. Which
 //! step carries the decision is a registry question — the fork step is
-//! the one bearing the JobKind's enum field — and that rule already
+//! the one bearing the Workflow's enum field — and that rule already
 //! exists once, in the client (`apps/web/src/jobs/fork.ts`). It has
 //! drifted before, between the board and the terminal queue reader,
 //! and reporting a freshly filed item as already triaged is the worst
@@ -86,7 +86,7 @@ pub struct FlowJob {
     pub kind: String,
     pub title: String,
     pub status: String,
-    /// The role the JobKind names as owner — why this Job is here.
+    /// The role the Workflow names as owner — why this Job is here.
     pub owner_role: String,
     /// Wall clock, from the create event's `created_at`.
     pub filed_at: Option<String>,
@@ -98,10 +98,10 @@ pub struct FlowJob {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Flow {
-    /// The roles whose JobKinds are counted, so the surface can say
+    /// The roles whose Workflows are counted, so the surface can say
     /// whose throughput this is rather than asserting it.
     pub owner_roles: Vec<String>,
-    /// JobKinds included, for the same reason.
+    /// Workflows included, for the same reason.
     pub kinds: Vec<String>,
     pub jobs: Vec<FlowJob>,
     /// Wall-clock instant the read was taken, so a client can compute
@@ -113,7 +113,7 @@ pub struct Flow {
 /// Read the team's flow.
 #[async_trait]
 pub trait FlowRepo: Send + Sync {
-    /// Jobs of every kind whose JobKind declares one of `owner_roles`.
+    /// Jobs of every kind whose Workflow declares one of `owner_roles`.
     /// Simulated Jobs are excluded: this measures a team of people.
     async fn flow(&self, owner_roles: &[String], limit: i64) -> Result<Flow, ViewsError>;
 }

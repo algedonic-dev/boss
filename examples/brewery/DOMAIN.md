@@ -84,12 +84,12 @@ examples/brewery/
     locations.toml          ← Location rows for the demo brewery
                               (one taproom, one brewhouse, three
                               distribution routes)
-    job_kinds.toml          ← 25 JobKinds — e.g. morning-brew,
+    workflows.toml          ← 25 Workflows — e.g. morning-brew,
                               wholesale-keg-order, seasonal-release,
                               ingredient-restock, equipment-preventive-maintenance,
                               tap-launch, brewery-hire, payroll-run,
                               ap-payment-run, sales-tax-filing
-    tenant.toml             ← Sim rates per JobKind + per Subject
+    tenant.toml             ← Sim rates per Workflow + per Subject
                               kind, plus anomaly probabilities.
                               Read by the shape-driven sim
                               that generates the seed.
@@ -124,7 +124,7 @@ The brewery seeds in this directory are **data-first** — TOMLs and a
 JSON file rather than Rust. They're authored to be readable and
 diffable, and they drive the live brewery playground today. The
 shape-driven simulator reads `tenant.toml` to learn how often to
-create each JobKind, what Subject kinds to draw from, and how
+create each Workflow, what Subject kinds to draw from, and how
 aggressive to be with anomalies. A fresh deploy seeds this reference
 data, then runs the sim against the live API — every order, invoice,
 and ledger entry lands as an `audit_log` event in real time. The demo

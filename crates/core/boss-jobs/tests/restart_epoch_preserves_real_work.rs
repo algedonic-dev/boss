@@ -39,7 +39,7 @@ async fn seed_event(db: &TestDb, kind: &str, payload: serde_json::Value) -> i64 
 
 async fn seed_job(db: &TestDb, id: &str, kind: &str, simulated: bool) {
     sqlx::query(
-        "INSERT INTO jobs (id, kind, job_kind_version, subject_kind, subject_id, title,
+        "INSERT INTO jobs (id, kind, workflow_version, subject_kind, subject_id, title,
                            owner_id, status, priority, opened_on, simulated)
          VALUES ($1::uuid, $2, 1, 'custom', '/x', 'T', 'emp-1', 'open', 'standard',
                  '2025-06-01', $3)",

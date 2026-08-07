@@ -4,7 +4,7 @@
 //
 // Why this exists: on 2026-05-22 the user hit two 404s by clicking
 // around the SPA — `/api/people/workflows` (HrPage tab; endpoint
-// not implemented) and `/api/subject-kinds/active` (JobKindNewPage;
+// not implemented) and `/api/subject-kinds/active` (WorkflowNewPage;
 // wrong URL, real one is `/api/subject-kinds`). Both were silent
 // from the user's perspective (the SPA swallowed the failure and
 // rendered an empty state), but generated 404s in the network tab

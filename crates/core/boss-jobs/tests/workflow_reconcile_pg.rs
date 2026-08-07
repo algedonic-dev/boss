@@ -1,4 +1,4 @@
-//! Postgres-backed coverage for `JobKindRegistry::bootstrap_reconcile`.
+//! Postgres-backed coverage for `WorkflowRegistry::bootstrap_reconcile`.
 //!
 //! The InMemory adapter is exercised in `registry::tests` (lib test).
 //! This file proves the Pg adapter has matching semantics — if they
@@ -9,17 +9,17 @@
 
 use boss_core::job::JobId;
 use boss_jobs::registry::{
-    JobKindRegistry, JobKindSpec, JobKindStatus, KindReconcileStats, PgJobKinds,
+    KindReconcileStats, PgWorkflows, WorkflowRegistry, WorkflowSpec, WorkflowStatus,
 };
 use boss_testing::TestDb;
 use sqlx::Row;
 
-fn spec(kind: &str, label: &str) -> JobKindSpec {
-    JobKindSpec::platform_seed(kind, label, "platform", vec!["account".into()], Vec::new())
+fn spec(kind: &str, label: &str) -> WorkflowSpec {
+    WorkflowSpec::platform_seed(kind, label, "platform", vec!["account".into()], Vec::new())
 }
 
 async fn created_by(db: &TestDb, kind: &str) -> Option<String> {
-    let row = sqlx::query("SELECT created_by FROM job_kinds WHERE kind = $1 AND status = 'active'")
+    let row = sqlx::query("SELECT created_by FROM workflows WHERE kind = $1 AND status = 'active'")
         .bind(kind)
         .fetch_optional(&db.pool)
         .await
@@ -30,10 +30,10 @@ async fn created_by(db: &TestDb, kind: &str) -> Option<String> {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_inserts_missing_kinds_as_bootstrap_owned() {
     let db = TestDb::new().await;
-    let registry = PgJobKinds::new(db.pool.clone());
+    let registry = PgWorkflows::new(db.pool.clone());
 
     let stats = registry
-        .bootstrap_reconcile(&[spec("job-kind-design", "Design a JobKind")])
+        .bootstrap_reconcile(&[spec("workflow-design", "Design a Workflow")])
         .await
         .expect("reconcile");
 
@@ -48,14 +48,14 @@ async fn pg_inserts_missing_kinds_as_bootstrap_owned() {
     );
 
     let live = registry
-        .get_active("job-kind-design")
+        .get_active("workflow-design")
         .await
         .expect("active row visible");
-    assert_eq!(live.label, "Design a JobKind");
+    assert_eq!(live.label, "Design a Workflow");
     assert_eq!(live.version, 1);
-    assert_eq!(live.status, JobKindStatus::Active);
+    assert_eq!(live.status, WorkflowStatus::Active);
     assert_eq!(
-        created_by(&db, "job-kind-design").await.as_deref(),
+        created_by(&db, "workflow-design").await.as_deref(),
         Some("bootstrap"),
         "fresh insert must be bootstrap-owned"
     );
@@ -64,15 +64,15 @@ async fn pg_inserts_missing_kinds_as_bootstrap_owned() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_republishes_drifted_bootstrap_rows_as_a_new_version() {
     let db = TestDb::new().await;
-    let registry = PgJobKinds::new(db.pool.clone());
+    let registry = PgWorkflows::new(db.pool.clone());
 
     registry
-        .bootstrap_reconcile(&[spec("job-kind-design", "Old Label")])
+        .bootstrap_reconcile(&[spec("workflow-design", "Old Label")])
         .await
         .expect("seed bootstrap");
 
     let stats = registry
-        .bootstrap_reconcile(&[spec("job-kind-design", "New Label")])
+        .bootstrap_reconcile(&[spec("workflow-design", "New Label")])
         .await
         .expect("republish");
 
@@ -81,7 +81,7 @@ async fn pg_republishes_drifted_bootstrap_rows_as_a_new_version() {
     assert_eq!(stats.preserved, 0);
     assert_eq!(stats.unchanged, 0);
 
-    let live = registry.get_active("job-kind-design").await.unwrap();
+    let live = registry.get_active("workflow-design").await.unwrap();
     assert_eq!(live.label, "New Label", "drift should self-heal");
     // This asserted the opposite — that a refresh preserves the
     // version — which is exactly what defeated the pin: a Job holding
@@ -91,23 +91,23 @@ async fn pg_republishes_drifted_bootstrap_rows_as_a_new_version() {
     // The superseded version must survive, retired but readable, or a
     // Job pinned to it has nothing to resolve.
     let pinned = registry
-        .get_version("job-kind-design", 1)
+        .get_version("workflow-design", 1)
         .await
         .expect("v1 still resolvable");
     assert_eq!(pinned.label, "Old Label");
-    assert_eq!(pinned.status, JobKindStatus::Retired);
+    assert_eq!(pinned.status, WorkflowStatus::Retired);
 
     // One active row per kind is a unique index; a republish that left
     // two actives would fail the insert rather than corrupt the table.
     let actives: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM job_kinds WHERE kind = $1 AND status = 'active'")
-            .bind("job-kind-design")
+        sqlx::query_scalar("SELECT COUNT(*) FROM workflows WHERE kind = $1 AND status = 'active'")
+            .bind("workflow-design")
             .fetch_one(&db.pool)
             .await
             .expect("count actives");
     assert_eq!(actives, 1);
     assert_eq!(
-        created_by(&db, "job-kind-design").await.as_deref(),
+        created_by(&db, "workflow-design").await.as_deref(),
         Some("bootstrap"),
         "refresh must keep the bootstrap discriminator"
     );
@@ -116,16 +116,16 @@ async fn pg_republishes_drifted_bootstrap_rows_as_a_new_version() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_preserves_operator_edits() {
     let db = TestDb::new().await;
-    let registry = PgJobKinds::new(db.pool.clone());
+    let registry = PgWorkflows::new(db.pool.clone());
 
     // Seed an operator-owned row directly (created_by != 'bootstrap').
     sqlx::query(
-        "INSERT INTO job_kinds
+        "INSERT INTO workflows
             (kind, version, status, label, description, category,
              subject_kinds, steps, metadata_schema, entitlements,
              on_complete_create, owning_team, authoring_job_id,
              created_by, created_at)
-         VALUES ('job-kind-design', 1, 'active', 'Operator Label', NULL, 'platform',
+         VALUES ('workflow-design', 1, 'active', 'Operator Label', NULL, 'platform',
                  '[\"account\"]'::jsonb, '[]'::jsonb,
                  '{}'::jsonb, '{}'::jsonb, '[]'::jsonb,
                  'platform', NULL, 'emp-cto', NOW())",
@@ -135,7 +135,7 @@ async fn pg_preserves_operator_edits() {
     .expect("seed operator row");
 
     let stats = registry
-        .bootstrap_reconcile(&[spec("job-kind-design", "Default Label")])
+        .bootstrap_reconcile(&[spec("workflow-design", "Default Label")])
         .await
         .expect("reconcile");
 
@@ -144,13 +144,13 @@ async fn pg_preserves_operator_edits() {
     assert_eq!(stats.preserved, 1);
     assert_eq!(stats.unchanged, 0);
 
-    let live = registry.get_active("job-kind-design").await.unwrap();
+    let live = registry.get_active("workflow-design").await.unwrap();
     assert_eq!(
         live.label, "Operator Label",
         "operator edits must survive reconcile"
     );
     assert_eq!(
-        created_by(&db, "job-kind-design").await.as_deref(),
+        created_by(&db, "workflow-design").await.as_deref(),
         Some("emp-cto"),
         "preserve must leave created_by intact"
     );
@@ -159,9 +159,9 @@ async fn pg_preserves_operator_edits() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_no_op_when_already_matching() {
     let db = TestDb::new().await;
-    let registry = PgJobKinds::new(db.pool.clone());
+    let registry = PgWorkflows::new(db.pool.clone());
 
-    let body = spec("job-kind-design", "Design a JobKind");
+    let body = spec("workflow-design", "Design a Workflow");
     registry
         .bootstrap_reconcile(std::slice::from_ref(&body))
         .await
@@ -180,7 +180,7 @@ async fn pg_no_op_when_already_matching() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_publish_authored_supersedes_active_and_stamps_provenance() {
     let db = TestDb::new().await;
-    let registry = PgJobKinds::new(db.pool.clone());
+    let registry = PgWorkflows::new(db.pool.clone());
 
     // Seed a bootstrap row first, so the publish path actually
     // exercises the supersede branch (not just an insert).
@@ -197,7 +197,7 @@ async fn pg_publish_authored_supersedes_active_and_stamps_provenance() {
 
     assert_eq!(published.kind, "morning-brew");
     assert_eq!(published.version, 2, "supersede must bump version");
-    assert_eq!(published.status, JobKindStatus::Active);
+    assert_eq!(published.status, WorkflowStatus::Active);
     assert_eq!(
         published.authoring_job_id.expect("authoring stamped"),
         *job_id.inner().as_uuid(),
@@ -209,12 +209,12 @@ async fn pg_publish_authored_supersedes_active_and_stamps_provenance() {
 
     // The previous bootstrap-owned row is now retired.
     let v1 = registry.get_version("morning-brew", 1).await.unwrap();
-    assert_eq!(v1.status, JobKindStatus::Retired);
+    assert_eq!(v1.status, WorkflowStatus::Retired);
 
     // Provenance — created_by reflects the meta-Job that authored
     // this version. The bootstrap reconciler's "preserve operator
     // edits" branch keys off this string.
-    let row = sqlx::query("SELECT created_by FROM job_kinds WHERE kind = $1 AND version = $2")
+    let row = sqlx::query("SELECT created_by FROM workflows WHERE kind = $1 AND version = $2")
         .bind("morning-brew")
         .bind(2)
         .fetch_one(&db.pool)

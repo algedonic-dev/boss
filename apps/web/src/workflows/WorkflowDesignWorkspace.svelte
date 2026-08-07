@@ -1,19 +1,19 @@
 <script lang="ts">
-  // /system/job-kinds/authoring/:jobId — the graphical authoring surface
-  // for a `job-kind-design` Job (decision D6). The working spec lives in
-  // the design Job's publish-step `metadata.job_kind_spec`; edits persist
-  // there (debounced) as ordinary STEP_UPDATED events — no `job_kinds`
-  // draft rows. The terminal `job-kind-publish` step is the single
+  // /system/workflows/authoring/:jobId — the graphical authoring surface
+  // for a `workflow-design` Job (decision D6). The working spec lives in
+  // the design Job's publish-step `metadata.workflow_spec`; edits persist
+  // there (debounced) as ordinary STEP_UPDATED events — no `workflows`
+  // draft rows. The terminal `workflow-publish` step is the single
   // registry write + `jobs.kind.published` audit fact.
   //
   // Workflow: author → validate (gated on the live dry-run being clean)
-  // → approve (job-kind-approver sign-off) → publish.
+  // → approve (workflow-approver sign-off) → publish.
 
   import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import StepAuthoringSurface from './StepAuthoringSurface.svelte';
-  import type { JobKindSpec } from './jobKindTypes';
+  import type { WorkflowSpec } from './workflowTypes';
   import type { Job, Step, StepStatus } from '../jobs/types';
   import { validateDraft } from './liveLint';
   import { href, navigate } from '../router';
@@ -39,7 +39,7 @@
   let loadState = $state<LoadState>({ kind: 'loading' });
 
   let job = $state<Job | null>(null);
-  let spec = $state<JobKindSpec | null>(null);
+  let spec = $state<WorkflowSpec | null>(null);
   let initialized = false;
 
   let acting = $state<string | null>(null);
@@ -112,7 +112,7 @@
       actionError = e instanceof Error ? e.message : String(e);
     }
   }
-  function editSpec(next: JobKindSpec): void {
+  function editSpec(next: WorkflowSpec): void {
     spec = next;
     schedulePersist();
   }
@@ -128,7 +128,7 @@
       try {
         const [sk, cats] = await Promise.all([
           fetch('/api/subject-kinds'),
-          fetch('/api/jobs/kinds'),
+          fetch('/api/workflows'),
         ]);
         if (cancelled) return;
         if (sk.ok) {
@@ -216,7 +216,7 @@
         );
       }
       await completeStep(jobId, publishStep.id);
-      navigate(href(`/system/job-kinds/${encodeURIComponent(slug)}`));
+      navigate(href(`/system/workflows/${encodeURIComponent(slug)}`));
     } catch (e) {
       actionError = e instanceof Error ? e.message : String(e);
       acting = null;
@@ -240,7 +240,7 @@
 </script>
 
 <div class="catalog theme-exec">
-  <Breadcrumb to={href('/system/job-kinds')}>← All job kinds</Breadcrumb>
+  <Breadcrumb to={href('/system/workflows')}>← All job kinds</Breadcrumb>
 
   {#if loadState.kind === 'loading'}
     <p class="empty">Loading…</p>

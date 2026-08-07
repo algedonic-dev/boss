@@ -1,12 +1,12 @@
 // Landing page (`/`) and AppShell — the surfaces shared across
 // every authed route. Landing is the unauth playground entry
-// point with a JobKind picker; AppShell wraps every page with
+// point with a Workflow picker; AppShell wraps every page with
 // the sidebar nav.
 
 import { test, expect } from '@playwright/test';
 import { mountPage } from './_helpers';
 
-test.describe('Landing (/) — JobKind picker', () => {
+test.describe('Landing (/) — Workflow picker', () => {
   test('hero + jobs-in-flight stat render', async ({ page }) => {
     await mountPage(page, '/');
     await expect(page.locator('h1').first()).toBeVisible({ timeout: 10_000 });
@@ -19,11 +19,11 @@ test.describe('Landing (/) — JobKind picker', () => {
     await mountPage(page, '/');
     const kindBtns = page.locator('button.live-count');
     if ((await kindBtns.count()) === 0) {
-      test.skip(true, 'no JobKinds in registry yet');
+      test.skip(true, 'no Workflows in registry yet');
     }
     const second = kindBtns.nth(1);
     if ((await second.count()) === 0) {
-      test.skip(true, 'fewer than 2 JobKinds registered');
+      test.skip(true, 'fewer than 2 Workflows registered');
     }
     await second.click();
     await expect(second).toHaveClass(/\bactive\b/);

@@ -30,7 +30,7 @@ const ROUTES = [
   '/cto',
   '/atlas',
   '/design',
-  '/system/job-kinds',
+  '/system/workflows',
   '/system/step-plugins',
   '/system/policy',
   '/perf',

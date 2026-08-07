@@ -1,12 +1,12 @@
 //! `gate.resolve` — the agent executor for decision gates.
 //!
 //! A gate is a `StepType` with `executor = Agent` and an `outcome` enum
-//! field that the JobKind forks on (`demand-gate` → brew|oversupply,
+//! field that the Workflow forks on (`demand-gate` → brew|oversupply,
 //! `availability-gate` → fulfill|backorder). This handler is the
 //! computer-speed executor for that decision: on `step.ready.*` it reads
 //! real finished-goods stock, computes the outcome, and `PUT`s the step
 //! `completed` with `metadata.outcome` stamped — no human, no workforce
-//! slot, no duration. The existing JobKind-v2 `ready_when` fork does the
+//! slot, no duration. The existing Workflow-v2 `ready_when` fork does the
 //! rest.
 //!
 //! This logic used to live in `boss-sim`'s workforce (it read FG stock at
@@ -68,7 +68,7 @@ impl GateResolve {
     }
 
     /// An agent gate: `executor = Agent` and an `outcome` enum field the
-    /// JobKind forks on. Plain agent action steps (order-intake, billing)
+    /// Workflow forks on. Plain agent action steps (order-intake, billing)
     /// have no `outcome` field — `jobs.complete_step` handles those.
     fn is_agent_gate(&self, kind: &str) -> bool {
         self.registry.get(kind).is_some_and(|st| {
@@ -103,14 +103,14 @@ impl GateResolve {
         Ok(v.get("total_on_hand").and_then(|x| x.as_i64()).unwrap_or(0))
     }
 
-    /// The JobKind of the gate's parent Job. The `step.ready` payload
-    /// carries the *step* kind (`demand-gate`), not the JobKind, so we
-    /// read it off `GET /api/jobs/{job_id}` — the JobKind is what
+    /// The Workflow of the gate's parent Job. The `step.ready` payload
+    /// carries the *step* kind (`demand-gate`), not the Workflow, so we
+    /// read it off `GET /api/jobs/{job_id}` — the Workflow is what
     /// distinguishes a `morning-brew-stout` in-flight count from a
     /// `morning-brew-ipa` one. Returns `None` on a non-success status
     /// (the Job genuinely isn't there); errors only on transport
     /// failure so the message NAKs + redelivers.
-    async fn job_kind_for(&self, job_id: &str) -> Result<Option<String>, HandlerError> {
+    async fn workflow_for(&self, job_id: &str) -> Result<Option<String>, HandlerError> {
         let url = format!(
             "{}/api/jobs/{}",
             self.jobs_base.trim_end_matches('/'),
@@ -177,7 +177,7 @@ impl GateResolve {
     /// review doesn't double-brew through the multi-day brew lag.
     /// `effective_on_hand[sku] = real_on_hand[sku] + in_flight ×
     /// batch_yield[sku]`, where `in_flight` is the count of OPEN Jobs
-    /// of this JobKind minus this one (its own gate is open at
+    /// of this Workflow minus this one (its own gate is open at
     /// decision time). The pure `decide_demand_outcome` then runs on
     /// the effective map — IO here, decision stays pure.
     async fn outcome_for(&self, ev: &StepEvent<'_>) -> Result<&'static str, HandlerError> {
@@ -188,13 +188,13 @@ impl GateResolve {
             if skus.is_empty() {
                 return Ok("brew");
             }
-            // In-flight pipeline depth: open Jobs of this JobKind,
+            // In-flight pipeline depth: open Jobs of this Workflow,
             // minus this one. Oversupply siblings are already
             // closed/terminal; siblings still brewing are open, so
             // `open_count − 1` is the number of in-flight brews whose
             // yield hasn't hit the cooler yet. Default to 0 in-flight
-            // when the JobKind can't be resolved (fail toward brewing).
-            let in_flight = match self.job_kind_for(ev.job_id).await? {
+            // when the Workflow can't be resolved (fail toward brewing).
+            let in_flight = match self.workflow_for(ev.job_id).await? {
                 Some(kind) => (self.open_jobs_of_kind(&kind).await? - 1).max(0),
                 None => 0,
             };
@@ -246,7 +246,7 @@ impl Handler for GateResolve {
 
         // PATCH-on-PUT replaces top-level `metadata` wholesale, so carry the
         // gate's existing metadata forward and add the computed outcome —
-        // the JobKind's fork predicate reads `metadata.outcome`.
+        // the Workflow's fork predicate reads `metadata.outcome`.
         let mut md = ev.metadata.clone();
         md.insert("outcome".to_string(), json!(outcome));
 
@@ -439,13 +439,13 @@ mod tests {
     // ---- in-flight-aware demand gate (IO wiring) ----
 
     /// Spin up a mock jobs-api (`GET /api/jobs/{id}` returns the
-    /// JobKind; `GET /api/jobs` list returns `total = open_count`;
+    /// Workflow; `GET /api/jobs` list returns `total = open_count`;
     /// `PUT /api/jobs/{id}/steps/{step_id}` captures the body) and a
     /// mock products-api (`GET /api/products/{sku}` returns
     /// `on_hand`). Returns the two base URLs + the captured PUT body
     /// handle. Mirrors the stub-server idiom in `inventory_po_place`.
     async fn stub_servers(
-        job_kind: &'static str,
+        workflow: &'static str,
         open_count: i64,
         on_hand: i64,
     ) -> (
@@ -467,7 +467,7 @@ mod tests {
             .route(
                 "/api/jobs/{id}",
                 get(move |Path(_id): Path<String>| async move {
-                    Json(json!({ "id": _id, "kind": job_kind }))
+                    Json(json!({ "id": _id, "kind": workflow }))
                 }),
             )
             .route(

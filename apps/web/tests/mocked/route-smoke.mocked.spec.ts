@@ -17,7 +17,7 @@ import { installAuthoringMocks, JOB_ID } from './_mockApi';
 // exact-match routes. Pure-action / form-submit routes (/login,
 // /finance/new, /finance/journal-entries/new) are excluded — this asserts
 // surfaces RENDER without throwing, not that forms submit. Two detail
-// routes are included (a JobKind + a marketing asset) because the mock
+// routes are included (a Workflow + a marketing asset) because the mock
 // seeds them, and that is where the omitted-field crashes live.
 const ROUTES: ReadonlyArray<string> = [
   // User Experiences perspective — bare / is the public home alias; the
@@ -34,8 +34,8 @@ const ROUTES: ReadonlyArray<string> = [
   '/system/monitoring/atlas', '/system/step-plugins', '/system/kb', '/system/design',
   '/system/experiments',
   // Modeling + admin surfaces (System Model).
-  '/system/workflows', '/system/job-kinds', '/system/job-kinds/new',
-  '/system/job-kinds/seasonal-release', '/system/policy', '/system/auth-admin',
+  '/system/workflows', '/system/workflows', '/system/workflows/new',
+  '/system/workflows/seasonal-release', '/system/policy', '/system/auth-admin',
   // IT surfaces added since the app split. They were absent for three
   // releases and the crawl reported success the whole time — see the
   // drift test at the bottom of this file for why that can no longer
@@ -120,7 +120,7 @@ test.describe('route smoke — every surface renders without a runtime crash', (
     ).toEqual([]);
   });
 
-  test('JobKind authoring workspace renders a serde-omitted terminal (StepDagEditor)', async ({ page }) => {
+  test('Workflow authoring workspace renders a serde-omitted terminal (StepDagEditor)', async ({ page }) => {
     test.setTimeout(60_000);
     // _mockApi.seedSpec() now omits `terminal` on the non-terminal step —
     // the exact shape that crashed StepDagEditor before the fix.
@@ -129,7 +129,7 @@ test.describe('route smoke — every surface renders without a runtime crash', (
     const errors: string[] = [];
     page.on('pageerror', (e) => errors.push(e.message));
 
-    await page.goto(`/system/job-kinds/authoring/${JOB_ID}`, { timeout: 20_000 });
+    await page.goto(`/system/workflows/authoring/${JOB_ID}`, { timeout: 20_000 });
     await expect(page.locator('.app-shell')).toBeVisible({ timeout: 10_000 });
     // Wait for the lazy graph + the step-authoring surface (which mounts
     // StepDagEditor) to render the seeded spec.

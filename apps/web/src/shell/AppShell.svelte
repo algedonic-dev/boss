@@ -12,7 +12,6 @@
   import { canSeeRoute, type RouteName, type Role } from '@boss/web-kit/session/permissions';
   import { workForRole } from '@boss/web-kit/session/work-by-role';
   import { navigate } from '../router';
-  import PersonaSwitcher from '../session/PersonaSwitcher.svelte';
   import {
     ROUTE_CATALOG,
     type AppId,
@@ -116,9 +115,9 @@
     {
       label: 'Define',
       items: [
-        // Workflows is the single UI surface for JobKinds: the
+        // Workflows is the single UI surface for Workflows: the
         // read-only catalog that also links into the authoring
-        // routes (/system/job-kinds*). The separate "Job kinds"
+        // routes (/system/workflows*). The separate "Job kinds"
         // sidebar entry was dropped — authoring is reached FROM
         // Workflows, not its own sidebar row.
         ROUTE_CATALOG.workflows,
@@ -273,7 +272,6 @@
          so it renders here but floats independently of the layout.
          The system-time + sign-in chrome moved up to the perspective
          tab bar; the old topbar is gone. -->
-    <PersonaSwitcher />
     <div class="shell-content">
       {@render children()}
     </div>

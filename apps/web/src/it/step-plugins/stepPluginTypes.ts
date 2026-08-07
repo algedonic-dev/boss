@@ -1,11 +1,11 @@
 // Mirror of boss_jobs::step_plugins::StepPluginSpec.
 
-import type { JobKindStatus } from '../../job-kinds/jobKindTypes';
+import type { WorkflowStatus } from '../../workflows/workflowTypes';
 
 export type StepPluginSpec = {
   kind: string;
   version: number;
-  status: JobKindStatus;
+  status: WorkflowStatus;
   label: string;
   description: string | null;
   category: string;

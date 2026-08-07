@@ -1,6 +1,6 @@
 # Brewery parts catalog — initial inventory state.
 #
-# Every SKU referenced by a JobKind's consume_parts list lives
+# Every SKU referenced by a Workflow's consume_parts list lives
 # here. The brewery prepare step (`boss-brewery-sim prepare`)
 # POSTs these to
 # `/api/inventory/items/batch` before the day loop starts, so

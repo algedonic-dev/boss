@@ -47,7 +47,7 @@
   };
 
   /// Step kind backing the review surface (`step_plugins` row
-  /// 'review-design', tier 0 of the design-doc-review JobKind).
+  /// 'review-design', tier 0 of the design-doc-review Workflow).
   const REVIEW_STEP_KIND = 'review-design';
 
   /// Where a review Job should open. The focused step route renders
@@ -186,7 +186,7 @@
       });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
       // doc_path is stamped at materialization from the Job's subject
-      // (the JobKind's metadata_defaults template `{subject.id}`) — no
+      // (the Workflow's metadata_defaults template `{subject.id}`) — no
       // follow-up PUT. The old fill-in write lost read-overlay-write
       // races against dispatcher assignment and workforce completion,
       // and terminal-metadata immutability then sealed the empty value

@@ -13,7 +13,7 @@ import { expect } from '@playwright/test';
  *     to synthesise the `x-boss-user` header for every backend
  *     hit, so the API responses are scoped to that employee.
  *  2. `boss.persona.empId` localStorage value — the SPA's
- *     `loadSession` reads this in DEMO_MODE to pick the rendered
+ *     the dev-server reads this to synthesise x-boss-user for the rendered
  *     `session.value.user`. Without it the SPA still falls back
  *     to `roster[0]` (or `emp-001`), so any UI gated on
  *     `session.value.user.id` keeps showing the wrong employee.

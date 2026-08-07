@@ -4,7 +4,7 @@
 
 -- A **View** is a saved composition over the Information API: a source,
 -- a filter, a set of columns, a layout. It is the personal rung of the
--- extensibility ladder — below "author a JobKind" there was previously
+-- extensibility ladder — below "author a Workflow" there was previously
 -- nothing, so an operator who wanted to look at the information a
 -- different way had to ask for a frontend change or keep a spreadsheet.
 --

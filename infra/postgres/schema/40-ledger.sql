@@ -126,7 +126,7 @@ INSERT INTO gl_accounts (id, code, name, kind, normal_side) VALUES
     -- permanent fake receivables.
     ('00000000-0000-0000-0000-000000006700', '6700', 'Bad Debt Expense', 'expense', 'debit'),
     -- 6900 Depreciation Expense — counterpart for the monthly
-    -- `depreciation-run` JobKind (DR 6900 / CR 1510) and for
+    -- `depreciation-run` Workflow (DR 6900 / CR 1510) and for
     -- the retirement-disposal JE that reverses cost basis.
     -- Straight-line depreciation over the asset's useful life
     -- (catalog-driven; default 10y for brewery vessels, 5y for
@@ -688,7 +688,7 @@ CREATE INDEX IF NOT EXISTS tax_filings_status
 -- lines the way `vendor_invoices` is. The free `bill_category` is
 -- routed to a debit account by bill_accounts.toml (boss-ledger/seeds/);
 -- the credit is always 2100 A/P. `lines` is an opaque metadata bag (no
--- part_sku). Adding a new kind of spend is a JobKind writing a
+-- part_sku). Adding a new kind of spend is a Workflow writing a
 -- `bill_category` + a bill_accounts.toml row — zero code. Posts via the
 -- finance.bill.{approved,paid} rules.
 -- -----------------------------------------------------------------------------

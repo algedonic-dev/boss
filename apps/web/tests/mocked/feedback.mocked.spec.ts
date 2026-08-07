@@ -1,5 +1,5 @@
 // Feedback is a Job, and these pin the two things that makes true:
-// the POST carries the identity-first Subject the JobKind declares,
+// the POST carries the identity-first Subject the Workflow declares,
 // and the control is present on every surface because it lives in the
 // chrome rather than on a page.
 //

@@ -3,9 +3,9 @@
 //! asserts its own invariants rather than diffing against a second
 //! one:
 //!
-//! - **Coverage**: every JobKind authored in
-//!   `examples/used-device-shop/seeds/job_kinds.toml` actually
-//!   fires over a 30-day window. A JobKind without a matching
+//! - **Coverage**: every Workflow authored in
+//!   `examples/used-device-shop/seeds/workflows.toml` actually
+//!   fires over a 30-day window. A Workflow without a matching
 //!   `[job_rates.*]` block in tenant.toml never fires; this test
 //!   pins that so a dropped rate block surfaces here.
 //! - **Lifecycle**: jobs open + steps complete + some jobs close +
@@ -95,7 +95,7 @@ fn lifecycle_invariants_hold() {
     assert!(
         shape.report.jobs_created > 10,
         "30-day shape-driven run should open >10 jobs across 32 \
-         JobKinds; got {}",
+         Workflows; got {}",
         shape.report.jobs_created
     );
     // The shape-driven engine only OPENS jobs/steps; the workforce executor

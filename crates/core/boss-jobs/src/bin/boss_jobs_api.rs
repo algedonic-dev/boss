@@ -156,9 +156,9 @@ async fn main() -> Result<()> {
             pg_url.to_string(),
             cfg.nats_url.clone(),
         ));
-        let kind_registry: Arc<dyn boss_jobs::JobKindRegistry> =
-            Arc::new(boss_jobs::PgJobKinds::new(pool.clone()));
-        reconcile_platform_kinds(kind_registry.as_ref()).await;
+        let kind_registry: Arc<dyn boss_jobs::WorkflowRegistry> =
+            Arc::new(boss_jobs::PgWorkflows::new(pool.clone()));
+        reconcile_platform_workflows(kind_registry.as_ref()).await;
         let plugin_registry: Arc<dyn boss_jobs::StepPluginRegistry> =
             Arc::new(boss_jobs::PgStepPlugins::new(pool.clone()));
         let scheduling: Arc<dyn boss_jobs::scheduling::SchedulingRepository> =
@@ -191,11 +191,11 @@ async fn main() -> Result<()> {
     boss_core::startup::require_postgres_or_explicit_inmemory("boss-jobs-api")?;
     info!("using in-memory jobs storage (no postgres_url configured)");
     let jobs = Arc::new(InMemoryJobs::new());
-    let kind_registry: Arc<dyn boss_jobs::JobKindRegistry> =
-        Arc::new(boss_jobs::InMemoryJobKinds::new());
+    let kind_registry: Arc<dyn boss_jobs::WorkflowRegistry> =
+        Arc::new(boss_jobs::InMemoryWorkflows::new());
     let plugin_registry: Arc<dyn boss_jobs::StepPluginRegistry> =
         Arc::new(boss_jobs::InMemoryStepPlugins::new());
-    reconcile_platform_kinds(kind_registry.as_ref()).await;
+    reconcile_platform_workflows(kind_registry.as_ref()).await;
     // No subjects table without Postgres — the in-memory spike path
     // skips the existence gate, same as before.
     let subject_existence: Option<Arc<dyn boss_jobs::subject_existence::SubjectExistenceCheck>> =
@@ -224,7 +224,7 @@ async fn run_server<R: JobsRepository + 'static>(
     jobs: Arc<R>,
     bus: Arc<NatsEventBus>,
     publisher: boss_core::publisher::DomainPublisher,
-    kind_registry: Option<Arc<dyn boss_jobs::JobKindRegistry>>,
+    kind_registry: Option<Arc<dyn boss_jobs::WorkflowRegistry>>,
     plugin_registry: Option<Arc<dyn boss_jobs::StepPluginRegistry>>,
     scheduling: Option<Arc<dyn boss_jobs::scheduling::SchedulingRepository>>,
     calendar: Option<Arc<dyn boss_calendar_client::CalendarClient>>,
@@ -342,8 +342,8 @@ async fn run_server<R: JobsRepository + 'static>(
     Ok(())
 }
 
-/// Reconcile the platform-supplied JobKinds (today: just
-/// `job-kind-design`) against the live registry. Insert if
+/// Reconcile the platform-supplied Workflows (today: just
+/// `workflow-design`) against the live registry. Insert if
 /// missing, refresh bootstrap-owned drift, preserve operator
 /// edits — same shape as
 /// `boss_policy_client::PolicyRepository::bootstrap_reconcile`.
@@ -353,9 +353,9 @@ async fn run_server<R: JobsRepository + 'static>(
 /// short (just one kind in v1) so a missing default surfaces
 /// instantly: the next boot logs `inserted=1` if someone
 /// retired the meta-kind by hand.
-async fn reconcile_platform_kinds(registry: &dyn boss_jobs::JobKindRegistry) {
-    use boss_jobs::registry::platform_kinds;
-    let defaults = platform_kinds();
+async fn reconcile_platform_workflows(registry: &dyn boss_jobs::WorkflowRegistry) {
+    use boss_jobs::registry::platform_workflows;
+    let defaults = platform_workflows();
     match registry.bootstrap_reconcile(&defaults).await {
         Ok(stats) => {
             info!(
@@ -364,29 +364,29 @@ async fn reconcile_platform_kinds(registry: &dyn boss_jobs::JobKindRegistry) {
                 preserved = stats.preserved,
                 unchanged = stats.unchanged,
                 total = defaults.len(),
-                "reconciled platform JobKinds"
+                "reconciled platform Workflows"
             );
         }
         Err(e) => {
-            tracing::warn!(error = %e, "platform JobKind reconcile failed");
+            tracing::warn!(error = %e, "platform Workflow reconcile failed");
         }
     }
     verify_registry_viability(registry).await;
 }
 
-/// Boot-time viability re-verification: every active JobKind in the
+/// Boot-time viability re-verification: every active Workflow in the
 /// registry must still pass the viability lint. A previously-valid
 /// spec can become invalid if an upstream StepType's enum domain
 /// changes; refuse to start rather than dispatch against a broken
 /// graph (the audit_log is the system of record — we don't open for
 /// writes we can't reason about).
-async fn verify_registry_viability(registry: &dyn boss_jobs::JobKindRegistry) {
-    use boss_jobs::job_kind_lint::validate_all;
+async fn verify_registry_viability(registry: &dyn boss_jobs::WorkflowRegistry) {
     use boss_jobs::step_registry::StepRegistry;
+    use boss_jobs::workflow_lint::validate_all;
     let kinds = match registry.list_active(None).await {
         Ok(k) => k,
         Err(e) => {
-            tracing::error!(error = %e, "boot viability check: could not list active JobKinds");
+            tracing::error!(error = %e, "boot viability check: could not list active Workflows");
             std::process::exit(1);
         }
     };
@@ -397,7 +397,7 @@ async fn verify_registry_viability(registry: &dyn boss_jobs::JobKindRegistry) {
         }
         tracing::error!(
             count = errs.len(),
-            "refusing to start: active JobKind(s) fail the viability lint"
+            "refusing to start: active Workflow(s) fail the viability lint"
         );
         std::process::exit(1);
     }

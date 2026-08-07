@@ -1,5 +1,5 @@
 -- =========================================================================
--- 03-jobs.sql — Jobs — Jobs, Steps, JobKind registry, Step UX Plugin registry.
+-- 03-jobs.sql — Jobs — Jobs, Steps, Workflow registry, Step UX Plugin registry.
 -- =========================================================================
 
 
@@ -83,14 +83,14 @@ CREATE INDEX IF NOT EXISTS steps_status ON steps(status);
 
 -- ---------------------------------------------------------------------------
 -- Job Kind Registry — see docs/architecture-decisions.md
--- (Jobs, JobKinds, Steps)
+-- (Jobs, Workflows, Steps)
 -- ---------------------------------------------------------------------------
--- Every Job in the system is an instance of a JobKind. This table is
+-- Every Job in the system is an instance of a Workflow. This table is
 -- the registry that lets department leads author new kinds without a
 -- core-team PR. Append-only versioning: every edit creates a new
 -- (kind, version+1) row. The partial unique index enforces exactly one
 -- active row per kind at a time.
-CREATE TABLE IF NOT EXISTS job_kinds (
+CREATE TABLE IF NOT EXISTS workflows (
     kind              TEXT NOT NULL,
     version           INT  NOT NULL,
     status            TEXT NOT NULL CHECK (status IN ('draft', 'active', 'retired')),
@@ -104,13 +104,13 @@ CREATE TABLE IF NOT EXISTS job_kinds (
     steps             JSONB NOT NULL,
     metadata_schema   JSONB NOT NULL DEFAULT '{}'::jsonb,
     entitlements      JSONB NOT NULL DEFAULT '{}'::jsonb,
-    -- JobKind-level display/routing hints (not the per-Job metadata,
+    -- Workflow-level display/routing hints (not the per-Job metadata,
     -- not the metadata_schema describing per-Job fields). The first
-    -- key is `surfaces` — which operational pages a JobKind appears
+    -- key is `surfaces` — which operational pages a Workflow appears
     -- on (e.g. `{ "surfaces": ["hr"] }`). Same `serde_json::Value`
     -- round-trip shape as metadata_schema / entitlements.
     metadata          JSONB NOT NULL DEFAULT '{}'::jsonb,
-    -- JobKinds to spawn when a Job of this kind closes. Each entry
+    -- Workflows to spawn when a Job of this kind closes. Each entry
     -- is a `JobTrigger` (kind + subject_source + metadata_seed),
     -- per crates/boss-jobs/src/registry.rs. Empty array = no
     -- triggers (the common case). The runtime that fires triggers
@@ -121,13 +121,13 @@ CREATE TABLE IF NOT EXISTS job_kinds (
     -- Discriminates platform-bootstrap rows from operator edits.
     -- `bootstrap` = inserted by `boss-jobs-api`'s startup
     -- reconciler from `platform_kinds()`; any other value = the row
-    -- came from a `job-kind-design` Job, the seed loader, or
+    -- came from a `workflow-design` Job, the seed loader, or
     -- an admin PUT. The bootstrap reconciler uses this to decide
     -- whether a drifted row should self-heal (bootstrap-owned) or
     -- be preserved untouched (operator-owned). Same shape as
     -- `policy_rules.updated_by`.
-    -- See docs/architecture-decisions.md (Jobs, JobKinds, Steps:
-    -- JobKinds bootstrap through Jobs).
+    -- See docs/architecture-decisions.md (Jobs, Workflows, Steps:
+    -- Workflows bootstrap through Jobs).
     created_by        TEXT NOT NULL DEFAULT 'bootstrap',
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (kind, version)
@@ -136,22 +136,22 @@ CREATE TABLE IF NOT EXISTS job_kinds (
 
 -- One active row per kind, at most. New publishes demote the previous
 -- active row to retired in the same transaction.
-CREATE UNIQUE INDEX IF NOT EXISTS job_kinds_one_active_per_kind
-    ON job_kinds (kind) WHERE status = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS workflows_one_active_per_kind
+    ON workflows (kind) WHERE status = 'active';
 
 
-CREATE INDEX IF NOT EXISTS job_kinds_category ON job_kinds (category) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS workflows_category ON workflows (category) WHERE status = 'active';
 
-CREATE INDEX IF NOT EXISTS job_kinds_authoring_job ON job_kinds (authoring_job_id)
+CREATE INDEX IF NOT EXISTS workflows_authoring_job ON workflows (authoring_job_id)
     WHERE authoring_job_id IS NOT NULL;
 
 
--- Every Job row records the JobKind version it was born with, so the
+-- Every Job row records the Workflow version it was born with, so the
 -- snapshotted template can be looked up later (in-flight Jobs stay
 -- pinned to the version they were opened under).
-ALTER TABLE jobs ADD COLUMN IF NOT EXISTS job_kind_version INT NOT NULL DEFAULT 1;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS workflow_version INT NOT NULL DEFAULT 1;
 
-CREATE INDEX IF NOT EXISTS jobs_kind_version ON jobs (kind, job_kind_version);
+CREATE INDEX IF NOT EXISTS jobs_kind_version ON jobs (kind, workflow_version);
 
 
 -- Whether this Job belongs to the simulated company. Decided ONCE, at
@@ -179,7 +179,7 @@ CREATE INDEX IF NOT EXISTS jobs_simulated ON jobs (simulated) WHERE simulated;
 -- kinds (step_registry::v1()) stay implicit — the Rust registry merges
 -- this table with the in-tree catalog at read time.
 --
--- Shape mirrors job_kinds: append-only versioning, partial unique
+-- Shape mirrors workflows: append-only versioning, partial unique
 -- index enforcing at most one active row per kind.
 CREATE TABLE IF NOT EXISTS step_plugins (
     kind                TEXT NOT NULL,
@@ -319,7 +319,7 @@ INSERT INTO step_plugins (
 ) ON CONFLICT (kind, version) DO NOTHING;
 
 
--- review-design plugin — tier 0 of the design-doc-review JobKind.
+-- review-design plugin — tier 0 of the design-doc-review Workflow.
 -- Fetches /api/design/docs/{doc_path}, lists open questions parsed
 -- by boss-docs-api from `### Qn:` headings, gates step completion
 -- on every question having a recorded resolution. Resolutions are

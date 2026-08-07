@@ -3,7 +3,7 @@
   // Production-consume step surface — drains raw ingredients
   // consumed by a brewing batch. The brewer confirms the
   // ingredients_consumed list (typically pre-populated by the
-  // JobKind from the recipe), and the inventory side-effect
+  // Workflow from the recipe), and the inventory side-effect
   // handler decrements each part_sku's on_hand on done.
   //
   // Demo framing: the recipe arrives populated. The brewer's job
@@ -142,7 +142,7 @@
     </div>
   {:else}
     <div class="step-empty">
-      No ingredient draws on this step yet — the JobKind's recipe
+      No ingredient draws on this step yet — the Workflow's recipe
       should populate <code class="mono">ingredients_consumed</code>
       via metadata_defaults.
     </div>

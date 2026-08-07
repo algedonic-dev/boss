@@ -6,7 +6,7 @@
 //! the canonical source for those. The DB table only stores
 //! plugins.
 //!
-//! Shape mirrors `JobKindRegistry`: append-only versioning + a
+//! Shape mirrors `WorkflowRegistry`: append-only versioning + a
 //! status lifecycle (draft → active → retired), with a partial
 //! unique index enforcing at most one active row per kind.
 
@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::registry::JobKindStatus;
+use crate::registry::WorkflowStatus;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -30,7 +30,7 @@ use crate::registry::JobKindStatus;
 pub struct StepPluginSpec {
     pub kind: String,
     pub version: i32,
-    pub status: JobKindStatus,
+    pub status: WorkflowStatus,
     pub label: String,
     #[serde(default)]
     pub description: Option<String>,
@@ -58,7 +58,7 @@ impl StepPluginSpec {
         Self {
             kind: kind.into(),
             version: 1,
-            status: JobKindStatus::Draft,
+            status: WorkflowStatus::Draft,
             label: label.into(),
             description: None,
             category: category.into(),
@@ -174,7 +174,7 @@ impl StepPluginRegistry for InMemoryStepPlugins {
     async fn get_active(&self, kind: &str) -> Result<StepPluginSpec, StepPluginError> {
         self.snapshot()
             .into_iter()
-            .find(|r| r.kind == kind && r.status == JobKindStatus::Active)
+            .find(|r| r.kind == kind && r.status == WorkflowStatus::Active)
             .ok_or_else(|| StepPluginError::NotFound(format!("no active plugin: {kind}")))
     }
 
@@ -198,7 +198,7 @@ impl StepPluginRegistry for InMemoryStepPlugins {
         let mut rows: Vec<StepPluginSpec> = self
             .snapshot()
             .into_iter()
-            .filter(|r| r.status == JobKindStatus::Active)
+            .filter(|r| r.status == WorkflowStatus::Active)
             .filter(|r| category.is_none_or(|c| r.category == c))
             .collect();
         rows.sort_by(|a, b| a.kind.cmp(&b.kind));
@@ -221,7 +221,7 @@ impl StepPluginRegistry for InMemoryStepPlugins {
     ) -> Result<StepPluginSpec, StepPluginError> {
         let next = self.max_version(&spec.kind).unwrap_or(0) + 1;
         spec.version = next;
-        spec.status = JobKindStatus::Draft;
+        spec.status = WorkflowStatus::Draft;
         spec.created_at = Utc::now();
         self.rows
             .lock()
@@ -234,7 +234,7 @@ impl StepPluginRegistry for InMemoryStepPlugins {
         let mut rows = self.rows.lock().unwrap();
         let latest_draft = rows
             .values()
-            .filter(|r| r.kind == kind && r.status == JobKindStatus::Draft)
+            .filter(|r| r.kind == kind && r.status == WorkflowStatus::Draft)
             .max_by_key(|r| r.version)
             .cloned()
             .ok_or_else(|| {
@@ -242,21 +242,21 @@ impl StepPluginRegistry for InMemoryStepPlugins {
             })?;
 
         for ((k, _), row) in rows.iter_mut() {
-            if k == kind && row.status == JobKindStatus::Active {
-                row.status = JobKindStatus::Retired;
+            if k == kind && row.status == WorkflowStatus::Active {
+                row.status = WorkflowStatus::Retired;
             }
         }
         let key = (latest_draft.kind.clone(), latest_draft.version);
         let row = rows.get_mut(&key).unwrap();
-        row.status = JobKindStatus::Active;
+        row.status = WorkflowStatus::Active;
         Ok(row.clone())
     }
 
     async fn retire(&self, kind: &str) -> Result<(), StepPluginError> {
         let mut rows = self.rows.lock().unwrap();
         for ((k, _), row) in rows.iter_mut() {
-            if k == kind && row.status == JobKindStatus::Active {
-                row.status = JobKindStatus::Retired;
+            if k == kind && row.status == WorkflowStatus::Active {
+                row.status = WorkflowStatus::Retired;
             }
         }
         Ok(())
@@ -300,7 +300,7 @@ mod pg {
     fn row_to_spec(r: Row) -> Result<StepPluginSpec, StepPluginError> {
         let status = r
             .status
-            .parse::<JobKindStatus>()
+            .parse::<WorkflowStatus>()
             .map_err(StepPluginError::Storage)?;
         Ok(StepPluginSpec {
             kind: r.kind,
@@ -402,7 +402,7 @@ mod pg {
                     .await
                     .map_err(|e| StepPluginError::Storage(e.to_string()))?;
             spec.version = max.0.map(|v| v + 1).unwrap_or(1);
-            spec.status = JobKindStatus::Draft;
+            spec.status = WorkflowStatus::Draft;
             spec.created_at = Utc::now();
 
             sqlx::query(
@@ -520,7 +520,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v1.version, 1);
-        assert_eq!(v1.status, JobKindStatus::Draft);
+        assert_eq!(v1.status, WorkflowStatus::Draft);
         let v2 = reg
             .create_draft(sample("emerald-inspection"))
             .await
@@ -533,13 +533,13 @@ mod tests {
         let reg = InMemoryStepPlugins::new();
         reg.create_draft(sample("kk")).await.unwrap();
         let active = reg.publish("kk").await.unwrap();
-        assert_eq!(active.status, JobKindStatus::Active);
+        assert_eq!(active.status, WorkflowStatus::Active);
 
         reg.create_draft(sample("kk")).await.unwrap();
         reg.publish("kk").await.unwrap();
 
         let v1 = reg.get_version("kk", 1).await.unwrap();
-        assert_eq!(v1.status, JobKindStatus::Retired);
+        assert_eq!(v1.status, WorkflowStatus::Retired);
         let cur = reg.get_active("kk").await.unwrap();
         assert_eq!(cur.version, 2);
     }
@@ -556,12 +556,12 @@ mod tests {
         let reg = InMemoryStepPlugins::new();
         let mut q = sample("qa-plugin");
         q.category = "qa".into();
-        q.status = JobKindStatus::Active;
+        q.status = WorkflowStatus::Active;
         reg.seed(q).unwrap();
 
         let mut s = sample("sales-plugin");
         s.category = "sales".into();
-        s.status = JobKindStatus::Active;
+        s.status = WorkflowStatus::Active;
         reg.seed(s).unwrap();
 
         let qa_only = reg.list_active(Some("qa")).await.unwrap();

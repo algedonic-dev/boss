@@ -13,7 +13,7 @@
   const RESOURCES = [
     'job', 'step', 'account', 'employee', 'invoice', 'agreement',
     'asset', 'shipment', 'part', 'purchase-order', 'policy-rule',
-    'job-kind', 'step-plugin',
+    'workflow', 'step-plugin',
   ] as const;
 
   function scopeForDisplay(s: Scope): string {

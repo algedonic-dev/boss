@@ -1,7 +1,7 @@
 <script lang="ts">
   // Home → Views. The personal rung of the extensibility ladder.
   //
-  // Below "author a JobKind" there used to be nothing: an operator who
+  // Below "author a Workflow" there used to be nothing: an operator who
   // wanted to look at the information a different way could ask for a
   // frontend change or keep a spreadsheet. This is the surface that
   // ends that, and the spreadsheet is what it is competing with — so

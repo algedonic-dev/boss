@@ -10,7 +10,7 @@
 #   4. Prime the formula clock to the demo epoch.
 #
 # Everything that goes through the public API — the operator-baseline +
-# bootstrap-admin EMPLOYEE, the brewery tenant (classes, JobKinds, policy,
+# bootstrap-admin EMPLOYEE, the brewery tenant (classes, Workflows, policy,
 # accounts/vendors/data), and the sim that builds the demo live — is run by
 # boss-services (services-launcher.sh) once the API is up. That's why
 # operator/employee seeding can't live here: boss-operator-baseline-seed

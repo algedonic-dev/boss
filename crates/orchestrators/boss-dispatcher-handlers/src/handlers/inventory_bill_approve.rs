@@ -145,7 +145,7 @@ impl Handler for InventoryBillApprove {
                 qty.saturating_mul(unit_cost)
             })
             .sum();
-        // Defense-in-depth: a JobKind that PRECOMPUTES amount_cents must keep
+        // Defense-in-depth: a Workflow that PRECOMPUTES amount_cents must keep
         // it in sync with its lines. Skip this when we derived line amounts
         // from the live item (per-SKU restock) — there Σ(lines) is
         // authoritative, and any amount_cents present is a sim-workforce

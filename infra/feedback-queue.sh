@@ -47,7 +47,7 @@ BASE="${BOSS_JOBS_URL:-http://127.0.0.1:7900}"
 WANT="${1:-all}"
 
 # Reads are policy-gated; an unheadered call lands as `guest`, which
-# holds JobKind read and nothing else. Reading is all this does — the
+# holds Workflow read and nothing else. Reading is all this does — the
 # docstring above is the reason writes are not added here.
 BOSS_USER='{"id":"it-triage-queue","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
 
@@ -69,7 +69,7 @@ def agent_request(job):
 # The step that asks for a disposition. Found by the enum field it
 # declares, which is the same data the board reads — not a second copy
 # of the rule for which step is the triage step. A pipe-shaped
-# field_type IS the fork marker; the JobKind lint reads it the same way
+# field_type IS the fork marker; the Workflow lint reads it the same way
 # to prove every value has a successor.
 #
 # NOTE: this whole program is embedded in a double-quoted shell string,

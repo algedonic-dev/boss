@@ -246,7 +246,7 @@ pub enum WeekGridBlock {
         status: AssignmentStatus,
         target_job_id: Uuid,
         target_job_title: Option<String>,
-        target_job_kind: Option<String>,
+        target_workflow: Option<String>,
         starts_at: DateTime<Utc>,
         ends_at: DateTime<Utc>,
         notes: Option<String>,

@@ -9,15 +9,35 @@
 # could be in the same state and we wouldn't notice.
 #
 # This script catches that. For every /usr/local/bin/boss-* it:
-#   1. Resolves the binary back to a crate dir under crates/.
-#   2. Asks git for the latest commit touching that crate dir.
-#   3. Compares the binary's mtime against that commit's timestamp.
-#   4. Flags any binary whose source has moved forward since build.
+# TWO checks, because they prove different things and only one of
+# them is decisive:
+#
+#   A. DEPLOYED vs BUILT — sha256 of the installed binary against
+#      target/release/<name>. Decisive. Answers "is the thing running
+#      the thing we built".
+#   B. BUILT vs SOURCE — the binary's mtime against the newest commit
+#      touching its crate. A heuristic, and it can lie.
+#
+# Check A exists because check B did lie, on 2026-08-07, during a
+# schema regen. The deployed boss-brewery-sim had an mtime NEWER than
+# the source change it was missing — a concurrent release build had
+# compiled that crate early in the run and relinked it late, so the
+# timestamp moved forward while the content did not. This script said
+# "fresh"; `md5sum` against a fresh build said otherwise, and the
+# behaviour change (a sim granularity fix) was silently absent on a
+# running box. Five stale-binary incidents that day, and that was the
+# one the tool built to catch them waved through.
+#
+# Neither check proves target/release itself is current — mtime is all
+# there is without a rebuild. `--rebuild` does exactly that: builds
+# first, so check A becomes decisive end-to-end. Slow, and the right
+# thing before a regen.
 #
 # Exit code: 0 if everything is current, 1 if any drift is found.
 #
 # Usage:
 #   ./infra/check-binary-freshness.sh
+#   ./infra/check-binary-freshness.sh --rebuild        # decisive; slow
 #   ./infra/check-binary-freshness.sh --bin-dir /opt/boss/target/release
 #
 # Notes:
@@ -34,10 +54,12 @@ set -eu
 
 BIN_DIR="/usr/local/bin"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REBUILD=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --bin-dir)  shift; BIN_DIR="$1" ;;
+        --rebuild)  REBUILD=1 ;;
         --help|-h)  sed -n '2,30p' "$0"; exit 0 ;;
         *)          echo "unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -45,6 +67,19 @@ while [ $# -gt 0 ]; do
 done
 
 cd "$REPO_ROOT"
+
+BUILT_DIR="$REPO_ROOT/target/release"
+
+if [ "$REBUILD" -eq 1 ]; then
+    echo "==> rebuilding so the hash comparison is decisive end-to-end"
+    ./infra/build-release.sh >/dev/null || { echo "FATAL: build failed" >&2; exit 2; }
+fi
+
+# sha256 of a file, or empty when it is not there.
+digest() {
+    [ -f "$1" ] || { echo ""; return; }
+    sha256sum "$1" 2>/dev/null | cut -d" " -f1
+}
 
 # Exceptions where the binary name doesn't follow the
 # `boss-<crate>-api`-or-similar convention.
@@ -120,6 +155,7 @@ fi
 stale_count=0
 unknown_count=0
 fresh_count=0
+drift_count=0
 
 # Collect once outside the find loop so subshell variable scope
 # doesn't eat our running counts.
@@ -153,6 +189,19 @@ for bin in "${BINS[@]}"; do
     src_when=$(date -u -d "@$src_ts" '+%Y-%m-%d %H:%M' 2>/dev/null || date -u -r "$src_ts" '+%Y-%m-%d %H:%M')
     bin_when=$(date -u -d "@$binary_mtime" '+%Y-%m-%d %H:%M' 2>/dev/null || date -u -r "$binary_mtime" '+%Y-%m-%d %H:%M')
 
+    # Check A first: it is the decisive one. A binary that differs
+    # from what we built is wrong regardless of what its mtime says,
+    # and reporting the weaker signal alongside it would only muddy
+    # the answer.
+    built="$BUILT_DIR/$name"
+    if [ -f "$built" ]; then
+        if [ "$(digest "$bin")" != "$(digest "$built")" ]; then
+            printf '%-40s %-20s %-20s %s\n' "$name" "$bin_when" "$src_when" "NOT_DEPLOYED"
+            drift_count=$((drift_count + 1))
+            continue
+        fi
+    fi
+
     if [ "$src_ts" -gt "$binary_mtime" ]; then
         printf '%-40s %-20s %-20s %s\n' "$name" "$bin_when" "$src_when" "STALE"
         stale_count=$((stale_count + 1))
@@ -163,9 +212,18 @@ for bin in "${BINS[@]}"; do
 done
 
 echo ""
-echo "==> $fresh_count fresh, $stale_count stale, $unknown_count unmapped"
+echo "==> $fresh_count fresh, $drift_count not-deployed, $stale_count stale, $unknown_count unmapped"
 
-if [ "$stale_count" -gt 0 ]; then
+if [ "$drift_count" -gt 0 ]; then
+    echo ""
+    echo "    NOT_DEPLOYED: the installed binary differs from target/release."
+    echo "    Its mtime may look current — that is the failure mode this catches."
+    echo "      sudo install -m 0755 target/release/<name> /usr/local/bin/<name>"
+    echo "    (deploy-services.sh only covers port-table services; seed,"
+    echo "     rebuild and one-shot binaries need installing directly.)"
+fi
+
+if [ "$stale_count" -gt 0 ] || [ "$drift_count" -gt 0 ]; then
     echo ""
     echo "    Rebuild + redeploy stale binaries:"
     echo "      cargo build --release --workspace --features postgres"
@@ -173,5 +231,12 @@ if [ "$stale_count" -gt 0 ]; then
     echo "      sudo install -m 0755 target/release/boss /usr/local/bin/boss"
     exit 1
 fi
+
+# Clean run: record it against an open regen, no-op otherwise. Only on
+# the clean path — a step that closes whether or not the check passed
+# would be a worse record than none, since the Job would then assert
+# the artifacts were verified when they were not.
+"$(dirname "$0")/boss-step.sh" regenerate-deployment artifacts \
+    "verified=$fresh_count fresh, 0 not-deployed, 0 stale ($unknown_count unmapped)" || true
 
 exit 0

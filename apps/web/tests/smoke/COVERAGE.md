@@ -19,7 +19,7 @@ handler, form submission, and significant input affordance.
   fast, deterministic, and run in the `web` CI job
   (`bun run test:mocked`, `playwright.mocked.config.ts`). This is
   where interactive behavior we want to *maintain* (e.g. the
-  JobKind authoring graph/inspector/workflow rail) is guarded
+  Workflow authoring graph/inspector/workflow rail) is guarded
   against regression.
 
 **Conventions.**
@@ -191,16 +191,16 @@ the actual surface.
       covers the render contract.
 
 ### Admin
-- [x] `admin/JobKindsPage.svelte` (0) — list.
-      `tests/smoke/admin-job-kinds.spec.ts` covers row → detail
+- [x] `admin/WorkflowsPage.svelte` (0) — list.
+      `tests/smoke/admin-workflows.spec.ts` covers row → detail
       navigation.
-- [x] `admin/JobKindNewPage.svelte` (1) — DAG editor.
-      `tests/smoke/admin-job-kind-new.spec.ts` covers spec
+- [x] `admin/WorkflowNewPage.svelte` (1) — DAG editor.
+      `tests/smoke/admin-workflow-new.spec.ts` covers spec
       inputs (slug / label / category / description) + subject-
       kind checkboxes + Create-draft button + StepDagEditor's
       Add-tier / Add-step / Show-JSON toggles.
-- [~] `admin/JobKindDetailPage.svelte` (6) —
-      `tests/smoke/admin-job-kinds.spec.ts` covers Publish/Retire
+- [~] `admin/WorkflowDetailPage.svelte` (6) —
+      `tests/smoke/admin-workflows.spec.ts` covers Publish/Retire
       disabled-state + Fork navigation. Add-tier / add-step
       controls inside the DAG editor flyout still uncovered.
 - [~] `admin/PolicyPage.svelte` (2) —
@@ -230,7 +230,7 @@ the actual surface.
       tabs (Providers / Banking / Payroll / Tax). Provider-row
       expand → action buttons (Configure / Test / Sync) skip
       when no providers seeded.
-- [x] `landing/LandingPage.svelte` (2) — JobKind picker on the
+- [x] `landing/LandingPage.svelte` (2) — Workflow picker on the
       unauth `/`. `tests/smoke/landing-shell.spec.ts` covers the
       hero + jobs-in-flight stat render and the kind-picker /
       recent-job button active-state toggles.

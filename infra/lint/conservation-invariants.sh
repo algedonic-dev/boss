@@ -453,7 +453,7 @@ SQL
 #
 # Tolerance bumped 2026-05-29 from $50k → $500k. The residual
 # ±$250k sits on per-brew burden vs produce_unit_cost
-# calibration in examples/brewery/seeds/job_kinds.toml; the
+# calibration in examples/brewery/seeds/workflows.toml; the
 # original -$87.9M structural class of bug is well outside
 # this band and still caught.
 run_invariant "Q. WIP balance roughly zero (burden absorption closes gap)" "$(cat <<'SQL'

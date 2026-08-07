@@ -90,7 +90,7 @@ pub struct LaunchCalendarRow {
 #[derive(Debug, Clone, Serialize)]
 pub struct AssignmentRow {
     pub job_id: JobId,
-    pub job_kind: String,
+    pub workflow: String,
     pub subject_kind: String,
     pub subject_id: String,
     pub priority: Priority,
@@ -257,7 +257,7 @@ pub trait JobsRepository: Send + Sync {
                 if assignee_match || role_match {
                     out.push(AssignmentRow {
                         job_id: job.id,
-                        job_kind: job.kind.clone(),
+                        workflow: job.kind.clone(),
                         subject_kind: boss_core::primitives::Subject::kind(&job.subject)
                             .to_string(),
                         subject_id: boss_core::primitives::Subject::id(&job.subject).to_string(),
@@ -307,7 +307,7 @@ pub trait JobsRepository: Send + Sync {
                 }
                 out.push(AssignmentRow {
                     job_id: job.id,
-                    job_kind: job.kind.clone(),
+                    workflow: job.kind.clone(),
                     subject_kind: boss_core::primitives::Subject::kind(&job.subject).to_string(),
                     subject_id: boss_core::primitives::Subject::id(&job.subject).to_string(),
                     priority: job.priority,
@@ -345,9 +345,9 @@ pub trait JobsRepository: Send + Sync {
     /// hasn't been closed yet.
     ///
     /// Drives the live histogram on the operating-model view so a
-    /// JobKind bar can show "how many refurbs are in Acquire vs.
+    /// Workflow bar can show "how many refurbs are in Acquire vs.
     /// Refurbish vs. Certify right now." Caller maps tier → phase
-    /// via its own JobKind-specific mapping.
+    /// via its own Workflow-specific mapping.
     async fn jobs_tier_distribution(
         &self,
         status: Option<JobStatus>,

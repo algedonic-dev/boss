@@ -1,6 +1,6 @@
-//! Static validation for `JobKindSpec` rows — the **viability lint**.
+//! Static validation for `WorkflowSpec` rows — the **viability lint**.
 //!
-//! A JobKind is a program written in the StepType alphabet; its step
+//! A Workflow is a program written in the StepType alphabet; its step
 //! DAG is implicit in the steps' `ready_when` predicates. The lint
 //! proves the program is well-formed before it can run:
 //!
@@ -19,41 +19,41 @@
 //!   discriminating enum is handled by some successor, or a wildcard
 //!   fallback covers the open-ended case.
 //!
-//! Runs at author time (`/system/job-kinds`), publish time (the
-//! `job-kind-publish` dispatch path), and boot time (boss-jobs-api
+//! Runs at author time (`/system/workflows`), publish time (the
+//! `workflow-publish` dispatch path), and boot time (boss-jobs-api
 //! refuses to start against a broken registry).
 
-use crate::registry::{JobKindSpec, StepSpec, predicate_step_refs};
+use crate::registry::{StepSpec, WorkflowSpec, predicate_step_refs};
 use crate::step_registry::StepRegistry;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 /// One viability failure. `step` is the offending step slug (empty
-/// for whole-JobKind structural failures).
+/// for whole-Workflow structural failures).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JobKindLintError {
-    pub job_kind: String,
+pub struct WorkflowLintError {
+    pub workflow: String,
     pub step: String,
     pub reason: String,
 }
 
-impl std::fmt::Display for JobKindLintError {
+impl std::fmt::Display for WorkflowLintError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.step.is_empty() {
-            write!(f, "[{}] {}", self.job_kind, self.reason)
+            write!(f, "[{}] {}", self.workflow, self.reason)
         } else {
             write!(
                 f,
                 "[{}] step `{}`: {}",
-                self.job_kind, self.step, self.reason
+                self.workflow, self.step, self.reason
             )
         }
     }
 }
 
-/// Validate a single JobKindSpec. Returns every violation found; an
-/// empty Vec means the JobKind is viable.
-pub fn validate_job_kind(spec: &JobKindSpec, registry: &StepRegistry) -> Vec<JobKindLintError> {
+/// Validate a single WorkflowSpec. Returns every violation found; an
+/// empty Vec means the Workflow is viable.
+pub fn validate_workflow(spec: &WorkflowSpec, registry: &StepRegistry) -> Vec<WorkflowLintError> {
     let mut errs = Vec::new();
     // Phase 0 — metadata default value shapes.
     for step in &spec.steps {
@@ -64,20 +64,20 @@ pub fn validate_job_kind(spec: &JobKindSpec, registry: &StepRegistry) -> Vec<Job
     errs
 }
 
-/// Validate every JobKindSpec in a list. One call, every error
-/// reported — used by the tenant seed bundles (`load_job_kinds_*`
+/// Validate every WorkflowSpec in a list. One call, every error
+/// reported — used by the tenant seed bundles (`load_workflows_*`
 /// returns a Vec).
-pub fn validate_all(specs: &[JobKindSpec], registry: &StepRegistry) -> Vec<JobKindLintError> {
+pub fn validate_all(specs: &[WorkflowSpec], registry: &StepRegistry) -> Vec<WorkflowLintError> {
     let mut errs = Vec::new();
     for spec in specs {
-        errs.extend(validate_job_kind(spec, registry));
+        errs.extend(validate_workflow(spec, registry));
     }
     errs
 }
 
-fn err(spec: &JobKindSpec, step: &str, reason: impl Into<String>) -> JobKindLintError {
-    JobKindLintError {
-        job_kind: spec.kind.clone(),
+fn err(spec: &WorkflowSpec, step: &str, reason: impl Into<String>) -> WorkflowLintError {
+    WorkflowLintError {
+        workflow: spec.kind.clone(),
         step: step.to_string(),
         reason: reason.into(),
     }
@@ -87,7 +87,11 @@ fn err(spec: &JobKindSpec, step: &str, reason: impl Into<String>) -> JobKindLint
 // Phases 1–3 — viability
 // ---------------------------------------------------------------------------
 
-fn check_viability(spec: &JobKindSpec, registry: &StepRegistry, errs: &mut Vec<JobKindLintError>) {
+fn check_viability(
+    spec: &WorkflowSpec,
+    registry: &StepRegistry,
+    errs: &mut Vec<WorkflowLintError>,
+) {
     let slugs: HashSet<&str> = spec.steps.iter().map(|s| s.title.as_str()).collect();
 
     // Duplicate slugs make every `steps.<slug>` reference ambiguous.
@@ -299,10 +303,10 @@ fn reachable_backward(
 /// discriminating enum can take, or that a wildcard fallback handles
 /// the open-ended case.
 fn check_fork_coverage(
-    spec: &JobKindSpec,
+    spec: &WorkflowSpec,
     registry: &StepRegistry,
     deps: &HashMap<String, Vec<String>>,
-    errs: &mut Vec<JobKindLintError>,
+    errs: &mut Vec<WorkflowLintError>,
 ) {
     for fork in &spec.steps {
         let successors: Vec<&StepSpec> = spec
@@ -417,7 +421,7 @@ fn enum_domain(registry: &StepRegistry, fork: &StepSpec, field: &str) -> Option<
 /// Build a synthetic predicate payload where `fork` has completed
 /// (optionally with one metadata field set), every other step is
 /// not-done. Used to probe successor coverage at lint time.
-fn synth_fork_payload(spec: &JobKindSpec, fork: &str, field: Option<(&str, Value)>) -> Value {
+fn synth_fork_payload(spec: &WorkflowSpec, fork: &str, field: Option<(&str, Value)>) -> Value {
     let mut steps = serde_json::Map::new();
     for s in &spec.steps {
         let done = s.title == fork;
@@ -455,7 +459,7 @@ fn eval_pred(src: &str, payload: &Value) -> Option<bool> {
 ///
 /// Catches a bad enum literal — e.g. `channel = "in-person"` when the
 /// field's enum is `email|phone|meeting|demo|other` — at
-/// JobKind-load time, so it fails fast instead of surfacing at
+/// Workflow-load time, so it fails fast instead of surfacing at
 /// step-completion time mid-run.
 ///
 /// Permissive about placeholders: empty strings on date / date-time /
@@ -464,10 +468,10 @@ fn eval_pred(src: &str, payload: &Value) -> Option<bool> {
 /// through. Unknown field names are ignored. Skipped for unknown step
 /// kinds (a separate error class).
 fn check_metadata_defaults_values(
-    spec: &JobKindSpec,
+    spec: &WorkflowSpec,
     step: &StepSpec,
     registry: &StepRegistry,
-    errs: &mut Vec<JobKindLintError>,
+    errs: &mut Vec<WorkflowLintError>,
 ) {
     let Some(step_type) = registry.get(&step.kind) else {
         return;
@@ -484,8 +488,8 @@ fn check_metadata_defaults_values(
             continue;
         }
         if let Some(reason) = check_field_value(field.field_type, value, field.name) {
-            errs.push(JobKindLintError {
-                job_kind: spec.kind.clone(),
+            errs.push(WorkflowLintError {
+                workflow: spec.kind.clone(),
                 step: step.title.clone(),
                 reason,
             });
@@ -502,8 +506,8 @@ fn check_metadata_defaults_values(
             continue;
         }
         if let Some(reason) = check_field_value(&field.field_type, value, &field.name) {
-            errs.push(JobKindLintError {
-                job_kind: spec.kind.clone(),
+            errs.push(WorkflowLintError {
+                workflow: spec.kind.clone(),
                 step: step.title.clone(),
                 reason,
             });
@@ -585,10 +589,10 @@ mod tests {
     use crate::registry::{StepSpec, Terminal};
     use serde_json::json;
 
-    /// Minimal viable two-step JobKind: a trigger that flows into a
+    /// Minimal viable two-step Workflow: a trigger that flows into a
     /// terminal. Passes all phases.
-    fn viable_spec(kind: &str) -> JobKindSpec {
-        JobKindSpec::platform_seed(
+    fn viable_spec(kind: &str) -> WorkflowSpec {
+        WorkflowSpec::platform_seed(
             kind,
             kind,
             "test",
@@ -616,7 +620,7 @@ mod tests {
     #[test]
     fn minimal_viable_jobkind_passes() {
         let reg = StepRegistry::v1();
-        assert!(validate_job_kind(&viable_spec("ok"), &reg).is_empty());
+        assert!(validate_workflow(&viable_spec("ok"), &reg).is_empty());
     }
 
     #[test]
@@ -624,7 +628,7 @@ mod tests {
         let reg = StepRegistry::v1();
         let mut spec = viable_spec("no-trigger");
         spec.steps[0].ready_when = "steps.finish.done".into(); // no "true"
-        let errs = validate_job_kind(&spec, &reg);
+        let errs = validate_workflow(&spec, &reg);
         assert!(errs.iter().any(|e| e.reason.contains("no trigger")));
     }
 
@@ -633,7 +637,7 @@ mod tests {
         let reg = StepRegistry::v1();
         let mut spec = viable_spec("no-terminal");
         spec.steps[1].terminal = None;
-        let errs = validate_job_kind(&spec, &reg);
+        let errs = validate_workflow(&spec, &reg);
         assert!(errs.iter().any(|e| e.reason.contains("no terminal")));
     }
 
@@ -642,7 +646,7 @@ mod tests {
         let reg = StepRegistry::v1();
         let mut spec = viable_spec("dangling");
         spec.steps[1].ready_when = "steps.ghost.done".into();
-        let errs = validate_job_kind(&spec, &reg);
+        let errs = validate_workflow(&spec, &reg);
         assert!(
             errs.iter()
                 .any(|e| e.reason.contains("unknown step `ghost`"))
@@ -656,7 +660,7 @@ mod tests {
         // start depends on finish, finish depends on start.
         spec.steps[0].ready_when = "steps.finish.done".into();
         spec.steps[1].ready_when = "steps.start.done".into();
-        let errs = validate_job_kind(&spec, &reg);
+        let errs = validate_workflow(&spec, &reg);
         assert!(errs.iter().any(|e| e.reason.contains("cycle")));
     }
 
@@ -672,7 +676,7 @@ mod tests {
             ready_when: "steps.island.done".into(), // self-ref → its own cycle guard
             ..Default::default()
         });
-        let errs = validate_job_kind(&spec, &reg);
+        let errs = validate_workflow(&spec, &reg);
         assert!(!errs.is_empty());
     }
 
@@ -681,7 +685,7 @@ mod tests {
         // approval.decision is an enum approved|rejected|changes-requested.
         // Cover only "approved" → the other two are orphan outcomes.
         let reg = StepRegistry::v1();
-        let spec = JobKindSpec::platform_seed(
+        let spec = WorkflowSpec::platform_seed(
             "fork",
             "fork",
             "test",
@@ -713,7 +717,7 @@ mod tests {
                 },
             ],
         );
-        let errs = validate_job_kind(&spec, &reg);
+        let errs = validate_workflow(&spec, &reg);
         assert!(
             errs.iter()
                 .any(|e| e.reason.contains("orphan outcome")
@@ -731,7 +735,7 @@ mod tests {
         // a tenant seed (e.g. the brewery's packaging allocation) declares a
         // fork's vocabulary as data without a brewery-specific core StepType.
         let reg = StepRegistry::v1();
-        let spec = JobKindSpec::platform_seed(
+        let spec = WorkflowSpec::platform_seed(
             "inline-fork",
             "inline-fork",
             "test",
@@ -768,7 +772,7 @@ mod tests {
                 },
             ],
         );
-        let errs = validate_job_kind(&spec, &reg);
+        let errs = validate_workflow(&spec, &reg);
         assert!(
             !errs.iter().any(|e| e.reason.contains("fork")),
             "inline package|skip enum should make the fork exhaustive, got: {errs:?}"
@@ -781,7 +785,7 @@ mod tests {
         // "skip" is now a provable orphan (not free-text), so the lint must
         // flag it rather than silently accept an uncovered branch.
         let reg = StepRegistry::v1();
-        let spec = JobKindSpec::platform_seed(
+        let spec = WorkflowSpec::platform_seed(
             "inline-orphan",
             "inline-orphan",
             "test",
@@ -818,7 +822,7 @@ mod tests {
                 },
             ],
         );
-        let errs = validate_job_kind(&spec, &reg);
+        let errs = validate_workflow(&spec, &reg);
         assert!(
             errs.iter()
                 .any(|e| e.reason.contains("orphan outcome") && e.reason.contains("skip")),
@@ -833,7 +837,7 @@ mod tests {
         spec.steps[1].kind = "outreach".into();
         spec.steps[1].metadata_defaults =
             json!({ "channel": "in-person", "recipient_id": "{subject.id}" });
-        let errs = validate_job_kind(&spec, &reg);
+        let errs = validate_workflow(&spec, &reg);
         assert!(
             errs.iter()
                 .any(|e| e.reason.contains("channel") && e.reason.contains("in-person")),
@@ -850,7 +854,7 @@ mod tests {
             json!({ "channel": "email", "recipient_id": "{subject.id}" });
         // No Phase-0 violation (other phases still pass for this shape).
         assert!(
-            !validate_job_kind(&spec, &reg)
+            !validate_workflow(&spec, &reg)
                 .iter()
                 .any(|e| e.reason.contains("metadata_defaults")),
             "{{subject.id}} is a valid string template"

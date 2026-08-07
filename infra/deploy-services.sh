@@ -999,7 +999,7 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]] \
         echo "  !! GATEWAY NOT RESPONDING ($gw_code) — the public face will show the" >&2
         echo "     'demo regenerating' splash until :4443 is up. Investigate boss-gateway." >&2
     fi
-    # The sim (also unmanaged here) gates on BOSS_DEMO_MODE; flag it if a
+    # The sim (also unmanaged here) runs iff its unit is enabled; flag it if a
     # demo host left it down, but don't force-start (non-demo deploys
     # intentionally leave it off).
     if systemctl is-enabled --quiet boss-brewery-sim.service 2>/dev/null \
@@ -1009,3 +1009,10 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]] \
 fi
 
 echo "done."
+
+# A deploy is a step of a regen when one is open, and a no-op otherwise.
+# `|| true` because a deploy must not fail on bookkeeping: the services
+# are already running by this point, and a Job that cannot be updated
+# is a worse thing to abort a deploy over than to report.
+"$(dirname "$0")/boss-step.sh" regenerate-deployment deploy \
+    "deployed=$(date -u +%Y-%m-%dT%H:%M:%SZ)" || true

@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 boss-core = { path = "../boss-core" }
+async-trait = { workspace = true }
 boss-classes-client = { path = "../boss-classes-client" }
 boss-ports = { path = "../boss-ports" }
 anyhow = { workspace = true }

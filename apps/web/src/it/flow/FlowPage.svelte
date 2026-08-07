@@ -18,7 +18,7 @@
   //
   // ## Whose work counts
   //
-  // JobKinds that declare an owner_role the server was asked for —
+  // Workflows that declare an owner_role the server was asked for —
   // registry data, never a list here. That is also what keeps the 85
   // mis-marked restock Jobs out: they declare no owner, so they never
   // enter, where a plain "not simulated" filter would have folded a
@@ -177,7 +177,7 @@
     try {
       const [flowResp, kindsResp] = await Promise.all([
         fetch('/api/views/flow'),
-        fetch('/api/jobs/kinds'),
+        fetch('/api/workflows'),
       ]);
       if (!flowResp.ok) throw new Error(`flow: HTTP ${flowResp.status}`);
       const next: Flow = await flowResp.json();

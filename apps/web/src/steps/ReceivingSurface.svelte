@@ -3,7 +3,7 @@
   import { appToday } from '@boss/web-kit/sim-clock';
   // Receiving step surface — three-way match for inbound goods
   // (PO line + actual qty received + over/short delta). The
-  // ingredient-restock JobKind opens with a procurement step
+  // ingredient-restock Workflow opens with a procurement step
   // (places PO) and ends with a receiving step where the
   // warehouse clerk confirms what actually showed up.
   //

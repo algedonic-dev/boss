@@ -110,12 +110,25 @@ async fn main() -> Result<()> {
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .context("local-auth http client")?,
-            // Guest browsing rides on the flag that already means
-            // "this deployment is a demo, not a tenant's real
-            // company" — the brewery simulator gates on the same
-            // one. A second variable would be a second way to
-            // answer one question, and the two would drift.
-            guest_access: std::env::var("BOSS_DEMO_MODE").as_deref() == Ok("1"),
+            // One flag, one question: does this deployment hand out
+            // a read-only session to anyone who asks?
+            //
+            // This rode on BOSS_DEMO_MODE, on the reasoning that a
+            // demo is exactly where guest browsing belongs. That was
+            // wrong in the way shared flags usually are — the same
+            // variable also decided whether the simulator ran, so
+            // turning off synthetic activity silently withdrew guest
+            // access, and neither effect was visible from the name.
+            guest_access: std::env::var("BOSS_GUEST_ACCESS").as_deref() == Ok("1"),
+            mail: boss_gateway::mail::from_env(),
+            // Origin the reset link points at. Falls back to the
+            // loopback listener, which is right for a laptop and
+            // obviously wrong in a deploy — a link nobody outside the
+            // box can open is easier to notice than a plausible one
+            // pointing at the wrong host.
+            public_url: std::env::var("BOSS_PUBLIC_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:4443".to_string()),
+            forgot_seen: Default::default(),
         }))
     } else {
         None
@@ -233,7 +246,7 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::DISPATCHER)),
         )
         // Public read surface for the unauth landing page (`/`) —
-        // live fetch from /api/jobs/kinds/{kind}, no session
+        // live fetch from /api/workflows/{kind}, no session
         // required. Strict path matchers win over `/api/jobs/{*rest}`
         // in axum's router.
         // Writes / step metadata / detail routes stay auth-gated.
@@ -242,7 +255,7 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
         // workflow-diagram preview into a live window into the
         // brewery's running operating company.
         //
-        // For `/api/jobs/kinds` and `/api/jobs/kinds/{*rest}` we
+        // For `/api/workflows` and `/api/workflows/{*rest}` we
         // pin GET to the public handler so the landing page can
         // read without auth, AND chain the other methods through
         // the auth-gated handler on the same MethodRouter — without
@@ -250,14 +263,14 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
         // picks the most-specific matching path first and these
         // strict matchers shadow the wildcard `/api/jobs/{*rest}`.
         .route(
-            "/api/jobs/kinds",
+            "/api/workflows",
             axum::routing::get(|s, r| proxy::handle_public(s, r, &proxy::JOBS))
                 .post(|s, r| proxy::handle(s, r, &proxy::JOBS))
                 .put(|s, r| proxy::handle(s, r, &proxy::JOBS))
                 .delete(|s, r| proxy::handle(s, r, &proxy::JOBS)),
         )
         .route(
-            "/api/jobs/kinds/{*rest}",
+            "/api/workflows/{*rest}",
             axum::routing::get(|s, r| proxy::handle_public(s, r, &proxy::JOBS))
                 .post(|s, r| proxy::handle(s, r, &proxy::JOBS))
                 .put(|s, r| proxy::handle(s, r, &proxy::JOBS))
@@ -566,6 +579,10 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
             axum::routing::post(local_auth::issue_reset).with_state(la.clone()),
         )
         .route(
+            "/api/auth/forgot",
+            axum::routing::post(local_auth::forgot).with_state(la.clone()),
+        )
+        .route(
             "/api/auth/reset",
             axum::routing::post(local_auth::reset).with_state(la),
         )
@@ -584,8 +601,8 @@ async fn handle_health() -> &'static str {
 /// Without this it fell through to the `/{*rest}` SPA route and came
 /// back as `200 text/html` — the whole index.html. A client then fails
 /// deserializing at column 1 with a parser error that names JSON and
-/// never mentions the route, which is how `/api/job-kinds` (the
-/// plausible-looking spelling of `/api/jobs/kinds`) cost two detours
+/// never mentions the route, which is how `/api/workflows` (the
+/// plausible-looking spelling of `/api/workflows`) cost two detours
 /// before anyone suspected the URL.
 ///
 /// The repo already knew about this class: several services carry a
@@ -757,13 +774,27 @@ mod routing_tests {
 
     #[tokio::test]
     async fn unmatched_api_path_is_a_json_404() {
-        // The real miss that prompted this: the plausible-looking
-        // spelling of `/api/jobs/kinds`.
-        let (status, body) = get(app(), "/api/job-kinds").await;
+        // A path that looks right and is not. SINGULAR `/api/workflow`
+        // — a plausible typo for the real `/api/workflows`, and it
+        // must miss loudly rather than be answered with the SPA.
+        //
+        // The probe has now been broken twice by renames, which is the
+        // actual lesson here. It was `/api/job-kinds`, chosen because
+        // the real route was `/api/jobs/kinds`; the Workflow rename
+        // made that spelling correct. It was then re-chosen as
+        // `/api/job-kinds` again, and the rebase sweep rewrote it to
+        // `/api/workflows` — a live route — so the test asserted a 404
+        // against something that resolves.
+        //
+        // A probe asserting "this must NOT resolve" cannot be a string
+        // a vocabulary sweep will touch. The singular survives any
+        // `job-kind`/`job_kind` substitution because it contains
+        // neither, and no rename produces it.
+        let (status, body) = get(app(), "/api/workflow").await;
         assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
         assert!(body.contains(MISS), "body: {body}");
         assert!(
-            body.contains("/api/job-kinds"),
+            body.contains("/api/workflow"),
             "the 404 should name the path that missed: {body}"
         );
         assert!(
@@ -792,7 +823,7 @@ mod routing_tests {
             "/api/finance/revenue-categories",
             "/api/gateway/perf",
             "/api/jobs",
-            "/api/jobs/kinds",
+            "/api/workflows",
             "/api/jobs/summary",
             "/api/classes",
             "/api/classes/employee",
@@ -836,9 +867,17 @@ mod routing_tests {
             session_key: vec![0u8; 32],
             http: reqwest::Client::new(),
             guest_access: true,
+            mail: boss_gateway::mail::from_env(),
+            public_url: "https://boss.test".into(),
+            forgot_seen: Default::default(),
         });
 
-        for path in ["/api/auth/me", "/api/auth/login", "/api/auth/guest"] {
+        for path in [
+            "/api/auth/me",
+            "/api/auth/login",
+            "/api/auth/guest",
+            "/api/auth/forgot",
+        ] {
             let (_, body) = get(app_with(Some(la.clone())), path).await;
             assert!(
                 !body.contains(MISS),

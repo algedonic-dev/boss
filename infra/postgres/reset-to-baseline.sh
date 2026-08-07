@@ -15,12 +15,12 @@
 # Sequence:
 #   1. Stop every boss service holding a DB connection.
 #   2. Drop + recreate the live `boss` DB (re-applies schema).
-#   3. Restart core services (jobs-api reconciles platform JobKinds).
+#   3. Restart core services (jobs-api reconciles platform Workflows).
 #   4. Apply brewery Class registry rows (POST /api/classes/batch from classes.json).
 #   5. Seed operator-baseline hires + bootstrap-admin, project them
 #      (FK targets for the tenant seed's account team members).
 #   6. Prime sim_clock to the demo epoch (2025-04-01).
-#   7. Seed the brewery tenant (JobKinds + policy + accounts/vendors/
+#   7. Seed the brewery tenant (Workflows + policy + accounts/vendors/
 #      data) and stamp the reset baseline — infra/seed-brewery-tenant.sh.
 #   8. Rebuild projections + GL from audit_log.
 #   9. Start boss-brewery-sim — the live tick resumes from epoch_start.
@@ -29,7 +29,8 @@
 #   sudo ./infra/postgres/reset-to-baseline.sh
 #
 # Optional env:
-#   BOSS_DEMO_EPOCH_START=2025-04-01   # demo day 0
+#   BOSS_BACKFILL_MONTHS=6             # how much synthetic past to lay down
+#   BOSS_DEMO_EPOCH_START=YYYY-MM-DD   # override the computed start
 #   BOSS_BOOTSTRAP_ADMIN_EMAIL=…       # platform-admin to re-seed
 
 set -euo pipefail
@@ -37,7 +38,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SEEDS_DIR="$REPO_ROOT/examples/brewery/seeds"
 DB_URL="postgres://boss:boss@127.0.0.1/boss"
-DEMO_EPOCH="${BOSS_DEMO_EPOCH_START:-2025-04-01}"
+# Six months of synthetic history ending TODAY. Relative to install,
+# not a fixed date: the point is that the backfill abuts real now, so
+# the live segment continues the same timeline instead of resuming
+# some calendar the demo was cut against months ago.
+BACKFILL_MONTHS="${BOSS_BACKFILL_MONTHS:-6}"
+DEMO_EPOCH="${BOSS_DEMO_EPOCH_START:-$(date -u -d "$BACKFILL_MONTHS months ago" +%F)}"
 
 echo "==> reset-to-baseline (live-sim demo → seeded day 0)"
 echo "    repo:  $REPO_ROOT"
@@ -102,7 +108,7 @@ for svc in boss-policy-api boss-classes-api boss-locations-api \
            boss-cybernetics boss-clock-api boss-jobs-api boss-dispatcher; do
     systemctl restart "$svc" 2>/dev/null || echo "  (skipped $svc — not installed)"
 done
-# Give jobs-api a beat to reconcile the platform job-kind-design.
+# Give jobs-api a beat to reconcile the platform workflow-design.
 sleep 3
 
 echo "==> [4/9] priming the sim clock to $DEMO_EPOCH via clock-api"
@@ -111,14 +117,25 @@ echo "==> [4/9] priming the sim clock to $DEMO_EPOCH via clock-api"
 # the clock's invariants + refresher). Prime FIRST, before the API seeds
 # below: event time is clock-authoritative, so the operator + tenant seeds
 # (which POST through the public API) inherit the epoch from the clock and
-# land their events on day 0. epoch_end = epoch_start + 365 → a 12-month loop;
-# without it the sim auto-pauses on tick 1 ('epoch complete').
-EPOCH_END="$(date -u -d "$DEMO_EPOCH + 365 days" +%F)"
+# land their events on day 0.
+#
+# epoch_end is TODAY, and it is not a loop boundary any more. Warp is a
+# startup PHASE: the sim runs fast once to lay down the synthetic past,
+# reaches today, and then hands the clock to real time (warp 1.0) and
+# keeps going with real people writing alongside it. The log is
+# append-only from the seed forward — reaching the end of the window
+# used to trim it back and replay the year, which is what destroyed a
+# posted year-end close and a day of real user feedback.
+EPOCH_END="$(date -u +%F)"
+# Backfill warp. ~21s of wall per sim-day, so six months lands in about
+# an hour. Sustainable only because the sim drops to one tick per
+# sim-day while warp > 1 (see boss_brewery_sim.rs); at hourly
+# granularity anything past ~2000 fell behind its own clock.
 clock_ok=
 for attempt in 1 2 3 4 5 6; do
     code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 -X POST \
         -H 'content-type: application/json' \
-        -d "{\"epoch_start\":\"$DEMO_EPOCH\",\"epoch_end\":\"$EPOCH_END\",\"warp_factor\":1000}" \
+        -d "{\"epoch_start\":\"$DEMO_EPOCH\",\"epoch_end\":\"$EPOCH_END\",\"warp_factor\":4000}" \
         "http://127.0.0.1:7060/api/clock/configure" 2>/dev/null || echo 000)
     if [[ "$code" == "200" || "$code" == "201" ]]; then
         clock_ok=1

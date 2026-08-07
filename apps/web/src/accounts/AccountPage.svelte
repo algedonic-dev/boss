@@ -80,7 +80,7 @@
   type TabKey = 'overview' | 'devices' | 'tickets' | 'finance' | 'shipments' | 'knowledge';
 
   // Tab ids are stable; labels stay tenant-neutral. The
-  // `Jobs` tab spans every JobKind on the account (not just
+  // `Jobs` tab spans every Workflow on the account (not just
   // service tickets), so it renders for any tenant that runs
   // Jobs at all. Industry-shaped tabs (Equipment, Deliveries)
   // get gated on data presence below — see `visibleTabs`.

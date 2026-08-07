@@ -1,16 +1,16 @@
-//! End-to-end coverage for the `job-kind-publish` StepType
+//! End-to-end coverage for the `workflow-publish` StepType
 //! dispatch path.
 //!
-//! When a step of kind `job-kind-publish` flips to Done via PUT
+//! When a step of kind `workflow-publish` flips to Done via PUT
 //! /api/jobs/{id}/steps/{step_id}, the handler must:
-//! 1. Pull `job_kind_spec` from the step metadata.
+//! 1. Pull `workflow_spec` from the step metadata.
 //! 2. Validate it via `validate_all`.
-//! 3. Call `JobKindRegistry::publish_authored(spec, job_id)`.
+//! 3. Call `WorkflowRegistry::publish_authored(spec, job_id)`.
 //! 4. Emit `jobs.kind.published` with the full published spec.
 //! 5. Persist STEP_UPDATED only AFTER the registry write succeeds.
 //!
 //! Decision record: `docs/architecture-decisions.md` §Jobs,
-//! JobKinds, Steps (JobKinds bootstrap through Jobs).
+//! Workflows, Steps (Workflows bootstrap through Jobs).
 
 use std::sync::Arc;
 
@@ -20,10 +20,10 @@ use axum::http::{Request, StatusCode};
 use boss_core::job::{JobId, Priority, Step, StepId, StepStatus, Subject};
 use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
-use boss_jobs::events::JOB_KIND_PUBLISHED;
+use boss_jobs::events::WORKFLOW_PUBLISHED;
 use boss_jobs::http::{JobsApiState, router};
 use boss_jobs::registry::{
-    InMemoryJobKinds, JobKindRegistry, JobKindSpec, JobKindStatus, StepSpec, Terminal,
+    InMemoryWorkflows, StepSpec, Terminal, WorkflowRegistry, WorkflowSpec, WorkflowStatus,
 };
 use boss_jobs::step_registry::StepRegistry;
 use boss_jobs::{InMemoryJobs, JobsRepository};
@@ -51,7 +51,7 @@ fn user_header(u: &User) -> String {
 }
 
 fn build_app(
-    kinds: Arc<dyn JobKindRegistry>,
+    kinds: Arc<dyn WorkflowRegistry>,
 ) -> (Router, Arc<InMemoryJobs>, Arc<RecordingEventBus>) {
     let jobs = Arc::new(InMemoryJobs::new());
     let bus = RecordingEventBus::new();
@@ -87,8 +87,8 @@ async fn seed_publish_step(
 ) -> (JobId, StepId) {
     use boss_core::job::Job as JobRow;
     let mut job = JobRow::new(
-        "job-kind-design",
-        Subject::new("job-kind", "morning-brew"),
+        "workflow-design",
+        Subject::new("workflow", "morning-brew"),
         "Design morning-brew",
         "emp-cto",
         Priority::Standard,
@@ -102,7 +102,7 @@ async fn seed_publish_step(
     let step = Step {
         id: StepId::new(),
         job_id,
-        kind: "job-kind-publish".into(),
+        kind: "workflow-publish".into(),
         title: "Publish".into(),
         assignee_id: None,
         status: StepStatus::Active,
@@ -122,10 +122,10 @@ async fn seed_publish_step(
     (job_id, step_id)
 }
 
-fn valid_spec(kind: &str) -> JobKindSpec {
+fn valid_spec(kind: &str) -> WorkflowSpec {
     // Must pass validate_all (the dispatch path lints before
     // publishing): a viable trigger → terminal pair.
-    JobKindSpec::platform_seed(
+    WorkflowSpec::platform_seed(
         kind,
         "Morning Brew",
         "production",
@@ -172,12 +172,12 @@ async fn put_step_done(
 
 #[tokio::test]
 async fn done_dispatches_publish_authored_and_emits_kind_published_event() {
-    let kinds: Arc<dyn JobKindRegistry> = Arc::new(InMemoryJobKinds::new());
+    let kinds: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
     let (app, jobs, _bus) = build_app(kinds.clone());
 
     let spec = valid_spec("morning-brew");
     let metadata = json!({
-        "job_kind_spec": serde_json::to_value(&spec).unwrap(),
+        "workflow_spec": serde_json::to_value(&spec).unwrap(),
     });
     let (job_id, step_id) = seed_publish_step(jobs.as_ref(), metadata).await;
 
@@ -193,7 +193,7 @@ async fn done_dispatches_publish_authored_and_emits_kind_published_event() {
     let live = kinds.get_active("morning-brew").await.expect("active");
     assert_eq!(live.kind, "morning-brew");
     assert_eq!(live.version, 1);
-    assert_eq!(live.status, JobKindStatus::Active);
+    assert_eq!(live.status, WorkflowStatus::Active);
     assert_eq!(
         live.authoring_job_id.expect("authoring stamped"),
         *job_id.inner().as_uuid(),
@@ -206,7 +206,7 @@ async fn done_dispatches_publish_authored_and_emits_kind_published_event() {
     let events = jobs.recorded_events();
     let published: Vec<_> = events
         .iter()
-        .filter(|e| e.kind == JOB_KIND_PUBLISHED)
+        .filter(|e| e.kind == WORKFLOW_PUBLISHED)
         .collect();
     assert_eq!(
         published.len(),
@@ -220,8 +220,8 @@ async fn done_dispatches_publish_authored_and_emits_kind_published_event() {
 }
 
 #[tokio::test]
-async fn missing_job_kind_spec_metadata_returns_400_no_publish() {
-    let kinds: Arc<dyn JobKindRegistry> = Arc::new(InMemoryJobKinds::new());
+async fn missing_workflow_spec_metadata_returns_400_no_publish() {
+    let kinds: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
     let (app, jobs, _bus) = build_app(kinds.clone());
 
     let (job_id, step_id) =
@@ -231,14 +231,14 @@ async fn missing_job_kind_spec_metadata_returns_400_no_publish() {
     assert_eq!(
         resp.status(),
         StatusCode::BAD_REQUEST,
-        "missing job_kind_spec must abort the step write"
+        "missing workflow_spec must abort the step write"
     );
 
     // No publish event should have recorded — OUTBOX (phase 2): the
     // repo collects what the Pg adapter would record in-tx.
     let events = jobs.recorded_events();
     assert!(
-        events.iter().all(|e| e.kind != JOB_KIND_PUBLISHED),
+        events.iter().all(|e| e.kind != WORKFLOW_PUBLISHED),
         "no jobs.kind.published event must fire when dispatch fails"
     );
 
@@ -261,13 +261,13 @@ async fn missing_job_kind_spec_metadata_returns_400_no_publish() {
 }
 
 #[tokio::test]
-async fn malformed_job_kind_spec_returns_400() {
-    let kinds: Arc<dyn JobKindRegistry> = Arc::new(InMemoryJobKinds::new());
+async fn malformed_workflow_spec_returns_400() {
+    let kinds: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
     let (app, jobs, _bus) = build_app(kinds.clone());
 
     let (job_id, step_id) = seed_publish_step(
         jobs.as_ref(),
-        json!({ "job_kind_spec": "not even an object" }),
+        json!({ "workflow_spec": "not even an object" }),
     )
     .await;
 
@@ -275,7 +275,7 @@ async fn malformed_job_kind_spec_returns_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     let events = jobs.recorded_events();
-    assert!(events.iter().all(|e| e.kind != JOB_KIND_PUBLISHED));
+    assert!(events.iter().all(|e| e.kind != WORKFLOW_PUBLISHED));
 }
 
 #[tokio::test]
@@ -312,7 +312,7 @@ async fn publish_step_without_kind_registry_returns_503() {
 
     let spec = valid_spec("morning-brew");
     let metadata = json!({
-        "job_kind_spec": serde_json::to_value(&spec).unwrap(),
+        "workflow_spec": serde_json::to_value(&spec).unwrap(),
     });
     let (job_id, step_id) = seed_publish_step(jobs.as_ref(), metadata).await;
 

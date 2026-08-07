@@ -276,7 +276,7 @@ pub(super) struct BatchPayResponse {
 }
 
 /// Settle every `approved` vendor invoice with a single side-effect call.
-/// Used by the daily `ap-payment-run` JobKind. Re-runnable: invoices
+/// Used by the daily `ap-payment-run` Workflow. Re-runnable: invoices
 /// already in `paid` are skipped because the listing filter is `approved`.
 pub(super) async fn batch_pay_vendor_invoices<R: InventoryRepository + 'static>(
     State(state): State<Arc<InventoryApiState<R>>>,

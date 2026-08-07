@@ -31,7 +31,7 @@ fn shape_driven_30_day_run_creates_jobs_and_closes_cleanly() {
         result.report.jobs_created
     );
 
-    // Every JobKind in the tenant TOML has a non-zero rate at the
+    // Every Workflow in the tenant TOML has a non-zero rate at the
     // launch ramp; confirm the day-loop touched at least 30 days
     // (the operating_days filter doesn't strip anything since the
     // tenant runs 7 days a week).
@@ -57,7 +57,7 @@ fn shape_driven_30_day_run_creates_jobs_and_closes_cleanly() {
         result.report.steps_completed
     );
 
-    // No unknown-kind drops. Every JobKind the tenant.toml fires
+    // No unknown-kind drops. Every Workflow the tenant.toml fires
     // must resolve in the registry (the seed_loader test enforces
     // this at the file level; this test confirms it at runtime).
     // `InMemoryOutput.events` is `Vec<(topic, payload)>`.
@@ -69,7 +69,7 @@ fn shape_driven_30_day_run_creates_jobs_and_closes_cleanly() {
             .filter(|(topic, _)| topic == "jobs.unknown_kind")
             .count(),
         0,
-        "tenant.toml fires a JobKind missing from job_kinds.toml"
+        "tenant.toml fires a Workflow missing from workflows.toml"
     );
 }
 

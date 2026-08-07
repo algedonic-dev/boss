@@ -3,7 +3,7 @@
 //!
 //! Lives here rather than in Tier 1 `boss-jobs-client`: the
 //! `refurb-used` / `refurb-oem-new` step graphs are device-shop
-//! JobKinds, not generic state-machine OS concepts, so the
+//! Workflows, not generic state-machine OS concepts, so the
 //! projection sits next to its sole consumer (`warehouse_status.rs`).
 
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,7 @@ pub const STAGE_ORDER: &[&str] = &["intake", "triage", "refurb", "qa", "ready"];
 
 /// Project the generic `PhaseDistribution` into refurb-pipeline stage
 /// counts. Non-refurb kinds are ignored; counts roll up across both
-/// shipped refurb JobKinds.
+/// shipped refurb Workflows.
 pub fn summarise_refurb_wip(dist: &PhaseDistribution) -> RefurbWipSummary {
     let mut counts = std::collections::HashMap::<&'static str, i64>::new();
     for stage in STAGE_ORDER {
@@ -74,7 +74,7 @@ pub fn summarise_refurb_wip(dist: &PhaseDistribution) -> RefurbWipSummary {
     }
 }
 
-/// Map (JobKind, tier) to a warehouse-status stage. Encoded from the
+/// Map (Workflow, tier) to a warehouse-status stage. Encoded from the
 /// seeded `refurb-used` (tiers 0–5) and `refurb-oem-new` (tiers 0–3)
 /// step graphs. `tier == -1` means every step is terminal but the Job
 /// isn't closed yet — treated as "ready" since the device is sitting

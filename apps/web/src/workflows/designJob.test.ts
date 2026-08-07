@@ -34,7 +34,7 @@ describe('readSpec', () => {
     return {
       id: 'step-1',
       job_id: 'job-1',
-      kind: 'job-kind-publish',
+      kind: 'workflow-publish',
       title: 'Publish',
       assignee_id: null,
       status: 'pending',
@@ -45,9 +45,9 @@ describe('readSpec', () => {
     };
   }
 
-  test('returns the spec from job_kind_spec metadata', () => {
+  test('returns the spec from workflow_spec metadata', () => {
     const spec = initialSpec('x', 'X', 'c', ['asset']);
-    expect(readSpec(step({ job_kind_spec: spec }))?.kind).toBe('x');
+    expect(readSpec(step({ workflow_spec: spec }))?.kind).toBe('x');
   });
 
   test('returns null when not yet seeded', () => {

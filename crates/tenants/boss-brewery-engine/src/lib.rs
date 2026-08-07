@@ -27,7 +27,7 @@ use boss_inventory::types::{InventoryItem, VendorBehavior};
 use chrono::NaiveDate;
 use serde::Deserialize;
 
-use boss_jobs::seed_loader::load_job_kinds_with_owning_team;
+use boss_jobs::seed_loader::load_workflows_with_owning_team;
 use boss_jobs::step_registry::StepRegistry;
 use boss_sim::calendar::CalendarRegistry;
 use boss_sim::engines::{
@@ -38,7 +38,7 @@ use boss_sim::output::{InMemoryOutput, SimOutput};
 use boss_sim::rng::Rng;
 use boss_sim::shape_driven::{ShapeDrivenState, TenantConfig};
 
-/// JobKind-publish logic shared by the `boss-brewery-bootstrap`
+/// Workflow-publish logic shared by the `boss-brewery-bootstrap`
 /// binary and the future unified "prepare" step.
 pub mod prepare;
 
@@ -54,7 +54,7 @@ pub struct BreweryRunResult {
     pub output: InMemoryOutput,
 }
 
-/// Initial inventory state. The brewery's JobKinds reference
+/// Initial inventory state. The brewery's Workflows reference
 /// part SKUs in their `consume_parts` metadata; those parts
 /// must exist in the inventory items table before the
 /// dispatcher fires the consume call, or the POST returns 404
@@ -165,7 +165,7 @@ pub fn mint_campaign_identities(campaign_ids: &[String], api_base: &str) {
     }
 }
 
-/// Seed the canonical brewery subjects so the JobKinds have
+/// Seed the canonical brewery subjects so the Workflows have
 /// targets to anchor on. Production deployments derive this
 /// from live tables; the standalone runner / test path uses
 /// this hand-seed.
@@ -175,7 +175,7 @@ pub fn seed_brewery_subjects(state: &mut ShapeDrivenState) {
     // parts are seeded into the inventory-api by the binary's
     // `seed_parts`; the workforce executor reads real on-hand back
     // when it gates production-consume / demand-gate steps.
-    // Q6: the organization itself is a Subject — org-level JobKinds
+    // Q6: the organization itself is a Subject — org-level Workflows
     // (payroll, tax filings, AP runs, facility overhead, the
     // production heartbeat) open their Jobs about it. One row per
     // tenant; the id matches tenant.toml meta.tenant_id.
@@ -194,7 +194,7 @@ pub fn seed_brewery_subjects(state: &mut ShapeDrivenState) {
         state.seed_subject("vendor", &format!("vnd-bigseed-{i:03}"));
     }
     // Campaign Subjects for the tap-launch + seasonal-release
-    // marketing flows. The tap-launch JobKind (rate 0.04 ≈
+    // marketing flows. The tap-launch Workflow (rate 0.04 ≈
     // 3/quarter in tenant.toml) attaches to a campaign Subject,
     // so the marketing surface needs anchors to fire against.
     // Six evergreen campaigns cover a typical brewery's seasonal
@@ -234,7 +234,7 @@ pub fn seed_brewery_subjects(state: &mut ShapeDrivenState) {
             if let (Some(id), Some(role)) = (id, role) {
                 state.register_employee(role, id);
                 // Subjects-by-kind too so `subject_kind=employee`
-                // JobKind rates can pick assignees from the same
+                // Workflow rates can pick assignees from the same
                 // pool.
                 state.seed_subject("employee", id);
             }
@@ -253,7 +253,7 @@ pub fn seed_brewery_subjects(state: &mut ShapeDrivenState) {
 /// [`run_brewery_one_day`] in a loop to advance day-by-day
 /// without losing pending-action state.
 pub struct BreweryEngineState {
-    pub kinds: Vec<boss_jobs::registry::JobKindSpec>,
+    pub kinds: Vec<boss_jobs::registry::WorkflowSpec>,
     pub registry: StepRegistry,
     pub tenant: TenantConfig,
     pub state: ShapeDrivenState,
@@ -314,8 +314,8 @@ impl BreweryEngineState {
         calendars: Vec<boss_core::calendar::BusinessCalendar>,
         vendor_behaviors: Vec<(String, VendorBehavior)>,
     ) -> Result<Self> {
-        let kinds_path = seeds.join("job_kinds.toml");
-        let kinds = load_job_kinds_with_owning_team(&kinds_path, &tenant.meta.tenant_id)
+        let kinds_path = seeds.join("workflows.toml");
+        let kinds = load_workflows_with_owning_team(&kinds_path, &tenant.meta.tenant_id)
             .with_context(|| format!("loading job kinds from {}", kinds_path.display()))?;
         let registry = StepRegistry::v1();
 
@@ -868,7 +868,7 @@ pub fn build_workforce(
         })
         .collect();
     // kind → required-at-done fields, so the worker supplies any the
-    // JobKind didn't default — the executor filling the step's form.
+    // Workflow didn't default — the executor filling the step's form.
     let required_fields: std::collections::HashMap<String, Vec<RequiredField>> = engine
         .registry
         .all()

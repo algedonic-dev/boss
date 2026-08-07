@@ -95,7 +95,7 @@ INSERT INTO subject_kinds (kind, label, description, owning_team, sort_order, pa
     ('marketing-asset', 'Marketing Asset', 'A marketing content artifact (photo, video, deck, …) under a campaign. Intangible; owns the kind taxonomy.',   'platform', 33, 'intangible'),
     ('invoice',         'Invoice',         'An AR document billed to an account. Workflow-document intangible; owns the status + revenue-category taxonomies.', 'platform', 34, 'intangible'),
     ('message',         'Message',         'An internal message / system signal. Workflow-document intangible; owns the kind taxonomy.',                   'platform', 35, 'intangible'),
-    ('job-kind',        'JobKind',         'A JobKind under design — the subject of the `job-kind-design` meta-Job that authors it. Intangible; identity is the kind code.',        'platform', 36, 'intangible'),
+    ('workflow',        'Workflow',         'A Workflow under design — the subject of the `workflow-design` meta-Job that authors it. Intangible; identity is the kind code.',        'platform', 36, 'intangible'),
 
     -- Location root has the same kind name; no specialization shipped.
     -- (Tenant Locations get parent_kind='location' once they're added.)
@@ -119,7 +119,7 @@ UPDATE subject_kinds
 
 -- Birth-by-Job is a SubjectKind property (data, not a code path):
 -- for these kinds the first Job ABOUT the subject IS its birth record
--- — there is no domain table to write through. `job-kind-design` Jobs
+-- — there is no domain table to write through. `workflow-design` Jobs
 -- birth the kind they design; `design-doc-review` Jobs birth the
 -- `custom` doc-path subject they review. The uniform jobs existence
 -- gate passes these kinds, and `create_job_at` mints the identity row
@@ -129,7 +129,7 @@ UPDATE subject_kinds
 -- Domain kinds (account, asset, …) stay fail-closed at the gate.
 UPDATE subject_kinds
    SET metadata = metadata || '{"birth": "job"}'::jsonb
- WHERE kind IN ('job-kind', 'custom');
+ WHERE kind IN ('workflow', 'custom');
 
 
 -- ---------------------------------------------------------------------------
@@ -540,7 +540,7 @@ INSERT INTO locations (id, name, kind, timezone) VALUES
     ('loc-remote-default',      'Remote (default)',     'remote',       'UTC'),
     -- Brewery example tenant — production sites referenced by the
     -- brewery employee roster + the morning-brew /
-    -- equipment-preventive-maintenance JobKinds. Added here so a fresh
+    -- equipment-preventive-maintenance Workflows. Added here so a fresh
     -- bootstrap-db.sh produces a DB the brewery roster can FK
     -- into without an out-of-band insert.
     ('loc-brewery-brewhouse',   'Brewery Brewhouse',    'production',   'America/Los_Angeles'),

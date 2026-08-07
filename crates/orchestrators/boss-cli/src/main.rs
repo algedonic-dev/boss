@@ -264,7 +264,7 @@ enum InspectAction {
         /// Filter by status (open | closed | blocked | ...).
         #[arg(long)]
         status: Option<String>,
-        /// Filter by JobKind (e.g. morning-brew, wholesale-keg-order).
+        /// Filter by Workflow (e.g. morning-brew, wholesale-keg-order).
         #[arg(long)]
         kind: Option<String>,
         /// Filter by account_id.

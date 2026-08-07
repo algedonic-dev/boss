@@ -6,16 +6,16 @@
 //! 1. classes — POST /api/classes/batch (the taxonomy that employee +
 //!    account writes validate against, so it lands first).
 //! 2. policy — tenant role grants ([`boss_policy::bootstrap`]); these are
-//!    capability-level (`resource = "job-kind"`, not a specific kind), so
-//!    they need no published JobKinds, and the design-Job approval in
-//!    step 4 needs the `job-kind-approver` grant resolved first.
+//!    capability-level (`resource = "workflow"`, not a specific kind), so
+//!    they need no published Workflows, and the design-Job approval in
+//!    step 4 needs the `workflow-approver` grant resolved first.
 //! 3. data — operators, employees, accounts, vendors, messages,
 //!    finished-goods, raw materials, equipment, assets, and opening
 //!    balances ([`super::seed_tenant_data`]).
-//! 4. JobKinds LAST ([`super::publish_job_kinds`]) — each one opens a real
-//!    `job-kind-design` Job with role-bearing `approve` + `publish` steps
+//! 4. Workflows LAST ([`super::publish_workflows`]) — each one opens a real
+//!    `workflow-design` Job with role-bearing `approve` + `publish` steps
 //!    that the dispatcher auto-assigns the moment they go ready. Their
-//!    holders (the `job-kind-approver`-granted leaders, it-director,
+//!    holders (the `workflow-approver`-granted leaders, it-director,
 //!    platform-admin) must already be seeded AND queryable, or the
 //!    assignment dead-letters against a cold roster — so we barrier on the
 //!    people projection before opening them.
@@ -43,7 +43,7 @@ use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use tracing::info;
 
-use super::{SeedBases, publish_job_kinds, seed_tenant_data};
+use super::{SeedBases, publish_workflows, seed_tenant_data};
 
 /// Seed the entire brewery tenant model through the public API.
 ///
@@ -95,7 +95,7 @@ pub fn prepare_model(gateway_base: Option<&str>, seeds_dir: &Path) -> Result<()>
 
     // 1c. The tenant's own identity — Q6: the organization being
     //     modeled is itself a Subject, one row per tenant. The
-    //     org-level JobKinds (payroll, tax filings, AP runs, facility
+    //     org-level Workflows (payroll, tax filings, AP runs, facility
     //     overhead, the production heartbeat) open their Jobs about
     //     it, so the identity must exist before the periodic engine
     //     opens the first one. Hard-fail: a missing company identity
@@ -116,10 +116,10 @@ pub fn prepare_model(gateway_base: Option<&str>, seeds_dir: &Path) -> Result<()>
 
     // 2. Tenant policy grants — core ships only platform rules; the
     //    brewery org chart's row-level access matrix arrives here. These
-    //    grants are capability-level (`resource = "job-kind"`, not a
-    //    specific published kind), so they don't depend on the JobKind
+    //    grants are capability-level (`resource = "workflow"`, not a
+    //    specific published kind), so they don't depend on the Workflow
     //    registry being populated — and the design-Job approval in step 4
-    //    needs the `job-kind-approver` grant to resolve to its
+    //    needs the `workflow-approver` grant to resolve to its
     //    operational-leader holders.
     boss_policy::bootstrap::publish_policy_rules(
         &policy_base,
@@ -132,12 +132,12 @@ pub fn prepare_model(gateway_base: Option<&str>, seeds_dir: &Path) -> Result<()>
     // 3. Tenant data — operators, employees, accounts, vendors,
     //    messages, finished-goods, raw materials, equipment, assets,
     //    + opening balances. None of it opens Jobs (so it needs no
-    //    JobKinds yet); it DOES seed the workforce step 4 depends on.
+    //    Workflows yet); it DOES seed the workforce step 4 depends on.
     seed_tenant_data(&data_bases, seeds_dir, None)?;
 
-    // 4. JobKinds LAST — publishing each brewery JobKind opens a real
-    //    `job-kind-design` Job whose `approve` (sign-off, authority
-    //    `job-kind-approver`) and `publish` (it-director / platform-admin)
+    // 4. Workflows LAST — publishing each brewery Workflow opens a real
+    //    `workflow-design` Job whose `approve` (sign-off, authority
+    //    `workflow-approver`) and `publish` (it-director / platform-admin)
     //    steps are role-bearing. The dispatcher auto-assigns role-bearing
     //    steps the instant they go ready, so those holders must already be
     //    seeded AND queryable — otherwise the assignment NAKs against an
@@ -146,11 +146,11 @@ pub fn prepare_model(gateway_base: Option<&str>, seeds_dir: &Path) -> Result<()>
     //    exhausts its redelivery budget). Barrier on the people projection
     //    first, then open the design Jobs. dev=true auto-walks the sign-off
     //    (unattended seed, same as `boss-brewery-bootstrap --dev`);
-    //    publish_job_kinds takes the job_kinds.toml FILE (not the dir).
+    //    publish_workflows takes the workflows.toml FILE (not the dir).
     wait_for_people_projection(&people_base)?;
-    publish_job_kinds(
+    publish_workflows(
         &jobs_base,
-        &seeds_dir.join("job_kinds.toml"),
+        &seeds_dir.join("workflows.toml"),
         true,
         false,
         None,
@@ -162,7 +162,7 @@ pub fn prepare_model(gateway_base: Option<&str>, seeds_dir: &Path) -> Result<()>
 
 /// Block until the people read-model reflects the just-seeded workforce,
 /// so the role-bearing steps opened immediately after (the
-/// `job-kind-design` Jobs) can be assigned to real holders instead of
+/// `workflow-design` Jobs) can be assigned to real holders instead of
 /// dead-lettering against a cold roster. Polls `/api/people` until the
 /// count is non-trivial and stable across three reads (the hire backlog
 /// has drained), or 90s elapse. Mirrors the sim-readiness barrier in

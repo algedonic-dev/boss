@@ -126,9 +126,9 @@ sudo /opt/boss/infra/postgres/bootstrap-scratch.sh
 
 Expect a WARN line about `boss-operator-baseline-seed` not being
 on PATH. That's fine — the binary doesn't exist yet; we'll re-run
-after the build. (There is no separate JobKind-seed binary:
-platform JobKinds auto-reconcile on `boss-jobs-api` startup, and
-tenant JobKinds load via the per-tenant prepare step —
+after the build. (There is no separate Workflow-seed binary:
+platform Workflows auto-reconcile on `boss-jobs-api` startup, and
+tenant Workflows load via the per-tenant prepare step —
 `boss-brewery-sim prepare`. See
 `docs/design/platform-vs-tenant-jobkinds.md`.)
 
@@ -139,7 +139,7 @@ brewer, controller, …) arrive via `boss-policy-bootstrap
 --seeds examples/<tenant>/seeds/policy_rules.toml`. The
 brewery seed-regen + reset-to-baseline scripts call it
 inline; a fresh manual bootstrap should invoke it after the
-JobKind bootstrap step.
+Workflow bootstrap step.
 
 ## 2. NATS
 
@@ -193,13 +193,13 @@ Expect two `operator hired` lines per DB — `emp-audit` (the
 system audit account from `infra/operator-baseline/operator_hires.toml`)
 plus `emp-bootstrap-admin`, which the seed injects from
 `BOSS_BOOTSTRAP_ADMIN_EMAIL` (or the first email in `BOSS_AUTH_FILE`).
-The JobKind registry is **not** seeded here. `boss-jobs-api`
+The Workflow registry is **not** seeded here. `boss-jobs-api`
 reconciles the platform kinds (`platform_kinds()`) on startup (§5);
 the brewery's tenant kinds are published by the converged prepare
 step, `boss-brewery-sim prepare` (run by
 `infra/postgres/validate-brewery-sim.sh`, `reset-to-baseline.sh`, and
-§7 below). So the `bootstrap-boss.sh` "seeded JobKinds" tail just
-counts whatever already landed in the `job_kinds` table.
+§7 below). So the `bootstrap-boss.sh` "seeded Workflows" tail just
+counts whatever already landed in the `workflows` table.
 
 ## 5. Deploy services
 
@@ -288,8 +288,8 @@ boss-brewery-sim prepare
 ```
 
 The converged prepare step seeds the whole tenant through the public
-API, in order: the Class registry, the brewery JobKinds (real
-`job-kind-design` Jobs), tenant policy grants, then the data — the
+API, in order: the Class registry, the brewery Workflows (real
+`workflow-design` Jobs), tenant policy grants, then the data — the
 brewery exec team (CTO/COO/CEO/owner, from
 `examples/brewery/seeds/operator_hires.toml`), the ~700-employee
 roster (`seed_employees`, deterministic seed=42), 50 wholesale

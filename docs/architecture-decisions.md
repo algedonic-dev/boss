@@ -4,7 +4,7 @@ This is the **consolidated decision record** for BOSS: one thematic
 walk through every load-bearing choice in the running system,
 written as current truth. It absorbs the v0.1 pre-release record
 (~180 decisions), the v1.1 ADR catalog (the step-UX plugin model,
-the dispatcher-as-event-router and JobKind-v2 decision sets, step
+the dispatcher-as-event-router and Workflow-v2 decision sets, step
 types as property bundles, the Intangible subject root), and the
 design documents whose work has shipped. There is no separate
 history to cross-reference: what this document says is what the
@@ -159,14 +159,14 @@ state). Every KB-exposing domain implements the shared `KB` trait
 from `boss-core`; facts live in domain tables, not a global facts
 table; aggregations rebuild on-demand + periodically.
 
-## Jobs, JobKinds, Steps
+## Jobs, Workflows, Steps
 
 A **Job** is a bounded unit of coordinated work: stable identity,
 owner, subject, status, and a structured list of Steps. The
-**JobKind registry** is append-only and versioned; in-flight Jobs
+**Workflow registry** is append-only and versioned; in-flight Jobs
 pin to the version they opened under; creation is blocked against
 `draft` and `retired` kinds. Adding a new workflow means adding a
-JobKind row — never a `match` branch in core code.
+Workflow row — never a `match` branch in core code.
 
 **The DAG is implicit in predicates.** Each step declares
 `ready_when` — a pure expression over
@@ -211,27 +211,27 @@ gate is the release valve that bounds open WIP the way human
 stock-judgment does in a real brewery; finished-goods / COGS draw on the
 billing line items.
 
-**JobKinds bootstrap through Jobs.** The system-owned
-`job-kind-design` kind authors new JobKinds inside a Job (draft
-edits live in the authoring Job; the terminal `job-kind-publish`
+**Workflows bootstrap through Jobs.** The system-owned
+`workflow-design` kind authors new Workflows inside a Job (draft
+edits live in the authoring Job; the terminal `workflow-publish`
 step writes the registry row), so the platform's own catalog is
 published with full audit provenance — the system models its own
 development. Platform kinds ship in code (`platform_kinds()`);
-tenant kinds load from `examples/<tenant>/seeds/job_kinds.toml`
+tenant kinds load from `examples/<tenant>/seeds/workflows.toml`
 (governance rule: `docs/design/platform-vs-tenant-jobkinds.md`).
 
-**Authoring is graphical and author-gated.** The `job-kind-design`
+**Authoring is graphical and author-gated.** The `workflow-design`
 surface is an interactive trigger→outcome canvas (Svelte Flow + dagre,
 code-split onto the editor route): steps are nodes (trigger / terminal
 / fork / work), an edge A→B *is* `steps.A.done` in B's `ready_when`, and
 a structured predicate builder emits the boss-expr behind a
 live-validated raw "advanced" escape hatch. A non-persisting dry-run
-(`POST /api/jobs/kinds/_validate`) runs the publish-path lint against
+(`POST /api/workflows/_validate`) runs the publish-path lint against
 the same in-process `StepRegistry::v1()`, so editor-green publishes by
-construction; the SPA persists drafts as `metadata.job_kind_spec`
-PATCHes on the design Job and never calls the direct `/api/jobs/kinds`
+construction; the SPA persists drafts as `metadata.workflow_spec`
+PATCHes on the design Job and never calls the direct `/api/workflows`
 create/update/publish handlers (kept only for bootstrap + tests). The
-design **approve** step requires a `job-kind-approver` capability —
+design **approve** step requires a `workflow-approver` capability —
 authoring a work-type is operational leadership's call, not the deploy
 operator's alone (core policy grants it to `platform-admin`; tenants
 grant it to their leaders; `design-doc-review` stays `platform-admin`).
@@ -248,7 +248,7 @@ tenant-authorable registry row carrying:
 
 - **Completion contract** — a `fields` schema (required-at-done +
   per-type value checks). Steps may also author `fields` inline in
-  the JobKind; validation is the union, so single-use vocabulary
+  the Workflow; validation is the union, so single-use vocabulary
   needs no registry row at all.
 - **Completion authority** — one enum: `human` (an operator
   holding `authority_role`; default), `agent` (a computed
@@ -275,7 +275,7 @@ tenant-authorable registry row carrying:
 
 **No core code may match on a step-kind name** — enforced from day
 one by `infra/lint/no-step-kind-match.sh` (ratchet allow-list:
-exactly the two platform-pinned rows, `job-kind-publish` and
+exactly the two platform-pinned rows, `workflow-publish` and
 `review-design`). The registry ships 43 bundles; identical-property
 bundles merge on sight (`approval` folded into `sign-off`,
 `generic` into `task`, `sub-job` into `delegate-subjob`), and row
@@ -490,7 +490,7 @@ event-log only.
 ## Simulator
 
 One **shape-driven engine** drives both tenants; per-tenant flow
-is data (`job_kinds.toml` step graphs; `tenant.toml` rates, ramps,
+is data (`workflows.toml` step graphs; `tenant.toml` rates, ramps,
 anomalies, shocks, counterparties, periodic and batch cycles). The
 workforce executor claims and completes **assigned** steps through
 the public API as the role-matched employees, filling
@@ -581,7 +581,7 @@ engine, used-device-shop engine) carry tenant binaries.
 `infra/lint/tier-import-audit.sh` enforces
 Tier-1-never-imports-Tier-2 for libraries. Seeds never write
 emergent state — if a seed wants to `INSERT INTO invoices`, the
-answer is a JobKind (`docs/design/seed-vs-emergent-state.md`,
+answer is a Workflow (`docs/design/seed-vs-emergent-state.md`,
 enforced by `seed-bypass-smell.sh`); the canonical demo world is
 **built live, not migrated**: the install starts the sim and it
 generates 365 simulated days of events against the live API.

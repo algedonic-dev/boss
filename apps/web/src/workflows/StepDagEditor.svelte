@@ -1,8 +1,8 @@
 <script lang="ts">
-  // JobKind v2 step editor — a FLAT ordered step list.
+  // Workflow v2 step editor — a FLAT ordered step list.
   //
   // v1 was a tier-list editor (tiers + edges); v2 deletes that. A
-  // JobKind is now a flat list of steps and the DAG is implicit in
+  // Workflow is now a flat list of steps and the DAG is implicit in
   // each step's `ready_when` predicate (it references sibling step
   // slugs as `steps.<slug>.done`). Array order is the authoring
   // order; it carries no execution semantics — readiness is purely
@@ -14,7 +14,7 @@
   // future refinement. This form-driven editor is the pragmatic
   // first cut.
 
-  import type { StepSpec } from './jobKindTypes';
+  import type { StepSpec } from './workflowTypes';
   import { lintSteps, type StepWarning } from './stepValidation';
 
   type StepTypeInfo = {

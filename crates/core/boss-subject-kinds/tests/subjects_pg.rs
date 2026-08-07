@@ -49,7 +49,7 @@ async fn record_in_tx_commit_lands_rollback_does_not() {
 async fn unregistered_kind_is_rejected() {
     // The subjects FK onto subject_kinds is the vocabulary gate made
     // structural: an identity row cannot exist for a kind the
-    // registry never declared (the `job-kind`-as-subject audit
+    // registry never declared (the `workflow`-as-subject audit
     // finding becomes impossible to repeat silently).
     let db = TestDb::new().await;
     let mut tx = db.pool.begin().await.unwrap();
@@ -213,10 +213,10 @@ async fn rebuild_reproduces_company_from_reference_table_after_a_trim() {
 /// NESTED `subject` object — `{subject: {id, subject_kind}}` — not
 /// top-level `subject_kind`/`subject_id` keys that never existed.
 /// Reading the wrong path silently matched zero rows since #123, so
-/// birth-by-job subjects (job-kind, custom) — minted live by
+/// birth-by-job subjects (workflow, custom) — minted live by
 /// create_job_at but not carried by any TOML event source — vanished
 /// on every log-only rebuild (an epoch rollover), reddening invariant
-/// X on the 25 job-kind-design meta-jobs (task #18, 2026-07-18).
+/// X on the 25 workflow-design meta-jobs (task #18, 2026-07-18).
 #[tokio::test(flavor = "multi_thread")]
 async fn rebuild_homes_job_subjects_from_the_nested_payload() {
     let db = TestDb::new().await;
@@ -227,8 +227,8 @@ async fn rebuild_homes_job_subjects_from_the_nested_payload() {
     )
     .bind(serde_json::json!({
         "id": "job-1",
-        "kind": "job-kind-design",
-        "subject": {"id": "ad-hoc", "subject_kind": "job-kind"}
+        "kind": "workflow-design",
+        "subject": {"id": "ad-hoc", "subject_kind": "workflow"}
     }))
     .execute(&db.pool)
     .await
@@ -239,7 +239,7 @@ async fn rebuild_homes_job_subjects_from_the_nested_payload() {
         .unwrap();
 
     assert!(
-        subject_exists(&db.pool, "job-kind", "ad-hoc")
+        subject_exists(&db.pool, "workflow", "ad-hoc")
             .await
             .unwrap(),
         "rebuild must home a job's subject from payload.subject (nested)"

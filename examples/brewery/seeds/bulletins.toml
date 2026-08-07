@@ -9,7 +9,7 @@ body = "This deployment is the public BOSS Brewery tenant. Every Job, invoice, s
 
 [[bulletin]]
 title = "Brewing day moves to 06:30 starts"
-body = "Effective next Monday, the morning brew JobKind anchors at 06:30 instead of 07:00 to make room for the new wholesale loadout window. Cellar handoff stays at 14:00."
+body = "Effective next Monday, the morning brew Workflow anchors at 06:30 instead of 07:00 to make room for the new wholesale loadout window. Cellar handoff stays at 14:00."
 
 [[bulletin]]
 title = "Q3 sales-tax filing window"

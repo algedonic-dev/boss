@@ -55,14 +55,14 @@ CREATE TABLE IF NOT EXISTS shipment_assets (
 -- used-device-shop systems) — line items are SKU + qty pairs for
 -- finished products and parts: a wholesale-keg-order shipment of
 -- "12× FP-PALE-1-2-BBL" lands here, not as 12 separate Subjects.
--- Populated by the shipping.create side effect from the JobKind
+-- Populated by the shipping.create side effect from the Workflow
 -- step's `line_items` metadata; the inventory.parts.consume
 -- handler reads from the same metadata to decrement stock when
 -- the shipment step transitions to done.
 --
 -- `idx` preserves authoring order on the originating Job so the
 -- shipment detail view + inventory consume can render line items
--- in the same sequence the JobKind author defined them.
+-- in the same sequence the Workflow author defined them.
 CREATE TABLE IF NOT EXISTS shipment_line_items (
     id                  BIGSERIAL PRIMARY KEY,
     shipment_id         TEXT NOT NULL REFERENCES shipments(id) ON DELETE CASCADE,

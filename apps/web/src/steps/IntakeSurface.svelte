@@ -1,9 +1,9 @@
 <script lang="ts">
   // Intake step surface — first step of every wholesale-keg-order
-  // Job (and any other JobKind that opens with `intake`).
+  // Job (and any other Workflow that opens with `intake`).
   //
   // Demo framing: line items arrive pre-populated from the
-  // JobKind's metadata_defaults (the brewery's wholesale-keg-order
+  // Workflow's metadata_defaults (the brewery's wholesale-keg-order
   // ships with default SKUs + qtys per the seed). The user
   // confirms the order, optionally tweaks the delivery window,
   // and marks the step done. We don't want to be a full

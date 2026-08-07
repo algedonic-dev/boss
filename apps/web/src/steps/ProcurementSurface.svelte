@@ -1,12 +1,12 @@
 <script lang="ts">
   import { isPending, isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
   // Procurement step surface — place a purchase order with a
-  // vendor. The ingredient-restock JobKind opens with this step
+  // vendor. The ingredient-restock Workflow opens with this step
   // (parts-buyer fires off an order to the malt-supplier or
   // hops-supplier counterparty).
   //
   // Demo framing: vendor + line items typically arrive populated
-  // from the JobKind's metadata_defaults. The buyer confirms +
+  // from the Workflow's metadata_defaults. The buyer confirms +
   // sets expected delivery, on done emits inventory.po.place
   // which lands a PO row + the malt-supplier counterparty fires
   // its 5-business-day vendor-invoice chain.

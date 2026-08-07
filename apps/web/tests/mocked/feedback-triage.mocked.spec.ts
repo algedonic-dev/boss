@@ -1,6 +1,6 @@
 // The triage board.
 //
-// What these pin is that the board is a rendering of the JobKind, not
+// What these pin is that the board is a rendering of the Workflow, not
 // a screen with opinions. Columns come from the registry's fork
 // vocabulary — add a disposition to the spec and a column appears —
 // and routing an item is completing the fork step with that
@@ -110,13 +110,13 @@ const JOBS = [
 test.describe('feedback triage board', () => {
   test.beforeEach(async ({ page }) => {
     await page.route(/\/api\/tenant\/manifest$/, (r) => r.fulfill({ json: MANIFEST }));
-    await page.route(/\/api\/jobs\/kinds$/, (r) => r.fulfill({ json: [KIND] }));
+    await page.route(/\/api\/workflows$/, (r) => r.fulfill({ json: [KIND] }));
     await page.route(/\/api\/jobs\?kind=user-feedback/, (r) =>
       r.fulfill({ json: { data: JOBS, total: JOBS.length } }),
     );
   });
 
-  test('builds its columns from the JobKind fork, labelled by each next step', async ({
+  test('builds its columns from the Workflow fork, labelled by each next step', async ({
     page,
   }) => {
     await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });

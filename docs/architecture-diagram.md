@@ -48,7 +48,7 @@ highest level it splits into three things:
 - **Surfaces** — how humans see and act on the state. The web SPA,
   step-plugin bundles, the unified Messages inbox, the `boss` CLI.
 - **Work** — how state changes. Jobs + Steps (coordination), the
-  JobKind / StepPlugin / StepType registries (workflows as data),
+  Workflow / StepPlugin / StepType registries (workflows as data),
   automation runners that turn events into work (`boss-dispatcher`
   step side-effect rules, `boss-cybernetics` agent runtime, tenant
   tick engines), and policy (row-level authorization as rows, not
@@ -84,11 +84,11 @@ a single event backbone.
 
 - **Four primitives** (Subjects · Jobs · Steps · Events) carry the
   state-machine vocabulary. New entities are modeled as Subject kinds;
-  new work as JobKinds; new transitions as StepTypes. The Class
+  new work as Workflows; new transitions as StepTypes. The Class
   registry, StepPlugins, and Policy are supporting concepts on top.
-- **Registries over match branches.** A new work type is a `job_kinds`
+- **Registries over match branches.** A new work type is a `workflows`
   row, a new step UX is a `step_plugins` row + a JS bundle. Zero core
-  code changes. JobKinds are version-pinned so in-flight Jobs keep the
+  code changes. Workflows are version-pinned so in-flight Jobs keep the
   graph they were opened under.
 - **Hexagonal.** Each domain crate defines a port trait (`AssetsRepository`,
   `JobsRepository`, …) and never imports the Postgres / reqwest /

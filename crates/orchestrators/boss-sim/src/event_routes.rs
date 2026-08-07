@@ -22,7 +22,7 @@ pub fn register_default_event_routes(out: &mut LiveApiOutput) {
         EventHttpMethod::Post,
     );
     // Payroll-run synthesize. The brewery's `payroll-run`
-    // JobKind opens via `[periodic.biweekly-payroll]`, walks
+    // Workflow opens via `[periodic.biweekly-payroll]`, walks
     // calculate → review → release. The terminal `payroll-release`
     // step's `ledger.payroll.run.submit` side-effect handler
     // emits this topic with the per-tenant rate config (periods,
@@ -48,7 +48,7 @@ pub fn register_default_event_routes(out: &mut LiveApiOutput) {
         EventHttpMethod::Post,
     );
     // Daily AP payment run — every approved vendor invoice is
-    // settled in one POST. The `ap-payment-run` JobKind's
+    // settled in one POST. The `ap-payment-run` Workflow's
     // `bill-payment-batch` step fires `inventory.bill.payment_batch`
     // with the run-date paid_on; inventory-api updates each
     // vendor_invoice + emits the canonical VENDOR_INVOICE_PAID
@@ -180,7 +180,7 @@ pub fn register_default_event_routes(out: &mut LiveApiOutput) {
         "/api/commerce/invoices/write-off/from-past-due",
         EventHttpMethod::Post,
     );
-    // Tax filings fire as JobKinds (sales-tax-filing,
+    // Tax filings fire as Workflows (sales-tax-filing,
     // payroll-941-filing, income-tax-filing, excise-tax-filing) whose
     // terminal `tax-remittance` step's `ledger.tax.remit` side-effect
     // handler emits the canonical TaxFilingSnapshot, which the

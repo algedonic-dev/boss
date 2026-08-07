@@ -1,4 +1,4 @@
-// Client-side, non-blocking lint for a JobKind v2 step list.
+// Client-side, non-blocking lint for a Workflow v2 step list.
 //
 // These checks are advisory: they surface authoring mistakes inline
 // in the editor. The authoritative viability / fork-coverage /
@@ -10,7 +10,7 @@
 // endpoint that does not exist yet. Do NOT add a Rust endpoint as
 // part of the UI migration; this module is the local stopgap.
 
-import type { StepSpec } from './jobKindTypes';
+import type { StepSpec } from './workflowTypes';
 
 export type StepWarning = Readonly<{
   /// Index of the offending step, or null for whole-spec warnings.

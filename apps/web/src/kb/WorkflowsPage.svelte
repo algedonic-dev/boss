@@ -1,23 +1,23 @@
 <script lang="ts">
-  // /workflows — Knowledge Base view of active JobKinds.
+  // /workflows — Knowledge Base view of active Workflows.
   //
   // In the three-axis IA, Workflows is the *what* —
-  // every active JobKind in the registry, browseable like a
-  // catalog. Editing JobKinds happens at /system/job-kinds (the
+  // every active Workflow in the registry, browseable like a
+  // catalog. Editing Workflows happens at /system/workflows (the
   // Surface for the platform-eng role). This page is the
   // read-only KB view non-admin operators land on when they
   // want to understand "what kinds of work does this brewery
   // run?"
   //
-  // Reads the same `/api/jobs/kinds` endpoint as the admin
+  // Reads the same `/api/workflows` endpoint as the admin
   // page; renders categories grouped + step-graph summary
   // per kind. Detail click drops the operator into the
   // canonical detail page (which is shared with admin since
   // the data is the same).
   //
-  // When the JobKind-as-Subject promotion lands (the
-  // `custom_kind = "job-kind"` Subject discriminator from
-  // the job-kind-self-bootstrap design), this page
+  // When the Workflow-as-Subject promotion lands (the
+  // `custom_kind = "workflow"` Subject discriminator from
+  // the workflow-self-bootstrap design), this page
   // becomes the "Equipment KB"-shaped sidebar entry that
   // every Subject kind owns — same shape as /catalog,
   // /accounts, /vendors, etc.
@@ -25,10 +25,10 @@
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import Link from '@boss/web-kit/ui/Link.svelte';
-  import type { JobKindSpec } from '../job-kinds/jobKindTypes';
+  import type { WorkflowSpec } from '../workflows/workflowTypes';
   import { href } from '../router';
 
-  let kinds = $state<ReadonlyArray<JobKindSpec>>([]);
+  let kinds = $state<ReadonlyArray<WorkflowSpec>>([]);
   let liveCounts = $state<Readonly<Record<string, number>>>({});
   let loading = $state(true);
   let error = $state<string | null>(null);
@@ -39,16 +39,16 @@
     loading = true;
     (async () => {
       try {
-        // Two parallel fetches: the JobKind catalog (static-ish)
+        // Two parallel fetches: the Workflow catalog (static-ish)
         // + the live in-flight count per kind. The catalog
         // grounds the page; the counts make it operational
         // ("12 wholesale-keg-orders in flight right now").
         const [kindsR, liveR] = await Promise.allSettled([
-          fetch('/api/jobs/kinds'),
+          fetch('/api/workflows'),
           fetch('/api/jobs/live'),
         ]);
         if (kindsR.status === 'fulfilled' && kindsR.value.ok) {
-          const body = (await kindsR.value.json()) as JobKindSpec[];
+          const body = (await kindsR.value.json()) as WorkflowSpec[];
           if (!cancelled) kinds = body;
         } else if (kindsR.status === 'fulfilled') {
           throw new Error(`HTTP ${kindsR.value.status}: ${await kindsR.value.text()}`);
@@ -81,7 +81,7 @@
   });
 
   let byCategory = $derived.by(() => {
-    const m = new Map<string, JobKindSpec[]>();
+    const m = new Map<string, WorkflowSpec[]>();
     for (const k of filtered) {
       const arr = m.get(k.category) ?? [];
       arr.push(k);
@@ -92,7 +92,7 @@
   });
   let categoryKeys = $derived([...byCategory.keys()].sort());
 
-  function describe(k: JobKindSpec): string {
+  function describe(k: WorkflowSpec): string {
     if (k.description) {
       // Strip newlines so the prose flows; keep first paragraph.
       return k.description.replace(/\s+/g, ' ').trim().slice(0, 220);
@@ -107,7 +107,7 @@
     title="Workflows"
     subtitle={loading
       ? 'Loading…'
-      : `${kinds.length} active JobKind${kinds.length === 1 ? '' : 's'} across ${categoryKeys.length} categor${categoryKeys.length === 1 ? 'y' : 'ies'} — every kind of work the brewery runs`}
+      : `${kinds.length} active Workflow${kinds.length === 1 ? '' : 's'} across ${categoryKeys.length} categor${categoryKeys.length === 1 ? 'y' : 'ies'} — every kind of work the brewery runs`}
   />
 
   {#if error}
@@ -122,9 +122,9 @@
       class="wf-search"
     />
     <!-- Authoring entry point. Workflows is the single UI surface for
-         JobKinds (the "Job kinds" sidebar entry was retired); the
-         authoring routes (/system/job-kinds*) are reached from here. -->
-    <Link to={href('/system/job-kinds/new')} className="wf-new">+ New workflow</Link>
+         Workflows (the "Job kinds" sidebar entry was retired); the
+         authoring routes (/system/workflows*) are reached from here. -->
+    <Link to={href('/system/workflows/new')} className="wf-new">+ New workflow</Link>
   </div>
 
   <div class="tab-grid">
@@ -135,7 +135,7 @@
             {#each rows as k (k.kind)}
               <li class="kb-workflow-row">
                 <div class="kb-workflow-header">
-                  <Link to={href(`/system/job-kinds/${encodeURIComponent(k.kind)}`)}>
+                  <Link to={href(`/system/workflows/${encodeURIComponent(k.kind)}`)}>
                     <span class="kb-workflow-kind mono">{k.kind}</span>
                   </Link>
                   <span class="kb-workflow-label">{k.label}</span>
@@ -167,7 +167,7 @@
       </Section>
     {/each}
     {#if !loading && categoryKeys.length === 0}
-      <p class="empty" style="padding:24px">No JobKinds match "{query}".</p>
+      <p class="empty" style="padding:24px">No Workflows match "{query}".</p>
     {/if}
   </div>
 </div>

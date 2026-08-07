@@ -1,24 +1,24 @@
 <script lang="ts">
   // Live System-Model view — a window into what the tenant is
   // actually doing right now: Jobs in flight (count chips + a
-  // recent-jobs feed) plus the per-JobKind step-graph each Job is
+  // recent-jobs feed) plus the per-Workflow step-graph each Job is
   // walking, with a workflow/atlas view toggle.
   //
   // Extracted from LandingPage.svelte so the same live view renders
   // both on the public landing (`/`) and as the System Model
   // perspective root (`/system`). This component owns the live
-  // polling + the JobKind registry load; it carries no marketing
+  // polling + the Workflow registry load; it carries no marketing
   // chrome (hero, CTA) — the host page supplies that.
 
   import { onMount } from 'svelte';
   import StepDag from '../../jobs/StepDag.svelte';
-  import { jobKindToDag } from '../../jobs/jobKindToDag';
+  import { workflowToDag } from '../../jobs/workflowToDag';
   import { navigate } from '../../router';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
   import type {
-    JobKindSpec,
-    JobKindStep,
-    JobKindSummary,
+    WorkflowSpec,
+    WorkflowStep,
+    WorkflowSummary,
     JobLiveSummary,
     JobLiveRow,
   } from '../../landing/types';
@@ -29,21 +29,21 @@
     NODE_H,
   } from '../../jobs/atlas-layout';
 
-  let kinds = $state<JobKindSummary[]>([]);
-  // Empty until /api/jobs/kinds loads, then defaulted to the first
+  let kinds = $state<WorkflowSummary[]>([]);
+  // Empty until /api/workflows loads, then defaulted to the first
   // kind in the (label-sorted) registry list — no brewery slug
   // baked in. See loadKinds().
   let selectedKind = $state<string>('');
-  let spec = $state<JobKindSpec | null>(null);
+  let spec = $state<WorkflowSpec | null>(null);
   // StepDag nodes + edges derived from the loaded spec.
-  let dag = $derived(spec ? jobKindToDag(spec.steps) : { nodes: [], edges: [] });
+  let dag = $derived(spec ? workflowToDag(spec.steps) : { nodes: [], edges: [] });
   let renderError = $state<string | null>(null);
   let loading = $state<boolean>(true);
-  let activeStep = $state<JobKindStep | null>(null);
+  let activeStep = $state<WorkflowStep | null>(null);
 
   // View-mode toggle. The default `workflow` view shows the
-  // per-JobKind step diagram. The `atlas` view shows the
-  // cross-JobKind operating-model overview (every published JobKind
+  // per-Workflow step diagram. The `atlas` view shows the
+  // cross-Workflow operating-model overview (every published Workflow
   // grouped by category). Visitors click an atlas node to drill into
   // its workflow.
   type ViewMode = 'workflow' | 'atlas';
@@ -61,7 +61,7 @@
   let kindPulseUntil = $state<Record<string, number>>({});
   // Full spec list — populated alongside `kinds` so the atlas
   // view can render step counts without per-kind fetches.
-  let allSpecs = $state<JobKindSpec[]>([]);
+  let allSpecs = $state<WorkflowSpec[]>([]);
 
   // Live operating-company state. Refreshed once on mount + every
   // 1s after that — turns the static workflow diagram into a
@@ -173,14 +173,14 @@
 
   async function loadKinds() {
     try {
-      const r = await fetch('/api/jobs/kinds');
+      const r = await fetch('/api/workflows');
       if (!r.ok) {
-        throw new Error(`GET /api/jobs/kinds: ${r.status}`);
+        throw new Error(`GET /api/workflows: ${r.status}`);
       }
-      const all: JobKindSpec[] = await r.json();
+      const all: WorkflowSpec[] = await r.json();
       // Stash full specs for the atlas view (step counts,
       // per-category grouping). The picker + summary list still
-      // use the trimmed JobKindSummary shape.
+      // use the trimmed WorkflowSummary shape.
       allSpecs = all;
       kinds = all
         .map((k) => ({ kind: k.kind, label: k.label, category: k.category }))
@@ -192,13 +192,13 @@
         selectedKind = kinds[0]?.kind ?? selectedKind;
       }
     } catch (e) {
-      renderError = `Couldn't load JobKinds: ${e instanceof Error ? e.message : String(e)}`;
+      renderError = `Couldn't load Workflows: ${e instanceof Error ? e.message : String(e)}`;
     }
   }
 
-  // ===== Atlas view. Groups JobKinds by category and lays them out
+  // ===== Atlas view. Groups Workflows by category and lays them out
   // as clickable SVG nodes; a visitor clicks a node to drill into its
-  // per-JobKind workflow view. The layout + colours are the shared
+  // per-Workflow workflow view. The layout + colours are the shared
   // engine (src/jobs/atlas-layout.ts), also used by the System Atlas
   // page — only this canvas's narrower width differs.
   const ATLAS_CANVAS_W = 1100;
@@ -214,7 +214,7 @@
   }
 
   /** True if `kind` is currently pulsing (live event landed
-   *  for that JobKind in the last ~600ms). Atlas nodes pulse
+   *  for that Workflow in the last ~600ms). Atlas nodes pulse
    *  when their kind sees fresh activity. */
   function atlasNodePulsing(kind: string): boolean {
     const until = kindPulseUntil[kind];
@@ -226,11 +226,11 @@
     loading = true;
     renderError = null;
     try {
-      const r = await fetch(`/api/jobs/kinds/${encodeURIComponent(kind)}`);
+      const r = await fetch(`/api/workflows/${encodeURIComponent(kind)}`);
       if (!r.ok) {
-        throw new Error(`GET /api/jobs/kinds/${kind}: ${r.status}`);
+        throw new Error(`GET /api/workflows/${kind}: ${r.status}`);
       }
-      spec = await r.json() as JobKindSpec;
+      spec = await r.json() as WorkflowSpec;
     } catch (e) {
       renderError = `Couldn't load workflow: ${e instanceof Error ? e.message : String(e)}`;
     } finally {
@@ -318,7 +318,7 @@
                   }}
                   title="Open job {job.id}"
                 >
-                  <span class="live-job-kind">{job.kind}</span>
+                  <span class="live-workflow">{job.kind}</span>
                   <span class="live-job-title">{job.title}</span>
                   <span class="live-job-meta">
                     on <code>{job.subject_kind}:{job.subject_id}</code> · opened {job.opened_on}
@@ -367,7 +367,7 @@
       {/if}
     {:else}
       <span class="kind-meta">
-        Every JobKind this tenant publishes, grouped by category. Click any to drill into its workflow.
+        Every Workflow this tenant publishes, grouped by category. Click any to drill into its workflow.
       </span>
     {/if}
   </div>
@@ -397,7 +397,7 @@
             viewBox={`0 0 ${ATLAS_CANVAS_W} ${atlasLayout.height}`}
             class="atlas-canvas"
             role="img"
-            aria-label="Tenant JobKind atlas"
+            aria-label="Tenant Workflow atlas"
             preserveAspectRatio="xMinYMid meet"
           >
             {#each atlasLayout.rows as row (row.category)}
@@ -486,7 +486,7 @@
 
   {#if spec?.description}
     <section class="description">
-      <h2>About this JobKind</h2>
+      <h2>About this Workflow</h2>
       <p>{spec.description}</p>
     </section>
   {/if}
@@ -644,7 +644,7 @@
     font: inherit;
   }
   .live-job:hover { border-color: var(--brew-amber, #d99b3a); }
-  .live-job-kind {
+  .live-workflow {
     grid-row: 1 / 3;
     align-self: center;
     font-family: 'Iowa', 'Iowan Old Style', Georgia, serif;
@@ -855,7 +855,7 @@
     font-family: -apple-system, system-ui, sans-serif;
   }
   /* Atlas node pulse — flashes when fresh job lifecycle events
-     for that JobKind land in the event tail. The amber stroke
+     for that Workflow land in the event tail. The amber stroke
      + scale lift reads as "this kind just did something."
      Companion to the per-step-node pulse in workflow mode. */
   .atlas-node.is-pulsing rect {

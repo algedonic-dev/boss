@@ -124,7 +124,7 @@
   // --- New Job creation ---
   // Two entry points: "Start a new Job" pops the picker with no
   // kind preselected; "Create Ad Hoc" preselects the `ad-hoc`
-  // JobKind (every BOSS tenant ships one — brewery + device-shop
+  // Workflow (every BOSS tenant ships one — brewery + device-shop
   // seeds both register it under operations, accepting every
   // platform Subject kind). #92 added the brewery's ad-hoc row
   // and broadened the device-shop's to the full platform subject
@@ -139,7 +139,7 @@
     sign_offs_required?: string[];
     authority_role?: string | null;
   };
-  type JobKindRow = {
+  type WorkflowRow = {
     kind: string;
     label: string;
     description?: string | null;
@@ -156,7 +156,7 @@
   type Owner = { id: string; name: string; role?: string };
 
   let newJobOpen = $state(false);
-  let kinds = $state<JobKindRow[]>([]);
+  let kinds = $state<WorkflowRow[]>([]);
   let kindsLoading = $state(false);
   let owners = $state<Owner[]>([]);
   let formKind = $state('');
@@ -206,7 +206,7 @@
   const currentSubjectOptions = $derived(currentSubjectOptionsState.options);
 
   // When the user lands via a Subject-page deep-link
-  // (?subject_kind=account&subject_id=…), filter the JobKind picker
+  // (?subject_kind=account&subject_id=…), filter the Workflow picker
   // to only the kinds that accept that subject_kind. Without this,
   // a user looking at "wholesale-keg-order" is shown alongside
   // "morning-brew" even though morning-brew can't take an account
@@ -221,12 +221,12 @@
     if (kinds.length > 0 || kindsLoading) return;
     kindsLoading = true;
     try {
-      const resp = await fetch('/api/jobs/kinds');
+      const resp = await fetch('/api/workflows');
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      // /api/jobs/kinds returns a plain array of JobKindSpec rows;
+      // /api/workflows returns a plain array of WorkflowSpec rows;
       // we keep `description` + `category` so the form can preview
       // what's about to happen.
-      kinds = (await resp.json()) as JobKindRow[];
+      kinds = (await resp.json()) as WorkflowRow[];
     } catch (e) {
       formError = e instanceof Error ? e.message : String(e);
     } finally {
@@ -389,7 +389,7 @@
       return;
     }
     const today = appToday();
-    // Default title: prefer the JobKind's human label + the
+    // Default title: prefer the Workflow's human label + the
     // Subject's name (resolved from autocomplete options) over the
     // raw slugs. Falls back to the slug shape when we don't know
     // the labels (custom subject, list endpoint failed, etc.).

@@ -1,16 +1,16 @@
 <script lang="ts">
-  // /system/job-kinds/new — name a new kind, then open the authoring
-  // workspace. Under D6 a JobKind is authored *through* a
-  // `job-kind-design` Job: this page collects the identity + headline
+  // /system/workflows/new — name a new kind, then open the authoring
+  // workspace. Under D6 a Workflow is authored *through* a
+  // `workflow-design` Job: this page collects the identity + headline
   // fields, creates the design Job (the slug becomes its immutable
   // subject id), seeds the publish step with an initial spec, and hands
-  // off to JobKindDesignWorkspace. No `job_kinds` row is written until
+  // off to WorkflowDesignWorkspace. No `workflows` row is written until
   // the author drives that Job to its publish step.
 
   import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
-  import type { JobKindSpec, StepSpec } from './jobKindTypes';
+  import type { WorkflowSpec, StepSpec } from './workflowTypes';
   import { initialSpec, startDesignJob } from './designJob';
   import { session } from '@boss/web-kit/session/session.svelte';
   import { appToday } from '@boss/web-kit/sim-clock';
@@ -25,7 +25,7 @@
     let cancelled = false;
     void (async () => {
       try {
-        const r = await fetch('/api/jobs/kinds');
+        const r = await fetch('/api/workflows');
         if (!r.ok) return;
         const kinds = (await r.json()) as Array<{ category?: string }>;
         if (cancelled) return;
@@ -79,9 +79,9 @@
     let cancelled = false;
     void (async () => {
       try {
-        const r = await fetch(`/api/jobs/kinds/${encodeURIComponent(fork)}`);
+        const r = await fetch(`/api/workflows/${encodeURIComponent(fork)}`);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const src = (await r.json()) as JobKindSpec;
+        const src = (await r.json()) as WorkflowSpec;
         if (cancelled) return;
         label = `${src.label} (fork)`;
         category = src.category;
@@ -119,20 +119,20 @@
     try {
       // Guardrail: a brand-new kind shouldn't collide with an existing
       // one — that path is "new version" (Edit on the detail page).
-      const existing = await fetch(`/api/jobs/kinds/${encodeURIComponent(kindSlug)}`);
+      const existing = await fetch(`/api/workflows/${encodeURIComponent(kindSlug)}`);
       if (existing.ok) {
         error = `Kind "${kindSlug}" already exists — use Edit on its detail page to author a new version.`;
         starting = false;
         return;
       }
-      const seed: JobKindSpec = {
+      const seed: WorkflowSpec = {
         ...initialSpec(kindSlug, label, category, subjectKinds, description || undefined),
         ...(forkSteps ? { steps: forkSteps } : {}),
       };
       const jobId = await startDesignJob(seed, ownerId, appToday(), {
         title: forkSource ? `Fork ${forkSource} → ${kindSlug}` : `Design ${kindSlug}`,
       });
-      navigate(href(`/system/job-kinds/authoring/${encodeURIComponent(jobId)}`));
+      navigate(href(`/system/workflows/authoring/${encodeURIComponent(jobId)}`));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       starting = false;
@@ -141,7 +141,7 @@
 </script>
 
 <div class="catalog theme-exec">
-  <Breadcrumb to={href('/system/job-kinds')}>← All job kinds</Breadcrumb>
+  <Breadcrumb to={href('/system/workflows')}>← All job kinds</Breadcrumb>
   <PageHeader
     eyebrow="Platform · Job kind"
     title={forkSource ? `New job kind (forked from ${forkSource})` : 'New job kind'}

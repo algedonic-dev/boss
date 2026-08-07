@@ -1,6 +1,6 @@
 <script lang="ts">
   // /system — the System Model perspective root. Renders the live
-  // System-Model view (Jobs in flight + the per-JobKind step-graph),
+  // System-Model view (Jobs in flight + the per-Workflow step-graph),
   // the same component the public landing wraps. The remaining
   // model-definition surfaces (Workflows, Dispatcher, Subjects &
   // Classes, Step plugins, Audit Log, Atlas, …) are reached from the

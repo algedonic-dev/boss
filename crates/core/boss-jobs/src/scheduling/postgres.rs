@@ -512,11 +512,11 @@ impl SchedulingRepository for PgScheduling {
             ends_at: DateTime<Utc>,
             notes: Option<String>,
             job_title: Option<String>,
-            job_kind: Option<String>,
+            workflow: Option<String>,
         }
         let assigns: Vec<S> = sqlx::query_as(
             "SELECT s.id, s.tech_id, s.target_job_id, s.kind, s.status,
-                    s.starts_at, s.ends_at, s.notes, j.title AS job_title, j.kind AS job_kind
+                    s.starts_at, s.ends_at, s.notes, j.title AS job_title, j.kind AS workflow
              FROM scheduled_assignments s
              LEFT JOIN jobs j ON j.id = s.target_job_id
              WHERE s.starts_at < $2 AND s.ends_at > $1
@@ -563,7 +563,7 @@ impl SchedulingRepository for PgScheduling {
                     status,
                     target_job_id: s.target_job_id,
                     target_job_title: s.job_title,
-                    target_job_kind: s.job_kind,
+                    target_workflow: s.workflow,
                     starts_at: s.starts_at,
                     ends_at: s.ends_at,
                     notes: s.notes,

@@ -32,7 +32,7 @@ async fn seed_vendor_and_employee(db: &TestDb) {
 
     // employees row — required FK target for interactions.actor_id +
     // account_team.employee_id + contracts.signed_by_employee_id. Procurement
-    // folks live under the `finance` department (per job-kinds seeding);
+    // folks live under the `finance` department (per workflows seeding);
     // the employees.department CHECK doesn't list 'procurement'.
     sqlx::query(
         "INSERT INTO employees (id, name, email, role, department, location, \

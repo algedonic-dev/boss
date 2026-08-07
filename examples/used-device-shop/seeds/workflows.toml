@@ -1,7 +1,7 @@
-# JobKind rows for the Used Device Shop tenant.
+# Workflow rows for the Used Device Shop tenant.
 #
-# Each [[job_kind]] block authors one row of the `job_kinds` table.
-# Schema mirrors `JobKindSpec` in
+# Each [[workflow]] block authors one row of the `workflows` table.
+# Schema mirrors `WorkflowSpec` in
 # crates/core/boss-jobs/src/registry.rs — the loader at
 # crates/core/boss-jobs/src/seed_loader.rs serializes these straight into
 # the row.
@@ -18,7 +18,7 @@
 # `warehouse-clerk`, `warehouse-mgr`, `parts-buyer`, etc.
 #
 # The boss-sim shape-driven path reads these rows + tenant.toml to
-# drive the tenant's work; each JobKind here is one bounded unit of
+# drive the tenant's work; each Workflow here is one bounded unit of
 # the device-refurb business modeled as data.
 
 # ---------------------------------------------------------------------------
@@ -33,7 +33,7 @@
 # minting yet another StepType.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "device-intake"
 label = "Device Intake"
 category = "operations"
@@ -46,7 +46,7 @@ or disposal lineage. Subject is the system id assigned at intake.
 
 # Trigger — the intake-condition inspection is the opening step
 # (fires at Job open).
-[[job_kind.step]]
+[[workflow.step]]
 title = "evaluate-condition"
 kind = "inspection"
 ready_when = "true"
@@ -70,7 +70,7 @@ metadata_defaults = { overall_result = "pass", inspector_notes = "", measurement
 # `quote.disposition` (or a dedicated `intake.outcome`) to a declared
 # enum `repair|salvage|totaled` on the StepType so the branches are
 # exhaustive and no bare-done fallback is needed.
-[[job_kind.step]]
+[[workflow.step]]
 title = "decide-disposition"
 kind = "quote"
 ready_when = "steps.evaluate-condition.done"
@@ -84,7 +84,7 @@ authority_role = "refurb-supervisor"
 metadata_defaults = { account_id = "acc-intake-bench", line_items = [], total_cents = 0, currency = "USD", disposition = "" }
 
 # Repair branch — bind the unit to the refurb lineage.
-[[job_kind.step]]
+[[workflow.step]]
 title = "record-intake"
 kind = "intake"
 ready_when = "steps.decide-disposition.done AND steps.decide-disposition.metadata.disposition = \"repair\""
@@ -96,7 +96,7 @@ terminal = { outcome = "intake-recorded" }
 metadata_defaults = { asset_id = "{subject.id}", source = "used-trade-in" }
 
 # Salvage branch — route the unit to the salvage/decommission lineage.
-[[job_kind.step]]
+[[workflow.step]]
 title = "record-salvage"
 kind = "intake"
 ready_when = "steps.decide-disposition.done AND steps.decide-disposition.metadata.disposition = \"salvage\""
@@ -107,7 +107,7 @@ metadata_defaults = { asset_id = "{subject.id}", source = "used-trade-in" }
 
 # Wildcard fallback terminal — catches any disposition value not
 # covered by the repair / salvage branches so no outcome dead-ends.
-[[job_kind.step]]
+[[workflow.step]]
 title = "disposition-other"
 kind = "intake"
 ready_when = "steps.decide-disposition.done"
@@ -120,11 +120,11 @@ metadata_defaults = { asset_id = "{subject.id}", source = "used-trade-in" }
 # refurb-used — the full triage → repair → QA path for a used unit.
 #
 # Step graph: handoff → inspection+checklist → repair →
-# inspection → sign-off → handoff. A tenant-owned JobKind — refurb
+# inspection → sign-off → handoff. A tenant-owned Workflow — refurb
 # is the device shop's vertical, not platform vocabulary.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "refurb-used"
 label = "Refurb (used)"
 category = "refurb"
@@ -136,7 +136,7 @@ units take the shorter `refurb-oem-new` path which skips triage +
 repair.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "intake-log"
 kind = "handoff"
 ready_when = "true"
@@ -147,7 +147,7 @@ metadata_defaults = { from_id = "receiving", to_id = "refurb-queue" }
 # Triage + parts-check run in parallel off the intake handoff (both
 # gate on `steps.intake-log.done`). The repair step gates on BOTH so
 # neither parallel step is a dead-end leaf.
-[[job_kind.step]]
+[[workflow.step]]
 title = "triage"
 kind = "inspection"
 ready_when = "steps.intake-log.done"
@@ -155,7 +155,7 @@ title_template = "Triage assessment — {subject.id}"
 authority_role = "refurb-tech"
 metadata_defaults = { asset_id = "{subject.id}", overall_result = "pass" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "check-parts"
 kind = "checklist"
 ready_when = "steps.intake-log.done"
@@ -167,7 +167,7 @@ metadata_defaults = { items = [
     { label = "Power supply spares on hand", checked = false },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "diagnose-repair"
 kind = "repair"
 ready_when = "steps.triage.done AND steps.check-parts.done"
@@ -178,7 +178,7 @@ authority_role = "refurb-tech"
 # inventory.parts.consume side-effect no-ops on empty arrays.
 metadata_defaults = { asset_id = "{subject.id}", parts_consumed = [], labor_hours = 0 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "qa-inspection"
 kind = "inspection"
 ready_when = "steps.diagnose-repair.done"
@@ -187,7 +187,7 @@ authority_role = "qa-tech"
 sign_offs_required = ["qa-tech"]
 metadata_defaults = { asset_id = "{subject.id}", overall_result = "pass" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "qa-certification"
 kind = "sign-off"
 ready_when = "steps.qa-inspection.done"
@@ -196,7 +196,7 @@ authority_role = "qa-lead"
 sign_offs_required = ["qa-lead"]
 metadata_defaults = { authority_role = "qa-lead" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "put-away"
 kind = "handoff"
 ready_when = "steps.qa-certification.done"
@@ -214,7 +214,7 @@ metadata_defaults = { from_id = "qa", to_id = "warehouse" }
 # examples/used-device-shop/design/operations-needs.md D1+A1.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "field-service"
 label = "Field Service"
 category = "service"
@@ -225,7 +225,7 @@ Step graph walks triage → diagnostic call → scheduling → on-site
 repair → checklist verification → customer sign-off.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "triage-request"
 kind = "sr-triage"
 ready_when = "true"
@@ -235,7 +235,7 @@ authority_role = "service-mgr"
 # priority. Operators overlay these from the inbound contact.
 metadata_defaults = { account_id = "", device_serial = "{subject.id}", failure_description = "", priority = "standard" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "diagnostic-call"
 kind = "diagnostic-call"
 ready_when = "steps.triage-request.done"
@@ -243,7 +243,7 @@ title_template = "Diagnostic call — {subject.id}"
 authority_role = "service-tech"
 metadata_defaults = { channel = "phone", attendees = [] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "schedule-dispatch"
 kind = "scheduling"
 ready_when = "steps.diagnostic-call.done"
@@ -254,7 +254,7 @@ authority_role = "service-mgr"
 # overlays the real slot.
 metadata_defaults = { location = "", scheduled_at = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "on-site-repair"
 kind = "repair"
 ready_when = "steps.schedule-dispatch.done"
@@ -262,7 +262,7 @@ title_template = "On-site repair — {subject.id}"
 authority_role = "service-tech"
 metadata_defaults = { asset_id = "{subject.id}", parts_consumed = [], labor_hours = 0 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "post-repair-verification"
 kind = "checklist"
 ready_when = "steps.on-site-repair.done"
@@ -274,7 +274,7 @@ metadata_defaults = { items = [
     { label = "Customer-facing function verified", checked = false },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "customer-signoff"
 kind = "sign-off"
 ready_when = "steps.post-repair-verification.done"
@@ -294,7 +294,7 @@ metadata_defaults = { authority_role = "account-contact" }
 # without per-Job overrides.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "sale"
 label = "Sale"
 category = "sales"
@@ -305,7 +305,7 @@ systems on one Job) carry the system list in metadata.asset_ids;
 the shipment + billing steps fan that out into per-line entries.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "qualify-lead"
 kind = "qualification"
 ready_when = "true"
@@ -316,7 +316,7 @@ metadata_defaults = { criteria = [], qualified = false }
 # Demo + quote run in parallel off qualification (both gate on
 # `steps.qualify-lead.done`). Close-deal gates on BOTH so neither
 # parallel step is a dead-end leaf.
-[[job_kind.step]]
+[[workflow.step]]
 title = "demo"
 kind = "outreach"
 ready_when = "steps.qualify-lead.done"
@@ -324,7 +324,7 @@ title_template = "Demo & presentation — {subject.id}"
 authority_role = "sales-rep"
 metadata_defaults = { channel = "demo", recipient_id = "{subject.id}", recipient_type = "account" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "send-quote"
 kind = "quote"
 ready_when = "steps.qualify-lead.done"
@@ -332,7 +332,7 @@ title_template = "Prepare & send quote — {subject.id}"
 authority_role = "sales-rep"
 metadata_defaults = { account_id = "{subject.id}", line_items = [], total_cents = 0, currency = "USD" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "close-deal"
 kind = "sign-off"
 ready_when = "steps.demo.done AND steps.send-quote.done"
@@ -342,9 +342,9 @@ sign_offs_required = ["sales-mgr"]
 metadata_defaults = { decision = "pending" }
 
 # Ship + invoice run in parallel off close-deal. Both are terminals
-# (multiple terminals per JobKind is normal) — the Job closes once
+# (multiple terminals per Workflow is normal) — the Job closes once
 # the unit ships and the invoice issues.
-[[job_kind.step]]
+[[workflow.step]]
 title = "ship-to-account"
 kind = "shipment"
 ready_when = "steps.close-deal.done"
@@ -360,7 +360,7 @@ authority_role = "warehouse-clerk"
 terminal = { outcome = "shipped" }
 metadata_defaults = { direction = "outbound", origin = "warehouse", destination = "{subject.id}", carrier = "ups", line_items = [], consumes_products = [] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "issue-invoice"
 kind = "billing"
 ready_when = "steps.close-deal.done"
@@ -374,11 +374,11 @@ metadata_defaults = { account_id = "{subject.id}", amount_cents = 0, currency = 
 # specialist. Subject is the requesting account.
 #
 # Covers the device-question / device-issue / account-question
-# support lanes. RMA + SLA renewal are their own JobKinds below —
+# support lanes. RMA + SLA renewal are their own Workflows below —
 # those have meaningfully different step graphs and SLAs.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "support-incident"
 label = "Support Incident"
 category = "support"
@@ -387,10 +387,10 @@ description = """
 Inbound support case — phone / email / chat from a customer contact.
 Subject is the account. Lifecycle: open → assigned → in-progress →
 resolved with optional CSAT. Routing to RMA / SLA-renewal stays a
-separate JobKind so each lane carries its own SLA + step graph.
+separate Workflow so each lane carries its own SLA + step graph.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "receive-case"
 kind = "outreach"
 ready_when = "true"
@@ -398,7 +398,7 @@ title_template = "Receive case — {subject.id}"
 authority_role = "support-specialist"
 metadata_defaults = { channel = "phone", recipient_id = "{subject.id}", recipient_type = "account", subject = "", body = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "triage-assign"
 kind = "qualification"
 ready_when = "steps.receive-case.done"
@@ -410,7 +410,7 @@ metadata_defaults = { criteria = [
     { name = "training-request", met = false, notes = "" },
 ], qualified = true }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "investigate-resolve"
 kind = "task"
 ready_when = "steps.triage-assign.done"
@@ -418,7 +418,7 @@ title_template = "Investigate & resolve"
 authority_role = "support-specialist"
 metadata_defaults = { category = "support-investigation", instructions = "", due_date = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "confirm-resolution"
 kind = "acknowledgment"
 ready_when = "steps.investigate-resolve.done"
@@ -436,14 +436,14 @@ metadata_defaults = { document_title = "Resolution confirmation", csat = 0 }
 # the account; the unit being returned + replacement (if any) carried
 # in metadata.
 #
-# A separate JobKind from support-incident because RMA
+# A separate Workflow from support-incident because RMA
 # fundamentally differs: a physical inbound shipment, a per-unit
 # inspection, a credit/refund decision, a return shipment if the
 # customer wants a replacement. Different SLA, different ownership
 # chain (support → warehouse → refurb → finance).
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "support-rma"
 label = "Support RMA"
 category = "support"
@@ -456,7 +456,7 @@ spawns separately). Subject is the account; the asset_id under
 return rides in metadata.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "rma-request"
 kind = "outreach"
 ready_when = "true"
@@ -464,7 +464,7 @@ title_template = "RMA request from {subject.id}"
 authority_role = "support-specialist"
 metadata_defaults = { channel = "email", recipient_id = "{subject.id}", recipient_type = "account", subject = "RMA request", body = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "approve-rma"
 kind = "sign-off"
 ready_when = "steps.rma-request.done"
@@ -473,7 +473,7 @@ authority_role = "service-mgr"
 sign_offs_required = ["service-mgr"]
 metadata_defaults = { decision = "pending", comment = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "receive-unit"
 kind = "shipment"
 ready_when = "steps.approve-rma.done"
@@ -481,7 +481,7 @@ title_template = "Receive returned unit"
 authority_role = "warehouse-clerk"
 metadata_defaults = { direction = "inbound", origin = "{subject.id}", destination = "warehouse", carrier = "ups", line_items = [], consumes_products = [] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "assess-unit"
 kind = "inspection"
 ready_when = "steps.receive-unit.done"
@@ -489,7 +489,7 @@ title_template = "Assess returned unit condition"
 authority_role = "qa-tech"
 metadata_defaults = { overall_result = "conditional", inspector_notes = "", measurements = [] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "refund-replace-decision"
 kind = "sign-off"
 ready_when = "steps.assess-unit.done"
@@ -498,7 +498,7 @@ authority_role = "service-mgr"
 sign_offs_required = ["service-mgr"]
 metadata_defaults = { decision = "pending", comment = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "process-refund"
 kind = "billing"
 ready_when = "steps.refund-replace-decision.done"
@@ -519,7 +519,7 @@ metadata_defaults = { account_id = "{subject.id}", amount_cents = 0, currency = 
 # counterparty trigger in tenant.toml once the engine swap lands.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "support-sla-renewal"
 label = "Support SLA Renewal"
 category = "support"
@@ -531,14 +531,14 @@ fresh quote, customer signs, finance bills. Subject is the account;
 the agreement_id rides in metadata.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "expiry-warning"
 kind = "milestone"
 ready_when = "true"
 title_template = "60-day expiry warning — {subject.id}"
 metadata_defaults = { milestone_name = "renewal-window-open", criteria = "agreement.end_date - 60d <= today" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "renewal-outreach"
 kind = "outreach"
 ready_when = "steps.expiry-warning.done"
@@ -546,7 +546,7 @@ title_template = "Renewal outreach — {subject.id}"
 authority_role = "support-specialist"
 metadata_defaults = { channel = "email", recipient_id = "{subject.id}", recipient_type = "account", subject = "Coverage renewal", body = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "renewal-quote"
 kind = "quote"
 ready_when = "steps.renewal-outreach.done"
@@ -554,7 +554,7 @@ title_template = "Renewal quote — {subject.id}"
 authority_role = "sales-rep"
 metadata_defaults = { account_id = "{subject.id}", line_items = [], total_cents = 0, currency = "USD" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "customer-signature"
 kind = "sign-off"
 ready_when = "steps.renewal-quote.done"
@@ -563,7 +563,7 @@ authority_role = "sales-mgr"
 sign_offs_required = ["sales-mgr"]
 metadata_defaults = { decision = "pending" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "renewal-invoice"
 kind = "billing"
 ready_when = "steps.customer-signature.done"
@@ -577,11 +577,11 @@ metadata_defaults = { account_id = "{subject.id}", amount_cents = 0, currency = 
 # buying account.
 #
 # Opens fresh coverage when a system is installed. The post-sale
-# renewal of an existing agreement is a separate JobKind
+# renewal of an existing agreement is a separate Workflow
 # (`contract-renewal`).
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "service-agreement"
 label = "Service Agreement"
 category = "sales"
@@ -593,7 +593,7 @@ parts-only / pm-only / extended-warranty) ride in metadata.
 The first-period invoice fires from the billing step on done.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "draft-agreement"
 kind = "quote"
 ready_when = "true"
@@ -601,7 +601,7 @@ title_template = "Draft agreement — {subject.id}"
 authority_role = "sales-rep"
 metadata_defaults = { account_id = "{subject.id}", line_items = [], total_cents = 0, currency = "USD" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "define-coverage"
 kind = "task"
 ready_when = "steps.draft-agreement.done"
@@ -612,7 +612,7 @@ authority_role = "sales-rep"
 # from the chosen agreement_type and land at done-overlay time.
 metadata_defaults = { category = "coverage-scope", instructions = "Pick agreement_type (full-service / parts-only / pm-only / extended-warranty)" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "customer-signature"
 kind = "sign-off"
 ready_when = "steps.define-coverage.done"
@@ -621,7 +621,7 @@ authority_role = "sales-mgr"
 sign_offs_required = ["sales-mgr"]
 metadata_defaults = { decision = "pending" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "first-period-invoice"
 kind = "billing"
 ready_when = "steps.customer-signature.done"
@@ -629,7 +629,7 @@ title_template = "First-period invoice — {subject.id}"
 authority_role = "sales-mgr"
 metadata_defaults = { account_id = "{subject.id}", amount_cents = 0, currency = "USD", line_items = [] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "coverage-active"
 kind = "milestone"
 ready_when = "steps.first-period-invoice.done"
@@ -645,7 +645,7 @@ metadata_defaults = { milestone_name = "coverage-active", criteria = "first invo
 # system crosses its end-of-life age threshold.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "decommission"
 label = "Decommission"
 category = "operations"
@@ -656,7 +656,7 @@ economic repair. Three steps: assess salvageable parts, harvest
 what's reusable, dispose of the remainder.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "assess-salvage"
 kind = "inspection"
 ready_when = "true"
@@ -664,7 +664,7 @@ title_template = "Assess salvageable parts — {subject.id}"
 authority_role = "refurb-tech"
 metadata_defaults = { asset_id = "{subject.id}", overall_result = "conditional", inspector_notes = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "harvest-parts"
 kind = "task"
 ready_when = "steps.assess-salvage.done"
@@ -672,7 +672,7 @@ title_template = "Harvest usable parts"
 authority_role = "refurb-tech"
 metadata_defaults = { category = "decommission-harvest", instructions = "Pull reusable transceivers / PSUs / fans into spares stock" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "dispose-remainder"
 kind = "task"
 ready_when = "steps.harvest-parts.done"
@@ -682,7 +682,7 @@ terminal = { outcome = "decommissioned" }
 metadata_defaults = { category = "decommission-disposal", instructions = "Per local e-waste guidelines" }
 
 # ===========================================================================
-# Second batch of tenant JobKinds. See
+# Second batch of tenant Workflows. See
 # `docs/design/platform-vs-tenant-jobkinds.md` for the
 # platform-vs-tenant split these rows live on the tenant side of.
 # ===========================================================================
@@ -692,7 +692,7 @@ metadata_defaults = { category = "decommission-disposal", instructions = "Per lo
 # intake → QA → certification → put-away. Fires for the OEM-new
 # slice of intake at the rate set in tenant.toml's
 # [job_rates.refurb-oem-new].
-[[job_kind]]
+[[workflow]]
 kind = "refurb-oem-new"
 label = "Refurb (OEM-new)"
 category = "refurb"
@@ -703,7 +703,7 @@ Identical lineage to refurb-used but skips triage + repair —
 new units go intake → QA → certification → put-away.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "intake-log"
 kind = "handoff"
 ready_when = "true"
@@ -711,7 +711,7 @@ title_template = "Intake & log — {subject.id}"
 authority_role = "warehouse-clerk"
 metadata_defaults = { from_id = "receiving", to_id = "qa-queue" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "qa-inspection"
 kind = "inspection"
 ready_when = "steps.intake-log.done"
@@ -720,7 +720,7 @@ authority_role = "qa-tech"
 sign_offs_required = ["qa-tech"]
 metadata_defaults = { asset_id = "{subject.id}", overall_result = "pass" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "qa-certification"
 kind = "sign-off"
 ready_when = "steps.qa-inspection.done"
@@ -729,7 +729,7 @@ authority_role = "qa-lead"
 sign_offs_required = ["qa-lead"]
 metadata_defaults = { authority_role = "qa-lead" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "put-away"
 kind = "handoff"
 ready_when = "steps.qa-certification.done"
@@ -743,7 +743,7 @@ metadata_defaults = { from_id = "qa", to_id = "warehouse" }
 # → record path; receiving is the audit-log artifact (single
 # intake step) that records "the unit arrived" as its own state
 # machine.
-[[job_kind]]
+[[workflow]]
 kind = "receiving"
 label = "Receiving"
 category = "operations"
@@ -757,7 +757,7 @@ handles disposition.
 
 # Single step — both the trigger (fires at Job open) and the
 # terminal (its completion closes the Job).
-[[job_kind.step]]
+[[workflow.step]]
 title = "intake-log"
 kind = "intake"
 ready_when = "true"
@@ -770,7 +770,7 @@ metadata_defaults = { asset_id = "{subject.id}", source = "used-trade-in" }
 # track. Sister to sale (which carries shipment as one of its
 # tiers); standalone shipping Jobs are used for inter-warehouse
 # transfers + RMA outbound replacements.
-[[job_kind]]
+[[workflow]]
 kind = "shipping"
 label = "Shipping"
 category = "operations"
@@ -778,10 +778,10 @@ subject_kinds = ["asset"]
 description = """
 Standalone shipping Job for inter-warehouse transfers + RMA
 replacement units. Sale Jobs carry shipment as a tier; this
-JobKind is the standalone surface.
+Workflow is the standalone surface.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "prepare-shipment"
 kind = "shipment"
 ready_when = "true"
@@ -789,7 +789,7 @@ title_template = "Prepare shipment for {subject.id}"
 authority_role = "warehouse-clerk"
 metadata_defaults = { direction = "outbound", origin = "warehouse", destination = "", line_items = [], consumes_products = [] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "track-shipment"
 kind = "shipment"
 ready_when = "steps.prepare-shipment.done"
@@ -800,7 +800,7 @@ metadata_defaults = { direction = "outbound", origin = "in-transit", destination
 
 # installation — on-site install + first-week handoff to Customer
 # Success. Spawned when a system flips to installed.
-[[job_kind]]
+[[workflow]]
 kind = "installation"
 label = "Installation"
 category = "service"
@@ -811,7 +811,7 @@ Spawned at the moment a system flips to installed. Follows
 ship → install → train → CS-handoff.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "ship-system"
 kind = "shipment"
 ready_when = "true"
@@ -819,7 +819,7 @@ title_template = "Ship system to account"
 authority_role = "warehouse-clerk"
 metadata_defaults = { direction = "outbound", origin = "warehouse", destination = "", carrier = "ups", line_items = [], consumes_products = [] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "on-site-install"
 kind = "repair"
 ready_when = "steps.ship-system.done"
@@ -827,7 +827,7 @@ title_template = "On-site installation"
 authority_role = "service-tech"
 metadata_defaults = { asset_id = "{subject.id}", parts_consumed = [], labor_hours = 0 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "operator-training"
 kind = "training"
 ready_when = "steps.on-site-install.done"
@@ -835,7 +835,7 @@ title_template = "Operator training"
 authority_role = "service-tech"
 metadata_defaults = { course_name = "Day-1 operation", provider = "in-house" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "cs-handoff"
 kind = "handoff"
 ready_when = "steps.operator-training.done"
@@ -847,7 +847,7 @@ metadata_defaults = { from_id = "service", to_id = "customer-success" }
 # preventive-maintenance-visit — preventive-maintenance visit on a deployed unit.
 # Quarterly cadence per service-agreement.pm_visits_per_year;
 # fires via the periodic engine.
-[[job_kind]]
+[[workflow]]
 kind = "preventive-maintenance-visit"
 label = "Preventive Maintenance Visit"
 category = "service"
@@ -858,7 +858,7 @@ inspect → checklist → customer sign-off. Cadence comes from
 the system's service-agreement.pm_visits_per_year.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "schedule-visit"
 kind = "scheduling"
 ready_when = "true"
@@ -866,7 +866,7 @@ title_template = "Schedule preventive maintenance visit"
 authority_role = "service-mgr"
 metadata_defaults = { location = "", scheduled_at = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "perform-pm"
 kind = "inspection"
 ready_when = "steps.schedule-visit.done"
@@ -874,7 +874,7 @@ title_template = "Perform preventive maintenance"
 authority_role = "service-tech"
 metadata_defaults = { asset_id = "{subject.id}", overall_result = "pass" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "pm-checklist"
 kind = "checklist"
 ready_when = "steps.perform-pm.done"
@@ -886,7 +886,7 @@ metadata_defaults = { items = [
     { label = "Firmware current", checked = false },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "customer-signoff"
 kind = "sign-off"
 ready_when = "steps.pm-checklist.done"
@@ -899,7 +899,7 @@ metadata_defaults = { authority_role = "account-contact" }
 # certification — annual recertification on a deployed system.
 # Single sign-off step; scheduled on a per-system anniversary
 # cadence.
-[[job_kind]]
+[[workflow]]
 kind = "certification"
 label = "Certification"
 category = "service"
@@ -911,7 +911,7 @@ anniversary cadence.
 """
 
 # Single step — both the trigger and the terminal.
-[[job_kind.step]]
+[[workflow.step]]
 title = "annual-certification"
 kind = "sign-off"
 ready_when = "true"
@@ -922,7 +922,7 @@ terminal = { outcome = "certified" }
 metadata_defaults = { authority_role = "qa-lead", regulatory_context = "annual-recert" }
 
 # demo — sales demo. Outreach → run demo → follow-up.
-[[job_kind]]
+[[workflow]]
 kind = "demo"
 label = "Demo"
 category = "sales"
@@ -933,7 +933,7 @@ session, then hands off to follow-up (which usually opens a
 sale Job if qualified).
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "schedule-demo"
 kind = "outreach"
 ready_when = "true"
@@ -941,7 +941,7 @@ title_template = "Schedule demo — {subject.id}"
 authority_role = "sales-rep"
 metadata_defaults = { channel = "email", recipient_id = "{subject.id}", recipient_type = "account" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "run-demo"
 kind = "task"
 ready_when = "steps.schedule-demo.done"
@@ -949,7 +949,7 @@ title_template = "Run demo"
 authority_role = "sales-rep"
 metadata_defaults = { category = "demo-session" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "follow-up"
 kind = "handoff"
 ready_when = "steps.run-demo.done"
@@ -960,7 +960,7 @@ metadata_defaults = { from_id = "sales-rep", to_id = "sales-mgr" }
 
 # account-onboarding — post-sale CS handoff. Spawned alongside
 # every sale Job.
-[[job_kind]]
+[[workflow]]
 kind = "account-onboarding"
 label = "Account Onboarding"
 category = "sales"
@@ -970,7 +970,7 @@ Post-sale onboarding pass. Spawned alongside every sale Job;
 walks welcome packet → orientation training → CS handoff.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "welcome-packet"
 kind = "handoff"
 ready_when = "true"
@@ -978,7 +978,7 @@ title_template = "Welcome packet"
 authority_role = "sales-rep"
 metadata_defaults = { from_id = "sales", to_id = "customer-success" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "orientation-call"
 kind = "training"
 ready_when = "steps.welcome-packet.done"
@@ -986,7 +986,7 @@ title_template = "Orientation call"
 authority_role = "service-tech"
 metadata_defaults = { course_name = "Account orientation", provider = "in-house" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "cs-handoff"
 kind = "handoff"
 ready_when = "steps.orientation-call.done"
@@ -998,7 +998,7 @@ metadata_defaults = { from_id = "onboarding", to_id = "cs-team" }
 # contract-renewal — generic post-sale renewal Job. Spawned by
 # contracts.rs when an agreement nears its end_date and the
 # customer has auto_renew set.
-[[job_kind]]
+[[workflow]]
 kind = "contract-renewal"
 label = "Contract Renewal"
 category = "sales"
@@ -1008,7 +1008,7 @@ Post-sale renewal Job. contracts.rs spawns one per agreement
 that's about to expire with auto_renew = true.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "renewal-outreach"
 kind = "outreach"
 ready_when = "true"
@@ -1016,7 +1016,7 @@ title_template = "Renewal outreach — {subject.id}"
 authority_role = "sales-rep"
 metadata_defaults = { channel = "email", recipient_id = "{subject.id}", recipient_type = "account" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "account-approval"
 kind = "sign-off"
 ready_when = "steps.renewal-outreach.done"
@@ -1025,7 +1025,7 @@ authority_role = "sales-mgr"
 sign_offs_required = ["sales-mgr"]
 metadata_defaults = { decision = "pending" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "generate-agreement"
 kind = "task"
 ready_when = "steps.account-approval.done"
@@ -1036,7 +1036,7 @@ metadata_defaults = { category = "renewal-paperwork" }
 
 # collections — A/R collections workflow. invoicing.rs opens these
 # when an invoice goes past-due past the configured threshold.
-[[job_kind]]
+[[workflow]]
 kind = "collections"
 label = "Collections"
 category = "finance"
@@ -1046,7 +1046,7 @@ A/R collections on a past-due account. Two outreach attempts
 then a write-off review by finance.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "first-notice"
 kind = "outreach"
 ready_when = "true"
@@ -1054,7 +1054,7 @@ title_template = "First notice"
 authority_role = "sales-mgr"
 metadata_defaults = { channel = "email", recipient_id = "{subject.id}", recipient_type = "account", subject = "Past-due notice" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "escalation"
 kind = "outreach"
 ready_when = "steps.first-notice.done"
@@ -1062,7 +1062,7 @@ title_template = "Escalation"
 authority_role = "sales-mgr"
 metadata_defaults = { channel = "phone", recipient_id = "{subject.id}", recipient_type = "account", subject = "Escalation: past-due" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "writeoff-review"
 kind = "sign-off"
 ready_when = "steps.escalation.done"
@@ -1074,7 +1074,7 @@ metadata_defaults = { decision = "pending", comment = "" }
 
 # vendor-payment — A/P payment workflow. Invoicing.rs / inventory
 # bridge opens these per approved vendor invoice.
-[[job_kind]]
+[[workflow]]
 kind = "vendor-payment"
 label = "Vendor Payment"
 category = "finance"
@@ -1084,7 +1084,7 @@ A/P payment workflow for an approved vendor invoice. Three-way
 match → finance approval → cut payment.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "three-way-match"
 kind = "task"
 ready_when = "true"
@@ -1092,7 +1092,7 @@ title_template = "Three-way match"
 authority_role = "controller"
 metadata_defaults = { category = "ap-3way-match" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "approve-payment"
 kind = "sign-off"
 ready_when = "steps.three-way-match.done"
@@ -1101,7 +1101,7 @@ authority_role = "controller"
 sign_offs_required = ["controller"]
 metadata_defaults = { decision = "pending" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "pay-vendor"
 kind = "billing"
 ready_when = "steps.approve-payment.done"
@@ -1112,7 +1112,7 @@ metadata_defaults = { account_id = "{subject.id}", amount_cents = 0, currency = 
 
 # purchase — generic procurement Job. Custom subject so the PO id
 # isn't constrained to a single tenant entity shape.
-[[job_kind]]
+[[workflow]]
 kind = "purchase"
 label = "Procurement"
 category = "finance"
@@ -1122,7 +1122,7 @@ Generic procurement Job. PO → vendor ack → receive → 3-way
 match → release payment.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "issue-po"
 kind = "procurement"
 ready_when = "true"
@@ -1130,7 +1130,7 @@ title_template = "Issue PO to vendor"
 authority_role = "parts-buyer"
 metadata_defaults = { vendor_id = "", items = [], po_id = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "vendor-ack"
 kind = "task"
 ready_when = "steps.issue-po.done"
@@ -1138,7 +1138,7 @@ title_template = "Vendor acknowledgment"
 authority_role = "parts-buyer"
 metadata_defaults = { category = "vendor-ack" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "receive-goods"
 kind = "receiving"
 ready_when = "steps.vendor-ack.done"
@@ -1146,7 +1146,7 @@ title_template = "Receive goods"
 authority_role = "warehouse-clerk"
 metadata_defaults = { po_id = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "three-way-match"
 kind = "sign-off"
 ready_when = "steps.receive-goods.done"
@@ -1155,7 +1155,7 @@ authority_role = "controller"
 sign_offs_required = ["controller"]
 metadata_defaults = { decision = "pending" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "release-payment"
 kind = "billing"
 ready_when = "steps.three-way-match.done"
@@ -1165,7 +1165,7 @@ terminal = { outcome = "paid" }
 metadata_defaults = { account_id = "vendor", amount_cents = 0, currency = "USD" }
 
 # listing — marketing listing draft + publish.
-[[job_kind]]
+[[workflow]]
 kind = "listing"
 label = "Listing"
 category = "marketing"
@@ -1174,7 +1174,7 @@ description = """
 Marketing listing draft + publish. Lightweight 2-tier flow.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "draft-listing"
 kind = "task"
 ready_when = "true"
@@ -1182,7 +1182,7 @@ title_template = "Draft listing"
 authority_role = "sales-mgr"
 metadata_defaults = { category = "listing-copy" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "publish"
 kind = "handoff"
 ready_when = "steps.draft-listing.done"
@@ -1192,7 +1192,7 @@ terminal = { outcome = "published" }
 metadata_defaults = { from_id = "marketing", to_id = "site-published" }
 
 # campaign — marketing campaign skeleton. Plan → launch → measure.
-[[job_kind]]
+[[workflow]]
 kind = "campaign"
 label = "Campaign"
 category = "marketing"
@@ -1201,7 +1201,7 @@ description = """
 Marketing campaign skeleton. plan → launch → measure.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "plan-campaign"
 kind = "task"
 ready_when = "true"
@@ -1209,7 +1209,7 @@ title_template = "Plan campaign"
 authority_role = "sales-mgr"
 metadata_defaults = { category = "campaign-plan" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "launch"
 kind = "outreach"
 ready_when = "steps.plan-campaign.done"
@@ -1217,7 +1217,7 @@ title_template = "Launch"
 authority_role = "sales-mgr"
 metadata_defaults = { channel = "email", recipient_id = "campaign-list", recipient_type = "account" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "measure"
 kind = "handoff"
 ready_when = "steps.launch.done"
@@ -1230,7 +1230,7 @@ metadata_defaults = { from_id = "execution", to_id = "analytics" }
 # examples/used-device-shop/design/marketing-needs.md D6. Each
 # tier advances the motion through idea → briefed → planned →
 # building → launched → measuring → retrospected.
-[[job_kind]]
+[[workflow]]
 kind = "marketing-motion"
 label = "Marketing Motion"
 category = "marketing"
@@ -1241,7 +1241,7 @@ circulated → execution project spawned → assets produced →
 launched → measurement window → retrospective filed.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "idea-captured"
 kind = "task"
 ready_when = "true"
@@ -1249,7 +1249,7 @@ title_template = "Idea captured"
 authority_role = "sales-mgr"
 metadata_defaults = { category = "motion-idea" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "brief-circulated"
 kind = "marketing-brief"
 ready_when = "steps.idea-captured.done"
@@ -1257,15 +1257,15 @@ title_template = "Brief circulated"
 authority_role = "sales-mgr"
 metadata_defaults = { brief_md = "", audience = [], acknowledgements = [] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "execution-spawned"
 kind = "delegate-subjob"
 ready_when = "steps.brief-circulated.done"
 title_template = "Execution project spawned"
 authority_role = "sales-mgr"
-metadata_defaults = { linked_job_kind = "marketing-project", auto_create = true }
+metadata_defaults = { linked_workflow = "marketing-project", auto_create = true }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "assets-produced"
 kind = "checklist"
 ready_when = "steps.execution-spawned.done"
@@ -1277,7 +1277,7 @@ metadata_defaults = { items = [
     { label = "Landing page", checked = false },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "launch"
 kind = "marketing-launch"
 ready_when = "steps.assets-produced.done"
@@ -1285,7 +1285,7 @@ title_template = "Launch"
 authority_role = "sales-mgr"
 metadata_defaults = { launch_date = "", launch_channel = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "measurement-window"
 kind = "marketing-attribution"
 ready_when = "steps.launch.done"
@@ -1293,7 +1293,7 @@ title_template = "Measurement window"
 authority_role = "sales-mgr"
 metadata_defaults = { measurement_days = 30 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "retrospective-filed"
 kind = "document"
 ready_when = "steps.measurement-window.done"
@@ -1304,7 +1304,7 @@ metadata_defaults = { doc_type = "retrospective", title = "Marketing motion retr
 
 # marketing-project — execution container spawned at tier 2 of
 # marketing-motion. Holds tasks + owners + due dates.
-[[job_kind]]
+[[workflow]]
 kind = "marketing-project"
 label = "Marketing Project"
 category = "marketing"
@@ -1314,7 +1314,7 @@ Execution container spawned at tier 2 of marketing-motion.
 Scope → tasks defined → execute → return to motion.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "scope-owners"
 kind = "task"
 ready_when = "true"
@@ -1322,7 +1322,7 @@ title_template = "Scope + owners"
 authority_role = "sales-mgr"
 metadata_defaults = { category = "project-scope" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "tasks-defined"
 kind = "checklist"
 ready_when = "steps.scope-owners.done"
@@ -1330,7 +1330,7 @@ title_template = "Tasks defined"
 authority_role = "sales-mgr"
 metadata_defaults = { items = [] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "execute"
 kind = "task"
 ready_when = "steps.tasks-defined.done"
@@ -1338,7 +1338,7 @@ title_template = "Execute"
 authority_role = "sales-mgr"
 metadata_defaults = { category = "project-execute" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "return-to-motion"
 kind = "handoff"
 ready_when = "steps.execute.done"
@@ -1348,7 +1348,7 @@ terminal = { outcome = "completed" }
 metadata_defaults = { from_id = "project", to_id = "motion" }
 
 # marketing-request — inbound work from other departments.
-[[job_kind]]
+[[workflow]]
 kind = "marketing-request"
 label = "Marketing Request"
 category = "marketing"
@@ -1358,7 +1358,7 @@ Inbound marketing work from other departments. Triaged → in
 progress → delivered.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "triaged"
 kind = "task"
 ready_when = "true"
@@ -1366,7 +1366,7 @@ title_template = "Triaged"
 authority_role = "sales-mgr"
 metadata_defaults = { category = "marketing-triage" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "in-progress"
 kind = "task"
 ready_when = "steps.triaged.done"
@@ -1374,7 +1374,7 @@ title_template = "In progress"
 authority_role = "sales-mgr"
 metadata_defaults = { category = "marketing-execution" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "delivered"
 kind = "handoff"
 ready_when = "steps.in-progress.done"
@@ -1384,7 +1384,7 @@ terminal = { outcome = "delivered" }
 metadata_defaults = { from_id = "marketing", to_id = "requester" }
 
 # onboarding — HR onboarding for a new hire.
-[[job_kind]]
+[[workflow]]
 kind = "onboarding"
 label = "Onboarding"
 category = "hr"
@@ -1394,7 +1394,7 @@ HR onboarding for a new hire. Offer acceptance → first-week
 training → manager sign-off.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "offer-acceptance"
 kind = "handoff"
 ready_when = "true"
@@ -1402,7 +1402,7 @@ title_template = "Offer acceptance"
 authority_role = "hr-generalist"
 metadata_defaults = { from_id = "recruiting", to_id = "hr" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "first-week-training"
 kind = "training"
 ready_when = "steps.offer-acceptance.done"
@@ -1410,7 +1410,7 @@ title_template = "First-week training"
 authority_role = "hr-generalist"
 metadata_defaults = { course_name = "New hire orientation", provider = "in-house" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "manager-signoff"
 kind = "sign-off"
 ready_when = "steps.first-week-training.done"
@@ -1421,7 +1421,7 @@ terminal = { outcome = "onboarded" }
 metadata_defaults = { authority_role = "hr-generalist" }
 
 # offboarding — HR offboarding.
-[[job_kind]]
+[[workflow]]
 kind = "offboarding"
 label = "Offboarding"
 category = "hr"
@@ -1431,7 +1431,7 @@ HR offboarding. Exit interview → deactivate access → final
 paperwork.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "exit-interview"
 kind = "handoff"
 ready_when = "true"
@@ -1439,7 +1439,7 @@ title_template = "Exit interview"
 authority_role = "hr-generalist"
 metadata_defaults = { from_id = "manager", to_id = "hr" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "deactivate-access"
 kind = "task"
 ready_when = "steps.exit-interview.done"
@@ -1447,7 +1447,7 @@ title_template = "Deactivate access"
 authority_role = "it-manager"
 metadata_defaults = { category = "access-revocation" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "final-paperwork"
 kind = "sign-off"
 ready_when = "steps.deactivate-access.done"
@@ -1459,7 +1459,7 @@ metadata_defaults = { authority_role = "hr-generalist" }
 
 # hiring — HR hiring funnel. Custom subject — req has no system
 # id at the post-job stage.
-[[job_kind]]
+[[workflow]]
 kind = "hiring"
 label = "Hiring"
 category = "hr"
@@ -1469,7 +1469,7 @@ HR hiring funnel. Post → screen → interview → offer →
 onboarding-checklist.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "post-listing"
 kind = "task"
 ready_when = "true"
@@ -1477,7 +1477,7 @@ title_template = "Post job listing"
 authority_role = "recruiter"
 metadata_defaults = { category = "job-posting" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "screen-candidates"
 kind = "task"
 ready_when = "steps.post-listing.done"
@@ -1485,7 +1485,7 @@ title_template = "Screen candidates"
 authority_role = "recruiter"
 metadata_defaults = { category = "candidate-screen" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "interview"
 kind = "scheduling"
 ready_when = "steps.screen-candidates.done"
@@ -1493,7 +1493,7 @@ title_template = "Interview"
 authority_role = "recruiter"
 metadata_defaults = { location = "", scheduled_at = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "extend-offer"
 kind = "sign-off"
 ready_when = "steps.interview.done"
@@ -1502,7 +1502,7 @@ authority_role = "hr-generalist"
 sign_offs_required = ["hr-generalist"]
 metadata_defaults = { decision = "pending" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "onboarding-checklist"
 kind = "checklist"
 ready_when = "steps.extend-offer.done"
@@ -1517,7 +1517,7 @@ metadata_defaults = { items = [
 
 # vendor-onboarding — procurement vendor admit. Custom multi-tier
 # flow per examples/used-device-shop/design/procurement-team-needs.md.
-[[job_kind]]
+[[workflow]]
 kind = "vendor-onboarding"
 label = "Vendor Onboarding"
 category = "procurement"
@@ -1531,7 +1531,7 @@ approved.
 # W9 + COI are parallel openers (both ready_when = "true", both
 # triggers). The credit + category checks gate on BOTH so neither
 # doc is a dead-end leaf.
-[[job_kind.step]]
+[[workflow.step]]
 title = "w9-on-file"
 kind = "document"
 ready_when = "true"
@@ -1539,7 +1539,7 @@ title_template = "W9 on file"
 authority_role = "parts-buyer"
 metadata_defaults = { doc_type = "w9", title = "Vendor W9" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "coi-on-file"
 kind = "document"
 ready_when = "true"
@@ -1547,7 +1547,7 @@ title_template = "Certificate of insurance on file"
 authority_role = "parts-buyer"
 metadata_defaults = { doc_type = "coi", title = "Vendor COI" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "credit-check"
 kind = "checklist"
 ready_when = "steps.w9-on-file.done AND steps.coi-on-file.done"
@@ -1558,7 +1558,7 @@ metadata_defaults = { items = [
     { label = "Three references confirmed", checked = false },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "category-tier"
 kind = "checklist"
 ready_when = "steps.w9-on-file.done AND steps.coi-on-file.done"
@@ -1569,7 +1569,7 @@ metadata_defaults = { items = [
     { label = "Tier assigned (preferred / approved / restricted)", checked = false },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "procurement-approval"
 kind = "sign-off"
 ready_when = "steps.credit-check.done AND steps.category-tier.done"
@@ -1578,7 +1578,7 @@ authority_role = "warehouse-mgr"
 sign_offs_required = ["warehouse-mgr"]
 metadata_defaults = { authority_role = "warehouse-mgr" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "first-po"
 kind = "task"
 ready_when = "steps.procurement-approval.done"
@@ -1586,7 +1586,7 @@ title_template = "First PO issued + received"
 authority_role = "parts-buyer"
 metadata_defaults = { category = "first-po-trial" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "flip-approved"
 kind = "handoff"
 ready_when = "steps.first-po.done"
@@ -1596,7 +1596,7 @@ terminal = { outcome = "approved" }
 metadata_defaults = { from_id = "onboarding", to_id = "approved-vendors" }
 
 # vendor-negotiation — structured negotiation rounds.
-[[job_kind]]
+[[workflow]]
 kind = "vendor-negotiation"
 label = "Vendor Negotiation"
 category = "procurement"
@@ -1606,7 +1606,7 @@ Structured vendor negotiation. Open dialogue → record rounds
 → over-threshold approval → close-out → capture artifact.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "open-dialogue"
 kind = "outreach"
 ready_when = "true"
@@ -1614,7 +1614,7 @@ title_template = "Open dialogue with vendor"
 authority_role = "parts-buyer"
 metadata_defaults = { channel = "email", recipient_id = "{subject.id}", recipient_type = "vendor" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "record-round"
 kind = "task"
 ready_when = "steps.open-dialogue.done"
@@ -1628,7 +1628,7 @@ fields = [
 ]
 metadata_defaults = { round_number = 1, our_ask_md = "", vendor_position_md = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "internal-approval"
 kind = "sign-off"
 ready_when = "steps.record-round.done"
@@ -1637,7 +1637,7 @@ authority_role = "warehouse-mgr"
 sign_offs_required = ["warehouse-mgr"]
 metadata_defaults = { decision = "pending", threshold_cents = 0 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "close-out"
 kind = "sign-off"
 ready_when = "steps.internal-approval.done"
@@ -1646,7 +1646,7 @@ authority_role = "warehouse-mgr"
 sign_offs_required = ["warehouse-mgr"]
 metadata_defaults = { authority_role = "warehouse-mgr" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "capture-artifact"
 kind = "document"
 ready_when = "steps.close-out.done"
@@ -1656,7 +1656,7 @@ terminal = { outcome = "completed" }
 metadata_defaults = { doc_type = "negotiation-outcome", title = "Negotiation outcome" }
 
 # rfq — request-for-quote across multiple vendors.
-[[job_kind]]
+[[workflow]]
 kind = "rfq"
 label = "Request for Quote"
 category = "procurement"
@@ -1666,7 +1666,7 @@ Request for quote across multiple vendors. Send RFQ →
 collect quotes → compare → pick winner → open purchase Job.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "send-rfq"
 kind = "outreach"
 ready_when = "true"
@@ -1674,7 +1674,7 @@ title_template = "Send RFQ to vendors"
 authority_role = "parts-buyer"
 metadata_defaults = { channel = "email", recipient_id = "rfq-vendors", recipient_type = "vendor" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "receive-quote"
 kind = "quote"
 ready_when = "steps.send-rfq.done"
@@ -1682,7 +1682,7 @@ title_template = "Receive quote"
 authority_role = "parts-buyer"
 metadata_defaults = { account_id = "{subject.id}", line_items = [] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "compare-quotes"
 kind = "task"
 ready_when = "steps.receive-quote.done"
@@ -1696,7 +1696,7 @@ fields = [
 ]
 metadata_defaults = { vendor_ids = [], rationale_md = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "pick-winner"
 kind = "sign-off"
 ready_when = "steps.compare-quotes.done"
@@ -1705,7 +1705,7 @@ authority_role = "warehouse-mgr"
 sign_offs_required = ["warehouse-mgr"]
 metadata_defaults = { decision = "pending" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "open-purchase"
 kind = "handoff"
 ready_when = "steps.pick-winner.done"
@@ -1715,7 +1715,7 @@ terminal = { outcome = "awarded" }
 metadata_defaults = { from_id = "rfq", to_id = "purchase-pipeline" }
 
 # vendor-catalog-refresh — scheduled scrape of a vendor's catalog.
-[[job_kind]]
+[[workflow]]
 kind = "vendor-catalog-refresh"
 label = "Vendor Catalog Refresh"
 category = "procurement"
@@ -1725,7 +1725,7 @@ Scheduled scrape of a vendor's catalog. Fetch snapshot →
 parse → diff against prior → close.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "fetch-snapshot"
 kind = "crawl-config"
 ready_when = "true"
@@ -1733,7 +1733,7 @@ title_template = "Fetch catalog snapshot"
 authority_role = "parts-buyer"
 metadata_defaults = { vendor_crawl_target_id = "{subject.id}", scraper_kind = "html" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "parse-normalize"
 kind = "task"
 ready_when = "steps.fetch-snapshot.done"
@@ -1741,7 +1741,7 @@ title_template = "Parse + normalize into snapshots"
 authority_role = "parts-buyer"
 metadata_defaults = { category = "catalog-parse" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "diff-emit"
 kind = "task"
 ready_when = "steps.parse-normalize.done"
@@ -1749,7 +1749,7 @@ title_template = "Diff against prior + emit change events"
 authority_role = "parts-buyer"
 metadata_defaults = { category = "catalog-diff" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "close"
 kind = "handoff"
 ready_when = "steps.diff-emit.done"
@@ -1759,7 +1759,7 @@ terminal = { outcome = "completed" }
 metadata_defaults = { from_id = "catalog-refresh", to_id = "vendor-kb" }
 
 # vendor-contract-renewal — vendor-side contract renewal.
-[[job_kind]]
+[[workflow]]
 kind = "vendor-contract-renewal"
 label = "Vendor Contract Renewal"
 category = "procurement"
@@ -1770,14 +1770,14 @@ renewal outreach → spawn negotiation Job → terms sign-off →
 file signed renewal.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "expiry-warning"
 kind = "milestone"
 ready_when = "true"
 title_template = "90 days before expiry"
 metadata_defaults = { milestone_name = "renewal-90d-warning" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "open-conversation"
 kind = "outreach"
 ready_when = "steps.expiry-warning.done"
@@ -1785,15 +1785,15 @@ title_template = "Open renewal conversation"
 authority_role = "parts-buyer"
 metadata_defaults = { channel = "email", recipient_id = "{subject.id}", recipient_type = "vendor" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "spawn-negotiation"
 kind = "delegate-subjob"
 ready_when = "steps.open-conversation.done"
 title_template = "Spawn vendor-negotiation"
 authority_role = "parts-buyer"
-metadata_defaults = { linked_job_kind = "vendor-negotiation", auto_create = true }
+metadata_defaults = { linked_workflow = "vendor-negotiation", auto_create = true }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "terms-signoff"
 kind = "sign-off"
 ready_when = "steps.spawn-negotiation.done"
@@ -1802,7 +1802,7 @@ authority_role = "warehouse-mgr"
 sign_offs_required = ["warehouse-mgr"]
 metadata_defaults = { decision = "pending" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "signed-renewal"
 kind = "document"
 ready_when = "steps.terms-signoff.done"
@@ -1813,7 +1813,7 @@ metadata_defaults = { doc_type = "vendor-contract", title = "Renewed vendor cont
 
 # ad-hoc — generic catchall for one-off work. Accepts every
 # Subject kind so any entity can anchor an ad-hoc piece of work.
-[[job_kind]]
+[[workflow]]
 kind = "ad-hoc"
 label = "Ad Hoc"
 category = "operations"
@@ -1824,7 +1824,7 @@ fills in what the work is via the title + metadata.
 """
 
 # Single step — both the trigger and the terminal.
-[[job_kind.step]]
+[[workflow.step]]
 title = "do-the-thing"
 kind = "task"
 ready_when = "true"
@@ -1836,12 +1836,12 @@ metadata_defaults = { category = "ad-hoc" }
 # training-session — on-site operator training spawned at install.
 # Subject is the account; asset_id rides in metadata.
 #
-# A dedicated JobKind so the training lifecycle (schedule →
+# A dedicated Workflow so the training lifecycle (schedule →
 # pre-reading → conduct → certify) is a first-class workflow rather
 # than an install side-effect.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "training-session"
 label = "Training Session"
 category = "service"
@@ -1852,7 +1852,7 @@ the account; asset_id (the unit being trained on) rides in
 metadata. Default cadence is 7-14 days post-install.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "schedule-session"
 kind = "scheduling"
 ready_when = "true"
@@ -1860,7 +1860,7 @@ title_template = "Schedule training session — {subject.id}"
 authority_role = "service-mgr"
 metadata_defaults = { location = "{subject.id}", scheduled_at = "", duration_minutes = 240, attendees = [] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "send-pre-reading"
 kind = "outreach"
 ready_when = "steps.schedule-session.done"
@@ -1868,7 +1868,7 @@ title_template = "Send pre-reading + agenda"
 authority_role = "service-tech"
 metadata_defaults = { channel = "email", recipient_id = "{subject.id}", recipient_type = "account", subject = "Training session prep", body = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "conduct-training"
 kind = "training"
 ready_when = "steps.send-pre-reading.done"
@@ -1876,7 +1876,7 @@ title_template = "Conduct training — {subject.id}"
 authority_role = "service-tech"
 metadata_defaults = { course_name = "Operator orientation", provider = "in-house", passing_score = 80 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "operator-certification"
 kind = "acknowledgment"
 ready_when = "steps.conduct-training.done"

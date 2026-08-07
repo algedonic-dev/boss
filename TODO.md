@@ -5,7 +5,7 @@ in [CHANGELOG.md](CHANGELOG.md)** — don't restate it here.
 
 This is a **preliminary release**: the core shape is in place — the
 four primitives (Subjects, Jobs, Steps, Events), the event-sourced
-audit log, and the registry-driven extensibility model (JobKinds,
+audit log, and the registry-driven extensibility model (Workflows,
 StepTypes, Classes, StepPlugins). The buckets below are what's
 deliberately *not* done yet. Treat [CHANGELOG.md](CHANGELOG.md) and
 [docs/architecture-decisions.md](docs/architecture-decisions.md) as the
@@ -14,8 +14,8 @@ tree before acting on a detailed item.
 
 ## Where to read first (orientation for a new contributor)
 
-- [`docs/architecture-decisions.md`](docs/architecture-decisions.md) — the consolidated decision record (JobKind v2 shape, dispatcher-as-event-router, step types as property bundles, all of it)
-- [`docs/design/extending-boss.md`](docs/design/extending-boss.md) — the extensibility ladder (JobKinds, StepTypes, StepPlugins)
+- [`docs/architecture-decisions.md`](docs/architecture-decisions.md) — the consolidated decision record (Workflow v2 shape, dispatcher-as-event-router, step types as property bundles, all of it)
+- [`docs/design/extending-boss.md`](docs/design/extending-boss.md) — the extensibility ladder (Workflows, StepTypes, StepPlugins)
 - [`docs/design/class-registry.md`](docs/design/class-registry.md) — registry-backed taxonomy pattern
 - [`docs/design/correctness-protocol.md`](docs/design/correctness-protocol.md) — five-property invariant (provenance, conservation, closure, idempotence, determinism)
 - [`docs/design/human-powered-state-machine.md`](docs/design/human-powered-state-machine.md) — reading frame for what BOSS *is*
@@ -448,13 +448,13 @@ which one matters first.
           sum** rather than per-jurisdiction lookup with line
           exempt handling. Flagged in-code as sim-only.
 
-- [ ] **Period close JobKind / cadence.** The validation script's
+- [ ] **Period close Workflow / cadence.** The validation script's
       step 7b creates + closes past fiscal years via `POST
       /api/ledger/periods/{id}/close`. Live playgrounds still need
-      a JobKind that fires at year-end so ongoing sim activity
+      a Workflow that fires at year-end so ongoing sim activity
       continues to close cleanly. Existing
       `[periodic.quarterly-sales-tax]` infra is a model; new
-      JobKind `fiscal-year-close` with a `tax-remittance`-like
+      Workflow `fiscal-year-close` with a `tax-remittance`-like
       terminal step that POSTs to
       `/api/ledger/periods/{id}/close`.
 
@@ -492,15 +492,15 @@ which one matters first.
       retail + taproom line items should accrue sales tax. The
       `commerce.invoice.issue` bridge supports `tax_rate_bps` +
       `tax_jurisdiction` already, but the side-effect spec
-      doesn't set them. Once retail / taproom JobKinds exist
+      doesn't set them. Once retail / taproom Workflows exist
       (see below), wire `tax_rate_bps` on their billing steps.
-      The `[periodic.quarterly-sales-tax]` JobKind is disabled
+      The `[periodic.quarterly-sales-tax]` Workflow is disabled
       because it remitted without an accrual flow; re-enable when
       the flow is whole.
 
-- [ ] **Taproom-pour and distribution-contract JobKinds.** 4120
+- [ ] **Taproom-pour and distribution-contract Workflows.** 4120
       (Taproom) and 4140 (Distribution Contracts) are revenue
-      accounts that no JobKind currently posts to.
+      accounts that no Workflow currently posts to.
       `seasonal-release` posts to 4130 (event-package);
       `wholesale-keg-order` → 4100; `direct-shop-order` → 4110
       (retail). Missing flows:
@@ -570,8 +570,8 @@ which one matters first.
       top of this section.
 
 - [ ] **Workflow modeling UX improvements.** The release ships a
-      functional `/system/job-kinds` editor (read-only catalog at
-      `/system/workflows`, full author surface at `/system/job-kinds`) plus
+      functional `/system/workflows` editor (read-only catalog at
+      `/system/workflows`, full author surface at `/system/workflows`) plus
       `/system/step-plugins` for custom step UX bundles. The
       modeling experience is correct but rough — it leans on
       operators understanding the StepGraph / TierSpec / step
@@ -582,22 +582,22 @@ which one matters first.
         - Step-template gallery — drop a `scheduling` /
           `repair` / `quote` / `sign-off` step from a palette
           rather than typing the kind slug.
-        - Live preview pane: open a JobKind in "what would a
+        - Live preview pane: open a Workflow in "what would a
           new Job of this kind look like" mode.
         - Validation hints surfaced inline (metadata schema
           required-at-done fields, blocker cycles, missing
           authority roles for sign-off steps).
-        - Per-tenant JobKind diff view so a head of department
+        - Per-tenant Workflow diff view so a head of department
           can see what changed between published versions
           without git-blame archaeology.
       Compounds with Integrated IAM above — once dept heads
       sign in with their real identity, the modeling UX they
       reach is what the platform is for.
-      - **used-device-shop `job-kind-approver` parity.** Core defaults
-        grant `step-signoff:job-kind-approver` to `platform-admin` and the
+      - **used-device-shop `workflow-approver` parity.** Core defaults
+        grant `step-signoff:workflow-approver` to `platform-admin` and the
         brewery grants it to its leaders; the used-device-shop tenant has
-        no grant, so if it ever drives `job-kind-design` Jobs its leaders
-        can't approve. Add the grant when that tenant authors JobKinds.
+        no grant, so if it ever drives `workflow-design` Jobs its leaders
+        can't approve. Add the grant when that tenant authors Workflows.
 
 - [ ] **Information theory on audit_log — triage, anomaly
       detection, error handling.** The audit_log is a stream
@@ -672,7 +672,7 @@ if a contributor wants them.
 
 - [ ] **Finished-product `/shop` integration — Phase 2 tail.**
       Phase 1 fully shipped (5→11 SKUs across 5 beer styles,
-      `direct-shop-order` JobKind, `shipment_line_items`
+      `direct-shop-order` Workflow, `shipment_line_items`
       projection, production + sale side-effects via
       `products.produce` / `products.consume` handlers, `/shop`
       SPA + sidebar module gate). One open sub-item:
@@ -681,7 +681,7 @@ if a contributor wants them.
           Account regardless of who's checking out, and
           `/shop` + `/shop/{sku}` require a session. Public-
           by-default shape: routes readable without a session
-          (matches `/api/jobs/kinds*`); checkout opens an
+          (matches `/api/workflows*`); checkout opens an
           email-OTP or magic-link step before the Job is
           created. Blocks on the email-OTP design call — which
           also gates "should /shop create a thin per-customer

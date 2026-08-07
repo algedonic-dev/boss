@@ -364,7 +364,7 @@ mod status_parse_tests {
             "living guidance — describes how the codebase actually tests",
             "living — HumanWorker engine shipped, BatchEngine in design",
             "load-bearing thesis. Treat this as the design north star",
-            "stable — describes the JobKind v2 extensibility model.",
+            "stable — describes the Workflow v2 extensibility model.",
         ] {
             assert_eq!(
                 DocStatus::from_status_line(line),

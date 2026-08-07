@@ -1,28 +1,28 @@
-// Client for authoring a JobKind *through* a `job-kind-design` Job
+// Client for authoring a Workflow *through* a `workflow-design` Job
 // (decision D6). The working spec lives in the design Job's publish-step
-// `metadata.job_kind_spec`; the registry write + `jobs.kind.published`
-// audit fact happen exactly once, when the terminal `job-kind-publish`
-// step completes. No `job_kinds` draft rows; the only persistence while
+// `metadata.workflow_spec`; the registry write + `jobs.kind.published`
+// audit fact happen exactly once, when the terminal `workflow-publish`
+// step completes. No `workflows` draft rows; the only persistence while
 // editing is `STEP_UPDATED` events on the design Job itself.
 //
 // These are thin, typed fetch wrappers over the existing job/step API —
 // the same endpoints any Job uses. The only pure piece (`initialSpec`)
 // is unit-tested; the rest is I/O verified end-to-end against the stack.
 
-import type { JobKindSpec, StepSpec } from './jobKindTypes';
+import type { WorkflowSpec, StepSpec } from './workflowTypes';
 import type { Job, Step } from '../jobs/types';
 
-export const DESIGN_KIND = 'job-kind-design';
-export const PUBLISH_STEP_KIND = 'job-kind-publish';
+export const DESIGN_KIND = 'workflow-design';
+export const PUBLISH_STEP_KIND = 'workflow-publish';
 /// The authority the `approve` sign-off step requires. Granted (via
-/// policy) to the C-suite/COO/dept-heads who own the job-kinds surface,
-/// plus platform-admin — see boss-jobs job_kind_design_spec + the tenant
+/// policy) to the C-suite/COO/dept-heads who own the workflows surface,
+/// plus platform-admin — see boss-jobs workflow_design_spec + the tenant
 /// policy seeds.
-export const APPROVE_ROLE = 'job-kind-approver';
+export const APPROVE_ROLE = 'workflow-approver';
 
 /// A complete, viable seed spec for a brand-new kind: a single trigger
 /// step (`ready_when = "true"`) that is also terminal — the minimal
-/// publishable JobKind (open and close). `created_at`/`version`/`status`
+/// publishable Workflow (open and close). `created_at`/`version`/`status`
 /// are placeholders; `publish_authored` stamps the real values when the
 /// publish step fires.
 export function initialSpec(
@@ -31,7 +31,7 @@ export function initialSpec(
   category: string,
   subjectKinds: ReadonlyArray<string>,
   description?: string,
-): JobKindSpec {
+): WorkflowSpec {
   const firstStep: StepSpec = {
     title: 'first-step',
     kind: 'generic',
@@ -63,9 +63,9 @@ export function initialSpec(
 
 /// Read the working spec out of the publish step's metadata, or null if
 /// it hasn't been seeded yet.
-export function readSpec(publishStep: Step | undefined): JobKindSpec | null {
-  const v = publishStep?.metadata?.['job_kind_spec'];
-  return v != null ? (v as JobKindSpec) : null;
+export function readSpec(publishStep: Step | undefined): WorkflowSpec | null {
+  const v = publishStep?.metadata?.['workflow_spec'];
+  return v != null ? (v as WorkflowSpec) : null;
 }
 
 export function findStep(
@@ -75,7 +75,7 @@ export function findStep(
   return steps.find((s) => s.kind === kind);
 }
 
-/// Create the `job-kind-design` Job. Its subject is `{custom, <slug>}` —
+/// Create the `workflow-design` Job. Its subject is `{custom, <slug>}` —
 /// the slug is the Job's immutable subject id (D1). Steps materialize on
 /// create. Returns the new Job id.
 export async function createDesignJob(
@@ -118,7 +118,7 @@ export async function loadDesignJob(jobId: string): Promise<Job> {
 /// "new kind" and "edit/new-version" route through. `previousVersion`
 /// stamps the publish step when branching from an existing active row.
 export async function startDesignJob(
-  seedSpec: JobKindSpec,
+  seedSpec: WorkflowSpec,
   ownerId: string,
   openedOn: string,
   opts?: { title?: string; previousVersion?: number },
@@ -145,12 +145,12 @@ export async function startDesignJob(
 export async function persistSpec(
   jobId: string,
   publishStep: Step,
-  spec: JobKindSpec,
+  spec: WorkflowSpec,
   previousVersion?: number,
 ): Promise<void> {
   const metadata: Record<string, unknown> = {
     ...publishStep.metadata,
-    job_kind_spec: spec,
+    workflow_spec: spec,
   };
   if (previousVersion != null) metadata['previous_kind_version'] = previousVersion;
   const r = await fetch(

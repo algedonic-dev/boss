@@ -152,7 +152,7 @@ mod tests {
         let repo = InMemoryPolicy::new();
         let defaults = vec![PolicyRule::new(
             "guest",
-            Resource::job_kind(),
+            Resource::workflow(),
             Action::Read,
             Scope::All,
         )];
@@ -161,7 +161,7 @@ mod tests {
         assert_eq!(stats.refreshed, 0);
         assert_eq!(stats.preserved, 0);
         assert!(
-            repo.rule_for("guest:job-kind:read")
+            repo.rule_for("guest:workflow:read")
                 .await
                 .unwrap()
                 .is_some()
@@ -172,13 +172,13 @@ mod tests {
     async fn bootstrap_reconcile_refreshes_drifted_bootstrap_rows() {
         let repo = InMemoryPolicy::new();
         // Seed an old bootstrap rule with the wrong scope.
-        let stale = PolicyRule::new("cto", Resource::job_kind(), Action::Read, Scope::Self_);
+        let stale = PolicyRule::new("cto", Resource::workflow(), Action::Read, Scope::Self_);
         repo.upsert_rule(&stale, "bootstrap").await.unwrap();
 
         // Defaults now say Scope::All — reconcile should refresh.
         let defaults = vec![PolicyRule::new(
             "cto",
-            Resource::job_kind(),
+            Resource::workflow(),
             Action::Read,
             Scope::All,
         )];
@@ -186,7 +186,7 @@ mod tests {
         assert_eq!(stats.inserted, 0);
         assert_eq!(stats.refreshed, 1);
         assert_eq!(stats.preserved, 0);
-        let live = repo.rule_for("cto:job-kind:read").await.unwrap().unwrap();
+        let live = repo.rule_for("cto:workflow:read").await.unwrap().unwrap();
         assert_eq!(live.scope, Scope::All);
     }
 
@@ -194,12 +194,12 @@ mod tests {
     async fn bootstrap_reconcile_preserves_operator_edits() {
         let repo = InMemoryPolicy::new();
         // Operator-tuned rule (changed_by != "bootstrap").
-        let custom = PolicyRule::new("cto", Resource::job_kind(), Action::Read, Scope::Self_);
+        let custom = PolicyRule::new("cto", Resource::workflow(), Action::Read, Scope::Self_);
         repo.upsert_rule(&custom, "emp-cto").await.unwrap();
 
         let defaults = vec![PolicyRule::new(
             "cto",
-            Resource::job_kind(),
+            Resource::workflow(),
             Action::Read,
             Scope::All,
         )];
@@ -207,14 +207,14 @@ mod tests {
         assert_eq!(stats.inserted, 0);
         assert_eq!(stats.refreshed, 0);
         assert_eq!(stats.preserved, 1);
-        let live = repo.rule_for("cto:job-kind:read").await.unwrap().unwrap();
+        let live = repo.rule_for("cto:workflow:read").await.unwrap().unwrap();
         assert_eq!(live.scope, Scope::Self_, "operator edit must survive");
     }
 
     #[tokio::test]
     async fn bootstrap_reconcile_no_op_when_already_matching() {
         let repo = InMemoryPolicy::new();
-        let rule = PolicyRule::new("cto", Resource::job_kind(), Action::Read, Scope::All);
+        let rule = PolicyRule::new("cto", Resource::workflow(), Action::Read, Scope::All);
         repo.upsert_rule(&rule, "bootstrap").await.unwrap();
 
         let stats = repo.bootstrap_reconcile(&[rule]).await.unwrap();

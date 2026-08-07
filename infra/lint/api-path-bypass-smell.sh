@@ -51,7 +51,7 @@ STRICT=0
 ALLOWLIST=(
     # init runs pre-API (clock-api isn't up yet), so the demo-epoch sim_clock
     # prime is a direct control-plane write here — the API path can't reach it
-    # this early. Tenant DATA seeding (classes/JobKinds/policy/accounts/…) has
+    # this early. Tenant DATA seeding (classes/Workflows/policy/accounts/…) has
     # moved onto the converged 'boss-brewery-sim prepare' step (post-API).
     "infra/oss-quickstart/init.sh::pre-API sim_clock prime — control-plane, clock-api not up at init"
     # The restart-epoch baseline marker is clock control-plane with no API yet.

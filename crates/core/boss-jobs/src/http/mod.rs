@@ -23,7 +23,7 @@ use crate::events;
 use crate::in_memory::compute_job_status;
 use crate::policy_glue::scope_matches;
 use crate::port::{JobFilter, JobScope, JobsRepository, LaunchCalendarRow};
-use crate::registry::{JobKindError, JobKindRegistry, JobKindSpec};
+use crate::registry::{WorkflowError, WorkflowRegistry, WorkflowSpec};
 use crate::step_plugins::{StepPluginError, StepPluginRegistry, StepPluginSpec};
 use crate::step_registry::StepRegistry;
 
@@ -55,10 +55,10 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// Cross-service client for row-level authorization. Plumb in a
     /// `ReqwestPolicyClient` in prod, `FakePolicyClient` in tests.
     pub policy: Arc<dyn PolicyClient>,
-    /// JobKind registry — authored via /api/jobs/kinds. None until a
+    /// Workflow registry — authored via /api/workflows. None until a
     /// caller wires the adapter in; endpoints respond with 503 in that
     /// case to keep the seam explicit.
-    pub kind_registry: Option<Arc<dyn JobKindRegistry>>,
+    pub kind_registry: Option<Arc<dyn WorkflowRegistry>>,
     /// Step UX plugin registry — authored via /api/jobs/step-plugins.
     /// Same optionality semantics as `kind_registry`.
     pub plugin_registry: Option<Arc<dyn StepPluginRegistry>>,
@@ -124,31 +124,31 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
             "/api/jobs/{id}/steps/{step_id}/sign-offs",
             post(post_step_sign_off::<R, B>),
         )
-        // JobKind registry — see docs/architecture-decisions.md
-        // §Jobs, JobKinds, Steps
+        // Workflow registry — see docs/architecture-decisions.md
+        // §Jobs, Workflows, Steps
         .route(
-            "/api/jobs/kinds",
+            "/api/workflows",
             get(list_kinds::<R, B>).post(create_kind::<R, B>),
         )
         // Author-time dry run: lint a draft spec without persisting, so
         // the editor surfaces the same validate_all the publish path
         // enforces (live, on the graph). See architecture-decisions.md
-        // §Jobs, JobKinds, Steps.
-        .route("/api/jobs/kinds/_validate", post(validate_kind::<R, B>))
+        // §Jobs, Workflows, Steps.
+        .route("/api/workflows/_validate", post(validate_kind::<R, B>))
         .route(
-            "/api/jobs/kinds/{kind}",
+            "/api/workflows/{kind}",
             get(get_kind::<R, B>).put(update_kind::<R, B>),
         )
         .route(
-            "/api/jobs/kinds/{kind}/versions",
+            "/api/workflows/{kind}/versions",
             get(list_kind_versions::<R, B>),
         )
         .route(
-            "/api/jobs/kinds/{kind}/versions/{version}",
+            "/api/workflows/{kind}/versions/{version}",
             get(get_kind_version::<R, B>),
         )
-        .route("/api/jobs/kinds/{kind}/publish", post(publish_kind::<R, B>))
-        .route("/api/jobs/kinds/{kind}/retire", post(retire_kind::<R, B>))
+        .route("/api/workflows/{kind}/publish", post(publish_kind::<R, B>))
+        .route("/api/workflows/{kind}/retire", post(retire_kind::<R, B>))
         // Step UX plugin registry — see docs/architecture-decisions.md
         // §Step UX & frontend
         .route(

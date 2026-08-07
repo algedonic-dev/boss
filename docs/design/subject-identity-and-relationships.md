@@ -53,7 +53,7 @@ correctness. The rebuild has four source families:
    about a subject proves the subject existed.
 3. **Reference tables** for seed-only kinds with no create events
    by design: `locations`, `companies`.
-4. **Birth-by-job kinds** (`job-kind`, `custom` — registry rows
+4. **Birth-by-job kinds** (`workflow`, `custom` — registry rows
    with `metadata.birth = "job"`): their identity row is minted in
    the job-create transaction itself; the jobs pass reproduces it.
 

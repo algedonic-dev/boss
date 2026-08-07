@@ -71,8 +71,8 @@ async fn os_map(State(state): State<Arc<ViewsApiState>>, Query(q): Query<OsMapQu
     }
 }
 
-/// Roles whose JobKinds count as this team's work. Defaults to the
-/// platform operator — the role the IT JobKinds declare as owner.
+/// Roles whose Workflows count as this team's work. Defaults to the
+/// platform operator — the role the IT Workflows declare as owner.
 /// Overridable so the same surface serves another team without a
 /// second endpoint.
 fn default_owner_roles() -> Vec<String> {

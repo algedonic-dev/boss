@@ -20,7 +20,7 @@
     assignee_id: string | null;
     metadata: Record<string, unknown>;
     notes: string | null;
-    /// The step's completion contract. Declared on the JobKind step
+    /// The step's completion contract. Declared on the Workflow step
     /// (inline authoring), so it is data rather than a bespoke
     /// surface — which is exactly why this generic view can honour it.
     fields?: StepField[];
@@ -43,7 +43,7 @@
   /// a required field: it sent `status: completed` with the existing
   /// metadata and the API refused it. That made every such step a dead
   /// end everywhere except a bespoke plugin — which defeats inline
-  /// field authoring, whose whole point is that a JobKind can state
+  /// field authoring, whose whole point is that a Workflow can state
   /// its own contract without one.
   let fieldValues = $state<Record<string, string>>(
     Object.fromEntries(
@@ -55,7 +55,7 @@
   );
 
   /// A pipe-shaped `field_type` is an enum domain — the same shape the
-  /// JobKind viability lint reads to prove fork coverage. Anything
+  /// Workflow viability lint reads to prove fork coverage. Anything
   /// else is free text.
   function optionsFor(f: StepField): string[] | null {
     return f.field_type.includes('|') ? f.field_type.split('|') : null;

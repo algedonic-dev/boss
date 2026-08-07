@@ -12,7 +12,7 @@
 // still useless if the step declares a required field, because
 // validators run at `completed` — the API refuses the write and the
 // operator has no way to supply the value. Inline field authoring
-// exists so a JobKind can state its own completion contract without a
+// exists so a Workflow can state its own completion contract without a
 // bespoke surface; if the generic surface ignores that contract, the
 // mechanism only works where someone already wrote a plugin.
 

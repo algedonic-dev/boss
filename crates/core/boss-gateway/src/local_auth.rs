@@ -358,6 +358,22 @@ pub struct LocalAuthState {
     pub store: CredentialStore,
     pub session_key: Vec<u8>,
     pub http: reqwest::Client,
+    /// How auth mail leaves the building. Defaults to a transport
+    /// that logs and sends nothing, so a deployment with no provider
+    /// configured still completes resets — the operator reads the
+    /// token out of the log — rather than silently pretending.
+    pub mail: std::sync::Arc<dyn crate::mail::MailTransport>,
+    /// Origin the reset link points at, e.g. `https://boss.example`.
+    pub public_url: String,
+    /// Last accepted `forgot` per email, for rate limiting.
+    ///
+    /// In-process and therefore a HEURISTIC, not a guarantee: with a
+    /// second gateway in front of the same store it does not hold.
+    /// Said plainly because a limiter that is assumed to be airtight
+    /// is worse than one known to be approximate — this raises the
+    /// cost of mailbombing a known address and of probing, and it
+    /// does not survive horizontal scaling.
+    pub forgot_seen: std::sync::Arc<RwLock<HashMap<String, std::time::Instant>>>,
     /// Whether this deployment offers the read-only guest session.
     /// Off unless the deployment declares itself a demo — a tenant
     /// running BOSS on real data does not hand out a session that
@@ -608,9 +624,8 @@ pub struct IssueResetRequest {
 
 #[derive(Serialize)]
 pub struct IssueResetResponse {
-    /// Plaintext token. Admin shares with user out-of-band; never
-    /// persisted in the credential store.
-    pub token: String,
+    /// Where the token went. NOT the token — see `issue_reset`.
+    pub sent_to: String,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -626,13 +641,89 @@ pub async fn issue_reset(
     }
     let ttl = 60 * 60; // 1h
     match state.store.issue_reset_token(&req.email, ttl) {
-        Ok(token) => Json(IssueResetResponse {
-            token,
-            expires_at: Utc::now() + chrono::Duration::seconds(ttl),
-        })
-        .into_response(),
+        Ok(token) => {
+            // Mail it; do not return it. Returning the token was
+            // correct while this was admin-only and the admin was the
+            // one conveying it — and it is exactly what must not
+            // happen now that `/api/auth/forgot` exists, because a
+            // handler that answers with a credential is one routing
+            // mistake away from handing anyone anyone else's reset.
+            let mail = crate::mail::reset_mail(&req.email, &token, &state.public_url);
+            if let Err(e) = state.mail.send(&mail).await {
+                tracing::warn!(error = %e, "reset token issued but mail failed");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    "token issued but could not be sent; check the mail transport",
+                )
+                    .into_response();
+            }
+            Json(IssueResetResponse {
+                sent_to: req.email,
+                expires_at: Utc::now() + chrono::Duration::seconds(ttl),
+            })
+            .into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+pub struct ForgotRequest {
+    pub email: String,
+}
+
+/// `POST /api/auth/forgot` — public. Self-service password reset.
+///
+/// Always answers 204, whatever happened. That is the whole design:
+///
+/// - **Enumeration.** A public endpoint that distinguishes "no such
+///   account" from "sent" is an account-discovery oracle. Anyone
+///   could walk a list of addresses and learn who works here.
+/// - **Rate limiting.** A public endpoint that sends mail is a
+///   mailbomb aimed at a victim's inbox and at our own sending
+///   reputation. Silently ignoring a repeat inside the window is
+///   better than an error, which would itself distinguish a known
+///   address from an unknown one.
+///
+/// The operator-facing signal lives in the logs, where it can be
+/// specific without telling the caller anything.
+pub async fn forgot(
+    State(state): State<Arc<LocalAuthState>>,
+    Json(req): Json<ForgotRequest>,
+) -> Response {
+    let email = req.email.trim().to_lowercase();
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+    {
+        let mut seen = match state.forgot_seen.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let now = std::time::Instant::now();
+        seen.retain(|_, t| now.duration_since(*t) < WINDOW);
+        if seen.contains_key(&email) {
+            tracing::info!(%email, "forgot: within the rate-limit window; ignoring");
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        seen.insert(email.clone(), now);
+    }
+
+    let ttl = 60 * 60;
+    match state.store.issue_reset_token(&email, ttl) {
+        Ok(token) => {
+            let mail = crate::mail::reset_mail(&email, &token, &state.public_url);
+            match state.mail.send(&mail).await {
+                Ok(()) => {
+                    tracing::info!(%email, delivered = state.mail.delivers(), "forgot: reset sent")
+                }
+                Err(e) => tracing::warn!(%email, error = %e, "forgot: mail failed"),
+            }
+        }
+        // No such account. Logged, never surfaced — the caller gets
+        // the same 204 either way.
+        Err(e) => tracing::info!(%email, reason = %e, "forgot: no token issued"),
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[derive(Deserialize)]
@@ -693,6 +784,133 @@ mod tests {
         (td, store)
     }
 
+    /// Captures instead of sending, so a test can assert what was
+    /// composed and — more importantly — how many times.
+    #[derive(Default)]
+    struct CapturingTransport {
+        sent: std::sync::Mutex<Vec<crate::mail::OutboundMail>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::mail::MailTransport for CapturingTransport {
+        async fn send(
+            &self,
+            mail: &crate::mail::OutboundMail,
+        ) -> Result<(), crate::mail::MailError> {
+            self.sent.lock().expect("lock").push(mail.clone());
+            Ok(())
+        }
+        fn delivers(&self) -> bool {
+            true
+        }
+    }
+
+    fn state_with(
+        transport: Arc<CapturingTransport>,
+    ) -> (TempDir, Arc<LocalAuthState>, Arc<CapturingTransport>) {
+        let (td, store) = temp_store();
+        let st = Arc::new(LocalAuthState {
+            store,
+            session_key: vec![7u8; 32],
+            http: reqwest::Client::new(),
+            guest_access: false,
+            mail: transport.clone(),
+            public_url: "https://boss.test".into(),
+            forgot_seen: Default::default(),
+        });
+        (td, st, transport)
+    }
+
+    /// The reset token must never come back in a response body. It was
+    /// returned while this was admin-only and the admin conveyed it by
+    /// hand; with a public `forgot` endpoint in the same file, a
+    /// handler that answers with a credential is one routing mistake
+    /// from handing anyone anyone else's reset.
+    #[tokio::test]
+    async fn issue_reset_mails_the_token_and_never_returns_it() {
+        let (_td, st, cap) = state_with(Arc::new(CapturingTransport::default()));
+        st.store.upsert("op@example.com", "pw").expect("seed");
+
+        let resp = forgot(
+            State(st.clone()),
+            Json(ForgotRequest {
+                email: "op@example.com".into(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let sent = cap.sent.lock().expect("lock");
+        assert_eq!(sent.len(), 1, "exactly one mail");
+        assert_eq!(sent[0].to, "op@example.com");
+        assert!(
+            sent[0].body.contains("https://boss.test/login?reset="),
+            "the mail must carry a usable link: {}",
+            sent[0].body
+        );
+    }
+
+    /// A public endpoint that answers differently for a known and an
+    /// unknown address is an account-discovery oracle. Same status,
+    /// same empty body, either way — and no mail for the unknown one.
+    #[tokio::test]
+    async fn forgot_does_not_reveal_whether_an_account_exists() {
+        let (_td, st, cap) = state_with(Arc::new(CapturingTransport::default()));
+        st.store.upsert("real@example.com", "pw").expect("seed");
+
+        let known = forgot(
+            State(st.clone()),
+            Json(ForgotRequest {
+                email: "real@example.com".into(),
+            }),
+        )
+        .await;
+        let unknown = forgot(
+            State(st.clone()),
+            Json(ForgotRequest {
+                email: "ghost@example.com".into(),
+            }),
+        )
+        .await;
+
+        assert_eq!(known.status(), unknown.status());
+        assert_eq!(known.status(), StatusCode::NO_CONTENT);
+        let sent = cap.sent.lock().expect("lock");
+        assert_eq!(sent.len(), 1, "only the real account gets mail");
+        assert_eq!(sent[0].to, "real@example.com");
+    }
+
+    /// A public endpoint that sends mail is a mailbomb aimed at a
+    /// victim's inbox and at our sending reputation. The repeat is
+    /// ignored SILENTLY — an error would itself distinguish a known
+    /// address from an unknown one, undoing the test above.
+    #[tokio::test]
+    async fn forgot_rate_limits_without_saying_so() {
+        let (_td, st, cap) = state_with(Arc::new(CapturingTransport::default()));
+        st.store.upsert("op@example.com", "pw").expect("seed");
+
+        let mut statuses = vec![];
+        for _ in 0..4 {
+            let r = forgot(
+                State(st.clone()),
+                Json(ForgotRequest {
+                    email: "op@example.com".into(),
+                }),
+            )
+            .await;
+            statuses.push(r.status());
+        }
+        assert!(
+            statuses.iter().all(|s| *s == StatusCode::NO_CONTENT),
+            "every call answers the same: {statuses:?}"
+        );
+        assert_eq!(
+            cap.sent.lock().expect("lock").len(),
+            1,
+            "four requests, one mail"
+        );
+    }
+
     fn guest_state(enabled: bool) -> (TempDir, Arc<LocalAuthState>) {
         let (td, store) = temp_store();
         let st = Arc::new(LocalAuthState {
@@ -700,6 +918,9 @@ mod tests {
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
             guest_access: enabled,
+            mail: Arc::new(crate::mail::LogTransport),
+            public_url: "https://boss.test".into(),
+            forgot_seen: Default::default(),
         });
         (td, st)
     }

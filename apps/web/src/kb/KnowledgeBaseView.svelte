@@ -65,7 +65,7 @@
   let jobs = $state<Job[]>([]);
   let docs = $state<KBDocument[]>([]);
   let empNames = $state<Map<string, string>>(new Map());
-  let jobKindLabels = $state<Map<string, string>>(new Map());
+  let workflowLabels = $state<Map<string, string>>(new Map());
 
   // --- Facts fetch ---------------------------------------------------------
   $effect(() => {
@@ -175,11 +175,11 @@
     let cancelled = false;
     (async () => {
       try {
-        const r = await fetch('/api/jobs/kinds');
+        const r = await fetch('/api/workflows');
         if (!r.ok || cancelled) return;
         const rows = (await r.json()) as Array<{ kind: string; label: string }>;
         if (!cancelled) {
-          jobKindLabels = new Map(rows.map((k) => [k.kind, k.label]));
+          workflowLabels = new Map(rows.map((k) => [k.kind, k.label]));
         }
       } catch {
         /* ignore */
@@ -245,8 +245,8 @@
       ''
     );
   }
-  function jobKindLabelOf(kind: string): string {
-    return jobKindLabels.get(kind) ?? kind;
+  function workflowLabelOf(kind: string): string {
+    return workflowLabels.get(kind) ?? kind;
   }
 </script>
 
@@ -293,7 +293,7 @@
         <div class="kb-jobs">
           {#each openJobs as job (job.id)}
             <Link to={entityHref('job', job.id)} className="kb-job-row">
-                <span class="kb-job-kind">{jobKindLabelOf(job.kind)}</span>
+                <span class="kb-workflow">{workflowLabelOf(job.kind)}</span>
                 <span class="kb-job-title">{job.title}</span>
                 <span class="kb-job-status kb-status-{job.status}">{job.status}</span>
                 <span class="kb-job-date">{job.opened_on}</span>
@@ -308,7 +308,7 @@
         <div class="kb-jobs">
           {#each closedJobs.slice(0, 10) as job (job.id)}
             <Link to={entityHref('job', job.id)} className="kb-job-row">
-                <span class="kb-job-kind">{jobKindLabelOf(job.kind)}</span>
+                <span class="kb-workflow">{workflowLabelOf(job.kind)}</span>
                 <span class="kb-job-title">{job.title}</span>
                 <span class="kb-job-status kb-status-{job.status}">{job.status}</span>
                 <span class="kb-job-date">{job.opened_on}</span>

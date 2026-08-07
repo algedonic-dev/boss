@@ -11,7 +11,7 @@
 //! `ReqwestPolicyClient` that points at the running boss-policy-api
 //! (default `http://localhost:7250`, override via
 //! `BOSS_POLICY_URL` to mirror the production env shape). It then
-//! issues `GET /api/jobs/kinds` and asserts a 200 — proving the
+//! issues `GET /api/workflows` and asserts a 200 — proving the
 //! policy gate end-to-end on the smoke-tester fixture role.
 //!
 //! Skipped cleanly when boss-policy-api isn't reachable, so a fresh
@@ -26,9 +26,9 @@ use axum::http::{Request, StatusCode};
 use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
 use boss_jobs::http::{JobsApiState, router};
-use boss_jobs::registry::InMemoryJobKinds;
+use boss_jobs::registry::InMemoryWorkflows;
 use boss_jobs::step_registry::StepRegistry;
-use boss_jobs::{InMemoryJobs, JobKindRegistry};
+use boss_jobs::{InMemoryJobs, WorkflowRegistry};
 use boss_policy_client::{PolicyClient, ReqwestPolicyClient};
 use boss_testing::RecordingEventBus;
 use tower::ServiceExt;
@@ -53,7 +53,7 @@ async fn policy_reachable(url: &str) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn smoke_tester_can_read_job_kinds_through_real_policy_api() {
+async fn smoke_tester_can_read_workflows_through_real_policy_api() {
     let url = policy_url();
     if !policy_reachable(&url).await {
         if require_roundtrip() {
@@ -78,7 +78,7 @@ async fn smoke_tester_can_read_job_kinds_through_real_policy_api() {
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let publisher = DomainPublisher::new(bus_dyn, "jobs");
     let step_registry = Arc::new(StepRegistry::v1());
-    let kind_registry: Arc<dyn JobKindRegistry> = Arc::new(InMemoryJobKinds::new());
+    let kind_registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
 
     let state = JobsApiState {
         jobs,
@@ -99,7 +99,7 @@ async fn smoke_tester_can_read_job_kinds_through_real_policy_api() {
 
     let req = Request::builder()
         .method("GET")
-        .uri("/api/jobs/kinds")
+        .uri("/api/workflows")
         .header(
             "x-boss-user",
             serde_json::json!({
@@ -119,7 +119,7 @@ async fn smoke_tester_can_read_job_kinds_through_real_policy_api() {
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "smoke-tester should be allowed to read JobKinds via the real \
+        "smoke-tester should be allowed to read Workflows via the real \
          policy-api round trip — got {} (BOSS_POLICY_URL={})",
         resp.status(),
         policy_url(),

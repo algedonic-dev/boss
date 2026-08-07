@@ -1,8 +1,8 @@
-// Pure transforms — the rules that keep a JobKind's step list coherent
+// Pure transforms — the rules that keep a Workflow's step list coherent
 // as it's edited from the graphical surface. Run via `bun test`.
 
 import { describe, expect, test } from 'bun:test';
-import type { StepSpec } from './jobKindTypes';
+import type { StepSpec } from './workflowTypes';
 import {
   freshSlug,
   makeStep,

@@ -1,7 +1,7 @@
 <script lang="ts">
   // A queue of Jobs parked on a human, as a board.
   //
-  // Columns come from the JobKind, not from this file. A triage step
+  // Columns come from the Workflow, not from this file. A triage step
   // that forks declares its dispositions as an inline enum field, and
   // each disposition has a successor step gated on it — so the board
   // renders one column per route the workflow actually offers, labelled
@@ -35,7 +35,7 @@
   import { type Fork, forkStep as forkStepOf, gatedStep, readFork } from './fork';
 
   type Props = Readonly<{
-    /// Which queue this board shows. One JobKind today because that is
+    /// Which queue this board shows. One Workflow today because that is
     /// what `JobFilter` can push into SQL; a board over "everything
     /// awaiting a human" needs a server-side filter that does not
     /// exist yet, and doing it client-side would silently truncate.
@@ -140,7 +140,7 @@
         // The list endpoint enriches each Job with its steps, so the
         // board needs one request rather than one per card.
         fetch(`/api/jobs?kind=${encodeURIComponent(kind)}&limit=200`),
-        fetch('/api/jobs/kinds'),
+        fetch('/api/workflows'),
       ]);
       if (!jobsRes.ok) throw new Error(`${kind} jobs: HTTP ${jobsRes.status}`);
       const body = await jobsRes.json();

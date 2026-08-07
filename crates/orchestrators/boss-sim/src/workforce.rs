@@ -92,7 +92,7 @@ fn service_url(api_base: &str, path: &str) -> String {
 /// A required-at-done field the executor must supply when completing a
 /// step — its `name` and the StepType `field_type` (enum types arrive
 /// pipe-joined, e.g. `"pass|fail|conditional"`). The workforce synthesizes
-/// a type-appropriate value when the JobKind didn't default it — the
+/// a type-appropriate value when the Workflow didn't default it — the
 /// simulated worker filling the step's form the way a human would before
 /// marking it done. Built from the StepRegistry's `FieldSpec`s and passed
 /// to [`Workforce::new`].
@@ -161,7 +161,7 @@ pub struct Workforce {
     /// StepRegistry. Drives the duration-gated completion.
     durations: HashMap<String, f64>,
     /// StepType kind → its required-at-done fields, sourced from the
-    /// StepRegistry. On completion the workforce supplies any the JobKind
+    /// StepRegistry. On completion the workforce supplies any the Workflow
     /// didn't default — the executor filling the step's form.
     required_fields: HashMap<String, Vec<RequiredField>>,
     /// Shared per-actor API-call tally (cockpit telemetry). The daemon
@@ -185,7 +185,7 @@ impl Workforce {
     /// (`direct://host`, `scratch://host`, or a gateway base).
     /// `durations` maps StepType kind → typical_duration_hours;
     /// `required_fields` maps StepType kind → its required-at-done fields
-    /// (so the worker can fill any the JobKind didn't default).
+    /// (so the worker can fill any the Workflow didn't default).
     pub fn new(
         api_base: &str,
         durations: HashMap<String, f64>,
@@ -542,7 +542,7 @@ impl Workforce {
 
     /// Active → Completed, attributed to `emp`. For a demand-gate step,
     /// reads real finished-goods stock to stamp the brew/oversupply
-    /// outcome the JobKind forks on. Co-signs in the same PUT when the
+    /// outcome the Workflow forks on. Co-signs in the same PUT when the
     /// step needs sign-off (the sim-origin bypass authorizes it).
     fn complete(
         &self,
@@ -562,7 +562,7 @@ impl Workforce {
         let obj = body.as_object_mut().expect("object");
         // Supply the step's required-at-done fields the executor would
         // fill in. Start from the current metadata so PATCH-on-PUT keeps
-        // existing keys, then fill any required field the JobKind didn't
+        // existing keys, then fill any required field the Workflow didn't
         // already default.
         let mut md = metadata.as_object().cloned().unwrap_or_default();
         self.fill_required_fields(kind, &mut md, now);
@@ -605,10 +605,10 @@ impl Workforce {
         )
     }
 
-    /// Fill the kind's required-at-done fields the JobKind didn't default,
+    /// Fill the kind's required-at-done fields the Workflow didn't default,
     /// with type-appropriate values — the simulated executor supplying the
     /// inputs a human would type before marking the step done. Existing
-    /// keys (JobKind defaults, values set on an earlier transition) are
+    /// keys (Workflow defaults, values set on an earlier transition) are
     /// never overwritten.
     fn fill_required_fields(
         &self,
@@ -925,7 +925,7 @@ mod tests {
         let mut md = serde_json::Map::new();
         md.insert("document_title".to_string(), json!("Q2 Safety Policy"));
         wf.fill_required_fields("acknowledgment", &mut md, now);
-        // Pre-set key is preserved (the JobKind's default wins).
+        // Pre-set key is preserved (the Workflow's default wins).
         assert_eq!(
             md.get("document_title").unwrap(),
             &json!("Q2 Safety Policy")

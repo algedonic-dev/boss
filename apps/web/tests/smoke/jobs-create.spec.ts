@@ -32,7 +32,7 @@ test.describe('Jobs list — create-job entry points', () => {
     await expect(form).toBeVisible({ timeout: 5_000 });
 
     const kindSelect = form.locator('select').first();
-    // Wait for /api/jobs/kinds to populate the dropdown options.
+    // Wait for /api/workflows to populate the dropdown options.
     await expect
       .poll(async () => kindSelect.locator('option[value="ad-hoc"]').count(), {
         timeout: 5_000,

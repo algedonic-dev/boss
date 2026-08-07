@@ -17,9 +17,9 @@
   } from '../people/types';
   import { tenureYears, expiringCerts } from '../people/utils';
   import {
-    jobKindSurfaces,
-    type JobKindSpec,
-  } from '../job-kinds/jobKindTypes';
+    workflowSurfaces,
+    type WorkflowSpec,
+  } from '../workflows/workflowTypes';
   import { href } from '../router';
 
   type Tab = 'overview' | 'requisitions' | 'certs' | 'headcount' | 'workflows';
@@ -84,17 +84,17 @@
   // /api/people/{id}/onboard (a bespoke endpoint that updated
   // Employee.status + wrote employee_changes directly) and listed
   // /api/people/workflows (a separate aggregation surface). Both
-  // bypassed the JobKind / Step / authority_role / audit_log
+  // bypassed the Workflow / Step / authority_role / audit_log
   // machinery that every other workflow in BOSS rides on.
-  // Post-#101: 'Start workflow' opens an HR JobKind via the
+  // Post-#101: 'Start workflow' opens an HR Workflow via the
   // canonical /jobs?new=1 deep-link; 'Active workflows' lists open
   // Jobs of those kinds. The bespoke endpoints stay (no breakage
   // of operator-baseline scripts) but the SPA stops driving them.
   //
-  // Which JobKinds are HR workflows is DATA, not code: a JobKind
+  // Which Workflows are HR workflows is DATA, not code: a Workflow
   // declares `metadata.surfaces ⊇ ['hr']` to appear here. The page
-  // discovers them from /api/jobs/kinds so it stays tenant-agnostic
-  // (no tenant JobKind slugs baked in).
+  // discovers them from /api/workflows so it stays tenant-agnostic
+  // (no tenant Workflow slugs baked in).
   // ------------------------------------------------------------
 
   type ActiveWorkflow = {
@@ -130,7 +130,7 @@
     'exit-interview': 'Exit Interview',
   };
 
-  // HR JobKinds discovered from the registry. A JobKind belongs
+  // HR Workflows discovered from the registry. A Workflow belongs
   // here when its `metadata.surfaces` includes 'hr'. We additionally
   // require subject_kinds ⊇ {employee} (HR Jobs are about an
   // Employee), but `surfaces:'hr'` is the primary signal. `{ kind,
@@ -150,18 +150,18 @@
   let workflowsApiAvailable = $state<boolean | null>(null);
 
   async function fetchHrKinds(): Promise<void> {
-    // /api/jobs/kinds is the canonical JobKind list. The HR
+    // /api/workflows is the canonical Workflow list. The HR
     // workflows are the kinds whose `surfaces` hint includes 'hr'
     // (and that are about an Employee). Discovering them keeps the
     // SPA tenant-agnostic — no brewery slugs baked into HR.
     try {
-      const r = await fetch('/api/jobs/kinds');
+      const r = await fetch('/api/workflows');
       if (!r.ok) return;
-      const all = (await r.json()) as JobKindSpec[];
+      const all = (await r.json()) as WorkflowSpec[];
       hrKinds = all
         .filter(
           (k) =>
-            jobKindSurfaces(k).includes('hr') &&
+            workflowSurfaces(k).includes('hr') &&
             k.subject_kinds.includes('employee'),
         )
         .map((k) => ({ kind: k.kind, label: k.label }));
@@ -295,7 +295,7 @@
     // picks the kind, prepopulates the Subject, and the operator
     // confirms / overrides before the Job opens. Same path
     // operators use for every other workflow in BOSS. `kind` is a
-    // discovered HR JobKind (surfaces ⊇ ['hr']).
+    // discovered HR Workflow (surfaces ⊇ ['hr']).
     const url = `/jobs?new=1&kind=${encodeURIComponent(kind)}&subject_kind=employee&subject_id=${encodeURIComponent(startTarget)}`;
     window.location.href = url;
   }
@@ -367,7 +367,7 @@
             {#if hrKinds.length === 0}
               <p style="color:#78716c; font-size:13px">
                 No HR workflows are published in this deployment.
-                JobKinds appear here once they declare
+                Workflows appear here once they declare
                 <code>metadata.surfaces ⊇ ["hr"]</code>.
               </p>
             {:else}

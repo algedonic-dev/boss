@@ -79,7 +79,7 @@ export function isInFlight(status: StepStatus): boolean {
 ///
 /// `field_type` is either a scalar name (`string`, `date-time`) or a
 /// pipe-shaped enum domain (`reproduce|design|build`). The enum form
-/// is what makes a step a FORK: the JobKind's viability lint proves
+/// is what makes a step a FORK: the Workflow's viability lint proves
 /// every value has a successor gated on it, and a triage surface can
 /// read the domain to know which routes exist without hardcoding them.
 export type StepField = {

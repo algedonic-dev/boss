@@ -17,7 +17,7 @@ API change you have in mind. -->
 <!-- BOSS is opinionated about *new work shipping as data*
 versus *new work requiring core code*. Pick the closest match:
 
-- New JobKind / step graph (a registry row, no code)
+- New Workflow / step graph (a registry row, no code)
 - New StepPlugin (JS bundle + registry row)
 - New Class registry entry (taxonomy)
 - New service (a brand-new noun in the domain)
@@ -28,7 +28,7 @@ See docs/design/extending-boss.md if you're not sure. -->
 ## Sketched solution
 
 <!-- A first-cut idea is fine; we'll iterate. Include any
-specific API shapes, JobKind step graphs, or schema
+specific API shapes, Workflow step graphs, or schema
 additions you have in mind. -->
 
 ## Alternatives considered
