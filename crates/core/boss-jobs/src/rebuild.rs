@@ -81,7 +81,17 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
                             return Ok(Applied::Skipped);
                         }
                     };
-                    let inserted_now = upsert_job(&mut *conn, &job, ev.ts)
+                    // `_simulated` on the create event is where a
+                    // Job's origin lives in the log. Read it here so a
+                    // replay reproduces the same flag the live write
+                    // set — otherwise a rebuild would quietly turn the
+                    // whole simulated company real.
+                    let simulated = ev
+                        .payload
+                        .get("_simulated")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let inserted_now = upsert_job(&mut *conn, &job, ev.ts, simulated)
                         .await
                         .map_err(|e| e.to_string())?;
                     if inserted_now {
@@ -138,18 +148,24 @@ pub async fn rebuild_jobs_and_steps(pool: &PgPool) -> Result<RebuildReport, Rebu
 /// Upsert a Job row, stamping `created_at` (only on insert) and
 /// `updated_at` from the audit_log event timestamp. Returns
 /// `true` if the row was inserted (new), `false` if updated.
+/// `simulated` is written on INSERT and deliberately absent from the
+/// DO UPDATE list: a Job's origin is decided when it is created and
+/// never revisited, so a later `jobs.job.updated` must not be able to
+/// move it. The storage enforces the immutability rather than trusting
+/// every caller to.
 async fn upsert_job(
     conn: &mut sqlx::PgConnection,
     job: &Job,
     ts: DateTime<Utc>,
+    simulated: bool,
 ) -> Result<bool, RebuildError> {
     let (subj_kind, subj_ref) = subject_parts(&job.subject);
     let result = sqlx::query(
         r#"
         INSERT INTO jobs (id, kind, subject_kind, subject_id, title, owner_id,
                           status, priority, opened_on, due_on, closed_on, metadata, tags,
-                          job_kind_version, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)
+                          job_kind_version, created_at, updated_at, simulated)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15, $16)
         ON CONFLICT (id) DO UPDATE SET
             kind = EXCLUDED.kind,
             job_kind_version = EXCLUDED.job_kind_version,
@@ -183,6 +199,7 @@ async fn upsert_job(
     .bind(&job.tags)
     .bind(job.job_kind_version)
     .bind(ts)
+    .bind(simulated)
     .fetch_one(&mut *conn)
     .await
     .map_err(|e| RebuildError::Storage(e.to_string()))?;

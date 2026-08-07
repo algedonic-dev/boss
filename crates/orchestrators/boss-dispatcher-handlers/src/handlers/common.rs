@@ -110,6 +110,44 @@ pub(crate) fn overhead_source_id(step_id: &str, credit_account: &str) -> String 
 /// API calls. Per the rule-as-actor model in the dispatcher design
 /// doc: every dispatcher-fired event names the rule as actor, with
 /// `executed_by = automation:dispatcher` distinct from `actor`.
+/// The `x-sim-origin` value for a downstream call.
+///
+/// Reads the task-local the dispatch loop set from the TRIGGERING
+/// event, so sim-ness is inherited rather than guessed. Downstream
+/// services parse `"true"`/`"1"` as simulated and anything else as
+/// real, so sending `"false"` explicitly is equivalent to omitting the
+/// header — and saying it out loud is better than relying on absence,
+/// because absence used to mean "ask the clock", which marked every
+/// real user action on this deployment as simulated.
+pub fn sim_origin_value() -> &'static str {
+    if boss_core::sim_origin::is_in_sim_chain() {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+/// The dispatcher's identity for a READ.
+///
+/// Writes stamp the specific rule (`dispatcher_actor_header`) because
+/// the rule is provenance on the event that results. A read produces
+/// no event, so the honest actor is the dispatcher itself — and a
+/// read still has to present SOMEBODY, or it breaks the day the
+/// service it calls grows a policy gate. That is not hypothetical:
+/// one unstamped ledger read halted the whole WIP→FG→COGS chain when
+/// `/api/ledger/*` became gated.
+pub fn dispatcher_reader_header() -> String {
+    serde_json::json!({
+        "id": "automation:dispatcher",
+        "role": "platform-admin",
+        "access_tier": "operator",
+        "territory_account_ids": [],
+        "direct_report_ids": [],
+        "department": "platform",
+    })
+    .to_string()
+}
+
 pub fn dispatcher_actor_header(rule_name: &str) -> String {
     serde_json::json!({
         "id": format!("rule:{}", rule_name),
@@ -143,6 +181,7 @@ pub(crate) async fn post_json(
         .post(url)
         .header("content-type", "application/json")
         .header("x-boss-user", dispatcher_actor_header(rule_name))
+        .header("x-sim-origin", sim_origin_value())
         .json(body)
         .send()
         .await
@@ -179,6 +218,7 @@ pub(crate) async fn get_json(
     let resp = client
         .get(url)
         .header("x-boss-user", dispatcher_actor_header(rule_name))
+        .header("x-sim-origin", sim_origin_value())
         .send()
         .await
         .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;

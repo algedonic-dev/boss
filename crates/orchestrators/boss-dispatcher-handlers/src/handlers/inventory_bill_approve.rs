@@ -5,7 +5,7 @@
 //! Σ(qty × unit_cost) over lines; validates against any caller-
 //! supplied amount_cents. POST `/api/inventory/vendor-invoices`.
 
-use super::common::{self, StepEvent, dispatcher_actor_header};
+use super::common::{self, StepEvent, dispatcher_actor_header, sim_origin_value};
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::Value;
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext, arg};
@@ -46,6 +46,7 @@ impl InventoryBillApprove {
             .client
             .get(&url)
             .header("x-boss-user", header)
+            .header("x-sim-origin", sim_origin_value())
             .send()
             .await
         else {

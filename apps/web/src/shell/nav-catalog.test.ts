@@ -54,12 +54,80 @@ describe('nav catalog — app assignment', () => {
     ).toEqual([]);
   });
 
-  it('the IT app contains exactly what the System Model tab listed', () => {
+  /// IT surfaces added SINCE the app split, listed explicitly.
+  ///
+  /// The pin below is about surfaces not silently CHANGING app; it was
+  /// never meant to freeze IT at its 2026-08-05 size. Growth goes here
+  /// deliberately, one line per surface, so the two properties stay
+  /// separable: nothing drifted, and this is what we added.
+  const IT_SURFACES_ADDED_SINCE: ReadonlyArray<string> = [
+    // The feedback triage board — user-feedback Jobs, worked Kanban
+    // style. New surface, not a moved one.
+    'system-feedback',
+    // The Operating System map — the executor network. Sits beside
+    // the dispatcher cascade: same IT audience, different question
+    // (job traffic, not rule wiring).
+    'system-os-map',
+  ];
+
+  it('the IT app contains the System Model set plus what we added deliberately', () => {
     const derived = entries
       .filter(([, v]) => v.app === 'it')
       .map(([k]) => k)
       .sort();
-    expect(derived).toEqual([...LEGACY_MODEL_ROUTES].sort());
+    const expected = [...LEGACY_MODEL_ROUTES, ...IT_SURFACES_ADDED_SINCE].sort();
+    expect(derived).toEqual(expected);
+  });
+
+  // A route can sit in the catalog with `app: 'it'` and still be
+  // unreachable, because AppShell builds the sidebar from its OWN
+  // explicit list of groups. That is the same fact in two places, and
+  // it drifted: the Operating System map shipped with a route, a
+  // permission key and a catalog entry, and no way to click to it.
+  //
+  // Source-level because the groups live inside a component. Crude,
+  // but it fails when someone adds an IT surface and forgets the
+  // sidebar, which is exactly the mistake it exists for.
+  it('every IT surface is reachable from the IT sidebar', () => {
+    const shell = readFileSync(
+      new URL('./AppShell.svelte', import.meta.url),
+      'utf8',
+    );
+    const groups = shell.slice(
+      shell.indexOf('const IT_GROUPS'),
+      shell.indexOf('// Home —'),
+    );
+    // Surfaces deliberately reached FROM another page rather than
+    // from the sidebar. Each needs a parent that links to it.
+    const REACHED_FROM_A_PARENT: ReadonlyArray<string> = [
+      // Authoring is reached from Workflows, by design — see the
+      // comment on the Define group.
+      'job-kinds',
+      // Sub-pages of the dispatcher cascade.
+      'system-dispatcher-rules',
+      'system-dispatcher-rule',
+    ];
+
+    const unreachable = entries
+      .filter(([, v]) => v.app === 'it')
+      .map(([k]) => k)
+      .filter((k) => !REACHED_FROM_A_PARENT.includes(k))
+      // The shell references entries BOTH ways — `ROUTE_CATALOG.policy`
+      // and `ROUTE_CATALOG['system-design']` — so check both spellings.
+      // Matching only the bracket form is how this test first reported
+      // five false positives.
+      .filter((k) => !groups.includes(`'${k}'`) && !groups.includes(`ROUTE_CATALOG.${k}`));
+    expect(unreachable, `IT routes with no sidebar entry: ${unreachable.join(', ')}`).toEqual(
+      [],
+    );
+  });
+
+  it('nothing from the original System Model set has left the IT app', () => {
+    // The half of the pin that matters most: a surface silently
+    // changing app is the failure this list was written for.
+    const inIt = new Set(entries.filter(([, v]) => v.app === 'it').map(([k]) => k));
+    const missing = LEGACY_MODEL_ROUTES.filter((r) => !inIt.has(r));
+    expect(missing, `these left the IT app: ${missing.join(', ')}`).toEqual([]);
   });
 
   it('every surface lands in an app the chrome bar actually offers', () => {

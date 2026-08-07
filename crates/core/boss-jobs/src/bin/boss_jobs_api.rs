@@ -360,7 +360,7 @@ async fn reconcile_platform_kinds(registry: &dyn boss_jobs::JobKindRegistry) {
         Ok(stats) => {
             info!(
                 inserted = stats.inserted,
-                refreshed = stats.refreshed,
+                republished = stats.republished,
                 preserved = stats.preserved,
                 unchanged = stats.unchanged,
                 total = defaults.len(),

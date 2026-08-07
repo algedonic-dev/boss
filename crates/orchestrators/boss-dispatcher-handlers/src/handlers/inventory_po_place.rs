@@ -12,7 +12,7 @@
 //! the explicit po_id survives — the non-batch /create endpoint
 //! mints its own UUID and discards the caller's id.
 
-use super::common::{self, StepEvent};
+use super::common::{self, StepEvent, sim_origin_value};
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::Value;
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
@@ -61,6 +61,7 @@ impl InventoryPoPlace {
             .client
             .get(&url)
             .header("x-boss-user", header)
+            .header("x-sim-origin", sim_origin_value())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;

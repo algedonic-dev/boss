@@ -13,6 +13,25 @@
 //! - Logout: `POST /api/auth/logout` clears the cookie.
 //! - Me: `GET /api/auth/me` decodes the session, returns the
 //!   email + role + employee_id.
+//! - Guest: `POST /api/auth/guest` mints a read-only session for
+//!   the public demo (see below). `GET` on the same path reports
+//!   whether this deployment offers it.
+//!
+//! ## Guest sessions
+//!
+//! A demo deployment wants a visitor to look around without an
+//! account. The previous answer was demo mode: a middleware that
+//! minted a synthetic `audit-readonly` session for anyone arriving
+//! without a valid cookie. It substituted identity *silently*, and
+//! the failure that killed it was exactly that — when a real
+//! admin's 8-hour session expired, the next request minted a guest
+//! session over it and reissued the cookie under the same name.
+//! The SPA still looked signed in; every write returned 403.
+//!
+//! The guest session here is the same access with the substitution
+//! removed. It exists only when someone clicks the button, it says
+//! whose session it is, and an expiring session now expires — it
+//! does not quietly become somebody else's.
 //!
 //! Onboarding (admin-only):
 //! - `POST /api/auth/onboard {email, password}` — creates a
@@ -339,6 +358,11 @@ pub struct LocalAuthState {
     pub store: CredentialStore,
     pub session_key: Vec<u8>,
     pub http: reqwest::Client,
+    /// Whether this deployment offers the read-only guest session.
+    /// Off unless the deployment declares itself a demo — a tenant
+    /// running BOSS on real data does not hand out a session that
+    /// reads every projection.
+    pub guest_access: bool,
 }
 
 // --------------------------------------------------------------------
@@ -433,6 +457,83 @@ pub async fn login(
         .into_response()
 }
 
+/// The guest's fixed identity. It is a real address on the demo
+/// tenant's domain rather than something like `anonymous@local`
+/// because it shows up in the audit log as an actor, and an actor
+/// in the log should be a name you can look up.
+pub const GUEST_EMAIL: &str = "guest@algedonic.dev";
+
+#[derive(Serialize)]
+pub struct GuestAvailability {
+    pub enabled: bool,
+    pub email: &'static str,
+    pub role: &'static str,
+}
+
+/// `GET /api/auth/guest` — does this deployment offer guest
+/// browsing? The sign-in page asks before rendering the button, so
+/// a real tenant's users are never shown a control that 404s.
+///
+/// Unauthenticated by necessity: the caller is on the sign-in page.
+/// It discloses nothing a visitor cannot learn by clicking.
+pub async fn guest_available(State(state): State<Arc<LocalAuthState>>) -> Response {
+    Json(GuestAvailability {
+        enabled: state.guest_access,
+        email: GUEST_EMAIL,
+        role: boss_core::roles::AUDIT_READONLY_ROLE,
+    })
+    .into_response()
+}
+
+/// `POST /api/auth/guest` — mint the read-only session.
+///
+/// Both the identity and the role are constants: nothing the
+/// caller sends influences either, because the request body of an
+/// unauthenticated endpoint is not evidence of anything. Writes
+/// are refused downstream by `audit-readonly`'s policy rules —
+/// this handler grants a role, it does not enforce one.
+///
+/// `employee_id` stays `None`. A guest is not on the payroll, and
+/// giving them an Employee row to satisfy a session field would
+/// put a person who does not exist into the org chart, headcount
+/// and directory.
+pub async fn guest(State(state): State<Arc<LocalAuthState>>) -> Response {
+    if !state.guest_access {
+        return (
+            StatusCode::NOT_FOUND,
+            "guest access is not enabled on this deployment",
+        )
+            .into_response();
+    }
+
+    let mut sess = Session::new(GUEST_EMAIL, session::DEFAULT_TTL_SECONDS);
+    sess.role = Some(boss_core::roles::AUDIT_READONLY_ROLE.to_string());
+
+    let cookie_value = sess.encode(&state.session_key);
+    let set_cookie = session::set_cookie(
+        session::COOKIE_NAME,
+        &cookie_value,
+        session::DEFAULT_TTL_SECONDS,
+        "/",
+    );
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(&set_cookie) {
+        headers.insert(header::SET_COOKIE, v);
+    }
+
+    (
+        StatusCode::OK,
+        headers,
+        Json(MeResponse {
+            email: GUEST_EMAIL.to_string(),
+            employee_id: None,
+            role: sess.role.clone(),
+            access_tier: sess.access_tier.clone(),
+        }),
+    )
+        .into_response()
+}
+
 /// `POST /api/auth/logout` — clear the boss_session cookie.
 pub async fn logout() -> Response {
     let cookie = session::set_cookie(session::COOKIE_NAME, "", 0, "/");
@@ -443,28 +544,27 @@ pub async fn logout() -> Response {
     (StatusCode::NO_CONTENT, headers).into_response()
 }
 
-/// `GET /api/auth/me` — decode the cookie + return the identity
-/// of the currently-logged-in BOSS user. 401 if no cookie, the
-/// signature is invalid, OR the session is the demo-mode
-/// audit-readonly mint (no employee_id, role=audit-readonly).
+/// `GET /api/auth/me` — decode the cookie + return the identity of
+/// the current session. 401 if there is no cookie or the signature
+/// is invalid.
 ///
-/// The demo-session 401 is what lets the LoginPage form actually
-/// render: without it, demo mode auto-mints an anonymous session
-/// for the GET, /me returns 200, and the SPA redirects to home
-/// instead of showing the login form. The semantic is "are you
-/// logged in via BOSS local-auth credentials?" — a demo session
-/// is anonymous, so the answer is no.
+/// This used to 401 a session with no `employee_id` and role
+/// `audit-readonly` as well. That was demo mode's signature, and
+/// the 401 existed to keep the sign-in form reachable: the
+/// middleware minted a session for the form's own GET, so without
+/// the exclusion `/me` answered 200 and the SPA redirected a
+/// signed-out visitor to the home page.
+///
+/// Demo mode is gone, so nothing mints a session behind the
+/// caller's back and the exclusion has no work left to do — but a
+/// guest session has that exact signature, so leaving it in place
+/// would 401 every guest and bounce them back to the page they
+/// just came from. It reports the session it finds.
 pub async fn me(State(state): State<Arc<LocalAuthState>>, headers: HeaderMap) -> Response {
     let session = match extract_session(&headers, &state.session_key) {
         Some(s) => s,
         None => return StatusCode::UNAUTHORIZED.into_response(),
     };
-    // Reject demo sessions: no employee_id + role=audit-readonly
-    // is the signature of the demo-mode synthetic session. A real
-    // local-auth login populates employee_id on the session.
-    if session.employee_id.is_none() && session.role.as_deref() == Some("audit-readonly") {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
     Json(MeResponse {
         email: session.username.clone(),
         employee_id: session.employee_id.clone(),
@@ -591,6 +691,116 @@ mod tests {
         let path = td.path().join("credentials.toml");
         let store = CredentialStore::load(path).unwrap();
         (td, store)
+    }
+
+    fn guest_state(enabled: bool) -> (TempDir, Arc<LocalAuthState>) {
+        let (td, store) = temp_store();
+        let st = Arc::new(LocalAuthState {
+            store,
+            session_key: vec![7u8; 32],
+            http: reqwest::Client::new(),
+            guest_access: enabled,
+        });
+        (td, st)
+    }
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    /// Pull the cookie value out of a `Set-Cookie` header: the first
+    /// `;`-separated segment is `name=value`, the rest are attributes.
+    fn cookie_value(resp: &Response) -> String {
+        let raw = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("Set-Cookie present")
+            .to_str()
+            .expect("ascii cookie");
+        let first = raw.split(';').next().expect("a first segment");
+        let (name, value) = first.split_once('=').expect("name=value");
+        assert_eq!(name, session::COOKIE_NAME);
+        value.to_string()
+    }
+
+    /// Nothing the caller sends decides who a guest is, so the only
+    /// thing to assert is that the constants land on the session.
+    #[tokio::test]
+    async fn a_guest_session_is_audit_readonly_and_not_an_employee() {
+        let (_td, st) = guest_state(true);
+        let resp = guest(State(st.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let sess = Session::decode(&cookie_value(&resp), &st.session_key).expect("decodes");
+        assert_eq!(sess.username, GUEST_EMAIL);
+        assert_eq!(sess.role.as_deref(), Some("audit-readonly"));
+        assert!(
+            sess.employee_id.is_none(),
+            "a guest must not carry an Employee identity — that would put a \
+             person who does not exist into the org chart"
+        );
+    }
+
+    /// A tenant running BOSS on their own company's data has not asked
+    /// to hand out a session that reads every projection.
+    #[tokio::test]
+    async fn guest_access_is_refused_unless_the_deployment_offers_it() {
+        let (_td, st) = guest_state(false);
+        let resp = guest(State(st.clone())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            resp.headers().get(header::SET_COOKIE).is_none(),
+            "a refused mint must not set a cookie"
+        );
+
+        let avail = body_json(guest_available(State(st)).await).await;
+        assert_eq!(avail["enabled"], serde_json::json!(false));
+    }
+
+    /// The sign-in page renders its button from this, so the answer
+    /// has to track the deployment rather than be assumed.
+    #[tokio::test]
+    async fn availability_reports_the_identity_it_would_mint() {
+        let (_td, st) = guest_state(true);
+        let avail = body_json(guest_available(State(st)).await).await;
+        assert_eq!(avail["enabled"], serde_json::json!(true));
+        assert_eq!(avail["email"], serde_json::json!(GUEST_EMAIL));
+        assert_eq!(avail["role"], serde_json::json!("audit-readonly"));
+    }
+
+    /// Regression. `me` used to 401 a session with no `employee_id`
+    /// and role `audit-readonly` — demo mode's signature, and now
+    /// exactly a guest's. With that branch still in place a guest
+    /// signs in, the SPA asks who it is, gets a 401, and returns them
+    /// to the sign-in page they just left.
+    #[tokio::test]
+    async fn me_answers_for_a_guest_session() {
+        let (_td, st) = guest_state(true);
+        let minted = guest(State(st.clone())).await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "{}={}",
+                session::COOKIE_NAME,
+                cookie_value(&minted)
+            ))
+            .unwrap(),
+        );
+
+        let resp = me(State(st), headers).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let me_body = body_json(resp).await;
+        assert_eq!(me_body["email"], serde_json::json!(GUEST_EMAIL));
+        assert!(
+            me_body["employee_id"].is_null(),
+            "the SPA distinguishes a guest from a real login by the absence \
+             of an employee_id, so it has to be reported, not omitted"
+        );
     }
 
     #[test]

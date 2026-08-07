@@ -23,6 +23,28 @@ pub fn static_dir() -> &'static str {
     })
 }
 
+/// Pages served without a session.
+///
+/// `/login` is the load-bearing one, and its absence here was a
+/// circular lock: the page that hands out a session required one to
+/// load, so a signed-out visitor got a bare "authentication required"
+/// and no way forward.
+///
+/// It went unnoticed because demo mode used to mint a session for
+/// anyone arriving without a valid cookie — the minter ran ahead of
+/// this gate, so in practice nobody ever reached it unauthenticated.
+/// Removing the minter did not create the bug; it revealed one that
+/// had been masked since the gate was written.
+///
+/// Anything added here is readable by the entire internet. The bar is
+/// "a signed-out visitor cannot proceed without it", not "it's
+/// convenient".
+fn is_public_path(path: &str) -> bool {
+    matches!(path, "/" | "/login" | "/login/" | "/health")
+        // /auth is the SSH-CA endpoint (CLI operator flow).
+        || path.starts_with("/auth")
+}
+
 /// Handle all `/dashboard/*` and root `/*` requests for the SPA.
 pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Response {
     // Session gate for /dashboard/* HTML pages.
@@ -33,13 +55,10 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
     // auth, the browser gets a CORS error and can't load at all.
     let path = req.uri().path();
     let is_static_asset = has_file_extension(path);
-    // /auth is the SSH-CA endpoint (CLI operator flow). /health is a
-    // liveness probe. `/` is the unauth landing surface —
-    // the SPA's client-side router renders the landing
-    // component there; deep links to other routes
-    // still hit the session gate via the api/* proxies.
-    let is_public = path == "/" || path == "/health" || path.starts_with("/auth");
-    if !is_static_asset && !is_public && !has_valid_session(req.headers(), &state.session_key) {
+    if !is_static_asset
+        && !is_public_path(path)
+        && !has_valid_session(req.headers(), &state.session_key)
+    {
         return unauthorized();
     }
 
@@ -161,6 +180,32 @@ fn unauthorized() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression, and the expensive kind: a signed-out visitor asked
+    /// for the sign-in page and got "authentication required". Demo
+    /// mode had masked it by minting a session ahead of this gate, so
+    /// the circularity only surfaced once the minter was removed.
+    #[test]
+    fn the_sign_in_page_is_reachable_without_a_session() {
+        assert!(is_public_path("/login"));
+        assert!(is_public_path("/login/"));
+    }
+
+    #[test]
+    fn the_landing_surface_and_probes_stay_public() {
+        assert!(is_public_path("/"));
+        assert!(is_public_path("/health"));
+        assert!(is_public_path("/auth/ssh-ca"));
+    }
+
+    /// The gate still has to gate. If this ever passes, the session
+    /// check has been widened into a no-op.
+    #[test]
+    fn application_pages_are_not_public() {
+        for path in ["/ux/jobs", "/system", "/it/os-map", "/me", "/finance"] {
+            assert!(!is_public_path(path), "{path} must require a session");
+        }
+    }
 
     #[test]
     fn guess_content_type_for_known_extensions() {

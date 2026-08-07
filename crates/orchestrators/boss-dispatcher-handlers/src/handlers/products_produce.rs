@@ -54,7 +54,9 @@
 //! computation — so a loud retry (dead-letter if the facts never come)
 //! is the only path that conserves WIP.
 
-use super::common::{self, StepEvent};
+use super::common::{
+    self, StepEvent, dispatcher_actor_header, dispatcher_reader_header, sim_origin_value,
+};
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::Value as ExprValue;
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext, arg_string};
@@ -107,6 +109,8 @@ impl ProductsProduce {
         let resp = self
             .client
             .get(&url)
+            .header("x-boss-user", dispatcher_reader_header())
+            .header("x-sim-origin", sim_origin_value())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
@@ -133,6 +137,7 @@ impl ProductsProduce {
     /// fact verbatim and never re-runs this computation.
     async fn drain_actual_wip_cents(
         &self,
+        rule_name: &str,
         step: &StepEvent<'_>,
         job: &Value,
         overhead_accounts: &[String],
@@ -174,8 +179,8 @@ impl ProductsProduce {
         let overhead_ids = overhead_source_ids(steps, step.step_id, overhead_accounts);
         let (raw_mash_cost, overhead_cost) = {
             let (raw, overhead) = tokio::join!(
-                self.ledger_transferred_sum("inventory_consume", mash_ids),
-                self.ledger_transferred_sum("ledger_overhead_absorbed", overhead_ids),
+                self.ledger_transferred_sum(rule_name, "inventory_consume", mash_ids),
+                self.ledger_transferred_sum(rule_name, "ledger_overhead_absorbed", overhead_ids),
             );
             (raw?, overhead?)
         };
@@ -236,6 +241,7 @@ impl ProductsProduce {
     /// once the facts land; a fact that never lands dead-letters loudly.
     async fn ledger_transferred_sum(
         &self,
+        rule_name: &str,
         source_table: &str,
         mut source_ids: Vec<String>,
     ) -> Result<i64, HandlerError> {
@@ -253,6 +259,13 @@ impl ProductsProduce {
         let resp = self
             .client
             .post(&url)
+            // Stamp the dispatcher's rule-as-actor, like every other
+            // downstream call. This one was raw, which was harmless
+            // while /api/ledger/* was ungated and became a hard 403
+            // the moment it wasn't — silently halting the whole
+            // WIP→FG→COGS chain rather than failing anything visible.
+            .header("x-boss-user", dispatcher_actor_header(rule_name))
+            .header("x-sim-origin", sim_origin_value())
             .json(&json!({
                 "kind": "finance.inventory.transferred",
                 "source_table": source_table,
@@ -297,6 +310,8 @@ impl ProductsProduce {
         let resp = self
             .client
             .get(&url)
+            .header("x-boss-user", dispatcher_reader_header())
+            .header("x-sim-origin", sim_origin_value())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
@@ -585,7 +600,7 @@ impl Handler for ProductsProduce {
             // (NAK → retry once the facts land); the current-avg
             // fallback below covers only the structural no-steps case.
             _ => match self
-                .drain_actual_wip_cents(&step, &job, &overhead_accounts)
+                .drain_actual_wip_cents(&ctx.rule_name, &step, &job, &overhead_accounts)
                 .await?
             {
                 Some(c) => Some(c),

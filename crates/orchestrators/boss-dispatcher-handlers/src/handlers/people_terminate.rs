@@ -1,7 +1,7 @@
 //! `people.terminate` — PUT `/api/people/{id}/status` with
 //! status=terminated. Reads a `terminate` block from step metadata.
 
-use super::common::{StepEvent, dispatcher_actor_header};
+use super::common::{StepEvent, dispatcher_actor_header, sim_origin_value};
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::Value;
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
@@ -67,6 +67,7 @@ impl Handler for PeopleTerminate {
             .put(&url)
             .header("content-type", "application/json")
             .header("x-boss-user", dispatcher_actor_header(&ctx.rule_name))
+            .header("x-sim-origin", sim_origin_value())
             .json(&body)
             .send()
             .await

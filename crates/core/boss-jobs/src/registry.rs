@@ -346,6 +346,67 @@ pub fn platform_kinds() -> Vec<JobKindSpec> {
 ///   0. `triage`    — an operator reads it and decides
 ///   999. `outcome` — closed
 fn user_feedback_spec() -> JobKindSpec {
+    // Triage is a FORK, not a checkbox. Its output is a decision about
+    // what happens next, and the whole point of recording it on the
+    // step is that the successors gate on it — so "triaged" stops
+    // meaning "someone closed it" and starts meaning "someone chose a
+    // route". The first cut of this spec had a single successor, which
+    // made triage a step whose only possible outcome was closure; the
+    // board built on it was a to-do list wearing a Kanban.
+    //
+    // The vocabulary is an INLINE field on the step rather than a new
+    // StepType. `task`'s bundle stays generic and this JobKind carries
+    // its own completion contract, which is what inline authoring is
+    // for. The viability lint reads the pipe-shaped `field_type` as an
+    // enum domain and proves every value has a successor, so a
+    // disposition with nowhere to go fails at authoring time instead
+    // of stranding a Job at runtime.
+    const DISPOSITIONS: &str = "reproduce|design|build|duplicate|needs-info|decline";
+
+    /// A branch that leaves the Job open for someone to do the work.
+    /// Authority-gated for the same reason triage is: `task` has no
+    /// required roles, so without a gate the simulated workforce
+    /// role-matches it and "investigates" real feedback on its own.
+    fn branch(title: &str, label: &str, disposition: &str) -> StepSpec {
+        StepSpec {
+            title: title.into(),
+            kind: "task".into(),
+            ready_when: format!(
+                "steps.triage.done AND steps.triage.metadata.disposition = \"{disposition}\""
+            ),
+            title_template: label.into(),
+            authority_role: Some("platform-admin".into()),
+            ..Default::default()
+        }
+    }
+
+    /// A branch that ends the Job immediately. `outcome_kind` is a
+    /// closed enum on the StepType (`completed|skipped|aborted|
+    /// withdrawn`), so the domain-specific label rides on `terminal`,
+    /// which is free-form — a Job that ended as a duplicate reads that
+    /// way in its outcome without inventing a new outcome_kind.
+    fn closing_branch(
+        title: &str,
+        label: &str,
+        disposition: &str,
+        outcome_kind: &str,
+        outcome: &str,
+    ) -> StepSpec {
+        StepSpec {
+            title: title.into(),
+            kind: "outcome".into(),
+            ready_when: format!(
+                "steps.triage.done AND steps.triage.metadata.disposition = \"{disposition}\""
+            ),
+            title_template: label.into(),
+            metadata_defaults: serde_json::json!({ "outcome_kind": outcome_kind }),
+            terminal: Some(Terminal {
+                outcome: outcome.into(),
+            }),
+            ..Default::default()
+        }
+    }
+
     let steps = vec![
         StepSpec {
             title: "submitted".into(),
@@ -360,7 +421,16 @@ fn user_feedback_spec() -> JobKindSpec {
         },
         StepSpec {
             title: "triage".into(),
-            kind: "acknowledgment".into(),
+            // `task` — "simple assigned task for HR, IT, admin", which
+            // is what triaging is, and it requires no metadata of its
+            // own. This was `acknowledgment` and could never be closed:
+            // that kind means "confirm receipt of a policy or document"
+            // and requires `document_title`. Validators run at
+            // `completed`, so the step materialized fine and every
+            // attempt to triage failed. Pick the kind whose field
+            // schema describes the work, not the one whose label
+            // sounds close.
+            kind: "task".into(),
             ready_when: "steps.submitted.done".into(),
             title_template: "Triage feedback".into(),
             // Authority is what keeps this waiting for a person.
@@ -372,12 +442,70 @@ fn user_feedback_spec() -> JobKindSpec {
             // read is worse than no feedback mechanism, because the
             // audit trail says it was handled.
             authority_role: Some("platform-admin".into()),
+            fields: vec![
+                boss_core::job::StepField {
+                    name: "disposition".into(),
+                    field_type: DISPOSITIONS.into(),
+                    // Required at done: there is no such thing as
+                    // completing triage without deciding where it goes.
+                    required: true,
+                },
+                // What triage FOUND, as opposed to where it routed.
+                //
+                // The board recorded that an agent had been asked and
+                // never what it came back with, so a diagnosed item and
+                // an untouched one looked identical — three items sat
+                // in "waiting" for a whole session with their causes
+                // known and their fixes shipped.
+                //
+                // Free text, because that is what eight hand-processed
+                // items actually produced: a root cause (a claim about
+                // the code the feedback text never mentions) and what
+                // was done about it. Never a structured verdict. A
+                // schema here would have been invented rather than
+                // observed.
+                //
+                // Optional: a finding is evidence, and triage can
+                // legitimately route something obvious without one.
+                // Declared on the step rather than kept as loose
+                // metadata so it is self-describing — the generic step
+                // surface renders it from the contract, with no second
+                // place teaching a UI about feedback.
+                boss_core::job::StepField {
+                    name: "finding".into(),
+                    field_type: "string".into(),
+                    required: false,
+                },
+            ],
             ..Default::default()
         },
+        branch("investigate", "Reproduce and investigate", "reproduce"),
+        branch("design-review", "Decide the design", "design"),
+        branch("build", "Build the change", "build"),
+        branch("needs-info", "Waiting on the reporter", "needs-info"),
+        closing_branch(
+            "duplicate",
+            "Closed as a duplicate",
+            "duplicate",
+            "withdrawn",
+            "duplicate",
+        ),
+        closing_branch(
+            "declined",
+            "Closed without action",
+            "decline",
+            "aborted",
+            "declined",
+        ),
         StepSpec {
             title: "closed".into(),
             kind: "outcome".into(),
-            ready_when: "steps.triage.done".into(),
+            // Any branch that did real work lands here. The two
+            // closing branches terminate on their own and never reach
+            // this one.
+            ready_when: "steps.investigate.done OR steps.design-review.done \
+                         OR steps.build.done OR steps.needs-info.done"
+                .into(),
             title_template: "Feedback closed".into(),
             metadata_defaults: serde_json::json!({ "outcome_kind": "completed" }),
             terminal: Some(Terminal {
@@ -405,7 +533,8 @@ fn user_feedback_spec() -> JobKindSpec {
          (a `custom` Subject whose id is the route path), so \"what have people said about \
          this page\" is a Subject-history question rather than a report someone has to build. \
          Modelled as a Job deliberately: feedback is work, and work that lives outside the \
-         Job model is work the system cannot route, own, or audit."
+         Job model is work the system cannot route, own, or audit. Triage forks on a \
+         disposition, so routing an item is a recorded decision that opens the next step."
             .to_string(),
     );
     spec
@@ -1137,9 +1266,12 @@ pub trait JobKindRegistry: Send + Sync {
 pub struct KindReconcileStats {
     /// New rows inserted as `created_by = 'bootstrap'`.
     pub inserted: usize,
-    /// Bootstrap-owned rows whose body was refreshed to match the
-    /// current default.
-    pub refreshed: usize,
+    /// Bootstrap-owned rows whose body drifted from the default and
+    /// were republished as a NEW version. Never an in-place rewrite:
+    /// a Job pins the version it opened under, so mutating a live
+    /// version's body re-points every in-flight Job at a spec it never
+    /// agreed to.
+    pub republished: usize,
     /// Operator-edited rows left untouched
     /// (`created_by != 'bootstrap'`).
     pub preserved: usize,
@@ -1382,15 +1514,36 @@ impl JobKindRegistry for InMemoryJobKinds {
                     let existing = rows.get(&key).expect("just located it").clone();
                     if owned.contains(&key) {
                         if !kind_body_matches(&existing, default) {
-                            // Refresh the body in place. Preserve
-                            // version + created_at so a fixup never
-                            // looks like a new publish.
-                            let mut updated = default.clone();
-                            updated.version = existing.version;
-                            updated.status = JobKindStatus::Active;
-                            updated.created_at = existing.created_at;
-                            rows.insert(key, updated);
-                            stats.refreshed += 1;
+                            // Publish a NEW version and retire the old
+                            // one. This used to rewrite the body in
+                            // place and keep the version, on the theory
+                            // that a fixup should not look like a
+                            // publish — but a Job pins the version it
+                            // opened under, so an in-place rewrite
+                            // silently re-points every in-flight Job at
+                            // a spec it never agreed to. Two feedback
+                            // Jobs were stranded exactly that way: their
+                            // steps stayed the old shape while closure
+                            // came to depend on branch steps they never
+                            // had.
+                            let next = rows
+                                .keys()
+                                .filter(|(k, _)| k == &default.kind)
+                                .map(|(_, v)| *v)
+                                .max()
+                                .unwrap_or(0)
+                                + 1;
+                            let mut retired = existing.clone();
+                            retired.status = JobKindStatus::Retired;
+                            rows.insert(key.clone(), retired);
+
+                            let mut published = default.clone();
+                            published.version = next;
+                            published.status = JobKindStatus::Active;
+                            let new_key = (published.kind.clone(), next);
+                            rows.insert(new_key.clone(), published);
+                            owned.insert(new_key);
+                            stats.republished += 1;
                         } else {
                             stats.unchanged += 1;
                         }
@@ -1874,10 +2027,14 @@ mod pg {
                         let existing = row_to_spec(body)?;
                         if created_by == "bootstrap" {
                             if !kind_body_matches(&existing, default) {
-                                // Refresh body in place. Preserve
-                                // version + created_at; restamp
-                                // created_by = 'bootstrap' so the
-                                // discriminator stays accurate.
+                                // Publish a NEW version and retire the
+                                // live one. This used to UPDATE the body
+                                // in place and keep the version, so a Job
+                                // pinned to that version silently began
+                                // resolving a spec it never agreed to —
+                                // which stranded in-flight Jobs whose
+                                // materialized steps no longer matched
+                                // the predicates closure now depended on.
                                 let subject_kinds_json =
                                     serde_json::to_value(&default.subject_kinds)
                                         .map_err(|e| JobKindError::Invalid(e.to_string()))?;
@@ -1887,23 +2044,45 @@ mod pg {
                                     serde_json::to_value(&default.on_complete_create)
                                         .map_err(|e| JobKindError::Invalid(e.to_string()))?;
 
+                                let mut tx = self
+                                    .pool
+                                    .begin()
+                                    .await
+                                    .map_err(|e| JobKindError::Storage(e.to_string()))?;
+
+                                // Retire first: `job_kinds_one_active_per_kind`
+                                // is a unique index over active rows, so the
+                                // two cannot both be active even mid-transaction.
                                 sqlx::query(
-                                    "UPDATE job_kinds SET
-                                        label = $3,
-                                        description = $4,
-                                        category = $5,
-                                        subject_kinds = $6,
-                                        steps = $7,
-                                        metadata_schema = $8,
-                                        entitlements = $9,
-                                        metadata = $10,
-                                        on_complete_create = $11,
-                                        owning_team = $12,
-                                        created_by = 'bootstrap'
+                                    "UPDATE job_kinds SET status = 'retired'
                                      WHERE kind = $1 AND version = $2",
                                 )
                                 .bind(&default.kind)
                                 .bind(version)
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(|e| JobKindError::Storage(e.to_string()))?;
+
+                                let next: i32 = sqlx::query_scalar(
+                                    "SELECT COALESCE(MAX(version), 0) + 1
+                                     FROM job_kinds WHERE kind = $1",
+                                )
+                                .bind(&default.kind)
+                                .fetch_one(&mut *tx)
+                                .await
+                                .map_err(|e| JobKindError::Storage(e.to_string()))?;
+
+                                sqlx::query(
+                                    "INSERT INTO job_kinds
+                                        (kind, version, status, label, description, category,
+                                         subject_kinds, steps, metadata_schema, entitlements,
+                                         metadata, on_complete_create, owning_team,
+                                         authoring_job_id, created_by, created_at)
+                                     VALUES ($1, $2, 'active', $3, $4, $5, $6, $7, $8, $9,
+                                             $10, $11, $12, NULL, 'bootstrap', NOW())",
+                                )
+                                .bind(&default.kind)
+                                .bind(next)
                                 .bind(&default.label)
                                 .bind(&default.description)
                                 .bind(&default.category)
@@ -1914,11 +2093,15 @@ mod pg {
                                 .bind(&default.metadata)
                                 .bind(&on_complete_create_json)
                                 .bind(&default.owning_team)
-                                .execute(&self.pool)
+                                .execute(&mut *tx)
                                 .await
                                 .map_err(|e| JobKindError::Storage(e.to_string()))?;
 
-                                stats.refreshed += 1;
+                                tx.commit()
+                                    .await
+                                    .map_err(|e| JobKindError::Storage(e.to_string()))?;
+
+                                stats.republished += 1;
                             } else {
                                 stats.unchanged += 1;
                             }
@@ -2263,6 +2446,83 @@ mod tests {
         for s in &steps {
             assert_eq!(s.job_id, job_id);
         }
+    }
+
+    /// The feedback flow collects exactly ONE thing from an operator —
+    /// the triage disposition — so every step must close on its own
+    /// defaults plus that.
+    ///
+    /// Both halves matter. A required field anywhere else is a step
+    /// nothing in this flow can satisfy, because no surface asks for
+    /// it: the chrome control posts a message and the board sends a
+    /// status flip. And triage must genuinely require the disposition,
+    /// or routing becomes optional and the fork decorative.
+    ///
+    /// Regression this came from: triage shipped as `acknowledgment`,
+    /// which requires `document_title`. Validators run at `completed`,
+    /// so the Job materialized cleanly and looked healthy in the
+    /// waiting column; the only symptom was a 400 the first time a
+    /// human tried to triage real feedback.
+    #[test]
+    fn user_feedback_collects_only_the_triage_disposition() {
+        let spec = user_feedback_spec();
+        let registry = crate::step_registry::StepRegistry::v1();
+        let subject = Subject::new("custom", "/system");
+        let job_metadata = serde_json::Value::Object(Default::default());
+        let mut i = 0u32;
+        let steps = materialize_steps(&spec, &subject, JobId::new(), &job_metadata, || {
+            i += 1;
+            StepId::from_uuid(Uuid::from_u128(i as u128))
+        });
+        assert!(!steps.is_empty(), "user-feedback materialized no steps");
+
+        let mut operator_supplied: Vec<String> = Vec::new();
+
+        for s in &steps {
+            let mut metadata = s.metadata.clone();
+
+            // Stand in for what the operator types. A pipe-shaped
+            // field_type is an enum, so the first value is a legal
+            // answer; anything else required here would be a field no
+            // surface in this flow collects.
+            for f in s.fields.iter().filter(|f| f.required) {
+                operator_supplied.push(format!("{}.{}", s.title, f.name));
+                let sample = f.field_type.split('|').next().unwrap_or("x");
+                if let serde_json::Value::Object(m) = &mut metadata {
+                    m.insert(
+                        f.name.clone(),
+                        serde_json::Value::String(sample.to_string()),
+                    );
+                }
+            }
+
+            let result = registry
+                .validate_metadata(&s.kind, &metadata)
+                .and_then(|()| {
+                    crate::step_registry::StepRegistry::validate_authored_fields(
+                        &s.fields, &metadata,
+                    )
+                });
+            if let Err(errors) = result {
+                panic!(
+                    "step `{}` (kind `{}`) can never be completed as materialized — {}",
+                    s.title,
+                    s.kind,
+                    errors
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                );
+            }
+        }
+
+        assert_eq!(
+            operator_supplied,
+            vec!["Triage feedback.disposition".to_string()],
+            "the feedback flow has exactly one field an operator fills in; anything \
+             else here is a step no surface can complete"
+        );
     }
 
     #[test]
@@ -2647,7 +2907,7 @@ mod tests {
         let defaults = vec![reconcile_spec("job-kind-design", "Design a JobKind")];
         let stats = registry.bootstrap_reconcile(&defaults).await.unwrap();
         assert_eq!(stats.inserted, 1);
-        assert_eq!(stats.refreshed, 0);
+        assert_eq!(stats.republished, 0);
         assert_eq!(stats.preserved, 0);
         assert_eq!(stats.unchanged, 0);
         let live = registry.get_active("job-kind-design").await.unwrap();
@@ -2657,7 +2917,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_reconcile_refreshes_drifted_bootstrap_rows() {
+    async fn bootstrap_reconcile_republishes_drift_as_a_new_version() {
         let registry = InMemoryJobKinds::new();
         // Seed a stale bootstrap row.
         let stale = reconcile_spec("job-kind-design", "Old Label");
@@ -2670,15 +2930,57 @@ mod tests {
         let stats = registry
             .bootstrap_reconcile(&[updated])
             .await
-            .expect("refresh");
+            .expect("republish");
         assert_eq!(stats.inserted, 0);
-        assert_eq!(stats.refreshed, 1);
+        assert_eq!(stats.republished, 1);
         assert_eq!(stats.preserved, 0);
         assert_eq!(stats.unchanged, 0);
+
         let live = registry.get_active("job-kind-design").await.unwrap();
         assert_eq!(live.label, "Design a JobKind", "drift should self-heal");
-        // Refresh preserves version — never publishes a new one.
-        assert_eq!(live.version, 1, "refresh must not bump version");
+        // A changed body is a NEW version, not a rewrite of the old
+        // one. This used to assert the opposite, and that is precisely
+        // what defeated the version pin: Jobs opened under v1 kept
+        // pointing at v1 while v1's body changed underneath them.
+        assert_eq!(live.version, 2, "a changed body publishes a version");
+
+        // The old version must still be readable, or a Job pinned to
+        // it has nothing to resolve.
+        let pinned = registry
+            .get_version("job-kind-design", 1)
+            .await
+            .expect("v1 still resolvable");
+        assert_eq!(pinned.label, "Old Label", "v1 keeps the body it had");
+        assert_eq!(pinned.status, JobKindStatus::Retired);
+    }
+
+    /// Reconcile runs on EVERY boot. If an unchanged default still
+    /// published, a restart loop would mint versions forever.
+    #[tokio::test]
+    async fn bootstrap_reconcile_republishes_only_on_a_real_change() {
+        let registry = InMemoryJobKinds::new();
+        let spec = reconcile_spec("job-kind-design", "Design a JobKind");
+        registry
+            .bootstrap_reconcile(std::slice::from_ref(&spec))
+            .await
+            .expect("seed");
+        for _ in 0..3 {
+            let stats = registry
+                .bootstrap_reconcile(std::slice::from_ref(&spec))
+                .await
+                .expect("reboot");
+            assert_eq!(stats.republished, 0);
+            assert_eq!(stats.unchanged, 1);
+        }
+        assert_eq!(
+            registry
+                .get_active("job-kind-design")
+                .await
+                .unwrap()
+                .version,
+            1,
+            "three boots with no change must not mint versions"
+        );
     }
 
     #[tokio::test]
@@ -2694,7 +2996,7 @@ mod tests {
         let updated = reconcile_spec("job-kind-design", "Default Label");
         let stats = registry.bootstrap_reconcile(&[updated]).await.unwrap();
         assert_eq!(stats.inserted, 0);
-        assert_eq!(stats.refreshed, 0);
+        assert_eq!(stats.republished, 0);
         assert_eq!(stats.preserved, 1);
         assert_eq!(stats.unchanged, 0);
         let live = registry.get_active("job-kind-design").await.unwrap();
@@ -2714,7 +3016,7 @@ mod tests {
             .expect("seed");
         let stats = registry.bootstrap_reconcile(&[spec]).await.unwrap();
         assert_eq!(stats.inserted, 0);
-        assert_eq!(stats.refreshed, 0);
+        assert_eq!(stats.republished, 0);
         assert_eq!(stats.preserved, 0);
         assert_eq!(stats.unchanged, 1);
     }
@@ -2813,9 +3115,43 @@ mod tests {
         assert_eq!(feedback.version, 1);
         assert_eq!(feedback.status, JobKindStatus::Active);
         assert_eq!(feedback.subject_kinds, vec!["custom".to_string()]);
-        // trigger -> triage -> outcome. A terminal step is what lets
-        // the Job close rather than sitting open forever.
-        assert_eq!(feedback.steps.len(), 3);
+        // submitted -> triage -> one branch per disposition -> a
+        // terminal. Asserting the fork rather than a step count: what
+        // matters is that triage HAS somewhere to route to, since a
+        // triage step with a single successor is a checkbox, which is
+        // what this spec shipped as first.
+        let triage = feedback
+            .steps
+            .iter()
+            .find(|s| s.title == "triage")
+            .expect("triage step present");
+        let disposition = triage
+            .fields
+            .iter()
+            .find(|f| f.name == "disposition")
+            .expect("triage declares a disposition field");
+        assert!(
+            disposition.required,
+            "triage must not be completable without choosing a route"
+        );
+        let values: Vec<&str> = disposition.field_type.split('|').collect();
+        assert!(
+            values.len() >= 2,
+            "a fork needs at least two dispositions, got {values:?}"
+        );
+        // Every declared disposition has a step gated on it. The
+        // viability lint proves this too; asserting it here names the
+        // offending value instead of failing a whole-registry check.
+        for v in &values {
+            let needle = format!("disposition = \"{v}\"");
+            assert!(
+                feedback
+                    .steps
+                    .iter()
+                    .any(|s| s.ready_when.contains(&needle)),
+                "disposition `{v}` has no successor — a Job routed there would strand"
+            );
+        }
         assert!(
             feedback.steps.iter().any(|s| s.terminal.is_some()),
             "must have a terminal step or feedback Jobs never close"

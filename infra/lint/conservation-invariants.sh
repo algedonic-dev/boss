@@ -241,6 +241,14 @@ SQL
 # ignored `invoice.revenue_category` and routed everything to a
 # fallback. We require ≥3 distinct revenue accounts with non-zero
 # credits whenever the invoices table is non-empty.
+#
+# Measured on GROSS CREDITS, not the net balance. A year-end close
+# debits every revenue account to zero, so a net-balance test reports
+# "revenue is concentrated" the moment a year closes — which is a
+# statement about the close, not about the posting rule it is trying
+# to police. Closes only ever debit revenue, so gross credits isolate
+# real revenue postings and the check survives a close. Found when
+# closing FY2025 turned this check red with clean data.
 run_invariant "H. Revenue distributes across ≥3 accounts" "$(cat <<'SQL'
 WITH inv_exists AS (SELECT 1 FROM invoices LIMIT 1),
      rev_accounts AS (
@@ -249,8 +257,7 @@ WITH inv_exists AS (SELECT 1 FROM invoices LIMIT 1),
          JOIN gl_journal_lines jl ON jl.account_id = a.id
         WHERE a.kind = 'revenue'
         GROUP BY a.code
-       HAVING coalesce(sum(jl.credit_cents), 0)
-            - coalesce(sum(jl.debit_cents), 0) > 0
+       HAVING coalesce(sum(jl.credit_cents), 0) > 0
      )
 SELECT 'only ' || count(*) || ' revenue account(s) carry a non-zero credit balance — '
      || 'expected ≥3 when invoices exist. Active: '
@@ -649,7 +656,13 @@ SQL
 # aggregation that breaks the equation fires here.
 echo
 LEDGER_BASE="${LEDGER_BASE:-http://127.0.0.1:7080}"
-bs_response=$(curl -sS --fail "$LEDGER_BASE/api/ledger/balance-sheet" 2>&1) || {
+# `/api/ledger/*` is policy-gated (a `ledger` read grant), so this
+# sweep has to present an identity like any other reader. It used to
+# call bare, which stopped working the day the gate landed and turned
+# a real invariant into a permanently-erroring check — a sweep that
+# always errors is a sweep nobody reads.
+LEDGER_READER='{"id":"automation:conservation-sweep","role":"audit-readonly","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
+bs_response=$(curl -sS --fail -H "x-boss-user: $LEDGER_READER" "$LEDGER_BASE/api/ledger/balance-sheet" 2>&1) || {
     echo "[ERROR] S. Balance-sheet endpoint — fetch failed:"
     echo "$bs_response" | sed 's/^/    /'
     violations=$((violations + 1))

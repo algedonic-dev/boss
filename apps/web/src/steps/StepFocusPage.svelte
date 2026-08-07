@@ -17,6 +17,9 @@
   // same bundle renders here and inline.
   import { onMount } from 'svelte';
   import StepPluginMount from './StepPluginMount.svelte';
+  import StepSurface from './StepSurface.svelte';
+  import { getStepPluginMount } from './pluginHost';
+  import type { StepStatus } from '../jobs/types';
   import type { StepPluginProps } from './pluginHost';
   import { navigate } from '../router';
   import { session } from '@boss/web-kit/session/session.svelte';
@@ -63,6 +66,33 @@
     }
   }
 
+  /// The plugin contract types `status` as a plain string — plugins
+  /// are framework-agnostic and get no Svelte types — while the
+  /// platform surfaces take the narrowed `StepStatus` union. Narrow
+  /// once here rather than loosening the surfaces, which would give up
+  /// the exhaustiveness they rely on.
+  function surfaceStep(s: Step) {
+    return { ...s, status: s.status as StepStatus };
+  }
+
+  /// Which surface to render. `null` while we are still asking —
+  /// rendering the fallback before the answer arrives would flash the
+  /// generic surface under every plugin-backed step.
+  let hasPlugin = $state<boolean | null>(null);
+
+  $effect(() => {
+    const kind = step?.kind;
+    if (!kind) return;
+    let cancelled = false;
+    void (async () => {
+      const mount = await getStepPluginMount(kind);
+      if (!cancelled) hasPlugin = mount != null;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
+
   onMount(load);
 </script>
 
@@ -82,7 +112,7 @@
       <p class="step-focus-msg">Loading step…</p>
     {:else if error}
       <p class="step-focus-msg step-focus-err">{error}</p>
-    {:else if step}
+    {:else if step && hasPlugin === true}
       <StepPluginMount
         kind={step.kind}
         {step}
@@ -90,6 +120,17 @@
         {currentUser}
         onUpdate={load}
       />
+    {:else if step && hasPlugin === false}
+      <!-- No plugin for this kind. The page was written for
+           plugin-backed steps, so it used to render "No plugin
+           registered for task" and stop — which became a dead end the
+           moment inbox notifications started linking here for every
+           authority-gated step. `StepSurface` is the platform's own
+           dispatcher and lands on GenericSurface, so the route now
+           works for any kind rather than only the ones with a bundle. -->
+      <div class="step-focus-fallback">
+        <StepSurface step={surfaceStep(step)} {jobId} onUpdate={load} />
+      </div>
     {/if}
   </div>
 </div>

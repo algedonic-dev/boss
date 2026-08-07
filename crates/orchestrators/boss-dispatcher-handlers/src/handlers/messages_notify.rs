@@ -10,7 +10,9 @@
 //! ready step — no role-wide fan-out. Steps with no `authority_role`
 //! (generic / outcome kinds an operator picks off a queue) are a no-op.
 
-use super::common::{StepEvent, dispatcher_actor_header};
+use super::common::{
+    StepEvent, dispatcher_actor_header, dispatcher_reader_header, sim_origin_value,
+};
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::Value;
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
@@ -88,6 +90,8 @@ impl Handler for MessagesNotify {
         let resp = self
             .client
             .get(&people_url)
+            .header("x-boss-user", dispatcher_reader_header())
+            .header("x-sim-origin", sim_origin_value())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {people_url}: {e}")))?;
@@ -109,10 +113,15 @@ impl Handler for MessagesNotify {
             return Ok(());
         };
 
-        let subject = format!("Ready: {} step needs the {} team", ev.kind, role);
+        // Name the Subject, not just the step kind. Seven feedback
+        // Jobs produce seven identical "Ready: task step needs the
+        // platform-admin team" lines, and an inbox where every row
+        // reads the same is a list you scroll past.
+        let subject = format!("Ready: {} — {}", ev.kind, ev.subject_id);
         let body = format!(
-            "A '{}' step is ready on job {}. Pick it up from My Day.",
-            ev.kind, ev.job_id
+            "A '{}' step is ready on {} {}, waiting on the {} team. \
+             Opening this message goes straight to the step.",
+            ev.kind, ev.subject_kind, ev.subject_id, role
         );
         let msg = json!({
             // Deterministic id `notify:{step_id}:{recipient}`. A
@@ -127,10 +136,21 @@ impl Handler for MessagesNotify {
             "subject": subject,
             "body": body,
             "kind": "signal",
+            // Link to the STEP, not the Job. The notification exists
+            // because one specific step became ready; landing on the
+            // Job leaves the reader to find it again among the others,
+            // which is work the message already did. `/jobs/{job}/
+            // steps/{step}` is the full-page step surface, so the link
+            // opens the thing the message is about.
+            //
+            // `entity_type` follows the entity: nothing keys on it
+            // (the inbox renders `entity_path` directly and shows the
+            // type only as a label), and calling a step a job would be
+            // a small lie that costs nothing to avoid.
             "entity_ref": {
-                "entity_type": "job",
-                "entity_id": ev.job_id,
-                "entity_path": format!("/jobs/{}", ev.job_id),
+                "entity_type": "step",
+                "entity_id": ev.step_id,
+                "entity_path": format!("/jobs/{}/steps/{}", ev.job_id, ev.step_id),
             },
         });
         let msg_url = format!(
@@ -141,6 +161,7 @@ impl Handler for MessagesNotify {
             .client
             .post(&msg_url)
             .header("x-boss-user", dispatcher_actor_header(&ctx.rule_name))
+            .header("x-sim-origin", sim_origin_value())
             .json(&msg)
             .send()
             .await
@@ -167,6 +188,143 @@ mod tests {
             triggering_topic: "step.ready.bill-approval".into(),
             event_payload: payload,
         }
+    }
+
+    /// Stand-ins for `boss-people` and `boss-messages`. The messages
+    /// side captures the posted body so the test can assert what an
+    /// operator would actually receive — nothing pinned that before,
+    /// which is why the link could point anywhere without a failure.
+    async fn mock_services() -> (
+        String,
+        String,
+        std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    ) {
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+
+        let people = Router::new().route(
+            "/api/people",
+            get(|| async {
+                // Deliberately out of id order: the handler picks the
+                // deterministic on-call member (lowest id).
+                Json(serde_json::json!([{ "id": "emp-zz" }, { "id": "emp-aa" }]))
+            }),
+        );
+        let people_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let people_addr = people_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(people_listener, people).await.unwrap() });
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let cap = captured.clone();
+        let messages = Router::new().route(
+            "/api/messages/send",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let cap = cap.clone();
+                async move {
+                    *cap.lock().unwrap() = Some(body);
+                    Json(serde_json::json!({ "ok": true }))
+                }
+            }),
+        );
+        let msg_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let msg_addr = msg_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(msg_listener, messages).await.unwrap() });
+
+        (
+            format!("http://{people_addr}"),
+            format!("http://{msg_addr}"),
+            captured,
+        )
+    }
+
+    fn ready_payload() -> serde_json::Value {
+        serde_json::json!({
+            "job_id": "11111111-1111-1111-1111-111111111111",
+            "step_id": "22222222-2222-2222-2222-222222222222",
+            "kind": "review-design",
+            "subject_kind": "custom",
+            "subject_id": "docs/design/operating-system-view.md",
+            "metadata": { "authority_role": "platform-admin" }
+        })
+    }
+
+    /// The notification exists because one specific step became ready,
+    /// so it must open that step. Linking to the Job leaves the reader
+    /// to find it again among the others — work the message already
+    /// did.
+    #[tokio::test]
+    async fn links_to_the_step_not_the_job() {
+        let (people, messages, captured) = mock_services().await;
+        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        h.invoke(&[], &ctx(ready_payload())).await.expect("notify");
+
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a message was sent");
+        assert_eq!(
+            sent["entity_ref"]["entity_path"],
+            "/jobs/11111111-1111-1111-1111-111111111111/steps/22222222-2222-2222-2222-222222222222"
+        );
+        assert_eq!(sent["entity_ref"]["entity_type"], "step");
+        assert_eq!(
+            sent["entity_ref"]["entity_id"],
+            "22222222-2222-2222-2222-222222222222"
+        );
+    }
+
+    /// An inbox where every row reads the same is a list you scroll
+    /// past. Seven feedback Jobs produced seven identical "Ready: task
+    /// step needs the platform-admin team" lines.
+    #[tokio::test]
+    async fn subject_names_the_subject() {
+        let (people, messages, captured) = mock_services().await;
+        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        h.invoke(&[], &ctx(ready_payload())).await.expect("notify");
+
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a message was sent");
+        let subject = sent["subject"].as_str().unwrap_or_default();
+        assert!(
+            subject.contains("docs/design/operating-system-view.md"),
+            "subject must identify WHICH item: {subject}"
+        );
+        assert!(subject.contains("review-design"), "subject: {subject}");
+        // The role still has to reach the reader; it moved to the body.
+        assert!(
+            sent["body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("platform-admin"),
+            "body must still name the responsible team: {}",
+            sent["body"]
+        );
+    }
+
+    /// Redelivery is at-least-once, so the id has to be stable per
+    /// (step, recipient) or a JetStream retry stacks a duplicate row.
+    #[tokio::test]
+    async fn notifies_the_lowest_id_holder_with_a_stable_id() {
+        let (people, messages, captured) = mock_services().await;
+        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        h.invoke(&[], &ctx(ready_payload())).await.expect("notify");
+
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a message was sent");
+        assert_eq!(sent["recipient_id"], "emp-aa");
+        assert_eq!(
+            sent["id"],
+            "notify:22222222-2222-2222-2222-222222222222:emp-aa"
+        );
     }
 
     #[tokio::test]

@@ -72,7 +72,7 @@ pub async fn post_fact_in_tx(
         return Ok(());
     }
 
-    let period_id = ensure_period_for(tx, draft.posted_on).await?;
+    let period_id = ensure_period_for(tx, fact.kind, draft.posted_on).await?;
 
     // Reject writes to a locked period up-front with a clear error. The
     // DB trigger is defense-in-depth, but we'd rather surface a clean
@@ -144,12 +144,60 @@ pub async fn post_fact_in_tx(
     Ok(())
 }
 
-/// Auto-create the monthly period containing `posted_on` if it doesn't
-/// exist. Returns the period id.
-async fn ensure_period_for(
-    tx: &mut Transaction<'_, Postgres>,
-    posted_on: NaiveDate,
-) -> Result<Uuid, LedgerError> {
+/// The fact kind emitted when an accounting period is closed.
+pub const PERIOD_CLOSED_FACT: &str = "finance.period.closed";
+
+/// Which period kind owns the journal entry a fact produces.
+///
+/// Ordinary postings belong to the month they are dated in. A
+/// year-end close is dated Dec 31 but belongs to the **year** it
+/// closes: filing the act of ending the year inside one of the months
+/// that year contains would put the entry that zeroes December's
+/// revenue into December's own balances.
+///
+/// This is the one definition of that rule. The live posting path
+/// resolves through [`ensure_period_for`], and the rebuild / replay
+/// paths decide what re-posts through [`OPEN_PERIOD_FACTS_SQL`],
+/// which is this function expressed in SQL — `rust_and_sql_agree`
+/// pins the two together.
+pub fn owning_period_kind(fact_kind: &str) -> &'static str {
+    if fact_kind == PERIOD_CLOSED_FACT {
+        "year"
+    } else {
+        "month"
+    }
+}
+
+/// Facts whose owning period is open, or does not exist yet — the set
+/// a rebuild or a replay re-projects. Locked periods are immutable, so
+/// their facts stay untouched.
+///
+/// `$1` binds [`PERIOD_CLOSED_FACT`]; the CASE is
+/// [`owning_period_kind`] in SQL.
+///
+/// Three call sites (rebuild, and the replay check's two passes) had
+/// this query copied out verbatim with `p.kind = 'month'` hardcoded.
+/// That is what made the ledger non-deterministic: a year-end close
+/// lived in the yearly period when posted live, and re-posted into
+/// December on replay, because only the live path knew the rule.
+pub const OPEN_PERIOD_FACTS_SQL: &str = "SELECT f.id, f.kind, f.happened_on, f.payload \
+     FROM financial_facts f \
+     LEFT JOIN gl_periods p \
+        ON p.kind = CASE WHEN f.kind = $1 THEN 'year' ELSE 'month' END \
+       AND f.happened_on BETWEEN p.starts_on AND p.ends_on \
+     WHERE (p.id IS NULL OR p.status = 'open') \
+       AND f.supersede_reason IS NULL \
+     ORDER BY f.happened_on, f.recorded_at";
+
+/// Calendar bounds of the period that owns `posted_on`, for the given
+/// period kind.
+fn period_bounds(kind: &str, posted_on: NaiveDate) -> (NaiveDate, NaiveDate) {
+    if kind == "year" {
+        return (
+            NaiveDate::from_ymd_opt(posted_on.year(), 1, 1).expect("Jan 1 always valid"),
+            NaiveDate::from_ymd_opt(posted_on.year(), 12, 31).expect("Dec 31 always valid"),
+        );
+    }
     let starts_on = NaiveDate::from_ymd_opt(posted_on.year(), posted_on.month(), 1)
         .expect("first of month always valid");
     let ends_on = match posted_on.month() {
@@ -158,9 +206,22 @@ async fn ensure_period_for(
     }
     .and_then(|d| d.pred_opt())
     .expect("last of month always valid");
+    (starts_on, ends_on)
+}
+
+/// Auto-create the period that owns a `fact_kind` posting dated
+/// `posted_on`, if it doesn't exist. Returns the period id.
+async fn ensure_period_for(
+    tx: &mut Transaction<'_, Postgres>,
+    fact_kind: &str,
+    posted_on: NaiveDate,
+) -> Result<Uuid, LedgerError> {
+    let kind = owning_period_kind(fact_kind);
+    let (starts_on, ends_on) = period_bounds(kind, posted_on);
 
     let existing: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM gl_periods WHERE kind = 'month' AND starts_on = $1")
+        sqlx::query_as("SELECT id FROM gl_periods WHERE kind = $1 AND starts_on = $2")
+            .bind(kind)
             .bind(starts_on)
             .fetch_optional(&mut **tx)
             .await
@@ -172,10 +233,11 @@ async fn ensure_period_for(
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO gl_periods (id, kind, starts_on, ends_on, status) \
-         VALUES ($1, 'month', $2, $3, 'open') \
+         VALUES ($1, $2, $3, $4, 'open') \
          ON CONFLICT (kind, starts_on) DO NOTHING",
     )
     .bind(id)
+    .bind(kind)
     .bind(starts_on)
     .bind(ends_on)
     .execute(&mut **tx)
@@ -185,7 +247,8 @@ async fn ensure_period_for(
     // Conflict path: someone else created the row concurrently. Read it
     // back rather than assuming our insert won.
     let (id,): (Uuid,) =
-        sqlx::query_as("SELECT id FROM gl_periods WHERE kind = 'month' AND starts_on = $1")
+        sqlx::query_as("SELECT id FROM gl_periods WHERE kind = $1 AND starts_on = $2")
+            .bind(kind)
             .bind(starts_on)
             .fetch_one(&mut **tx)
             .await

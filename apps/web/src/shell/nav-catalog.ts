@@ -100,6 +100,8 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
   'system-dispatcher-rules': { id: 'system-dispatcher-rules', label: 'Dispatcher rules — authoring', path: '/system/dispatcher/rules', permKey: 'system-dispatcher-rules', app: 'it' },
   'system-dispatcher-rule':  { id: 'system-dispatcher-rule',  label: 'Dispatcher rule — editor',     path: '/system/dispatcher/rules', permKey: 'system-dispatcher-rule',  app: 'it' },
   'system-design':           { id: 'system-design',           label: 'Design review',       path: '/system/design',       permKey: 'system-design',           app: 'it' },
+  'system-os-map':           { id: 'system-os-map',           label: 'Operating system',    path: '/system/os-map',       permKey: 'system-os-map',           app: 'it' },
+  'system-feedback':         { id: 'system-feedback',         label: 'Feedback triage',     path: '/system/feedback',     permKey: 'system-feedback',         app: 'it' },
   // The "Evolve" surface — controlled, sandboxed model modifications
   // (placeholder for now; visible to every role via canSeeRoute).
   'system-experiments':      { id: 'system-experiments',      label: 'Experiments',         path: '/system/experiments',  permKey: 'system-experiments',      app: 'it' },

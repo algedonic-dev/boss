@@ -123,21 +123,14 @@ export async function loadSession(): Promise<void> {
         session.value = { kind: 'ready', user: emp };
         return;
       }
-      if (DEMO_MODE && byId.has(storedPersona)) {
-        session.fromGateway = false;
-        session.value = { kind: 'ready', user: byId.get(storedPersona)! };
-        return;
-      }
-      // In demo mode with a roster but no resolved employee_id +
-      // no valid stored persona (fresh incognito visitor, or
-      // stored persona pointing at a wiped employee), fall
-      // through to the demo-mode preferred-persona path below
-      // rather than landing in 'unrecognized'. The gateway's
-      // default unauth session carries `username='demo@anonymous'`
-      // which used to land here as unrecognized — that hid the
-      // persona switcher from anyone who hadn't manually picked
-      // one.
-      if (username && !(DEMO_MODE && roster.length > 0)) {
+      // A session that resolves to no employee is still a real
+      // session — since demo mode was removed, that means a guest.
+      // This used to substitute a persona from localStorage, which
+      // put an employee's name, role and department on a visitor
+      // holding none of them, and left the shell offering actions
+      // that could only 403. Report who they actually are; the
+      // roster fallback below is for having no session at all.
+      if (username) {
         session.value = { kind: 'unrecognized', username };
         return;
       }

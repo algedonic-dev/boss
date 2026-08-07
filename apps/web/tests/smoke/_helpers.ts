@@ -48,12 +48,14 @@ export async function pinPersona(page: Page, employeeId: string): Promise<void> 
 export async function mountPage(
   page: Page,
   path: string,
-  opts: { titleMatch?: RegExp } = {},
+  opts: { titleMatch?: RegExp; root?: string } = {},
 ): Promise<void> {
   await page.goto(path);
-  // AppShell renders for every authed route. If it never paints,
-  // either auth failed or the bundle crashed.
-  await expect(page.locator('.app-shell')).toBeVisible({ timeout: 10_000 });
+  // AppShell renders for every authed route — except the handful that
+  // deliberately render outside it to take the whole viewport (login,
+  // the full-page step surface). Those pass their own root; waiting
+  // for `.app-shell` there fails on a page that is working correctly.
+  await expect(page.locator(opts.root ?? '.app-shell')).toBeVisible({ timeout: 10_000 });
   if (opts.titleMatch) {
     await expect(page.locator('h1').first()).toContainText(opts.titleMatch, {
       timeout: 10_000,

@@ -81,19 +81,11 @@ pub async fn rebuild(pool: &PgPool) -> Result<RebuildReport, LedgerError> {
     // Re-project every fact whose happened_on falls in an open period, or
     // whose period doesn't exist yet. `ensure_period_for` inside the
     // projection auto-creates missing periods.
-    let fact_rows = sqlx::query(
-        "SELECT f.id, f.kind, f.happened_on, f.payload \
-         FROM financial_facts f \
-         LEFT JOIN gl_periods p \
-            ON p.kind = 'month' \
-           AND f.happened_on BETWEEN p.starts_on AND p.ends_on \
-         WHERE (p.id IS NULL OR p.status = 'open') \
-           AND f.supersede_reason IS NULL \
-         ORDER BY f.happened_on, f.recorded_at",
-    )
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|e| LedgerError::Storage(e.to_string()))?;
+    let fact_rows = sqlx::query(crate::postgres::OPEN_PERIOD_FACTS_SQL)
+        .bind(crate::postgres::PERIOD_CLOSED_FACT)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| LedgerError::Storage(e.to_string()))?;
 
     let mut facts_processed: u64 = 0;
     let mut entries_created: u64 = 0;

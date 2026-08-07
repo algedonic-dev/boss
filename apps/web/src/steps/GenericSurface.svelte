@@ -4,7 +4,12 @@
   // every service Job's steps pick up implicitly. Port of
   // apps/web-legacy/src/steps/GenericSurface.tsx.
 
-  import { isPending, isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
+  import {
+    isPending,
+    isTerminal as _isTerminal,
+    type StepStatus,
+    type StepField,
+  } from '../jobs/types';
   import type { Employee } from '../people/types';
 
   type StepData = {
@@ -15,6 +20,10 @@
     assignee_id: string | null;
     metadata: Record<string, unknown>;
     notes: string | null;
+    /// The step's completion contract. Declared on the JobKind step
+    /// (inline authoring), so it is data rather than a bespoke
+    /// surface — which is exactly why this generic view can honour it.
+    fields?: StepField[];
   };
 
   type Props = {
@@ -26,6 +35,35 @@
 
   const initialDueOn =
     typeof step.metadata.due_on === 'string' ? step.metadata.due_on : '';
+
+  /// Values for the step's declared fields, seeded from whatever is
+  /// already in metadata.
+  ///
+  /// Without this the surface could not complete a step that declares
+  /// a required field: it sent `status: completed` with the existing
+  /// metadata and the API refused it. That made every such step a dead
+  /// end everywhere except a bespoke plugin — which defeats inline
+  /// field authoring, whose whole point is that a JobKind can state
+  /// its own contract without one.
+  let fieldValues = $state<Record<string, string>>(
+    Object.fromEntries(
+      (step.fields ?? []).map((f) => {
+        const v = step.metadata[f.name];
+        return [f.name, typeof v === 'string' ? v : ''];
+      }),
+    ),
+  );
+
+  /// A pipe-shaped `field_type` is an enum domain — the same shape the
+  /// JobKind viability lint reads to prove fork coverage. Anything
+  /// else is free text.
+  function optionsFor(f: StepField): string[] | null {
+    return f.field_type.includes('|') ? f.field_type.split('|') : null;
+  }
+
+  let missingRequired = $derived(
+    (step.fields ?? []).filter((f) => f.required && !fieldValues[f.name]?.trim()),
+  );
 
   let notes = $state(step.notes ?? '');
   let assigneeId = $state(step.assignee_id ?? '');
@@ -97,7 +135,16 @@
           overrides.assignee_id !== undefined
             ? overrides.assignee_id
             : assigneeId || null,
-        metadata: overrides.metadata ?? mergeMetadata(step.metadata, dueOn),
+        metadata:
+          overrides.metadata ?? {
+            ...mergeMetadata(step.metadata, dueOn),
+            // Only send fields the operator actually filled — an
+            // empty string is not an answer, and writing one would
+            // satisfy a required-field check with nothing in it.
+            ...Object.fromEntries(
+              Object.entries(fieldValues).filter(([, v]) => v.trim() !== ''),
+            ),
+          },
       };
       await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
         method: 'PUT',
@@ -152,6 +199,40 @@
   </div>
 
   {#if extraMetadataEntries.length > 0}
+    {#if (step.fields ?? []).length > 0 && !terminal}
+      <!-- The step's own completion contract, rendered from data.
+           Validators run at `completed`, so a required field missing
+           here is not a warning — it is a step that cannot close. -->
+      <div class="step-fields">
+        {#each step.fields ?? [] as f (f.name)}
+          {@const options = optionsFor(f)}
+          <label class="step-field">
+            <span class="step-field-label">
+              {f.name.replace(/_/g, ' ')}{#if f.required}<span
+                  class="step-field-required"
+                  aria-hidden="true">*</span
+                >{/if}
+            </span>
+            {#if options}
+              <select class="step-field-input" bind:value={fieldValues[f.name]}>
+                <option value="">Choose…</option>
+                {#each options as o (o)}
+                  <option value={o}>{o}</option>
+                {/each}
+              </select>
+            {:else}
+              <input
+                class="step-field-input"
+                type="text"
+                bind:value={fieldValues[f.name]}
+                placeholder={f.field_type}
+              />
+            {/if}
+          </label>
+        {/each}
+      </div>
+    {/if}
+
     <div class="step-metadata-display">
       {#each extraMetadataEntries as [k, v] (k)}
         <div class="step-meta-row">
@@ -196,7 +277,10 @@
       <button
         class="step-btn step-btn-primary"
         onclick={() => persist({ status: 'completed' })}
-        disabled={saving}
+        disabled={saving || missingRequired.length > 0}
+        title={missingRequired.length > 0
+          ? `Needs ${missingRequired.map((f) => f.name).join(', ')}`
+          : undefined}
       >
         Complete
       </button>

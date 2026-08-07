@@ -580,7 +580,14 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
             _ => None,
         };
         if let Some(job) = job_for_reeval {
-            match reg.get_active(&job.kind).await {
+            // Resolve the version the Job was OPENED under, not
+            // whatever is active now. A Job materializes its steps once
+            // and keeps them; evaluating those steps against a newer
+            // spec asks predicates about steps the Job never had, and
+            // the length-guard below then bails and the Job stops
+            // advancing — silently, as a Job that simply never closes.
+            // Two feedback Jobs were stranded exactly this way.
+            match reg.get_version(&job.kind, job.job_kind_version).await {
                 Ok(spec) => {
                     if let Ok(mut steps) = state.jobs.list_steps(&job_id).await {
                         // `reevaluate` requires steps in spec order
@@ -669,7 +676,7 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                     // all-steps-terminal case.
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, job_id = %job_id, "re-eval: get_active failed");
+                    tracing::warn!(error = %e, job_id = %job_id, version = job.job_kind_version, "re-eval: pinned JobKind version not resolvable");
                 }
             }
         }

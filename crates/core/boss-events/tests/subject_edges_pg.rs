@@ -348,15 +348,44 @@ async fn pr2_module_edges_are_seeded() {
     .unwrap();
     assert_eq!(jobs, 2, "job subject edges (created + updated)");
 
+    // Top-level, not `kind.holder_id`. `AssetEvent` declares
+    // `#[serde(flatten)] kind: AssetEventKind`, so the variant's
+    // fields land beside `asset_id` and `kind` on the wire is just
+    // the tag string.
+    //
+    // This assertion used to name the prefixed paths, and passed —
+    // the rows existed exactly as written. What it could not see was
+    // that nothing resolved through them: 170 `asset.installed`
+    // events sat unlinked behind a rule that looked correct in the
+    // registry. Pinning the seed's spelling is not the same as
+    // pinning its behavior, so keep the negative below.
     let custody: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM subject_edges \
          WHERE source_kind IN ('asset.shipped', 'asset.installed') \
-           AND field_path = 'kind.holder_id' AND target_kind_path = 'kind.holder_kind'",
+           AND field_path = 'holder_id' AND target_kind_path = 'holder_kind'",
     )
     .fetch_one(&db.pool)
     .await
     .unwrap();
     assert_eq!(custody, 2, "asset custody-pair edges");
+
+    // No asset edge may address a flattened field through `kind.`.
+    // Such a row resolves to NULL for every event it matches and
+    // reports nothing — the failure is silent, which is why it needs
+    // a test rather than a reader.
+    let prefixed: Vec<String> = sqlx::query_scalar(
+        "SELECT source_kind || ' -> ' || field_path FROM subject_edges \
+         WHERE source_kind LIKE 'asset.%' \
+           AND (field_path LIKE 'kind.%' OR target_kind_path LIKE 'kind.%')",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert!(
+        prefixed.is_empty(),
+        "asset edges must address flattened fields at the top level; \
+         these resolve to NULL on every event: {prefixed:?}"
+    );
 
     let commerce: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM subject_edges \

@@ -21,13 +21,17 @@ export type Role = string;
 export type RouteName =
   | 'shop' | 'exec' | 'catalog' | 'accounts' | 'assets' | 'sales' | 'service'
   | 'refurb' | 'parts' | 'products' | 'finance' | 'people' | 'qa' | 'warehouse' | 'support' | 'ops'
-  | 'system-monitoring' | 'inbox' | 'shipping' | 'views'
+  | 'system-monitoring' | 'inbox' | 'shipping' | 'views' | 'system-feedback'
   | 'vendors' | 'marketing-assets' | 'calendar' | 'schedule' | 'jobs'
   // Platform-administration surfaces. Same `permKey: 'it'` gate
   // as the legacy ADMIN footer; these route names exist so the
   // surfaces can land in role-keyed Work lists per the
   // three-axis IA simplifier ("administering is someone's job").
   | 'policy' | 'job-kinds' | 'system-step-plugins' | 'system-dispatcher' | 'system-design'
+  // The executor network — who moves work and where it goes.
+  // Sits beside the dispatcher cascade: same IT audience, different
+  // question (job traffic, not rule wiring).
+  | 'system-os-map'
   // The model-vocabulary surface — SubjectKind taxonomy + Class registry
   // (read-only). Same `it-*` audience as the dispatcher cascade it sits beside.
   | 'system-subjects'
@@ -49,7 +53,7 @@ const ALL: ReadonlyArray<RouteName> = [
   'shipping', 'vendors', 'marketing-assets', 'calendar',
   'schedule', 'jobs',
   'policy', 'job-kinds', 'system-step-plugins', 'system-dispatcher',
-  'system-dispatcher-rules', 'system-dispatcher-rule', 'system-design', 'system-subjects', 'system-model', 'system-kb', 'auth-admin',
+  'system-dispatcher-rules', 'system-dispatcher-rule', 'system-design', 'system-os-map', 'system-subjects', 'system-model', 'system-kb', 'auth-admin',
   'system-experiments',
   'workflows',
 ];
@@ -198,6 +202,9 @@ export function canSeeRoute(role: Role, route: RouteName): boolean {
   // there is nothing to gate. What a View can READ is still policed
   // by the endpoints it reads through.
   if (route === 'views') return true;
+  // Feedback triage is IT work; the board itself is readable by any
+  // operator, and the Job/step writes behind it are policy-gated.
+  if (route === 'system-feedback') return true;
   // Defensive default: a role we don't know about (a freshly-added
   // class registry entry the SPA hasn't been re-bundled for) sees
   // nothing rather than crashing on `.includes` of undefined.

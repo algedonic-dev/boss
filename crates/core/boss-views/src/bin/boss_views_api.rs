@@ -45,6 +45,8 @@ async fn main() -> Result<()> {
 
     let app = boss_views::http::router(boss_views::http::ViewsApiState {
         repo: Arc::new(boss_views::PgViewsRepo::new(pool.clone())),
+        // The OS map reads `event_facts` through the same adapter.
+        os_map: Some(Arc::new(boss_views::PgViewsRepo::new(pool.clone()))),
         resolver: Arc::new(boss_views::PgViewResolver::new(pool, policy)),
     });
     let addr = format!("127.0.0.1:{}", cli.http_port);

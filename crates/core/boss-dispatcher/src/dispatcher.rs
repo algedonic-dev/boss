@@ -174,7 +174,20 @@ pub async fn run_loop(
                 // silently yields all-None fields, so unwrap `payload` first.
                 let inner = envelope.get("payload").cloned().unwrap_or(envelope);
                 let subject = msg.subject.to_string();
-                let outcome = handle_event(&ctx, &subject, &inner).await;
+                // Inherit the triggering event's sim-ness, same as the
+                // rules dispatcher. The assignment path is a SEPARATE
+                // consumer, and it was the last hop losing the marker:
+                // its writes landed `_simulated: false` on simulated
+                // Jobs because nothing here ever set the task-local.
+                let simulated = inner
+                    .get("_simulated")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let outcome = boss_core::sim_origin::with_sim_chain(
+                    simulated,
+                    handle_event(&ctx, &subject, &inner),
+                )
+                .await;
                 // ACK on success; NAK (→ redeliver) on failure; dead-letter
                 // once the redelivery budget is spent. `settle` logs the
                 // failure (a transient NAK is not phrased as the health
@@ -435,6 +448,7 @@ async fn pick_employee(
         let resp = ctx
             .client
             .get(&url)
+            .header("x-sim-origin", sim_origin_value())
             .send()
             .await
             .with_context(|| format!("GET {url}"))?
@@ -467,6 +481,17 @@ async fn pick_employee(
 /// that event fast enough can PUT the assignee into the emit→write window
 /// and 404. The retry rides out that window so the assignment isn't lost;
 /// a step that is genuinely missing still surfaces after the last attempt.
+/// `x-sim-origin` for a downstream call, read from the task-local the
+/// event loop set from the triggering event. Mirrors the handlers'
+/// helper; kept local because this crate does not depend on them.
+pub(crate) fn sim_origin_value() -> &'static str {
+    if boss_core::sim_origin::is_in_sim_chain() {
+        "true"
+    } else {
+        "false"
+    }
+}
+
 async fn assign(ctx: &DispatcherCtx, job_id: &str, step_id: &str, emp_id: &str) -> Result<()> {
     const MAX_ATTEMPTS: u32 = 4;
     let url = format!(
@@ -482,6 +507,9 @@ async fn assign(ctx: &DispatcherCtx, job_id: &str, step_id: &str, emp_id: &str) 
         let resp = ctx
             .client
             .put(&url)
+            // Per-call, not a default header: the identity is constant
+            // but sim-ness belongs to the event being handled.
+            .header("x-sim-origin", sim_origin_value())
             .json(&body)
             .send()
             .await

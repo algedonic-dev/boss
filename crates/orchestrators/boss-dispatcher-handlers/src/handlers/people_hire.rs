@@ -98,6 +98,7 @@ impl Handler for PeopleHire {
                 "x-boss-user",
                 common::dispatcher_actor_header(&ctx.rule_name),
             )
+            .header("x-sim-origin", common::sim_origin_value())
             .json(&body)
             .send()
             .await

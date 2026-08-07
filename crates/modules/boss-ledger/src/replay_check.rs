@@ -144,19 +144,11 @@ pub async fn replay_check_from_audit_log(
     // Now project facts → entries, scoped to open periods (mirrors
     // `rebuild`'s behavior). Only facts within open-period dates
     // re-post; locked-period facts stay untouched.
-    let fact_rows = sqlx::query(
-        "SELECT f.id, f.kind, f.happened_on, f.payload \
-         FROM financial_facts f \
-         LEFT JOIN gl_periods p \
-            ON p.kind = 'month' \
-           AND f.happened_on BETWEEN p.starts_on AND p.ends_on \
-         WHERE (p.id IS NULL OR p.status = 'open') \
-           AND f.supersede_reason IS NULL \
-         ORDER BY f.happened_on, f.recorded_at",
-    )
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|e| LedgerError::Storage(e.to_string()))?;
+    let fact_rows = sqlx::query(crate::postgres::OPEN_PERIOD_FACTS_SQL)
+        .bind(crate::postgres::PERIOD_CLOSED_FACT)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| LedgerError::Storage(e.to_string()))?;
 
     for row in &fact_rows {
         let id: Uuid = row.get("id");
@@ -443,19 +435,11 @@ pub async fn replay_check(pool: &PgPool) -> Result<ReplayCheckReport, LedgerErro
     // check's duration.
     create_replay_shadows(&mut tx, false).await?;
 
-    let fact_rows = sqlx::query(
-        "SELECT f.id, f.kind, f.happened_on, f.payload \
-         FROM financial_facts f \
-         LEFT JOIN gl_periods p \
-            ON p.kind = 'month' \
-           AND f.happened_on BETWEEN p.starts_on AND p.ends_on \
-         WHERE (p.id IS NULL OR p.status = 'open') \
-           AND f.supersede_reason IS NULL \
-         ORDER BY f.happened_on, f.recorded_at",
-    )
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|e| LedgerError::Storage(e.to_string()))?;
+    let fact_rows = sqlx::query(crate::postgres::OPEN_PERIOD_FACTS_SQL)
+        .bind(crate::postgres::PERIOD_CLOSED_FACT)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| LedgerError::Storage(e.to_string()))?;
 
     let mut facts_replayed: u64 = 0;
     for row in &fact_rows {

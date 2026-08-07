@@ -157,11 +157,18 @@ impl Handler for JobsSpawn {
         });
 
         let url = format!("{}/api/jobs", self.jobs_base.trim_end_matches('/'));
+        // The spawned Job inherits the triggering event's sim-ness.
+        // Without this header jobs-api sees no sim chain and records
+        // the Job as real — and because a Job's `simulated` bit is
+        // immutable once written, a restock spawned by the simulated
+        // brewery became a permanent real Job that the epoch trim
+        // would never collect.
         let resp = self
             .client
             .post(&url)
             .header("Content-Type", "application/json")
             .header("x-boss-user", user_header.as_str())
+            .header("x-sim-origin", crate::dispatcher::sim_origin_value())
             .json(&body)
             .send()
             .await
@@ -219,6 +226,7 @@ impl Handler for JobsSpawn {
                 .put(&step_url)
                 .header("Content-Type", "application/json")
                 .header("x-boss-user", user_header.as_str())
+                .header("x-sim-origin", crate::dispatcher::sim_origin_value())
                 .json(&put_body)
                 .send()
                 .await
