@@ -1,13 +1,14 @@
 // Current-user session.
 //
-// Resolution order:
-//   1. Gateway `/api/session` → resolved `employee_id` → Employee row
-//   2. Demo-mode localStorage persona override
-//   3. Fallback to the first active employee (first-boot safety net)
+// One source: the gateway's `/api/session`, resolved to an Employee
+// row. No session means unauthenticated — there is no fallback that
+// invents an identity, because the fallback that used to be here is
+// what let the chrome disagree with the server about who you were.
 //
-// The `setPersona` path writes to localStorage so a refresh keeps
-// the chosen persona; selecting one flips off the "from gateway"
-// bit so the header shows "viewing as … (demo)" cleanly.
+// `setPersona` survives for `bun run dev` and the smoke suite, where
+// there is no gateway to issue a session. The dev-server reads the
+// cookie it writes and synthesises `x-boss-user` from it. The gateway
+// ignores it entirely.
 
 const STORAGE_KEY = 'boss.persona.empId';
 const DEFAULT_EMP_ID = 'emp-001'; // CEO
@@ -28,18 +29,6 @@ function writePersonaCookie(id: string): void {
   // server is http.
   document.cookie = `${PERSONA_COOKIE}=${encodeURIComponent(id)}; path=/; max-age=2592000; SameSite=Lax`;
 }
-
-// BOSS_DEMO_MODE is baked in by the build step. Default true so that
-// bun-run-dev works without a gateway; prod sets it to '0'.
-export const DEMO_MODE: boolean = (() => {
-  try {
-    return (process as unknown as { env?: Record<string, string> }).env?.[
-      'BOSS_DEMO_MODE'
-    ] !== '0';
-  } catch {
-    return true;
-  }
-})();
 
 export type Certification = {
   name: string;
@@ -139,38 +128,14 @@ export async function loadSession(): Promise<void> {
     // Network failure → fall through to demo-mode path
   }
 
-  // 3. Demo-mode fallback.
-  if (DEMO_MODE && byId.has(storedPersona)) {
-    session.fromGateway = false;
-    session.value = { kind: 'ready', user: byId.get(storedPersona)! };
-    // Mirror the chosen persona into the cookie so the gateway's
-    // role_headers middleware sees the same id the SPA renders
-    // as. Without this, `session.value.user.id` is the brewery
-    // employee but `x-boss-user.id` stays "demo@anonymous", and
-    // every "you can only act as yourself" check (messages
-    // send, inbox read) returns 403.
-    writePersonaCookie(storedPersona);
-  } else if (DEMO_MODE && roster.length > 0) {
-    session.fromGateway = false;
-    // Prefer the CEO for the first-impression demo experience —
-    // the playground's "what does Boss look like" page should
-    // open as the operator, not as an audit-readonly system
-    // account (which sorts alphabetically first as `emp-audit`
-    // and otherwise wins via roster[0]).
-    const preferred =
-      roster.find((e) => e.role === 'ceo') ??
-      roster.find((e) => e.role === 'cto') ??
-      roster.find((e) => e.role === 'coo') ??
-      roster.find((e) => !['audit-readonly', 'system'].includes(e.role)) ??
-      roster[0]!;
-    session.value = { kind: 'ready', user: preferred };
-    // Same persona-cookie mirroring as the storedPersona branch
-    // above — pin the backend's view of "who is this request" to
-    // the brewery employee the SPA is rendering as.
-    writePersonaCookie(preferred.id);
-  } else {
-    session.value = { kind: 'unauthenticated' };
-  }
+  // No session, no user. There used to be a demo-mode fallback here
+  // that rendered a persona from localStorage — or, failing that, the
+  // CEO — for anyone the gateway could not resolve. It is why a
+  // read-only visitor saw an executive's name in the chrome while
+  // every write returned 403, and it is the last piece of the mode
+  // that made "who am I" a different question from "who does the
+  // server think I am".
+  session.value = { kind: 'unauthenticated' };
 }
 
 export function setPersona(id: string): void {

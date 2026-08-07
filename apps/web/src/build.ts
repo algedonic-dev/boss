@@ -115,8 +115,6 @@ console.log(`codegen: wrote _generated/ports.ts (${ports.length} services)`);
 // Demo mode defaults ON. The public OSS playground wants Demo Mode
 // (audit-readonly default + always-visible PersonaSwitcher + amber
 // "Demo Mode · read-only" badge) baked into every default build.
-// Real-tenant deploys opt out with `BOSS_DEMO_MODE=0`.
-const demoMode = process.env['BOSS_DEMO_MODE'] !== '0';
 const development = process.env['BOSS_DEV'] === '1';
 
 // publicPath controls how the bundler rewrites asset URLs in the
@@ -130,14 +128,13 @@ const result = await Bun.build({
   outdir: OUT,
   target: 'browser',
   minify: !development,
-  sourcemap: demoMode || development ? 'linked' : 'none',
+  sourcemap: 'linked',
   publicPath,
   // Splits dynamic imports (`import('react')`) into their own chunks
   // so the React runtime only loads on pages that mount a plugin-
   // backed step. See src/steps/reactRuntime.ts.
   splitting: true,
   define: {
-    'process.env.BOSS_DEMO_MODE': JSON.stringify(demoMode ? '1' : '0'),
   },
   plugins: [SveltePlugin({ development })],
 });

@@ -267,23 +267,23 @@ if [[ "$START" -eq 1 ]]; then
     # Gateway last — depends on every other service being reachable.
     # Anonymous visitors get 401 and are sent to /login.
     #
-    # BOSS_DEMO_MODE marks this stack as a demo rather than a real
-    # tenant. Two things read it: the brewery SIMULATOR decides whether
-    # to run (infra/sim/boss-brewery-sim.service), and the gateway
-    # decides whether /login offers the read-only guest button. One
-    # flag, because it answers one question — a second variable would
-    # be a second way to say "this is a demo" and the two would drift.
+    # BOSS_GUEST_ACCESS answers one question: does /login offer a
+    # read-only guest session? A local playground says yes.
     #
-    # It used to do something else here: mint an `audit-readonly`
-    # session for anyone arriving without a valid cookie, so the
-    # playground rendered without a signup. That made an EXPIRED login
-    # indistinguishable from a permissions problem — the cookie it
-    # minted replaced the real one, so an operator stayed apparently
-    # logged in while silently downgraded to read-only, and every write
-    # came back 403. The guest session is the same access, granted only
-    # when somebody clicks for it.
+    # This was BOSS_DEMO_MODE, which also decided whether the brewery
+    # simulator ran — one variable for two unrelated questions, so
+    # turning off synthetic activity silently withdrew guest access.
+    # Whether the sim runs is now answered by whether its unit is
+    # enabled.
+    #
+    # Earlier still, the same flag made the gateway MINT an
+    # audit-readonly session for anyone arriving without a cookie.
+    # That made an expired login indistinguishable from a permissions
+    # problem: the mint replaced the real cookie, so an operator
+    # stayed apparently signed in while silently downgraded, and every
+    # write came back 403.
     GW_ENV="$SVC_ENV"
-    GW_ENV="$GW_ENV BOSS_DEMO_MODE=1"
+    GW_ENV="$GW_ENV BOSS_GUEST_ACCESS=1"
     GW_ENV="$GW_ENV BOSS_LISTEN=127.0.0.1:4443"
     GW_ENV="$GW_ENV BOSS_STATIC_DIR=$REPO_ROOT/apps/web/dist"
     GW_ENV="$GW_ENV BOSS_AUTH_PROVIDER=local-auth"

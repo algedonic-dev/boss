@@ -999,7 +999,7 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]] \
         echo "  !! GATEWAY NOT RESPONDING ($gw_code) — the public face will show the" >&2
         echo "     'demo regenerating' splash until :4443 is up. Investigate boss-gateway." >&2
     fi
-    # The sim (also unmanaged here) gates on BOSS_DEMO_MODE; flag it if a
+    # The sim (also unmanaged here) runs iff its unit is enabled; flag it if a
     # demo host left it down, but don't force-start (non-demo deploys
     # intentionally leave it off).
     if systemctl is-enabled --quiet boss-brewery-sim.service 2>/dev/null \

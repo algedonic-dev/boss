@@ -23,14 +23,13 @@ Environment=BOSS_SIM_SEEDS_DIR=/opt/boss/examples/brewery/seeds
 # scans). Must match the dispatcher's BOSS_EVENT_WEBHOOK_URL host:port; unset →
 # zero collections fire and AR balloons.
 Environment=BOSS_SIM_CALLBACK_BIND=127.0.0.1:7099
-# BOSS_DEMO_MODE gates whether the brewery simulator runs. A real
-# tenant (BOSS_DEMO_MODE=0 or unset) has real activity flowing
-# through Jobs; running the synthetic sim alongside that would
-# double-book everything. ExecStartPre exits 0 to skip the unit
-# silently when demo mode is off — the unit shows as activating
-# briefly then deactivates without producing an error in journal.
-ExecStartPre=/bin/sh -c '[ "${BOSS_DEMO_MODE:-0}" = "1" ] || { echo "BOSS_DEMO_MODE not set; sim will not start." >&2; exit 0; }'
-ExecStartPre=/bin/sh -c '[ "${BOSS_DEMO_MODE:-0}" = "1" ] || exit 1'
+# Whether the simulator runs is answered by whether this unit is
+# installed and enabled — nothing else. It used to carry a second
+# gate on an env flag, so an enabled unit could still silently
+# decline to start, and that same flag separately decided whether the
+# gateway offered guest sign-in: one variable answering two unrelated
+# questions, neither guessable from its name. A tenant that does not
+# want synthetic activity does not enable the unit.
 ExecStart=/usr/local/bin/boss-brewery-sim
 # on-failure also restarts on the daemon's deliberate exit(75): after a
 # config Apply (POST /simulator/api/config) — the "edit + restart"

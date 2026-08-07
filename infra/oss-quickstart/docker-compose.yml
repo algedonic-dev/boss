@@ -133,7 +133,7 @@ services:
       # still available at /login: bootstrap-admin email + password
       # upgrades the session to platform-admin (full write access).
       # Real-tenant deployments should remove this line.
-      BOSS_DEMO_MODE: "1"
+      BOSS_GUEST_ACCESS: "1"
       # Tenant manifest the gateway loads for /api/finance/revenue-categories
       # and other tenant-scoped lookups. The docker image carries the
       # brewery seeds at /opt/boss/examples/brewery/seeds/; production

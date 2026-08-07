@@ -110,12 +110,16 @@ async fn main() -> Result<()> {
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .context("local-auth http client")?,
-            // Guest browsing rides on the flag that already means
-            // "this deployment is a demo, not a tenant's real
-            // company" — the brewery simulator gates on the same
-            // one. A second variable would be a second way to
-            // answer one question, and the two would drift.
-            guest_access: std::env::var("BOSS_DEMO_MODE").as_deref() == Ok("1"),
+            // One flag, one question: does this deployment hand out
+            // a read-only session to anyone who asks?
+            //
+            // This rode on BOSS_DEMO_MODE, on the reasoning that a
+            // demo is exactly where guest browsing belongs. That was
+            // wrong in the way shared flags usually are — the same
+            // variable also decided whether the simulator ran, so
+            // turning off synthetic activity silently withdrew guest
+            // access, and neither effect was visible from the name.
+            guest_access: std::env::var("BOSS_GUEST_ACCESS").as_deref() == Ok("1"),
         }))
     } else {
         None
@@ -757,13 +761,22 @@ mod routing_tests {
 
     #[tokio::test]
     async fn unmatched_api_path_is_a_json_404() {
-        // The real miss that prompted this: the plausible-looking
-        // spelling of `/api/workflows`.
-        let (status, body) = get(app(), "/api/workflows").await;
+        // A path that looks right and is not. `/api/job-kinds` is the
+        // pre-rename spelling of `/api/workflows`, so it is exactly
+        // what a stale client or a habit types — and it must miss
+        // loudly rather than be answered with the SPA.
+        //
+        // The probe used to BE `/api/job-kinds`, chosen for the same
+        // reason when the real route was `/api/jobs/kinds`. The
+        // rename turned the deliberately-wrong path into the correct
+        // one and the test asserted a 404 on a live route; a probe
+        // for "this must not resolve" has to be re-chosen whenever
+        // the thing it was avoiding moves.
+        let (status, body) = get(app(), "/api/job-kinds").await;
         assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
         assert!(body.contains(MISS), "body: {body}");
         assert!(
-            body.contains("/api/workflows"),
+            body.contains("/api/job-kinds"),
             "the 404 should name the path that missed: {body}"
         );
         assert!(

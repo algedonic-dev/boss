@@ -12,7 +12,6 @@
   import { canSeeRoute, type RouteName, type Role } from '@boss/web-kit/session/permissions';
   import { workForRole } from '@boss/web-kit/session/work-by-role';
   import { navigate } from '../router';
-  import PersonaSwitcher from '../session/PersonaSwitcher.svelte';
   import {
     ROUTE_CATALOG,
     type AppId,
@@ -273,7 +272,6 @@
          so it renders here but floats independently of the layout.
          The system-time + sign-in chrome moved up to the perspective
          tab bar; the old topbar is gone. -->
-    <PersonaSwitcher />
     <div class="shell-content">
       {@render children()}
     </div>

@@ -13,7 +13,7 @@
 #   4. Insert the bootstrap-admin Employee with role='platform-admin'
 #      so the operator has full permissions out of the box.
 #   5. Start every service as a background process (PIDs in ~/.boss-pids)
-#      including boss-gateway with BOSS_DEMO_MODE=1 +
+#      including boss-gateway with BOSS_GUEST_ACCESS=1 +
 #      BOSS_AUTH_PROVIDER=local-auth. Operator opens
 #      http://127.0.0.1:4443 and is in — anonymous visitors get
 #      `audit-readonly` (everything renders, no writes); log in
@@ -23,7 +23,7 @@
 # What this is NOT: a production setup. The gateway runs the
 # file-backed local-auth provider (Argon2id-hashed credentials,
 # signed session cookies, admin-issued password reset tokens)
-# next to BOSS_DEMO_MODE — real auth gates writes, demo mode
+# next to BOSS_GUEST_ACCESS — real auth gates writes, guest access
 # gates reads. No SSO, no MFA, no account lockout, no rate
 # limiting, no edge-tier hardening. This is the OSS evaluation
 # path; production-grade deployments are tracked under the
