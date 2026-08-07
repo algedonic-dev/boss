@@ -67,50 +67,77 @@ impl Handler for MessagesNotify {
         ctx: &InvocationContext,
     ) -> Result<(), HandlerError> {
         let ev = StepEvent::from_payload(&ctx.event_payload)?;
-        // `authority_role` lives in the step's metadata. No role => a
-        // generic / outcome step an operator picks off a queue; nothing
-        // to route, so no-op.
-        let Some(role) = ev
+
+        // An ASSIGNEE wins over a role, and a step with neither is the
+        // only no-op.
+        //
+        // This used to key on `authority_role` alone, reasoning that a
+        // step without one was "generic — an operator picks it off a
+        // queue". That is true of outcome steps and false of the
+        // `task` StepType, which is documented as "Simple assigned
+        // task for HR, IT, admin" with `required_roles = []`:
+        // assignment IS its routing mechanism. So filing a task FOR
+        // someone told them nothing, and the manual notification the
+        // Job model exists to remove had to be sent by hand.
+        //
+        // The assignee takes precedence because it is the more
+        // specific claim: a role says someone like you should do this,
+        // an assignee says you specifically.
+        //
+        // Measured before changing it: of 39,347 steps, 2,550 carry an
+        // assignee and no role, and 2,525 of those are on simulated
+        // Jobs — about 14 extra messages per sim-day, in a system
+        // already sending thousands. Proportionate, not a storm.
+        let recipient_id: Option<String> = ev.assignee_id.map(str::to_string);
+        let role = ev
             .metadata
             .get("authority_role")
             .and_then(|v| v.as_str())
-            .filter(|r| !r.is_empty())
-        else {
+            .filter(|r| !r.is_empty());
+        if recipient_id.is_none() && role.is_none() {
             return Ok(());
-        };
-
-        // Resolve the role to its active members; notify the
-        // deterministic on-call member (lowest id), mirroring the
-        // assignment pick so the recipient is a stable choice.
-        let people_url = format!(
-            "{}/api/people?role={}&status=active",
-            self.people_base.trim_end_matches('/'),
-            role,
-        );
-        let resp = self
-            .client
-            .get(&people_url)
-            .header("x-boss-user", dispatcher_reader_header())
-            .header("x-sim-origin", sim_origin_value())
-            .send()
-            .await
-            .map_err(|e| HandlerError::Downstream(format!("GET {people_url}: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(HandlerError::Downstream(format!(
-                "GET {people_url} returned {status}: {body}"
-            )));
         }
-        let mut emps: Vec<EmployeeLite> = resp
-            .json()
-            .await
-            .map_err(|e| HandlerError::Downstream(format!("people response not JSON: {e}")))?;
-        emps.sort_by(|a, b| a.id.cmp(&b.id));
-        // No active member in the role — leave it for the pull-side role
-        // queue; nothing to notify.
-        let Some(recipient) = emps.first() else {
-            return Ok(());
+
+        // With an assignee, there is nothing to resolve — that IS the
+        // recipient. Only the role path needs a lookup.
+        let (recipient, waiting_on) = match (&recipient_id, role) {
+            (Some(id), _) => (id.clone(), format!("assigned to {id}")),
+            (None, Some(r)) => {
+                // Resolve the role to its active members; notify the
+                // deterministic on-call member (lowest id), mirroring
+                // the assignment pick so the recipient is stable.
+                let people_url = format!(
+                    "{}/api/people?role={}&status=active",
+                    self.people_base.trim_end_matches('/'),
+                    r,
+                );
+                let resp = self
+                    .client
+                    .get(&people_url)
+                    .header("x-boss-user", dispatcher_reader_header())
+                    .header("x-sim-origin", sim_origin_value())
+                    .send()
+                    .await
+                    .map_err(|e| HandlerError::Downstream(format!("GET {people_url}: {e}")))?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(HandlerError::Downstream(format!(
+                        "GET {people_url} returned {status}: {body}"
+                    )));
+                }
+                let mut emps: Vec<EmployeeLite> = resp.json().await.map_err(|e| {
+                    HandlerError::Downstream(format!("people response not JSON: {e}"))
+                })?;
+                emps.sort_by(|a, b| a.id.cmp(&b.id));
+                // No active member in the role — leave it for the
+                // pull-side role queue; nothing to notify.
+                let Some(first) = emps.first() else {
+                    return Ok(());
+                };
+                (first.id.clone(), format!("waiting on the {r} team"))
+            }
+            (None, None) => return Ok(()),
         };
 
         // Name the Subject, not just the step kind. Seven feedback
@@ -119,9 +146,9 @@ impl Handler for MessagesNotify {
         // reads the same is a list you scroll past.
         let subject = format!("Ready: {} — {}", ev.kind, ev.subject_id);
         let body = format!(
-            "A '{}' step is ready on {} {}, waiting on the {} team. \
+            "A '{}' step is ready on {} {}, {}. \
              Opening this message goes straight to the step.",
-            ev.kind, ev.subject_kind, ev.subject_id, role
+            ev.kind, ev.subject_kind, ev.subject_id, waiting_on
         );
         let msg = json!({
             // Deterministic id `notify:{step_id}:{recipient}`. A
@@ -130,9 +157,9 @@ impl Handler for MessagesNotify {
             // on the messages `ON CONFLICT (id) DO NOTHING` insert instead
             // of stacking a duplicate inbox row. Per-recipient so a future
             // role-fan-out keys cleanly; one row per (step, recipient).
-            "id": format!("notify:{}:{}", ev.step_id, recipient.id),
+            "id": format!("notify:{}:{}", ev.step_id, recipient),
             "sender_id": "automation:dispatcher",
-            "recipient_id": recipient.id,
+            "recipient_id": recipient,
             "subject": subject,
             "body": body,
             "kind": "signal",
@@ -254,6 +281,67 @@ mod tests {
     /// so it must open that step. Linking to the Job leaves the reader
     /// to find it again among the others — work the message already
     /// did.
+    /// The defect this handler was filed for. A `task` step is
+    /// documented as "Simple assigned task for HR, IT, admin" with
+    /// `required_roles = []` — assignment IS its routing mechanism —
+    /// and this handler used to key on `authority_role` alone, so
+    /// filing a task FOR someone told them nothing.
+    ///
+    /// Caught by the inbox rather than by code: two backlog-items with
+    /// gated triage steps notified automatically, while two ad-hoc
+    /// tasks assigned to the same person needed a message sent by
+    /// hand.
+    #[tokio::test]
+    async fn an_assigned_step_notifies_its_assignee_with_no_role() {
+        let (people, messages, captured) = mock_services().await;
+        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        let mut payload = ready_payload();
+        payload["assignee_id"] = serde_json::json!("emp-bootstrap-admin");
+        // No authority_role at all — the case that used to be a no-op.
+        payload["metadata"] = serde_json::json!({});
+        h.invoke(&[], &ctx(payload)).await.expect("notify");
+
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a message was sent");
+        assert_eq!(sent["recipient_id"], "emp-bootstrap-admin");
+    }
+
+    /// An assignee is the more specific claim: a role says someone
+    /// like you should do this, an assignee says you specifically. So
+    /// when both are present the person wins, and the role's on-call
+    /// member (emp-aa in the mock) is NOT the recipient.
+    #[tokio::test]
+    async fn the_assignee_wins_over_the_role() {
+        let (people, messages, captured) = mock_services().await;
+        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        let mut payload = ready_payload();
+        payload["assignee_id"] = serde_json::json!("emp-named");
+        h.invoke(&[], &ctx(payload)).await.expect("notify");
+
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a message was sent");
+        assert_eq!(sent["recipient_id"], "emp-named");
+        assert_ne!(sent["recipient_id"], "emp-aa");
+    }
+
+    /// Neither signal is still the only no-op. Outcome steps an
+    /// operator picks off a queue must not generate an inbox row each.
+    #[tokio::test]
+    async fn a_step_with_neither_assignee_nor_role_stays_silent() {
+        let (people, messages, captured) = mock_services().await;
+        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        let mut payload = ready_payload();
+        payload["metadata"] = serde_json::json!({});
+        h.invoke(&[], &ctx(payload)).await.expect("no-op");
+        assert!(captured.lock().unwrap().is_none(), "nothing should be sent");
+    }
+
     #[tokio::test]
     async fn links_to_the_step_not_the_job() {
         let (people, messages, captured) = mock_services().await;
@@ -328,9 +416,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_authority_role_is_noop() {
-        // metadata present but no authority_role -> Ok without any HTTP
-        // call (the URLs are unreachable; a call would error).
+    async fn neither_signal_makes_no_http_call_at_all() {
+        // Renamed from `no_authority_role_is_noop`, which became an
+        // overclaim: a step with no authority_role but WITH an assignee
+        // now notifies. The narrower truth this still proves is the
+        // valuable one — with neither signal the handler returns
+        // without touching the network, since the URLs are unreachable
+        // and any call would error.
         let h = MessagesNotify::new("http://127.0.0.1:1", "http://127.0.0.1:1");
         let payload = serde_json::json!({
             "job_id": "11111111-1111-1111-1111-111111111111",
