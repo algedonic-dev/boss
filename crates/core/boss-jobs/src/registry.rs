@@ -306,6 +306,195 @@ fn job_kind_design_spec() -> JobKindSpec {
     spec
 }
 
+/// Build the canonical `ship-a-change` JobKindSpec.
+///
+/// Shipping is work, so it is a Job — the same argument feedback got.
+/// What it buys here is different, though: a Job gives a change an
+/// owner, a recorded decision about its boundary, and a place in the
+/// same throughput view as everything else the team does. `/system/flow`
+/// counts these against a cadence target without a second mechanism.
+///
+/// The Subject is a `custom` Subject whose id is the branch name, the
+/// shape feedback uses for a route and design-doc-review uses for a
+/// path. "What shipped on this branch" then answers from Subject
+/// history rather than from a report someone writes.
+///
+/// ## Why `scope` comes first, and is gated on a person
+///
+/// The problem this kind exists to solve is that a PR's boundary gets
+/// decided at the END, when whoever is working is tired and everything
+/// is already entangled. The branch that added this spec is the
+/// evidence: one PR carrying a guest sign-in, a dispatcher fix, a
+/// ledger determinism fix and two new surfaces, because nothing ever
+/// asked where it should have been cut.
+///
+/// So the first step is a human declaring what this change contains
+/// and what it deliberately leaves out, BEFORE the work. `excludes` is
+/// required for exactly that reason: naming what you are not doing is
+/// the act that keeps a change small, and a field nobody has to fill
+/// in would be filled in never. It is the split point, made a state
+/// transition instead of a judgement call.
+///
+/// Step graph:
+///  -1. `opened`  — someone started a change
+///   0. `scope`   — declare the boundary (human-gated)
+///   1. `build`   — the change, with the test that fails without it
+///   2. `gate`    — everything green, and observed working
+///   3. `review`  — opened for review, url recorded
+///   999. `merged`/`abandoned` — outcomes
+fn ship_a_change_spec() -> JobKindSpec {
+    let steps = vec![
+        StepSpec {
+            title: "opened".into(),
+            kind: "trigger".into(),
+            ready_when: "true".into(),
+            title_template: "Change started".into(),
+            metadata_defaults: serde_json::json!({
+                "trigger_kind": "operator",
+                "trigger_name": "operator-starts-a-change",
+            }),
+            ..Default::default()
+        },
+        StepSpec {
+            title: "scope".into(),
+            kind: "task".into(),
+            ready_when: "steps.opened.done".into(),
+            title_template: "Declare the boundary".into(),
+            // Human-gated for the same reason triage is: `task` carries
+            // no required role, and an ungated ready step gets
+            // role-matched and completed by the simulated workforce. A
+            // scope nobody chose is worse than no scope step, because
+            // the audit trail then says someone decided.
+            authority_role: Some("platform-admin".into()),
+            fields: vec![
+                boss_core::job::StepField {
+                    name: "summary".into(),
+                    field_type: "string".into(),
+                    required: true,
+                },
+                // Required, deliberately. See the doc comment: the
+                // sentence that keeps a change small is the one about
+                // what it is not doing, and an optional field for it
+                // would be skipped every time under exactly the
+                // conditions that need it.
+                boss_core::job::StepField {
+                    name: "excludes".into(),
+                    field_type: "string".into(),
+                    required: true,
+                },
+            ],
+            ..Default::default()
+        },
+        StepSpec {
+            title: "build".into(),
+            kind: "task".into(),
+            ready_when: "steps.scope.done".into(),
+            title_template: "Build it".into(),
+            authority_role: Some("platform-admin".into()),
+            fields: vec![
+                // The test that fails without the change. Named rather
+                // than checkboxed: "tests pass" is true of a change
+                // with no test, and a name is something a reviewer can
+                // go read.
+                boss_core::job::StepField {
+                    name: "test".into(),
+                    field_type: "string".into(),
+                    required: true,
+                },
+            ],
+            ..Default::default()
+        },
+        StepSpec {
+            title: "gate".into(),
+            kind: "task".into(),
+            ready_when: "steps.build.done".into(),
+            title_template: "Green, and observed working".into(),
+            authority_role: Some("platform-admin".into()),
+            fields: vec![
+                boss_core::job::StepField {
+                    name: "gates".into(),
+                    field_type: "string".into(),
+                    required: true,
+                },
+                // How the change was seen working on a running system
+                // — or why there is nothing to observe. Required
+                // because "the tests passed" and "the operator can use
+                // it" came apart repeatedly: a deploy that copied a
+                // stale binary, a fix reported from a green suite while
+                // the running service still had the bug.
+                boss_core::job::StepField {
+                    name: "verified".into(),
+                    field_type: "string".into(),
+                    required: true,
+                },
+            ],
+            ..Default::default()
+        },
+        StepSpec {
+            title: "review".into(),
+            kind: "task".into(),
+            ready_when: "steps.gate.done".into(),
+            title_template: "Open for review".into(),
+            authority_role: Some("platform-admin".into()),
+            fields: vec![boss_core::job::StepField {
+                name: "pr_url".into(),
+                field_type: "string".into(),
+                required: true,
+            }],
+            ..Default::default()
+        },
+        StepSpec {
+            title: "merged".into(),
+            kind: "outcome".into(),
+            ready_when: "steps.review.done".into(),
+            title_template: "Merged".into(),
+            metadata_defaults: serde_json::json!({ "outcome_kind": "completed" }),
+            terminal: Some(Terminal {
+                outcome: "merged".into(),
+            }),
+            ..Default::default()
+        },
+        // A change that gets abandoned is a real outcome and the
+        // cadence view should be able to tell it apart from one still
+        // in flight. Ready from `scope` onward: anything can be
+        // dropped after its boundary is known, and dropping it before
+        // that is just not starting.
+        StepSpec {
+            title: "abandoned".into(),
+            kind: "outcome".into(),
+            ready_when: "steps.scope.done".into(),
+            title_template: "Abandoned".into(),
+            metadata_defaults: serde_json::json!({ "outcome_kind": "aborted" }),
+            terminal: Some(Terminal {
+                outcome: "abandoned".into(),
+            }),
+            ..Default::default()
+        },
+    ];
+
+    let mut spec = JobKindSpec::platform_seed(
+        "ship-a-change",
+        "Ship a change",
+        "platform",
+        vec!["custom".into()],
+        steps,
+    );
+    // Same owner as the other platform meta-kinds — and what puts
+    // these Jobs on `/system/flow`, which selects by owner_role rather
+    // than by a list of kinds.
+    spec.metadata = serde_json::json!({ "owner_role": "platform-admin" });
+    spec.description = Some(
+        "One change, from declaring its boundary to merging it. The Subject is a `custom` \
+         Subject whose id is the branch, so \"what shipped here\" is a Subject-history \
+         question. The `scope` step is the point of the kind: it asks a person what the \
+         change contains and what it deliberately excludes BEFORE the work, which is the \
+         only moment that decision keeps a PR small. Counted on /system/flow, so a cadence \
+         target needs no second mechanism."
+            .to_string(),
+    );
+    spec
+}
+
 /// Every JobKind that ships baked into the platform binary. Read by
 /// `boss-jobs-api`'s startup reconciler — `kind_registry
 /// .bootstrap_reconcile(&platform_kinds())` runs on every boot,
@@ -322,6 +511,7 @@ pub fn platform_kinds() -> Vec<JobKindSpec> {
         job_kind_design_spec(),
         design_doc_review_spec(),
         user_feedback_spec(),
+        ship_a_change_spec(),
     ]
 }
 
@@ -3085,9 +3275,38 @@ mod tests {
         let kinds = platform_kinds();
         assert_eq!(
             kinds.len(),
-            3,
-            "ships job-kind-design + design-doc-review + user-feedback"
+            4,
+            "ships job-kind-design + design-doc-review + user-feedback + ship-a-change"
         );
+
+        // The boundary declaration is the whole point of the kind, so
+        // it gets pinned rather than left to the generic viability
+        // lint. `excludes` optional would make the step completable
+        // without saying what the change leaves out, which is the one
+        // sentence that keeps a change small.
+        let ship = kinds
+            .iter()
+            .find(|k| k.kind == "ship-a-change")
+            .expect("ship-a-change present");
+        let scope = ship
+            .steps
+            .iter()
+            .find(|s| s.title == "scope")
+            .expect("scope step present");
+        assert_eq!(
+            scope.authority_role.as_deref(),
+            Some("platform-admin"),
+            "an ungated scope step gets role-matched and completed by the simulated \
+             workforce, and the audit trail then says a person chose the boundary"
+        );
+        for field in ["summary", "excludes"] {
+            let f = scope
+                .fields
+                .iter()
+                .find(|f| f.name == field)
+                .unwrap_or_else(|| panic!("scope declares `{field}`"));
+            assert!(f.required, "`{field}` is required at done");
+        }
 
         let design = kinds
             .iter()
