@@ -47,7 +47,13 @@ ALLOW = {
 CALL = re.compile(r"\.(post|get)\(\s*&?(url|[a-z_]*url)\b")
 
 failures = []
-for path in sorted(handlers.glob("*.rs")) + sorted(assignment.glob("*.rs")):
+# rglob, not glob. The assignment path was added here after it leaked
+# sim-origin, and `glob("*.rs")` reads the top of `boss-dispatcher/src`
+# only — so `src/rules/jobs_spawn.rs` stayed invisible and leaked the
+# same header for the same reason, on 55 events across three kinds.
+# A check that covers one directory of a tree reports "ok" for the
+# rest of it.
+for path in sorted(handlers.rglob("*.rs")) + sorted(assignment.rglob("*.rs")):
     if path.name in ALLOW:
         continue
     src = path.read_text()

@@ -484,7 +484,7 @@ async fn pick_employee(
 /// `x-sim-origin` for a downstream call, read from the task-local the
 /// event loop set from the triggering event. Mirrors the handlers'
 /// helper; kept local because this crate does not depend on them.
-fn sim_origin_value() -> &'static str {
+pub(crate) fn sim_origin_value() -> &'static str {
     if boss_core::sim_origin::is_in_sim_chain() {
         "true"
     } else {

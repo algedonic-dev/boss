@@ -38,10 +38,16 @@ impl InventoryHelpers {
         url: &str,
         helper: &str,
     ) -> Result<T, EvalError> {
+        // A read emits nothing, so this header changes no recorded
+        // fact today. It is stamped anyway to keep the rule without
+        // exceptions: "every dispatcher call declares its origin" is
+        // a rule anyone can apply, whereas "…except reads, unless the
+        // service logs them" is one people get wrong.
         let req = self
             .client
             .get(url)
             .header("x-boss-user", SYSTEM_USER_HEADER)
+            .header("x-sim-origin", crate::dispatcher::sim_origin_value())
             .send();
         let resp = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(req))
             .map_err(|e| EvalError::HelperFailed {
