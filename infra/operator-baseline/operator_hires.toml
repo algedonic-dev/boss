@@ -33,12 +33,16 @@
 # emp-audit — system audit account. External auditors / CPAs /
 # SOC-2 reviewers + demo-mode fallback identity. Read on every
 # projection via boss-policy::defaults.
+# 'platform' is not a department. The operator and the agent ARE the
+# IT department — one person and one AI — so they sit in `it` like any
+# other employee. A department that exists only to hold the people who
+# run the software is a silo the org chart does not have.
 [[hire]]
 id = "emp-audit"
 name = "System Audit Account"
 email = "audit@boss.example"
 role = "audit-readonly"
-department = "platform"
+department = "it"
 hire_date = "2023-01-01"
 location = "loc-hq"
 employment_type = "contractor"

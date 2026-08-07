@@ -180,7 +180,12 @@ fn main() -> Result<()> {
                 name: Some(display_name_from_email(&bootstrap_email)),
                 email: Some(bootstrap_email.clone()),
                 role: Some("platform-admin".to_string()),
-                department: Some("platform".to_string()),
+                // `it`, not `platform`. The operator and the agent ARE
+                // the IT department — one person and one AI — so they
+                // are employees of the tenant like anyone else. A
+                // department invented to hold the people who run the
+                // software is a silo the org chart does not have.
+                department: Some("it".to_string()),
                 skill_level: None,
                 skills: Vec::new(),
                 hire_date: Some(
@@ -224,7 +229,7 @@ fn main() -> Result<()> {
         "access_tier": "operator",
         "territory_account_ids": [],
         "direct_report_ids": [],
-        "department": "platform",
+        "department": "it",
     })
     .to_string();
 
