@@ -93,6 +93,20 @@ jobs:
         # after the 2026-05-05 sweep.
         run: cargo clippy --workspace --all-features --tests -- -D warnings
 
+      - name: Build with default features
+        # Every other Rust step here passes `--all-features`, so a crate
+        # whose DEFAULT feature set does not compile is invisible to
+        # CI. That is not hypothetical: #180 deleted a `pub mod search;`
+        # sitting under a `#[cfg(feature = "postgres")]`, the orphaned
+        # attribute rebound onto the next item — `pub mod types;` — and
+        # `cargo build -p boss-people` was broken for anyone who ran it
+        # without the feature flag. Every gate above stayed green.
+        #
+        # A dangling `#[cfg]` always lands on whatever follows it, so
+        # this is a whole class of bug, not one typo. One cheap build
+        # closes it (CLAUDE.md §9a).
+        run: cargo build --workspace
+
       - name: Test
         run: cargo test --all-features
 

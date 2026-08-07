@@ -20,7 +20,11 @@ pub mod rebuild;
 pub mod requisitions;
 #[cfg(feature = "postgres")]
 pub mod scope;
-#[cfg(feature = "postgres")]
+// Not gated: `port` and `in_memory` are ungated and both import
+// `crate::types::Employee`. A `#[cfg]` here breaks the crate's default
+// feature set — which is how it arrived, when #180 deleted the
+// `pub mod search;` line below a `#[cfg(feature = "postgres")]` and
+// left the attribute to bind to whatever came next.
 pub mod types;
 #[cfg(feature = "postgres")]
 pub mod workflows;
