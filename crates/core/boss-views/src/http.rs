@@ -31,6 +31,8 @@ pub struct ViewsApiState {
     /// Postgres-backed views service still serves the rest of the
     /// surface rather than failing to construct.
     pub os_map: Option<Arc<dyn crate::os_map::OsMapRepo>>,
+    /// The team's flow. Optional for the same reason as `os_map`.
+    pub flow: Option<Arc<dyn crate::flow::FlowRepo>>,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +71,57 @@ async fn os_map(State(state): State<Arc<ViewsApiState>>, Query(q): Query<OsMapQu
     }
 }
 
+/// Roles whose JobKinds count as this team's work. Defaults to the
+/// platform operator — the role the IT JobKinds declare as owner.
+/// Overridable so the same surface serves another team without a
+/// second endpoint.
+fn default_owner_roles() -> Vec<String> {
+    vec![boss_core::roles::PLATFORM_ADMIN_ROLE.to_string()]
+}
+
+#[derive(Deserialize)]
+pub struct FlowQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+    /// Comma-separated owner roles.
+    #[serde(default)]
+    pub owner_roles: Option<String>,
+}
+
+/// `GET /api/views/flow` — what the team is getting through.
+///
+/// Wall-clock, unlike every other view: see `crate::flow` for why the
+/// projection's timestamps cannot answer this question.
+async fn flow(State(state): State<Arc<ViewsApiState>>, Query(q): Query<FlowQuery>) -> Response {
+    let Some(repo) = state.flow.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "flow needs a postgres-backed views service",
+        )
+            .into_response();
+    };
+    let roles: Vec<String> = q
+        .owner_roles
+        .as_deref()
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .filter(|v: &Vec<String>| !v.is_empty())
+        .unwrap_or_else(default_owner_roles);
+    let limit = q
+        .limit
+        .unwrap_or(crate::flow::DEFAULT_LIMIT)
+        .clamp(1, 20_000);
+    match repo.flow(&roles, limit).await {
+        Ok(f) => Json(f).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ResultsQuery {
     #[serde(default)]
@@ -85,6 +138,7 @@ pub fn router(state: ViewsApiState) -> Router {
         )
         .route("/api/views/{id}/results", get(view_results))
         .route("/api/views/os-map", get(os_map))
+        .route("/api/views/flow", get(flow))
         .with_state(Arc::new(state))
 }
 
@@ -234,6 +288,7 @@ mod tests {
             // These tests exercise the View surface; the map has its
             // own coverage and needs Postgres.
             os_map: None,
+            flow: None,
             repo: Arc::new(InMemoryViewsRepo::new(
                 DateTime::from_timestamp(1_700_000_000, 0).expect("valid ts"),
             )),

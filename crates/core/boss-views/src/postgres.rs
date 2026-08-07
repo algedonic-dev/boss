@@ -261,3 +261,160 @@ impl crate::os_map::OsMapRepo for PgViewsRepo {
         })
     }
 }
+
+#[async_trait::async_trait]
+impl crate::flow::FlowRepo for PgViewsRepo {
+    async fn flow(
+        &self,
+        owner_roles: &[String],
+        limit: i64,
+    ) -> Result<crate::flow::Flow, ViewsError> {
+        use crate::flow::{Flow, FlowJob, FlowStep};
+
+        // Wall clock, deliberately: `created_at` rather than
+        // `timestamp`. See the module docs — `timestamp` is the
+        // authoritative clock, which on a demo deployment is the
+        // simulator's, so it cannot answer "how long did a person
+        // wait". This is the only view that reads `audit_log` instead
+        // of `event_facts`, because `event_facts` keeps only
+        // `occurred_at` and drops the wall clock entirely.
+        //
+        // Which kinds count comes from the registry: a JobKind naming
+        // one of `owner_roles` as its owner is this team's work. No
+        // list of kinds lives in code (CLAUDE.md §9), and a Job with
+        // no declared owner never enters — which is what keeps 85
+        // mis-marked restock Jobs out of the IT team's numbers.
+        let job_rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "WITH team_kinds AS (
+                     SELECT DISTINCT k.kind, k.metadata->>'owner_role' AS owner_role
+                     FROM job_kinds k
+                     WHERE k.metadata->>'owner_role' = ANY($1)
+                 ),
+                 filed AS (
+                     SELECT a.payload->>'id' AS job_id, min(a.created_at) AS filed_at
+                     FROM audit_log a
+                     WHERE a.kind = 'jobs.job.created'
+                     GROUP BY 1
+                 ),
+                 activity AS (
+                     SELECT coalesce(a.payload->>'job_id', a.payload->>'id') AS job_id,
+                            max(a.created_at) AS last_at
+                     FROM audit_log a
+                     GROUP BY 1
+                 )
+                 SELECT j.id::text, j.kind, j.title, j.status,
+                        to_char(f.filed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+                        to_char(ac.last_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                 FROM jobs j
+                 JOIN team_kinds tk ON tk.kind = j.kind
+                 LEFT JOIN filed f ON f.job_id = j.id::text
+                 LEFT JOIN activity ac ON ac.job_id = j.id::text
+                 WHERE NOT j.simulated
+                 ORDER BY f.filed_at DESC NULLS LAST
+                 LIMIT $2",
+        )
+        .bind(owner_roles)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ViewsError::Storage(e.to_string()))?;
+
+        let job_ids: Vec<String> = job_rows.iter().map(|r| r.0.clone()).collect();
+
+        // Steps for those Jobs, each with the wall-clock time of its
+        // newest event. Raw on purpose: which step carries the
+        // decision is a registry question the client already answers
+        // once (apps/web/src/jobs/fork.ts), and a second copy of that
+        // rule has drifted before.
+        let step_rows: Vec<(
+            String,
+            String,
+            String,
+            serde_json::Value,
+            serde_json::Value,
+            Option<String>,
+        )> = sqlx::query_as(
+            "WITH touched AS (
+                     SELECT a.payload->>'step_id' AS step_id, max(a.created_at) AS last_at
+                     FROM audit_log a
+                     WHERE a.payload ? 'step_id'
+                     GROUP BY 1
+                 )
+                 SELECT s.job_id::text, s.id::text, s.status, s.metadata, s.fields,
+                        to_char(t.last_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                 FROM steps s
+                 LEFT JOIN touched t ON t.step_id = s.id::text
+                 WHERE s.job_id::text = ANY($1)
+                 ORDER BY s.job_id, s.sort_order",
+        )
+        .bind(&job_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ViewsError::Storage(e.to_string()))?;
+
+        let mut kinds: Vec<String> = job_rows.iter().map(|r| r.1.clone()).collect();
+        kinds.sort();
+        kinds.dedup();
+
+        let jobs = job_rows
+            .into_iter()
+            .map(
+                |(job_id, kind, title, status, filed_at, last_activity_at)| {
+                    let steps = step_rows
+                        .iter()
+                        .filter(|s| s.0 == job_id)
+                        .map(
+                            |(_, step_id, st, metadata, fields, last_written_at)| FlowStep {
+                                step_id: step_id.clone(),
+                                status: st.clone(),
+                                metadata: metadata.clone(),
+                                // `fields` is the declared schema; the client
+                                // finds the fork by the field it bears.
+                                field_names: fields
+                                    .as_array()
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|f| {
+                                                f.get("name")
+                                                    .and_then(|n| n.as_str())
+                                                    .map(String::from)
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                                last_written_at: last_written_at.clone(),
+                            },
+                        )
+                        .collect();
+                    FlowJob {
+                        job_id,
+                        // Every Job here came through the `team_kinds`
+                        // join, so its kind declares an owner_role; the
+                        // caller's list is the set that matched.
+                        owner_role: owner_roles.first().cloned().unwrap_or_default(),
+                        kind,
+                        title,
+                        status,
+                        filed_at,
+                        last_activity_at,
+                        steps,
+                    }
+                },
+            )
+            .collect();
+
+        Ok(Flow {
+            owner_roles: owner_roles.to_vec(),
+            kinds,
+            jobs,
+            as_of: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        })
+    }
+}
