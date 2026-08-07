@@ -2,7 +2,7 @@
 //!
 //! Mirrors `examples/brewery/seeds/tenant.toml` exactly. Every
 //! shape-driven sim run is parameterized by one of these files; the
-//! file authors how often each JobKind fires, which Subjects birth
+//! file authors how often each Workflow fires, which Subjects birth
 //! at what rate, and how aggressive anomalies should be. No Rust
 //! changes needed to add a new tenant — just a new directory of
 //! seeds with a tenant.toml inside.
@@ -28,7 +28,7 @@ pub enum TenantConfigError {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TenantConfig {
     pub meta: TenantMeta,
-    /// Per-JobKind creation rates. Key is the JobKind slug
+    /// Per-Workflow creation rates. Key is the Workflow slug
     /// (`"morning-bake"`, `"wholesale-order"`, …).
     #[serde(default)]
     pub job_rates: HashMap<String, JobRate>,
@@ -36,7 +36,7 @@ pub struct TenantConfig {
     /// (`"account"`, `"vendor"`, …).
     #[serde(default)]
     pub subject_rates: HashMap<String, SubjectRate>,
-    /// Per-JobKind anomaly probabilities. Key matches `job_rates`.
+    /// Per-Workflow anomaly probabilities. Key matches `job_rates`.
     /// Values are arbitrary `prob_name -> [0, 1]` pairs — sim code
     /// reads the keys it knows about.
     #[serde(default)]
@@ -48,7 +48,7 @@ pub struct TenantConfig {
     #[serde(default)]
     pub counterparty: HashMap<String, CounterpartyToml>,
     /// Random shocks — quarterly probabilistic events that bump a
-    /// JobKind's rate (or one Subject's draws within a JobKind) for
+    /// Workflow's rate (or one Subject's draws within a Workflow) for
     /// a fixed window. Models real-world disruption: a viral bar
     /// doubles its order rate for a few weeks, a supply-chain hiccup
     /// dampens production for a month. Empty by default — tenants
@@ -63,9 +63,9 @@ pub struct TenantConfig {
     // BatchEngine specs retired 2026-05-06 — see TODO.md
     // "Strip BatchEngine". The four [batch.*] rows that lived
     // here (payroll, sales-tax, payroll-941, income-tax) bypassed
-    // the JobKind / Step / audit-trail by emitting canonical
+    // the Workflow / Step / audit-trail by emitting canonical
     // events directly. Replaced by [periodic.*] specs that open
-    // honest JobKinds whose terminal step's side-effect handler
+    // honest Workflows whose terminal step's side-effect handler
     // POSTs to the canonical /api/ledger/* endpoint. The field
     // stays as untyped values so tenant.tomls still carrying old
     // [batch.*] blocks parse without error during the migration
@@ -89,7 +89,7 @@ pub struct PeriodicToml {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PeriodicActionToml {
     OpenJob {
-        job_kind: String,
+        workflow: String,
         #[serde(default)]
         subject_kind: Option<String>,
         #[serde(default)]
@@ -453,7 +453,7 @@ pub fn parse_tick_duration(s: &str) -> Result<u32, String> {
     }
 }
 
-/// Per-JobKind rate spec. The base `rate` is jobs/day; ramps
+/// Per-Workflow rate spec. The base `rate` is jobs/day; ramps
 /// override that rate from a given date onward; weekday/weekend
 /// multipliers tilt the curve.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -508,7 +508,7 @@ pub struct JobRate {
     /// effective rate* number of Jobs once per sim-day — a fixed
     /// review that fires every working day, never zero by chance.
     ///
-    /// Built for production-review JobKinds (the five
+    /// Built for production-review Workflows (the five
     /// `morning-brew*` daily brews): a Poisson(λ) draw is 0 with
     /// probability `e^−λ`, so a low-rate brew can go many days
     /// without a single review — the cold-start drought that
@@ -562,11 +562,11 @@ pub struct ShockSpec {
 /// What a shock multiplies. Four shapes:
 ///
 /// - `kind = "..."` — multiplier applies to every Job of that
-///   JobKind. Models a supply-chain shock dampening every brew, or
+///   Workflow. Models a supply-chain shock dampening every brew, or
 ///   a launch surge boosting every direct-shop-order.
 ///
 /// - `kind = "..."`, `subject_id = "..."` — multiplier applies only
-///   to draws targeting that Subject within the JobKind. Models the
+///   to draws targeting that Subject within the Workflow. Models the
 ///   "viral bar" — one Account's wholesale-keg-order rate doubles
 ///   for a few weeks.
 ///
@@ -583,7 +583,7 @@ pub struct ShockSpec {
 ///   `rate_multiplier > 1.0` = longer delays, `< 1.0` = faster.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ShockTarget {
-    /// JobKind slug to apply against. Mutually exclusive with
+    /// Workflow slug to apply against. Mutually exclusive with
     /// `counterparty`; exactly one must be set.
     #[serde(default)]
     pub kind: Option<String>,
@@ -648,7 +648,7 @@ impl ShockTarget {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SubjectCadence {
     /// Subject id this cadence applies to. Matched against the
-    /// SubjectKind declared in the JobKind's `subject_kinds[0]`
+    /// SubjectKind declared in the Workflow's `subject_kinds[0]`
     /// (same convention the Poisson path uses).
     pub subject_id: String,
     /// Weekday name: `Mon` / `Tue` / `Wed` / `Thu` / `Fri` /
@@ -747,8 +747,8 @@ pub struct SubjectRate {
     pub created_event_kind: Option<String>,
 }
 
-/// Anomaly probabilities for a single JobKind. The keys are
-/// anomaly *names* defined by the StepType or JobKind authors;
+/// Anomaly probabilities for a single Workflow. The keys are
+/// anomaly *names* defined by the StepType or Workflow authors;
 /// values are probabilities in `[0, 1]`. The sim enumerates the
 /// keys it understands and rolls each per Step transition.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -803,11 +803,11 @@ impl TenantConfig {
                 business_calendar: p.business_calendar.clone(),
                 action: match &p.action {
                     PeriodicActionToml::OpenJob {
-                        job_kind,
+                        workflow,
                         subject_kind,
                         subject_id,
                     } => crate::engines::PeriodicAction::OpenJob {
-                        job_kind: job_kind.clone(),
+                        workflow: workflow.clone(),
                         subject_kind: subject_kind.clone(),
                         subject_id: subject_id.clone(),
                     },
@@ -999,7 +999,7 @@ mod tests {
         });
         assert_eq!(cfg.meta.tenant_id, "used-device-shop");
         assert_eq!(cfg.meta.display_name, "Used Device Shop");
-        // Every JobKind from the step-4 job_kinds.toml batch must
+        // Every Workflow from the step-4 workflows.toml batch must
         // have a matching [job_rates.*] block here, otherwise the
         // shape-driven engine has nothing to fire for that kind.
         for required in &[
@@ -1436,7 +1436,7 @@ delay_probability = 1.5
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         // `quarterly-sales-tax` was intentionally disabled in the
         // brewery tenant.toml (it remitted without an accrual flow);
-        // re-add to this list when that periodic JobKind comes back.
+        // re-add to this list when that periodic Workflow comes back.
         for required in &["daily-bank-sweep", "equipment-preventive-maintenance"] {
             assert!(
                 names.contains(required),

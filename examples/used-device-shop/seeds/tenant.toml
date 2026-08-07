@@ -6,9 +6,9 @@
 #
 #   1. [meta]            — tenant identity + sim window + operating days
 #   2. [modules]         — which platform surfaces are visible
-#   3. [job_rates]       — JobKind creation rates (Poisson per day)
+#   3. [job_rates]       — Workflow creation rates (Poisson per day)
 #   4. [subject_rates]   — Subject birth rates (account, asset, vendor)
-#   5. [anomalies]       — per-JobKind anomaly probabilities
+#   5. [anomalies]       — per-Workflow anomaly probabilities
 #   6. [[shock]]         — quarterly probabilistic disruptions
 #   7. [counterparty.*]  — external actors (banks, couriers, suppliers,
 #                          warranty timer, RMA inbound chain)
@@ -16,7 +16,7 @@
 #   9. [batch.*]         — population aggregations (payroll + taxes)
 #
 # Per the HumanWorker generator retirement step 5, this file fires
-# the 10 JobKinds authored in `job_kinds.toml` at the rates the legacy
+# the 10 Workflows authored in `workflows.toml` at the rates the legacy
 # generators encode (intake.rs / refurb.rs / sales.rs / service.rs /
 # support.rs / contracts.rs / decommission.rs / training.rs). Once
 # step 7's engine swap lands, the shape-driven path consumes these
@@ -37,7 +37,7 @@ end_date = "2026-04-25"
 # Refurb floor + warehouse run Mon-Fri; service techs cover Mon-Sat
 # for on-site dispatches; support specialists cover every day. The
 # shape-driven engine reads `operating_days` once for the tenant; the
-# per-JobKind weekday/weekend multipliers below tilt individual
+# per-Workflow weekday/weekend multipliers below tilt individual
 # flows for the kinds where that distinction matters (refurb only
 # fires Mon-Fri via weekend_multiplier=0; support fires every day).
 operating_days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
@@ -94,10 +94,10 @@ sim         = true
 it          = true
 
 # ---------------------------------------------------------------------------
-# JobKind creation rates (jobs/day at steady state).
+# Workflow creation rates (jobs/day at steady state).
 #
-# Each entry mirrors a JobKind authored in
-# examples/used-device-shop/seeds/job_kinds.toml. Rates are
+# Each entry mirrors a Workflow authored in
+# examples/used-device-shop/seeds/workflows.toml. Rates are
 # Poisson-sampled per day. Ramps grow the company over the sim
 # window; weekday/weekend multipliers gate flows that don't run on
 # weekends (refurb floor) vs. those that do (support).
@@ -154,7 +154,7 @@ rate = 76.0
 # refurb-oem-new — the 15% of intake that's factory-sealed. Shorter
 # step graph (skips triage + repair). Rate is intake × 0.15.
 # Step 8's parity harness flagged the missing rate block —
-# refurb-oem-new was authored in job_kinds.toml without a
+# refurb-oem-new was authored in workflows.toml without a
 # corresponding [job_rates.*] entry, so the shape-driven engine
 # never fired it.
 [job_rates.refurb-oem-new]
@@ -198,7 +198,7 @@ rate = 90.0
 # account-onboarding — post-sale CS handoff. The legacy sales.rs
 # spawns one per sale Job; once on_complete_create triggers wire
 # through the shape-driven engine, this rate retires in favor of
-# a sale → account-onboarding trigger (the JobKindSpec.on_complete_create
+# a sale → account-onboarding trigger (the WorkflowSpec.on_complete_create
 # data shape is already there per `[GAP 5]` in the brewery
 # tenant.toml). Until then, fire independently at 1:1 with sale
 # so the post-sale CS lane is visible.
@@ -267,7 +267,7 @@ rate = 5.0
 # training-request / account categories from support.rs. Per-account
 # daily probabilities: platinum 0.020, gold 0.010, silver 0.005.
 # 2500 accounts × ~0.011 weighted avg = ~27/day, minus the RMA +
-# SLA-renewal lanes carved into separate JobKinds below.
+# SLA-renewal lanes carved into separate Workflows below.
 # Support covers every day; weekend dampened.
 [job_rates.support-incident]
 rate = 22.0
@@ -434,20 +434,20 @@ created_event_kind = "inventory.vendor.created"
 # Employees come from examples/used-device-shop/data/employees.json
 # at boot — the shape-driven engine doesn't synthesize new ones
 # during the sim. brewery-hire / brewery-terminate have no
-# used-device-shop equivalent yet (HR JobKinds for this tenant
+# used-device-shop equivalent yet (HR Workflows for this tenant
 # would be `hire` / `offboarding` from seed_kinds.rs once they
 # move into this file).
 [subject_rates.employee]
 rate = 0.0
 
 # Campaigns — marketing motions land via the marketing-motion
-# JobKind in seed_kinds.rs (not yet in this file).
+# Workflow in seed_kinds.rs (not yet in this file).
 [subject_rates.campaign]
 rate = 0.05
 created_event_kind = "commerce.campaign.created"
 
 # ---------------------------------------------------------------------------
-# Anomaly probabilities — likelihood that a Step on a given JobKind
+# Anomaly probabilities — likelihood that a Step on a given Workflow
 # experiences a given anomaly during execution. Mirrors the
 # probabilities the legacy generators encoded inline.
 # ---------------------------------------------------------------------------
@@ -491,7 +491,7 @@ mismatch_probability = 0.03
 
 # ---------------------------------------------------------------------------
 # Random shocks — quarterly probabilistic events that bump a
-# JobKind's rate (or one Subject's draws) for a fixed window.
+# Workflow's rate (or one Subject's draws) for a fixed window.
 # ---------------------------------------------------------------------------
 
 # Spare-parts shortage — refurb floor stalls when key parts dry up.
@@ -660,7 +660,7 @@ emit_probability = 1.0
     method = "ach"
 
 # Tax authority — acks the tax-filing pipeline. (The brewery has no
-# tax-authority counterparty — its tax pipeline is JobKind-driven
+# tax-authority counterparty — its tax pipeline is Workflow-driven
 # via the tax-remittance step; an earlier comment here claimed
 # otherwise.) `ledger.tax_filing_acked` is DELIBERATELY UNROUTED —
 # acknowledgment-only, no system consumer; the sim drops it and it
@@ -789,9 +789,9 @@ cadence = "quarterly"
 anchor_date = "2024-01-31"
 business_calendar = "us-tax"
 action.kind = "open_job"
-action.job_kind = "sales-tax-filing"
-# sales-tax-filing is a brewery-side JobKind in
-# examples/brewery/seeds/job_kinds.toml + seed_kinds.rs; the
+action.workflow = "sales-tax-filing"
+# sales-tax-filing is a brewery-side Workflow in
+# examples/brewery/seeds/workflows.toml + seed_kinds.rs; the
 # used-device-shop tenant reuses it via the platform registry. Step
 # 9 of the retirement decides whether to lift it into both tenants'
 # files or leave it platform-shared.

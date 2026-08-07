@@ -94,15 +94,15 @@ describe('parseRoute — every specific path matches its specific case', () => {
     ['/ux/qa', { kind: 'qa' }],
     ['/ux/ops', { kind: 'ops' }],
     ['/ux/ops/anything', { kind: 'ops' }],
-    // Policy + JobKind authoring (System Model). The job-kinds
+    // Policy + Workflow authoring (System Model). The workflows
     // `/authoring/<jobId>` route is the wildcard-precedence trap: it MUST
-    // resolve before the catch-all `/job-kinds/(.+)` detail route.
+    // resolve before the catch-all `/workflows/(.+)` detail route.
     ['/system/policy', { kind: 'policy' }],
     ['/system/auth-admin', { kind: 'authAdmin' }],
-    ['/system/job-kinds', { kind: 'jobKinds' }],
-    ['/system/job-kinds/new', { kind: 'jobKindNew' }],
-    ['/system/job-kinds/authoring/job-abc-123', { kind: 'jobKindDesign', jobId: 'job-abc-123' }],
-    ['/system/job-kinds/seasonal-release', { kind: 'jobKindDetail', kindSlug: 'seasonal-release' }],
+    ['/system/workflows', { kind: 'workflows' }],
+    ['/system/workflows/new', { kind: 'workflowNew' }],
+    ['/system/workflows/authoring/job-abc-123', { kind: 'workflowDesign', jobId: 'job-abc-123' }],
+    ['/system/workflows/seasonal-release', { kind: 'workflowDetail', kindSlug: 'seasonal-release' }],
   ];
 
   for (const [path, expected] of cases) {
@@ -129,9 +129,9 @@ describe('parseRoute — wildcard does not shadow specific cases', () => {
     const r = parseRoute('/ux/finance/journal-entries/new');
     expect(r.kind).toBe('newJournalEntry');
   });
-  test('/system/job-kinds/authoring/X → jobKindDesign, NOT jobKindDetail', () => {
-    const r = parseRoute('/system/job-kinds/authoring/job-abc-123');
-    expect(r.kind).toBe('jobKindDesign');
+  test('/system/workflows/authoring/X → workflowDesign, NOT workflowDetail', () => {
+    const r = parseRoute('/system/workflows/authoring/job-abc-123');
+    expect(r.kind).toBe('workflowDesign');
   });
 });
 

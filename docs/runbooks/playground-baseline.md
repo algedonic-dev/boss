@@ -12,7 +12,7 @@ projections from what survives.
 The consequence is the part that surprises people:
 
 > **Nothing merged after the baseline was cut exists in the running tenant.**
-> Not seed values, not JobKind specs, not Class rows. The demo will replay
+> Not seed values, not Workflow specs, not Class rows. The demo will replay
 > the same frozen snapshot every lap, indefinitely, no matter how far the
 > source tree moves.
 
@@ -25,10 +25,10 @@ change shape under them — but it is only safe if the pin is *legible*.
 |---|---|---|
 | Class rows | `examples/<tenant>/seeds/classes.json`, `infra/postgres/schema/*.sql` | prepare step 1 (`POST /api/classes/batch`) |
 | Seed values (reorder points, BOMs, products, accounts) | `examples/<tenant>/seeds/*.toml` | the baseline's audit events |
-| JobKind specs | `examples/<tenant>/seeds/job_kinds.toml` | prepare's publish pass |
+| Workflow specs | `examples/<tenant>/seeds/workflows.toml` | prepare's publish pass |
 
-None of these reach a *running* tenant. Republishing a JobKind does not
-either — the sim posts whole Jobs carrying `job_kind_version`, and the
+None of these reach a *running* tenant. Republishing a Workflow does not
+either — the sim posts whole Jobs carrying `workflow_version`, and the
 create path honours the posted version.
 
 ## Checking the pin
@@ -84,7 +84,7 @@ curl -s localhost:7060/api/clock/baseline
 know it without a working tree (container builds).
 
 The reset aborts rather than stamping a baseline over a failed seed — a
-baseline captured mid-failure has no published JobKinds, and the *next*
+baseline captured mid-failure has no published Workflows, and the *next*
 restart-epoch would trim to it and destroy the tenant model. If it aborts,
 fix the reported cause and re-run; the script is idempotent.
 

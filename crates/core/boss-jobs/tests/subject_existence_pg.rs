@@ -50,7 +50,7 @@ fn job_about(id: &str, kind: &str, subject: Subject) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
         kind: kind.to_string(),
-        job_kind_version: 1,
+        workflow_version: 1,
         subject,
         title: "t".into(),
         owner_id: "emp-1".into(),
@@ -67,23 +67,23 @@ fn job_about(id: &str, kind: &str, subject: Subject) -> Job {
 /// Birth-by-job kinds — declared in the SubjectKind registry via
 /// `metadata.birth = "job"` — pass the gate WITHOUT a pre-existing
 /// identity row: the Job that references them IS the subject's birth
-/// record (`job-kind-design` Jobs about the kind under design,
+/// record (`workflow-design` Jobs about the kind under design,
 /// `design-doc-review` Jobs about a `custom` doc path). Their identity
 /// row is minted inside `create_job_at`'s transaction — the write-side
 /// mirror of the rebuilder's `jobs.job.created` pass, which already
 /// reproduces exactly these rows from the log. Without the write-side
 /// mint, live and rebuilt `subjects` diverge; without the gate pass,
-/// the brewery prepare can't open a single `job-kind-design` Job and
+/// the brewery prepare can't open a single `workflow-design` Job and
 /// the whole tenant seed starves (the 2026-07-15 install-smoke red).
 #[tokio::test(flavor = "multi_thread")]
-async fn birth_by_job_kinds_pass_gate_and_create_mints_identity() {
+async fn birth_by_workflows_pass_gate_and_create_mints_identity() {
     let db = TestDb::new().await;
     let check = PgSubjectExistence::new(db.pool.clone());
 
     // Asserted against the REAL platform seed rows (01-registries.sql),
     // not synthetic fixtures — a seed regression must fail here.
     for (kind, id) in [
-        ("job-kind", "wholesale-keg-order"),
+        ("workflow", "wholesale-keg-order"),
         (
             "custom",
             "docs/design/subject-identity-and-relationships.md",
@@ -107,13 +107,13 @@ async fn birth_by_job_kinds_pass_gate_and_create_mints_identity() {
     // Creating the Job mints the identity row in the same transaction.
     repo.create_job(&job_about(
         "00000000-0000-0000-0000-00000000b001",
-        "job-kind-design",
-        Subject::new("job-kind", "wholesale-keg-order"),
+        "workflow-design",
+        Subject::new("workflow", "wholesale-keg-order"),
     ))
     .await
     .unwrap();
     let minted: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM subjects WHERE kind='job-kind' AND id='wholesale-keg-order')",
+        "SELECT EXISTS(SELECT 1 FROM subjects WHERE kind='workflow' AND id='wholesale-keg-order')",
     )
     .fetch_one(&db.pool)
     .await

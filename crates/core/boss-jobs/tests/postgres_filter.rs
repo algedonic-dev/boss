@@ -26,7 +26,7 @@ fn job(id: &str, kind: &str, subject: Subject) -> Job {
     Job {
         id: JobId::from_uuid(Uuid::parse_str(id).unwrap()),
         kind: kind.to_string(),
-        job_kind_version: 1,
+        workflow_version: 1,
         subject,
         title: "t".into(),
         owner_id: "emp-1".into(),

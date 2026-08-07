@@ -220,7 +220,7 @@ impl PgSubjectExistence {
 impl SubjectExistenceCheck for PgSubjectExistence {
     async fn check(&self, subject: &Subject) -> Result<(), SubjectExistenceError> {
         // Birth-by-job kinds (SubjectKind registry rows carrying
-        // `metadata.birth = "job"`: `job-kind`, `custom`) pass without
+        // `metadata.birth = "job"`: `workflow`, `custom`) pass without
         // an identity row — the Job being created IS the subject's
         // birth record, and `create_job_at` mints the identity inside
         // the job-create transaction. A registry property, not a gate

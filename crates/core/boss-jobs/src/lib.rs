@@ -14,7 +14,6 @@ pub mod escalation;
 pub mod events;
 pub mod http;
 pub mod in_memory;
-pub mod job_kind_lint;
 pub mod jobs_config;
 pub mod policy_glue;
 pub mod port;
@@ -24,9 +23,10 @@ pub mod postgres;
 pub mod rebuild;
 pub mod registry;
 pub mod scheduling;
-// Platform JobKinds live in `registry::platform_kinds()` (currently
-// just `job-kind-design`); tenant JobKinds live in
-// `examples/<tenant>/seeds/job_kinds.toml` and load via `seed_loader`.
+pub mod workflow_lint;
+// Platform Workflows live in `registry::platform_kinds()` (currently
+// just `workflow-design`); tenant Workflows live in
+// `examples/<tenant>/seeds/workflows.toml` and load via `seed_loader`.
 // See docs/design/platform-vs-tenant-jobkinds.md.
 pub mod owner_resolution;
 pub mod seed_loader;
@@ -41,10 +41,10 @@ pub use postgres::PgJobs;
 #[cfg(feature = "postgres")]
 pub use rebuild::{RebuildError, RebuildReport, rebuild_jobs_and_steps};
 #[cfg(feature = "postgres")]
-pub use registry::PgJobKinds;
+pub use registry::PgWorkflows;
 pub use registry::{
-    InMemoryJobKinds, JobKindError, JobKindRegistry, JobKindSpec, JobKindStatus, StepSpec,
-    Terminal, materialize_steps, reevaluate,
+    InMemoryWorkflows, StepSpec, Terminal, WorkflowError, WorkflowRegistry, WorkflowSpec,
+    WorkflowStatus, materialize_steps, reevaluate,
 };
 #[cfg(feature = "postgres")]
 pub use step_plugins::PgStepPlugins;

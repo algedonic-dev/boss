@@ -25,8 +25,8 @@ PATTERN="kind[)]?[[:space:]]*(==|===|!=|!==)[[:space:]]*[\"'](${KINDS})[\"']|mat
 
 # Allow-list: file => max permitted match count.
 #   - boss-jobs http/steps.rs / DesignReviewPage: the two platform-
-#     pinned rows (job-kind-publish, review-design) — permanent pins.
-#     (steps.rs is where job-kind-publish landed after http.rs was
+#     pinned rows (workflow-publish, review-design) — permanent pins.
+#     (steps.rs is where workflow-publish landed after http.rs was
 #     split into the http/ module directory.)
 #   - apps/web/src/debug/: dev-only demo driver, not a core surface.
 declare -A ALLOW=(

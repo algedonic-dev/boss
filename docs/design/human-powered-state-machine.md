@@ -24,7 +24,7 @@ mapping:
 |---|---|
 | Persistent state | `audit_log` + projections (Assets, Accounts, Ledger, …) |
 | Alphabet of transitions | StepType registry (~43 opcodes) |
-| Program | JobKind registry (StepTypes wired into an implicit DAG, versioned) |
+| Program | Workflow registry (StepTypes wired into an implicit DAG, versioned) |
 | Program counter | A Step's `status` + the Job's open step set |
 | Dispatcher / scheduler | Messages inbox + My Day |
 | Preconditions on a transition | each Step's `ready_when` predicate + policy rules |
@@ -101,7 +101,7 @@ acts on exactly one Subject, which is how the machine knows which
 cell a transition writes into.
 
 ### Jobs
-A Job is a **program invocation**. Its JobKind is the program; the
+A Job is a **program invocation**. Its Workflow is the program; the
 versioned `steps` set (the DAG implicit in each step's `ready_when`)
 declares the call shape. A Job opened under
 `v3` of `field-service` executes against `v3`'s semantics for the
@@ -183,7 +183,7 @@ we probably shouldn't be allowing it.
 
 ### I-3. The alphabet is closed; the programs are open.
 New StepTypes land rarely, and when they do it is a deliberate
-extension of the machine's alphabet. New JobKinds land often, as
+extension of the machine's alphabet. New Workflows land often, as
 data. If a proposed feature requires a new StepType and a new core
 code path to implement it, we are probably modeling it at the wrong
 layer.
@@ -204,7 +204,7 @@ that question using BOSS alone, we have a dispatcher gap.
 
 ### I-6. The machine describes real operations, not aspirational ones.
 If the tenant actually performs some business transition, it must have a
-StepType. If a StepType exists but no JobKind uses it, it's dead
+StepType. If a StepType exists but no Workflow uses it, it's dead
 metal. Both directions matter: documentation-only constructs are
 smells.
 
@@ -216,7 +216,7 @@ Not much in the code — the framing codifies what's already there. The
 payoff is in **how we talk about new work and review new designs**:
 
 1. **When adding a new workflow**, the first question is "which
-   existing StepTypes does it need and what's the JobKind's DAG?"
+   existing StepTypes does it need and what's the Workflow's DAG?"
    Not "which crate owns this?" If a new StepType is unavoidable,
    that's a deliberate extension of the machine, not a detail.
 
@@ -239,7 +239,7 @@ payoff is in **how we talk about new work and review new designs**:
 
 5. **When deciding whether a change is "feature" vs "architecture"**,
    ask whether it extends the alphabet (StepType), the program
-   library (JobKind), the rendering layer (StepPlugin), or just
+   library (Workflow), the rendering layer (StepPlugin), or just
    adds a row to the program library. Only the first is architecture;
    the rest are data changes with matching UI.
 
@@ -253,7 +253,7 @@ payoff is in **how we talk about new work and review new designs**:
   both are audited the same way.
 - It is **not a call for a DSL, workflow engine, or BPMN rewrite**.
   We already have the machine; the framing just names it. Adding a
-  purpose-built DSL would be reinventing what JobKind + StepType
+  purpose-built DSL would be reinventing what Workflow + StepType
   already do.
 - It is **not a permission to over-model**. Not every entity is a
   Subject, not every action is a Step, and not every screen is a

@@ -3,7 +3,7 @@
 //!
 //! `boss-jobs` had fifteen integration tests and not one of them
 //! opened a Job and closed it. That hole shipped a `user-feedback`
-//! JobKind whose triage step could never complete: it used the
+//! Workflow whose triage step could never complete: it used the
 //! `acknowledgment` kind, whose schema requires `document_title`, and
 //! metadata validators run at `completed` rather than at create. So
 //! the Job materialized cleanly, sat in the triage board's waiting
@@ -20,10 +20,10 @@
 //! never fires — none of which the spec test can see.
 //!
 //! Scoped to `user-feedback` on purpose. The invariant worth having
-//! is "every platform JobKind can be driven from open to closed using
+//! is "every platform Workflow can be driven from open to closed using
 //! only what its own surfaces supply", but the other two kinds are
-//! driven by authoring UIs that DO supply fields (`job-kind-design`'s
-//! publish step takes a `job_kind_spec`), so generalizing needs a
+//! driven by authoring UIs that DO supply fields (`workflow-design`'s
+//! publish step takes a `workflow_spec`), so generalizing needs a
 //! per-kind fixture describing what each surface posts. Feedback is
 //! the one flow where the answer is "nothing", which is exactly why
 //! it is the one that broke.
@@ -41,14 +41,14 @@ use boss_jobs::http::{JobsApiState, router};
 use boss_jobs::owner_resolution::RosterLookup;
 use boss_jobs::registry::platform_kinds;
 use boss_jobs::step_registry::StepRegistry;
-use boss_jobs::{InMemoryJobKinds, InMemoryJobs, JobKindRegistry};
+use boss_jobs::{InMemoryJobs, InMemoryWorkflows, WorkflowRegistry};
 use boss_policy_client::{Action, FakePolicyClient, PolicyClient, Resource, Scope};
 use boss_testing::RecordingEventBus;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 /// The triage step's `authority_role` is `platform-admin`, and the
-/// JobKind's `owner_role` is too — so the roster must hold one or the
+/// Workflow's `owner_role` is too — so the roster must hold one or the
 /// create handler rejects the Job for having no human owner.
 struct AdminRoster;
 
@@ -78,7 +78,7 @@ fn admin_header() -> String {
 }
 
 fn app() -> axum::Router {
-    let kinds = Arc::new(InMemoryJobKinds::new());
+    let kinds = Arc::new(InMemoryWorkflows::new());
     // Seeded from the real platform registry, not a hand-built spec —
     // a fixture copy would have kept passing while the shipped kind
     // was broken.
@@ -111,7 +111,7 @@ fn app() -> axum::Router {
         publisher: DomainPublisher::new(bus_dyn, "jobs"),
         step_registry: Arc::new(StepRegistry::v1()),
         policy,
-        kind_registry: Some(kinds as Arc<dyn JobKindRegistry>),
+        kind_registry: Some(kinds as Arc<dyn WorkflowRegistry>),
         plugin_registry: None,
         calendar: None,
         subject_kinds: None,

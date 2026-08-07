@@ -192,15 +192,15 @@ the actual surface.
 
 ### Admin
 - [x] `admin/JobKindsPage.svelte` (0) — list.
-      `tests/smoke/admin-job-kinds.spec.ts` covers row → detail
+      `tests/smoke/admin-workflows.spec.ts` covers row → detail
       navigation.
 - [x] `admin/JobKindNewPage.svelte` (1) — DAG editor.
-      `tests/smoke/admin-job-kind-new.spec.ts` covers spec
+      `tests/smoke/admin-workflow-new.spec.ts` covers spec
       inputs (slug / label / category / description) + subject-
       kind checkboxes + Create-draft button + StepDagEditor's
       Add-tier / Add-step / Show-JSON toggles.
 - [~] `admin/JobKindDetailPage.svelte` (6) —
-      `tests/smoke/admin-job-kinds.spec.ts` covers Publish/Retire
+      `tests/smoke/admin-workflows.spec.ts` covers Publish/Retire
       disabled-state + Fork navigation. Add-tier / add-step
       controls inside the DAG editor flyout still uncovered.
 - [~] `admin/PolicyPage.svelte` (2) —

@@ -1,22 +1,22 @@
 <script lang="ts">
-  // /system/job-kinds — port of apps/web/src/admin/JobKindsPage.tsx.
+  // /system/workflows — port of apps/web/src/admin/WorkflowsPage.tsx.
 
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import Link from '@boss/web-kit/ui/Link.svelte';
-  import type { JobKindSpec } from './jobKindTypes';
+  import type { WorkflowSpec } from './workflowTypes';
   import { href } from '../router';
 
-  let kinds = $state<ReadonlyArray<JobKindSpec>>([]);
+  let kinds = $state<ReadonlyArray<WorkflowSpec>>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
 
   async function load(): Promise<void> {
     loading = true;
     try {
-      const r = await fetch('/api/jobs/kinds');
+      const r = await fetch('/api/workflows');
       if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
-      kinds = (await r.json()) as JobKindSpec[];
+      kinds = (await r.json()) as WorkflowSpec[];
       error = null;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -30,7 +30,7 @@
   });
 
   let byCategory = $derived.by(() => {
-    const m = new Map<string, JobKindSpec[]>();
+    const m = new Map<string, WorkflowSpec[]>();
     for (const k of kinds) {
       const arr = m.get(k.category) ?? [];
       arr.push(k);
@@ -55,7 +55,7 @@
   {/if}
 
   <div style="padding:0 24px 16px">
-    <Link to={href('/system/job-kinds/new')} className="wb-btn wb-btn-primary">
+    <Link to={href('/system/workflows/new')} className="wb-btn wb-btn-primary">
       + Create new kind
     </Link>
   </div>
@@ -78,7 +78,7 @@
               {#each byCategory.get(cat) ?? [] as k (k.kind)}
                 <tr>
                   <td>
-                    <Link to={href(`/system/job-kinds/${encodeURIComponent(k.kind)}`)}>
+                    <Link to={href(`/system/workflows/${encodeURIComponent(k.kind)}`)}>
                       <span class="mono">{k.kind}</span>
                     </Link>
                   </td>

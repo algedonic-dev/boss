@@ -6,7 +6,7 @@
   // chain (in-transit → out-for-delivery → delivered) has
   // something to attach to.
   //
-  // Demo framing: most fields are pre-populated by the JobKind
+  // Demo framing: most fields are pre-populated by the Workflow
   // (origin = brewery, destination = customer account). User
   // confirms carrier + tracking and either marks shipped or
   // delivered. Scan-event timeline (if any) renders read-only

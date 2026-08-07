@@ -51,7 +51,7 @@ latitude = 37.7600
 longitude = -122.4180
 address = "2104 Harrison St, San Francisco, CA 94110"
 # Industrial scale, coherent with the 250-BBL batches the morning-brew
-# JobKinds package and the ~400-person workforce: a 250-BBL brewhouse
+# Workflows package and the ~400-person workforce: a 250-BBL brewhouse
 # running ~1.6 brews/day with ~40 fermenters (250-BBL, ~14-day turn →
 # ~27 batches in flight + headroom) yields ~110k BBL/yr. (The sim does
 # not yet hard-gate production on fermenter availability — see the

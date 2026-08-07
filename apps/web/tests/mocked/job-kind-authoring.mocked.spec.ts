@@ -1,4 +1,4 @@
-// Admin · JobKind authoring workspace (D6). The graphical heart we want
+// Admin · Workflow authoring workspace (D6). The graphical heart we want
 // to maintain: the trigger→outcome graph renders from the spec, the
 // palette adds steps, the inspector edits the selected node, and the
 // workflow rail drives the design Job author → validate → approve →
@@ -9,17 +9,17 @@ import { test, expect } from '@playwright/test';
 import { mountPage } from '../smoke/_helpers';
 import { installAuthoringMocks, JOB_ID, KIND_SLUG } from './_mockApi';
 
-const WORKSPACE = `/system/job-kinds/authoring/${JOB_ID}`;
+const WORKSPACE = `/system/workflows/authoring/${JOB_ID}`;
 
 test.beforeEach(async ({ page }) => {
   await installAuthoringMocks(page);
 });
 
-test.describe('JobKind authoring workspace — graph + inspector', () => {
+test.describe('Workflow authoring workspace — graph + inspector', () => {
   test('loads the design Job and renders the trigger→outcome graph', async ({ page }) => {
     await mountPage(page, WORKSPACE, { titleMatch: /Authoring/i });
 
-    // Spec fields are seeded from the publish step's job_kind_spec.
+    // Spec fields are seeded from the publish step's workflow_spec.
     // Located by placeholder, not by index: this used to be
     // `locator('input').nth(1)` with a comment pinning the DOM order
     // (slug · label · category), which silently counted every input
@@ -59,7 +59,7 @@ test.describe('JobKind authoring workspace — graph + inspector', () => {
   });
 });
 
-test.describe('JobKind authoring workspace — workflow rail', () => {
+test.describe('Workflow authoring workspace — workflow rail', () => {
   test('drives author → validate → approve → publish, then routes to the kind', async ({ page }) => {
     await mountPage(page, WORKSPACE, { titleMatch: /Authoring/i });
 
@@ -83,7 +83,7 @@ test.describe('JobKind authoring workspace — workflow rail', () => {
 
     // Publishing completes the terminal step and routes to the kind.
     await Promise.all([
-      page.waitForURL(new RegExp(`/system/job-kinds/${KIND_SLUG}$`), { timeout: 15_000 }),
+      page.waitForURL(new RegExp(`/system/workflows/${KIND_SLUG}$`), { timeout: 15_000 }),
       publish.click(),
     ]);
   });

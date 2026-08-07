@@ -1,15 +1,15 @@
-// Shared JobKind "atlas" layout engine.
+// Shared Workflow "atlas" layout engine.
 //
 // The System Atlas (IT monitoring) and the landing page's operating-model
-// map both read /api/jobs/kinds and lay the active JobKinds out the same
+// map both read /api/workflows and lay the active Workflows out the same
 // way: one row per category (a few pinned at the top, the rest
 // alphabetical), nodes wrapping to the next line at the canvas width, each
 // node showing its step count. The two pages used to carry parallel copies
 // of this engine that drifted only in their canvas width; this module is
 // the single copy, with `canvasW` as the one parameter that differs.
 
-/** The minimal JobKind shape the layout reads. Any richer spec — the
- *  landing page's `JobKindSpec` or the canonical `jobKindTypes` one — is
+/** The minimal Workflow shape the layout reads. Any richer spec — the
+ *  landing page's `WorkflowSpec` or the canonical `workflowTypes` one — is
  *  structurally assignable, so callers pass their own spec arrays. */
 export type AtlasSpec = Readonly<{
   kind: string;
@@ -46,7 +46,7 @@ const ROW_LABEL_W = 130;
 // else sorts alphabetically.
 const PINNED = ['production', 'sales', 'procurement', 'operations', 'finance'];
 
-/** Lay JobKind specs out by category into positioned SVG rows + nodes.
+/** Lay Workflow specs out by category into positioned SVG rows + nodes.
  *  `canvasW` is the only per-page difference (the System Atlas canvas is
  *  wider than the landing card), so it is a parameter. */
 export function atlasLayout(

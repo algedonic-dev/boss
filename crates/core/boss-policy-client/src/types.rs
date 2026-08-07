@@ -15,7 +15,7 @@ pub enum Action {
     Close,
     SignOff,
     Delete,
-    /// Flip a draft JobKind (or similar lifecycle resource) to active.
+    /// Flip a draft Workflow (or similar lifecycle resource) to active.
     /// Separate from Update so organizations can let many roles draft
     /// while restricting who can actually make a draft live.
     Publish,
@@ -62,7 +62,7 @@ impl std::str::FromStr for Action {
 
 /// Resource is a policy-gated kind of thing — what a rule says "Read /
 /// Update / Close / SignOff is allowed on." Tier-1 (state-machine OS)
-/// kinds are `job`, `step`, `policy-rule`, `job-kind`, `step-plugin`;
+/// kinds are `job`, `step`, `policy-rule`, `workflow`, `step-plugin`;
 /// module + tenant crates introduce their own kinds (`invoice`,
 /// `account`, `specimen`, …) by calling `Resource::new("specimen")`
 /// without modifying core. Helper constructors are provided for the
@@ -70,7 +70,7 @@ impl std::str::FromStr for Action {
 /// not the gating list.
 ///
 /// Wire + DB format is the bare kebab-case string ("policy-rule",
-/// "job-kind", "purchase-order"). `#[serde(transparent)]` makes the
+/// "workflow", "purchase-order"). `#[serde(transparent)]` makes the
 /// newtype invisible on the wire — a v1 policy_rules row with
 /// `resource = 'invoice'` deserializes the same after this lift.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -102,8 +102,8 @@ impl Resource {
     pub fn policy_rule() -> Self {
         Self::new("policy-rule")
     }
-    pub fn job_kind() -> Self {
-        Self::new("job-kind")
+    pub fn workflow() -> Self {
+        Self::new("workflow")
     }
     /// Raw audit-log rows, wherever they are surfaced as results —
     /// global search, a View over `events`, any future reader.

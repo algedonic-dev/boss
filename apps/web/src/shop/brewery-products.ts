@@ -31,7 +31,7 @@ export type BreweryProduct = Readonly<{
   ibu: number;
   package: PackageFormat;
   /// Retail price for direct-shop sales. Wholesale orders use a
-  /// separate price (built into JobKind metadata_defaults), so
+  /// separate price (built into Workflow metadata_defaults), so
   /// /shop can display a customer-facing price without coupling
   /// to wholesale pricing.
   unit_price_cents: number;

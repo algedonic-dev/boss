@@ -1,6 +1,6 @@
 <!--
   The graphical step-authoring surface (Slice 2) — shared by the New
-  and Edit JobKind pages so neither duplicates the canvas wiring.
+  and Edit Workflow pages so neither duplicates the canvas wiring.
 
   Composes: a StepPalette (add by type) · the interactive graph
   (lazy-loaded per D2) · a StepInspector for the selected node · the
@@ -20,7 +20,7 @@
   import StepPalette from './StepPalette.svelte';
   import StepInspector from './StepInspector.svelte';
   import StepDagEditor from './StepDagEditor.svelte';
-  import type { StepSpec } from './jobKindTypes';
+  import type { StepSpec } from './workflowTypes';
   import type { StepTypeInfo } from './stepTypes';
   import {
     validateDraft,
@@ -40,7 +40,7 @@
 
   // The heavy graph editor (Svelte Flow + dagre) stays in its own chunk
   // (D2). Hoisted so the dynamic import resolves once, not per render.
-  const graphModule = import('./JobKindGraphEditor.svelte');
+  const graphModule = import('./WorkflowGraphEditor.svelte');
 
   let selected = $state<string | null>(null);
   let stepTypes = $state<ReadonlyArray<StepTypeInfo>>([]);

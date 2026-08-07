@@ -233,7 +233,7 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::DISPATCHER)),
         )
         // Public read surface for the unauth landing page (`/`) —
-        // live fetch from /api/jobs/kinds/{kind}, no session
+        // live fetch from /api/workflows/{kind}, no session
         // required. Strict path matchers win over `/api/jobs/{*rest}`
         // in axum's router.
         // Writes / step metadata / detail routes stay auth-gated.
@@ -242,7 +242,7 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
         // workflow-diagram preview into a live window into the
         // brewery's running operating company.
         //
-        // For `/api/jobs/kinds` and `/api/jobs/kinds/{*rest}` we
+        // For `/api/workflows` and `/api/workflows/{*rest}` we
         // pin GET to the public handler so the landing page can
         // read without auth, AND chain the other methods through
         // the auth-gated handler on the same MethodRouter — without
@@ -250,14 +250,14 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
         // picks the most-specific matching path first and these
         // strict matchers shadow the wildcard `/api/jobs/{*rest}`.
         .route(
-            "/api/jobs/kinds",
+            "/api/workflows",
             axum::routing::get(|s, r| proxy::handle_public(s, r, &proxy::JOBS))
                 .post(|s, r| proxy::handle(s, r, &proxy::JOBS))
                 .put(|s, r| proxy::handle(s, r, &proxy::JOBS))
                 .delete(|s, r| proxy::handle(s, r, &proxy::JOBS)),
         )
         .route(
-            "/api/jobs/kinds/{*rest}",
+            "/api/workflows/{*rest}",
             axum::routing::get(|s, r| proxy::handle_public(s, r, &proxy::JOBS))
                 .post(|s, r| proxy::handle(s, r, &proxy::JOBS))
                 .put(|s, r| proxy::handle(s, r, &proxy::JOBS))
@@ -584,8 +584,8 @@ async fn handle_health() -> &'static str {
 /// Without this it fell through to the `/{*rest}` SPA route and came
 /// back as `200 text/html` — the whole index.html. A client then fails
 /// deserializing at column 1 with a parser error that names JSON and
-/// never mentions the route, which is how `/api/job-kinds` (the
-/// plausible-looking spelling of `/api/jobs/kinds`) cost two detours
+/// never mentions the route, which is how `/api/workflows` (the
+/// plausible-looking spelling of `/api/workflows`) cost two detours
 /// before anyone suspected the URL.
 ///
 /// The repo already knew about this class: several services carry a
@@ -758,12 +758,12 @@ mod routing_tests {
     #[tokio::test]
     async fn unmatched_api_path_is_a_json_404() {
         // The real miss that prompted this: the plausible-looking
-        // spelling of `/api/jobs/kinds`.
-        let (status, body) = get(app(), "/api/job-kinds").await;
+        // spelling of `/api/workflows`.
+        let (status, body) = get(app(), "/api/workflows").await;
         assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
         assert!(body.contains(MISS), "body: {body}");
         assert!(
-            body.contains("/api/job-kinds"),
+            body.contains("/api/workflows"),
             "the 404 should name the path that missed: {body}"
         );
         assert!(
@@ -792,7 +792,7 @@ mod routing_tests {
             "/api/finance/revenue-categories",
             "/api/gateway/perf",
             "/api/jobs",
-            "/api/jobs/kinds",
+            "/api/workflows",
             "/api/jobs/summary",
             "/api/classes",
             "/api/classes/employee",

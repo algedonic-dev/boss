@@ -82,12 +82,11 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
   calendar:  { id: 'calendar',  label: 'Release calendar', path: '/ux/calendar',  permKey: 'calendar',  module: 'calendar', app: 'operations' },
 
   // Modeling surfaces — operator-tier (no separate /admin tier).
-  // policy + job-kinds are dept-head + COO authority (per the
+  // policy + workflows are dept-head + COO authority (per the
   // "engineers are operators like anyone else" frame). Step
   // plugins are JS bundle authoring → IT engineering work.
   'system-monitoring':       { id: 'system-monitoring',       label: 'Monitoring',          path: '/system/monitoring',   permKey: 'system-monitoring',       app: 'it' },
   policy:                    { id: 'policy',                  label: 'Policy',              path: '/system/policy',       permKey: 'policy',                  app: 'it' },
-  'job-kinds':               { id: 'job-kinds',               label: 'Job kinds',           path: '/system/job-kinds',    permKey: 'job-kinds',               app: 'it' },
   'system-step-plugins':     { id: 'system-step-plugins',     label: 'Step plugins',        path: '/system/step-plugins', permKey: 'system-step-plugins',     app: 'it' },
   'system-dispatcher':       { id: 'system-dispatcher',       label: 'Dispatcher rules',    path: '/system/dispatcher',   permKey: 'system-dispatcher',       app: 'it' },
   'system-model':            { id: 'system-model',            label: 'System Model',        path: '/system',              permKey: 'system-model',            app: 'it' },
@@ -108,9 +107,14 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
   'system-experiments':      { id: 'system-experiments',      label: 'Experiments',         path: '/system/experiments',  permKey: 'system-experiments',      app: 'it' },
   'system-kb':               { id: 'system-kb',               label: 'Knowledge Base',      path: '/system/kb',           permKey: 'system-kb',               app: 'it' },
   'auth-admin':              { id: 'auth-admin',              label: 'Auth admin',          path: '/system/auth-admin',   permKey: 'auth-admin',              app: 'it' },
-  // KB view of every active JobKind — read-only catalog, visible to
+  // The single Workflow surface. There were two entries before the
+  // rename — a 'Job kinds' authoring row and a 'Workflows' catalog
+  // row — pointing at the same path; the authoring row had already
+  // been dropped from the sidebar (authoring is reached FROM here),
+  // and renaming collapsed the keys, which is what surfaced it.
+  // KB view of every active Workflow — read-only catalog, visible to
   // every role via canSeeRoute() short-circuit. Editing lives at
-  // /system/job-kinds, reached FROM Workflows.
+  // /system/workflows, reached FROM Workflows.
   workflows:                 { id: 'workflows',               label: 'Workflows',           path: '/system/workflows',    permKey: 'workflows',               app: 'it' },
 };
 
@@ -209,10 +213,10 @@ export const APP_SUBJECT_KINDS: Readonly<Record<AppId, ReadonlyArray<string>>> =
   // `custom` is the escape hatch for Jobs about things that are not
   // domain Subjects — a design doc is the shipped example, and
   // /system/design is an IT surface.
-  it: ['job-kind', 'company', 'custom'],
+  it: ['workflow', 'company', 'custom'],
   crm: ['account', 'customer', 'campaign', 'marketing-asset'],
   finance: ['invoice', 'vendor', 'vendor-invoice', 'purchase_order'],
-  operations: ['job-kind', 'calendar', 'location'],
+  operations: ['workflow', 'calendar', 'location'],
   'supply-chain': ['product', 'asset', 'purchase_order', 'shipment', 'vendor'],
   people: ['employee'],
 };

@@ -47,10 +47,10 @@
   import ItKnowledgeBasePage from './it/ItKnowledgeBasePage.svelte';
   import AtlasPage from './it/monitoring/AtlasPage.svelte';
   import PolicyPage from './policy/PolicyPage.svelte';
-  import JobKindsPage from './job-kinds/JobKindsPage.svelte';
-  import JobKindNewPage from './job-kinds/JobKindNewPage.svelte';
-  import JobKindDesignWorkspace from './job-kinds/JobKindDesignWorkspace.svelte';
-  import JobKindDetailPage from './job-kinds/JobKindDetailPage.svelte';
+  import WorkflowsAdminPage from './workflows/WorkflowsAdminPage.svelte';
+  import WorkflowNewPage from './workflows/WorkflowNewPage.svelte';
+  import WorkflowDesignWorkspace from './workflows/WorkflowDesignWorkspace.svelte';
+  import WorkflowDetailPage from './workflows/WorkflowDetailPage.svelte';
   import StepPluginsPage from './it/step-plugins/StepPluginsPage.svelte';
   import StepPluginDetailPage from './it/step-plugins/StepPluginDetailPage.svelte';
   import DispatcherCascadePage from './dispatcher/DispatcherCascadePage.svelte';
@@ -201,13 +201,12 @@
       : route.kind === 'marketingAssets' || route.kind === 'marketingAsset' ? 'marketing-assets'
       : route.kind === 'manual' || route.kind === 'manualSection' ? 'manual'
       : route.kind === 'policy' ? 'policy'
-      : route.kind === 'jobKinds' || route.kind === 'jobKindNew' || route.kind === 'jobKindDesign' || route.kind === 'jobKindDetail' ? 'jobKinds'
+      : route.kind === 'workflows' || route.kind === 'workflowsAdmin' || route.kind === 'workflowNew' || route.kind === 'workflowDesign' || route.kind === 'workflowDetail' ? 'workflows'
       : route.kind === 'systemStepPlugins' || route.kind === 'systemStepPluginDetail' ? 'systemStepPlugins'
       : route.kind === 'dispatcherRules' || route.kind === 'dispatcherRulesList' || route.kind === 'dispatcherRuleEdit' ? 'system-dispatcher'
       : route.kind === 'systemSubjects' ? 'system-subjects'
       : route.kind === 'systemModel' ? 'system-model'
       : route.kind === 'experiments' ? 'system-experiments'
-      : route.kind === 'workflows' ? 'workflows'
       : 'me',
   );
 
@@ -256,8 +255,8 @@
       <MePage />
     {:else if route.kind === 'jobs'}
       <JobsListPage
-        initialKind={route.jobKind ?? ''}
-        initialKindPrefix={route.jobKindPrefix ?? ''}
+        initialKind={route.workflow ?? ''}
+        initialKindPrefix={route.workflowPrefix ?? ''}
         initialStatus={route.jobStatus ?? 'open'}
         initialOwnerId={route.jobOwnerId ?? ''}
         initialSubjectKind={route.jobSubjectKind ?? ''}
@@ -337,14 +336,14 @@
       <ItKnowledgeBasePage />
     {:else if route.kind === 'policy'}
       <PolicyPage />
-    {:else if route.kind === 'jobKinds'}
-      <JobKindsPage />
-    {:else if route.kind === 'jobKindNew'}
-      <JobKindNewPage />
-    {:else if route.kind === 'jobKindDesign'}
-      <JobKindDesignWorkspace jobId={route.jobId} />
-    {:else if route.kind === 'jobKindDetail'}
-      <JobKindDetailPage kindSlug={route.kindSlug} />
+    {:else if route.kind === 'workflowsAdmin'}
+      <WorkflowsAdminPage />
+    {:else if route.kind === 'workflowNew'}
+      <WorkflowNewPage />
+    {:else if route.kind === 'workflowDesign'}
+      <WorkflowDesignWorkspace jobId={route.jobId} />
+    {:else if route.kind === 'workflowDetail'}
+      <WorkflowDetailPage kindSlug={route.kindSlug} />
     {:else if route.kind === 'systemStepPlugins'}
       <StepPluginsPage />
     {:else if route.kind === 'systemStepPluginDetail'}

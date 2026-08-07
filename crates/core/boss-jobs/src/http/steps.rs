@@ -108,41 +108,41 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
         .into_response()
 }
 
-/// Dispatch path for the `job-kind-publish` StepType — the
-/// terminal step of every `job-kind-design` Job. Reads
-/// `job_kind_spec` out of the step metadata, validates it, and
-/// calls `JobKindRegistry::publish_authored`. Returns the
+/// Dispatch path for the `workflow-publish` StepType — the
+/// terminal step of every `workflow-design` Job. Reads
+/// `workflow_spec` out of the step metadata, validates it, and
+/// calls `WorkflowRegistry::publish_authored`. Returns the
 /// published spec on success or a (status, message) pair the
 /// caller can short-circuit with.
 ///
-/// Validation = `boss_jobs::job_kind_lint::validate_all` —
+/// Validation = `boss_jobs::workflow_lint::validate_all` —
 /// catches required-field mismatches, unknown step kinds, and the
 /// other static guarantees a published spec needs. The lint
 /// failure is surfaced as 400 so the SPA can render the offender.
-async fn dispatch_job_kind_publish(
-    registry: &dyn crate::registry::JobKindRegistry,
+async fn dispatch_workflow_publish(
+    registry: &dyn crate::registry::WorkflowRegistry,
     step: &boss_core::job::Step,
     job_id: boss_core::job::JobId,
-) -> Result<crate::registry::JobKindSpec, (StatusCode, String)> {
-    use crate::job_kind_lint::validate_all;
+) -> Result<crate::registry::WorkflowSpec, (StatusCode, String)> {
+    use crate::workflow_lint::validate_all;
 
-    let spec_value = step.metadata.get("job_kind_spec").ok_or((
+    let spec_value = step.metadata.get("workflow_spec").ok_or((
         StatusCode::BAD_REQUEST,
-        "job-kind-publish step missing required metadata field `job_kind_spec`".to_string(),
+        "workflow-publish step missing required metadata field `workflow_spec`".to_string(),
     ))?;
 
-    let spec: crate::registry::JobKindSpec =
+    let spec: crate::registry::WorkflowSpec =
         serde_json::from_value(spec_value.clone()).map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
-                format!("`job_kind_spec` did not deserialize as JobKindSpec: {e}"),
+                format!("`workflow_spec` did not deserialize as WorkflowSpec: {e}"),
             )
         })?;
 
     let registry_v1 = crate::step_registry::StepRegistry::v1();
     let lint_errs = validate_all(std::slice::from_ref(&spec), &registry_v1);
     if !lint_errs.is_empty() {
-        let mut msg = String::from("job-kind-publish: spec failed validate_all:");
+        let mut msg = String::from("workflow-publish: spec failed validate_all:");
         for e in &lint_errs {
             msg.push_str(&format!("\n  {e}"));
         }
@@ -432,26 +432,26 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         }
     }
 
-    // In-process dispatch for the `job-kind-publish` StepType. When a
-    // step of this kind flips to Done, read `job_kind_spec` from
+    // In-process dispatch for the `workflow-publish` StepType. When a
+    // step of this kind flips to Done, read `workflow_spec` from
     // metadata, lint it via `validate_all`, and call
-    // `JobKindRegistry::publish_authored` so the meta-Job's authoring
+    // `WorkflowRegistry::publish_authored` so the meta-Job's authoring
     // closes by writing a real registry row.
     //
     // Registry-write-first: if publish_authored fails, `update_step_at`
     // is never called and no STEP_UPDATED accumulates in audit_log for
     // a step whose side effect couldn't fire — keeping audit_log
     // integrity on partial failure.
-    let mut published_kind: Option<crate::registry::JobKindSpec> = None;
-    if is_flipping_to_done && step.kind == "job-kind-publish" {
+    let mut published_kind: Option<crate::registry::WorkflowSpec> = None;
+    if is_flipping_to_done && step.kind == "workflow-publish" {
         let Some(reg) = &state.kind_registry else {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "JobKind registry unavailable for job-kind-publish dispatch",
+                "Workflow registry unavailable for workflow-publish dispatch",
             )
                 .into_response();
         };
-        match dispatch_job_kind_publish(reg.as_ref(), &step, job_id).await {
+        match dispatch_workflow_publish(reg.as_ref(), &step, job_id).await {
             Ok(spec) => published_kind = Some(spec),
             Err((status, msg)) => return (status, msg).into_response(),
         }
@@ -497,12 +497,12 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         serde_json::to_value(&step).unwrap_or_default(),
     )];
 
-    // The `job-kind-publish` dispatch produces an audit-bearing
-    // event with the full published spec — what `rebuild_job_kinds`
+    // The `workflow-publish` dispatch produces an audit-bearing
+    // event with the full published spec — what `rebuild_workflows`
     // reads to reconstruct the registry from audit_log.
     if let Some(spec) = &published_kind {
         step_events.push(stamp.event(
-            events::JOB_KIND_PUBLISHED,
+            events::WORKFLOW_PUBLISHED,
             serde_json::to_value(spec).unwrap_or_default(),
         ));
     }
@@ -573,7 +573,7 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // make a downstream step's `ready_when` predicate flip (Pending →
     // Ready) or rule a branch out (Pending → Skipped). The re-evaluator
     // is the single readiness engine, driven off the active
-    // JobKindSpec's predicates rather than denormalized edges.
+    // WorkflowSpec's predicates rather than denormalized edges.
     if let Some(reg) = &state.kind_registry {
         let job_for_reeval = match state.jobs.get_job(&job_id).await {
             Ok(Some(j)) => Some(j),
@@ -587,14 +587,14 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
             // the length-guard below then bails and the Job stops
             // advancing — silently, as a Job that simply never closes.
             // Two feedback Jobs were stranded exactly this way.
-            match reg.get_version(&job.kind, job.job_kind_version).await {
+            match reg.get_version(&job.kind, job.workflow_version).await {
                 Ok(spec) => {
                     if let Ok(mut steps) = state.jobs.list_steps(&job_id).await {
                         // `reevaluate` requires steps in spec order
                         // (sort_order == index); list_steps returns them
                         // sorted by sort_order, so the invariant holds.
                         // Invariant (expose, don't swallow): a Job's live
-                        // step set must match its active JobKind spec, or
+                        // step set must match its active Workflow spec, or
                         // `reevaluate`'s length-guard bails and the Job can
                         // no longer advance. With atomic materialization
                         // this only fires on a genuine mid-flight republish
@@ -606,9 +606,9 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                                 kind = %job.kind,
                                 spec_len = spec.steps.len(),
                                 steps_len = steps.len(),
-                                "re-eval: live step count != active JobKind spec — \
+                                "re-eval: live step count != active Workflow spec — \
                                  readiness cannot advance this Job (its step graph \
-                                 is inconsistent with its JobKind)"
+                                 is inconsistent with its Workflow)"
                             );
                         }
                         let changed = crate::registry::reevaluate(
@@ -669,14 +669,14 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                         }
                     }
                 }
-                Err(crate::registry::JobKindError::NotFound(_)) => {
+                Err(crate::registry::WorkflowError::NotFound(_)) => {
                     // No active spec (ad-hoc / registry-less kind):
                     // nothing to re-evaluate. The compute_job_status
                     // auto-close below still handles the
                     // all-steps-terminal case.
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, job_id = %job_id, version = job.job_kind_version, "re-eval: pinned JobKind version not resolvable");
+                    tracing::warn!(error = %e, job_id = %job_id, version = job.workflow_version, "re-eval: pinned Workflow version not resolvable");
                 }
             }
         }

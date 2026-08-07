@@ -1,11 +1,11 @@
-//! JobKind-publish logic, shared by the
+//! Workflow-publish logic, shared by the
 //! `boss-brewery-bootstrap` binary and the unified
 //! [`crate::prepare`] step (we're converging the brewery's
 //! bootstrap/data-seed/engine/sim binaries into one tool).
 //!
-//! [`publish_job_kinds`] opens one `job-kind-design` Job per
-//! brewery JobKind, walks it to closure, and lets the
-//! `job-kind-publish` dispatch path land the spec in the
+//! [`publish_workflows`] opens one `workflow-design` Job per
+//! brewery Workflow, walks it to closure, and lets the
+//! `workflow-publish` dispatch path land the spec in the
 //! registry.
 //!
 //! Tenant kinds arrive with full provenance this way: audit_log
@@ -14,7 +14,7 @@
 //! `crates/boss-jobs/src/registry.rs::platform_kinds()` for the
 //! meta-kind itself.
 //!
-//! Idempotent: if a `job-kind-design` Job has already published a
+//! Idempotent: if a `workflow-design` Job has already published a
 //! given target kind (the registry has an active row whose
 //! `created_by` starts with `job-`), the publish skips it. Re-
 //! running after a partial failure resumes from where it left off.
@@ -26,13 +26,13 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use boss_jobs::registry::JobKindSpec;
+use boss_jobs::registry::WorkflowSpec;
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-/// Open one `job-kind-design` Job per brewery JobKind in `seeds`,
-/// walk each to closure, and let the `job-kind-publish` dispatch
+/// Open one `workflow-design` Job per brewery Workflow in `seeds`,
+/// walk each to closure, and let the `workflow-publish` dispatch
 /// path land the spec in the registry.
 ///
 /// `api_base` is the jobs-api (or gateway) base URL; `dev`
@@ -44,7 +44,7 @@ use tracing::{info, warn};
 ///
 /// Idempotent + hard-fails on any non-2xx response — see the
 /// module docs.
-pub fn publish_job_kinds(
+pub fn publish_workflows(
     api_base: &str,
     seeds: &Path,
     dev: bool,
@@ -76,8 +76,8 @@ pub fn publish_job_kinds(
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    let specs = boss_jobs::seed_loader::load_job_kinds_with_owning_team(seeds, "brewery-bootstrap")
-        .context("loading brewery job_kinds.toml")?;
+    let specs = boss_jobs::seed_loader::load_workflows_with_owning_team(seeds, "brewery-bootstrap")
+        .context("loading brewery workflows.toml")?;
 
     info!(
         seeds = %seeds.display(),
@@ -139,7 +139,7 @@ fn active_kind_provenance(
     headers: &reqwest::header::HeaderMap,
     kind: &str,
 ) -> Result<Provenance> {
-    let url = jobs_url(api_base, &format!("/api/jobs/kinds/{kind}"));
+    let url = jobs_url(api_base, &format!("/api/workflows/{kind}"));
     let resp = client.get(&url).headers(headers.clone()).send()?;
     if resp.status() == 404 {
         return Ok(Provenance::Missing);
@@ -171,22 +171,22 @@ fn bootstrap_kind(
     client: &Client,
     api_base: &str,
     headers: &reqwest::header::HeaderMap,
-    target: &JobKindSpec,
+    target: &WorkflowSpec,
     dev: bool,
 ) -> Result<()> {
-    info!(kind = %target.kind, "opening job-kind-design Job");
+    info!(kind = %target.kind, "opening workflow-design Job");
 
-    // 1. POST /api/jobs to open a job-kind-design Job whose
+    // 1. POST /api/jobs to open a workflow-design Job whose
     //    Subject points at the target kind. The metadata carries
     //    a placeholder; metadata for individual steps gets PUT
     //    in subsequent calls.
     let create_body = json!({
-        "kind": "job-kind-design",
+        "kind": "workflow-design",
         // Subject is uniformly a {subject_kind, id} pair — every
-        // kind, including this meta-Job's `job-kind` subject, uses
+        // kind, including this meta-Job's `workflow` subject, uses
         // the same shape.
         "subject": {
-            "subject_kind": "job-kind",
+            "subject_kind": "workflow",
             "id": target.kind,
         },
         "title": format!("Design `{}`", target.kind),
@@ -198,7 +198,7 @@ fn bootstrap_kind(
         // step-walk below closes the Job against. A hardcoded epoch date
         // diverged from the prior-day seed anchor the close lands on
         // (seed_tenant_data's configure_clock_to_epoch rebases the clock to
-        // the prior day), so closed_on < opened_on whenever JobKinds publish
+        // the prior day), so closed_on < opened_on whenever Workflows publish
         // after that rebase — tripping the lifecycle-ordering invariant.
         "metadata": json!({
             "target_kind": target.kind,
@@ -265,7 +265,7 @@ fn walk_step(
     job_id: &str,
     step_id: &str,
     step_kind: &str,
-    target: &JobKindSpec,
+    target: &WorkflowSpec,
     dev: bool,
 ) -> Result<()> {
     let url = jobs_url(api_base, &format!("/api/jobs/{job_id}/steps/{step_id}"));
@@ -288,12 +288,12 @@ fn walk_step(
             // Sign-off contract: metadata lands first, the stamp attests the
             // final shape, then the status flip below completes it.
             //
-            // The `job-kind-design` approve step requires the
-            // `job-kind-approver` authority (boss-jobs registry), so the
+            // The `workflow-design` approve step requires the
+            // `workflow-approver` authority (boss-jobs registry), so the
             // stamp's `role` must equal that — the sign-off endpoint
             // rejects any role not in `sign_offs_required`. We stamp as the
             // `platform-admin` automation identity, which holds
-            // `step-signoff:job-kind-approver` via the core policy defaults;
+            // `step-signoff:workflow-approver` via the core policy defaults;
             // seed-time provisioning therefore never depends on the tenant's
             // approver grants having loaded first.
             let md_url = jobs_url(api_base, &format!("/api/jobs/{job_id}/steps/{step_id}"));
@@ -302,7 +302,7 @@ fn walk_step(
                 .headers(headers.clone())
                 .json(&json!({
                     "metadata": {
-                        "authority_role": "job-kind-approver",
+                        "authority_role": "workflow-approver",
                         "signed_by": "emp-cto",
                     },
                 }))
@@ -333,7 +333,7 @@ fn walk_step(
                     "x-boss-user",
                     reqwest::header::HeaderValue::from_str(&stamper).context("stamper header")?,
                 )
-                .json(&json!({ "role": "job-kind-approver" }))
+                .json(&json!({ "role": "workflow-approver" }))
                 .send()
                 .with_context(|| format!("POST {stamp_url}"))?;
             if !resp.status().is_success() {
@@ -343,22 +343,22 @@ fn walk_step(
             }
             json!({ "status":"completed" })
         }
-        "job-kind-publish" => {
+        "workflow-publish" => {
             // The terminal step. Metadata MUST carry the full
-            // JobKindSpec so the dispatch handler in
+            // WorkflowSpec so the dispatch handler in
             // boss-jobs::http::update_step can call
             // publish_authored.
-            let spec_value =
-                serde_json::to_value(target).context("serializing JobKindSpec for publish step")?;
+            let spec_value = serde_json::to_value(target)
+                .context("serializing WorkflowSpec for publish step")?;
             json!({
                 "status":"completed",
                 "metadata": {
-                    "job_kind_spec": spec_value,
+                    "workflow_spec": spec_value,
                 },
             })
         }
         other => {
-            warn!(step_kind = %other, "unrecognized step kind on job-kind-design; flipping to done");
+            warn!(step_kind = %other, "unrecognized step kind on workflow-design; flipping to done");
             json!({ "status":"completed" })
         }
     };

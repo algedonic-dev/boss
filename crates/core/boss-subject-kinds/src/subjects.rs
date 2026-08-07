@@ -257,7 +257,7 @@ pub async fn rebuild_subjects(pool: &PgPool) -> Result<u64, String> {
     // Job serialization). Read the NESTED object — top-level
     // `subject_kind`/`subject_id` keys never existed, so the old path
     // silently homed nothing and every log-only rebuild dropped the
-    // birth-by-job subjects (job-kind, custom) that no TOML event
+    // birth-by-job subjects (workflow, custom) that no TOML event
     // source carries (task #18).
     let res = sqlx::query(
         "INSERT INTO subjects (kind, id) \

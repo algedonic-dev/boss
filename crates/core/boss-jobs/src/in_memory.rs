@@ -695,7 +695,7 @@ mod tests {
         assert!(!titles.contains(&"Receive"), "pending excluded");
         assert!(!titles.contains(&"Stale bill"), "closed-job step excluded");
         assert_eq!(rows.len(), 4);
-        assert!(rows.iter().all(|r| r.job_kind == "ingredient-restock"));
+        assert!(rows.iter().all(|r| r.workflow == "ingredient-restock"));
     }
 
     #[tokio::test]

@@ -73,7 +73,7 @@ test.describe('Phase-3 Work + Admin', () => {
   });
 
   test('Admin: Job kinds list loads', async ({ page }) => {
-    await page.goto('/system/job-kinds');
+    await page.goto('/system/workflows');
     await expect(page.locator('h1')).toContainText(/job kinds/i);
     // At least one category section with a table, once seeded.
     await expect(
@@ -82,12 +82,12 @@ test.describe('Phase-3 Work + Admin', () => {
   });
 
   test('Admin: Job kind detail loads for a seeded kind', async ({ page }) => {
-    await page.goto('/system/job-kinds');
+    await page.goto('/system/workflows');
     const firstRow = page.locator('table tbody tr').first();
     await expect(firstRow).toBeVisible({ timeout: 10_000 });
     const link = firstRow.locator('a').first();
     const href = await link.getAttribute('href');
-    expect(href).toMatch(/\/admin\/job-kinds\//);
+    expect(href).toMatch(/\/admin\/workflows\//);
     await page.goto(href!);
     // The detail page renders an h3 "Spec" inside the first Section.
     await expect(page.locator('h3').filter({ hasText: /^Spec$/ })).toBeVisible({
@@ -96,7 +96,7 @@ test.describe('Phase-3 Work + Admin', () => {
   });
 
   test('Admin: Job kind new page loads the DAG editor', async ({ page }) => {
-    await page.goto('/system/job-kinds/new');
+    await page.goto('/system/workflows/new');
     await expect(page.locator('h1')).toContainText(/new job kind/i);
     await expect(page.locator('.sde')).toBeVisible({ timeout: 10_000 });
   });

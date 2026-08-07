@@ -167,7 +167,7 @@ async fn my_scope<R: PolicyRepository + 'static>(
     let mut entries = Vec::new();
     // Iterate the platform's shipped resources (defaults::shipped_resources)
     // so the discovery endpoint covers everything `default_rules` enumerates
-    // Read access against — including the registry resources (job_kind,
+    // Read access against — including the registry resources (workflow,
     // step_plugin) the SPA needs for /workflows + /system/step-plugins
     // nav-gating.
     for resource in boss_policy_client::defaults::shipped_resources() {

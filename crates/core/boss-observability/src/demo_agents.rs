@@ -46,7 +46,7 @@ fn agent_specs() -> Value {
         {
             "id": "agent-tap-launch-copywriter",
             "display_name": "Tap launch copywriter",
-            "system_prompt": "Draft tap-handle copy + social-post variants for new releases. One pass per tap-launch JobKind step.done event.",
+            "system_prompt": "Draft tap-handle copy + social-post variants for new releases. One pass per tap-launch Workflow step.done event.",
             "model": "claude-sonnet-4-6",
             "hourly_budget_usd_micros": 1_500_000,
             "max_concurrent_runs": 2

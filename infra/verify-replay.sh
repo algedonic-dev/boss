@@ -45,7 +45,7 @@ section() { printf "\n%s%s%s\n" "$BOLD" "$1" "$RESET"; }
 
 # x-boss-user header attaching the deploy-time platform-admin
 # identity. Required because the API endpoints policy-gate; an
-# anonymous curl gets `guest` which can only read JobKinds.
+# anonymous curl gets `guest` which can only read Workflows.
 BOSS_USER='{"id":"verify-replay","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
 
 # Per-tenant HTTP API endpoint check. Reads the live API, extracts a
@@ -120,7 +120,7 @@ check_api_count "accounts"         "http://127.0.0.1:7550/api/people/accounts"  
 check_api_count "vendors"          "http://127.0.0.1:7300/api/inventory/vendors"        "len(d)"     1
 check_api_count "assets"    "http://127.0.0.1:7600/api/assets?limit=1"    "d.get('total', 0)"      1
 check_api_count "jobs"             "http://127.0.0.1:7900/api/jobs?limit=1"             "d.get('total', 0)"      1
-check_api_count "JobKinds"         "http://127.0.0.1:7900/api/jobs/kinds"               "len(d)"     1
+check_api_count "Workflows"         "http://127.0.0.1:7900/api/workflows"               "len(d)"     1
 
 # ---------------------------------------------------------------------------
 if (( STRICT )); then

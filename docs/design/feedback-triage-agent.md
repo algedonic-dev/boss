@@ -62,7 +62,7 @@ catalog, and the open-PR list have reached the same disposition?
 | `811c5dc5` | `/system` | defect | `/api/*` miss falls through to the SPA as 200 HTML instead of a JSON 404 | **No** — needed gateway routing |
 | `8c55d799` | step focus | defect | Full-page step route demanded a plugin; fell back to the platform surface | **No** — needed the surface dispatcher |
 | `bd500848` | job page | defect | Same cause as above, older link shape | **Partly** — a dedupe rule could have paired them |
-| `74cbe627` | `/system/job-kinds` | defect (agent-filed) | Version pin defeated by in-place reconcile; both halves fixed | **No** — needed reconcile + re-eval together |
+| `74cbe627` | `/system/workflows` | defect (agent-filed) | Version pin defeated by in-place reconcile; both halves fixed | **No** — needed reconcile + re-eval together |
 
 ### Notes per item
 
@@ -94,7 +94,7 @@ no metadata; pinned by a spec test that reproduces the operator's
 exact error at authoring time.
 
 Worth noting for Q1: dispositioning this needed the StepType field
-schema, the JobKind spec, and the rule that validators fire at
+schema, the Workflow spec, and the rule that validators fire at
 completion. None of that is in the feedback text, and no amount of
 classifying the text would have reached it. But also note what
 *found* it — an operator clicking a button, not an agent reading a
@@ -143,8 +143,8 @@ separate items — a step kind that could never complete, a board that
 could not find its fork step, and two Jobs that would not close — were
 dispositioned as three unrelated bugs. They were one: **a Job
 materializes its steps once and keeps them, so anything that changes
-the JobKind underneath it strands the Job.** The root cause was a
-JobKind refresh rewriting a live version in place while Jobs pinned to
+the Workflow underneath it strands the Job.** The root cause was a
+Workflow refresh rewriting a live version in place while Jobs pinned to
 it kept resolving that version.
 
 Each item on its own looked like a one-off, and triaging item-by-item

@@ -5,7 +5,7 @@
 //! `boss-inventory-sim-bridge::PoPlaceEmitter`. Reads step metadata
 //! for the explicit po_id + lines (the bill-approval step that runs
 //! later references the SAME po_id, so the FK has to resolve at
-//! both ends); falls back to a subject-derived id when the JobKind
+//! both ends); falls back to a subject-derived id when the Workflow
 //! author didn't set one.
 //!
 //! POST `/api/inventory/orders/batch` with a single-element array so
@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-/// A PO line as authored in step metadata. The JobKind usually
+/// A PO line as authored in step metadata. The Workflow usually
 /// supplies only `part_sku` (templated from the Job's
 /// `metadata.part_sku`); qty and price are resolved at placement.
 #[derive(Deserialize)]
@@ -123,7 +123,7 @@ impl Handler for InventoryPoPlace {
             .unwrap_or(14);
         let expected_on = placed_on + chrono::Duration::days(expected_offset_days);
 
-        // Lines come from step metadata. The restock JobKinds author
+        // Lines come from step metadata. The restock Workflows author
         // a single `{ part_sku = "{metadata.part_sku}" }` entry; any
         // line missing qty / unit_cost is priced here, once, at
         // placement — qty from the item's reorder_qty, price from

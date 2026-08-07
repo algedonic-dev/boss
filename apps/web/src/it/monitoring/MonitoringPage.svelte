@@ -36,7 +36,7 @@
   // intended pressure: stay current with descriptions, but never
   // miss a service silently.
   const DESCRIPTIONS: Record<string, string> = {
-    jobs: 'Jobs + Steps + Scheduling, JobKind + StepPlugin registries',
+    jobs: 'Jobs + Steps + Scheduling, Workflow + StepPlugin registries',
     people: 'Employees, contacts, HR, org chart, certifications, account team membership',
     assets: 'Tracked physical units + event log, device-insights projection',
     catalog: 'System models, parts, consumables, failure modes',

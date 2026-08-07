@@ -7,7 +7,7 @@
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import type { StepPluginSpec } from './stepPluginTypes';
-  import type { JobKindStatus } from '../../job-kinds/jobKindTypes';
+  import type { WorkflowStatus } from '../../workflows/workflowTypes';
   import { href } from '../../router';
 
   type LoadState =
@@ -89,7 +89,7 @@
     }
   }
 
-  function statusChipClass(status: JobKindStatus): string {
+  function statusChipClass(status: WorkflowStatus): string {
     return status === 'active' ? 'ok' : status === 'retired' ? 'muted' : 'warn';
   }
 </script>

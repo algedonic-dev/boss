@@ -364,7 +364,7 @@ impl Handler for PackagingAllocate {
         let fork_keys = md.get("fork_keys");
         let default_map = md.get("default_kegs");
 
-        // Fetch the Job once — used for its JobKind (the in-flight count)
+        // Fetch the Job once — used for its Workflow (the in-flight count)
         // and its steps (to write package quantities).
         let job = self.fetch_job(ev.job_id).await?;
         // In-flight pipeline depth (open Jobs of this kind minus this one),

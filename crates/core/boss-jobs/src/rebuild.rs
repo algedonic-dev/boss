@@ -164,11 +164,11 @@ async fn upsert_job(
         r#"
         INSERT INTO jobs (id, kind, subject_kind, subject_id, title, owner_id,
                           status, priority, opened_on, due_on, closed_on, metadata, tags,
-                          job_kind_version, created_at, updated_at, simulated)
+                          workflow_version, created_at, updated_at, simulated)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15, $16)
         ON CONFLICT (id) DO UPDATE SET
             kind = EXCLUDED.kind,
-            job_kind_version = EXCLUDED.job_kind_version,
+            workflow_version = EXCLUDED.workflow_version,
             subject_kind = EXCLUDED.subject_kind,
             subject_id = EXCLUDED.subject_id,
             title = EXCLUDED.title,
@@ -197,7 +197,7 @@ async fn upsert_job(
     .bind(job.closed_on)
     .bind(&job.metadata)
     .bind(&job.tags)
-    .bind(job.job_kind_version)
+    .bind(job.workflow_version)
     .bind(ts)
     .bind(simulated)
     .fetch_one(&mut *conn)

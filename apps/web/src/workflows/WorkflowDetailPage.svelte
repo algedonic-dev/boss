@@ -1,15 +1,15 @@
 <script lang="ts">
-  // /system/job-kinds/:slug — port of
-  // apps/web/src/admin/JobKindDetailPage.tsx.
+  // /system/workflows/:slug — port of
+  // apps/web/src/admin/WorkflowDetailPage.tsx.
 
   import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
-  import type { JobKindSpec, StepSpec } from './jobKindTypes';
+  import type { WorkflowSpec, StepSpec } from './workflowTypes';
   import { href, navigate } from '../router';
   import StepDag from '../jobs/StepDag.svelte';
-  import { jobKindToDag } from '../jobs/jobKindToDag';
+  import { workflowToDag } from '../jobs/workflowToDag';
   import { startDesignJob } from './designJob';
   import { session } from '@boss/web-kit/session/session.svelte';
   import { appToday } from '@boss/web-kit/sim-clock';
@@ -17,7 +17,7 @@
   type LoadState =
     | { kind: 'loading' }
     | { kind: 'error'; message: string }
-    | { kind: 'ready'; spec: JobKindSpec; versions: ReadonlyArray<JobKindSpec> };
+    | { kind: 'ready'; spec: WorkflowSpec; versions: ReadonlyArray<WorkflowSpec> };
 
   type Props = { kindSlug: string };
   let { kindSlug }: Props = $props();
@@ -31,7 +31,7 @@
   );
 
   // Edit / new version (D6): author the next version *through* a fresh
-  // `job-kind-design` Job seeded from the active spec — never a direct
+  // `workflow-design` Job seeded from the active spec — never a direct
   // registry write. The active row + in-flight Jobs are untouched until
   // the new design Job reaches its publish step.
   async function editNewVersion(): Promise<void> {
@@ -46,7 +46,7 @@
         appToday(),
         { title: `Edit ${spec.kind}`, previousVersion: spec.version },
       );
-      navigate(href(`/system/job-kinds/authoring/${encodeURIComponent(jobId)}`));
+      navigate(href(`/system/workflows/authoring/${encodeURIComponent(jobId)}`));
     } catch (e) {
       actionError = e instanceof Error ? e.message : String(e);
       action = null;
@@ -56,15 +56,15 @@
   async function load(): Promise<void> {
     try {
       const [specResp, versionsResp] = await Promise.all([
-        fetch(`/api/jobs/kinds/${encodeURIComponent(kindSlug)}`),
-        fetch(`/api/jobs/kinds/${encodeURIComponent(kindSlug)}/versions`),
+        fetch(`/api/workflows/${encodeURIComponent(kindSlug)}`),
+        fetch(`/api/workflows/${encodeURIComponent(kindSlug)}/versions`),
       ]);
       const versions = versionsResp.ok
-        ? ((await versionsResp.json()) as JobKindSpec[])
+        ? ((await versionsResp.json()) as WorkflowSpec[])
         : [];
-      let spec: JobKindSpec | null = null;
+      let spec: WorkflowSpec | null = null;
       if (specResp.ok) {
-        spec = (await specResp.json()) as JobKindSpec;
+        spec = (await specResp.json()) as WorkflowSpec;
       } else if (versions.length > 0) {
         spec = versions[versions.length - 1]!;
       } else {
@@ -111,7 +111,7 @@
         }
       }
       const r = await fetch(
-        `/api/jobs/kinds/${encodeURIComponent(kindSlug)}/${verb}`,
+        `/api/workflows/${encodeURIComponent(kindSlug)}/${verb}`,
         { method: 'POST' },
       );
       if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
@@ -123,7 +123,7 @@
     }
   }
 
-  function statusChipClass(status: JobKindSpec['status']): string {
+  function statusChipClass(status: WorkflowSpec['status']): string {
     return status === 'active' ? 'ok' : status === 'retired' ? 'muted' : 'warn';
   }
 
@@ -149,7 +149,7 @@
   /// Union of step slugs across the two versions, preserving the
   /// authoring order of the current (B / `spec`) side first, then
   /// appending any slugs that only exist on the other (A) side.
-  function slugUnion(a: JobKindSpec, b: JobKindSpec): string[] {
+  function slugUnion(a: WorkflowSpec, b: WorkflowSpec): string[] {
     const order: string[] = [];
     const seen = new Set<string>();
     for (const s of b.steps) {
@@ -169,7 +169,7 @@
 
   function diffMark(
     step: StepSpec,
-    other: JobKindSpec,
+    other: WorkflowSpec,
     side: 'A' | 'B',
   ): DiffMark {
     const matching = other.steps.find((s) => s.title === step.title);
@@ -202,7 +202,7 @@
     : null}
 
   <div class="catalog theme-exec">
-    <Breadcrumb to={href('/system/job-kinds')}>
+    <Breadcrumb to={href('/system/workflows')}>
       ← All job kinds
     </Breadcrumb>
     <PageHeader
@@ -233,7 +233,7 @@
       <button
         type="button"
         class="wb-btn"
-        onclick={() => navigate(href(`/system/job-kinds/new?fork=${encodeURIComponent(spec.kind)}`))}
+        onclick={() => navigate(href(`/system/workflows/new?fork=${encodeURIComponent(spec.kind)}`))}
         title="Create a new kind pre-populated from this one"
       >
         Fork…
@@ -393,7 +393,7 @@
           title={`Steps (${spec.steps.length} step${spec.steps.length === 1 ? '' : 's'})`}
           wide
         >
-            {@const dag = jobKindToDag(spec.steps)}
+            {@const dag = workflowToDag(spec.steps)}
             <StepDag nodes={dag.nodes} edges={dag.edges} />
             <div class="jd-steps">
               {#each spec.steps as step (step.title)}

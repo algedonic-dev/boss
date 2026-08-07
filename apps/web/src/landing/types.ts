@@ -1,10 +1,10 @@
 // Wire types for the landing page's read-only surface. Mirrors
-// the boss-jobs JobKindSpec shape — kept narrow (only the fields
+// the boss-jobs WorkflowSpec shape — kept narrow (only the fields
 // the graph + side panel use) so a future server-side change
 // doesn't ripple through the SPA more than necessary.
 
-export type JobKindStep = Readonly<{
-  /// Stable kebab-case slug, unique within the JobKind. Edges in the
+export type WorkflowStep = Readonly<{
+  /// Stable kebab-case slug, unique within the Workflow. Edges in the
   /// Mermaid graph are derived from sibling steps' `ready_when`
   /// predicates referencing this slug as `steps.<title>.done`.
   title: string;
@@ -18,7 +18,7 @@ export type JobKindStep = Readonly<{
   terminal?: Readonly<{ outcome: string }> | null;
 }>;
 
-export type JobKindSpec = Readonly<{
+export type WorkflowSpec = Readonly<{
   kind: string;
   version: number;
   status: string;
@@ -26,14 +26,14 @@ export type JobKindSpec = Readonly<{
   description?: string | null;
   category: string;
   subject_kinds: ReadonlyArray<string>;
-  steps: ReadonlyArray<JobKindStep>;
-  /// Free-form JobKind-level metadata blob (the `surfaces` hint
+  steps: ReadonlyArray<WorkflowStep>;
+  /// Free-form Workflow-level metadata blob (the `surfaces` hint
   /// lives here). Optional on the landing surface — only consumed
   /// where a page needs it.
   metadata?: Record<string, unknown>;
 }>;
 
-export type JobKindSummary = Readonly<{
+export type WorkflowSummary = Readonly<{
   kind: string;
   label: string;
   category: string;

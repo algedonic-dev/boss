@@ -360,7 +360,7 @@ CREATE TRIGGER event_outbox_check_refs_trg
 -- edge for this event kind against the `subjects` identity table:
 -- `subjects (kind = target_kind, id = payload->>field_path)`. One
 -- resolution path for every kind — platform, tenant-defined, and the
--- table-less ones (campaign, company, job-kind) — because R1 gave
+-- table-less ones (campaign, company, workflow) — because R1 gave
 -- them all a home there. Same escape hatch, same dual-mount
 -- (audit_log + event_outbox) as the non-subject guard above; the
 -- outbox mount is the one that can ABORT inside the domain

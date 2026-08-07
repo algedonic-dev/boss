@@ -30,7 +30,7 @@ pub struct ShapeDrivenState {
     /// Engine rolls fresh shocks at quarter starts (probabilistic);
     /// expired shocks (end_date < day) get pruned at the top of
     /// `simulate_day`. Multipliers stack — two concurrent shocks on
-    /// the same JobKind multiply together, which is correct for
+    /// the same Workflow multiply together, which is correct for
     /// "supply shortage hits during a viral-bar surge."
     pub active_shocks: Vec<ActiveShock>,
     /// Employee-id pool keyed by role slug, populated at init from the
@@ -89,7 +89,7 @@ pub struct RunCounters {
     pub jobs_skipped_no_subject: u64,
     pub jobs_skipped_unknown_kind: u64,
     /// `open_job_from_request` got an open_job payload missing
-    /// one of the required fields (job_kind, subject_kind,
+    /// one of the required fields (workflow, subject_kind,
     /// subject_id). Each fire is logged at WARN with the missing
     /// field + the offending payload so a misconfigured
     /// `[periodic.*]` open_job spec (e.g. one missing
@@ -101,7 +101,7 @@ pub struct RunCounters {
     pub subjects_born: u64,
     pub anomalies_fired: u64,
     pub triggered_jobs_spawned: u64,
-    /// Per-JobKind creation count, for spot-checking that rates
+    /// Per-Workflow creation count, for spot-checking that rates
     /// roughly track the tenant config.
     pub jobs_created_by_kind: HashMap<String, u64>,
     /// Per-SubjectKind birth count.
@@ -113,7 +113,7 @@ pub struct RunCounters {
     pub subject_id_counter: HashMap<String, u64>,
     /// Per-anomaly-name fire count, keyed as
     /// `"<jobkind>:<anomaly-name>"` so the same anomaly across
-    /// JobKinds doesn't collide.
+    /// Workflows doesn't collide.
     pub anomalies_fired_by_kind: HashMap<String, u64>,
 }
 
@@ -129,7 +129,7 @@ pub struct DaySummary {
     pub subjects_born: u64,
     pub anomalies_fired: u64,
     pub triggered_jobs_spawned: u64,
-    /// Per-JobKind count for this day.
+    /// Per-Workflow count for this day.
     pub by_kind: HashMap<String, u64>,
     /// Side-effect handler failures captured during this day. Each
     /// entry is `(handler_name, error_summary)`. Empty in the happy
@@ -143,7 +143,7 @@ pub struct DaySummary {
 
 impl ShapeDrivenState {
     /// Construct an empty state. Callers add Subjects via
-    /// `seed_subjects` before the first `simulate_day` so JobKinds
+    /// `seed_subjects` before the first `simulate_day` so Workflows
     /// targeting "account" / "vendor" / etc. have something to
     /// attach to.
     pub fn new() -> Self {

@@ -5,7 +5,7 @@
 #   1. Drop + create the database
 #   2. Apply the per-module schema
 #   3. Grant table/sequence/function privileges to the boss role
-#   4. Seed the JobKind registry (24 system-owned kinds)
+#   4. Seed the Workflow registry (24 system-owned kinds)
 #
 # Without step 4 every `POST /api/jobs` fails with
 # "unknown or inactive job kind" and the whole app looks broken.
@@ -16,7 +16,7 @@
 # Usage:
 #   sudo ./infra/postgres/bootstrap-db.sh DB_NAME          # idempotent drop + recreate
 #   sudo ./infra/postgres/bootstrap-db.sh DB_NAME --init   # no-op if DB already exists
-#   sudo ./infra/postgres/bootstrap-db.sh DB_NAME --no-seed  # skip the JobKind seed
+#   sudo ./infra/postgres/bootstrap-db.sh DB_NAME --no-seed  # skip the Workflow seed
 
 set -euo pipefail
 
@@ -131,16 +131,16 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO $DB_USER;
 SQL
 
 if $SEED; then
-    # Platform-shipped JobKinds (`platform_kinds()` — currently just
-    # `job-kind-design`) auto-reconcile on every `boss-jobs-api` start
-    # via `JobKindRegistry::bootstrap_reconcile`. Tenant-shipped
-    # JobKinds + policy + data load from each tenant's `seeds/` via the
+    # Platform-shipped Workflows (`platform_kinds()` — currently just
+    # `workflow-design`) auto-reconcile on every `boss-jobs-api` start
+    # via `WorkflowRegistry::bootstrap_reconcile`. Tenant-shipped
+    # Workflows + policy + data load from each tenant's `seeds/` via the
     # per-tenant converged prepare step (for the brewery,
     # `boss-brewery-sim prepare`). The generic `boss-jobs-seed-kinds`
     # bin retired 2026-05-03 (step 9a of the HumanWorker generator
     # retirement; see docs/design/platform-vs-tenant-jobkinds.md).
     # Nothing to do here.
-    echo "  JobKind registry seeding handled by boss-jobs-api startup +"
+    echo "  Workflow registry seeding handled by boss-jobs-api startup +"
     echo "  the per-tenant prepare step (brewery: boss-brewery-sim prepare,"
     echo "  which also seeds tenant policy rules + accounts/vendors/data)"
 fi
@@ -231,6 +231,6 @@ fi
 table_count=$(sudo -n -u postgres psql -d "$DB_NAME" -tAc \
     "SELECT COUNT(*) FROM pg_tables WHERE schemaname='public'")
 kind_count=$(sudo -n -u postgres psql -d "$DB_NAME" -tAc \
-    "SELECT COUNT(*) FROM job_kinds" 2>/dev/null || echo "?")
+    "SELECT COUNT(*) FROM workflows" 2>/dev/null || echo "?")
 
-echo "done. $DB_NAME has $table_count tables, $kind_count seeded JobKinds, and $DB_USER has full privileges."
+echo "done. $DB_NAME has $table_count tables, $kind_count seeded Workflows, and $DB_USER has full privileges."

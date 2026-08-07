@@ -24,7 +24,7 @@ const code = source
   .replace(/(^|[^:])\/\/.*$/gm, '$1');
 
 describe('TriageBoard stays queue-agnostic', () => {
-  test('names no specific JobKind', () => {
+  test('names no specific Workflow', () => {
     expect(code).not.toContain('user-feedback');
   });
 

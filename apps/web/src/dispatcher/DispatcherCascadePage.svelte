@@ -6,7 +6,7 @@
   emitted topic re-triggers a rule; jobs-api/external "system" edges that
   re-enter the rule set are drawn distinctly, and the feedback cycles
   (restock, DAG-advance, AR) are highlighted. Data: GET /api/dispatcher/rules.
-  Layout dagre LR; render Svelte Flow (same stack as the JobKind graph).
+  Layout dagre LR; render Svelte Flow (same stack as the Workflow graph).
 -->
 <script lang="ts">
   import { onMount } from 'svelte';

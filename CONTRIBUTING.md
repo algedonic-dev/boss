@@ -40,7 +40,7 @@ The contribution path depends on what you want to do.
   using the brewery playground tenant are strongly preferred.
 - **Feature ideas:** describe the use case before the
   implementation. BOSS is opinionated about the difference between
-  *new work shipping as data* (registry rows, JobKinds, plugins)
+  *new work shipping as data* (registry rows, Workflows, plugins)
   and *new work requiring core code*; framing your ask in those
   terms gets you to a useful conversation faster. See
   [`docs/design/extending-boss.md`](docs/design/extending-boss.md).
@@ -89,17 +89,17 @@ change:
   using.
 - **Seeds set initial conditions only.** Never seed downstream
   artifacts (invoices, journal entries, shipments) directly. If
-  you're tempted, the JobKind is the gap. See
+  you're tempted, the Workflow is the gap. See
   [`docs/design/seed-vs-emergent-state.md`](docs/design/seed-vs-emergent-state.md).
 - **Five-property correctness protocol.** Provenance,
   conservation, closure, idempotence, determinism. Every
-  JobKind / projection / adapter must satisfy all five. See
+  Workflow / projection / adapter must satisfy all five. See
   [`docs/design/correctness-protocol.md`](docs/design/correctness-protocol.md).
 
 ## What we don't accept
 
 - New bespoke workflow code paths. New work ships as
-  JobKind/StepPlugin rows, not new `match` branches.
+  Workflow/StepPlugin rows, not new `match` branches.
 - Tenant-specific assumptions in BOSS core. The brewery and
   used-device-shop crates are example tenants, not core.
 - Code without tests. PRs that include "tests deferred" comments

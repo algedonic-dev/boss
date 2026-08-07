@@ -1,5 +1,5 @@
-//! JobKind registry handlers — author, version, publish, and retire
-//! JobKind specs via `/api/jobs/kinds`.
+//! Workflow registry handlers — author, version, publish, and retire
+//! Workflow specs via `/api/workflows`.
 
 use super::*;
 
@@ -11,7 +11,7 @@ use axum::extract::{Path, Query};
 )]
 pub(super) fn kind_registry_or_503<R: JobsRepository, B: EventBus>(
     state: &JobsApiState<R, B>,
-) -> Result<&Arc<dyn JobKindRegistry>, Response> {
+) -> Result<&Arc<dyn WorkflowRegistry>, Response> {
     state.kind_registry.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -21,12 +21,12 @@ pub(super) fn kind_registry_or_503<R: JobsRepository, B: EventBus>(
     })
 }
 
-pub(super) fn kind_err_response(err: JobKindError) -> Response {
+pub(super) fn kind_err_response(err: WorkflowError) -> Response {
     match err {
-        JobKindError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
-        JobKindError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
-        JobKindError::Invalid(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
-        JobKindError::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+        WorkflowError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
+        WorkflowError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
+        WorkflowError::Invalid(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+        WorkflowError::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
     }
 }
 
@@ -35,7 +35,7 @@ pub(super) async fn policy_check<R: JobsRepository, B: EventBus>(
     user: &boss_policy_client::User,
     action: Action,
 ) -> Result<(), Response> {
-    match state.policy.check(user, action, Resource::job_kind()).await {
+    match state.policy.check(user, action, Resource::workflow()).await {
         Ok(Decision::Allow { .. }) => Ok(()),
         Ok(Decision::Deny { reason }) => Err((StatusCode::FORBIDDEN, reason).into_response()),
         Err(e) => Err((
@@ -126,7 +126,7 @@ pub(super) async fn list_kind_versions<R: JobsRepository + 'static, B: EventBus 
 pub(super) async fn create_kind<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,
-    Json(spec): Json<JobKindSpec>,
+    Json(spec): Json<WorkflowSpec>,
 ) -> Response {
     let reg = match kind_registry_or_503(&state) {
         Ok(r) => r,
@@ -144,7 +144,7 @@ pub(super) async fn create_kind<R: JobsRepository + 'static, B: EventBus + 'stat
 /// Body for the author-time dry run. Only the kind slug (for error
 /// labels) and the step list are needed — the lint validates the graph,
 /// not the heavyweight registry-row fields — so the editor doesn't have
-/// to assemble a full `JobKindSpec` on every keystroke.
+/// to assemble a full `WorkflowSpec` on every keystroke.
 #[derive(serde::Deserialize)]
 pub(super) struct DraftLintRequest {
     #[serde(default)]
@@ -153,12 +153,12 @@ pub(super) struct DraftLintRequest {
 }
 
 /// Author-time dry run — lint a draft's steps WITHOUT persisting.
-/// Runs the same `validate_job_kind` the publish path enforces, against
+/// Runs the same `validate_workflow` the publish path enforces, against
 /// the same process-resident StepType registry, so an editor showing
 /// "no problems" will publish cleanly. Always returns 200 with a
 /// structured result; lint failures are data, not an HTTP error — the
 /// editor renders them on the graph. See architecture-decisions.md
-/// §Jobs, JobKinds, Steps.
+/// §Jobs, Workflows, Steps.
 pub(super) async fn validate_kind<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,
@@ -173,9 +173,9 @@ pub(super) async fn validate_kind<R: JobsRepository + 'static, B: EventBus + 'st
     } else {
         req.kind.as_str()
     };
-    let spec = JobKindSpec::platform_seed(kind, "draft", "draft", Vec::new(), req.steps);
+    let spec = WorkflowSpec::platform_seed(kind, "draft", "draft", Vec::new(), req.steps);
     let registry = crate::step_registry::StepRegistry::v1();
-    let errs = crate::job_kind_lint::validate_job_kind(&spec, &registry);
+    let errs = crate::workflow_lint::validate_workflow(&spec, &registry);
     let problems: Vec<serde_json::Value> = errs
         .iter()
         .map(|e| {
@@ -197,7 +197,7 @@ pub(super) async fn update_kind<R: JobsRepository + 'static, B: EventBus + 'stat
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,
     Path(kind): Path<String>,
-    Json(mut spec): Json<JobKindSpec>,
+    Json(mut spec): Json<WorkflowSpec>,
 ) -> Response {
     let reg = match kind_registry_or_503(&state) {
         Ok(r) => r,

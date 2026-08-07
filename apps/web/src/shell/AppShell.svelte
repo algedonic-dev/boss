@@ -116,9 +116,9 @@
     {
       label: 'Define',
       items: [
-        // Workflows is the single UI surface for JobKinds: the
+        // Workflows is the single UI surface for Workflows: the
         // read-only catalog that also links into the authoring
-        // routes (/system/job-kinds*). The separate "Job kinds"
+        // routes (/system/workflows*). The separate "Job kinds"
         // sidebar entry was dropped — authoring is reached FROM
         // Workflows, not its own sidebar row.
         ROUTE_CATALOG.workflows,

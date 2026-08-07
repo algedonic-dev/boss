@@ -93,9 +93,9 @@ impl JobsCompleteStep {
     ///   - agent action steps (`executor = Agent`) that are NOT gates —
     ///     order-intake, acknowledgment, billing: computer-speed automation
     ///     a human shouldn't queue behind. Gates (an `outcome` enum the
-    ///     JobKind forks on) are excluded — `gate.resolve` completes those
+    ///     Workflow forks on) are excluded — `gate.resolve` completes those
     ///     after computing the outcome from real stock.
-    /// A gate — an `outcome` enum the JobKind forks on. Never auto-completed
+    /// A gate — an `outcome` enum the Workflow forks on. Never auto-completed
     /// here even though it carries the marker shape (no role + 0 duration):
     /// gate.resolve must compute its outcome from real stock first.
     fn is_gate(&self, kind: &str) -> bool {

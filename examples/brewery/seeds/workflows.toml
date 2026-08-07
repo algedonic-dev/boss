@@ -1,9 +1,9 @@
-# JobKind rows for Boss Brewery.
+# Workflow rows for Boss Brewery.
 #
-# Each [[job_kind]] block authors one row of the `job_kinds` table.
-# Schema mirrors `JobKindSpec` in
+# Each [[workflow]] block authors one row of the `workflows` table.
+# Schema mirrors `WorkflowSpec` in
 # crates/core/boss-jobs/src/registry.rs — the brewery prepare step
-# (`boss-brewery-sim prepare`) publishes these into the JobKind
+# (`boss-brewery-sim prepare`) publishes these into the Workflow
 # registry.
 #
 # Step DAGs use existing StepTypes from
@@ -16,7 +16,7 @@
 # ibu_target, ferm_temp_c, …).
 #
 # Authority roles reference the `employee` role Classes seeded in
-# `infra/postgres/schema/01-registries.sql`. The shipped JobKindSpec
+# `infra/postgres/schema/01-registries.sql`. The shipped WorkflowSpec
 # validation does not yet
 # cross-check authority_role against the Class registry; when it
 # does, these rows must resolve.
@@ -26,7 +26,7 @@
 # per brewhouse Location.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "morning-brew"
 label = "Morning Brew"
 category = "production"
@@ -44,15 +44,15 @@ daily demand. Prevents unbounded inventory growth during sim runs
 and demonstrates the Job abstractions support for decision-gated
 DAGs.
 """
-# JobKind-level display/routing hints. `surfaces` lists the
-# operational pages this JobKind appears on.
+# Workflow-level display/routing hints. `surfaces` lists the
+# operational pages this Workflow appears on.
 metadata = { surfaces = ["qa"], owner_role = "shift-lead" }
 
 # Trigger. Captures the opening signal (periodic action fires at
 # brewing-shift start) so operators see "how did this Job get here"
 # as a real DAG node instead of inferred from audit_log. Engine
 # auto-completes this step at Job-open (ready_when = "true").
-[[job_kind.step]]
+[[workflow.step]]
 title = "trigger"
 kind = "trigger"
 ready_when = "true"
@@ -78,7 +78,7 @@ metadata_defaults = { trigger_kind = "periodic", trigger_name = "morning-brew-sh
 # on the brew path. Lint-clean fork coverage wants `checklist.outcome`
 # promoted to a declared enum `brew|oversupply` on the StepType — a
 # StepType change out of scope for this data-only migration.
-[[job_kind.step]]
+[[workflow.step]]
 title = "demand-check"
 kind = "demand-gate"
 ready_when = "steps.trigger.done"
@@ -107,7 +107,7 @@ title_template = "Demand check — should we brew today?"
 metadata_defaults = { target_skus = ["FP-PALE-1-2-BBL", "FP-PALE-1-6-BBL"], expected_daily_demand = { FP-PALE-1-2-BBL = 240, FP-PALE-1-6-BBL = 240 }, batch_yield = { FP-PALE-1-2-BBL = 210, FP-PALE-1-6-BBL = 315 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
 
 # Brew path — gated on the demand-check deciding "brew".
-[[job_kind.step]]
+[[workflow.step]]
 title = "plan"
 kind = "scheduling"
 ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"brew\""
@@ -115,7 +115,7 @@ authority_role = "senior-brewer"
 title_template = "Plan today's brew — {subject.id}"
 metadata_defaults = { recipes_planned = [], batch_size_bbl = 30 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "mash-in"
 kind = "production-consume"
 ready_when = "steps.plan.done"
@@ -125,7 +125,7 @@ authority_role = "brewer"
 # derivation (per-style ingredient lists) is the faker hook in
 # #33; v1 ships the canonical pale-ale grain bill so the
 # inventory.parts.consume side effect drains real SKUs. Grain bill
-# sized to the 250-BBL batch this JobKind packages (~157 BBL of
+# sized to the 250-BBL batch this Workflow packages (~157 BBL of
 # finished beer across the produce step below): a pale ale at
 # ~2 lb grain/gal needs ~9,800 lb = ~196 fifty-lb bags of 2-row +
 # ~10% specialty munich, plus the hop + yeast charge. The
@@ -162,7 +162,7 @@ metadata_defaults = { mash_temp_f = 152, mash_minutes = 60, ingredients_consumed
     { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "lauter"
 kind = "task"
 ready_when = "steps.mash-in.done"
@@ -170,7 +170,7 @@ authority_role = "brewer"
 title_template = "Lauter / sparge"
 metadata_defaults = { sparge_minutes = 90, runoff_gravity = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "boil"
 kind = "task"
 ready_when = "steps.lauter.done"
@@ -178,7 +178,7 @@ authority_role = "brewer"
 title_template = "Boil"
 metadata_defaults = { boil_minutes = 60, ibu_target = 35, og_target = 1.052 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "whirlpool"
 kind = "task"
 ready_when = "steps.boil.done"
@@ -186,7 +186,7 @@ authority_role = "brewer"
 title_template = "Whirlpool & knockout"
 metadata_defaults = { whirlpool_minutes = 20, knockout_temp_f = 68 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "fermentation-start"
 kind = "task"
 ready_when = "steps.whirlpool.done"
@@ -199,10 +199,10 @@ metadata_defaults = { ferm_temp_c = 19, yeast_strain = "", vessel = "" }
 # sub-Job on the same brewhouse Subject and the parent waits for the
 # sub-Job's resolution before packaging fires.
 # REVIEW(v2 fork): QC-hold sub-Job — the anomaly-path delegation to
-# the `batch-qc-hold` sub-JobKind is handled separately (dispatcher /
+# the `batch-qc-hold` sub-Workflow is handled separately (dispatcher /
 # delegate-subjob), NOT modeled in this predicate graph. This step
 # stays a plain checklist on the brew path.
-[[job_kind.step]]
+[[workflow.step]]
 title = "qc-checkpoint"
 kind = "checklist"
 ready_when = "steps.fermentation-start.done"
@@ -225,7 +225,7 @@ metadata_defaults = { ph_target = 4.4, fg_target = 1.012, microbial_pass = true,
 # independent per-format skip gates that stranded a whole batch's wort in
 # WIP when BOTH skipped (the demand caught up during the multi-day lag).
 # All numbers are data (fork_keys map SKU→a predicate-safe label).
-[[job_kind.step]]
+[[workflow.step]]
 title = "allocate-packaging"
 kind = "packaging-allocate"
 ready_when = "steps.qc-checkpoint.done"
@@ -239,7 +239,7 @@ title_template = "Allocate packaging — split the batch by demand"
 fields = [{ name = "outcome_half", field_type = "package|skip", required = false }, { name = "outcome_sixtel", field_type = "package|skip", required = false }]
 metadata_defaults = { batch_bbl = 158, target_skus = ["FP-PALE-1-2-BBL", "FP-PALE-1-6-BBL"], expected_daily_demand = { FP-PALE-1-2-BBL = 240, FP-PALE-1-6-BBL = 240 }, batch_yield = { FP-PALE-1-2-BBL = 210, FP-PALE-1-6-BBL = 315 }, default_kegs = { FP-PALE-1-2-BBL = 210, FP-PALE-1-6-BBL = 315 }, fork_keys = { FP-PALE-1-2-BBL = "half", FP-PALE-1-6-BBL = "sixtel" }, demand_window_days = 30, oversupply_multiplier = 1.5 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "package-half"
 kind = "production-produce"
 ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_half = \"package\""
@@ -261,7 +261,7 @@ metadata_defaults = { batch_id = "", excise_bbl = 105, produces_products = [
     { part_sku = "PKG-CO2-50LB", qty = 1 },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "package-sixtel"
 kind = "production-produce"
 ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_sixtel = \"package\""
@@ -279,14 +279,14 @@ metadata_defaults = { batch_id = "", excise_bbl = 53, produces_products = [
 # No packaging; they exist so the demand-gate fork routes every outcome
 # to a successor (layer-1 requires it) and so brew-completed can join on
 # "packaged OR skipped" per format. A packaging hand logs the hold.
-[[job_kind.step]]
+[[workflow.step]]
 title = "skip-half"
 kind = "task"
 ready_when = "steps.allocate-packaging.metadata.outcome_half = \"skip\""
 title_template = "Hold half-BBLs — sufficient stock on hand"
 authority_role = "packaging-tech"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "skip-sixtel"
 kind = "task"
 ready_when = "steps.allocate-packaging.metadata.outcome_sixtel = \"skip\""
@@ -297,7 +297,7 @@ authority_role = "packaging-tech"
 # on the demand-check's outcome metadata. Exactly one lands
 # Completed per Job; the sibling is Skipped. Makes the branching
 # visible at the DAG instead of inferred from step status alone.
-[[job_kind.step]]
+[[workflow.step]]
 title = "brew-completed"
 kind = "outcome"
 # Fires once BOTH formats are resolved — each either packaged or
@@ -308,7 +308,7 @@ title_template = "Brew completed — packaged + handed off"
 terminal = { outcome = "completed" }
 metadata_defaults = { outcome_kind = "completed" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "day-skipped"
 kind = "outcome"
 # Skipped outcome branches straight off the demand-check decision —
@@ -328,7 +328,7 @@ metadata_defaults = { outcome_kind = "skipped" }
 # boss-brewery-data-seed).
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "sale"
 label = "Wholesale Account — Sales Pipeline"
 category = "sales"
@@ -344,14 +344,14 @@ The recurring keg orders that follow are captured by separate
 wholesale-keg-order Jobs against the same Account.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "trigger"
 kind = "trigger"
 ready_when = "true"
 title_template = "Sales rep opens a new prospect pursuit"
 metadata_defaults = { trigger_kind = "operator", trigger_name = "sales-rep-discretion" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "first-touch"
 kind = "outreach"
 ready_when = "steps.trigger.done"
@@ -359,7 +359,7 @@ title_template = "First-touch outreach — {subject.id}"
 authority_role = "sales-rep"
 metadata_defaults = { channel = "email", purpose = "Introduce the brewery, share the wholesale price list, gauge interest" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "qualify"
 kind = "qualification"
 ready_when = "steps.first-touch.done"
@@ -367,14 +367,14 @@ title_template = "Qualify the prospect"
 authority_role = "sales-rep"
 metadata_defaults = { criteria = ["geography within owned route", "on-premise license active", "dedicated craft taps"], outcome = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "book-tasting"
 kind = "scheduling"
 ready_when = "steps.qualify.done"
 title_template = "Book the tasting visit"
 authority_role = "sales-rep"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "tasting-visit"
 kind = "outreach"
 ready_when = "steps.book-tasting.done"
@@ -382,7 +382,7 @@ title_template = "Tasting visit"
 authority_role = "sales-rep"
 metadata_defaults = { channel = "demo", purpose = "Pour the core five + one seasonal; capture which SKUs the buyer wants on tap" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "pricing-proposal"
 kind = "quote"
 ready_when = "steps.tasting-visit.done"
@@ -393,14 +393,14 @@ metadata_defaults = { line_items = [
     { sku = "FP-IPA-1-6-BBL", qty = 8, unit_price_cents = 15000, description = "IPA 1/6 BBL keg" },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "ops-signoff"
 kind = "sign-off"
 ready_when = "steps.pricing-proposal.done"
 title_template = "Ops sign-off — add to weekly route"
 authority_role = "head-of-distribution"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "onboarded"
 kind = "outcome"
 ready_when = "steps.ops-signoff.done"
@@ -413,7 +413,7 @@ metadata_defaults = { outcome_kind = "completed" }
 # restaurants, retail.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "wholesale-keg-order"
 label = "Wholesale Keg Order"
 category = "sales"
@@ -425,14 +425,14 @@ quantity + delivery date go in Job metadata; cellar techs work the
 production tier; distribution drivers pick up the delivery tier.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "trigger"
 kind = "trigger"
 ready_when = "true"
 title_template = "Customer ordered — keg request from {subject.id}"
 metadata_defaults = { trigger_kind = "event", trigger_name = "wholesale-customer-order" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "confirm-order"
 kind = "order-intake"
 ready_when = "steps.trigger.done"
@@ -468,7 +468,7 @@ metadata_defaults = { delivery_window = "", line_items = [
 # cooler can't cover exits to the `backordered` outcome instead of marching
 # through pick → ship → bill against stock that isn't there. The old flow had
 # no inventory check at all. See docs/architecture-decisions.md.
-[[job_kind.step]]
+[[workflow.step]]
 title = "stock-check"
 kind = "availability-gate"
 ready_when = "steps.confirm-order.done"
@@ -492,7 +492,7 @@ metadata_defaults = { line_items = [
 # acknowledge to ship). Finished goods are relieved here against the kegs
 # actually pulled — see the FG-drawdown-on-pick rule in rules.toml. Wholesale
 # ships from the stock morning-brew builds; there is no per-order brew.
-[[job_kind.step]]
+[[workflow.step]]
 title = "pull-and-stage"
 kind = "handoff"
 ready_when = "steps.stock-check.done AND steps.stock-check.metadata.outcome = \"fulfill\""
@@ -510,7 +510,7 @@ metadata_defaults = { from_id = "inventory-clerk", to_id = "shipping-clerk", lin
     { sku = "FP-HAZY-1-2-BBL", qty = 1 },
     { sku = "FP-HAZY-1-6-BBL", qty = 1 },
 ] }
-[[job_kind.step]]
+[[workflow.step]]
 title = "deliver"
 kind = "shipment"
 ready_when = "steps.pull-and-stage.done"
@@ -541,7 +541,7 @@ metadata_defaults = { direction = "outbound", origin = "loc-brewery-brewhouse", 
     { sku = "FP-HAZY-1-6-BBL", qty = 1, unit_price_cents = 8500, description = "Hazy IPA 1/6 BBL keg" },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "invoice"
 kind = "billing"
 ready_when = "steps.deliver.done"
@@ -549,7 +549,7 @@ title_template = "Invoice"
 authority_role = "bookkeeper"
 # Default line items + StepType-required fields so
 # commerce.invoice.issue has something to emit AND the
-# layer-1 JobKind lint sees the contract satisfied. The
+# layer-1 Workflow lint sees the contract satisfied. The
 # handler computes amount_cents from line_items, but the
 # StepType lists account_id / amount_cents / currency as
 # required for the UI/admin path. Per-Job derivation is the
@@ -588,7 +588,7 @@ metadata_defaults = { account_id = "{subject.id}", amount_cents = 169500, curren
     { sku = "FP-HAZY-1-6-BBL", qty = 1, amount_cents = 8500, revenue_category = "wholesale", description = "Hazy IPA 1/6 BBL × 1" },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "delivered-invoiced"
 kind = "outcome"
 ready_when = "steps.invoice.done"
@@ -599,9 +599,9 @@ metadata_defaults = { outcome_kind = "completed" }
 # The backorder branch of the stock-check gate — the order couldn't be
 # covered from the cooler. Terminal (skipped) for now; a follow-up backorder
 # Job that fulfills once stock returns is the next enhancement (see
-# architecture-decisions.md §Jobs, JobKinds, Steps). This is the release
+# architecture-decisions.md §Jobs, Workflows, Steps). This is the release
 # valve that keeps unfulfillable orders from lingering as open WIP.
-[[job_kind.step]]
+[[workflow.step]]
 title = "backordered"
 kind = "outcome"
 ready_when = "steps.stock-check.done AND steps.stock-check.metadata.outcome = \"backorder\""
@@ -614,7 +614,7 @@ metadata_defaults = { outcome_kind = "skipped" }
 # program, holiday seasonal).
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "seasonal-release"
 label = "Seasonal Release"
 category = "sales"
@@ -627,14 +627,14 @@ batch happen before the full batch is firm; production runs short
 before the launch date.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "trigger"
 kind = "trigger"
 ready_when = "true"
 title_template = "Head brewer proposes seasonal release"
 metadata_defaults = { trigger_kind = "operator", trigger_name = "head-brewer-discretion" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "concept-brief"
 kind = "order-intake"
 ready_when = "steps.trigger.done"
@@ -646,28 +646,28 @@ title_template = "Concept brief — {subject.id}"
 # packaging tiers know which vessels are committed.
 metadata_defaults = { release_date = "", barrels_planned = 0, style = "", linked_systems = [] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "schedule-recipe"
 kind = "scheduling"
 ready_when = "steps.concept-brief.done"
 authority_role = "senior-brewer"
 title_template = "Schedule recipe session"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "recipe-design"
 kind = "task"
 ready_when = "steps.schedule-recipe.done"
 title_template = "Recipe design"
 authority_role = "head-brewer"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "test-batch"
 kind = "task"
 ready_when = "steps.recipe-design.done"
 title_template = "Test batch (pilot system)"
 authority_role = "lab-tech"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "tasting-signoff"
 kind = "sign-off"
 ready_when = "steps.test-batch.done"
@@ -675,7 +675,7 @@ title_template = "Tasting sign-off"
 authority_role = "head-brewer"
 sign_offs_required = ["head-brewer"]
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "brew-full-batch"
 kind = "production-consume"
 ready_when = "steps.tasting-signoff.done"
@@ -717,7 +717,7 @@ metadata_defaults = { mash_temp_f = 150, mash_minutes = 75, ingredients_consumed
     { part_sku = "PKG-CO2-50LB", qty = 1 },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "package"
 kind = "production-produce"
 ready_when = "steps.brew-full-batch.done"
@@ -748,13 +748,13 @@ metadata_defaults = { batch_id = "", excise_bbl = 4, produces_products = [
     { part_sku = "PKG-CAN-12OZ-CS24", qty = 50 },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "launch-announcement"
 kind = "outreach"
 ready_when = "steps.package.done"
 title_template = "Launch announcement"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "release-day"
 kind = "milestone"
 ready_when = "steps.launch-announcement.done"
@@ -765,7 +765,7 @@ title_template = "Release day"
 # no longer drives COGS (#105 moved that to billing). Kept for
 # operational tracking + the existing scan/courier counterparty
 # chain.
-[[job_kind.step]]
+[[workflow.step]]
 title = "allocate-cases"
 kind = "shipment"
 ready_when = "steps.release-day.done"
@@ -775,7 +775,7 @@ metadata_defaults = { direction = "outbound", origin = "loc-brewery-brewhouse", 
     { sku = "FP-SEASONAL-12OZ-CS", qty = 50, unit_price_cents = 17000, description = "Seasonal release allocation" },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "final-invoice"
 kind = "billing"
 ready_when = "steps.allocate-cases.done"
@@ -789,7 +789,7 @@ metadata_defaults = { account_id = "{subject.id}", amount_cents = 850000, curren
     { sku = "FP-SEASONAL-12OZ-CS", qty = 50, amount_cents = 850000, revenue_category = "event-package", description = "Seasonal release allocation" },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "launched-shipped"
 kind = "outcome"
 ready_when = "steps.final-invoice.done"
@@ -801,7 +801,7 @@ metadata_defaults = { outcome_kind = "completed" }
 # Ingredient restock — periodic supplier order. Subject is Vendor.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "ingredient-restock"
 label = "Ingredient Restock"
 category = "procurement"
@@ -812,7 +812,7 @@ adjuncts, packaging). Subject is the Vendor; line items go in
 metadata. Receiving / put-away closes the loop.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "trigger"
 kind = "trigger"
 ready_when = "true"
@@ -826,21 +826,21 @@ metadata_defaults = { trigger_kind = "event", trigger_name = "inventory-reorder-
 # Job can be initiated reactively (the threshold trigger above) or
 # proactively (this forecast check), and either path runs the same
 # audit → order → receive → bill flow.
-[[job_kind.step]]
+[[workflow.step]]
 title = "reorder-check"
 kind = "trigger"
 ready_when = "true"
 title_template = "Scheduled reorder check — pre-buy on {subject.id} demand forecast"
 metadata_defaults = { trigger_kind = "periodic", trigger_name = "demand-forecast-reorder", forecast_window_days = 30, safety_stock_days = 14 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "audit-stock"
 kind = "task"
 ready_when = "steps.trigger.done OR steps.reorder-check.done"
 title_template = "Audit on-hand stock"
 authority_role = "head-brewer"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "place-order"
 kind = "procurement"
 ready_when = "steps.audit-stock.done"
@@ -862,7 +862,7 @@ metadata_defaults = { po_id = "PO-{subject.id}-{day}-{metadata.part_sku}", items
     { part_sku = "{metadata.part_sku}" },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "inbound-shipment"
 kind = "shipment"
 ready_when = "steps.place-order.done"
@@ -873,7 +873,7 @@ title_template = "Inbound shipment from {subject.id}"
 # arrive. Receiving (next tier) closes against the same PO.
 metadata_defaults = { direction = "inbound", origin = "{subject.id}", destination = "brewery-dock", carrier = "freight", tracking_number = "", items = [] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "receive-delivery"
 kind = "receiving"
 ready_when = "steps.inbound-shipment.done"
@@ -916,7 +916,7 @@ metadata_defaults = { po_id = "PO-{subject.id}-{day}-{metadata.part_sku}", expec
     { part_sku = "{metadata.part_sku}" },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "put-away"
 kind = "task"
 ready_when = "steps.receive-delivery.done"
@@ -926,7 +926,7 @@ title_template = "Put-away to grain bin / hop freezer / yeast cooler"
 # which left restocks open forever and drained raw malt to dead-letters.
 authority_role = "warehouse-lead"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "approve-bill"
 kind = "bill-approval"
 ready_when = "steps.put-away.done"
@@ -946,7 +946,7 @@ metadata_defaults = { po_id = "PO-{subject.id}-{day}-{metadata.part_sku}", curre
     { part_sku = "{metadata.part_sku}" },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "restock-completed"
 kind = "outcome"
 ready_when = "steps.approve-bill.done"
@@ -960,7 +960,7 @@ metadata_defaults = { outcome_kind = "completed" }
 # equipment-as-Subject — see DOMAIN.md).
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "equipment-preventive-maintenance"
 label = "Equipment Preventive Maintenance"
 category = "operations"
@@ -974,28 +974,28 @@ subject_kinds=['equipment'].
 """
 metadata = { surfaces = ["qa"], owner_role = "cellar-tech" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "trigger"
 kind = "trigger"
 ready_when = "true"
 title_template = "Monthly preventive-maintenance cycle fires"
 metadata_defaults = { trigger_kind = "periodic", trigger_name = "equipment-preventive-maintenance" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "schedule-window"
 kind = "scheduling"
 ready_when = "steps.trigger.done"
 authority_role = "mechanic"
 title_template = "Schedule preventive maintenance window"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "inspect-diagnose"
 kind = "inspection"
 ready_when = "steps.schedule-window.done"
 title_template = "Inspect & diagnose"
 authority_role = "head-brewer"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "service-parts"
 kind = "repair"
 ready_when = "steps.inspect-diagnose.done"
@@ -1008,7 +1008,7 @@ metadata_defaults = { parts_consumed = [
     { part_sku = "PKG-CO2-50LB", qty = 1 },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "verify-back-in-service"
 kind = "sign-off"
 ready_when = "steps.service-parts.done"
@@ -1016,7 +1016,7 @@ title_template = "Verify back in service"
 authority_role = "head-brewer"
 sign_offs_required = ["head-brewer"]
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "back-in-service"
 kind = "outcome"
 ready_when = "steps.verify-back-in-service.done"
@@ -1037,7 +1037,7 @@ metadata_defaults = { outcome_kind = "completed" }
 # different `bill_category` — zero code.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "facility-overhead"
 # Q7: the responsible human owner's role for Jobs of this kind.
 metadata = { owner_role = "bookkeeper" }
@@ -1052,14 +1052,14 @@ utilities bills through the ledger AP subledger, then pay them. Opened by
 always 2100 A/P, drained to 1000 Cash by the payment step.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "trigger"
 kind = "trigger"
 ready_when = "true"
 title_template = "Monthly facility-overhead cycle fires"
 metadata_defaults = { trigger_kind = "periodic", trigger_name = "facility-overhead" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "approve-rent"
 kind = "expense-bill"
 ready_when = "steps.trigger.done"
@@ -1069,7 +1069,7 @@ authority_role = "bookkeeper"
 # Routed to 6200 Operating Expense — Rent by bill_category.
 metadata_defaults = { bill_category = "rent", amount_cents = 12500000, vendor = "Cascade Industrial Properties", currency = "USD" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "approve-utilities"
 kind = "expense-bill"
 ready_when = "steps.approve-rent.done"
@@ -1079,14 +1079,14 @@ authority_role = "bookkeeper"
 # → ~$2.1M/yr. Routed to 6300 Operating Expense — General by bill_category.
 metadata_defaults = { bill_category = "utilities", amount_cents = 17500000, vendor = "Regional Power & Water", currency = "USD" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "pay-overhead"
 kind = "expense-bill-payment"
 ready_when = "steps.approve-utilities.done"
 title_template = "Settle approved facility bills"
 authority_role = "bookkeeper"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "overhead-posted"
 kind = "outcome"
 ready_when = "steps.pay-overhead.done"
@@ -1099,7 +1099,7 @@ metadata_defaults = { outcome_kind = "completed" }
 # into a wholesale lineup). Subject is Campaign.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "tap-launch"
 label = "Tap Launch"
 category = "marketing"
@@ -1112,35 +1112,35 @@ the Campaign Subject; once Recipe-as-Subject lands, the recipe id
 can be the primary subject and the campaign becomes secondary.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "trigger"
 kind = "trigger"
 ready_when = "true"
 title_template = "Head brewer schedules a tap launch"
 metadata_defaults = { trigger_kind = "operator", trigger_name = "head-brewer-discretion" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "recipe-lock"
 kind = "task"
 ready_when = "steps.trigger.done"
 title_template = "Recipe lock"
 authority_role = "head-brewer"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "test-batch"
 kind = "task"
 ready_when = "steps.recipe-lock.done"
 authority_role = "brewer"
 title_template = "Test batch on pilot system"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "cost-price"
 kind = "task"
 ready_when = "steps.test-batch.done"
 title_template = "Cost & price"
 authority_role = "owner"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "owner-approval"
 kind = "sign-off"
 ready_when = "steps.cost-price.done"
@@ -1148,13 +1148,13 @@ title_template = "Owner approval"
 authority_role = "owner"
 sign_offs_required = ["owner"]
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "announce"
 kind = "outreach"
 ready_when = "steps.owner-approval.done"
 title_template = "Announce to taproom + accounts"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "tap-day"
 kind = "outcome"
 ready_when = "steps.announce.done"
@@ -1167,7 +1167,7 @@ metadata_defaults = { outcome_kind = "completed" }
 # hire, created at offer-accept).
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "brewery-hire"
 label = "Brewery Hire"
 category = "hr"
@@ -1181,33 +1181,33 @@ employee_id once offer is signed.
 """
 metadata = { surfaces = ["hr"] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "trigger"
 kind = "trigger"
 ready_when = "true"
 title_template = "Manager requests new headcount"
 metadata_defaults = { trigger_kind = "operator", trigger_name = "headcount-request" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "open-requisition"
 kind = "task"
 ready_when = "steps.trigger.done"
 title_template = "Open requisition"
 metadata_defaults = { role_target = "", department = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "source-candidates"
 kind = "outreach"
 ready_when = "steps.open-requisition.done"
 title_template = "Source candidates"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "interviews"
 kind = "task"
 ready_when = "steps.source-candidates.done"
 title_template = "Interviews"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "make-offer"
 kind = "sign-off"
 ready_when = "steps.interviews.done"
@@ -1215,13 +1215,13 @@ title_template = "Make offer"
 authority_role = "owner"
 sign_offs_required = ["owner"]
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "onboarding-day-1"
 kind = "task"
 ready_when = "steps.make-offer.done"
 title_template = "Onboarding day 1"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "onboarding-week-1"
 kind = "hr-hire"
 ready_when = "steps.onboarding-day-1.done"
@@ -1235,7 +1235,7 @@ sign_offs_required = ["head-brewer"]
 # overlays at done time.
 metadata_defaults = { hire = { id = "emp-new-hire", name = "new hire", role = "cellar-tech", department = "production", location = "loc-brewery-brewhouse", employment_type = "full-time" } }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "hire-onboarded"
 kind = "outcome"
 ready_when = "steps.onboarding-week-1.done"
@@ -1248,7 +1248,7 @@ metadata_defaults = { outcome_kind = "completed" }
 # the existing employee whose status flips to terminated.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "brewery-terminate"
 label = "Brewery Terminate"
 category = "hr"
@@ -1262,27 +1262,27 @@ employees projection picks up the change.
 """
 metadata = { surfaces = ["hr"] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "trigger"
 kind = "trigger"
 ready_when = "true"
 title_template = "Resignation notice or termination decision"
 metadata_defaults = { trigger_kind = "event", trigger_name = "employee-separation" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "notify-last-day"
 kind = "task"
 ready_when = "steps.trigger.done"
 title_template = "Notify + last-day plan"
 metadata_defaults = { reason = "voluntary", last_day = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "exit-interview"
 kind = "task"
 ready_when = "steps.notify-last-day.done"
 title_template = "Exit interview"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "offboarding-checklist"
 kind = "checklist"
 ready_when = "steps.exit-interview.done"
@@ -1294,7 +1294,7 @@ metadata_defaults = { items = [
     { label = "knowledge handoff", checked = false },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "status-flip-terminate"
 kind = "hr-terminate"
 ready_when = "steps.offboarding-checklist.done"
@@ -1309,7 +1309,7 @@ sign_offs_required = ["head-of-people"]
 # do the overlay manually for now.
 metadata_defaults = { terminate = { id = "emp-placeholder", reason = "sim-driven", last_day = "" } }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "separation-completed"
 kind = "outcome"
 ready_when = "steps.status-flip-terminate.done"
@@ -1318,13 +1318,13 @@ terminal = { outcome = "completed" }
 metadata_defaults = { outcome_kind = "completed" }
 
 # ---------------------------------------------------------------------------
-# Periodic-driven aggregates — JobKinds the periodic + batch engines
+# Periodic-driven aggregates — Workflows the periodic + batch engines
 # OpenJob into when their cadence fires. Subject is the brewhouse
 # Location since these are tenant-scoped operations rather than
 # tied to a specific account / vendor / employee.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "payroll-run"
 # Q7: the responsible human owner's role for Jobs of this kind.
 metadata = { owner_role = "bookkeeper" }
@@ -1345,21 +1345,21 @@ BatchEngine `[batch.payroll]` path (retired 2026-05-06; see
 TODO.md "Strip BatchEngine").
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "trigger"
 kind = "trigger"
 ready_when = "true"
 title_template = "Biweekly payroll cycle fires"
 metadata_defaults = { trigger_kind = "periodic", trigger_name = "biweekly-payroll" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "run-calculation"
 kind = "task"
 ready_when = "steps.trigger.done"
 authority_role = "payroll-mgr"
 title_template = "Run payroll calculation"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "bookkeeper-review"
 kind = "sign-off"
 ready_when = "steps.run-calculation.done"
@@ -1367,7 +1367,7 @@ title_template = "Bookkeeper review"
 authority_role = "bookkeeper"
 sign_offs_required = ["bookkeeper"]
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "release-funds"
 kind = "payroll-release"
 ready_when = "steps.bookkeeper-review.done"
@@ -1384,7 +1384,7 @@ authority_role = "bookkeeper"
 # and the run is dated D (cash leaves the bank that day).
 metadata_defaults = { period_start = "{day_minus_13}", period_end = "{day}", run_date = "{day}" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "payroll-released"
 kind = "outcome"
 ready_when = "steps.release-funds.done"
@@ -1396,7 +1396,7 @@ metadata_defaults = { outcome_kind = "completed" }
 # Quarterly sales-tax filing — opened by `[periodic.quarterly-sales-tax]`.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "sales-tax-filing"
 # Q7: the responsible human owner's role for Jobs of this kind.
 metadata = { owner_role = "bookkeeper" }
@@ -1410,14 +1410,14 @@ jurisdiction lines a few weeks later. Steps walk the prepare →
 review → file → confirm sequence.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "prepare-filing"
 kind = "task"
 ready_when = "true"
 title_template = "Prepare filing data"
 authority_role = "bookkeeper"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "review-sign"
 kind = "sign-off"
 ready_when = "steps.prepare-filing.done"
@@ -1425,7 +1425,7 @@ title_template = "Review + sign filing"
 authority_role = "bookkeeper"
 sign_offs_required = ["bookkeeper"]
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "submit-remit"
 kind = "tax-remittance"
 ready_when = "steps.review-sign.done"
@@ -1459,7 +1459,7 @@ metadata_defaults = { kind = "sales", jurisdiction = "US-CA" }
 # quarterly filing for sim plausibility.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "payroll-941-filing"
 # Q7: the responsible human owner's role for Jobs of this kind.
 metadata = { owner_role = "bookkeeper" }
@@ -1475,14 +1475,14 @@ canonical TaxFilingSnapshot which the ledger-sim-bridge POSTs
 to /api/ledger/tax-filings.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "aggregate-accruals"
 kind = "task"
 ready_when = "true"
 title_template = "Aggregate quarterly employer-tax accruals"
 authority_role = "bookkeeper"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "bookkeeper-review"
 kind = "sign-off"
 ready_when = "steps.aggregate-accruals.done"
@@ -1490,7 +1490,7 @@ title_template = "Bookkeeper review"
 authority_role = "bookkeeper"
 sign_offs_required = ["bookkeeper"]
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "file-941-remit"
 kind = "tax-remittance"
 ready_when = "steps.bookkeeper-review.done"
@@ -1514,7 +1514,7 @@ metadata_defaults = { kind = "payroll_941", jurisdiction = "US-FEDERAL" }
 # Q1 amount for the demo.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "income-tax-filing"
 # Q7: the responsible human owner's role for Jobs of this kind.
 metadata = { owner_role = "bookkeeper" }
@@ -1529,14 +1529,14 @@ prepare → review → file. Terminal tax-remittance step's
 TaxFilingSnapshot for /api/ledger/tax-filings.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "compute-estimate"
 kind = "task"
 ready_when = "true"
 title_template = "Compute quarterly estimated tax"
 authority_role = "bookkeeper"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "cfo-review"
 kind = "sign-off"
 ready_when = "steps.compute-estimate.done"
@@ -1544,7 +1544,7 @@ title_template = "CFO review"
 authority_role = "cfo"
 sign_offs_required = ["cfo"]
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "pay-estimate"
 kind = "tax-remittance"
 ready_when = "steps.cfo-review.done"
@@ -1572,7 +1572,7 @@ metadata_defaults = { kind = "income", jurisdiction = "US-FEDERAL" }
 # balance for the quarter and the terminal step drains it to Cash.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "excise-tax-filing"
 # Q7: the responsible human owner's role for Jobs of this kind.
 metadata = { owner_role = "bookkeeper" }
@@ -1589,14 +1589,14 @@ prepare → review → file sequence; the terminal tax-remittance step's
 which the ledger POSTs to /api/ledger/tax-filings.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "aggregate-accruals"
 kind = "task"
 ready_when = "true"
 title_template = "Aggregate quarterly excise-tax accruals"
 authority_role = "bookkeeper"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "bookkeeper-review"
 kind = "sign-off"
 ready_when = "steps.aggregate-accruals.done"
@@ -1604,7 +1604,7 @@ title_template = "Bookkeeper review"
 authority_role = "bookkeeper"
 sign_offs_required = ["bookkeeper"]
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "file-excise-remit"
 kind = "tax-remittance"
 ready_when = "steps.bookkeeper-review.done"
@@ -1633,7 +1633,7 @@ metadata_defaults = { kind = "excise", jurisdiction = "US-FEDERAL" }
 # Account creation.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "direct-shop-order"
 label = "Direct Shop Order"
 category = "sales"
@@ -1648,7 +1648,7 @@ shipment via inventory.parts.consume; bills via
 commerce.invoice.issue on the closing billing step.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "confirm-order"
 kind = "order-intake"
 ready_when = "true"
@@ -1666,7 +1666,7 @@ authority_role = "shipping-clerk"
 # UX overlays nothing else — this default is enough.
 metadata_defaults = { asset_id = "direct-shop-order" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "pull-from-cooler"
 kind = "handoff"
 ready_when = "steps.confirm-order.done"
@@ -1679,7 +1679,7 @@ authority_role = "inventory-clerk"
 # we satisfy the validator with the two staffed role names.
 metadata_defaults = { from_id = "inventory-clerk", to_id = "shipping-clerk" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "ship-to-customer"
 kind = "shipment"
 ready_when = "steps.pull-from-cooler.done"
@@ -1699,7 +1699,7 @@ metadata_defaults = { direction = "outbound", origin = "loc-brewery-brewhouse", 
     { sku = "FP-PALE-1-6-BBL", qty = 1, unit_price_cents = 18000, description = "Direct shop order — Pale Ale sixtel ($180 retail)" },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "invoice-customer"
 kind = "billing"
 ready_when = "steps.ship-to-customer.done"
@@ -1736,11 +1736,11 @@ metadata_defaults = { account_id = "acc-direct-shop", amount_cents = 18000, curr
 # FP-IPA-* SKUs. The shape-driven engine picks between this and
 # the Pale Ale variant via the `[job_rates]` split in tenant.toml
 # (default 0.7 pale + 0.3 IPA = 1.0 brewing days/week). Adding
-# more recipes is a matter of authoring more JobKinds + adjusting
+# more recipes is a matter of authoring more Workflows + adjusting
 # rates, not engine code.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "morning-brew-ipa"
 # Q7: the responsible human owner's role for Jobs of this kind.
 metadata = { owner_role = "shift-lead" }
@@ -1764,14 +1764,14 @@ goes to FP-IPA-* SKUs.
 # Branches are mutually exclusive on `= "brew"` / `= "oversupply"`;
 # lint-clean Phase-3 coverage wants `checklist.outcome` promoted to a
 # declared enum on the StepType (out of scope for this data migration).
-[[job_kind.step]]
+[[workflow.step]]
 title = "trigger"
 kind = "trigger"
 ready_when = "true"
 title_template = "Periodic action — daily IPA brewing schedule fires"
 metadata_defaults = { trigger_kind = "periodic", trigger_name = "morning-brew-shift" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "demand-check"
 kind = "demand-gate"
 ready_when = "steps.trigger.done"
@@ -1785,7 +1785,7 @@ title_template = "Demand check — should we brew IPA today?"
 # batch_yield: IPA packages 160 half-BBL + 320 sixtels per brew.
 metadata_defaults = { target_skus = ["FP-IPA-1-2-BBL", "FP-IPA-1-6-BBL"], expected_daily_demand = { FP-IPA-1-2-BBL = 470, FP-IPA-1-6-BBL = 470 }, batch_yield = { FP-IPA-1-2-BBL = 160, FP-IPA-1-6-BBL = 320 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "plan"
 kind = "scheduling"
 ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"brew\""
@@ -1793,7 +1793,7 @@ authority_role = "senior-brewer"
 title_template = "Plan today's IPA — {subject.id}"
 metadata_defaults = { recipes_planned = ["West Coast IPA"], batch_size_bbl = 30 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "mash-in"
 kind = "production-consume"
 ready_when = "steps.plan.done"
@@ -1812,7 +1812,7 @@ metadata_defaults = { mash_temp_f = 150, mash_minutes = 60, ingredients_consumed
     { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "lauter"
 kind = "task"
 ready_when = "steps.mash-in.done"
@@ -1820,7 +1820,7 @@ authority_role = "brewer"
 title_template = "Lauter / sparge"
 metadata_defaults = { sparge_minutes = 90, runoff_gravity = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "boil"
 kind = "task"
 ready_when = "steps.lauter.done"
@@ -1828,7 +1828,7 @@ authority_role = "brewer"
 title_template = "Boil + late hop additions"
 metadata_defaults = { boil_minutes = 60, ibu_target = 65, og_target = 1.066 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "whirlpool"
 kind = "task"
 ready_when = "steps.boil.done"
@@ -1836,7 +1836,7 @@ authority_role = "brewer"
 title_template = "Whirlpool & knockout"
 metadata_defaults = { whirlpool_minutes = 20, knockout_temp_f = 68 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "fermentation-start"
 kind = "task"
 ready_when = "steps.whirlpool.done"
@@ -1848,7 +1848,7 @@ metadata_defaults = { ferm_temp_c = 19, yeast_strain = "California Ale", vessel 
 # demand shortfall so the whole ~133-BBL batch ALWAYS packages (WIP → FG,
 # never dumped); an over-supplied format gets zero and routes to its skip.
 # See morning-brew (pale) for the full rationale; all numbers are data.
-[[job_kind.step]]
+[[workflow.step]]
 title = "allocate-packaging"
 kind = "packaging-allocate"
 ready_when = "steps.fermentation-start.done"
@@ -1862,7 +1862,7 @@ title_template = "Allocate packaging — split the batch by demand"
 fields = [{ name = "outcome_half", field_type = "package|skip", required = false }, { name = "outcome_sixtel", field_type = "package|skip", required = false }]
 metadata_defaults = { batch_bbl = 133, target_skus = ["FP-IPA-1-2-BBL", "FP-IPA-1-6-BBL"], expected_daily_demand = { FP-IPA-1-2-BBL = 470, FP-IPA-1-6-BBL = 470 }, batch_yield = { FP-IPA-1-2-BBL = 160, FP-IPA-1-6-BBL = 320 }, default_kegs = { FP-IPA-1-2-BBL = 160, FP-IPA-1-6-BBL = 320 }, fork_keys = { FP-IPA-1-2-BBL = "half", FP-IPA-1-6-BBL = "sixtel" }, demand_window_days = 30, oversupply_multiplier = 1.5 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "package-half"
 kind = "production-produce"
 ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_half = \"package\""
@@ -1881,7 +1881,7 @@ metadata_defaults = { batch_id = "", excise_bbl = 80, produces_products = [
     { part_sku = "PKG-CO2-50LB", qty = 1 },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "package-sixtel"
 kind = "production-produce"
 ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_sixtel = \"package\""
@@ -1899,21 +1899,21 @@ metadata_defaults = { batch_id = "", excise_bbl = 53, produces_products = [
 # No packaging; they exist so the demand-gate fork routes every outcome
 # to a successor and so brew-completed can join on "packaged OR
 # skipped" per format. A packaging hand logs the hold.
-[[job_kind.step]]
+[[workflow.step]]
 title = "skip-half"
 kind = "task"
 ready_when = "steps.allocate-packaging.metadata.outcome_half = \"skip\""
 title_template = "Hold half-BBLs — sufficient stock on hand"
 authority_role = "packaging-tech"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "skip-sixtel"
 kind = "task"
 ready_when = "steps.allocate-packaging.metadata.outcome_sixtel = \"skip\""
 title_template = "Hold sixtels — sufficient stock on hand"
 authority_role = "packaging-tech"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "brew-completed"
 kind = "outcome"
 # Fires once BOTH formats are resolved — each either packaged or
@@ -1923,7 +1923,7 @@ title_template = "Brew completed — packaged + handed off"
 terminal = { outcome = "completed" }
 metadata_defaults = { outcome_kind = "completed" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "day-skipped"
 kind = "outcome"
 ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"oversupply\""
@@ -1936,11 +1936,11 @@ metadata_defaults = { outcome_kind = "skipped" }
 # Same step graph as morning-brew. Lower fan-out vs PALE/IPA — stouts
 # are a smaller share of taproom + wholesale volume in most US regional
 # breweries. Added 2026-05-05 as part of the 5-beer scalability lift
-# (TODO #48): exercises the simulator's per-JobKind fan-out and the
+# (TODO #48): exercises the simulator's per-Workflow fan-out and the
 # wholesale line-item mix at higher SKU count.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "morning-brew-stout"
 # Q7: the responsible human owner's role for Jobs of this kind.
 metadata = { owner_role = "shift-lead" }
@@ -1959,14 +1959,14 @@ roast-malt grain bill and English ale yeast. Output is FP-STOUT-*.
 # `checklist.outcome` field — same shape as morning-brew (pale).
 # Branches mutually exclusive on `= "brew"` / `= "oversupply"`;
 # lint-clean coverage wants `checklist.outcome` as a declared enum.
-[[job_kind.step]]
+[[workflow.step]]
 title = "trigger"
 kind = "trigger"
 ready_when = "true"
 title_template = "Periodic action — daily stout brewing schedule fires"
 metadata_defaults = { trigger_kind = "periodic", trigger_name = "morning-brew-shift" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "demand-check"
 kind = "demand-gate"
 ready_when = "steps.trigger.done"
@@ -1980,7 +1980,7 @@ title_template = "Demand check — should we brew Stout today?"
 # batch_yield: Stout packages 100 half-BBL + 360 sixtels per brew.
 metadata_defaults = { target_skus = ["FP-STOUT-1-2-BBL", "FP-STOUT-1-6-BBL"], expected_daily_demand = { FP-STOUT-1-2-BBL = 64, FP-STOUT-1-6-BBL = 64 }, batch_yield = { FP-STOUT-1-2-BBL = 100, FP-STOUT-1-6-BBL = 360 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "plan"
 kind = "scheduling"
 ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"brew\""
@@ -1988,7 +1988,7 @@ authority_role = "senior-brewer"
 title_template = "Plan today's stout — {subject.id}"
 metadata_defaults = { recipes_planned = ["Dry Irish Stout"], batch_size_bbl = 30 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "mash-in"
 kind = "production-consume"
 ready_when = "steps.plan.done"
@@ -2008,7 +2008,7 @@ metadata_defaults = { mash_temp_f = 154, mash_minutes = 60, ingredients_consumed
     { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "lauter"
 kind = "task"
 ready_when = "steps.mash-in.done"
@@ -2016,7 +2016,7 @@ authority_role = "brewer"
 title_template = "Lauter / sparge"
 metadata_defaults = { sparge_minutes = 90, runoff_gravity = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "boil"
 kind = "task"
 ready_when = "steps.lauter.done"
@@ -2024,7 +2024,7 @@ authority_role = "brewer"
 title_template = "Boil"
 metadata_defaults = { boil_minutes = 75, ibu_target = 30, og_target = 1.045 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "whirlpool"
 kind = "task"
 ready_when = "steps.boil.done"
@@ -2032,7 +2032,7 @@ authority_role = "brewer"
 title_template = "Whirlpool & knockout"
 metadata_defaults = { whirlpool_minutes = 15, knockout_temp_f = 66 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "fermentation-start"
 kind = "task"
 ready_when = "steps.whirlpool.done"
@@ -2044,7 +2044,7 @@ metadata_defaults = { ferm_temp_c = 18, yeast_strain = "English Ale", vessel = "
 # demand shortfall so the whole ~110-BBL batch ALWAYS packages (WIP → FG,
 # never dumped); an over-supplied format gets zero and routes to its skip.
 # See morning-brew (pale) for the full rationale; all numbers are data.
-[[job_kind.step]]
+[[workflow.step]]
 title = "allocate-packaging"
 kind = "packaging-allocate"
 ready_when = "steps.fermentation-start.done"
@@ -2058,7 +2058,7 @@ title_template = "Allocate packaging — split the batch by demand"
 fields = [{ name = "outcome_half", field_type = "package|skip", required = false }, { name = "outcome_sixtel", field_type = "package|skip", required = false }]
 metadata_defaults = { batch_bbl = 110, target_skus = ["FP-STOUT-1-2-BBL", "FP-STOUT-1-6-BBL"], expected_daily_demand = { FP-STOUT-1-2-BBL = 64, FP-STOUT-1-6-BBL = 64 }, batch_yield = { FP-STOUT-1-2-BBL = 100, FP-STOUT-1-6-BBL = 360 }, default_kegs = { FP-STOUT-1-2-BBL = 100, FP-STOUT-1-6-BBL = 360 }, fork_keys = { FP-STOUT-1-2-BBL = "half", FP-STOUT-1-6-BBL = "sixtel" }, demand_window_days = 30, oversupply_multiplier = 1.5 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "package-half"
 kind = "production-produce"
 ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_half = \"package\""
@@ -2077,7 +2077,7 @@ metadata_defaults = { batch_id = "", excise_bbl = 50, produces_products = [
     { part_sku = "PKG-CO2-50LB", qty = 1 },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "package-sixtel"
 kind = "production-produce"
 ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_sixtel = \"package\""
@@ -2095,21 +2095,21 @@ metadata_defaults = { batch_id = "", excise_bbl = 60, produces_products = [
 # No packaging; they exist so the demand-gate fork routes every outcome
 # to a successor and so brew-completed can join on "packaged OR
 # skipped" per format. A packaging hand logs the hold.
-[[job_kind.step]]
+[[workflow.step]]
 title = "skip-half"
 kind = "task"
 ready_when = "steps.allocate-packaging.metadata.outcome_half = \"skip\""
 title_template = "Hold half-BBLs — sufficient stock on hand"
 authority_role = "packaging-tech"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "skip-sixtel"
 kind = "task"
 ready_when = "steps.allocate-packaging.metadata.outcome_sixtel = \"skip\""
 title_template = "Hold sixtels — sufficient stock on hand"
 authority_role = "packaging-tech"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "brew-completed"
 kind = "outcome"
 # Fires once BOTH formats are resolved — each either packaged or
@@ -2119,7 +2119,7 @@ title_template = "Brew completed — packaged + handed off"
 terminal = { outcome = "completed" }
 metadata_defaults = { outcome_kind = "completed" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "day-skipped"
 kind = "outcome"
 ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"oversupply\""
@@ -2134,7 +2134,7 @@ metadata_defaults = { outcome_kind = "skipped" }
 # brewhouse-scheduling parity. Tap-room Lagers move steady but slow.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "morning-brew-lager"
 # Q7: the responsible human owner's role for Jobs of this kind.
 metadata = { owner_role = "shift-lead" }
@@ -2153,14 +2153,14 @@ Note: real cold conditioning is collapsed for sim purposes.
 # `checklist.outcome` field — same shape as morning-brew (pale).
 # Branches mutually exclusive on `= "brew"` / `= "oversupply"`;
 # lint-clean coverage wants `checklist.outcome` as a declared enum.
-[[job_kind.step]]
+[[workflow.step]]
 title = "trigger"
 kind = "trigger"
 ready_when = "true"
 title_template = "Periodic action — daily lager brewing schedule fires"
 metadata_defaults = { trigger_kind = "periodic", trigger_name = "morning-brew-shift" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "demand-check"
 kind = "demand-gate"
 ready_when = "steps.trigger.done"
@@ -2174,7 +2174,7 @@ title_template = "Demand check — should we brew Lager today?"
 # batch_yield: Lager packages 200 half-BBL + 200 sixtels per brew.
 metadata_defaults = { target_skus = ["FP-LAGER-1-2-BBL", "FP-LAGER-1-6-BBL"], expected_daily_demand = { FP-LAGER-1-2-BBL = 50, FP-LAGER-1-6-BBL = 50 }, batch_yield = { FP-LAGER-1-2-BBL = 200, FP-LAGER-1-6-BBL = 200 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "plan"
 kind = "scheduling"
 ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"brew\""
@@ -2182,7 +2182,7 @@ authority_role = "senior-brewer"
 title_template = "Plan today's lager — {subject.id}"
 metadata_defaults = { recipes_planned = ["Czech Pilsner"], batch_size_bbl = 30 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "mash-in"
 kind = "production-consume"
 ready_when = "steps.plan.done"
@@ -2199,7 +2199,7 @@ metadata_defaults = { mash_temp_f = 148, mash_minutes = 90, ingredients_consumed
     { part_sku = "ING-YEAST-LAGER-1L", qty = 6 },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "lauter"
 kind = "task"
 ready_when = "steps.mash-in.done"
@@ -2207,7 +2207,7 @@ authority_role = "brewer"
 title_template = "Lauter / sparge"
 metadata_defaults = { sparge_minutes = 105, runoff_gravity = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "boil"
 kind = "task"
 ready_when = "steps.lauter.done"
@@ -2215,7 +2215,7 @@ authority_role = "brewer"
 title_template = "Boil"
 metadata_defaults = { boil_minutes = 90, ibu_target = 38, og_target = 1.048 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "whirlpool"
 kind = "task"
 ready_when = "steps.boil.done"
@@ -2223,7 +2223,7 @@ authority_role = "brewer"
 title_template = "Whirlpool & knockout"
 metadata_defaults = { whirlpool_minutes = 20, knockout_temp_f = 50 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "fermentation-start"
 kind = "task"
 ready_when = "steps.whirlpool.done"
@@ -2235,7 +2235,7 @@ metadata_defaults = { ferm_temp_c = 11, yeast_strain = "German Lager", vessel = 
 # demand shortfall so the whole ~133-BBL batch ALWAYS packages (WIP → FG,
 # never dumped); an over-supplied format gets zero and routes to its skip.
 # See morning-brew (pale) for the full rationale; all numbers are data.
-[[job_kind.step]]
+[[workflow.step]]
 title = "allocate-packaging"
 kind = "packaging-allocate"
 ready_when = "steps.fermentation-start.done"
@@ -2249,7 +2249,7 @@ title_template = "Allocate packaging — split the batch by demand"
 fields = [{ name = "outcome_half", field_type = "package|skip", required = false }, { name = "outcome_sixtel", field_type = "package|skip", required = false }]
 metadata_defaults = { batch_bbl = 133, target_skus = ["FP-LAGER-1-2-BBL", "FP-LAGER-1-6-BBL"], expected_daily_demand = { FP-LAGER-1-2-BBL = 50, FP-LAGER-1-6-BBL = 50 }, batch_yield = { FP-LAGER-1-2-BBL = 200, FP-LAGER-1-6-BBL = 200 }, default_kegs = { FP-LAGER-1-2-BBL = 200, FP-LAGER-1-6-BBL = 200 }, fork_keys = { FP-LAGER-1-2-BBL = "half", FP-LAGER-1-6-BBL = "sixtel" }, demand_window_days = 30, oversupply_multiplier = 1.5 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "package-half"
 kind = "production-produce"
 ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_half = \"package\""
@@ -2269,7 +2269,7 @@ metadata_defaults = { batch_id = "", excise_bbl = 100, produces_products = [
     { part_sku = "PKG-CO2-50LB", qty = 1 },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "package-sixtel"
 kind = "production-produce"
 ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_sixtel = \"package\""
@@ -2287,21 +2287,21 @@ metadata_defaults = { batch_id = "", excise_bbl = 33, produces_products = [
 # No packaging; they exist so the demand-gate fork routes every outcome
 # to a successor and so brew-completed can join on "packaged OR
 # skipped" per format. A packaging hand logs the hold.
-[[job_kind.step]]
+[[workflow.step]]
 title = "skip-half"
 kind = "task"
 ready_when = "steps.allocate-packaging.metadata.outcome_half = \"skip\""
 title_template = "Hold half-BBLs — sufficient stock on hand"
 authority_role = "packaging-tech"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "skip-sixtel"
 kind = "task"
 ready_when = "steps.allocate-packaging.metadata.outcome_sixtel = \"skip\""
 title_template = "Hold sixtels — sufficient stock on hand"
 authority_role = "packaging-tech"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "brew-completed"
 kind = "outcome"
 # Fires once BOTH formats are resolved — each either packaged or
@@ -2311,7 +2311,7 @@ title_template = "Brew completed — packaged + handed off"
 terminal = { outcome = "completed" }
 metadata_defaults = { outcome_kind = "completed" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "day-skipped"
 kind = "outcome"
 ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"oversupply\""
@@ -2325,7 +2325,7 @@ metadata_defaults = { outcome_kind = "skipped" }
 # regional craft breweries today.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "morning-brew-hazy"
 # Q7: the responsible human owner's role for Jobs of this kind.
 metadata = { owner_role = "shift-lead" }
@@ -2344,14 +2344,14 @@ English ale yeast for haze/mouthfeel. Output is FP-HAZY-*.
 # `checklist.outcome` field — same shape as morning-brew (pale).
 # Branches mutually exclusive on `= "brew"` / `= "oversupply"`;
 # lint-clean coverage wants `checklist.outcome` as a declared enum.
-[[job_kind.step]]
+[[workflow.step]]
 title = "trigger"
 kind = "trigger"
 ready_when = "true"
 title_template = "Periodic action — daily hazy brewing schedule fires"
 metadata_defaults = { trigger_kind = "periodic", trigger_name = "morning-brew-shift" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "demand-check"
 kind = "demand-gate"
 ready_when = "steps.trigger.done"
@@ -2365,7 +2365,7 @@ title_template = "Demand check — should we brew Hazy IPA today?"
 # batch_yield: Hazy packages 80 half-BBL + 400 sixtels per brew.
 metadata_defaults = { target_skus = ["FP-HAZY-1-2-BBL", "FP-HAZY-1-6-BBL"], expected_daily_demand = { FP-HAZY-1-2-BBL = 60, FP-HAZY-1-6-BBL = 60 }, batch_yield = { FP-HAZY-1-2-BBL = 80, FP-HAZY-1-6-BBL = 400 }, demand_window_days = 30, oversupply_multiplier = 1.5, is_demand_check = true }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "plan"
 kind = "scheduling"
 ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"brew\""
@@ -2373,7 +2373,7 @@ authority_role = "senior-brewer"
 title_template = "Plan today's hazy — {subject.id}"
 metadata_defaults = { recipes_planned = ["Hazy IPA"], batch_size_bbl = 30 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "mash-in"
 kind = "production-consume"
 ready_when = "steps.plan.done"
@@ -2393,7 +2393,7 @@ metadata_defaults = { mash_temp_f = 156, mash_minutes = 60, ingredients_consumed
     { part_sku = "ING-YEAST-CALI-1L", qty = 6 },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "lauter"
 kind = "task"
 ready_when = "steps.mash-in.done"
@@ -2401,7 +2401,7 @@ authority_role = "brewer"
 title_template = "Lauter / sparge"
 metadata_defaults = { sparge_minutes = 90, runoff_gravity = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "boil"
 kind = "task"
 ready_when = "steps.lauter.done"
@@ -2409,7 +2409,7 @@ authority_role = "brewer"
 title_template = "Boil + whirlpool hops"
 metadata_defaults = { boil_minutes = 60, ibu_target = 50, og_target = 1.064 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "whirlpool"
 kind = "task"
 ready_when = "steps.boil.done"
@@ -2417,7 +2417,7 @@ authority_role = "brewer"
 title_template = "Whirlpool & knockout"
 metadata_defaults = { whirlpool_minutes = 30, knockout_temp_f = 70 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "fermentation-start"
 kind = "task"
 ready_when = "steps.whirlpool.done"
@@ -2429,7 +2429,7 @@ metadata_defaults = { ferm_temp_c = 20, yeast_strain = "English Ale", vessel = "
 # demand shortfall so the whole ~107-BBL batch ALWAYS packages (WIP → FG,
 # never dumped); an over-supplied format gets zero and routes to its skip.
 # See morning-brew (pale) for the full rationale; all numbers are data.
-[[job_kind.step]]
+[[workflow.step]]
 title = "allocate-packaging"
 kind = "packaging-allocate"
 ready_when = "steps.fermentation-start.done"
@@ -2443,7 +2443,7 @@ title_template = "Allocate packaging — split the batch by demand"
 fields = [{ name = "outcome_half", field_type = "package|skip", required = false }, { name = "outcome_sixtel", field_type = "package|skip", required = false }]
 metadata_defaults = { batch_bbl = 107, target_skus = ["FP-HAZY-1-2-BBL", "FP-HAZY-1-6-BBL"], expected_daily_demand = { FP-HAZY-1-2-BBL = 60, FP-HAZY-1-6-BBL = 60 }, batch_yield = { FP-HAZY-1-2-BBL = 80, FP-HAZY-1-6-BBL = 400 }, default_kegs = { FP-HAZY-1-2-BBL = 80, FP-HAZY-1-6-BBL = 400 }, fork_keys = { FP-HAZY-1-2-BBL = "half", FP-HAZY-1-6-BBL = "sixtel" }, demand_window_days = 30, oversupply_multiplier = 1.5 }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "package-half"
 kind = "production-produce"
 ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_half = \"package\""
@@ -2463,7 +2463,7 @@ metadata_defaults = { batch_id = "", excise_bbl = 40, produces_products = [
     { part_sku = "PKG-CO2-50LB", qty = 1 },
 ] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "package-sixtel"
 kind = "production-produce"
 ready_when = "steps.allocate-packaging.done AND steps.allocate-packaging.metadata.outcome_sixtel = \"package\""
@@ -2481,21 +2481,21 @@ metadata_defaults = { batch_id = "", excise_bbl = 67, produces_products = [
 # No packaging; they exist so the demand-gate fork routes every outcome
 # to a successor and so brew-completed can join on "packaged OR
 # skipped" per format. A packaging hand logs the hold.
-[[job_kind.step]]
+[[workflow.step]]
 title = "skip-half"
 kind = "task"
 ready_when = "steps.allocate-packaging.metadata.outcome_half = \"skip\""
 title_template = "Hold half-BBLs — sufficient stock on hand"
 authority_role = "packaging-tech"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "skip-sixtel"
 kind = "task"
 ready_when = "steps.allocate-packaging.metadata.outcome_sixtel = \"skip\""
 title_template = "Hold sixtels — sufficient stock on hand"
 authority_role = "packaging-tech"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "brew-completed"
 kind = "outcome"
 # Fires once BOTH formats are resolved — each either packaged or
@@ -2505,7 +2505,7 @@ title_template = "Brew completed — packaged + handed off"
 terminal = { outcome = "completed" }
 metadata_defaults = { outcome_kind = "completed" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "day-skipped"
 kind = "outcome"
 ready_when = "steps.demand-check.done AND steps.demand-check.metadata.outcome = \"oversupply\""
@@ -2521,7 +2521,7 @@ metadata_defaults = { outcome_kind = "skipped" }
 # operator fills in what the work is via the title + metadata.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "ad-hoc"
 # Q7: the responsible human owner's role for Jobs of this kind.
 metadata = { owner_role = "shift-lead" }
@@ -2535,7 +2535,7 @@ fills in what the work is via the title + metadata.
 
 # Single step is both the trigger (fires at Job open) and the
 # terminal (its completion closes the Job).
-[[job_kind.step]]
+[[workflow.step]]
 title = "do-the-thing"
 kind = "task"
 ready_when = "true"
@@ -2546,7 +2546,7 @@ metadata_defaults = { category = "ad-hoc" }
 
 # ---------------------------------------------------------------------------
 # Batch QC Hold — anomaly-path Sub-Job for morning-brew (and other
-# production JobKinds). When a QC checkpoint flags off-spec results
+# production Workflows). When a QC checkpoint flags off-spec results
 # (microbial contamination, pH drift, gravity miss), the parent Job
 # spawns one of these on the same brewhouse Subject. This is the
 # canonical example of how the Job abstraction handles non-DAG
@@ -2571,7 +2571,7 @@ metadata_defaults = { category = "ad-hoc" }
 # the parent and vice versa.
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "batch-qc-hold"
 # Q7: the responsible human owner's role for Jobs of this kind.
 metadata = { owner_role = "qa-tech" }
@@ -2582,7 +2582,7 @@ description = """
 Opened when a parent production Job (typically morning-brew) flags
 a QC anomaly. Lab analysis + triage decision; outcome determines
 whether the parent batch packages, re-blends, or gets written off.
-The parent JobKind waits on this sub-Job before completing its QC
+The parent Workflow waits on this sub-Job before completing its QC
 step.
 """
 
@@ -2592,7 +2592,7 @@ step.
 # sign-off's `decision`, not as separate predicate-graph branches —
 # the sub-Job resolves to one terminal (release hold) regardless of
 # branch, so a linear chain is the faithful v2 shape.
-[[job_kind.step]]
+[[workflow.step]]
 title = "lab-analysis"
 kind = "task"
 ready_when = "true"
@@ -2600,7 +2600,7 @@ authority_role = "qa-tech"
 title_template = "Lab analysis — collect + run extended panel"
 metadata_defaults = { panel = ["pH", "fg", "abv", "diacetyl", "microbial_plating"], parent_job_id = "", parent_step_id = "", batch_id = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "document-findings"
 kind = "task"
 ready_when = "steps.lab-analysis.done"
@@ -2608,7 +2608,7 @@ authority_role = "qa-tech"
 title_template = "Document findings — extended results"
 metadata_defaults = { findings = "", anomaly_confirmed = false }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "triage-decision"
 kind = "sign-off"
 ready_when = "steps.document-findings.done"
@@ -2617,7 +2617,7 @@ title_template = "Triage decision — re-test, re-blend, or discard"
 sign_offs_required = ["qa-supervisor"]
 metadata_defaults = { decision = "pending", rationale = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "apply-triage"
 kind = "task"
 ready_when = "steps.triage-decision.done"
@@ -2625,7 +2625,7 @@ authority_role = "qa-tech"
 title_template = "Apply triage decision — execute the branch"
 metadata_defaults = { branch = "", action_taken = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "release-hold"
 kind = "handoff"
 ready_when = "steps.apply-triage.done"
@@ -2652,7 +2652,7 @@ metadata_defaults = { release_decision = "", parent_resumes = true }
 # reality. (#128 finding.)
 # ---------------------------------------------------------------------------
 
-[[job_kind]]
+[[workflow]]
 kind = "ap-payment-run"
 # Q7: the responsible human owner's role for Jobs of this kind.
 metadata = { owner_role = "ap-clerk" }
@@ -2667,7 +2667,7 @@ window, batches them into a single payment run, and marks each
 paid via a side-effect that drains 2100 AP back into 1000 Cash.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "pull-aging-report"
 kind = "task"
 ready_when = "true"
@@ -2679,7 +2679,7 @@ title_template = "Pull due-bills aging report"
 # track standard net-30 terms.
 metadata_defaults = { window_days = 30, invoices_to_pay = [] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "cut-checks"
 kind = "bill-payment-batch"
 ready_when = "steps.pull-aging-report.done"
@@ -2693,7 +2693,7 @@ title_template = "Cut checks + ACH for due bills"
 # per invoice. Those project to finance.bill.paid → DR 2100 / CR 1000.
 metadata_defaults = { payment_method = "ach", check_run_id = "" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "record-provenance"
 kind = "task"
 ready_when = "steps.cut-checks.done"
@@ -2710,7 +2710,7 @@ metadata_defaults = { total_paid_cents = 0, bill_count = 0, run_notes = "" }
 # pour value and posts to Revenue — Taproom (4120). The billing line_items
 # drive both the FG decrement and the revenue+COGS JE (post-#105).
 # ---------------------------------------------------------------------------
-[[job_kind]]
+[[workflow]]
 kind = "taproom-shift-close"
 label = "Taproom Shift Close"
 category = "sales"
@@ -2722,7 +2722,7 @@ taproom revenue. One per operating day; a shift-lead closes the register and
 a bookkeeper posts the revenue.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "ring-sales"
 kind = "order-intake"
 ready_when = "true"
@@ -2730,7 +2730,7 @@ title_template = "Ring up taproom shift sales"
 authority_role = "shift-lead"
 metadata_defaults = { asset_id = "taproom-shift" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "close-register"
 kind = "billing"
 ready_when = "steps.ring-sales.done"
@@ -2751,7 +2751,7 @@ metadata_defaults = { account_id = "acc-direct-shop", amount_cents = 1555400, cu
 # distributor at bulk (below-retail) pricing. Posts to Revenue — Distribution
 # Contracts (4140). Same sale shape; bigger quantities, lower per-unit price.
 # ---------------------------------------------------------------------------
-[[job_kind]]
+[[workflow]]
 kind = "distribution-contract"
 label = "Distribution Contract"
 category = "sales"
@@ -2762,7 +2762,7 @@ pallet of the surplus co-product kegs the wholesale flow doesn't move. Bulk
 pricing (below taproom/retail), high volume. Posts Revenue — Distribution.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "pull-contract"
 kind = "order-intake"
 ready_when = "true"
@@ -2770,7 +2770,7 @@ title_template = "Pull distribution contract — {subject.id}"
 authority_role = "sales-rep"
 metadata_defaults = { asset_id = "distribution-contract" }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "invoice-distributor"
 kind = "billing"
 ready_when = "steps.pull-contract.done"

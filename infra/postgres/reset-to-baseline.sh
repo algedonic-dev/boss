@@ -15,12 +15,12 @@
 # Sequence:
 #   1. Stop every boss service holding a DB connection.
 #   2. Drop + recreate the live `boss` DB (re-applies schema).
-#   3. Restart core services (jobs-api reconciles platform JobKinds).
+#   3. Restart core services (jobs-api reconciles platform Workflows).
 #   4. Apply brewery Class registry rows (POST /api/classes/batch from classes.json).
 #   5. Seed operator-baseline hires + bootstrap-admin, project them
 #      (FK targets for the tenant seed's account team members).
 #   6. Prime sim_clock to the demo epoch (2025-04-01).
-#   7. Seed the brewery tenant (JobKinds + policy + accounts/vendors/
+#   7. Seed the brewery tenant (Workflows + policy + accounts/vendors/
 #      data) and stamp the reset baseline — infra/seed-brewery-tenant.sh.
 #   8. Rebuild projections + GL from audit_log.
 #   9. Start boss-brewery-sim — the live tick resumes from epoch_start.
@@ -102,7 +102,7 @@ for svc in boss-policy-api boss-classes-api boss-locations-api \
            boss-cybernetics boss-clock-api boss-jobs-api boss-dispatcher; do
     systemctl restart "$svc" 2>/dev/null || echo "  (skipped $svc — not installed)"
 done
-# Give jobs-api a beat to reconcile the platform job-kind-design.
+# Give jobs-api a beat to reconcile the platform workflow-design.
 sleep 3
 
 echo "==> [4/9] priming the sim clock to $DEMO_EPOCH via clock-api"

@@ -7,7 +7,7 @@ land.
 ## Frame
 
 The correctness protocol (`docs/design/correctness-protocol.md`)
-states the *invariants* — every JobKind, projection, and adapter
+states the *invariants* — every Workflow, projection, and adapter
 must satisfy provenance, conservation, closure, idempotence,
 determinism. This document says how those invariants get
 **enforced** through the testing + lint pipeline.
@@ -51,7 +51,7 @@ formatting drift, syntax-level mistakes.
 ### Layer 2 — Static lints beyond the type system
 
 **What it catches:** structural mistakes the type system can't see
-— seed scripts that bypass the JobKind path, Tier-1 crates that
+— seed scripts that bypass the Workflow path, Tier-1 crates that
 import from Tier-2, *-api binaries that would silently boot
 in-memory, leaked credentials in release artifacts.
 
@@ -59,7 +59,7 @@ in-memory, leaked credentials in release artifacts.
 
 | Script | Catches |
 |---|---|
-| `infra/lint/seed-bypass-smell.sh` | Seed SQL that INSERTs into projection tables instead of routing through a JobKind. |
+| `infra/lint/seed-bypass-smell.sh` | Seed SQL that INSERTs into projection tables instead of routing through a Workflow. |
 | `infra/lint/tier-import-audit.sh` | Tier-1 library crates depending on Tier-2. 0 violations across 27 core crates today. |
 | `infra/check-binary-build-coverage.sh` | `*-api` binaries that would silently produce in-memory builds because their `postgres` (or `s3`) feature isn't activated by default, required-features, or workspace dep unification. Catches both the silent-skip class and the startup-guard-trap class. |
 

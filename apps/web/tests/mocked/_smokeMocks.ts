@@ -23,7 +23,7 @@ const EMP = {
   location: 'HQ', employment_type: 'full-time', skills: [], certifications: [],
 };
 
-// A JobKind whose first step OMITS `terminal` (the adversarial serde
+// A Workflow whose first step OMITS `terminal` (the adversarial serde
 // shape) and whose second carries one. Renders on the hub, atlas,
 // workflows list, and the detail page.
 const JOB_KIND = {
@@ -80,7 +80,7 @@ export async function installSmokeMocks(page: Page): Promise<void> {
   await page.route(/\/api\/jobs\/live$/, (r) => json(r, { counts: {}, open_total: 0, recent: [], sim_clock: {} }));
   await page.route(/\/api\/jobs\/summary(\?|$)/, (r) => json(r, { counts: {}, total: 0 }));
 
-  // JobKind registry + the adversarial kind (omitted-terminal step).
+  // Workflow registry + the adversarial kind (omitted-terminal step).
   await page.route(/\/api\/jobs\/kinds$/, (r) => json(r, [JOB_KIND]));
   await page.route(/\/api\/jobs\/kinds\/[^/]+$/, (r) => json(r, JOB_KIND));
   await page.route(/\/api\/jobs\/kinds\/[^/]+\/versions$/, (r) => json(r, [JOB_KIND]));

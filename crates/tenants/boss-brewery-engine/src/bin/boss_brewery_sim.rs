@@ -250,7 +250,7 @@ async fn main() -> Result<()> {
     let seeds_path = PathBuf::from(&seeds_dir);
 
     // One-shot `prepare` subcommand: seed the whole brewery tenant
-    // model (classes → JobKinds → policy → data) through the public
+    // model (classes → Workflows → policy → data) through the public
     // API, then exit. This is the converged prepare phase — reset /
     // launchers / CI call it instead of the old scattered
     // bootstrap + policy-bootstrap + data-seed + classes-curl steps,
@@ -392,9 +392,9 @@ async fn main() -> Result<()> {
     //
     // Recurring financial work (payroll, 941, income-tax) runs as
     // `[periodic.*]` specs in tenant.toml that open honest
-    // JobKinds whose terminal step's side-effect POSTs to the
+    // Workflows whose terminal step's side-effect POSTs to the
     // canonical `/api/ledger/*` endpoint — every such event has a
-    // JobKind / Step / audit-trail behind it.
+    // Workflow / Step / audit-trail behind it.
     // Vendor behaviors from the model (boss-inventory) — the simulator reads
     // each vendor's supply profile and synthesizes one supplier counterparty
     // chain per vendor (paced by its lead time + fulfilment), so the vendor
@@ -545,7 +545,7 @@ async fn main() -> Result<()> {
             .map(|id| (id.clone(), brewery_account_class(id)))
             .collect();
         // The storefront / taproom aggregate account is hardcoded in the
-        // order JobKinds' metadata, not sampled from the demand pool.
+        // order Workflows' metadata, not sampled from the demand pool.
         m.entry("acc-direct-shop".to_string())
             .or_insert_with(|| "retail".to_string());
         m

@@ -9,13 +9,13 @@
 //! library module is how the two paths stop diverging.
 //!
 //! [`prepare_model`] ([`model`]) is the single entry point — it
-//! seeds the entire tenant (classes → JobKinds → policy → data)
+//! seeds the entire tenant (classes → Workflows → policy → data)
 //! through one gateway URL. It composes the focused pieces, each a
 //! pure public-API client (no DB credentials, no privileged internal
 //! state — every write goes through a service behind its port):
 //!
-//! - [`publish_job_kinds`] ([`job_kinds`]) — open one
-//!   `job-kind-design` Job per brewery JobKind and walk it to
+//! - [`publish_workflows`] ([`workflows`]) — open one
+//!   `workflow-design` Job per brewery Workflow and walk it to
 //!   closure so the spec lands in the registry with full provenance.
 //! - [`seed_tenant_data`] ([`tenant_data`]) — POST the brewery's
 //!   operators, accounts, vendors, employees, catalog, assets, and
@@ -28,10 +28,10 @@
 //! `source_id`s). The thin `boss-brewery-bootstrap` /
 //! `boss-brewery-data-seed` binaries are CLI shells over these fns.
 
-pub mod job_kinds;
 pub mod model;
 pub mod tenant_data;
+pub mod workflows;
 
-pub use job_kinds::publish_job_kinds;
 pub use model::prepare_model;
 pub use tenant_data::{SeedBases, seed_tenant_data};
+pub use workflows::publish_workflows;

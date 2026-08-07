@@ -6,14 +6,14 @@
 //! - `platform-admin` — the operator who owns the deployment. Broad
 //!   Read across every shipped resource + Create/Update/Publish/
 //!   Retire/Delete on the registry resources (`policy-rule`,
-//!   `job-kind`, `step-plugin`) that govern how the platform behaves.
+//!   `workflow`, `step-plugin`) that govern how the platform behaves.
 //! - `audit-readonly` — the external-auditor / OSS-anonymous-visitor
 //!   role. Strictly Read on every shipped resource.
 //! - `smoke-tester` — fixture role for the boss-testing harness.
 //!   Read-only mirror of `audit-readonly`; isolated so a misconfigured
 //!   test can't accidentally drift external-auditor expectations.
 //! - `guest` — the unauth landing surface. Strictly
-//!   `job-kind` Read; no other resource.
+//!   `workflow` Read; no other resource.
 //!
 //! Tenant role grants (sales-rep, service-tech, controllers, the
 //! C-suite, department managers, …) live in **tenant seed data**, not
@@ -52,7 +52,7 @@ pub fn shipped_resources() -> Vec<Resource> {
         Resource::part(),
         Resource::purchase_order(),
         Resource::policy_rule(),
-        Resource::job_kind(),
+        Resource::workflow(),
         Resource::step_plugin(),
         // Result-set access to the log and to identity. Adding them
         // here is what makes the search/View gates data-driven: every
@@ -76,8 +76,8 @@ pub fn default_rules() -> Vec<Rule> {
     // ------------------------------------------------------------------
     // Platform admin — the operator running the BOSS deployment itself.
     // Broad **every-action** grant across every shipped resource. This
-    // is the deploy-time superuser: it walks `job-kind-design` meta-
-    // Jobs to register tenant JobKinds, runs `boss-policy-bootstrap`
+    // is the deploy-time superuser: it walks `workflow-design` meta-
+    // Jobs to register tenant Workflows, runs `boss-policy-bootstrap`
     // to seed tenant role grants, runs `boss-brewery-data-seed` to
     // populate Subject rosters, and tunes any policy-rule after launch.
     //
@@ -98,14 +98,14 @@ pub fn default_rules() -> Vec<Rule> {
     // role-scoped `step-signoff:<role>` resource (see
     // `boss-jobs::http::update_step`). The deploy superuser keeps SignOff
     // on `step-signoff:platform-admin` (the `design-doc-review` approval
-    // step still requires it) AND on `step-signoff:job-kind-approver` —
-    // the operational-leadership capability the `job-kind-design` approval
-    // step now requires. Tenants grant `job-kind-approver` to their
+    // step still requires it) AND on `step-signoff:workflow-approver` —
+    // the operational-leadership capability the `workflow-design` approval
+    // step now requires. Tenants grant `workflow-approver` to their
     // C-suite/COO/dept-heads in `examples/<tenant>/seeds/policy_rules.toml`
     // so authoring a work-type isn't gated solely on the deploy operator;
     // the bare `step` grant above does NOT cover these role-scoped
     // resources.
-    for authority in ["platform-admin", "job-kind-approver"] {
+    for authority in ["platform-admin", "workflow-approver"] {
         rules.push(Rule::new(
             "platform-admin",
             Resource::new(format!("step-signoff:{authority}")),
@@ -143,11 +143,11 @@ pub fn default_rules() -> Vec<Rule> {
 
     // ------------------------------------------------------------------
     // Guest — the unauth landing surface. The gateway forwards
-    // `GET /api/jobs/kinds*` without a session; the
+    // `GET /api/workflows*` without a session; the
     // jobs-api then sees role `guest`, and this rule lets it answer.
-    // Strictly read-only, strictly job-kind.
+    // Strictly read-only, strictly workflow.
     // ------------------------------------------------------------------
-    rules.push(Rule::new("guest", Resource::job_kind(), Read, Scope::All));
+    rules.push(Rule::new("guest", Resource::workflow(), Read, Scope::All));
 
     rules
 }
@@ -239,11 +239,11 @@ mod tests {
     }
 
     #[test]
-    fn guest_only_reads_job_kinds() {
+    fn guest_only_reads_workflows() {
         let rules = default_rules();
         let guest: Vec<_> = rules.iter().filter(|r| r.role == "guest").collect();
         assert_eq!(guest.len(), 1);
-        assert_eq!(guest[0].resource, Resource::job_kind());
+        assert_eq!(guest[0].resource, Resource::workflow());
         assert_eq!(guest[0].action, Action::Read);
     }
 }

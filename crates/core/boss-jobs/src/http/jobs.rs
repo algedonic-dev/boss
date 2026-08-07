@@ -218,7 +218,7 @@ pub(super) async fn jobs_summary<R: JobsRepository + 'static, B: EventBus + 'sta
 }
 
 /// Public landing-page surface. Returns a small bundle of
-/// "what's the brewery doing right now": per-JobKind counts of
+/// "what's the brewery doing right now": per-Workflow counts of
 /// open Jobs + a list of the most recently-opened in-flight
 /// Jobs with their current step. No auth — the gateway proxies
 /// this unauth so the public landing can render a live window
@@ -355,7 +355,7 @@ pub(super) fn job_status_str_public(s: JobStatus) -> &'static str {
 /// ```
 /// `tiers[-1]` = Jobs with every step terminal (completed/skipped)
 /// but the Job not yet closed (e.g. awaiting sign-off). Frontend maps
-/// tier → lifecycle phase via the JobKind's step list (sort_order
+/// tier → lifecycle phase via the Workflow's step list (sort_order
 /// buckets).
 pub(super) async fn jobs_phase_distribution<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
@@ -385,7 +385,7 @@ pub(super) async fn jobs_phase_distribution<R: JobsRepository + 'static, B: Even
 #[derive(Deserialize, Default)]
 pub(super) struct CreateJobQuery {
     /// When false, the handler creates the Job row but skips
-    /// materializing the JobKind's steps. Used by the brewery
+    /// materializing the Workflow's steps. Used by the brewery
     /// engine, which emits its own deterministic-UUID step
     /// creates via POST /api/jobs/{id}/steps and would otherwise
     /// land 2× the steps per Job. SPA / admin creates omit the
@@ -426,14 +426,14 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
         }
     };
 
-    // Validate the kind against the JobKind registry. When no registry
+    // Validate the kind against the Workflow registry. When no registry
     // is plumbed (older tests) we accept any kind string. We capture
     // the active spec here so the step-materialization pass below
     // doesn't need a second registry lookup.
     let kind_spec = if let Some(ref reg) = state.kind_registry {
         match reg.get_active(&job.kind).await {
             Ok(spec) => Some(spec),
-            Err(crate::registry::JobKindError::NotFound(_)) => {
+            Err(crate::registry::WorkflowError::NotFound(_)) => {
                 return (
                     StatusCode::BAD_REQUEST,
                     format!("unknown or inactive job kind: {}", job.kind),
@@ -449,13 +449,13 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
     };
 
     // Pin the Job to the kind's active version — the version it opens
-    // under. Per docs/architecture-decisions.md §Jobs, JobKinds, Steps:
+    // under. Per docs/architecture-decisions.md §Jobs, Workflows, Steps:
     // in-flight Jobs pin to the version they opened under, and creation
     // is blocked against draft/retired kinds (enforced by get_active
     // above, which 400s on an inactive kind). Server-assigned —
     // overrides any value a client put on the wire.
     if let Some(ref spec) = kind_spec {
-        job.job_kind_version = spec.version;
+        job.workflow_version = spec.version;
     }
 
     // Q7: every Job names a responsible HUMAN owner. Automation-shaped
@@ -516,7 +516,7 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
             Err(crate::subject_existence::SubjectExistenceError::Unavailable(msg)) => {
                 tracing::warn!(
                     %msg,
-                    job_kind = %job.kind,
+                    workflow = %job.kind,
                     "subject existence check unavailable; failing closed"
                 );
                 return (
@@ -549,7 +549,7 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
-    // Materialize the JobKind's steps into actual `steps` rows. Job
+    // Materialize the Workflow's steps into actual `steps` rows. Job
     // kinds with no steps (`ad-hoc`, where the user defines work as
     // they go) materialize into zero steps.
     //

@@ -101,7 +101,7 @@ handler = "commerce.invoice.issue"
 # resale-exempt (omitted from taxable_categories, so they accrue no 2300).
 # The handler taxes only the taxable-category line subtotal; commerce stamps
 # a tax_lines[account=2300] that the ledger accrues, and the quarterly
-# sales-tax-filing JobKind remits it back to Cash.
+# sales-tax-filing Workflow remits it back to Cash.
 args = { due_days = "30", default_revenue_category = "\"uncategorized\"", tax_rate_bps = "725", tax_jurisdiction = "\"US-CA\"", taxable_categories = "\"retail,taproom,event-package\"" }
 
 [[rule]]
@@ -115,7 +115,7 @@ args = { remit = "true", provider = "\"in-house\"" }
 # accrues `excise_bbl × $3.50/bbl` (TTB small-brewer rate) as
 # DR 6550 Excise Tax Expense / CR 2320 Excise Tax Payable, exactly
 # the way sales tax accrues per invoice line. The quarterly
-# excise-tax-filing JobKind drains 2320 → 1000 Cash. `excise_bbl`
+# excise-tax-filing Workflow drains 2320 → 1000 Cash. `excise_bbl`
 # rides in the package step's metadata (seeded per beer); a batch with
 # no taxable barrels is a no-op.
 [[rule]]
@@ -144,7 +144,7 @@ args = { reason = "\"morning-brew\"" }
 # own data: a step's `batch_bbl`, else the summed `excise_bbl` of its
 # produce steps). PREDETERMINED per-bbl rates pinned to the model's own
 # inputs at the ~262k-bbl/yr expected volume (derivations in the
-# pale-ale mash-in comment, examples/brewery/seeds/job_kinds.toml):
+# pale-ale mash-in comment, examples/brewery/seeds/workflows.toml):
 #   • Direct labor  $36.60/bbl — $9.59M/yr gross production payroll ÷ 262k
 #   • Process utilities $5.60/bbl — 70% of the $2.1M/yr utilities bill ÷ 262k
 #   • Production depreciation $8.60/bbl — 80% of $2.82M/yr depreciation ÷ 262k
@@ -227,9 +227,9 @@ args = { reason = "\"sale\"" }
 handler = "products.consume"
 
 # ---------------------------------------------------------------------------
-# Delegate-subjob (JobKind v2, D7) — the spawn → link → resolve loop.
+# Delegate-subjob (Workflow v2, D7) — the spawn → link → resolve loop.
 #
-# A `delegate-subjob` step spawns a child Job of `metadata.subjob_kind`
+# A `delegate-subjob` step spawns a child Job of `metadata.subworkflow`
 # when it becomes Ready, then pauses; when that child Job closes, the
 # child's terminal outcome is written back into the parent step's
 # `subjob_outcome` and the parent step flips to Completed.
@@ -251,7 +251,7 @@ name = "spawn-subjob-on-delegate-subjob-step-ready"
 on_event = "step.ready.delegate-subjob"
 [[rule.do]]
 handler = "jobs.spawn"
-args = { kind = "metadata.subjob_kind", subject_kind = "subject_kind", subject = "subject_id", parent_step_id = "step_id" }
+args = { kind = "metadata.subworkflow", subject_kind = "subject_kind", subject = "subject_id", parent_step_id = "step_id" }
 
 # ---------------------------------------------------------------------------
 # Marker auto-completion (the SYSTEM half of work routing)
@@ -292,7 +292,7 @@ handler = "gate.resolve"
 # Packaging allocation — a brewed batch is fungible wort. On step.ready the
 # dispatcher reads real FG stock, splits the whole batch across its formats
 # by demand shortfall, writes the packaged keg quantities + excise onto the
-# produce steps, and stamps per-format outcomes the JobKind forks on — so
+# produce steps, and stamps per-format outcomes the Workflow forks on — so
 # the whole batch always packages (WIP → FG, never dumped). Same
 # computer-speed agent pattern as the gate above.
 [[rule]]

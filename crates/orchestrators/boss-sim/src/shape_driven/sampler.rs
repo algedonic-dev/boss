@@ -17,7 +17,7 @@ use crate::engines::Tick;
 use crate::rng::{Rng, poisson_sample};
 use crate::shape_driven::tenant::JobRate;
 
-/// Resolve the active jobs/day rate for a JobKind on a given day.
+/// Resolve the active jobs/day rate for a Workflow on a given day.
 ///
 /// Walks `JobRate.ramp` to find the latest ramp whose `date <=
 /// today` (falls back to `JobRate.rate` if no ramps apply or none

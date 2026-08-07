@@ -200,7 +200,7 @@ async fn main() -> Result<()> {
             // Per-production excise-tax accrual (DR 6550 / CR 2320),
             // fired on `step.done.production-produce` — the brewery's
             // federal beer excise liability accrues at packaging time,
-            // drained quarterly by the excise-tax-filing JobKind.
+            // drained quarterly by the excise-tax-filing Workflow.
             handlers.register(LedgerTaxAccrue::new(cfg.ledger_api_url.clone()));
             handlers.register(LedgerPayrollRunSubmit::new(cfg.ledger_api_url.clone()));
             // General AP bills (rent/utilities/…) → ledger subledger.

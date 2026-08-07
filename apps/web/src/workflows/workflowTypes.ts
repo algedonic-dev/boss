@@ -1,12 +1,12 @@
-// Mirror of boss_jobs::registry types (JobKind v2).
+// Mirror of boss_jobs::registry types (Workflow v2).
 //
-// v2 deletes the tier-based step graph. A JobKind is now a FLAT
+// v2 deletes the tier-based step graph. A Workflow is now a FLAT
 // ordered list of steps; the DAG is implicit in each step's
 // `ready_when` predicate. There is no `StepGraph`, `TierSpec`, or
 // `StepEdge` anymore — the topological order emerges from the
 // predicates referencing sibling step slugs (`steps.<title>.done`).
 
-export type JobKindStatus = 'draft' | 'active' | 'retired';
+export type WorkflowStatus = 'draft' | 'active' | 'retired';
 
 /// Terminal marker. When a step reaches Completed, the Job closes
 /// with this outcome. Absent for non-terminal steps.
@@ -15,7 +15,7 @@ export type Terminal = {
 };
 
 export type StepSpec = {
-  /// STABLE kebab-case slug, unique within the JobKind. Predicates
+  /// STABLE kebab-case slug, unique within the Workflow. Predicates
   /// reference it as `steps.<title>.done` /
   /// `steps.<title>.metadata.<field>`. This is NOT human display —
   /// `title_template` is the display string.
@@ -39,20 +39,20 @@ export type StepSpec = {
   metadata_defaults: Record<string, unknown>;
 };
 
-export type JobKindSpec = {
+export type WorkflowSpec = {
   kind: string;
   version: number;
-  status: JobKindStatus;
+  status: WorkflowStatus;
   label: string;
   description: string | null;
   category: string;
   subject_kinds: ReadonlyArray<string>;
   steps: ReadonlyArray<StepSpec>;
   metadata_schema: Record<string, unknown>;
-  /// Free-form JobKind-level metadata blob. Carries the `surfaces`
+  /// Free-form Workflow-level metadata blob. Carries the `surfaces`
   /// hint (an array like `["hr"]` / `["qa"]`) declaring which
-  /// operational pages this JobKind appears on — read via
-  /// `jobKindSurfaces`.
+  /// operational pages this Workflow appears on — read via
+  /// `workflowSurfaces`.
   metadata: Record<string, unknown>;
   entitlements: Record<string, unknown>;
   owning_team: string;
@@ -60,12 +60,12 @@ export type JobKindSpec = {
   created_at: string;
 };
 
-/// Safely read the `surfaces` hint off a JobKind's `metadata` blob.
+/// Safely read the `surfaces` hint off a Workflow's `metadata` blob.
 /// Returns the declared operational-page slugs (e.g. `['hr']`,
 /// `['qa']`) as a string[], or `[]` when the key is absent or
 /// malformed. Operational pages (HR, QA) use this to discover which
-/// JobKinds belong to them instead of hardcoding tenant slugs.
-export function jobKindSurfaces(spec: {
+/// Workflows belong to them instead of hardcoding tenant slugs.
+export function workflowSurfaces(spec: {
   metadata?: Record<string, unknown>;
 }): string[] {
   const surfaces = spec.metadata?.surfaces;

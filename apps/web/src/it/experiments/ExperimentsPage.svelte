@@ -4,7 +4,7 @@
   // The System Model tab is where the model is operated and,
   // increasingly, where it is *changed*. Experiments will host
   // controlled, sandboxed modifications to the running model — a new
-  // JobKind version, a Class / Subject-kind tweak, a dispatcher rule,
+  // Workflow version, a Class / Subject-kind tweak, a dispatcher rule,
   // a policy change — trialled safely before they go live. Shipped as
   // a placeholder now (per the IA decision) so the slot is reserved
   // and the intent is visible; the real surface lands when the
@@ -23,7 +23,7 @@
   <p class="exp-lead">
     The System Model tab is where the model is <em>operated</em> — and,
     increasingly, where it is <em>changed</em>. Experiments will let you
-    propose a controlled modification to the model — a new JobKind
+    propose a controlled modification to the model — a new Workflow
     version, a Class or Subject-kind tweak, a dispatcher rule, a policy
     change — and trial it safely before it goes live.
   </p>

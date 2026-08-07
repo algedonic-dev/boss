@@ -1,8 +1,8 @@
 //! The create handler must pin a new Job to its kind's *active*
-//! version. Per docs/architecture-decisions.md §Jobs, JobKinds, Steps:
+//! version. Per docs/architecture-decisions.md §Jobs, Workflows, Steps:
 //! creation is blocked against draft/retired kinds, and in-flight Jobs
 //! pin to the version they opened under — so a freshly created Job's
-//! `job_kind_version` is the active version at open time, never the
+//! `workflow_version` is the active version at open time, never the
 //! schema DEFAULT 1 and never a client-supplied value.
 
 use std::sync::Arc;
@@ -13,9 +13,9 @@ use boss_core::job::{Job, Priority, Subject};
 use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
 use boss_jobs::http::{JobsApiState, router};
-use boss_jobs::registry::{JobKindRegistry, JobKindSpec, JobKindStatus};
+use boss_jobs::registry::{WorkflowRegistry, WorkflowSpec, WorkflowStatus};
 use boss_jobs::step_registry::StepRegistry;
-use boss_jobs::{InMemoryJobKinds, InMemoryJobs, JobsRepository};
+use boss_jobs::{InMemoryJobs, InMemoryWorkflows, JobsRepository};
 use boss_policy_client::{Action, FakePolicyClient, PolicyClient, Resource, Scope};
 use boss_testing::RecordingEventBus;
 use chrono::NaiveDate;
@@ -33,8 +33,8 @@ fn ceo_header() -> String {
     .to_string()
 }
 
-fn versioned_spec(version: i32, status: JobKindStatus) -> JobKindSpec {
-    let mut s = JobKindSpec::platform_seed(
+fn versioned_spec(version: i32, status: WorkflowStatus) -> WorkflowSpec {
+    let mut s = WorkflowSpec::platform_seed(
         "versioned",
         "Versioned",
         "test",
@@ -49,19 +49,19 @@ fn versioned_spec(version: i32, status: JobKindStatus) -> JobKindSpec {
 #[tokio::test]
 async fn new_job_pins_to_active_version_not_default_one() {
     // A kind whose ACTIVE version is 3 (v1, v2 retired by prior publishes).
-    let kinds = Arc::new(InMemoryJobKinds::new());
+    let kinds = Arc::new(InMemoryWorkflows::new());
     kinds
-        .seed(versioned_spec(1, JobKindStatus::Retired))
+        .seed(versioned_spec(1, WorkflowStatus::Retired))
         .unwrap();
     kinds
-        .seed(versioned_spec(2, JobKindStatus::Retired))
+        .seed(versioned_spec(2, WorkflowStatus::Retired))
         .unwrap();
     kinds
-        .seed(versioned_spec(3, JobKindStatus::Active))
+        .seed(versioned_spec(3, WorkflowStatus::Active))
         .unwrap();
 
     let jobs = Arc::new(InMemoryJobs::new());
-    let kind_registry: Arc<dyn JobKindRegistry> = kinds;
+    let kind_registry: Arc<dyn WorkflowRegistry> = kinds;
     let policy: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
             .allow("ceo", Action::Create, Resource::job(), Scope::All)
@@ -95,7 +95,7 @@ async fn new_job_pins_to_active_version_not_default_one() {
         Priority::Standard,
         NaiveDate::from_ymd_opt(2026, 4, 28).unwrap(),
     );
-    job.job_kind_version = 99;
+    job.workflow_version = 99;
 
     let resp = app
         .oneshot(
@@ -121,7 +121,7 @@ async fn new_job_pins_to_active_version_not_default_one() {
         .unwrap()
         .expect("job was stored");
     assert_eq!(
-        stored.job_kind_version, 3,
+        stored.workflow_version, 3,
         "new Job must pin to the active version (3), not the client value (99) or DEFAULT 1"
     );
 }
@@ -143,8 +143,8 @@ async fn a_republish_does_not_strand_a_job_opened_under_the_old_version() {
     use boss_jobs::registry::{StepSpec, Terminal};
 
     /// v1: open → gate → closed, where closure depends on the gate.
-    fn v1() -> JobKindSpec {
-        JobKindSpec::platform_seed(
+    fn v1() -> WorkflowSpec {
+        WorkflowSpec::platform_seed(
             "versioned",
             "Versioned",
             "test",
@@ -182,7 +182,7 @@ async fn a_republish_does_not_strand_a_job_opened_under_the_old_version() {
     /// v2 adds a branch and moves closure behind it — the exact shape
     /// that stranded the real Jobs, because a v1 Job has no `branch`
     /// step for `steps.branch.done` to ever be true about.
-    fn v2() -> JobKindSpec {
+    fn v2() -> WorkflowSpec {
         let mut s = v1();
         s.label = "Versioned v2".into();
         s.steps.insert(
@@ -200,11 +200,11 @@ async fn a_republish_does_not_strand_a_job_opened_under_the_old_version() {
         s
     }
 
-    let kinds = Arc::new(InMemoryJobKinds::new());
+    let kinds = Arc::new(InMemoryWorkflows::new());
     kinds.bootstrap_reconcile(&[v1()]).await.expect("seed v1");
 
     let jobs = Arc::new(InMemoryJobs::new());
-    let kind_registry: Arc<dyn JobKindRegistry> = kinds.clone();
+    let kind_registry: Arc<dyn WorkflowRegistry> = kinds.clone();
     let policy: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
             .allow("ceo", Action::Create, Resource::job(), Scope::All)
@@ -257,7 +257,7 @@ async fn a_republish_does_not_strand_a_job_opened_under_the_old_version() {
 
     let (stored, _) = jobs.list_jobs(&Default::default(), 10, 0).await.unwrap();
     let opened = stored.first().expect("job stored").clone();
-    assert_eq!(opened.job_kind_version, 1);
+    assert_eq!(opened.workflow_version, 1);
 
     // The registry moves on WHILE the Job is in flight.
     let stats = kinds.bootstrap_reconcile(&[v2()]).await.expect("republish");
@@ -311,7 +311,7 @@ async fn a_republish_does_not_strand_a_job_opened_under_the_old_version() {
         boss_core::job::StepStatus::Pending,
         "the terminal never opened: the Job is pinned to v{} but was evaluated against a \
          spec whose closure depends on steps it does not have. Steps: {:?}",
-        opened.job_kind_version,
+        opened.workflow_version,
         after
             .iter()
             .map(|s| (s.title.as_str(), s.status))

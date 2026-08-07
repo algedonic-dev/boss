@@ -1,4 +1,4 @@
-// Pure, side-effect-free transforms on a JobKind v2 step list. The
+// Pure, side-effect-free transforms on a Workflow v2 step list. The
 // graphical authoring surface (palette, inspector) routes every edit
 // through these so the rules live in one tested place rather than
 // scattered across components. Each returns a NEW array — no mutation
@@ -10,7 +10,7 @@
 // rewrite every reference or the DAG silently breaks, which is exactly
 // the sharp edge the free-text list editor has today.
 
-import type { StepSpec } from './jobKindTypes';
+import type { StepSpec } from './workflowTypes';
 
 const SLUG_PART_RE = /[^a-z0-9]+/g;
 

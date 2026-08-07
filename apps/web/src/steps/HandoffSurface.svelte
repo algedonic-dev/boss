@@ -4,7 +4,7 @@
   // cellar → packaging, packaging → warehouse, the wholesale
   // bookkeeper-finance handoff, etc.
   //
-  // Demo framing: from + to are pre-populated by the JobKind.
+  // Demo framing: from + to are pre-populated by the Workflow.
   // The user picks "I'm the sender, confirm" or "I'm the
   // receiver, confirm." Both ack lights up → step done.
 

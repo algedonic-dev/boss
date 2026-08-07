@@ -2,7 +2,7 @@
 //! `boss-brewery-engine`.
 //!
 //! Loads the used-device-shop seed bundle (`tenant.toml` +
-//! `job_kinds.toml` + `data/employees.json`), seeds the subject
+//! `workflows.toml` + `data/employees.json`), seeds the subject
 //! pool, and drives the day-loop via
 //! `boss_sim::engines::run_ticks_with_handlers`. Side-effect
 //! dispatch lives in the boss-dispatcher daemon's rule registry; the
@@ -22,8 +22,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 
-use boss_jobs::registry::JobKindSpec;
-use boss_jobs::seed_loader::load_job_kinds_with_owning_team;
+use boss_jobs::registry::WorkflowSpec;
+use boss_jobs::seed_loader::load_workflows_with_owning_team;
 use boss_jobs::step_registry::StepRegistry;
 use boss_sim::calendar::CalendarRegistry;
 use boss_sim::engines::{
@@ -42,7 +42,7 @@ pub struct UsedDeviceShopRunResult {
     pub output: InMemoryOutput,
 }
 
-/// Seed the canonical used-device-shop subjects so the JobKinds have
+/// Seed the canonical used-device-shop subjects so the Workflows have
 /// targets to anchor on. Production deployments derive this from
 /// live tables; the standalone runner / test path uses this hand-seed
 /// PLUS the per-day subject birth driven by `[subject_rates]` in
@@ -115,7 +115,7 @@ pub fn seed_used_device_shop_subjects(
 /// [`run_used_device_shop_one_day`] in a loop to advance day-by-day
 /// without losing pending-action state.
 pub struct UsedDeviceShopEngineState {
-    pub kinds: Vec<JobKindSpec>,
+    pub kinds: Vec<WorkflowSpec>,
     pub registry: StepRegistry,
     pub tenant: TenantConfig,
     pub state: ShapeDrivenState,
@@ -134,10 +134,10 @@ impl UsedDeviceShopEngineState {
     /// boss-dispatcher's rule registry.
     pub fn load(seeds: &Path) -> Result<Self> {
         let tenant_path = seeds.join("tenant.toml");
-        let kinds_path = seeds.join("job_kinds.toml");
+        let kinds_path = seeds.join("workflows.toml");
         let tenant = TenantConfig::load(&tenant_path)
             .with_context(|| format!("loading tenant config from {}", tenant_path.display()))?;
-        let kinds = load_job_kinds_with_owning_team(&kinds_path, &tenant.meta.tenant_id)
+        let kinds = load_workflows_with_owning_team(&kinds_path, &tenant.meta.tenant_id)
             .with_context(|| format!("loading job kinds from {}", kinds_path.display()))?;
         let registry = StepRegistry::v1();
 

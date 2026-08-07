@@ -119,7 +119,7 @@ log "== 8 — deploy services =="
 log "== 9 — tenant seed =="
 case "$TENANT" in
     brewery)
-        # Converged tenant prepare: classes + JobKinds + policy + data
+        # Converged tenant prepare: classes + Workflows + policy + data
         # (operators / employees / accounts / vendors / opening
         # balances) in one call — the same prepare_model the live demo
         # (seed-brewery-tenant.sh) and CI (validate-brewery-sim.sh)

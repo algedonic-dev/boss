@@ -17,9 +17,9 @@ use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
 use boss_jobs::http::{JobsApiState, router};
 use boss_jobs::owner_resolution::RosterLookup;
-use boss_jobs::registry::{JobKindSpec, StepSpec};
+use boss_jobs::registry::{StepSpec, WorkflowSpec};
 use boss_jobs::step_registry::StepRegistry;
-use boss_jobs::{InMemoryJobKinds, InMemoryJobs, JobKindRegistry, JobsRepository};
+use boss_jobs::{InMemoryJobs, InMemoryWorkflows, JobsRepository, WorkflowRegistry};
 use boss_policy_client::{Action, FakePolicyClient, PolicyClient, Resource, Scope};
 use boss_testing::RecordingEventBus;
 use chrono::NaiveDate;
@@ -33,7 +33,7 @@ impl RosterLookup for FixedRoster {
     async fn active_holders(&self, role: &str) -> Result<Vec<String>, String> {
         Ok(match role {
             "bookkeeper" => vec!["emp-bk-1".to_string(), "emp-bk-2".to_string()],
-            "job-kind-approver" => vec!["emp-lead-1".to_string()],
+            "workflow-approver" => vec!["emp-lead-1".to_string()],
             _ => Vec::new(),
         })
     }
@@ -61,7 +61,7 @@ fn kind_with_owner_role(
     kind: &str,
     owner_role: Option<&str>,
     step_role: Option<&str>,
-) -> JobKindSpec {
+) -> WorkflowSpec {
     let steps = match step_role {
         Some(role) => vec![StepSpec {
             title: "approve".into(),
@@ -73,7 +73,7 @@ fn kind_with_owner_role(
         }],
         None => Vec::new(),
     };
-    let mut s = JobKindSpec::platform_seed(kind, kind, "test", vec!["custom".into()], steps);
+    let mut s = WorkflowSpec::platform_seed(kind, kind, "test", vec!["custom".into()], steps);
     if let Some(role) = owner_role {
         s.metadata = serde_json::json!({ "owner_role": role });
     }
@@ -86,8 +86,8 @@ async fn stored_owner(jobs: &InMemoryJobs) -> String {
     all[0].owner_id.clone()
 }
 
-fn app_with(specs: Vec<JobKindSpec>) -> (axum::Router, Arc<InMemoryJobs>) {
-    let kinds = Arc::new(InMemoryJobKinds::new());
+fn app_with(specs: Vec<WorkflowSpec>) -> (axum::Router, Arc<InMemoryJobs>) {
+    let kinds = Arc::new(InMemoryWorkflows::new());
     for s in specs {
         kinds.seed(s).unwrap();
     }
@@ -105,7 +105,7 @@ fn app_with(specs: Vec<JobKindSpec>) -> (axum::Router, Arc<InMemoryJobs>) {
         publisher: DomainPublisher::new(bus_dyn, "jobs"),
         step_registry: Arc::new(StepRegistry::v1()),
         policy,
-        kind_registry: Some(kinds as Arc<dyn JobKindRegistry>),
+        kind_registry: Some(kinds as Arc<dyn WorkflowRegistry>),
         plugin_registry: None,
         calendar: None,
         subject_kinds: None,
@@ -176,11 +176,11 @@ async fn human_owner_is_kept_verbatim() {
 #[tokio::test]
 async fn step_authority_role_is_the_fallback_for_meta_kinds() {
     let (app, jobs) = app_with(vec![kind_with_owner_role(
-        "job-kind-design",
+        "workflow-design",
         None,
-        Some("job-kind-approver"),
+        Some("workflow-approver"),
     )]);
-    let (status, body) = post_job(&app, &job("job-kind-design", "automation:prepare")).await;
+    let (status, body) = post_job(&app, &job("workflow-design", "automation:prepare")).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(stored_owner(&jobs).await, "emp-lead-1");
 }
@@ -201,8 +201,8 @@ async fn unresolvable_owner_rejects_the_create() {
 
 #[tokio::test]
 async fn platform_meta_kinds_declare_a_resolvable_owner_role() {
-    // The 2026-07-17 smoke red: job-kind-design's approve authority
-    // (`job-kind-approver`) is a policy CAPABILITY, not an
+    // The 2026-07-17 smoke red: workflow-design's approve authority
+    // (`workflow-approver`) is a policy CAPABILITY, not an
     // employees.role — the step fallback found zero holders, every
     // design-Job create was rejected, no brewery kind ever
     // published, and the whole from-empty stack starved. The

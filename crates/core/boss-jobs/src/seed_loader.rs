@@ -1,29 +1,29 @@
-//! Tenant-authored JobKind seed loader.
+//! Tenant-authored Workflow seed loader.
 //!
-//! Tenants ship `[[job_kind]]` rows in
-//! `examples/<tenant>/seeds/job_kinds.toml`. This module parses
-//! those files and returns `Vec<JobKindSpec>` ready to consume by
+//! Tenants ship `[[workflow]]` rows in
+//! `examples/<tenant>/seeds/workflows.toml`. This module parses
+//! those files and returns `Vec<WorkflowSpec>` ready to consume by
 //! the shape-driven sim, the boss-jobs-api bootstrap, or any test
-//! that needs the tenant's JobKind list.
+//! that needs the tenant's Workflow list.
 //!
-//! JobKind v2 TOML shape — flat steps with predicates, no tiers:
+//! Workflow v2 TOML shape — flat steps with predicates, no tiers:
 //!
 //! ```toml
-//! [[job_kind]]
+//! [[workflow]]
 //! kind = "morning-brew"
 //! label = "Morning Brew"
 //! category = "production"
 //! subject_kinds = ["location"]
 //! description = "..."
 //!
-//! [[job_kind.step]]
+//! [[workflow.step]]
 //! title = "plan"                       # kebab-case slug, unique per kind
 //! kind = "scheduling"                  # StepType
 //! ready_when = "true"                  # predicate; "true" = trigger
 //! title_template = "Plan today's brew — {subject.id}"
 //! metadata_defaults = { recipes_planned = [] }
 //!
-//! [[job_kind.step]]
+//! [[workflow.step]]
 //! title = "mash-in"
 //! kind = "task"
 //! ready_when = "steps.plan.done"       # references the slug above
@@ -40,19 +40,19 @@
 //! TOML doesn't override (version=1, status=Active, owning_team=system).
 //!
 //! Every loaded bundle is run through
-//! [`crate::job_kind_lint::validate_all`] — the viability lint that
+//! [`crate::workflow_lint::validate_all`] — the viability lint that
 //! owns the structural concerns (≥1 trigger, ≥1 terminal, predicate
 //! refs resolve, acyclic, reachable, fork coverage). The loader no
 //! longer enforces any of that itself; its only job is TOML → spec.
 //!
 //! Tenants override `owning_team` to their tenant id. Pass `default_owner`
-//! into [`load_job_kinds_with_owning_team`] to set it for every row.
+//! into [`load_workflows_with_owning_team`] to set it for every row.
 
 use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::registry::{JobKindSpec, StepSpec, Terminal};
+use crate::registry::{StepSpec, Terminal, WorkflowSpec};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SeedLoaderError {
@@ -60,8 +60,8 @@ pub enum SeedLoaderError {
     Io(String, String),
     #[error("parsing {0}: {1}")]
     Parse(String, String),
-    /// One or more JobKinds in the loaded file failed
-    /// [`crate::job_kind_lint::validate_all`]. Surfaces seed-
+    /// One or more Workflows in the loaded file failed
+    /// [`crate::workflow_lint::validate_all`]. Surfaces seed-
     /// authoring bugs (bad enum literals, type mismatches,
     /// unviable predicate graphs, side-effect bindings without
     /// metadata defaults) in seconds at startup instead of half an
@@ -71,20 +71,20 @@ pub enum SeedLoaderError {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct JobKindsFile {
-    #[serde(rename = "job_kind", default)]
-    job_kinds: Vec<JobKindToml>,
+struct WorkflowsFile {
+    #[serde(rename = "workflow", default)]
+    workflows: Vec<WorkflowToml>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct JobKindToml {
+struct WorkflowToml {
     kind: String,
     label: String,
     category: String,
     subject_kinds: Vec<String>,
     #[serde(default)]
     description: Option<String>,
-    /// JobKind-level display/routing hints (e.g.
+    /// Workflow-level display/routing hints (e.g.
     /// `metadata = { surfaces = ["hr"] }`). Mirrors the registry's
     /// `metadata` JSONB column; same `serde_json::Value` shape as a
     /// tenant could supply for `metadata_schema` / `entitlements`.
@@ -102,7 +102,7 @@ struct JobKindToml {
 /// serde attributes onto the registry type.
 #[derive(Debug, Clone, Deserialize)]
 struct StepToml {
-    /// Stable kebab-case slug, unique within the JobKind. Referenced
+    /// Stable kebab-case slug, unique within the Workflow. Referenced
     /// by other steps' `ready_when` predicates as `steps.<title>.…`.
     title: String,
     kind: String,
@@ -130,50 +130,50 @@ struct TerminalToml {
     outcome: String,
 }
 
-/// Load a tenant's `job_kinds.toml` and materialize `JobKindSpec`s.
-/// Owning team defaults to `"platform"` (matching `JobKindSpec::platform_seed`).
-pub fn load_job_kinds(path: impl AsRef<Path>) -> Result<Vec<JobKindSpec>, SeedLoaderError> {
-    load_job_kinds_with_owning_team(path, "platform")
+/// Load a tenant's `workflows.toml` and materialize `WorkflowSpec`s.
+/// Owning team defaults to `"platform"` (matching `WorkflowSpec::platform_seed`).
+pub fn load_workflows(path: impl AsRef<Path>) -> Result<Vec<WorkflowSpec>, SeedLoaderError> {
+    load_workflows_with_owning_team(path, "platform")
 }
 
-/// Same as [`load_job_kinds`] but stamps every spec with
+/// Same as [`load_workflows`] but stamps every spec with
 /// `owning_team = default_owner` (typically the tenant id, e.g.
 /// `"brewery"` or `"used-device-shop"`).
-pub fn load_job_kinds_with_owning_team(
+pub fn load_workflows_with_owning_team(
     path: impl AsRef<Path>,
     default_owner: &str,
-) -> Result<Vec<JobKindSpec>, SeedLoaderError> {
+) -> Result<Vec<WorkflowSpec>, SeedLoaderError> {
     let path_ref = path.as_ref();
     let path_str = path_ref.display().to_string();
     let text = std::fs::read_to_string(path_ref)
         .map_err(|e| SeedLoaderError::Io(path_str.clone(), e.to_string()))?;
-    parse_job_kinds(&text, default_owner, &path_str)
+    parse_workflows(&text, default_owner, &path_str)
 }
 
 /// Parse TOML text directly. Useful for inline tests; the file
 /// loader is a thin wrapper around this.
 ///
-/// Loaded specs are run through [`crate::job_kind_lint::validate_all`]
+/// Loaded specs are run through [`crate::workflow_lint::validate_all`]
 /// before being returned. Any lint failure (bad enum literal in
 /// metadata_defaults, type mismatch, unviable predicate graph,
 /// side-effect-bound step with empty defaults) fails the load with
 /// [`SeedLoaderError::LintFailed`] — surfaces seed-authoring bugs at
 /// startup instead of mid-sim.
-pub fn parse_job_kinds(
+pub fn parse_workflows(
     text: &str,
     default_owner: &str,
     source: &str,
-) -> Result<Vec<JobKindSpec>, SeedLoaderError> {
-    let file: JobKindsFile = toml::from_str(text)
+) -> Result<Vec<WorkflowSpec>, SeedLoaderError> {
+    let file: WorkflowsFile = toml::from_str(text)
         .map_err(|e| SeedLoaderError::Parse(source.to_string(), e.to_string()))?;
-    let specs: Vec<JobKindSpec> = file
-        .job_kinds
+    let specs: Vec<WorkflowSpec> = file
+        .workflows
         .into_iter()
-        .map(|jk| job_kind_toml_to_spec(jk, default_owner))
+        .map(|jk| workflow_toml_to_spec(jk, default_owner))
         .collect();
 
     let registry = crate::step_registry::StepRegistry::v1();
-    let lint_errs = crate::job_kind_lint::validate_all(&specs, &registry);
+    let lint_errs = crate::workflow_lint::validate_all(&specs, &registry);
     if !lint_errs.is_empty() {
         return Err(SeedLoaderError::LintFailed {
             file: source.to_string(),
@@ -183,9 +183,9 @@ pub fn parse_job_kinds(
     Ok(specs)
 }
 
-fn job_kind_toml_to_spec(toml: JobKindToml, default_owner: &str) -> JobKindSpec {
+fn workflow_toml_to_spec(toml: WorkflowToml, default_owner: &str) -> WorkflowSpec {
     // Flat steps map straight onto StepSpec — the viability lint
-    // (run by parse_job_kinds) owns every structural concern, so the
+    // (run by parse_workflows) owns every structural concern, so the
     // loader is pure deserialization now.
     let steps: Vec<StepSpec> = toml
         .steps
@@ -203,7 +203,7 @@ fn job_kind_toml_to_spec(toml: JobKindToml, default_owner: &str) -> JobKindSpec 
         })
         .collect();
 
-    let mut spec = JobKindSpec::platform_seed(
+    let mut spec = WorkflowSpec::platform_seed(
         toml.kind,
         toml.label,
         toml.category,
@@ -230,26 +230,26 @@ mod tests {
     #[test]
     fn parses_minimal_jobkind() {
         let text = r#"
-[[job_kind]]
+[[workflow]]
 kind = "test-job"
 label = "Test Job"
 category = "production"
 subject_kinds = ["location"]
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "start"
 kind = "task"
 ready_when = "true"
 title_template = "Step one"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "finish"
 kind = "task"
 ready_when = "steps.start.done"
 title_template = "Step two"
 terminal = { outcome = "done" }
 "#;
-        let specs = parse_job_kinds(text, "platform", "<test>").unwrap();
+        let specs = parse_workflows(text, "platform", "<test>").unwrap();
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].kind, "test-job");
         assert_eq!(specs[0].label, "Test Job");
@@ -272,38 +272,38 @@ terminal = { outcome = "done" }
         // the DAG is implicit in the `steps.<slug>.done` references,
         // no tier / edge structure in sight.
         let text = r#"
-[[job_kind]]
+[[workflow]]
 kind = "diamond"
 label = "Diamond"
 category = "production"
 subject_kinds = ["account"]
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "start"
 kind = "task"
 ready_when = "true"
 title_template = "Trigger"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "left"
 kind = "task"
 ready_when = "steps.start.done"
 title_template = "Left"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "right"
 kind = "task"
 ready_when = "steps.start.done"
 title_template = "Right"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "join"
 kind = "task"
 ready_when = "steps.left.done AND steps.right.done"
 title_template = "Join"
 terminal = { outcome = "done" }
 "#;
-        let specs = parse_job_kinds(text, "platform", "<test>").unwrap();
+        let specs = parse_workflows(text, "platform", "<test>").unwrap();
         assert_eq!(specs[0].steps.len(), 4);
         let titles: Vec<&str> = specs[0].steps.iter().map(|s| s.title.as_str()).collect();
         assert_eq!(titles, vec!["start", "left", "right", "join"]);
@@ -312,19 +312,19 @@ terminal = { outcome = "done" }
     #[test]
     fn carries_step_metadata_through() {
         let text = r#"
-[[job_kind]]
+[[workflow]]
 kind = "with-metadata"
 label = "With Metadata"
 category = "production"
 subject_kinds = ["location"]
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "trigger"
 kind = "task"
 ready_when = "true"
 title_template = "Open"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "mash-in"
 kind = "task"
 ready_when = "steps.trigger.done"
@@ -334,7 +334,7 @@ authority_role = "head-brewer"
 metadata_defaults = { mash_temp_f = 152, mash_minutes = 60 }
 terminal = { outcome = "brewed" }
 "#;
-        let specs = parse_job_kinds(text, "brewery", "<test>").unwrap();
+        let specs = parse_workflows(text, "brewery", "<test>").unwrap();
         let step = &specs[0].steps[1];
         assert_eq!(step.kind, "task");
         assert_eq!(step.title, "mash-in");
@@ -346,38 +346,38 @@ terminal = { outcome = "brewed" }
 
     #[test]
     fn carries_jobkind_metadata_through() {
-        // A JobKind-level `metadata` inline table (the display/routing
+        // A Workflow-level `metadata` inline table (the display/routing
         // hint blob — `surfaces` is the first key) must round-trip from
-        // the seed TOML into `JobKindSpec.metadata`, mirroring how
+        // the seed TOML into `WorkflowSpec.metadata`, mirroring how
         // `description` flows through. Proves the seed→spec path for
         // the new column.
         let text = r#"
-[[job_kind]]
+[[workflow]]
 kind = "with-surfaces"
 label = "With Surfaces"
 category = "production"
 subject_kinds = ["location"]
 metadata = { surfaces = ["qa"] }
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "start"
 kind = "task"
 ready_when = "true"
 title_template = "Open"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "done"
 kind = "task"
 ready_when = "steps.start.done"
 title_template = "Done"
 terminal = { outcome = "done" }
 "#;
-        let specs = parse_job_kinds(text, "brewery", "<test>").unwrap();
+        let specs = parse_workflows(text, "brewery", "<test>").unwrap();
         assert_eq!(specs.len(), 1);
         assert_eq!(
             specs[0].metadata,
             serde_json::json!({ "surfaces": ["qa"] }),
-            "JobKind-level metadata must round-trip from TOML into the spec"
+            "Workflow-level metadata must round-trip from TOML into the spec"
         );
     }
 
@@ -387,33 +387,33 @@ terminal = { outcome = "done" }
         // `platform_seed` default (`{}`), matching the column's
         // DEFAULT '{}'::jsonb.
         let text = r#"
-[[job_kind]]
+[[workflow]]
 kind = "no-surfaces"
 label = "No Surfaces"
 category = "production"
 subject_kinds = ["location"]
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "start"
 kind = "task"
 ready_when = "true"
 title_template = "Open"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "done"
 kind = "task"
 ready_when = "steps.start.done"
 title_template = "Done"
 terminal = { outcome = "done" }
 "#;
-        let specs = parse_job_kinds(text, "platform", "<test>").unwrap();
+        let specs = parse_workflows(text, "platform", "<test>").unwrap();
         assert_eq!(specs[0].metadata, serde_json::json!({}));
     }
 
     #[test]
     fn parses_optional_description() {
         let text = r#"
-[[job_kind]]
+[[workflow]]
 kind = "described"
 label = "Described"
 category = "production"
@@ -423,20 +423,20 @@ Multi-line description
 explaining the job.
 """
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "start"
 kind = "task"
 ready_when = "true"
 title_template = "Open"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "done"
 kind = "task"
 ready_when = "steps.start.done"
 title_template = "Done"
 terminal = { outcome = "done" }
 "#;
-        let specs = parse_job_kinds(text, "platform", "<test>").unwrap();
+        let specs = parse_workflows(text, "platform", "<test>").unwrap();
         assert!(
             specs[0]
                 .description
@@ -453,19 +453,19 @@ terminal = { outcome = "done" }
     #[test]
     fn rejects_metadata_defaults_with_bad_enum_literal() {
         let text = r#"
-[[job_kind]]
+[[workflow]]
 kind = "bad-enum-seed"
 label = "Bad Enum Seed"
 category = "production"
 subject_kinds = ["account"]
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "start"
 kind = "task"
 ready_when = "true"
 title_template = "Open"
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "outreach"
 kind = "outreach"
 ready_when = "steps.start.done"
@@ -473,7 +473,7 @@ title_template = "Bad outreach"
 metadata_defaults = { channel = "in-person", recipient_id = "x" }
 terminal = { outcome = "sent" }
 "#;
-        let err = parse_job_kinds(text, "platform", "<test>").unwrap_err();
+        let err = parse_workflows(text, "platform", "<test>").unwrap_err();
         let SeedLoaderError::LintFailed { file, failures } = err else {
             panic!("expected LintFailed, got {err:?}");
         };
@@ -491,19 +491,19 @@ terminal = { outcome = "sent" }
         // No terminal step → the viability lint rejects it at load
         // time. Structure is wholly the lint's concern.
         let text = r#"
-[[job_kind]]
+[[workflow]]
 kind = "no-terminal"
 label = "No Terminal"
 category = "production"
 subject_kinds = ["location"]
 
-[[job_kind.step]]
+[[workflow.step]]
 title = "start"
 kind = "task"
 ready_when = "true"
 title_template = "Open"
 "#;
-        let err = parse_job_kinds(text, "platform", "<test>").unwrap_err();
+        let err = parse_workflows(text, "platform", "<test>").unwrap_err();
         let SeedLoaderError::LintFailed { failures, .. } = err else {
             panic!("expected LintFailed, got {err:?}");
         };
@@ -515,7 +515,7 @@ title_template = "Open"
 
     #[test]
     fn empty_file_returns_empty_list() {
-        let specs = parse_job_kinds("", "platform", "<test>").unwrap();
+        let specs = parse_workflows("", "platform", "<test>").unwrap();
         assert!(specs.is_empty());
     }
 
@@ -528,15 +528,15 @@ title_template = "Open"
             .join("..")
             .join("..")
             .join("..")
-            .join("examples/brewery/seeds/job_kinds.toml");
-        let specs = load_job_kinds_with_owning_team(&path, "brewery").unwrap();
+            .join("examples/brewery/seeds/workflows.toml");
+        let specs = load_workflows_with_owning_team(&path, "brewery").unwrap();
         assert!(!specs.is_empty(), "brewery seed bundle should yield kinds");
         let kinds: Vec<&str> = specs.iter().map(|s| s.kind.as_str()).collect();
         // Sanity-check the ones brewery_e2e exercises.
         for required in &["morning-brew", "wholesale-keg-order", "ingredient-restock"] {
             assert!(
                 kinds.contains(required),
-                "expected `{required}` in brewery JobKinds; got {kinds:?}"
+                "expected `{required}` in brewery Workflows; got {kinds:?}"
             );
         }
         // Every spec carries the brewery owning_team stamp.
@@ -546,18 +546,18 @@ title_template = "Open"
     #[test]
     fn round_trips_used_device_shop_seed_bundle() {
         // Sibling smoke test for the used-device-shop tenant: this
-        // file is the data form of the tenant's 10 JobKinds.
+        // file is the data form of the tenant's 10 Workflows.
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
             .join("..")
-            .join("examples/used-device-shop/seeds/job_kinds.toml");
-        let specs = load_job_kinds_with_owning_team(&path, "used-device-shop").unwrap();
+            .join("examples/used-device-shop/seeds/workflows.toml");
+        let specs = load_workflows_with_owning_team(&path, "used-device-shop").unwrap();
         let kinds: Vec<&str> = specs.iter().map(|s| s.kind.as_str()).collect();
         // Two batches:
-        // - The ten JobKinds explicitly named in step 4 of the
+        // - The ten Workflows explicitly named in step 4 of the
         //   retirement doc.
-        // - The fourteen JobKinds lifted from
+        // - The fourteen Workflows lifted from
         //   `crates/boss-jobs/src/seed_kinds.rs` per
         //   `docs/design/platform-vs-tenant-jobkinds.md` so the
         //   tenant TOML carries the full catalog before step 7's
@@ -604,7 +604,7 @@ title_template = "Open"
         ] {
             assert!(
                 kinds.contains(required),
-                "expected `{required}` in used-device-shop JobKinds; got {kinds:?}"
+                "expected `{required}` in used-device-shop Workflows; got {kinds:?}"
             );
         }
         assert!(specs.iter().all(|s| s.owning_team == "used-device-shop"));
@@ -613,10 +613,10 @@ title_template = "Open"
         // unknown kinds parse fine but mis-route at runtime) and the
         // side-effect-binding-needs-metadata-defaults contract.
         let registry = crate::step_registry::StepRegistry::v1();
-        let errs = crate::job_kind_lint::validate_all(&specs, &registry);
+        let errs = crate::workflow_lint::validate_all(&specs, &registry);
         assert!(
             errs.is_empty(),
-            "used-device-shop JobKinds failed JobKind lint: {errs:#?}"
+            "used-device-shop Workflows failed Workflow lint: {errs:#?}"
         );
     }
 }

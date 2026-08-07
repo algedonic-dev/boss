@@ -19,12 +19,12 @@ pub const JOB_CREATED: &str = "jobs.job.created";
 pub const JOB_UPDATED: &str = "jobs.job.updated";
 pub const STEP_CREATED: &str = "jobs.step.created";
 pub const STEP_UPDATED: &str = "jobs.step.updated";
-/// Emitted when a `job-kind-publish` Step flips to `Done` and the
-/// dispatch path successfully writes a JobKindSpec into the
-/// registry. Payload is the full published `JobKindSpec` (with
+/// Emitted when a `workflow-publish` Step flips to `Done` and the
+/// dispatch path successfully writes a WorkflowSpec into the
+/// registry. Payload is the full published `WorkflowSpec` (with
 /// `authoring_job_id` set to the meta-Job's id), matching what
-/// `rebuild_job_kinds` consumes to reconstruct the projection.
-pub const JOB_KIND_PUBLISHED: &str = "jobs.kind.published";
+/// `rebuild_workflows` consumes to reconstruct the projection.
+pub const WORKFLOW_PUBLISHED: &str = "jobs.kind.published";
 
 // Marker events — informational only; rebuild ignores them.
 pub const JOB_STATUS_CHANGED: &str = "jobs.job.status_changed";

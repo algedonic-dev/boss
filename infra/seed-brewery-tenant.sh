@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # seed-brewery-tenant.sh — publish the brewery tenant onto a running
-# BOSS stack via the converged prepare step: classes, JobKinds, tenant
+# BOSS stack via the converged prepare step: classes, Workflows, tenant
 # policy grants, and the seed data (operators / employees / accounts /
 # vendors / messages / FG + raw + asset opening balances), then stamp
 # the reset baseline. The seeding is one `boss-brewery-sim prepare`
@@ -24,11 +24,11 @@ set -euo pipefail
 EPOCH_START="${BOSS_DEMO_EPOCH_START:-2025-04-01}"
 SEEDS_DIR="${BOSS_SIM_SEEDS_DIR:-/opt/boss/examples/brewery/seeds}"
 
-# Seed the whole brewery tenant model — classes, JobKinds, policy
+# Seed the whole brewery tenant model — classes, Workflows, policy
 # grants, and data (operators / employees / accounts / vendors /
 # messages / FG + raw + asset opening balances) — through the public
 # API in one call. `boss-brewery-sim prepare` drives the converged
-# prepare_model lib fn (classes → JobKinds → policy → data), routing
+# prepare_model lib fn (classes → Workflows → policy → data), routing
 # to each service's own port. Retry while the stack finishes binding
 # (the launcher calls this the moment it reaches the sim in its start
 # order). Idempotent + retry-safe: each sub-step skips rows that
@@ -93,7 +93,7 @@ if command -v boss-brewery-sim >/dev/null 2>&1; then
         tail -20 "$prepare_log" >&2
         echo "ERROR: aborting BEFORE stamping the reset baseline." >&2
         echo "       A baseline stamped over a failed prepare captures a log with no" >&2
-        echo "       published JobKinds, and the next restart-epoch trims to it —" >&2
+        echo "       published Workflows, and the next restart-epoch trims to it —" >&2
         echo "       destroying the tenant model permanently rather than just idling." >&2
         exit 1
     fi

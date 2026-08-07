@@ -1995,7 +1995,7 @@ pub mod live {
             // Vendor invoices + payroll runs have no per-day buffer
             // here: CounterpartyEngine specs emit
             // `inventory.vendor_invoice_received` /
-            // `ap.payment_acknowledged`, and the payroll-run JobKind's
+            // `ap.payment_acknowledged`, and the payroll-run Workflow's
             // terminal step emits `ledger.payroll.run.submit`. Those
             // topics reach the services through the LiveApi
             // event-route map (see `register_default_event_routes`).

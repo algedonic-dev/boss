@@ -60,7 +60,7 @@ Three containers come up: `postgres:16`, `nats:2.10`, and a
 gateway (which serves the SPA at `/`). A one-shot `boss-init`
 container applies the schema and seeds your bootstrap-admin Employee
 with role `platform-admin`; `boss-services` then publishes the
-brewery tenant (JobKinds, accounts, vendors) and starts the sim,
+brewery tenant (Workflows, accounts, vendors) and starts the sim,
 which builds the demo live from an empty log.
 
 When `boss-services` logs `all services up`, open
@@ -145,7 +145,7 @@ The script will:
    their `change-me` credential in
    `/var/lib/boss/auth/credentials.toml`.
 6. Start every service as a background process (PIDs in
-   `~/.boss-pids`) — including the brewery tenant seed (JobKinds,
+   `~/.boss-pids`) — including the brewery tenant seed (Workflows,
    accounts, vendors) and the sim that builds the demo live, and the
    gateway on `127.0.0.1:4443`.
 
@@ -160,7 +160,7 @@ the SPA renders without a login. Click **Log in** to upgrade to
 
 The brewery (Algedonic Ales) is the public OSS demo tenant. The
 install seeds the reference data — employees, accounts, vendors,
-recipes, equipment, the JobKind catalog — then starts the brewery
+recipes, equipment, the Workflow catalog — then starts the brewery
 sim, which ticks ~1 sim-day per 86 wall-seconds and builds the rest
 live: orders, work, invoices, ledger entries, projections. The SPA
 is sparse on first load and fills in as the sim runs.
@@ -173,8 +173,8 @@ Try:
 - `/system/kb` — architecture diagrams, ADRs, hardware/software
   reference.
 - `/ux/jobs` — every Job in flight.
-- `/system/workflows` — the JobKind catalog (read-only).
-- `/system/job-kinds` — JobKind authoring (visible to your platform-admin
+- `/system/workflows` — the Workflow catalog (read-only).
+- `/system/workflows` — Workflow authoring (visible to your platform-admin
   role).
 
 ## Stop it
@@ -354,7 +354,7 @@ checks. ~30 minutes on a 4-core box; watch the per-step echo to follow
 along.
 
 The source-of-truth inputs are the brewery seed files
-(`examples/brewery/seeds/{job_kinds,tenant,accounts,vendors,parts,products,classes}.toml`)
+(`examples/brewery/seeds/{workflows,tenant,accounts,vendors,parts,products,classes}.toml`)
 plus the sim engine (`crates/tenants/boss-brewery-engine`), which ticks
 one sim-year against the live API.
 
@@ -370,7 +370,7 @@ sudo BOSS_REGEN_DAYS=30 BOSS_REGEN_START=2025-07-01 \
 ```
 
 `--hard-fail` surfaces the failing request on stderr — common roots: a
-JobKind step referencing a SKU/employee/account the tenant seed didn't
+Workflow step referencing a SKU/employee/account the tenant seed didn't
 create, a side-effect handler error (empty line_items, inventory
 underflow, FK violation), or service-bootstrap timing on a slow box.
 

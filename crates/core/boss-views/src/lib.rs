@@ -1,7 +1,7 @@
 //! Views — saved compositions over the Information API.
 //!
 //! A View is the personal rung of the extensibility ladder. Below
-//! "author a JobKind" there used to be nothing: an operator who wanted
+//! "author a Workflow" there used to be nothing: an operator who wanted
 //! to *look at* the information a different way could ask for a
 //! frontend change or keep a spreadsheet, and the spreadsheet is a
 //! silo arriving by another door.

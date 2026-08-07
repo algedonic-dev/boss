@@ -69,22 +69,22 @@ UNION ALL SELECT 'shipment.delivered_on<shipped_on ' || id::text FROM shipments 
 SQL
 )"
 
-# ---- 2. JobKind version pin — Jobs open under the active version ----
-# docs/architecture-decisions.md §Jobs, JobKinds, Steps: creation is
+# ---- 2. Workflow version pin — Jobs open under the active version ----
+# docs/architecture-decisions.md §Jobs, Workflows, Steps: creation is
 # blocked against draft/retired kinds, and in-flight Jobs pin to the
-# version they opened under. So every Job's (kind, job_kind_version)
-# must resolve to a real job_kinds row, and that row must NOT be a
+# version they opened under. So every Job's (kind, workflow_version)
+# must resolve to a real workflows row, and that row must NOT be a
 # `draft` — a Job can never open under a draft. It MAY be `retired`:
 # an in-flight Job whose version was superseded by a later publish.
-# (Catches the regression where job_kind_version silently defaulted to
+# (Catches the regression where workflow_version silently defaulted to
 # 1 instead of being stamped with the kind's active version on create.)
-run_invariant "2. JobKind version pin — every Job opened under a non-draft version" "$(cat <<'SQL'
-SELECT 'job ' || j.id::text || ' kind=' || j.kind || ' v=' || j.job_kind_version ||
-       CASE WHEN k.kind IS NULL THEN ' — no such job_kinds row'
+run_invariant "2. Workflow version pin — every Job opened under a non-draft version" "$(cat <<'SQL'
+SELECT 'job ' || j.id::text || ' kind=' || j.kind || ' v=' || j.workflow_version ||
+       CASE WHEN k.kind IS NULL THEN ' — no such workflows row'
             ELSE ' — opened under a draft version' END
   FROM jobs j
-  LEFT JOIN job_kinds k
-    ON k.kind = j.kind AND k.version = j.job_kind_version
+  LEFT JOIN workflows k
+    ON k.kind = j.kind AND k.version = j.workflow_version
  WHERE k.kind IS NULL
     OR k.status = 'draft'
 SQL
@@ -116,7 +116,7 @@ Events landed in an order that couldn't happen in a real run. The audit
 log is the system of record, so this is a generation bug (a seed
 shortcut, a reordered side-effect handler, or a bad happened_on), never
 something to patch in the projection. Trace the offending aggregate's
-events in audit_log and fix the JobKind / handler that emitted them out
+events in audit_log and fix the Workflow / handler that emitted them out
 of order. See docs/design/correctness-protocol.md.
 EOF
     exit 1

@@ -31,7 +31,7 @@ mutate `inventory_items`, and every change lands in the audit log.
 
 If a fresh tenant + the simulator running for N ticks doesn't
 produce a coherent Finance / Inventory / Shipping page, that's
-the signal we want — it tells us a JobKind is incompletely
+the signal we want — it tells us a Workflow is incompletely
 modeled. Topping up the table with `INSERT INTO ...` hides the
 signal and decorates the gap.
 
@@ -43,9 +43,9 @@ Two patterns are almost always evidence of bypass:
    any other downstream artifact) directly into the table
    without a paired Job step that should have produced them.
    Shape: a seed that writes month-aggregate JEs because no
-   JobKind emits `wholesale-revenue-monthly` / `payroll-monthly`
+   Workflow emits `wholesale-revenue-monthly` / `payroll-monthly`
    financial facts when its `done` transition fires. The right
-   fix is at the JobKind layer, not the seed.
+   fix is at the Workflow layer, not the seed.
 
 2. **Per-row seed of an artifact that should have provenance** —
    `INSERT`ing a year of invoices to fill the trailing-12 because
@@ -59,7 +59,7 @@ Two patterns are almost always evidence of bypass:
   `boss-brewery-data-seed`). These are the only journal entries
   the seed authors directly.
 - Subjects: accounts, vendors, employees, recipes, locations.
-- Registries: classes, JobKinds, StepTypes, gl_accounts,
+- Registries: classes, Workflows, StepTypes, gl_accounts,
   gl_periods (the time skeleton, not the entries inside).
 - In-flight Jobs at their starting step. The simulator advances
   them; that's where the rest of the brewery's life-cycle data
@@ -112,8 +112,8 @@ where a Step's `done` transition is the fact's provenance).
 `payroll_run_lines`, `shipments`, `tax_filings`.
 
 The denylist forces seeds-side authors to either (a) extend a
-JobKind so the simulator produces the artifact, (b) author a
-new JobKind, or (c) accept the empty view until the model
+Workflow so the simulator produces the artifact, (b) author a
+new Workflow, or (c) accept the empty view until the model
 catches up. The lint passes with zero seed SQL files in the
 tree — emergent state is produced by the sim, not seeded.
 

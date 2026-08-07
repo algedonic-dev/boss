@@ -96,10 +96,10 @@ pub enum Priority {
 /// Status of a single Step line item.
 ///
 /// Five statuses describing one predicate-driven lifecycle. Each
-/// Step carries a `ready_when` predicate (declared on its JobKind
+/// Step carries a `ready_when` predicate (declared on its Workflow
 /// `StepSpec`); the materializer evaluates it at Job open and the
 /// re-evaluator re-checks it on every upstream change. Status is the
-/// program counter — which nodes of the JobKind's implicit DAG have
+/// program counter — which nodes of the Workflow's implicit DAG have
 /// fired, which are eligible, which the predicates ruled out.
 ///
 /// ```text
@@ -112,7 +112,7 @@ pub enum Priority {
 /// simply `Pending` until its predicate flips, and an abandoned
 /// branch is `Skipped`. Reactions to external state live in
 /// dispatcher rules, not in the step lifecycle. See
-/// docs/architecture-decisions.md §Jobs, JobKinds, Steps.
+/// docs/architecture-decisions.md §Jobs, Workflows, Steps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum StepStatus {
@@ -146,14 +146,14 @@ pub struct Job {
     #[serde(default)]
     pub id: JobId,
     pub kind: String,
-    /// JobKind version this Job opened under. Server-assigned at
+    /// Workflow version this Job opened under. Server-assigned at
     /// creation to the kind's active version — creation is blocked
     /// against draft/retired kinds, so this is the latest version at
     /// open time. In-flight Jobs stay pinned to it across later
     /// publishes. Default 1 keeps pre-versioning events replaying
-    /// clean. Per docs/architecture-decisions.md §Jobs, JobKinds, Steps.
-    #[serde(default = "default_job_kind_version")]
-    pub job_kind_version: i32,
+    /// clean. Per docs/architecture-decisions.md §Jobs, Workflows, Steps.
+    #[serde(default = "default_workflow_version")]
+    pub workflow_version: i32,
     pub subject: Subject,
     pub title: String,
     pub owner_id: String,
@@ -178,7 +178,7 @@ impl Job {
         Self {
             id: JobId::new(),
             kind: kind.into(),
-            job_kind_version: default_job_kind_version(),
+            workflow_version: default_workflow_version(),
             subject,
             title: title.into(),
             owner_id: owner_id.into(),
@@ -208,12 +208,12 @@ impl Job {
         self
     }
 
-    /// Set the JobKind version this Job opened under. Production goes
+    /// Set the Workflow version this Job opened under. Production goes
     /// through the create handler, which stamps the kind's active
     /// version; this builder is for sim/replay/test paths that
     /// construct a Job directly.
-    pub fn with_job_kind_version(mut self, version: i32) -> Self {
-        self.job_kind_version = version;
+    pub fn with_workflow_version(mut self, version: i32) -> Self {
+        self.workflow_version = version;
         self
     }
 
@@ -231,7 +231,7 @@ impl Job {
 /// A step-authored completion-contract field (inline authoring —
 /// architecture-decisions.md §Step types are property bundles):
 /// the same schema language registry bundles carry,
-/// declared per step in the JobKind. Validation is the union of the
+/// declared per step in the Workflow. Validation is the union of the
 /// bundle's fields and these.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepField {
@@ -360,7 +360,7 @@ pub struct Step {
     pub embedded_job: Option<JobId>,
 }
 
-fn default_job_kind_version() -> i32 {
+fn default_workflow_version() -> i32 {
     1
 }
 

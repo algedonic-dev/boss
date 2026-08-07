@@ -1,6 +1,6 @@
 //! Layer-1 of the Job-completeness validator
-//! (`docs/design/correctness-protocol.md`): every JobKindSpec in the
-//! brewery seed bundle must pass the static lint. New JobKinds that bind
+//! (`docs/design/correctness-protocol.md`): every WorkflowSpec in the
+//! brewery seed bundle must pass the static lint. New Workflows that bind
 //! a side-effect-bearing StepType without filling required metadata fail
 //! this test before publish — catching the bypass at authoring time
 //! instead of waiting for a runtime "metadata X missing" log.
@@ -21,18 +21,18 @@ fn brewery_seeds_dir() -> PathBuf {
 }
 
 #[test]
-fn brewery_job_kinds_pass_layer1_lint() {
-    use boss_jobs::job_kind_lint::validate_all;
-    use boss_jobs::seed_loader::load_job_kinds_with_owning_team;
+fn brewery_workflows_pass_layer1_lint() {
+    use boss_jobs::seed_loader::load_workflows_with_owning_team;
     use boss_jobs::step_registry::StepRegistry;
+    use boss_jobs::workflow_lint::validate_all;
 
-    let kinds_path = brewery_seeds_dir().join("job_kinds.toml");
-    let kinds = load_job_kinds_with_owning_team(&kinds_path, "brewery")
-        .expect("brewery job_kinds.toml parses");
+    let kinds_path = brewery_seeds_dir().join("workflows.toml");
+    let kinds = load_workflows_with_owning_team(&kinds_path, "brewery")
+        .expect("brewery workflows.toml parses");
     let registry = StepRegistry::v1();
     let errs = validate_all(&kinds, &registry);
     if !errs.is_empty() {
-        let mut msg = String::from("brewery JobKinds failed layer-1 lint:\n");
+        let mut msg = String::from("brewery Workflows failed layer-1 lint:\n");
         for e in &errs {
             msg.push_str(&format!("  {}\n", e));
         }
@@ -50,17 +50,17 @@ fn brewery_job_kinds_pass_layer1_lint() {
 /// not just the instance we found (deliver omitting 3 of 5 SKUs).
 #[test]
 fn wholesale_order_references_one_consistent_sku_set() {
-    use boss_jobs::seed_loader::load_job_kinds_with_owning_team;
+    use boss_jobs::seed_loader::load_workflows_with_owning_team;
     use std::collections::BTreeSet;
 
-    let kinds_path = brewery_seeds_dir().join("job_kinds.toml");
-    let kinds = load_job_kinds_with_owning_team(&kinds_path, "brewery")
-        .expect("brewery job_kinds.toml parses");
+    let kinds_path = brewery_seeds_dir().join("workflows.toml");
+    let kinds = load_workflows_with_owning_team(&kinds_path, "brewery")
+        .expect("brewery workflows.toml parses");
 
     let order = kinds
         .iter()
         .find(|k| k.kind == "wholesale-keg-order")
-        .expect("wholesale-keg-order JobKind present");
+        .expect("wholesale-keg-order Workflow present");
 
     // Each step that carries `line_items` → (step title, its SKU set).
     let per_step: Vec<(String, BTreeSet<String>)> = order
@@ -109,10 +109,10 @@ fn wholesale_order_references_one_consistent_sku_set() {
 /// old hand-stamped `overhead_absorbed` amounts:
 ///   (a) the production-consume rule carries exactly the model's three
 ///       canonical drivers at the canonical rates (derivation in the
-///       pale-ale mash-in comment, job_kinds.toml);
+///       pale-ale mash-in comment, workflows.toml);
 ///   (b) capitalize-set == drain-set (the produce rule's
 ///       `overhead_accounts` names the same accounts);
-///   (c) no JobKind stamps `overhead_absorbed` amounts anymore; and
+///   (c) no Workflow stamps `overhead_absorbed` amounts anymore; and
 ///   (d) every producing kind still states the batch size the runtime
 ///       multiplication reads (`batch_bbl` on a step, else the summed
 ///       `excise_bbl` of its produce steps).
@@ -120,7 +120,7 @@ fn wholesale_order_references_one_consistent_sku_set() {
 /// (then regenerate 41-dispatcher.sql via gen-seed.py).
 #[test]
 fn overhead_absorption_rules_agree() {
-    use boss_jobs::seed_loader::load_job_kinds_with_owning_team;
+    use boss_jobs::seed_loader::load_workflows_with_owning_team;
 
     const DRIVERS: [(&str, i64, &str); 3] = [
         ("6100", 3660, "Direct labor"),
@@ -249,9 +249,9 @@ fn overhead_absorption_rules_agree() {
     );
 
     // --- seed: no stamps; batch size derivable ---------------------
-    let kinds_path = brewery_seeds_dir().join("job_kinds.toml");
-    let kinds = load_job_kinds_with_owning_team(&kinds_path, "brewery")
-        .expect("brewery job_kinds.toml parses");
+    let kinds_path = brewery_seeds_dir().join("workflows.toml");
+    let kinds = load_workflows_with_owning_team(&kinds_path, "brewery")
+        .expect("brewery workflows.toml parses");
 
     let mut producing_kinds = 0;
     for kind in &kinds {
@@ -259,7 +259,7 @@ fn overhead_absorption_rules_agree() {
         for step in &kind.steps {
             assert!(
                 step.metadata_defaults.get("overhead_absorbed").is_none(),
-                "JobKind `{}` step `{}` stamps overhead_absorbed — absorption amounts are \
+                "Workflow `{}` step `{}` stamps overhead_absorbed — absorption amounts are \
                  rules data now (inventory.overhead.absorb args), not seed stamps",
                 kind.kind,
                 step.title
@@ -292,7 +292,7 @@ fn overhead_absorption_rules_agree() {
                 });
             assert!(
                 batch_bbl > 0,
-                "JobKind `{}` brews (production-consume → production-produce) but states no \
+                "Workflow `{}` brews (production-consume → production-produce) but states no \
                  batch_bbl / excise_bbl — the absorb handler would no-op and the kind would \
                  cost out materials-only while sibling kinds carry the per-bbl burden",
                 kind.kind
@@ -304,7 +304,7 @@ fn overhead_absorption_rules_agree() {
     // collapse to 0 here means the walk silently matched nothing.
     assert!(
         producing_kinds >= 6,
-        "expected ≥6 brewing JobKinds with a derivable batch size, found {producing_kinds}"
+        "expected ≥6 brewing Workflows with a derivable batch size, found {producing_kinds}"
     );
 }
 
@@ -317,10 +317,10 @@ fn overhead_absorption_rules_agree() {
 /// kind remains for genuinely place-bound work.
 #[test]
 fn org_level_kinds_are_about_the_company() {
-    use boss_jobs::seed_loader::load_job_kinds_with_owning_team;
+    use boss_jobs::seed_loader::load_workflows_with_owning_team;
 
-    let kinds_path = brewery_seeds_dir().join("job_kinds.toml");
-    let kinds = load_job_kinds_with_owning_team(&kinds_path, "brewery").unwrap();
+    let kinds_path = brewery_seeds_dir().join("workflows.toml");
+    let kinds = load_workflows_with_owning_team(&kinds_path, "brewery").unwrap();
 
     let org_level = [
         "payroll-run",
@@ -342,7 +342,7 @@ fn org_level_kinds_are_about_the_company() {
         let spec = kinds
             .iter()
             .find(|k| k.kind == kind)
-            .unwrap_or_else(|| panic!("{kind} missing from job_kinds.toml"));
+            .unwrap_or_else(|| panic!("{kind} missing from workflows.toml"));
         assert_eq!(
             spec.subject_kinds,
             vec!["company".to_string()],
@@ -359,7 +359,7 @@ fn org_level_kinds_are_about_the_company() {
 
 /// The shape-driven engine picks a Job's subject_id from the rate's
 /// `subject_distribution` (or `subject_cadence`) but its subject_KIND
-/// from the JobKind's declared `subject_kinds[0]` — two different
+/// from the Workflow's declared `subject_kinds[0]` — two different
 /// files. A distribution still pinning the brewhouse location under a
 /// company-subjected kind builds `(company, loc-brewery-brewhouse)`
 /// pairs, which the existence gate rejected 18 times in Q6's first
@@ -367,11 +367,11 @@ fn org_level_kinds_are_about_the_company() {
 /// company-subjected kind must target the company id.
 #[test]
 fn company_kind_rate_distributions_target_the_company() {
-    use boss_jobs::seed_loader::load_job_kinds_with_owning_team;
+    use boss_jobs::seed_loader::load_workflows_with_owning_team;
     use std::collections::HashSet;
 
-    let kinds_path = brewery_seeds_dir().join("job_kinds.toml");
-    let kinds = load_job_kinds_with_owning_team(&kinds_path, "brewery").unwrap();
+    let kinds_path = brewery_seeds_dir().join("workflows.toml");
+    let kinds = load_workflows_with_owning_team(&kinds_path, "brewery").unwrap();
     let company_kinds: HashSet<&str> = kinds
         .iter()
         .filter(|k| k.subject_kinds == vec!["company".to_string()])
@@ -419,10 +419,10 @@ fn company_kind_rate_distributions_target_the_company() {
 /// seed must fail here first, at test time.
 #[test]
 fn every_kind_can_resolve_a_human_owner() {
-    use boss_jobs::seed_loader::load_job_kinds_with_owning_team;
+    use boss_jobs::seed_loader::load_workflows_with_owning_team;
 
-    let kinds_path = brewery_seeds_dir().join("job_kinds.toml");
-    let kinds = load_job_kinds_with_owning_team(&kinds_path, "brewery").unwrap();
+    let kinds_path = brewery_seeds_dir().join("workflows.toml");
+    let kinds = load_workflows_with_owning_team(&kinds_path, "brewery").unwrap();
 
     let mut unresolvable = Vec::new();
     for k in &kinds {

@@ -51,7 +51,7 @@ export const WORK_BY_ROLE: Record<Role, ReadonlyArray<RouteName>> = {
 
   // ----- Support / IT -----
   'support-specialist': ['support', 'jobs'],
-  'it-manager':         ['policy', 'job-kinds', 'system-step-plugins', 'system-monitoring', 'jobs'],
+  'it-manager':         ['policy', 'workflows', 'system-step-plugins', 'system-monitoring', 'jobs'],
 
   // ----- Audit -----
   auditor:          ['finance', 'jobs'],
@@ -63,7 +63,7 @@ export const WORK_BY_ROLE: Record<Role, ReadonlyArray<RouteName>> = {
 
   // ----- Brewery: production (cellar + brewhouse) -----
   // Brewers work the morning-brew, ingredient-restock, and
-  // seasonal-release JobKinds. Their day is steps + the
+  // seasonal-release Workflows. Their day is steps + the
   // ingredient inventory.
   'head-brewer':   ['jobs', 'parts', 'qa'],
   'senior-brewer': ['jobs', 'parts', 'schedule'],
@@ -89,7 +89,7 @@ export const WORK_BY_ROLE: Record<Role, ReadonlyArray<RouteName>> = {
   'distribution-driver': ['shipping', 'schedule'],
 
   // ----- Brewery: maintenance -----
-  // Equipment-preventive maintenance JobKind drives most of these tickets.
+  // Equipment-preventive maintenance Workflow drives most of these tickets.
   'maintenance-mgr': ['jobs', 'parts', 'schedule'],
   electrician:       ['jobs', 'parts'],
   mechanic:          ['jobs', 'parts'],
@@ -122,11 +122,11 @@ export const WORK_BY_ROLE: Record<Role, ReadonlyArray<RouteName>> = {
 
   // ----- Brewery: IT -----
   // IT roles' Work IS platform admin per the three-axis IA
-  // simplifier — policy edits, JobKind authoring, step-plugin
+  // simplifier — policy edits, Workflow authoring, step-plugin
   // publishes are all administrative work that lives here, not
   // in a separate /admin tier.
-  'it-director': ['policy', 'job-kinds', 'system-step-plugins', 'system-monitoring', 'exec'],
-  sysadmin:      ['policy', 'job-kinds', 'system-step-plugins', 'system-monitoring'],
+  'it-director': ['policy', 'workflows', 'system-step-plugins', 'system-monitoring', 'exec'],
+  sysadmin:      ['policy', 'workflows', 'system-step-plugins', 'system-monitoring'],
   helpdesk:      ['system-monitoring', 'jobs'],
 
   // ----- Brewery: heads of department -----

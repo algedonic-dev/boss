@@ -145,7 +145,7 @@ pub struct StepType {
     /// fact about the work; the assignment dispatcher reads it to route
     /// the step to a matching Employee, and the simulator reads it to
     /// pick a realistic actor. Empty = anyone in the roster. Per-Job
-    /// overrides ride on the JobKind step's `authority_role`.
+    /// overrides ride on the Workflow step's `authority_role`.
     pub required_roles: &'static [&'static str],
     /// How often this kind of work stalls on an external dependency
     /// (parts, a signature, a vendor reply) instead of completing — an
@@ -166,7 +166,7 @@ pub struct StepType {
     pub surface: &'static str,
     /// Role codes that must each stamp the step in its current shape
     /// before completion (the sign-off contract). Registry-level default;
-    /// JobKinds may extend per step. Empty = no sign-offs required.
+    /// Workflows may extend per step. Empty = no sign-offs required.
     pub sign_offs_required: &'static [&'static str],
 }
 
@@ -528,7 +528,7 @@ pub fn core_v1_types() -> Vec<StepType> {
 
 /// Company-modeling kinds. Currently empty — the core/module-tier
 /// partition isn't modeled at the StepType level. It would return a
-/// non-empty set only if a JobKind-level "needs module tier"
+/// non-empty set only if a Workflow-level "needs module tier"
 /// predicate were introduced.
 pub fn company_modeling_v1_types() -> Vec<StepType> {
     Vec::new()
@@ -603,14 +603,14 @@ mod tests {
     #[test]
     fn every_platform_jobkind_step_has_a_defined_step_type() {
         // Invariant I-3: the alphabet is closed; programs are open.
-        // Every step kind referenced by a platform-shipped JobKind
+        // Every step kind referenced by a platform-shipped Workflow
         // must be defined in the StepType registry — otherwise the
         // step exists on the Job without a metadata validator,
         // which silently fails the "required at done" contract.
         //
         // Tenant-specific kinds live in per-tenant TOMLs, linted at
         // load time by the seed_loader test. `platform_kinds()` carries
-        // just `job-kind-design`.
+        // just `workflow-design`.
         let reg = StepRegistry::v1();
         let defined: std::collections::HashSet<&str> = reg.all().iter().map(|t| t.kind).collect();
 
@@ -624,7 +624,7 @@ mod tests {
         }
         assert!(
             missing.is_empty(),
-            "platform JobKinds reference undefined StepType kinds: {missing:?}"
+            "platform Workflows reference undefined StepType kinds: {missing:?}"
         );
     }
 

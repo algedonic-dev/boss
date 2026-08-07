@@ -108,7 +108,7 @@ impl From<&str> for Carrier {
 /// ingredients in a vendor inbound — recorded as
 /// SKU + quantity, not per-unit Subjects.
 ///
-/// Populated by the shipping.create side effect from the JobKind
+/// Populated by the shipping.create side effect from the Workflow
 /// shipment-step's `line_items` metadata. The
 /// inventory.parts.consume handler reads the same metadata to
 /// decrement stock when the shipment step transitions to done,

@@ -19,7 +19,7 @@ The first public cut. Proves the shape of the idea rather than
 shipping a stable product. Highlights of what is present:
 
 - **Four primitives** — Subjects, Jobs, Steps, and an immutable
-  Event log, with the JobKind / StepType / Class registries that
+  Event log, with the Workflow / StepType / Class registries that
   let new work types and taxonomies land as data rather than code.
 - **Event-sourced core** — `audit_log` as the system of record;
   projections and rebuilders are pure functions of it, guarded by

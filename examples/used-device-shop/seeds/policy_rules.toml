@@ -28,7 +28,7 @@ roles = ["ceo", "coo", "cfo", "cto"]
 resources = [
     "job", "step", "account", "employee", "invoice", "agreement",
     "asset", "shipment", "part", "purchase-order", "policy-rule",
-    "job-kind", "step-plugin",
+    "workflow", "step-plugin",
 ]
 action = "read"
 scope = "all"
@@ -55,7 +55,7 @@ scope = "all"
 
 # CEO + COO + CFO can create + update accounts / invoices / agreements.
 # (CFO who creates the invoice is NOT the one who signs it off —
-# the four-eyes rule is enforced at the JobKind sign-off step.)
+# the four-eyes rule is enforced at the Workflow sign-off step.)
 [[grants]]
 roles = ["ceo", "coo", "cfo"]
 resources = ["account", "invoice", "agreement"]
@@ -77,10 +77,10 @@ resource = "asset"
 action = "update"
 scope = "all"
 
-# CEO + CTO can author + publish + retire JobKinds and StepPlugins.
+# CEO + CTO can author + publish + retire Workflows and StepPlugins.
 [[grants]]
 roles = ["ceo", "cto"]
-resources = ["job-kind", "step-plugin"]
+resources = ["workflow", "step-plugin"]
 actions = ["create", "update", "publish", "retire"]
 scope = "all"
 
@@ -443,7 +443,7 @@ role = "auditor"
 resources = [
     "job", "step", "account", "employee", "invoice", "agreement",
     "asset", "shipment", "part", "purchase-order", "policy-rule",
-    "job-kind", "step-plugin",
+    "workflow", "step-plugin",
 ]
 action = "read"
 scope = "all"
@@ -461,8 +461,8 @@ scope = "all"
 # metadata, so a PUT body cannot lower the bar.
 #
 # One grant per distinct `authority_role` used by the
-# used-device-shop's JobKinds
-# (examples/used-device-shop/seeds/job_kinds.toml). Without these,
+# used-device-shop's Workflows
+# (examples/used-device-shop/seeds/workflows.toml). Without these,
 # every sign-off step becomes unsignable. Scope is `all`: the role
 # match (the resource match) IS the authority gate; row-level scope
 # is not layered on top of the sign-off authority check.

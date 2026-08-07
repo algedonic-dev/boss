@@ -1,5 +1,5 @@
 <!--
-  Interactive trigger→outcome graph for a JobKind draft (Slice 2).
+  Interactive trigger→outcome graph for a Workflow draft (Slice 2).
 
   Steps are nodes; edges are derived from each step's `ready_when`
   references (the DAG is implicit in the predicates — `blocked_by` is
@@ -15,7 +15,7 @@
   import type { Node, Edge } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
   import dagre from '@dagrejs/dagre';
-  import type { StepSpec } from './jobKindTypes';
+  import type { StepSpec } from './workflowTypes';
   import type { LintProblem } from './liveLint';
 
   type Props = Readonly<{

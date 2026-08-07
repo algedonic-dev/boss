@@ -2,17 +2,17 @@
 
 This directory holds the JavaScript bundles served at `/plugins/*`
 by `boss-gateway`. A bundle adds a custom UX surface for one
-StepType (or for a JobKind step that doesn't have an inline render
+StepType (or for a Workflow step that doesn't have an inline render
 in the SPA today). Authoring one is the **second-level extension
 point** in BOSS:
 
 | Want to add… | Build… | Code? |
 |---|---|---|
-| A new workflow that composes existing steps | A JobKind row at `/system/job-kinds` | No |
+| A new workflow that composes existing steps | A Workflow row at `/system/workflows` | No |
 | A new step kind with its own UX surface | A StepPlugin (this directory) | JS only |
 | A new domain entity (Subject kind) | A new crate | Rust |
 
-Both first-tier extensions (JobKind authoring + StepPlugin
+Both first-tier extensions (Workflow authoring + StepPlugin
 authoring) are **data + JS**, no Rust changes, no core PR. New
 core code lands only when you're introducing a new domain.
 
@@ -233,8 +233,8 @@ plugin registry is fetched at boot; a hard refresh forces it).
 
 ### 5. Use it
 
-Author or update a JobKind that includes a step of
-`kind=pour-quality-check` (via `/system/job-kinds`), open a Job of
+Author or update a Workflow that includes a step of
+`kind=pour-quality-check` (via `/system/workflows`), open a Job of
 that kind, and the step renders your plugin's surface instead of
 the generic typed-fields form.
 

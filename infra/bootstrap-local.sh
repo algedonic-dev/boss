@@ -205,7 +205,7 @@ if [[ "$START" -eq 1 ]]; then
             "$REPO_ROOT/target/release/boss-$svc-api" --config "$CONFIG_DIR/boss-$svc-api.toml"
     done
     start_svc boss-observability "$SVC_ENV" "$REPO_ROOT/target/release/boss-observability"
-    # The brewery sim reads its tenant seed files (tenant.toml + job_kinds
+    # The brewery sim reads its tenant seed files (tenant.toml + workflows
     # + rates) at runtime; without BOSS_SIM_SEEDS_DIR it falls back to the
     # /opt/boss dev-box path and crashes on any other checkout. Point it at
     # this repo, plus a user-writable state dir (the default /var/lib/boss-sim
@@ -227,7 +227,7 @@ if [[ "$START" -eq 1 ]]; then
         BOSS_OPERATOR_BASELINE_TOML="$REPO_ROOT/infra/operator-baseline/operator_hires.toml" \
         "$REPO_ROOT/infra/seed-operator-baseline.sh"
 
-    # Publish the brewery tenant (JobKinds + policy + accounts/vendors/data)
+    # Publish the brewery tenant (Workflows + policy + accounts/vendors/data)
     # before the sim. None of it is event-sourced — it's published through
     # the API — so the live-from-empty demo seeds it here or the sim's job
     # posts 400 ("unknown or inactive job kind") and the playground stays

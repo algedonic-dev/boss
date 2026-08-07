@@ -57,11 +57,11 @@ export async function installAuthoringMocks(page: Page): Promise<void> {
   const steps = [
     { id: 's-author', job_id: JOB_ID, kind: 'task', title: 'author', assignee_id: null, status: 'ready', sort_order: 0, blocked_by: [], completed_on: null, metadata: {} },
     { id: 's-validate', job_id: JOB_ID, kind: 'task', title: 'validate', assignee_id: null, status: 'pending', sort_order: 1, blocked_by: [], completed_on: null, metadata: {} },
-    { id: 's-approve', job_id: JOB_ID, kind: 'sign-off', title: 'approve', assignee_id: null, status: 'pending', sort_order: 2, blocked_by: [], sign_offs_required: ['job-kind-approver'], sign_offs: [], completed_on: null, metadata: { authority_role: 'job-kind-approver' } },
-    { id: 's-publish', job_id: JOB_ID, kind: 'job-kind-publish', title: 'publish', assignee_id: null, status: 'pending', sort_order: 3, blocked_by: [], completed_on: null, metadata: { job_kind_spec: seedSpec() } },
+    { id: 's-approve', job_id: JOB_ID, kind: 'sign-off', title: 'approve', assignee_id: null, status: 'pending', sort_order: 2, blocked_by: [], sign_offs_required: ['workflow-approver'], sign_offs: [], completed_on: null, metadata: { authority_role: 'workflow-approver' } },
+    { id: 's-publish', job_id: JOB_ID, kind: 'workflow-publish', title: 'publish', assignee_id: null, status: 'pending', sort_order: 3, blocked_by: [], completed_on: null, metadata: { workflow_spec: seedSpec() } },
   ];
   const job = {
-    id: JOB_ID, kind: 'job-kind-design',
+    id: JOB_ID, kind: 'workflow-design',
     subject: { subject_kind: 'custom', id: KIND_SLUG },
     title: `Design ${KIND_SLUG}`, owner_id: EMP.id, status: 'open',
     priority: 'standard', opened_on: '2026-06-21', due_on: null,
@@ -80,7 +80,7 @@ export async function installAuthoringMocks(page: Page): Promise<void> {
 
   // 3) Authoring vocabulary.
   await page.route('**/api/subject-kinds', (r) => json(r, [{ kind: 'asset' }, { kind: 'account' }, { kind: 'employee' }]));
-  await page.route('**/api/jobs/kinds', (r) => json(r, []));
+  await page.route('**/api/workflows', (r) => json(r, []));
   await page.route('**/api/jobs/step-types', (r) => json(r, [
     { kind: 'task', label: 'Task', category: 'generic', ux: 'inline', description: 'A unit of work' },
     { kind: 'sign-off', label: 'Sign-off', category: 'approval', ux: 'inline', description: 'Requires an approval' },
@@ -89,8 +89,8 @@ export async function installAuthoringMocks(page: Page): Promise<void> {
 
   // 4) Any kind-slug GET → 404 (existence probe: nothing exists yet, so
   //    New proceeds). Registered before `_validate` so the POST wins.
-  await page.route('**/api/jobs/kinds/*', (r) => json(r, 'not found', 404));
-  await page.route('**/api/jobs/kinds/_validate', (r) => json(r, { ok: true, problems: [] }));
+  await page.route('**/api/workflows/*', (r) => json(r, 'not found', 404));
+  await page.route('**/api/workflows/_validate', (r) => json(r, { ok: true, problems: [] }));
 
   // 5) Create the design Job (POST) — return its id.
   await page.route('**/api/jobs', (r) =>

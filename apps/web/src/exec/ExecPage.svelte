@@ -144,7 +144,7 @@
         // ignore
       }
       try {
-        const r = await fetch('/api/jobs/kinds');
+        const r = await fetch('/api/workflows');
         if (r.ok) {
           const kinds = (await r.json()) as Array<{ kind: string; label: string }>;
           const m = new Map<string, string>();

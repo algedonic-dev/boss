@@ -2,7 +2,7 @@
 //! device serial.
 //!
 //! Lives here rather than in Tier 1 `boss-jobs-client`: `field-service`
-//! is a used-device-shop JobKind, not a generic state-machine OS
+//! is a used-device-shop Workflow, not a generic state-machine OS
 //! concept, so the projection sits next to its sole consumer
 //! (`asset_insights.rs`).
 

@@ -199,7 +199,7 @@ pub(super) async fn create_payroll_run(
 /// `POST /api/ledger/payroll-runs/synthesize` — server-side
 /// payroll computation for the simulator path.
 ///
-/// The brewery sim's `payroll-run` JobKind walks
+/// The brewery sim's `payroll-run` Workflow walks
 /// calculate → review → release; the terminal `payroll-release`
 /// step's `ledger.payroll.run.submit` side-effect handler emits
 /// a `ledger.payroll.run.submit` event whose payload (this

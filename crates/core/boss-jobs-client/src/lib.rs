@@ -5,7 +5,7 @@
 //! "what Jobs match these filters?". Tenant-shape projections
 //! (refurb-pipeline WIP, field-service history per device) build on
 //! top of these in modules-tier crates — keeping this trait
-//! generic over JobKind / StepType vocabulary.
+//! generic over Workflow / StepType vocabulary.
 
 use std::collections::BTreeMap;
 
@@ -27,7 +27,7 @@ impl ServiceLabel for Jobs {
 /// compiling.
 pub type JobsClientError = HttpClientError<Jobs>;
 
-/// Generic phase-distribution response keyed by JobKind. The
+/// Generic phase-distribution response keyed by Workflow. The
 /// `tiers` map carries per-step-tier counts (and the synthetic
 /// `-1` bucket for "every step terminal but Job still open").
 ///
@@ -44,7 +44,7 @@ pub struct PhaseKindCounts {
     pub tiers: BTreeMap<String, i64>,
 }
 
-/// One row from `/api/jobs`. Generic across JobKinds — callers
+/// One row from `/api/jobs`. Generic across Workflows — callers
 /// filter by `kind` and project to their own row shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobSummary {
@@ -67,7 +67,7 @@ pub trait JobsClient: Send + Sync {
     ) -> Result<PhaseDistribution, JobsClientError>;
 
     /// List Jobs matching the given filters. `kind` selects a
-    /// JobKind; `subject_id` filters by the Job subject id;
+    /// Workflow; `subject_id` filters by the Job subject id;
     /// `limit` caps the response.
     async fn list_jobs(
         &self,

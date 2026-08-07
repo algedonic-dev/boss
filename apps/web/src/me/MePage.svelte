@@ -189,7 +189,7 @@
                 onclick={() => navigate(entityHref('job', job.id))}
               >
                 <div class="myday-job-header">
-                  <span class="myday-job-kind">{job.kind}</span>
+                  <span class="myday-workflow">{job.kind}</span>
                   <span class="myday-job-title">{job.title}</span>
                   {#if job.priority !== 'standard'}
                     <span class="chip chip-sm">{job.priority}</span>

@@ -26,7 +26,7 @@
 //! roles = ["ceo", "coo", "cfo", "cto"]
 //! resources = ["job", "step", "account", "employee", "invoice",
 //!              "agreement", "asset", "shipment", "part",
-//!              "purchase-order", "policy-rule", "job-kind",
+//!              "purchase-order", "policy-rule", "workflow",
 //!              "step-plugin"]
 //! action = "read"
 //! scope = "all"

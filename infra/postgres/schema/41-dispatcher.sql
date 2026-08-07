@@ -64,7 +64,7 @@ INSERT INTO dispatcher_rules (name, version, status, on_event, when_expr, do_ste
   ('people-hire-on-hr-hire-step-done', 1, 'active', 'step.done.hr-hire', NULL, '[{"handler":"people.hire","args":{}}]'::jsonb, NULL, NULL, NULL, NULL),
   ('people-terminate-on-hr-terminate-step-done', 1, 'active', 'step.done.hr-terminate', NULL, '[{"handler":"people.terminate","args":{}}]'::jsonb, NULL, NULL, NULL, NULL),
   ('shipment-side-effects-on-shipment-step-done', 1, 'active', 'step.done.shipment', NULL, '[{"handler":"shipping.create","args":{}},{"handler":"inventory.parts.consume","args":{"reason":"\"sale\""}},{"handler":"products.consume","args":{}}]'::jsonb, NULL, NULL, NULL, NULL),
-  ('spawn-subjob-on-delegate-subjob-step-ready', 1, 'active', 'step.ready.delegate-subjob', NULL, '[{"handler":"jobs.spawn","args":{"kind":"metadata.subjob_kind","subject_kind":"subject_kind","subject":"subject_id","parent_step_id":"step_id"}}]'::jsonb, NULL, NULL, NULL, NULL),
+  ('spawn-subjob-on-delegate-subjob-step-ready', 1, 'active', 'step.ready.delegate-subjob', NULL, '[{"handler":"jobs.spawn","args":{"kind":"metadata.subworkflow","subject_kind":"subject_kind","subject":"subject_id","parent_step_id":"step_id"}}]'::jsonb, NULL, NULL, NULL, NULL),
   ('complete-marker-on-step-ready', 1, 'active', 'step.ready.*', NULL, '[{"handler":"jobs.complete_step","args":{}}]'::jsonb, NULL, NULL, NULL, NULL),
   ('resolve-agent-gate-on-step-ready', 1, 'active', 'step.ready.*', NULL, '[{"handler":"gate.resolve","args":{}}]'::jsonb, NULL, NULL, NULL, NULL),
   ('allocate-packaging-on-step-ready', 1, 'active', 'step.ready.packaging-allocate', NULL, '[{"handler":"packaging.allocate","args":{}}]'::jsonb, NULL, NULL, NULL, NULL),

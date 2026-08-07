@@ -1,7 +1,7 @@
 <script lang="ts">
   // Public unauth landing surface at `/`. A marketing hero over the
   // live System-Model view — Jobs in flight right now plus the
-  // per-JobKind step-graph each Job is walking. The live view itself
+  // per-Workflow step-graph each Job is walking. The live view itself
   // is the shared SystemModelLiveView component (also the /system
   // perspective root); this page wraps it with the landing chrome
   // (hero + sign-in CTA).

@@ -392,7 +392,7 @@
   <div class="behavior-grid">
     <Section title="Work generation">
       <p class="hint">
-        Per-JobKind open rates and per-SubjectKind arrival rates. Rate is
+        Per-Workflow open rates and per-SubjectKind arrival rates. Rate is
         the expected number opened per sim day.
       </p>
       <h4 class="subhead">Job rates</h4>
@@ -493,7 +493,7 @@
 
     <Section title="Cadences & anomalies">
       <p class="hint">
-        Per-JobKind anomaly probabilities. Each value is the chance the
+        Per-Workflow anomaly probabilities. Each value is the chance the
         named anomaly is injected on a given Job.
       </p>
       <div class="rate-list">

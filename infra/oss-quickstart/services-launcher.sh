@@ -95,7 +95,7 @@ cleanup() {
 trap cleanup TERM INT
 
 # Seed the platform operator-baseline (emp-audit + the bootstrap-admin)
-# and then the brewery tenant (JobKinds + policy + accounts/vendors/data)
+# and then the brewery tenant (Workflows + policy + accounts/vendors/data)
 # before the sim starts. Both go through the public API — and boss-init
 # can't do them (the API isn't up during init), so they run here, just
 # before the sim opens its first Job. operator-baseline FIRST so the
@@ -109,7 +109,7 @@ publish_brewery_tenant() {
 echo "==> boss-launch starting ${#SERVICES[@]} services"
 for svc in "${SERVICES[@]}"; do
     # Just before the sim — which posts jobs immediately — make sure the
-    # brewery JobKinds + policy grants exist (the jobs-api it needs is up
+    # brewery Workflows + policy grants exist (the jobs-api it needs is up
     # by now, having been started earlier in this loop).
     if [[ "$svc" == "boss-brewery-sim" ]]; then
         publish_brewery_tenant

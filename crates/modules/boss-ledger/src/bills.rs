@@ -14,7 +14,7 @@
 //!
 //! Both posting rules in `rules.rs` are reused UNCHANGED — this module only
 //! owns the subledger row + its lifecycle. Adding a new kind of spend is a
-//! JobKind writing a `bill_category` + a `bill_accounts.toml` row, no code.
+//! Workflow writing a `bill_category` + a `bill_accounts.toml` row, no code.
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};

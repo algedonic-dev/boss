@@ -12,7 +12,7 @@ use boss_core::publisher::DomainPublisher;
 use boss_jobs::http::{JobsApiState, router};
 use boss_jobs::step_registry::StepRegistry;
 use boss_jobs::{
-    InMemoryJobs, InMemoryStepPlugins, JobKindStatus, StepPluginRegistry, StepPluginSpec,
+    InMemoryJobs, InMemoryStepPlugins, StepPluginRegistry, StepPluginSpec, WorkflowStatus,
 };
 use boss_policy_client::{AccessTier, Action, Resource, Scope, User};
 use boss_policy_client::{FakePolicyClient, PolicyClient};
@@ -128,7 +128,7 @@ async fn full_plugin_lifecycle() {
     let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let stored: StepPluginSpec = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(stored.version, 1);
-    assert_eq!(stored.status, JobKindStatus::Draft);
+    assert_eq!(stored.status, WorkflowStatus::Draft);
 
     // 2. Active GET 404s (no active yet).
     let resp = send_json(
@@ -164,7 +164,7 @@ async fn full_plugin_lifecycle() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let active: StepPluginSpec = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(active.status, JobKindStatus::Active);
+    assert_eq!(active.status, WorkflowStatus::Active);
 
     // 5. Retire.
     let resp = send_json(

@@ -131,7 +131,7 @@ ALLOWED_PREFIXES=(
   # only; LiveApiOutput goes through advance_clock_to_instant.
   "crates/orchestrators/boss-sim/src/output.rs"
   # boss-jobs registry + step-plugin row creation timestamps
-  # (created_at on JobKindSpec, StepPluginSpec rows). These
+  # (created_at on WorkflowSpec, StepPluginSpec rows). These
   # are reference-data rows in the platform registry — not
   # audit-emitting sim/operations work.
   "crates/core/boss-jobs/src/registry.rs"

@@ -126,25 +126,25 @@ async fn main() -> Result<()> {
             total += res.rows_affected();
         }
 
-        // JobKinds under design — the registry is multi-version, so
+        // Workflows under design — the registry is multi-version, so
         // DISTINCT ON picks the newest label per kind.
         let res = sqlx::query(
             "INSERT INTO subjects (kind, id, label) \
-             SELECT 'job-kind', jk.kind, jk.label \
+             SELECT 'workflow', jk.kind, jk.label \
                FROM (SELECT DISTINCT ON (kind) kind, label \
-                       FROM job_kinds ORDER BY kind, version DESC) jk \
+                       FROM workflows ORDER BY kind, version DESC) jk \
              ON CONFLICT (kind, id) DO UPDATE \
                 SET label = COALESCE(EXCLUDED.label, subjects.label)",
         )
         .execute(&pool)
         .await
-        .context("backfill from job_kinds")?;
-        info!(rows = res.rows_affected(), "backfilled job-kind identities");
+        .context("backfill from workflows")?;
+        info!(rows = res.rows_affected(), "backfilled workflow identities");
         total += res.rows_affected();
 
         // Birth-by-job subjects that only ever existed as a Job's
         // subject (design-doc reviews on `custom`, historical
-        // job-kind design Jobs) — the projection-side mirror of the
+        // workflow design Jobs) — the projection-side mirror of the
         // log's jobs.job.created pass. Registered kinds only: the FK
         // would reject anything else, and unregistered residue should
         // stay visible, not get laundered in.

@@ -89,7 +89,7 @@ impl SeedBases {
 
 const ACCOUNT_COUNT: u32 = 50;
 // Vendor count is bounded by what the brewery sim actually transacts
-// with over a 12-month run — seed vendors when a JobKind or
+// with over a 12-month run — seed vendors when a Workflow or
 // counterparty spec reaches for them, not preemptively, so the SPA's
 // vendor list reflects real procurement rather than noise.
 //
@@ -108,7 +108,7 @@ const ACCOUNT_COUNT: u32 = 50;
 // cannot drift from itself.
 pub const VENDOR_COUNT: u32 = 13;
 
-/// Pre-seeded prospect Accounts that the `sale` JobKind targets
+/// Pre-seeded prospect Accounts that the `sale` Workflow targets
 /// (the wholesale-account-acquisition funnel: cold outreach →
 /// qualification → tasting visit → quote → ops approval → first
 /// order). Distinct from `acc-bigseed-*` (existing wholesale
@@ -336,14 +336,14 @@ pub fn seed_tenant_data(
         ensure_account_with_id(&client, &bases.accounts, &headers, &id, i)?;
     }
     // Catch-all account for the brewery `/shop` direct-to-consumer
-    // checkout flow. The direct-shop-order JobKind sets subject =
+    // checkout flow. The direct-shop-order Workflow sets subject =
     // {kind=account, id=acc-direct-shop} regardless of which guest
     // checked out — per-customer Account creation is deferred to
     // the email-OTP follow-up. Seed once on every regen so the
     // FK from jobs.subject resolves.
     ensure_direct_shop_account(&client, &bases.accounts, &headers)?;
 
-    // Prospect accounts for the `sale` JobKind (wholesale-account-
+    // Prospect accounts for the `sale` Workflow (wholesale-account-
     // acquisition funnel). Seeded with account_type=
     // 'wholesale-prospect' so the Sales pipeline page can filter
     // them apart from `acc-bigseed-*` (existing wholesale
@@ -595,7 +595,7 @@ fn ensure_direct_shop_account(
     }
 }
 
-/// Pre-seed a prospect Account for the `sale` JobKind. Distinct
+/// Pre-seed a prospect Account for the `sale` Workflow. Distinct
 /// from `ensure_account_with_id` because the payload is fixed
 /// (account_type='wholesale-prospect', name carries the "Prospect"
 /// label so it's visually distinguishable on AccountsList until
@@ -643,7 +643,7 @@ fn ensure_prospect_account(
         "state": state,
         "tier": tier,
         // Customer_since left null-ish (placeholder past date) since
-        // prospects haven't bought yet. The `sale` JobKind's tier-6
+        // prospects haven't bought yet. The `sale` Workflow's tier-6
         // milestone marks the actual onboarding moment.
         "customer_since": "2026-01-01",
         "territory_rep_id": "emp-aa-005",
@@ -1426,7 +1426,7 @@ fn ensure_marketing_assets(
 /// Posts one DR 1500 / CR 3000 JE per system; idempotent via
 /// `source_id = opening-asset-{asset_id}`. New-acquisition JEs
 /// (DR 1500 / CR 2100) come from the runtime `equipment-purchase`
-/// JobKind, not this seed pass.
+/// Workflow, not this seed pass.
 fn ensure_asset_opening_balances(
     client: &Client,
     ledger_base: &str,
@@ -1731,7 +1731,7 @@ fn ensure_brewhouse_assets(
 /// Without this, the first wholesale-keg-order in --hard-fail
 /// regen 400s on POST /api/products/{sku}/inventory/consume
 /// because the morning-brew → packaging step hasn't completed
-/// yet (the JobKind takes ~5 sim-days to walk through its
+/// yet (the Workflow takes ~5 sim-days to walk through its
 /// 7-tier graph). Pre-seeded buffer = ~30 sim-days of
 /// canonical wholesale demand.
 ///
@@ -1782,7 +1782,7 @@ fn ensure_finished_product_inventory(
     // catch up. Without this, the first wholesale-keg-order in
     // --hard-fail regen 400s on POST /api/products/{sku}/inventory/
     // consume because the morning-brew → packaging step hasn't
-    // completed yet (the JobKind takes ~5 sim-days to walk through
+    // completed yet (the Workflow takes ~5 sim-days to walk through
     // its 7-tier graph).
     //
     // Buffer sized for ~30 sim-days at the canonical
@@ -1790,7 +1790,7 @@ fn ensure_finished_product_inventory(
     // Per-line-item demand: PALE-1/2=4, IPA-1/6=8, STOUT/LAGER/HAZY-1/6=1
     // each. Sixtel co-products (PALE-1/6, IPA-1/2, STOUT/LAGER/HAZY-1/2)
     // accumulate from production with no consumer — buffered low so
-    // the cooler has *something* on day 1 if a future JobKind reaches
+    // the cooler has *something* on day 1 if a future Workflow reaches
     // for them.
     const BUFFER_PALE_HALF_BBL: i64 = 5000;
     const BUFFER_PALE_SIXTEL: i64 = 2000;
@@ -1803,7 +1803,7 @@ fn ensure_finished_product_inventory(
     const BUFFER_HAZY_HALF_BBL: i64 = 500;
     const BUFFER_HAZY_SIXTEL: i64 = 1500;
     // The seasonal release is bottled in infrequent bursts (the
-    // seasonal-release JobKind, ~50 cases/run) against steady allocation
+    // seasonal-release Workflow, ~50 cases/run) against steady allocation
     // demand (~50 cases/sale) — unlike the kegs that refill continuously
     // from daily morning-brew. With no opening buffer, a sale landing
     // between production runs 404s the invoice on `insufficient FG

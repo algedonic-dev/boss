@@ -494,7 +494,7 @@ mod tests {
         Job {
             id: JobId::new(),
             kind: "test".into(),
-            job_kind_version: 1,
+            workflow_version: 1,
             subject: JobSubject::new("asset", "sys-001"),
             title: title.into(),
             owner_id: "emp-001".into(),
@@ -741,7 +741,7 @@ mod tests {
             let job = Job {
                 id: JobId::new(),
                 kind: "test".into(),
-                job_kind_version: 1,
+                workflow_version: 1,
                 subject: JobSubject::new("asset", "sys-p"),
                 title: ci.title.clone(),
                 owner_id: "emp".into(),
@@ -764,7 +764,7 @@ mod tests {
         let parent_job = Job {
             id: JobId::new(),
             kind: "test".into(),
-            job_kind_version: 1,
+            workflow_version: 1,
             subject: JobSubject::new("asset", "sys-p"),
             title: parent_input.title.clone(),
             owner_id: "emp".into(),

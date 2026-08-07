@@ -1,6 +1,6 @@
-// Build StepDag `nodes` + `edges` from a JobKind's step list — the
+// Build StepDag `nodes` + `edges` from a Workflow's step list — the
 // authoring view (no live status). Shared by every surface that shows a
-// JobKind's shape (root/landing, JobKind detail), so they all render
+// Workflow's shape (root/landing, Workflow detail), so they all render
 // through the one `StepDag` component instead of bespoke per-surface
 // diagrams.
 //
@@ -40,7 +40,7 @@ function nodeTitle(step: DagStep): string {
   return t || humanize(step.title);
 }
 
-export function jobKindToDag(steps: ReadonlyArray<DagStep>): {
+export function workflowToDag(steps: ReadonlyArray<DagStep>): {
   nodes: DagNode[];
   edges: DagEdge[];
 } {

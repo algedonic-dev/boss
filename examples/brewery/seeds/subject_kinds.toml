@@ -17,7 +17,7 @@ A brewery recipe — Czech Pilsner, West Coast IPA, Imperial Stout,
 the barrel-aged sour spec. Carries identity + version history (every
 recipe has revisions across iterations), grain bills, hop schedules,
 yeast strain, mash + fermentation profiles, and required vessels.
-Subject of tap-launch JobKinds and the target of `morning-brew`
+Subject of tap-launch Workflows and the target of `morning-brew`
 step metadata's `recipe_id` field.
 """
 owning_team = "brewery"
@@ -30,7 +30,7 @@ description = """
 Production hardware — mash tun, lauter tun, fermenters, brite
 tanks, glycol chiller, kegging line, packaging machine. Carries
 identity + service history (preventive maintenance Jobs reference it). Subject of
-`equipment-preventive-maintenance` JobKinds, referenced as
+`equipment-preventive-maintenance` Workflows, referenced as
 Subject { subject_kind = "equipment", id = "fermenter-04" }.
 """
 owning_team = "brewery"

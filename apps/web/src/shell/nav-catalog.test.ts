@@ -38,7 +38,11 @@ import { readFileSync } from 'node:fs';
 const LEGACY_MODEL_ROUTES: ReadonlyArray<string> = [
   'system-model', 'system-monitoring', 'system-step-plugins', 'system-dispatcher',
   'system-subjects', 'system-dispatcher-rules', 'system-dispatcher-rule',
-  'system-kb', 'system-design', 'system-experiments', 'policy', 'job-kinds',
+  'system-kb', 'system-design', 'system-experiments', 'policy',
+  // One entry, not two. `job-kinds` (the authoring row, already
+  // dropped from the sidebar) and `workflows` (the catalog) were
+  // separate keys pointing at the same path; the rename collapsed
+  // them, which is what surfaced the redundancy.
   'workflows', 'auth-admin',
 ];
 
@@ -106,7 +110,7 @@ describe('nav catalog — app assignment', () => {
     const REACHED_FROM_A_PARENT: ReadonlyArray<string> = [
       // Authoring is reached from Workflows, by design — see the
       // comment on the Define group.
-      'job-kinds',
+      'workflows',
       // Sub-pages of the dispatcher cascade.
       'system-dispatcher-rules',
       'system-dispatcher-rule',

@@ -12,8 +12,8 @@ export type Route =
   | { kind: 'me' }
   | {
       kind: 'jobs';
-      jobKind?: string;
-      jobKindPrefix?: string;
+      workflow?: string;
+      workflowPrefix?: string;
       jobStatus?: string;
       // #93: filter by Job.owner_id so "View this employee's
       // assigned jobs" links actually filter the list.
@@ -75,10 +75,11 @@ export type Route =
   | { kind: 'systemMonitoringEvents' }
   | { kind: 'systemMonitoringAtlas' }
   | { kind: 'policy' }
-  | { kind: 'jobKinds' }
-  | { kind: 'jobKindNew' }
-  | { kind: 'jobKindDesign'; jobId: string }
-  | { kind: 'jobKindDetail'; kindSlug: string }
+  | { kind: 'workflows' }
+  | { kind: 'workflowsAdmin' }
+  | { kind: 'workflowNew' }
+  | { kind: 'workflowDesign'; jobId: string }
+  | { kind: 'workflowDetail'; kindSlug: string }
   | { kind: 'systemStepPlugins' }
   | { kind: 'systemStepPluginDetail'; pluginSlug: string }
   | { kind: 'systemDesign' }
@@ -104,7 +105,6 @@ export type Route =
   | { kind: 'marketingAsset'; assetId: string }
   | { kind: 'manual' }
   | { kind: 'manualSection'; slug: string }
-  | { kind: 'workflows' }
   | { kind: 'po'; poId: string }
   | { kind: 'watchlist' }
   | { kind: 'shop' }
@@ -132,12 +132,15 @@ export function parseRoute(pathname: string): Route {
     if (p === '/policy') return { kind: 'policy' };
     if (p === '/workflows') return { kind: 'workflows' };
     if (p === '/auth-admin') return { kind: 'authAdmin' };
-    if (p === '/job-kinds') return { kind: 'jobKinds' };
-    if (p === '/job-kinds/new') return { kind: 'jobKindNew' };
-    const jkDesignM = p.match(/^\/job-kinds\/authoring\/(.+)$/);
-    if (jkDesignM) return { kind: 'jobKindDesign', jobId: decodeURIComponent(jkDesignM[1]!) };
-    const jkM = p.match(/^\/job-kinds\/(.+)$/);
-    if (jkM) return { kind: 'jobKindDetail', kindSlug: decodeURIComponent(jkM[1]!) };
+    if (p === '/workflows/new') return { kind: 'workflowNew' };
+    // The admin index. Was `/system/job-kinds` before the rename;
+    // it and the catalog collapsed onto one path when `job-kinds`
+    // became `workflows`, and they are two different surfaces.
+    if (p === '/workflows/authoring') return { kind: 'workflowsAdmin' };
+    const jkDesignM = p.match(/^\/workflows\/authoring\/(.+)$/);
+    if (jkDesignM) return { kind: 'workflowDesign', jobId: decodeURIComponent(jkDesignM[1]!) };
+    const jkM = p.match(/^\/workflows\/(.+)$/);
+    if (jkM) return { kind: 'workflowDetail', kindSlug: decodeURIComponent(jkM[1]!) };
     if (p === '/step-plugins') return { kind: 'systemStepPlugins' };
     const spM = p.match(/^\/step-plugins\/(.+)$/);
     if (spM) return { kind: 'systemStepPluginDetail', pluginSlug: decodeURIComponent(spM[1]!) };
@@ -254,8 +257,8 @@ export function parseRoute(pathname: string): Route {
     const filterSubjectKind = sp.get('filter_subject_kind');
     const filterSubjectId = sp.get('subject_id');
     const r: Route = { kind: 'jobs' };
-    if (jk) (r as { jobKind?: string }).jobKind = jk;
-    if (jkp) (r as { jobKindPrefix?: string }).jobKindPrefix = jkp;
+    if (jk) (r as { workflow?: string }).workflow = jk;
+    if (jkp) (r as { workflowPrefix?: string }).workflowPrefix = jkp;
     if (js) (r as { jobStatus?: string }).jobStatus = js;
     if (ownerId) (r as { jobOwnerId?: string }).jobOwnerId = ownerId;
     if (filterSubjectId) (r as { jobSubjectId?: string }).jobSubjectId = filterSubjectId;

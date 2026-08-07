@@ -1,9 +1,9 @@
 <script lang="ts">
-  // System Atlas — flow map of the tenant's actual JobKind graph.
+  // System Atlas — flow map of the tenant's actual Workflow graph.
   //
   // v1 was a static hand-placed device-lifecycle SVG, accurate only
   // for the used-device-shop tenant. v2 (this version) reads
-  // `/api/jobs/kinds` and lays out the active JobKinds by category,
+  // `/api/workflows` and lays out the active Workflows by category,
   // each node showing its step count and a click-through to the
   // workflows KB. Tenant-aware out of the box: brewery sees brewing
   // / sales / procurement / finance flows; used-device-shop sees the
@@ -34,7 +34,7 @@
 
   onMount(async () => {
     try {
-      const r = await fetch('/api/jobs/kinds');
+      const r = await fetch('/api/workflows');
       if (!r.ok) {
         state = { kind: 'error', message: `HTTP ${r.status}` };
         return;
@@ -64,18 +64,18 @@
   <PageHeader
     eyebrow="System Model · System atlas"
     title="Operating model flows"
-    subtitle="Every JobKind this tenant publishes, grouped by category. Data-driven from /api/jobs/kinds."
+    subtitle="Every Workflow this tenant publishes, grouped by category. Data-driven from /api/workflows."
   />
 
-  <Section title="JobKind map" wide>
+  <Section title="Workflow map" wide>
     {#if state.kind === 'loading'}
-      <p class="empty">Loading JobKinds…</p>
+      <p class="empty">Loading Workflows…</p>
     {:else if state.kind === 'error'}
-      <p class="empty">Couldn't load /api/jobs/kinds: {state.message}</p>
+      <p class="empty">Couldn't load /api/workflows: {state.message}</p>
     {:else if state.specs.length === 0}
       <p class="empty">
-        This tenant has no published JobKinds. Author one at
-        <a href={href('/system/job-kinds')}>/system/job-kinds</a>
+        This tenant has no published Workflows. Author one at
+        <a href={href('/system/workflows')}>/system/workflows</a>
         to populate the atlas.
       </p>
     {:else if layoutResult}
@@ -84,7 +84,7 @@
           viewBox={`0 0 ${CANVAS_W} ${layoutResult.height}`}
           class="atlas-canvas"
           role="img"
-          aria-label="Tenant JobKind flow diagram"
+          aria-label="Tenant Workflow flow diagram"
           preserveAspectRatio="xMinYMid meet"
         >
           {#each layoutResult.rows as row (row.category)}
@@ -132,11 +132,11 @@
 
   <Section title="How to read this">
       <p class="prose">
-        Each box is a <strong>JobKind</strong> the tenant has published —
+        Each box is a <strong>Workflow</strong> the tenant has published —
         a typed unit of coordinated work, with a fixed step graph
-        registered in <code>job_kinds</code>. Rows group by
+        registered in <code>workflows</code>. Rows group by
         <code>category</code>; the count below each label is the
-        number of Steps in the JobKind's graph. Click any node to
+        number of Steps in the Workflow's graph. Click any node to
         jump to the <a href={href('/system/workflows')}>Workflows</a> KB
         for full step-graph + metadata.
       </p>

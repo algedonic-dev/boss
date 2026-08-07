@@ -1,6 +1,6 @@
 // The triage board.
 //
-// What these pin is that the board is a rendering of the JobKind, not
+// What these pin is that the board is a rendering of the Workflow, not
 // a screen with opinions. Columns come from the registry's fork
 // vocabulary — add a disposition to the spec and a column appears —
 // and routing an item is completing the fork step with that
@@ -116,7 +116,7 @@ test.describe('feedback triage board', () => {
     );
   });
 
-  test('builds its columns from the JobKind fork, labelled by each next step', async ({
+  test('builds its columns from the Workflow fork, labelled by each next step', async ({
     page,
   }) => {
     await mountPage(page, '/system/feedback', { titleMatch: /feedback triage/i });

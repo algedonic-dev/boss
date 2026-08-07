@@ -11,7 +11,7 @@
 -->
 <script lang="ts">
   import { untrack } from 'svelte';
-  import type { StepSpec } from './jobKindTypes';
+  import type { StepSpec } from './workflowTypes';
   import type { StepTypeInfo } from './stepTypes';
   import type { LintProblem } from './liveLint';
 

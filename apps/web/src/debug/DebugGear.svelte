@@ -90,9 +90,9 @@
   // Simulator panel now carries only the universal controls
   // (clock, view-as-of, reset loop, pause/resume) that apply to
   // every tenant. Buttons here are brewery-shaped — they hardcode
-  // brewery JobKinds (direct-shop-order / wholesale-keg-order /
+  // brewery Workflows (direct-shop-order / wholesale-keg-order /
   // vendor-delay-anomaly). A future "Open Job…" picker that lists
-  // active JobKinds from the registry would let any tenant
+  // active Workflows from the registry would let any tenant
   // exercise its own flows without per-tenant SPA code.
   const sims: ReadonlyArray<{ label: string; run: (l: SimLogger) => Promise<void> }> = [
     { label: 'Show sim clock', run: showSimClock },

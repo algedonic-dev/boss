@@ -31,7 +31,7 @@ fail()    { printf "  %sFAIL%s %s\n" "$RED" "$RESET" "$1"; failures=$((failures 
 section() { printf "\n%s%s%s\n" "$BOLD" "$1" "$RESET"; }
 
 # x-boss-user header — endpoints policy-gate, anonymous curl
-# would land as `guest` which only has JobKind read.
+# would land as `guest` which only has Workflow read.
 BOSS_USER='{"id":"verify-smoke","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
 
 # Smoke check: hit an HTTP API, fail if the count is 0.
@@ -69,7 +69,7 @@ expect_at_least_one "accounts"    "http://127.0.0.1:7500/api/people/accounts"   
 expect_at_least_one "vendors"     "http://127.0.0.1:7300/api/inventory/vendors"        "len(d)"
 
 section "Coordination primitives (every brewery sim emits these)"
-expect_at_least_one "JobKinds"    "http://127.0.0.1:7900/api/jobs/kinds"               "len(d)"
+expect_at_least_one "Workflows"    "http://127.0.0.1:7900/api/workflows"               "len(d)"
 expect_at_least_one "jobs"        "http://127.0.0.1:7900/api/jobs?limit=1"             "d.get('total', 0)"
 expect_at_least_one "assets" "http://127.0.0.1:7600/api/assets?limit=1"  "d.get('total', 0)"
 

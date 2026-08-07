@@ -31,7 +31,7 @@ roles = ["ceo", "coo", "cfo", "cto"]
 resources = [
     "job", "step", "account", "employee", "invoice", "agreement",
     "shipment", "part", "purchase-order", "policy-rule",
-    "job-kind", "step-plugin", "event", "subject", "ledger",
+    "workflow", "step-plugin", "event", "subject", "ledger",
 ]
 action = "read"
 scope = "all"
@@ -71,10 +71,10 @@ resource = "employee"
 actions = ["create", "update"]
 scope = "all"
 
-# CEO + CTO can publish + retire JobKinds and StepPlugins.
+# CEO + CTO can publish + retire Workflows and StepPlugins.
 [[grants]]
 roles = ["ceo", "cto"]
-resources = ["job-kind", "step-plugin"]
+resources = ["workflow", "step-plugin"]
 actions = ["create", "update", "publish", "retire"]
 scope = "all"
 
@@ -445,7 +445,7 @@ scope = "self"
 # metadata, so a PUT body cannot lower the bar.
 #
 # One grant per distinct `authority_role` used by the brewery's
-# JobKinds (examples/brewery/seeds/job_kinds.toml). Without these,
+# Workflows (examples/brewery/seeds/workflows.toml). Without these,
 # every sign-off step becomes unsignable. Scope is `all`: the role
 # match (the resource match) IS the authority gate; row-level scope
 # is not layered on top of the sign-off authority check.
@@ -504,35 +504,35 @@ resource = "step-signoff:warehouse-clerk"
 action = "sign-off"
 scope = "all"
 
-# JobKind-authoring approval (step-signoff:job-kind-approver).
+# Workflow-authoring approval (step-signoff:workflow-approver).
 #
-# The `job-kind-design` meta-Job's approve step requires the
-# `job-kind-approver` authority (boss-jobs registry), NOT platform-admin.
-# Grant it to the operational leaders who own the `job-kinds` authoring
+# The `workflow-design` meta-Job's approve step requires the
+# `workflow-approver` authority (boss-jobs registry), NOT platform-admin.
+# Grant it to the operational leaders who own the `workflows` authoring
 # surface — the C-suite + COO — so they can approve a new/edited work
 # type without the platform operator. (platform-admin also holds this via
 # the core policy defaults; design-doc-review still uses platform-admin.)
 [[grants]]
 role = "ceo"
-resource = "step-signoff:job-kind-approver"
+resource = "step-signoff:workflow-approver"
 action = "sign-off"
 scope = "all"
 
 [[grants]]
 role = "coo"
-resource = "step-signoff:job-kind-approver"
+resource = "step-signoff:workflow-approver"
 action = "sign-off"
 scope = "all"
 
 [[grants]]
 role = "cto"
-resource = "step-signoff:job-kind-approver"
+resource = "step-signoff:workflow-approver"
 action = "sign-off"
 scope = "all"
 
 [[grants]]
 role = "owner"
-resource = "step-signoff:job-kind-approver"
+resource = "step-signoff:workflow-approver"
 action = "sign-off"
 scope = "all"
 

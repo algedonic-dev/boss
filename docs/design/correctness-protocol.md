@@ -1,7 +1,7 @@
 # The BOSS correctness protocol
 
 **Status:** load-bearing thesis. Treat this as the design north
-star for every JobKind, every projection, every adapter.
+star for every Workflow, every projection, every adapter.
 
 ## The claim
 
@@ -27,8 +27,8 @@ every quarter.
 
 ## The five properties
 
-Every JobKind, projection, and adapter must satisfy all five.
-A JobKind that can't answer all five is incomplete; ship it
+Every Workflow, projection, and adapter must satisfy all five.
+A Workflow that can't answer all five is incomplete; ship it
 that way only as a known stop-gap.
 
 ### 1. Provenance
@@ -128,8 +128,8 @@ conventional stacks can't, and does the things they do better.
 Five mechanisms turn the protocol into something the system
 checks for itself, not something authors have to remember.
 
-1. **Static lint on JobKind specs.** `validate_job_kind` (in
-   `boss-jobs/src/job_kind_lint.rs`) proves a JobKind is a
+1. **Static lint on Workflow specs.** `validate_workflow` (in
+   `boss-jobs/src/workflow_lint.rs`) proves a Workflow is a
    well-formed program before it can run. Phase 0 checks that
    every value in a step's `metadata_defaults` matches its
    StepType field's declared type. Phases 1–3 check the
@@ -138,7 +138,7 @@ checks for itself, not something authors have to remember.
    `steps.<slug>` reference resolves, the graph is acyclic,
    every step is reachable, and every fork point covers all
    values of its discriminating enum. Runs at author time
-   (`/system/job-kinds`), at publish, and at boot
+   (`/system/workflows`), at publish, and at boot
    (boss-jobs-api refuses to start against a broken registry).
    The runtime metadata validator in `step_registry.rs` is the
    complement: it enforces a StepType's `required` fields when
@@ -174,11 +174,11 @@ checks for itself, not something authors have to remember.
 
 4. **Tenant seed + lifecycle tests.** The brewery crate's
    `tests/protocol_holds_e2e.rs` runs the layer-1 static lint
-   over every JobKind in the tenant's seed files — a broken
-   JobKind fails `cargo test`. The used-device-shop
+   over every Workflow in the tenant's seed files — a broken
+   Workflow fails `cargo test`. The used-device-shop
    crate's `tests/parity_harness.rs` and `shape_driven_smoke.rs`
    drive the tenant through a 30-day window and assert coverage
-   (every authored JobKind fires) and lifecycle (jobs open,
+   (every authored Workflow fires) and lifecycle (jobs open,
    steps complete, jobs close, the canonical side-effect topics
    fire). The sim does not materialize or drive steps in-process,
    so step volumes, metadata shapes, and side-effect wiring are
