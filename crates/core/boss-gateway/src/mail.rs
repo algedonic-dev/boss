@@ -132,7 +132,9 @@ impl MailTransport for HttpApiTransport {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
             // Never log the body here — it carries the token.
-            return Err(MailError::Transport(format!("provider returned {status}: {detail}")));
+            return Err(MailError::Transport(format!(
+                "provider returned {status}: {detail}"
+            )));
         }
         Ok(())
     }
@@ -223,13 +225,20 @@ mod tests {
         // reset had gone out when it had not.
         let t = LogTransport;
         assert!(!t.delivers());
-        assert!(t.send(&reset_mail("a@b.c", "tok", "https://x")).await.is_ok());
+        assert!(
+            t.send(&reset_mail("a@b.c", "tok", "https://x"))
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
     fn the_reset_link_carries_an_encoded_token() {
         let m = reset_mail("op@example.com", "ab+cd/ef", "https://boss.example/");
-        assert!(m.body.contains("https://boss.example/login?reset=ab%2Bcd%2Fef"));
+        assert!(
+            m.body
+                .contains("https://boss.example/login?reset=ab%2Bcd%2Fef")
+        );
         // The raw token is offered too — a link can be mangled by a
         // mail client, and the form accepts a pasted token.
         assert!(m.body.contains("ab+cd/ef"));

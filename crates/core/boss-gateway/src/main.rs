@@ -120,6 +120,15 @@ async fn main() -> Result<()> {
             // turning off synthetic activity silently withdrew guest
             // access, and neither effect was visible from the name.
             guest_access: std::env::var("BOSS_GUEST_ACCESS").as_deref() == Ok("1"),
+            mail: boss_gateway::mail::from_env(),
+            // Origin the reset link points at. Falls back to the
+            // loopback listener, which is right for a laptop and
+            // obviously wrong in a deploy — a link nobody outside the
+            // box can open is easier to notice than a plausible one
+            // pointing at the wrong host.
+            public_url: std::env::var("BOSS_PUBLIC_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:4443".to_string()),
+            forgot_seen: Default::default(),
         }))
     } else {
         None
@@ -570,6 +579,10 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
             axum::routing::post(local_auth::issue_reset).with_state(la.clone()),
         )
         .route(
+            "/api/auth/forgot",
+            axum::routing::post(local_auth::forgot).with_state(la.clone()),
+        )
+        .route(
             "/api/auth/reset",
             axum::routing::post(local_auth::reset).with_state(la),
         )
@@ -761,22 +774,27 @@ mod routing_tests {
 
     #[tokio::test]
     async fn unmatched_api_path_is_a_json_404() {
-        // A path that looks right and is not. `/api/workflows` is the
-        // pre-rename spelling of `/api/workflows`, so it is exactly
-        // what a stale client or a habit types — and it must miss
-        // loudly rather than be answered with the SPA.
+        // A path that looks right and is not. SINGULAR `/api/workflow`
+        // — a plausible typo for the real `/api/workflows`, and it
+        // must miss loudly rather than be answered with the SPA.
         //
-        // The probe used to BE `/api/workflows`, chosen for the same
-        // reason when the real route was `/api/workflows`. The
-        // rename turned the deliberately-wrong path into the correct
-        // one and the test asserted a 404 on a live route; a probe
-        // for "this must not resolve" has to be re-chosen whenever
-        // the thing it was avoiding moves.
-        let (status, body) = get(app(), "/api/workflows").await;
+        // The probe has now been broken twice by renames, which is the
+        // actual lesson here. It was `/api/job-kinds`, chosen because
+        // the real route was `/api/jobs/kinds`; the Workflow rename
+        // made that spelling correct. It was then re-chosen as
+        // `/api/job-kinds` again, and the rebase sweep rewrote it to
+        // `/api/workflows` — a live route — so the test asserted a 404
+        // against something that resolves.
+        //
+        // A probe asserting "this must NOT resolve" cannot be a string
+        // a vocabulary sweep will touch. The singular survives any
+        // `job-kind`/`job_kind` substitution because it contains
+        // neither, and no rename produces it.
+        let (status, body) = get(app(), "/api/workflow").await;
         assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
         assert!(body.contains(MISS), "body: {body}");
         assert!(
-            body.contains("/api/workflows"),
+            body.contains("/api/workflow"),
             "the 404 should name the path that missed: {body}"
         );
         assert!(
@@ -849,9 +867,17 @@ mod routing_tests {
             session_key: vec![0u8; 32],
             http: reqwest::Client::new(),
             guest_access: true,
+            mail: boss_gateway::mail::from_env(),
+            public_url: "https://boss.test".into(),
+            forgot_seen: Default::default(),
         });
 
-        for path in ["/api/auth/me", "/api/auth/login", "/api/auth/guest"] {
+        for path in [
+            "/api/auth/me",
+            "/api/auth/login",
+            "/api/auth/guest",
+            "/api/auth/forgot",
+        ] {
             let (_, body) = get(app_with(Some(la.clone())), path).await;
             assert!(
                 !body.contains(MISS),

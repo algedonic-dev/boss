@@ -7,4 +7,5 @@
 //! these instead of redeclaring them.
 
 pub mod local_auth;
+pub mod mail;
 pub mod session;
