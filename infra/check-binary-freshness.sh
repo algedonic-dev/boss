@@ -232,4 +232,11 @@ if [ "$stale_count" -gt 0 ] || [ "$drift_count" -gt 0 ]; then
     exit 1
 fi
 
+# Clean run: record it against an open regen, no-op otherwise. Only on
+# the clean path — a step that closes whether or not the check passed
+# would be a worse record than none, since the Job would then assert
+# the artifacts were verified when they were not.
+"$(dirname "$0")/boss-step.sh" regenerate-deployment artifacts \
+    "verified=$fresh_count fresh, 0 not-deployed, 0 stale ($unknown_count unmapped)" || true
+
 exit 0

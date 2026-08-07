@@ -74,11 +74,26 @@ if [[ "${1:-}" == "--verify" ]]; then
     [[ "$rc" == 0 ]] && echo "    all gated bins link sqlx"
 fi
 
-# Stamp every built bin as current. After a clean build-release run every
-# binary IS up to date (cargo either rebuilt it or confirmed it current), but
-# cargo leaves a skipped bin's mtime untouched — which the deploy freshness
-# guard would then false-flag as "older than the newest source". Touch them so
-# the mtime tells the truth: built/verified now.
-find "$RELEASE_DIR" -maxdepth 1 -type f -executable -name 'boss-*' -exec touch {} +
+# NO mtime stamping. This used to `touch` every binary here, to stop the
+# freshness guard false-flagging a bin cargo had skipped as "older than the
+# newest source". The premise — after a clean run every binary is current,
+# because cargo either rebuilt it or confirmed it — holds only while the tree
+# does not move DURING the run.
+#
+# On 2026-08-07 it moved. A source edit landed mid-build, after phase 1 had
+# already compiled that crate; the touch then stamped the resulting binary
+# "current" and the guard passed it. The change (a sim granularity fix) was
+# silently absent on a running box while the sim fell behind its own clock,
+# and only `sha256` against a fresh build found it.
+#
+# The touch turned a conservative wrong answer into a confident wrong one, and
+# those cost differently: a false STALE costs a rebuild, a false "fresh" costs
+# an incident. So a skipped bin may now read STALE. That is the safe
+# direction, and `check-binary-freshness.sh --rebuild` settles it for real —
+# cargo is the only thing that actually knows.
 
 echo "==> release build complete. Next: sudo infra/deploy-services.sh prod"
+
+# The build is a step of a regen when one is open, and a no-op otherwise.
+"$(dirname "$0")/boss-step.sh" regenerate-deployment build \
+    "source_ref=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" || true

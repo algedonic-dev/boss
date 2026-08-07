@@ -1009,3 +1009,10 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]] \
 fi
 
 echo "done."
+
+# A deploy is a step of a regen when one is open, and a no-op otherwise.
+# `|| true` because a deploy must not fail on bookkeeping: the services
+# are already running by this point, and a Job that cannot be updated
+# is a worse thing to abort a deploy over than to report.
+"$(dirname "$0")/boss-step.sh" regenerate-deployment deploy \
+    "deployed=$(date -u +%Y-%m-%dT%H:%M:%SZ)" || true

@@ -752,7 +752,19 @@ async fn main() -> Result<()> {
                 "backfill complete — going live at wall speed"
             );
             match go_live().await {
-                Ok(()) => info!("clock re-anchored to warp 1.0; the sim now runs in real time"),
+                Ok(()) => {
+                    info!("clock re-anchored to warp 1.0; the sim now runs in real time");
+                    // Close the regen's `backfill` step from here.
+                    //
+                    // This is the one step whose completion nobody
+                    // else can honestly assert. A build finishing or a
+                    // deploy landing is observable from outside; "the
+                    // backfill reached today and the clock is now
+                    // real" is known only to the process that did it.
+                    // Recording it anywhere else would be a report of
+                    // a transition rather than the transition itself.
+                    record_backfill_complete(&api_base).await;
+                }
                 Err(e) => {
                     warn!(error = %e, "go-live failed; pausing rather than looping the epoch");
                     set_paused(true).await?;
@@ -1278,6 +1290,51 @@ fn cadence_of(clock: &Clock, day: Option<NaiveDate>) -> sim_control::Cadence {
 /// SimClockBadge "Restart epoch" button hits. Returns Ok on
 /// 200/202; any other status (or a connection failure) becomes
 /// an error so the caller can fall back to pause-and-wait.
+/// Close the open regen's `backfill` step, if there is one.
+///
+/// Best-effort by construction: the sim must not stop simulating
+/// because a Job could not be updated. A missing record is a gap in
+/// the audit trail; a sim that halts on bookkeeping is an outage.
+///
+/// Shells out to `boss-step.sh` rather than reimplementing
+/// find-open-Job-then-merge-metadata in Rust. That rule already lives
+/// in one place, and the merge half of it is the kind that bites
+/// quietly — `PUT` swaps `metadata` wholesale, so a partial write
+/// silently drops `authority_role` and ungates a gated step.
+async fn record_backfill_complete(api_base: &str) {
+    let script = std::env::var("BOSS_STEP_SCRIPT")
+        .unwrap_or_else(|_| "/opt/boss/infra/boss-step.sh".to_string());
+    if !std::path::Path::new(&script).exists() {
+        return;
+    }
+    let went_live = format!("went_live={}", chrono::Utc::now().to_rfc3339());
+    let out = tokio::process::Command::new(&script)
+        .args(["regenerate-deployment", "backfill", &went_live])
+        .env("BOSS_STEP_ACTOR", "automation:brewery-sim")
+        .env("BOSS_JOBS_URL", jobs_base_for(api_base))
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            info!("recorded backfill completion on the open regen Job")
+        }
+        Ok(o) => warn!(
+            stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+            "could not record backfill completion; the sim is live regardless"
+        ),
+        Err(e) => warn!(error = %e, "could not run boss-step.sh"),
+    }
+}
+
+/// jobs-api origin for a given api_base, mirroring the loopback
+/// translation the other callers do.
+fn jobs_base_for(api_base: &str) -> String {
+    match api_base.strip_prefix("direct://") {
+        Some(host) => format!("http://{host}:7900"),
+        None => api_base.trim_end_matches('/').to_string(),
+    }
+}
+
 /// Hand the clock over to real time.
 ///
 /// `POST /api/clock/configure { warp_factor: 1.0 }` — the handler
