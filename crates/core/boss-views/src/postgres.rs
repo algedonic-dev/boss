@@ -410,11 +410,27 @@ impl crate::flow::FlowRepo for PgViewsRepo {
             )
             .collect();
 
+        // `as_of` comes from the DATABASE clock, not the process's.
+        //
+        // Not a lint dodge — `Utc::now()` here would be a second clock
+        // in a calculation that already has one. Every timestamp this
+        // view returns is `audit_log.created_at`, written by Postgres
+        // `now()`, and the page subtracts `as_of` from them to render
+        // "open for 4h". Reading the reference point from anywhere
+        // else means the answer drifts by whatever the two clocks
+        // disagree about, silently and only under skew.
+        let as_of: String = sqlx::query_scalar(
+            "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| ViewsError::Storage(e.to_string()))?;
+
         Ok(Flow {
             owner_roles: owner_roles.to_vec(),
             kinds,
             jobs,
-            as_of: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            as_of,
         })
     }
 }
