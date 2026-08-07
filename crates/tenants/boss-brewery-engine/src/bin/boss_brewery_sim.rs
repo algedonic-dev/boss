@@ -720,21 +720,41 @@ async fn main() -> Result<()> {
         // instead of looping. Fallback: if the endpoint isn't
         // reachable, set paused=true so the loop idles gracefully
         // and an operator can run `reset-to-baseline.sh` by hand.
+        // End of the BACKFILL window: go live, do not lap.
+        //
+        // The epoch used to restart here — trim the audit_log back to
+        // the seed baseline and replay the same year forever. That is
+        // what made warp a permanent condition, and the lap is what
+        // destroyed real work: a year-end close a person posted, and a
+        // day of a real user's feedback, both taken by a restart
+        // nobody asked for.
+        //
+        // Warp is a startup PHASE now. The sim runs fast once to lay
+        // down a synthetic past, reaches today, and then keeps going
+        // at wall speed with real people writing alongside it. The log
+        // is append-only from the seed forward; nothing is ever
+        // trimmed.
+        //
+        // Warp itself is the phase marker, which is why this needs no
+        // new state. `epoch_end` cannot be cleared through
+        // `configure` (an absent field means "leave it"), so a naive
+        // condition would re-fire every tick once the date passed. At
+        // wall speed warp is 1.0 and the guard is simply false — the
+        // transition is one-way by construction rather than by a flag
+        // someone has to remember to set.
         if let Some(end) = clock.epoch_end_date
             && clock.current_sim_date >= end
-            && !clock.restart_in_progress
+            && clock.warp_factor.unwrap_or(1.0) > 1.0
         {
             info!(
                 current_sim_date = %clock.current_sim_date,
                 epoch_end_date = %end,
-                "sim epoch complete — triggering auto-restart"
+                "backfill complete — going live at wall speed"
             );
-            match trigger_restart_epoch(&api_base).await {
-                Ok(()) => info!(
-                    "restart-epoch dispatched; daemon will idle until restart_in_progress clears"
-                ),
+            match go_live().await {
+                Ok(()) => info!("clock re-anchored to warp 1.0; the sim now runs in real time"),
                 Err(e) => {
-                    warn!(error = %e, "restart-epoch dispatch failed; pausing for manual reset");
+                    warn!(error = %e, "go-live failed; pausing rather than looping the epoch");
                     set_paused(true).await?;
                 }
             }
@@ -1236,31 +1256,36 @@ fn cadence_of(clock: &Clock, day: Option<NaiveDate>) -> sim_control::Cadence {
 /// SimClockBadge "Restart epoch" button hits. Returns Ok on
 /// 200/202; any other status (or a connection failure) becomes
 /// an error so the caller can fall back to pause-and-wait.
-async fn trigger_restart_epoch(api_base: &str) -> Result<()> {
-    // api_base is either `direct://127.0.0.1` (in-process loopback
-    // marker) or a real http(s) origin. Translate the loopback to
-    // the canonical jobs-api port; everything else gets a literal
-    // POST.
-    let base = if let Some(host) = api_base.strip_prefix("direct://") {
-        format!("http://{host}:7900")
-    } else {
-        api_base.trim_end_matches('/').to_string()
-    };
-    let url = format!("{base}/api/jobs/sim-clock/restart-epoch");
-    let client = reqwest::Client::builder()
+/// Hand the clock over to real time.
+///
+/// `POST /api/clock/configure { warp_factor: 1.0 }` — the handler
+/// re-anchors so sim-time does not teleport, and `SimClockParams`
+/// documents 1.0 as real time. Sim mode at warp 1.0 anchored to now
+/// IS wall-clock; there is no mode to flip and no service to restart.
+///
+/// Goes to clock-api directly, like `set_paused` — clock-api owns
+/// clock state and the simulator is a pure consumer. jobs-api
+/// proxies pause/resume/restart-epoch but not configure, and adding
+/// a proxy route for one caller would put the clock's contract in
+/// two services.
+///
+/// `epoch_end` is deliberately left where it is. It stops being a cap
+/// the sim acts on (the caller's guard sees warp 1.0 and never fires
+/// again) and becomes what it should always have been: a record of
+/// the window the synthetic history covers.
+async fn go_live() -> Result<()> {
+    let clock_url = std::env::var("BOSS_CLOCK_URL").unwrap_or_else(|_| boss_ports::url("clock"));
+    let url = format!("{}/api/clock/configure", clock_url.trim_end_matches('/'));
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
-        .build()?;
-    let resp = client
+        .build()?
         .post(&url)
-        .header("x-boss-user", "{\"id\":\"system\",\"role\":\"platform-admin\",\"access_tier\":\"operator\",\"territory_account_ids\":[],\"direct_report_ids\":[],\"department\":\"platform\"}")
+        .json(&serde_json::json!({ "warp_factor": 1.0 }))
         .send()
         .await
+        .with_context(|| format!("POST {url}"))?
+        .error_for_status()
         .with_context(|| format!("POST {url}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("restart-epoch returned {status}: {body}");
-    }
     Ok(())
 }
 
