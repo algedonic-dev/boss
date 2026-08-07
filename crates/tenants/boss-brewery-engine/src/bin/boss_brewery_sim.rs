@@ -791,6 +791,28 @@ async fn main() -> Result<()> {
             let guard = engine.lock().expect("engine mutex poisoned");
             guard.tenant.meta.ticks_per_day()
         };
+        // Backfill runs at DAY granularity; live runs at the tenant's
+        // own (hourly). Warp is the phase marker again — the same one
+        // the go-live guard reads — so there is no second knob and no
+        // way for the two to disagree about which phase we are in.
+        //
+        // This is not a speed-up by itself: `per_tick_sleep_ms`
+        // divides one wall budget N ways, so 24 ticks and 1 tick cost
+        // the same per sim-day. What it buys is HEADROOM — one batch
+        // of work per sim-day instead of 24 — and headroom is what
+        // makes a shorter budget (higher warp) sustainable. Warp past
+        // ~2000 was previously "chase dead" at hourly granularity for
+        // exactly this reason: the day's work stopped fitting in the
+        // day's budget and the sim fell behind its own clock.
+        //
+        // Intra-day detail in fabricated history is the thing being
+        // traded away, and nothing evaluates it. The live segment —
+        // where the real measurement happens — keeps full resolution.
+        let ticks_per_day = if clock.warp_factor.unwrap_or(1.0) > 1.0 {
+            1
+        } else {
+            ticks_per_day
+        };
         assert!(ticks_per_day > 0);
         let per_tick_sleep_ms =
             (clock.tick_interval_seconds as u64 * 1000) / (ticks_per_day as u64);

@@ -127,11 +127,15 @@ echo "==> [4/9] priming the sim clock to $DEMO_EPOCH via clock-api"
 # used to trim it back and replay the year, which is what destroyed a
 # posted year-end close and a day of real user feedback.
 EPOCH_END="$(date -u +%F)"
+# Backfill warp. ~21s of wall per sim-day, so six months lands in about
+# an hour. Sustainable only because the sim drops to one tick per
+# sim-day while warp > 1 (see boss_brewery_sim.rs); at hourly
+# granularity anything past ~2000 fell behind its own clock.
 clock_ok=
 for attempt in 1 2 3 4 5 6; do
     code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 -X POST \
         -H 'content-type: application/json' \
-        -d "{\"epoch_start\":\"$DEMO_EPOCH\",\"epoch_end\":\"$EPOCH_END\",\"warp_factor\":1000}" \
+        -d "{\"epoch_start\":\"$DEMO_EPOCH\",\"epoch_end\":\"$EPOCH_END\",\"warp_factor\":4000}" \
         "http://127.0.0.1:7060/api/clock/configure" 2>/dev/null || echo 000)
     if [[ "$code" == "200" || "$code" == "201" ]]; then
         clock_ok=1
