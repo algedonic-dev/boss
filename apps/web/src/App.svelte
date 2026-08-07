@@ -207,12 +207,39 @@
       : route.kind === 'systemSubjects' ? 'system-subjects'
       : route.kind === 'systemModel' ? 'system-model'
       : route.kind === 'experiments' ? 'system-experiments'
+      // Everything below was falling through to 'me' — 21 of 74 route
+      // kinds, which meant the right page rendered inside the HOME
+      // chrome. Reported as "clicking Feedback triage took me to the
+      // Home app"; that was one symptom of twenty-one.
+      //
+      // The comment under this block used to claim the ternary
+      // "already resolves every route.kind down to" a section. It did
+      // not, and nothing checked, which is why the list below exists
+      // and why `every-route-has-a-section.test.ts` now pins it.
+      : route.kind === 'systemFeedback' ? 'system-feedback'
+      : route.kind === 'systemOsMap' ? 'system-os-map'
+      : route.kind === 'systemFlow' ? 'system-flow'
+      : route.kind === 'systemKb' ? 'system-kb'
+      : route.kind === 'systemDesign' ? 'system-design'
+      : route.kind === 'authAdmin' ? 'auth-admin'
+      : route.kind === 'views' ? 'views'
+      : route.kind === 'myCalendar' ? 'calendar'
+      : route.kind === 'products' || route.kind === 'product' ? 'products'
+      : route.kind === 'shop' || route.kind === 'shopProduct' ? 'shop'
+      : route.kind === 'newInvoice' || route.kind === 'newJournalEntry' ? 'finance'
+      // A purchase order and a vendor invoice are both about a vendor;
+      // neither has a sidebar row of its own.
+      : route.kind === 'po' || route.kind === 'vendorInvoice' ? 'vendors'
+      : route.kind === 'watchlist' ? 'accounts'
+      // 'me' is the honest answer for the rest, not a fallback:
+      // - login, stepFocus and home render OUTSIDE AppShell entirely,
+      //   so no section applies.
+      // - search is cross-cutting and has no sidebar row.
       : 'me',
   );
 
-  // Which app tab is active. Derived from `activeSection` — the id
-  // the ternary above already resolves every route.kind down to — via
-  // the catalog's `app` field.
+  // Which app tab is active. Derived from `activeSection` via the
+  // catalog's `app` field.
   //
   // This replaced a MODEL_KINDS set of Route['kind']s maintained here
   // alongside a MODEL_ROUTES set of RouteNames in AppShell.svelte.
