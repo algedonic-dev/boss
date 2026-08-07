@@ -7,7 +7,6 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 mod api;
-mod demo_session;
 mod perf;
 mod plugin_files;
 mod proxy;
@@ -48,13 +47,6 @@ pub(crate) struct AppState {
     pub session_key: Vec<u8>,
     pub proxy_client: reqwest::Client,
     pub perf: Arc<PerfCollector>,
-    /// Demo mode (`BOSS_DEMO_MODE=1`). When true, anonymous visitors
-    /// (no valid `boss_session` cookie) get a synthetic
-    /// `audit-readonly` session — read access to every projection,
-    /// no writes — so the playground deployment shows live data and
-    /// the PersonaSwitcher "View As" flow works without forcing
-    /// signup.
-    pub demo_mode: bool,
 }
 
 #[tokio::main]
@@ -123,20 +115,10 @@ async fn main() -> Result<()> {
         None
     };
 
-    let demo_mode = std::env::var("BOSS_DEMO_MODE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if demo_mode {
-        tracing::info!(
-            "BOSS_DEMO_MODE=1: anonymous visitors will be granted audit-readonly sessions"
-        );
-    }
-
     let state = Arc::new(AppState {
         session_key,
         proxy_client,
         perf: Arc::new(PerfCollector::new()),
-        demo_mode,
     });
 
     let app = build_router(local_auth_state.clone());
@@ -149,15 +131,6 @@ async fn main() -> Result<()> {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             role_headers::inject_role_headers,
-        ))
-        // Outermost: when BOSS_DEMO_MODE=1, mint a synthetic
-        // `audit-readonly` session for anonymous visitors so the
-        // playground shows live data without forcing signup. No-op
-        // when demo_mode=false or when a valid cookie is already
-        // present.
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            demo_session::session_minter,
         ))
         .with_state(state);
 
@@ -752,7 +725,6 @@ mod routing_tests {
             session_key: vec![0u8; 32],
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(PerfCollector::new()),
-            demo_mode: false,
         });
         build_router(local_auth).with_state(state)
     }

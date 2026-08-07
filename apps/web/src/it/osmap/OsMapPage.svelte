@@ -40,9 +40,17 @@
       // that changed nothing should not look like activity.
       if (map && next.high_water > map.high_water) lastAdvanced = Date.now();
       map = next;
+      // The number is handoffs the executor took part in — out, in,
+      // and internal — within the current window. Spelled out rather
+      // than left bare: an unlabelled figure on a node reads as a
+      // headcount or a queue depth just as easily, and the first
+      // question asked of this map was what it meant.
       nodes = layout(next.nodes).map((n) => ({
         ...n,
-        data: { ...n.data, label: `${n.data.label} · ${n.data.touched}` },
+        data: {
+          ...n.data,
+          label: `${n.data.label}\n${Number(n.data.touched).toLocaleString()} handoffs`,
+        },
       }));
       edges = toEdges(next.edges).map((e) => ({
         ...e,
@@ -90,7 +98,12 @@
   {#if map}
     <span class="os-stat">{map.nodes.length} executors</span>
     <span class="os-stat">{map.edges.length} routes</span>
-    <span class="os-stat">{map.handoffs_considered.toLocaleString()} handoffs</span>
+    <span class="os-stat">{map.handoffs_considered.toLocaleString()} handoffs in window</span>
+    <span class="os-note">
+      A node's count is every handoff it took part in — sent, received, or
+      internal — so the counts sum to more than the window: a handoff has two
+      ends.
+    </span>
     <span class="os-legend"><i class="os-swatch os-swatch-real"></i>real</span>
     <span class="os-legend"><i class="os-swatch os-swatch-sim"></i>simulated ({simulatedShare}%)</span>
   {/if}
@@ -142,6 +155,12 @@
   .os-stat {
     font-variant-numeric: tabular-nums;
   }
+  .os-note {
+    flex-basis: 100%;
+    font-size: 11px;
+    color: var(--text-dim, #a8a29e);
+    max-width: 62ch;
+  }
   .os-legend {
     display: inline-flex;
     align-items: center;
@@ -183,5 +202,9 @@
   }
   :global(.os-node) {
     font-size: 12px;
+    /* The label carries a second line now. */
+    white-space: pre-line;
+    text-align: center;
+    line-height: 1.3;
   }
 </style>

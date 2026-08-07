@@ -53,19 +53,14 @@ pub async fn inject_role_headers(
     strip_boss_headers(req.headers_mut());
 
     if let Some(session) = extract_session(&req, &state.session_key) {
-        // Demo-mode persona override. The SPA writes a `boss-persona`
-        // cookie when "View As" picks an employee; we use it as the
-        // effective id for the x-boss-user payload + headers. Gated
-        // on demo_mode AND the session being audit-readonly so a
-        // real BOSS login can't be hijacked by a forged cookie.
-        let persona_emp_id = if state.demo_mode && session.role.as_deref() == Some("audit-readonly")
-        {
-            extract_persona_cookie(&req)
-        } else {
-            None
-        };
-
-        let user_json = build_user_json(&session, persona_emp_id.as_deref());
+        // The identity is the session's, full stop. There used to be a
+        // demo-mode persona override here — a `boss-persona` cookie the
+        // SPA wrote for "View As" — gated on the session being the
+        // synthetic `audit-readonly` one. Demo mode is gone, so the
+        // gate could never open and the override was dead; a
+        // client-supplied cookie deciding who you are is not something
+        // to leave lying around unreachable.
+        let user_json = build_user_json(&session, None);
         if let Ok(val) = axum::http::HeaderValue::from_str(&user_json) {
             req.headers_mut().insert("x-boss-user", val);
         }
@@ -74,7 +69,7 @@ pub async fn inject_role_headers(
         {
             req.headers_mut().insert("x-boss-role", val);
         }
-        let effective_emp_id = persona_emp_id.as_deref().or(session.employee_id.as_deref());
+        let effective_emp_id = session.employee_id.as_deref();
         if let Some(emp_id) = effective_emp_id
             && let Ok(val) = axum::http::HeaderValue::from_str(emp_id)
         {
@@ -99,28 +94,6 @@ fn strip_boss_headers(headers: &mut axum::http::HeaderMap) {
     for name in inbound {
         headers.remove(&name);
     }
-}
-
-const PERSONA_COOKIE: &str = "boss-persona";
-
-/// Parse the `boss-persona` cookie value (an employee id) out of the
-/// Cookie header. Returns `None` when the cookie is missing or the
-/// value is empty / structurally invalid for an employee id slug
-/// (alphanumeric + `-`).
-fn extract_persona_cookie(req: &Request) -> Option<String> {
-    let cookie_header = req.headers().get(header::COOKIE)?.to_str().ok()?;
-    let raw = session::find_cookie(cookie_header, PERSONA_COOKIE)?;
-    // Employee ids are alphanumeric + dash + underscore. Reject
-    // anything else (no need to URL-decode; the SPA's
-    // `encodeURIComponent` is a no-op on the id alphabet).
-    if raw.is_empty()
-        || !raw
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return None;
-    }
-    Some(raw.to_string())
 }
 
 /// Build the JSON payload the `CurrentUser` extractor expects. Shape
@@ -171,46 +144,6 @@ fn extract_session(req: &Request, key: &[u8]) -> Option<Session> {
 mod tests {
     use super::*;
     use axum::http::Request;
-
-    fn req_with_cookie(value: &str) -> Request<axum::body::Body> {
-        let mut r = Request::builder().body(axum::body::Body::empty()).unwrap();
-        r.headers_mut().insert(
-            header::COOKIE,
-            axum::http::HeaderValue::from_str(value).unwrap(),
-        );
-        r
-    }
-
-    #[test]
-    fn persona_cookie_extract_happy_path() {
-        let r = req_with_cookie("boss-persona=emp-aa-004");
-        assert_eq!(extract_persona_cookie(&r), Some("emp-aa-004".to_string()));
-    }
-
-    #[test]
-    fn persona_cookie_extract_with_other_cookies() {
-        let r = req_with_cookie("foo=bar; boss-persona=emp-cto; other=x");
-        assert_eq!(extract_persona_cookie(&r), Some("emp-cto".to_string()));
-    }
-
-    #[test]
-    fn persona_cookie_missing_returns_none() {
-        let r = req_with_cookie("foo=bar; baz=qux");
-        assert_eq!(extract_persona_cookie(&r), None);
-    }
-
-    #[test]
-    fn persona_cookie_rejects_special_chars() {
-        // Defend against forged cookies trying to inject control
-        // chars or path separators into the eventual header value.
-        let r = req_with_cookie("boss-persona=emp; DROP TABLE");
-        // `find_cookie` parses up to the next `;` — so the captured
-        // value is `emp` plus whitespace, which still has a space.
-        // Either way the validator rejects.
-        assert_eq!(extract_persona_cookie(&r), Some("emp".to_string()));
-        let r2 = req_with_cookie("boss-persona=../etc/passwd");
-        assert_eq!(extract_persona_cookie(&r2), None);
-    }
 
     #[test]
     fn build_user_json_uses_persona_when_provided() {
@@ -272,7 +205,6 @@ mod tests {
             session_key: TEST_KEY.to_vec(),
             proxy_client: reqwest::Client::new(),
             perf: Arc::new(crate::perf::PerfCollector::new()),
-            demo_mode: false,
         });
         axum::Router::new()
             .route("/probe", axum::routing::get(probe))
