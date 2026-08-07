@@ -10,23 +10,22 @@
 //!   - `X-Boss-Employee-Id`: Boss employee ID (e.g., "emp-001").
 //!   - `X-Boss-Access-Tier`: operator | user.
 //!
-//! ## Demo-mode persona switching
+//! ## Identity comes from the session, and only from the session
 //!
-//! When demo mode is on, the SPA writes a `boss-persona=<employee-id>`
-//! cookie when the user picks a persona via the "View As" menu. The
-//! signed-session cookie (which the gateway minted as audit-readonly)
-//! stays unchanged, so policy scope remains read-only across every
-//! resource. But the **id** in `x-boss-user` switches to the chosen
-//! employee — that's what gates like `messages-api`'s "you can only
-//! read your own inbox" need to match. Without this, the SPA renders
-//! the persona's inbox URL but the backend rejects with 403 because
-//! the session id is still `demo@anonymous`.
+//! There is one source: the signed `boss_session` cookie. Client-
+//! supplied `x-boss-*` headers are stripped at the edge before
+//! anything reads them, so a caller cannot assert who they are.
 //!
-//! Trust note: this is a **demo affordance only**. A persona cookie
-//! cannot escalate scope beyond the underlying session — an
-//! audit-readonly session that claims a CEO persona still hits
-//! audit-readonly policy rules. The only effect is which employee
-//! id the per-row "is this you?" checks see.
+//! The gateway used to accept a second source — a `boss-persona=
+//! <employee-id>` cookie the SPA wrote for its "View As" menu, which
+//! replaced the **id** in `x-boss-user` while leaving policy scope on
+//! the underlying session. It was scoped to demo mode, and it went
+//! when demo mode did.
+//!
+//! The dev-server still reads that cookie for `bun run dev` and the
+//! smoke suite (`apps/web/src/dev-server.ts`), where there is no
+//! gateway and no real session to speak of. That is a local
+//! affordance and stops at the gateway's edge.
 
 use std::sync::Arc;
 
@@ -60,7 +59,7 @@ pub async fn inject_role_headers(
         // gate could never open and the override was dead; a
         // client-supplied cookie deciding who you are is not something
         // to leave lying around unreachable.
-        let user_json = build_user_json(&session, None);
+        let user_json = build_user_json(&session);
         if let Ok(val) = axum::http::HeaderValue::from_str(&user_json) {
             req.headers_mut().insert("x-boss-user", val);
         }
@@ -105,20 +104,20 @@ fn strip_boss_headers(headers: &mut axum::http::HeaderMap) {
 /// from `GET /api/people/{id}/scope` and baked into the cookie.
 /// That keeps the per-request injection zero-cost; staleness is
 /// bounded by the 8h session TTL.
-fn build_user_json(session: &Session, persona_emp_id: Option<&str>) -> String {
+fn build_user_json(session: &Session) -> String {
     let access_tier_value = match session.access_tier.as_str() {
         "operator" => "operator",
         _ => "user",
     };
-    // Identity precedence: (1) demo-mode persona override, (2) signed
-    // employee_id from the session, (3) username fallback.
-    let id = persona_emp_id
-        .or(session.employee_id.as_deref())
-        .unwrap_or(&session.username);
-    // Default-fall-through is `audit-readonly` (Demo Mode floor) so
-    // that any session reaching a backend without an explicit role
-    // gets read-everywhere / write-nothing semantics — belt-and-
-    // suspenders for any path that lands here with role == None.
+    // The signed `employee_id` when the session has one, otherwise the
+    // username. A guest session has no employee_id by design, so it
+    // identifies downstream as `guest@algedonic.dev` — which is what
+    // should appear against anything it touches.
+    let id = session.employee_id.as_deref().unwrap_or(&session.username);
+    // Default-fall-through is `audit-readonly` so that any session
+    // reaching a backend without an explicit role gets read-everywhere
+    // / write-nothing semantics — belt-and-suspenders for any path
+    // that lands here with role == None.
     let role = session.role.as_deref().unwrap_or("audit-readonly");
     // serde_json for robust escaping of id/role — some usernames
     // contain characters (`.`, `-`) that are header-safe but we want
@@ -146,18 +145,26 @@ mod tests {
     use axum::http::Request;
 
     #[test]
-    fn build_user_json_uses_persona_when_provided() {
-        let session = Session::new("demo@anonymous", 3600);
-        let json = build_user_json(&session, Some("emp-aa-004"));
-        assert!(json.contains("\"id\":\"emp-aa-004\""), "got: {json}");
-    }
-
-    #[test]
-    fn build_user_json_falls_back_to_session_when_no_persona() {
+    fn identity_is_the_signed_employee_id() {
         let mut session = Session::new("real@example.com", 3600);
         session.employee_id = Some("emp-001".to_string());
-        let json = build_user_json(&session, None);
+        let json = build_user_json(&session);
         assert!(json.contains("\"id\":\"emp-001\""), "got: {json}");
+    }
+
+    /// A guest carries no employee_id, and must identify as itself
+    /// rather than as an empty or defaulted employee — whatever it
+    /// touches gets attributed to a name someone can look up.
+    #[test]
+    fn a_session_without_an_employee_identifies_by_username() {
+        let mut session = Session::new("guest@algedonic.dev", 3600);
+        session.role = Some("audit-readonly".to_string());
+        let json = build_user_json(&session);
+        assert!(
+            json.contains("\"id\":\"guest@algedonic.dev\""),
+            "got: {json}"
+        );
+        assert!(json.contains("\"role\":\"audit-readonly\""), "got: {json}");
     }
 
     #[test]
