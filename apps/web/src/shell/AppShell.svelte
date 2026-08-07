@@ -63,7 +63,6 @@
   const APP_SURFACES: Readonly<Partial<Record<AppId, ReadonlyArray<RouteName>>>> = {
     crm: ['accounts', 'sales', 'support', 'shop', 'marketing-assets'],
     finance: ['finance', 'vendors'],
-    operations: ['ops', 'jobs', 'service', 'refurb', 'qa', 'calendar'],
     'supply-chain': ['warehouse', 'shipping', 'parts', 'products', 'catalog', 'assets'],
     people: ['people'],
   };

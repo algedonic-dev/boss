@@ -155,11 +155,6 @@ test.describe('the crawl covers every registered surface', () => {
   /// list is the work; adding to it is a decision.
   const DEFERRED: ReadonlyMap<string, string> = new Map([
     ['/system/monitoring', 'aggregation dashboard: snapshot .length needs a faithful fixture'],
-    // Surfaced by this drift test on its first run: the route was
-    // registered and never crawled. Under the generic [] catch-all it
-    // throws reading .length off an object-shaped snapshot — the same
-    // fixture gap as /system/monitoring, not a defect in the page.
-    ['/ux/ops', 'reads an object-shaped ops snapshot; needs a faithful fixture'],
     ['/ux/finance', 'statements .reduce needs object-shaped fixtures'],
     ['/ux/warehouse', 'summary.below_reorder_count needs a faithful fixture'],
     ['/ux/exec', '.find/.length over object-shaped summaries'],

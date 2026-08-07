@@ -75,8 +75,11 @@ export const APPS: ReadonlyArray<AppTab> = [
   { id: 'simulator', label: 'Simulator', href: '/simulator' },
   { id: 'crm', label: 'CRM', href: '/ux/accounts' },
   { id: 'finance', label: 'Finance', href: '/ux/finance' },
-  { id: 'operations', label: 'Operations', href: '/ux/ops' },
   { id: 'supply-chain', label: 'Supply Chain', href: '/ux/warehouse' },
   { id: 'people', label: 'People', href: '/ux/people' },
-  { id: 'it', label: 'IT', href: '/system' },
+  // Flow, not the System Model. The IT tab should open on what the
+  // team is getting through, not on how the machine is wired — the
+  // System Model is a reference you go to, Flow is a dashboard you
+  // watch. It is still one click away in the sidebar.
+  { id: 'it', label: 'IT', href: '/system/flow' },
 ];

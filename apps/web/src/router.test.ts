@@ -92,8 +92,6 @@ describe('parseRoute — every specific path matches its specific case', () => {
     // HR + QA + ops
     ['/ux/hr', { kind: 'hr' }],
     ['/ux/qa', { kind: 'qa' }],
-    ['/ux/ops', { kind: 'ops' }],
-    ['/ux/ops/anything', { kind: 'ops' }],
     // Policy + Workflow authoring (System Model). The workflows
     // `/authoring/<jobId>` route is the wildcard-precedence trap: it MUST
     // resolve before the catch-all `/workflows/(.+)` detail route.

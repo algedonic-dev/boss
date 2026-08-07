@@ -41,7 +41,6 @@
   import NewJournalEntryPage from './finance/NewJournalEntryPage.svelte';
   import HrPage from './hr/HrPage.svelte';
   import QaPage from './qa/QaPage.svelte';
-  import OpsDashboard from './ops/OpsDashboard.svelte';
   // SimPage retired 2026-05-03 — boss-sim-api is gone (HumanWorker
   // generator retirement step 9b). Tenant runners are CLI tools now.
   import ItKnowledgeBasePage from './it/ItKnowledgeBasePage.svelte';
@@ -191,7 +190,6 @@
       : route.kind === 'support' ? 'support'
       : route.kind === 'hr' ? 'hr'
       : route.kind === 'qa' ? 'qa'
-      : route.kind === 'ops' ? 'ops'
       : route.kind === 'calendar' ? 'calendar'
       : route.kind === 'schedule' ? 'schedule'
       : route.kind === 'exec' ? 'exec'
@@ -357,8 +355,6 @@
       <HrPage />
     {:else if route.kind === 'qa'}
       <QaPage />
-    {:else if route.kind === 'ops'}
-      <OpsDashboard />
     {:else if route.kind === 'systemKb'}
       <ItKnowledgeBasePage />
     {:else if route.kind === 'policy'}

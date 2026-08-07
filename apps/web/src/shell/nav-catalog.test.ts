@@ -195,7 +195,10 @@ describe('appForSection — the App.svelte tab derivation', () => {
     expect(appForSection('system-model')).toBe('it');
     expect(appForSection('accounts')).toBe('crm');
     expect(appForSection('finance')).toBe('finance');
-    expect(appForSection('jobs')).toBe('operations');
+    // 'jobs' moved to home when the operations app was deleted:
+    // Algedonic Ales has 14 departments and none is operations, so
+    // the app represented nobody. Interim — see feedback 43b61794.
+    expect(appForSection('jobs')).toBe('home');
     expect(appForSection('warehouse')).toBe('supply-chain');
     expect(appForSection('people')).toBe('people');
     expect(appForSection('inbox')).toBe('home');

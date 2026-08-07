@@ -56,16 +56,15 @@ export type NavItem = Readonly<{
 export type NavGroup = Readonly<{ label: string; items: ReadonlyArray<NavItem> }>;
 
 export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
-  jobs:      { id: 'jobs',      label: 'All jobs',         path: '/ux/jobs',      permKey: 'jobs',      app: 'operations' },
+  jobs:      { id: 'jobs',      label: 'All jobs',         path: '/ux/jobs',      permKey: 'jobs',      app: 'home' },
   sales:     { id: 'sales',     label: 'Sales pipeline',   path: '/ux/sales',     permKey: 'sales',     app: 'crm' },
-  service:   { id: 'service',   label: 'Service queue',    path: '/ux/service',   permKey: 'service',   module: 'support', app: 'operations' },
-  refurb:    { id: 'refurb',    label: 'Refurbishment',    path: '/ux/refurb',    permKey: 'refurb',    module: 'support', app: 'operations' },
-  qa:        { id: 'qa',        label: 'QA',               path: '/ux/qa',        permKey: 'qa',        module: 'qa',      app: 'operations' },
+  service:   { id: 'service',   label: 'Service queue',    path: '/ux/service',   permKey: 'service',   module: 'support', app: 'home' },
+  refurb:    { id: 'refurb',    label: 'Refurbishment',    path: '/ux/refurb',    permKey: 'refurb',    module: 'support', app: 'home' },
+  qa:        { id: 'qa',        label: 'QA',               path: '/ux/qa',        permKey: 'qa',        module: 'qa',      app: 'home' },
   finance:   { id: 'finance',   label: 'Finance',          path: '/ux/finance',   permKey: 'finance',   module: 'finance', app: 'finance' },
   warehouse: { id: 'warehouse', label: 'Inventory',        path: '/ux/warehouse', permKey: 'warehouse', module: 'warehouse', app: 'supply-chain' },
   shipping:  { id: 'shipping',  label: 'Shipments',        path: '/ux/shipping',  permKey: 'shipping',  module: 'shipping', app: 'supply-chain' },
   support:   { id: 'support',   label: 'Support',          path: '/ux/support',   permKey: 'support',   module: 'support', app: 'crm' },
-  ops:       { id: 'ops',       label: 'Operations',       path: '/ux/ops',       permKey: 'ops',       app: 'operations' },
   exec:      { id: 'exec',      label: 'Exec',             path: '/ux/exec',      permKey: 'exec',      module: 'exec',    app: 'home' },
   schedule:  { id: 'schedule',  label: 'My schedule',      path: '/ux/calendar/me', permKey: 'schedule', app: 'home' },
   catalog:   { id: 'catalog',   label: 'Equipment',        path: '/ux/catalog',   permKey: 'catalog',   module: 'equipment', app: 'supply-chain' },
@@ -79,7 +78,7 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
   inbox:     { id: 'inbox',     label: 'Inbox',            path: '/ux/inbox',     permKey: 'inbox',     app: 'home' },
   views:     { id: 'views',     label: 'Views',            path: '/ux/views',     permKey: 'views',     app: 'home' },
   'marketing-assets': { id: 'marketing-assets', label: 'Marketing assets', path: '/ux/marketing-assets', permKey: 'marketing-assets', module: 'marketing-assets', app: 'crm' },
-  calendar:  { id: 'calendar',  label: 'Release calendar', path: '/ux/calendar',  permKey: 'calendar',  module: 'calendar', app: 'operations' },
+  calendar:  { id: 'calendar',  label: 'Release calendar', path: '/ux/calendar',  permKey: 'calendar',  module: 'calendar', app: 'home' },
 
   // Modeling surfaces — operator-tier (no separate /admin tier).
   // policy + workflows are dept-head + COO authority (per the
@@ -153,13 +152,26 @@ export const DEPARTMENT_APP: Readonly<Record<string, AppId>> = {
 
   // The floor: everything that turns inputs into product, plus the
   // service and rework flows that share the Jobs/Steps surfaces.
-  production: 'operations',
-  packaging: 'operations',
-  taproom: 'operations',
-  maintenance: 'operations',
-  qa: 'operations',
-  service: 'operations',
-  refurb: 'operations',
+  //
+  // INTERIM. These pointed at an 'operations' app that was deleted
+  // because Algedonic Ales has no operations department — 14
+  // departments and not one of them matches, so the app represented
+  // nobody and nobody could reclaim it.
+  //
+  // Home is the honest holding place, not the answer: it is already
+  // documented as personal work whichever domain it belongs to, so a
+  // production lead lands somewhere that works rather than somewhere
+  // that lies. The real answer is the open decision in feedback
+  // 43b61794 — only 3 of 7 apps were ever real departments while 11
+  // departments had no app, so the app list probably wants DERIVING
+  // from the Class registry rather than hand-listing.
+  production: 'home',
+  packaging: 'home',
+  taproom: 'home',
+  maintenance: 'home',
+  qa: 'home',
+  service: 'home',
+  refurb: 'home',
 
   warehouse: 'supply-chain',
   distribution: 'supply-chain',

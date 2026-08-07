@@ -17,7 +17,7 @@ import type { RouteName, Role } from './permissions';
 export const WORK_BY_ROLE: Record<Role, ReadonlyArray<RouteName>> = {
   // ----- Executive -----
   ceo:  ['jobs', 'exec', 'sales'],
-  coo:  ['jobs', 'ops', 'exec'],
+  coo:  ['jobs', 'exec'],
   cto:  ['jobs', 'system-monitoring'],
   cfo:  ['jobs', 'finance', 'exec'],
 

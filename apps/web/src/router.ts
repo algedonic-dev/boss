@@ -67,7 +67,6 @@ export type Route =
   | { kind: 'support' }
   | { kind: 'hr' }
   | { kind: 'qa' }
-  | { kind: 'ops' }
   // 'itSim' retired 2026-05-03 with boss-sim-api (HumanWorker step 9b).
   | { kind: 'systemKb' }
   | { kind: 'systemMonitoring' }
@@ -228,7 +227,6 @@ export function parseRoute(pathname: string): Route {
 
   if (p === '/hr') return { kind: 'hr' };
   if (p === '/qa') return { kind: 'qa' };
-  if (p.startsWith('/ops')) return { kind: 'ops' };
 
   if (p === '/service') return { kind: 'service' };
   const tm = p.match(/^\/service\/(.+)$/);
