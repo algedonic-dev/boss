@@ -22,11 +22,17 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 HANDLERS=crates/orchestrators/boss-dispatcher-handlers/src/handlers
+# The assignment dispatcher lives in the core crate and carries its
+# identity as a reqwest DEFAULT header, so it has no `.header(...)`
+# line to grep for. That is exactly how it stayed invisible while its
+# writes landed on simulated Jobs marked real.
+ASSIGNMENT=crates/core/boss-dispatcher/src
 
-python3 - "$HANDLERS" <<'PY'
+python3 - "$HANDLERS" "$ASSIGNMENT" <<'PY'
 import pathlib, re, sys
 
 handlers = pathlib.Path(sys.argv[1])
+assignment = pathlib.Path(sys.argv[2])
 
 # Files whose calls legitimately carry no actor. Keep this empty
 # unless there is a recorded reason — a public webhook to a third
@@ -41,7 +47,7 @@ ALLOW = {
 CALL = re.compile(r"\.(post|get)\(\s*&?(url|[a-z_]*url)\b")
 
 failures = []
-for path in sorted(handlers.glob("*.rs")):
+for path in sorted(handlers.glob("*.rs")) + sorted(assignment.glob("*.rs")):
     if path.name in ALLOW:
         continue
     src = path.read_text()
@@ -61,11 +67,16 @@ for path in sorted(handlers.glob("*.rs")):
             if ".send()" in lines[j]:
                 break
         chunk = "\n".join(window)
-        if "x-boss-user" not in chunk:
-            failures.append(f"{path}:{i + 1}: {line.strip()}")
+        # Identity may ride on the client's default headers (the
+        # assignment dispatcher does that), but sim-ness cannot: it
+        # belongs to the event being handled, not to the client.
+        if "x-sim-origin" not in chunk:
+            failures.append(f"{path}:{i + 1}: no x-sim-origin — {line.strip()}")
+        elif "x-boss-user" not in chunk and "default_headers" not in path.read_text():
+            failures.append(f"{path}:{i + 1}: no actor — {line.strip()}")
 
 if failures:
-    print("FAIL — dispatcher calls with no rule-as-actor header:")
+    print("FAIL — dispatcher calls missing an actor or sim-origin header:")
     for f in failures:
         print(f"  {f}")
     print()
@@ -73,5 +84,5 @@ if failures:
     print("or use common::post_json, which does it for you.")
     raise SystemExit(1)
 
-print("ok: every dispatcher downstream call stamps its actor")
+print("ok: every dispatcher downstream call stamps its actor and its origin")
 PY

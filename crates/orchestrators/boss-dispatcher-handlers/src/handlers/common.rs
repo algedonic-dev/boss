@@ -181,6 +181,7 @@ pub(crate) async fn post_json(
         .post(url)
         .header("content-type", "application/json")
         .header("x-boss-user", dispatcher_actor_header(rule_name))
+        .header("x-sim-origin", sim_origin_value())
         .json(body)
         .send()
         .await
@@ -217,6 +218,7 @@ pub(crate) async fn get_json(
     let resp = client
         .get(url)
         .header("x-boss-user", dispatcher_actor_header(rule_name))
+        .header("x-sim-origin", sim_origin_value())
         .send()
         .await
         .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
