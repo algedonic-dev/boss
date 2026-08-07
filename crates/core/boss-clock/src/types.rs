@@ -165,6 +165,17 @@ impl SimClockParams {
     }
 }
 
+/// Deserialize `Option<Option<T>>` so an absent field and an explicit
+/// `null` are distinguishable. serde collapses both to `None`, which
+/// makes "leave it alone" and "remove it" the same request.
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(de).map(Some)
+}
+
 /// Body of `POST /api/clock/configure`. Operators (and the
 /// restart-epoch path) use this to reset the formula's
 /// parameters. All fields optional — only the supplied ones
@@ -179,8 +190,19 @@ pub struct ConfigureRequest {
     /// factor is preserved.
     #[serde(default)]
     pub epoch_start: Option<NaiveDate>,
-    #[serde(default)]
-    pub epoch_end: Option<NaiveDate>,
+    /// Absent leaves the cap alone; explicit `null` REMOVES it.
+    ///
+    /// Removing it has to be expressible, because `epoch_end` is not
+    /// only a guard callers read — it is a hard cap inside `now()`.
+    /// Sim-time clamps at it. A run that reaches its epoch_end and
+    /// hands the clock to real time therefore FREEZES at midnight of
+    /// that day unless the cap goes, and with absent-means-unchanged
+    /// there was no way to say so. Seen exactly that way: a backfill
+    /// went live at warp 1.0 and the clock sat at
+    /// `2026-08-07T00:00:00` while the simulator failed its readiness
+    /// gate on a loop.
+    #[serde(default, deserialize_with = "double_option")]
+    pub epoch_end: Option<Option<NaiveDate>>,
     /// Sim-seconds per wall-second. Default brewery playground
     /// value is `8640.0` (1 sim-day per 10 wall-seconds).
     /// Backtests use large values; live demo uses moderate.

@@ -231,8 +231,12 @@ async fn configure_handler(
             p.paused_offset_seconds = 0.0;
             p.paused_at = None;
         }
+        // Absent leaves the cap alone; explicit `null` removes it.
+        // Removing it is what a run needs when it stops being bounded
+        // — `now()` clamps at epoch_end, so a capped clock at warp 1.0
+        // is a frozen clock, not a live one.
         if let Some(ee) = req.epoch_end {
-            p.epoch_end = Some(ee);
+            p.epoch_end = ee;
         }
         if let Some(w) = req.warp_factor
             && w > 0.0
@@ -550,6 +554,95 @@ mod tests {
             &sim_after[..19],
             "sim-time teleported across the warp change: {sim_before} -> {sim_after}"
         );
+    }
+
+    /// Going live must UNFREEZE the clock, not just change the rate.
+    ///
+    /// `epoch_end` is a hard cap inside `now()`: sim-time clamps at it
+    /// and stops. So a run that reaches its epoch_end and drops to
+    /// warp 1.0 with the cap still set has a frozen clock, and every
+    /// consumer that waits on time waits forever. The playground did
+    /// exactly this — pinned at `2026-08-07T00:00:00` while the
+    /// simulator failed its readiness gate on a loop.
+    ///
+    /// The earlier reasoning was that the cap "stops being a cap the
+    /// sim acts on" once the guard sees warp 1.0. True of the guard,
+    /// irrelevant to the formula. This asserts the formula.
+    #[tokio::test]
+    async fn clearing_the_epoch_end_unfreezes_the_clock() {
+        let state = sim_state();
+        let app = router(state);
+
+        // A window that is already over: epoch_end in the past means
+        // `now()` is pinned at the cap from the first read.
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/clock/configure",
+            serde_json::json!({
+                "epoch_start": "2026-02-06",
+                "epoch_end": "2026-02-07",
+                "warp_factor": 86_400_000.0
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let (_, capped) = get_json(app.clone(), "/api/clock/now").await;
+        let a = capped["now"].as_str().expect("now").to_string();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let (_, still) = get_json(app.clone(), "/api/clock/now").await;
+        assert_eq!(
+            a,
+            still["now"].as_str().expect("now"),
+            "precondition: a capped clock does not advance"
+        );
+
+        // Go live: real time, and the cap removed. `null` has to be
+        // distinguishable from absent for this to be sayable at all.
+        let (st, cfg) = post_json(
+            app.clone(),
+            "/api/clock/configure",
+            serde_json::json!({ "warp_factor": 1.0, "epoch_end": null }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(
+            cfg["epoch_end"].is_null(),
+            "the cap must be gone, not merely ignored: {cfg}"
+        );
+
+        let (_, before) = get_json(app.clone(), "/api/clock/now").await;
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let (_, after) = get_json(app, "/api/clock/now").await;
+        assert_ne!(
+            before["now"].as_str(),
+            after["now"].as_str(),
+            "the clock is still frozen after going live"
+        );
+    }
+
+    /// An ABSENT epoch_end still means "leave it alone". Without this
+    /// the double-Option would be a silent way to wipe the cap on any
+    /// unrelated configure call.
+    #[tokio::test]
+    async fn an_absent_epoch_end_leaves_the_cap_alone() {
+        let state = sim_state();
+        let app = router(state);
+        let (_, _) = post_json(
+            app.clone(),
+            "/api/clock/configure",
+            serde_json::json!({ "epoch_start": "2026-02-06", "epoch_end": "2026-08-07",
+                                "warp_factor": 1000.0 }),
+        )
+        .await;
+        let (_, cfg) = post_json(
+            app,
+            "/api/clock/configure",
+            serde_json::json!({ "warp_factor": 500.0 }),
+        )
+        .await;
+        assert_eq!(cfg["epoch_end"], "2026-08-07");
     }
 
     async fn post_json(

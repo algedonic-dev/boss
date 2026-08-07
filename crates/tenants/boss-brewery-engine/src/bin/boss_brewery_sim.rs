@@ -1348,10 +1348,19 @@ fn jobs_base_for(api_base: &str) -> String {
 /// a proxy route for one caller would put the clock's contract in
 /// two services.
 ///
-/// `epoch_end` is deliberately left where it is. It stops being a cap
-/// the sim acts on (the caller's guard sees warp 1.0 and never fires
-/// again) and becomes what it should always have been: a record of
-/// the window the synthetic history covers.
+/// `epoch_end` is CLEARED, and that is not optional.
+///
+/// I originally left it, reasoning that it stopped being a cap the sim
+/// acts on once the guard saw warp 1.0. That was wrong in a way the
+/// guard cannot see: `epoch_end` is also a hard cap inside the clock
+/// formula. Sim-time clamps at it, so going live at warp 1.0 with the
+/// cap still set produces a FROZEN clock, not a live one — observed on
+/// the playground, stuck at `2026-08-07T00:00:00` while the simulator
+/// failed its readiness gate on a loop.
+///
+/// Clearing it needs the double-Option on `ConfigureRequest`: an
+/// absent field means "leave it", so `null` had to become expressible
+/// before this call could say what it means.
 async fn go_live() -> Result<()> {
     let clock_url = std::env::var("BOSS_CLOCK_URL").unwrap_or_else(|_| boss_ports::url("clock"));
     let url = format!("{}/api/clock/configure", clock_url.trim_end_matches('/'));
@@ -1359,7 +1368,7 @@ async fn go_live() -> Result<()> {
         .timeout(Duration::from_secs(15))
         .build()?
         .post(&url)
-        .json(&serde_json::json!({ "warp_factor": 1.0 }))
+        .json(&serde_json::json!({ "warp_factor": 1.0, "epoch_end": null }))
         .send()
         .await
         .with_context(|| format!("POST {url}"))?
