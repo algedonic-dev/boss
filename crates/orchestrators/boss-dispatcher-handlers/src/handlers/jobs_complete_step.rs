@@ -43,7 +43,7 @@ use boss_jobs::step_registry::{Completion, StepRegistry};
 use serde_json::json;
 use std::sync::Arc;
 
-use super::common::{StepEvent, dispatcher_actor_header};
+use super::common::{StepEvent, dispatcher_actor_header, sim_origin_value};
 
 pub struct JobsCompleteStep {
     client: reqwest::Client,
@@ -174,6 +174,7 @@ impl Handler for JobsCompleteStep {
             .put(&url)
             .header("content-type", "application/json")
             .header("x-boss-user", dispatcher_actor_header(&ctx.rule_name))
+            .header("x-sim-origin", sim_origin_value())
             .json(&body)
             .send()
             .await

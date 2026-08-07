@@ -28,7 +28,9 @@ use serde_json::{Value as JsonValue, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::common::{StepEvent, dispatcher_actor_header, dispatcher_reader_header};
+use super::common::{
+    StepEvent, dispatcher_actor_header, dispatcher_reader_header, sim_origin_value,
+};
 
 pub struct GateResolve {
     client: reqwest::Client,
@@ -87,6 +89,7 @@ impl GateResolve {
             .client
             .get(&url)
             .header("x-boss-user", dispatcher_reader_header())
+            .header("x-sim-origin", sim_origin_value())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
@@ -117,6 +120,7 @@ impl GateResolve {
             .client
             .get(&url)
             .header("x-boss-user", dispatcher_reader_header())
+            .header("x-sim-origin", sim_origin_value())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
@@ -149,6 +153,7 @@ impl GateResolve {
             .client
             .get(&url)
             .header("x-boss-user", dispatcher_reader_header())
+            .header("x-sim-origin", sim_origin_value())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
@@ -257,6 +262,7 @@ impl Handler for GateResolve {
             .put(&url)
             .header("content-type", "application/json")
             .header("x-boss-user", dispatcher_actor_header(&ctx.rule_name))
+            .header("x-sim-origin", sim_origin_value())
             .json(&body)
             .send()
             .await

@@ -53,7 +53,9 @@ use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
 use serde_json::{Value as JsonValue, json};
 use std::sync::Arc;
 
-use super::common::{StepEvent, dispatcher_actor_header, dispatcher_reader_header};
+use super::common::{
+    StepEvent, dispatcher_actor_header, dispatcher_reader_header, sim_origin_value,
+};
 
 /// One finished-good format a brewed batch can be packaged into. All
 /// fields come from the allocation step's seed metadata + a live stock
@@ -176,6 +178,7 @@ impl PackagingAllocate {
             .client
             .get(&url)
             .header("x-boss-user", dispatcher_reader_header())
+            .header("x-sim-origin", sim_origin_value())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
@@ -199,6 +202,7 @@ impl PackagingAllocate {
             .client
             .get(&url)
             .header("x-boss-user", dispatcher_reader_header())
+            .header("x-sim-origin", sim_origin_value())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
@@ -226,6 +230,7 @@ impl PackagingAllocate {
             .client
             .get(&url)
             .header("x-boss-user", dispatcher_reader_header())
+            .header("x-sim-origin", sim_origin_value())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
@@ -257,6 +262,7 @@ impl PackagingAllocate {
             .put(&url)
             .header("content-type", "application/json")
             .header("x-boss-user", dispatcher_actor_header(rule))
+            .header("x-sim-origin", sim_origin_value())
             .json(&body)
             .send()
             .await

@@ -130,19 +130,21 @@ impl DomainPublisher {
         timestamp: chrono::DateTime<chrono::Utc>,
     ) -> bool {
         let mut payload = inject_actor(payload, &actor);
-        // The sim marker stamps when EITHER:
-        // - the current task is part of a sim chain (the
-        //   incoming request had x-sim-origin: true → task-local
-        //   IN_SIM_CHAIN is set), OR
-        // - the clock-mode probe reports sim mode.
-        // The task-local wins when set so a sim chain that hops
-        // through a wall-clock service still stamps its events as
-        // simulated — data-integrity invariant the correctness
-        // protocol requires.
-        let mut simulated = crate::sim_origin::is_in_sim_chain();
-        if !simulated && let Some(probe) = &self.sim_probe {
-            simulated = probe.simulated().await;
-        }
+        // `_simulated` describes THIS event's origin, not the
+        // deployment's clock. An event is simulated when the task is
+        // part of a sim chain — the request carried `x-sim-origin`, or
+        // the dispatcher inherited it from the event it is reacting to.
+        //
+        // This used to fall back to the clock-mode probe when the
+        // task-local was unset, and that conflated "the clock is
+        // running simulated time" with "this activity is synthetic".
+        // On a deployment whose clock is always simulated — every demo
+        // — it marked EVERYTHING simulated, including a person filing
+        // feedback through the browser. That made the flag useless for
+        // the one job it has: telling real operator input apart from
+        // the sim, so the epoch reset can delete one and keep the
+        // other.
+        let simulated = crate::sim_origin::is_in_sim_chain();
         if simulated || self.sim_probe.is_some() {
             payload = inject_simulated(payload, simulated);
         }
@@ -201,10 +203,11 @@ impl DomainPublisher {
         actor: ActorId,
         timestamp: chrono::DateTime<chrono::Utc>,
     ) -> EventStamp {
-        let mut simulated = crate::sim_origin::is_in_sim_chain();
-        if !simulated && let Some(probe) = &self.sim_probe {
-            simulated = probe.simulated().await;
-        }
+        // Origin, not clock mode — same rule as `emit_with_actor_at`.
+        // The outbox path has to agree with the publisher path byte for
+        // byte, so a divergence here would make a rebuild disagree with
+        // the live write about what was simulated.
+        let simulated = crate::sim_origin::is_in_sim_chain();
         EventStamp {
             source: self.source.clone(),
             actor,

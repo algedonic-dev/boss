@@ -32,7 +32,7 @@ use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext, 
 use serde_json::json;
 use std::sync::Arc;
 
-use super::common::{dispatcher_actor_header, dispatcher_reader_header};
+use super::common::{dispatcher_actor_header, dispatcher_reader_header, sim_origin_value};
 
 pub struct JobsSubjobResolve {
     client: reqwest::Client,
@@ -66,6 +66,7 @@ impl JobsSubjobResolve {
             .client
             .get(&url)
             .header("x-boss-user", dispatcher_reader_header())
+            .header("x-sim-origin", sim_origin_value())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
@@ -173,6 +174,7 @@ impl Handler for JobsSubjobResolve {
             .put(&step_url)
             .header("content-type", "application/json")
             .header("x-boss-user", dispatcher_actor_header(&ctx.rule_name))
+            .header("x-sim-origin", sim_origin_value())
             .json(&put_body)
             .send()
             .await

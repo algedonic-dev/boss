@@ -54,7 +54,9 @@
 //! computation — so a loud retry (dead-letter if the facts never come)
 //! is the only path that conserves WIP.
 
-use super::common::{self, StepEvent, dispatcher_actor_header, dispatcher_reader_header};
+use super::common::{
+    self, StepEvent, dispatcher_actor_header, dispatcher_reader_header, sim_origin_value,
+};
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::Value as ExprValue;
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext, arg_string};
@@ -108,6 +110,7 @@ impl ProductsProduce {
             .client
             .get(&url)
             .header("x-boss-user", dispatcher_reader_header())
+            .header("x-sim-origin", sim_origin_value())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;
@@ -262,6 +265,7 @@ impl ProductsProduce {
             // the moment it wasn't — silently halting the whole
             // WIP→FG→COGS chain rather than failing anything visible.
             .header("x-boss-user", dispatcher_actor_header(rule_name))
+            .header("x-sim-origin", sim_origin_value())
             .json(&json!({
                 "kind": "finance.inventory.transferred",
                 "source_table": source_table,
@@ -307,6 +311,7 @@ impl ProductsProduce {
             .client
             .get(&url)
             .header("x-boss-user", dispatcher_reader_header())
+            .header("x-sim-origin", sim_origin_value())
             .send()
             .await
             .map_err(|e| HandlerError::Downstream(format!("GET {url}: {e}")))?;

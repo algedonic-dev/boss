@@ -6,7 +6,7 @@
 //! `PO-{subject_id}` template the procurement step uses when the
 //! author didn't stamp one.
 
-use super::common::{self, StepEvent, dispatcher_actor_header};
+use super::common::{self, StepEvent, dispatcher_actor_header, sim_origin_value};
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::Value;
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
@@ -63,6 +63,7 @@ impl InventoryReceive {
             .client
             .get(&url)
             .header("x-boss-user", header)
+            .header("x-sim-origin", sim_origin_value())
             .send()
             .await
         else {
@@ -187,6 +188,7 @@ impl Handler for InventoryReceive {
             .put(&url)
             .header("content-type", "application/json")
             .header("x-boss-user", header)
+            .header("x-sim-origin", sim_origin_value())
             .json(&json!({ "status": "received" }))
             .send()
             .await

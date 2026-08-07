@@ -200,7 +200,24 @@ pub async fn dispatch(
                     handler: inv.handler.clone(),
                 });
             };
-            let outcome = h.invoke(&inv.args, &ctx).await;
+            // Inherit the triggering event's sim-ness for the whole
+            // invocation. Downstream services decide `_simulated` from
+            // the `x-sim-origin` header, and the handlers read this
+            // task-local to set it — so a side effect of simulated
+            // work is simulated, and a side effect of a real user's
+            // action is real.
+            //
+            // Without this the dispatcher's writes fell back to
+            // clock-mode, which on a sim deployment marks EVERYTHING
+            // simulated: 251,609 dispatcher-rule events, 57% of the
+            // log, were marked that way with no reference to what
+            // actually triggered them.
+            let simulated = event_payload
+                .get("_simulated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let outcome =
+                boss_core::sim_origin::with_sim_chain(simulated, h.invoke(&inv.args, &ctx)).await;
             out.push(InvocationResult {
                 rule_name: m.rule_name.clone(),
                 handler: inv.handler.clone(),

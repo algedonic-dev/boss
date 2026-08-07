@@ -110,6 +110,23 @@ pub(crate) fn overhead_source_id(step_id: &str, credit_account: &str) -> String 
 /// API calls. Per the rule-as-actor model in the dispatcher design
 /// doc: every dispatcher-fired event names the rule as actor, with
 /// `executed_by = automation:dispatcher` distinct from `actor`.
+/// The `x-sim-origin` value for a downstream call.
+///
+/// Reads the task-local the dispatch loop set from the TRIGGERING
+/// event, so sim-ness is inherited rather than guessed. Downstream
+/// services parse `"true"`/`"1"` as simulated and anything else as
+/// real, so sending `"false"` explicitly is equivalent to omitting the
+/// header — and saying it out loud is better than relying on absence,
+/// because absence used to mean "ask the clock", which marked every
+/// real user action on this deployment as simulated.
+pub fn sim_origin_value() -> &'static str {
+    if boss_core::sim_origin::is_in_sim_chain() {
+        "true"
+    } else {
+        "false"
+    }
+}
+
 /// The dispatcher's identity for a READ.
 ///
 /// Writes stamp the specific rule (`dispatcher_actor_header`) because
