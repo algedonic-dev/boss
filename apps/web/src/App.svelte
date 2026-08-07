@@ -8,7 +8,7 @@
 
   import { onMount } from 'svelte';
   import { parseRoute, type Route } from './router';
-  import { DEMO_MODE, loadSession } from '@boss/web-kit/session/session.svelte';
+  import { loadSession } from '@boss/web-kit/session/session.svelte';
   import { loadManifest } from '@boss/web-kit/session/manifest.svelte';
   import { loadStepTypeRegistry } from './steps/surfaceRegistry.svelte';
   import { loadClasses } from '@boss/web-kit/session/classes.svelte';
@@ -127,15 +127,18 @@
   // /api/* response that comes back unauthenticated kicks the
   // operator to /login with the current path captured as ?next=.
   //
-  // Skipped in demo mode: anonymous demo visitors HAVE a valid
-  // (audit-readonly) session and most 401s in their flow are
-  // intentional — e.g., /api/auth/me returns 401 for demo
-  // sessions (that's what tells the AppShell to render
-  // "Sign in" instead of "Sign out"). Auto-redirecting on every
-  // such 401 breaks anonymous browsing entirely. In demo mode
-  // the visitor reaches /login via the explicit "Sign in" link,
-  // never via an interceptor.
-  if (!DEMO_MODE) {
+  // This used to be skipped in demo mode, because a middleware
+  // minted a session for anyone arriving without one and several
+  // 401s were then routine rather than a problem. Nothing mints a
+  // session any more: a visitor is signed in as an employee, or as
+  // a guest, or not at all. So a 401 means what it says, and the
+  // interceptor runs for everyone.
+  //
+  // It is what a guest whose session expired needs most — without
+  // it they keep browsing a shell that looks signed in while every
+  // request fails, which is precisely how the expiry that killed
+  // demo mode presented.
+  {
     const _origFetch = window.fetch;
     window.fetch = (async (
       input: RequestInfo | URL,

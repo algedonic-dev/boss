@@ -110,6 +110,12 @@ async fn main() -> Result<()> {
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .context("local-auth http client")?,
+            // Guest browsing rides on the flag that already means
+            // "this deployment is a demo, not a tenant's real
+            // company" — the brewery simulator gates on the same
+            // one. A second variable would be a second way to
+            // answer one question, and the two would drift.
+            guest_access: std::env::var("BOSS_DEMO_MODE").as_deref() == Ok("1"),
         }))
     } else {
         None
@@ -546,6 +552,12 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
             axum::routing::get(local_auth::me).with_state(la.clone()),
         )
         .route(
+            "/api/auth/guest",
+            axum::routing::get(local_auth::guest_available)
+                .post(local_auth::guest)
+                .with_state(la.clone()),
+        )
+        .route(
             "/api/auth/onboard",
             axum::routing::post(local_auth::onboard).with_state(la.clone()),
         )
@@ -823,9 +835,10 @@ mod routing_tests {
             store,
             session_key: vec![0u8; 32],
             http: reqwest::Client::new(),
+            guest_access: true,
         });
 
-        for path in ["/api/auth/me", "/api/auth/login"] {
+        for path in ["/api/auth/me", "/api/auth/login", "/api/auth/guest"] {
             let (_, body) = get(app_with(Some(la.clone())), path).await;
             assert!(
                 !body.contains(MISS),

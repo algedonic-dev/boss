@@ -239,14 +239,25 @@ TODO.
 
 ## Authentication
 
-Both paths run the gateway with **demo mode + local-auth side
-by side**. Demo mode (`BOSS_DEMO_MODE=1`) mints a synthetic
-`audit-readonly` session for anonymous visitors — read every
-projection, never write — so the SPA loads immediately on first
-hit. Local-auth (`BOSS_AUTH_PROVIDER=local-auth`) gates the
-`/login` route: the bootstrap-admin email + password upgrades
-the cookie to a real `platform-admin` session with full write
-access.
+Every visitor signs in. Local-auth
+(`BOSS_AUTH_PROVIDER=local-auth`) serves `/login`, where the
+bootstrap-admin email + password mints a `platform-admin`
+session with full write access.
+
+A demo deployment (`BOSS_DEMO_MODE=1`, which is also what
+decides whether the brewery simulator runs) adds a **Browse as a
+guest** button to that page. It signs the visitor in as
+`guest@algedonic.dev` with the `audit-readonly` role — read
+every projection, write nothing. Leave `BOSS_DEMO_MODE` unset
+and the button is not offered.
+
+Earlier versions did this without the button: a middleware
+minted the `audit-readonly` session for anyone who arrived
+without a valid cookie. Convenient until a session expired —
+the next request minted a guest session over the expired admin
+one and reissued the cookie under the same name, so the SPA
+still looked signed in while every write returned 403. A
+session now appears only when someone asks for one.
 
 The bootstrap-admin credential is provisioned automatically on
 both paths. Default password: `change-me`. The credential lives
@@ -281,10 +292,11 @@ before deploying anywhere reachable — it's the HMAC key the
 gateway uses to sign session cookies. The default value
 (`please-rotate-me-in-prod-do-not-leak`) is correctly named.
 
-To turn off demo mode and force a real login on every request,
+To withdraw the guest button (and stop the brewery simulator),
 unset `BOSS_DEMO_MODE` (Docker: remove the line from
 `docker-compose.yml`; bare-metal: edit
-`infra/bootstrap-local.sh`'s gateway env).
+`infra/bootstrap-local.sh`'s gateway env). A login is then the
+only way in.
 
 > ⚠  This is the v1 launch auth — file-backed credentials, no
 > account lockout, no email-based password reset, no MFA.

@@ -17,20 +17,55 @@
   let mode = $state<'login' | 'reset'>('login');
   let busy = $state<boolean>(false);
   let error = $state<string | null>(null);
+  let guestOffered = $state<boolean>(false);
 
   // If the SPA already has a session (someone hit /login while
   // logged in), redirect to home rather than bury them in a form.
+  //
+  // A guest is the exception: they are signed in, but arriving here
+  // is how they ask to stop being a guest, so bouncing them home
+  // would strand them in read-only with no way out but the logout
+  // menu. `employee_id` is the structural difference — every
+  // credential login carries one, a guest never does.
   onMount(async () => {
     try {
       const r = await fetch('/api/auth/me');
       if (r.ok) {
-        window.location.href = '/';
+        const me = await r.json();
+        if (me.employee_id) window.location.href = '/';
       }
     } catch {
       // ignore — auth provider may not be local-auth, in which
       // case this endpoint 404s and we just show the form.
     }
+    // Ask before offering: a tenant running BOSS on their own data
+    // does not enable guest access, and their people should never
+    // be shown a button that answers 404.
+    try {
+      const r = await fetch('/api/auth/guest');
+      if (r.ok) guestOffered = (await r.json()).enabled === true;
+    } catch {
+      // no availability endpoint — no button.
+    }
   });
+
+  async function continueAsGuest(): Promise<void> {
+    busy = true;
+    error = null;
+    try {
+      const r = await fetch('/api/auth/guest', { method: 'POST' });
+      if (!r.ok) {
+        error = (await r.text()) || `HTTP ${r.status}`;
+        return;
+      }
+      const params = new URLSearchParams(window.location.search);
+      window.location.href = params.get('next') || '/';
+    } catch (e) {
+      error = String(e);
+    } finally {
+      busy = false;
+    }
+  }
 
   async function login(): Promise<void> {
     busy = true;
@@ -201,6 +236,49 @@
     align-items: center;
     font-size: 12px;
   }
+  .guest-block {
+    margin-top: 16px;
+  }
+  .guest-divider {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 4px 0 14px;
+    font-size: 11px;
+    color: #a8a29e;
+  }
+  .guest-divider::before,
+  .guest-divider::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: #e7e5e4;
+  }
+  .guest-btn {
+    width: 100%;
+    background: #fff;
+    color: #1c1917;
+    border: 1px solid #d6d3d1;
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .guest-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .guest-btn:hover:not(:disabled) { background: #f5f5f4; border-color: #a8a29e; }
+  .guest-note {
+    margin: 8px 0 0;
+    font-size: 11px;
+    line-height: 1.5;
+    color: #78716c;
+  }
+  .guest-note code {
+    font-size: 11px;
+    background: #f5f5f4;
+    padding: 1px 4px;
+    border-radius: 3px;
+  }
 </style>
 
 <div class="login-shell">
@@ -278,5 +356,18 @@
         </button>
       </div>
     </form>
+
+    {#if guestOffered && mode === 'login'}
+      <div class="guest-block">
+        <div class="guest-divider"><span>or</span></div>
+        <button type="button" class="guest-btn" disabled={busy} on:click={continueAsGuest}>
+          Browse as a guest
+        </button>
+        <p class="guest-note">
+          Signs you in as <code>guest@algedonic.dev</code> — read-only. You can open
+          any record and follow the audit log; nothing you do changes anything.
+        </p>
+      </div>
+    {/if}
   </div>
 </div>
