@@ -170,8 +170,7 @@ impl crate::os_map::OsMapRepo for PgViewsRepo {
             "WITH recent AS (
                  SELECT audit_id,
                         payload->>'job_id'   AS job_id,
-                        payload->>'_actor'   AS actor,
-                        COALESCE((payload->>'_simulated')::boolean, false) AS simulated
+                        payload->>'_actor'   AS actor
                  FROM event_facts
                  WHERE kind = 'jobs.step.completed'
                    AND payload->>'job_id' IS NOT NULL
@@ -179,10 +178,18 @@ impl crate::os_map::OsMapRepo for PgViewsRepo {
                  LIMIT $1
              ),
              paired AS (
-                 SELECT actor,
-                        simulated,
-                        LAG(actor) OVER (PARTITION BY job_id ORDER BY audit_id) AS prev_actor
-                 FROM recent
+                 -- Sim-ness comes from the JOB, not the event. A Job is
+                 -- simulated or real from creation and immutably so, so a
+                 -- real operator clicking a simulated Job does not make
+                 -- that handoff real. Reading the event's own marker had
+                 -- the map disagreeing with the epoch trim about the same
+                 -- traffic — two surfaces answering one question two ways.
+                 SELECT r.actor,
+                        COALESCE(j.simulated, false) AS simulated,
+                        LAG(r.actor) OVER (PARTITION BY r.job_id ORDER BY r.audit_id)
+                            AS prev_actor
+                 FROM recent r
+                 LEFT JOIN jobs j ON j.id::text = r.job_id
              ),
              resolved AS (
                  SELECT
