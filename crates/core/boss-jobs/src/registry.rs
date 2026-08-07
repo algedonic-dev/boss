@@ -676,6 +676,193 @@ fn regenerate_deployment_spec() -> WorkflowSpec {
     spec
 }
 
+/// Build the canonical `backlog-item` WorkflowSpec.
+///
+/// Engineering backlog, modelled as work rather than as a markdown
+/// file. TODO.md carried 41 open items across eight sections when this
+/// was written, some more than a month old, and the file cannot tell
+/// you which of them are still true.
+///
+/// The Subject is the AREA the item touches — a `custom` Subject whose
+/// id is a crate or surface path (`/crate/boss-ledger`,
+/// `/surface/cockpit`). That makes "what is outstanding against the
+/// ledger" a Subject-history question rather than a grep.
+///
+/// ## Why this is not `user-feedback` with a different name
+///
+/// The shape is close — both fork on a disposition — but two of the
+/// routes here do not exist there, and they are the ones a backlog
+/// needs most:
+///
+/// - `stale`: the claim is no longer true, and nobody did it on
+///   purpose. Triaging this file found C1 ("event_facts and
+///   search_index have no refresh path") dead — two timers now
+///   refresh both, shipped by work that never referenced the item.
+///   Feedback does not rot this way; an outside report is about
+///   something that happened. An internal claim about the codebase
+///   decays every time the codebase moves, which is daily.
+/// - `verify`: the claim needs re-measuring before anyone acts. The
+///   same triage hit an item whose RATIONALE was stale ("masked
+///   because the gate only diffs journal lines" — it diffs facts now)
+///   while its DEFECT stood unverified. Those are different states
+///   and collapsing them is how a backlog becomes fiction.
+///
+/// ## Why `evidence` is required at triage
+///
+/// Because the failure mode of a backlog is not neglect, it is
+/// confident wrong answers read off the file. Both findings above
+/// came from checking the claim against the running system — one
+/// item died, one survived, and reading either off its own text
+/// would have got it backwards. You cannot route an item here
+/// without saying what you actually checked.
+///
+/// Step graph:
+///  -1. `filed`   — an item entered the backlog
+///   0. `triage`  — measure the claim, choose a route (human-gated)
+///   1..n         — one branch per route
+///   999. `closed`
+fn backlog_item_spec() -> WorkflowSpec {
+    const DISPOSITIONS: &str = "verify|design|build|duplicate|stale|decline";
+
+    /// A branch that leaves the Job open for someone to do the work.
+    /// Authority-gated for the same reason triage is: `task` declares
+    /// no required roles, so an ungated ready step gets role-matched
+    /// and completed by the simulated workforce.
+    fn branch(title: &str, label: &str, disposition: &str) -> StepSpec {
+        StepSpec {
+            title: title.into(),
+            kind: "task".into(),
+            ready_when: format!(
+                "steps.triage.done AND steps.triage.metadata.disposition = \"{disposition}\""
+            ),
+            title_template: label.into(),
+            authority_role: Some("platform-admin".into()),
+            ..Default::default()
+        }
+    }
+
+    fn closing_branch(
+        title: &str,
+        label: &str,
+        disposition: &str,
+        outcome_kind: &str,
+        outcome: &str,
+    ) -> StepSpec {
+        StepSpec {
+            title: title.into(),
+            kind: "outcome".into(),
+            ready_when: format!(
+                "steps.triage.done AND steps.triage.metadata.disposition = \"{disposition}\""
+            ),
+            title_template: label.into(),
+            metadata_defaults: serde_json::json!({ "outcome_kind": outcome_kind }),
+            terminal: Some(Terminal {
+                outcome: outcome.into(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    let steps = vec![
+        StepSpec {
+            title: "filed".into(),
+            kind: "trigger".into(),
+            ready_when: "true".into(),
+            title_template: "Filed to the backlog".into(),
+            metadata_defaults: serde_json::json!({
+                "trigger_kind": "operator",
+                "trigger_name": "item-enters-the-backlog",
+            }),
+            ..Default::default()
+        },
+        StepSpec {
+            title: "triage".into(),
+            kind: "task".into(),
+            ready_when: "steps.filed.done".into(),
+            title_template: "Measure the claim, choose a route".into(),
+            authority_role: Some("platform-admin".into()),
+            fields: vec![
+                boss_core::job::StepField {
+                    name: "disposition".into(),
+                    field_type: DISPOSITIONS.into(),
+                    required: true,
+                },
+                // What was checked, and what it showed. Required: see
+                // the doc comment. An item routed without a
+                // measurement is an opinion about code that may have
+                // moved since the item was written.
+                boss_core::job::StepField {
+                    name: "evidence".into(),
+                    field_type: "string".into(),
+                    required: true,
+                },
+            ],
+            ..Default::default()
+        },
+        branch("measure", "Re-measure the claim", "verify"),
+        branch("design-review", "Decide the design", "design"),
+        branch("build", "Build the change", "build"),
+        closing_branch(
+            "duplicate",
+            "Closed as a duplicate",
+            "duplicate",
+            "withdrawn",
+            "duplicate",
+        ),
+        // Not "completed" — nobody completed it. The world moved and
+        // the claim stopped being true, which is worth being able to
+        // count separately from work anyone chose to do.
+        closing_branch(
+            "stale",
+            "Closed — the claim no longer holds",
+            "stale",
+            "withdrawn",
+            "stale",
+        ),
+        closing_branch(
+            "declined",
+            "Closed without action",
+            "decline",
+            "aborted",
+            "declined",
+        ),
+        StepSpec {
+            title: "closed".into(),
+            kind: "outcome".into(),
+            ready_when: "steps.measure.done OR steps.design-review.done \
+                         OR steps.build.done"
+                .into(),
+            title_template: "Backlog item closed".into(),
+            metadata_defaults: serde_json::json!({ "outcome_kind": "completed" }),
+            terminal: Some(Terminal {
+                outcome: "completed".into(),
+            }),
+            ..Default::default()
+        },
+    ];
+
+    let mut spec = WorkflowSpec::platform_seed(
+        "backlog-item",
+        "Backlog item",
+        "platform",
+        vec!["custom".into()],
+        steps,
+    );
+    spec.metadata = serde_json::json!({ "owner_role": "platform-admin" });
+    spec.description = Some(
+        "One piece of engineering backlog, modelled as work rather than a line in a \
+         markdown file. The Subject is the area it touches, so \"what is outstanding \
+         against the ledger\" answers from Subject history. Triage requires the evidence \
+         behind the routing decision, because the failure mode of a backlog is not \
+         neglect but confident wrong answers read off its own text — an internal claim \
+         about the codebase decays every time the codebase moves. `stale` exists for the \
+         items that die without anyone doing them, and `verify` for the ones whose claim \
+         needs re-measuring before anyone acts."
+            .to_string(),
+    );
+    spec
+}
+
 /// Every Workflow that ships baked into the platform binary. Read by
 /// `boss-jobs-api`'s startup reconciler — `kind_registry
 /// .bootstrap_reconcile(&platform_workflows())` runs on every boot,
@@ -694,6 +881,7 @@ pub fn platform_workflows() -> Vec<WorkflowSpec> {
         user_feedback_spec(),
         ship_a_change_spec(),
         regenerate_deployment_spec(),
+        backlog_item_spec(),
     ]
 }
 
@@ -3468,9 +3656,9 @@ mod tests {
         let kinds = platform_workflows();
         assert_eq!(
             kinds.len(),
-            5,
+            6,
             "ships workflow-design + design-doc-review + user-feedback + ship-a-change \
-             + regenerate-deployment"
+             + regenerate-deployment + backlog-item"
         );
 
         // The boundary declaration is the whole point of the kind, so
@@ -3537,6 +3725,43 @@ mod tests {
                  and completed by the simulated workforce"
             );
         }
+
+        // The two routes that justify this being its own Workflow
+        // rather than user-feedback wearing a different label. Both
+        // came out of triaging TODO.md: one item was dead because the
+        // world moved (`stale`), another had a stale rationale but a
+        // live defect (`verify`). Drop either and a backlog rots into
+        // fiction with nowhere to record why.
+        let backlog = kinds
+            .iter()
+            .find(|k| k.kind == "backlog-item")
+            .expect("backlog-item present");
+        let triage = backlog
+            .steps
+            .iter()
+            .find(|s| s.title == "triage")
+            .expect("triage step present");
+        let disposition = triage
+            .fields
+            .iter()
+            .find(|f| f.name == "disposition")
+            .expect("disposition field");
+        for route in ["stale", "verify"] {
+            assert!(
+                disposition.field_type.split('|').any(|v| v == route),
+                "`{route}` must be a disposition — it is why this is not user-feedback"
+            );
+        }
+        // Evidence is what separates triage from filing: every route
+        // here is a claim about code that may have moved since the
+        // item was written.
+        assert!(
+            triage
+                .fields
+                .iter()
+                .any(|f| f.name == "evidence" && f.required),
+            "`evidence` must be required at done"
+        );
 
         let design = kinds
             .iter()
