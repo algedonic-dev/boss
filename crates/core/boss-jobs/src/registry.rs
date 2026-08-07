@@ -454,15 +454,30 @@ fn ship_a_change_spec() -> WorkflowSpec {
             }),
             ..Default::default()
         },
-        // A change that gets abandoned is a real outcome and the
-        // cadence view should be able to tell it apart from one still
-        // in flight. Ready from `scope` onward: anything can be
-        // dropped after its boundary is known, and dropping it before
-        // that is just not starting.
+        // A change that gets abandoned is a real outcome, and the
+        // cadence view should tell it apart from one still in flight.
+        //
+        // Gated on an explicit `job.metadata.abandoned` marker, NOT on
+        // "scope is done". The first version used the latter and it
+        // closed the very first Job filed against this Workflow: an
+        // ungated terminal that is ready is a terminal the dispatcher
+        // completes, so `complete-marker-on-step-ready` fired the
+        // instant scope finished, skipped build/gate/review, and shut
+        // the Job as abandoned seconds after it opened.
+        //
+        // An always-ready escape hatch is indistinguishable from "this
+        // Job is finished". Abandoning has to be an act someone
+        // performs, which is what the marker makes it.
         StepSpec {
             title: "abandoned".into(),
             kind: "outcome".into(),
-            ready_when: "steps.scope.done".into(),
+            // BOTH halves are load-bearing. `steps.scope.done` is the
+            // DAG edge — the viability lint rejects a step no trigger
+            // can reach, and gating on metadata alone left this one
+            // orphaned. The marker is what stops it being ready by
+            // default, which is what let the dispatcher close a Job
+            // the moment its scope was declared.
+            ready_when: "steps.scope.done AND job.metadata.abandoned = \"true\"".into(),
             title_template: "Abandoned".into(),
             metadata_defaults: serde_json::json!({ "outcome_kind": "aborted" }),
             terminal: Some(Terminal {
@@ -640,13 +655,22 @@ fn regenerate_deployment_spec() -> WorkflowSpec {
             }),
             ..Default::default()
         },
-        // A regen that fails partway is the normal bad case, and it
-        // leaves a deployment in a known-broken state. Ready from
-        // `scope` onward so it can be reached from wherever it died.
+        // A regen that fails partway is the normal bad case and leaves
+        // a deployment in a known-broken state, so it needs an
+        // outcome. Same gate as ship-a-change, for the same reason:
+        // an ungated terminal that is ready gets completed by the
+        // dispatcher, which would close a regen as abandoned the
+        // moment its scope was declared.
         StepSpec {
             title: "abandoned".into(),
             kind: "outcome".into(),
-            ready_when: "steps.scope.done".into(),
+            // BOTH halves are load-bearing. `steps.scope.done` is the
+            // DAG edge — the viability lint rejects a step no trigger
+            // can reach, and gating on metadata alone left this one
+            // orphaned. The marker is what stops it being ready by
+            // default, which is what let the dispatcher close a Job
+            // the moment its scope was declared.
+            ready_when: "steps.scope.done AND job.metadata.abandoned = \"true\"".into(),
             title_template: "Abandoned".into(),
             metadata_defaults: serde_json::json!({ "outcome_kind": "aborted" }),
             terminal: Some(Terminal {
@@ -3724,6 +3748,43 @@ mod tests {
                 "`{gated}` must wait for a person — an ungated step gets role-matched \
                  and completed by the simulated workforce"
             );
+        }
+
+        // No terminal may be ready on nothing but a prior step.
+        //
+        // The viability lint proves a terminal is REACHABLE; it cannot
+        // say whether reaching it is deliberate. `ship-a-change` had
+        // an `abandoned` step gated only on `steps.scope.done`, which
+        // passed the lint and then closed the first Job ever filed
+        // against the Workflow: an ungated terminal that is ready is
+        // one the dispatcher completes, so `complete-marker-on-step-
+        // ready` fired the instant scope finished, skipped
+        // build/gate/review, and shut the Job seconds after it opened.
+        //
+        // The rule: an escape-hatch terminal needs a condition a
+        // PERSON supplies. A disposition on a fork step counts; so
+        // does a job-metadata marker. Bare step-completion does not.
+        for wf in &kinds {
+            for step in wf.steps.iter().filter(|s| s.terminal.is_some()) {
+                let rw = &step.ready_when;
+                // Terminals that conclude real work are fine gated on
+                // the steps that did it. This targets the ones whose
+                // whole purpose is to bail out.
+                if !matches!(
+                    step.title.as_str(),
+                    "abandoned" | "declined" | "duplicate" | "stale"
+                ) {
+                    continue;
+                }
+                assert!(
+                    rw.contains("metadata"),
+                    "{}/{}: an escape-hatch terminal ready on step state alone gets \
+                     auto-completed the moment it becomes ready — it needs a marker a \
+                     person sets. ready_when = {rw:?}",
+                    wf.kind,
+                    step.title
+                );
+            }
         }
 
         // The two routes that justify this being its own Workflow

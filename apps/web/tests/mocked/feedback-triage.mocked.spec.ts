@@ -110,7 +110,7 @@ const JOBS = [
 test.describe('feedback triage board', () => {
   test.beforeEach(async ({ page }) => {
     await page.route(/\/api\/tenant\/manifest$/, (r) => r.fulfill({ json: MANIFEST }));
-    await page.route(/\/api\/jobs\/kinds$/, (r) => r.fulfill({ json: [KIND] }));
+    await page.route(/\/api\/workflows$/, (r) => r.fulfill({ json: [KIND] }));
     await page.route(/\/api\/jobs\?kind=user-feedback/, (r) =>
       r.fulfill({ json: { data: JOBS, total: JOBS.length } }),
     );
