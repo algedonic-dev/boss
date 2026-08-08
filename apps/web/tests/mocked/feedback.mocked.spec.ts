@@ -50,7 +50,8 @@ test.describe('feedback control', () => {
 
     await mountPage(page, '/ux/views');
     await chromeFeedback(page).click();
-    await page.getByPlaceholder(/wrong, missing, or confusing/i).fill('Column picker forgets my choice');
+    await page.getByRole('radio', { name: /^feature$/i }).click();
+    await page.getByPlaceholder(/idea, a gap/i).fill('Column picker forgets my choice');
     await page.getByRole('button', { name: /^send$/i }).click();
 
     await expect(page.getByText(/opened a feedback Job/i)).toBeVisible();
@@ -85,9 +86,50 @@ test.describe('feedback control', () => {
     });
     await mountPage(page, '/ux/jobs');
     await chromeFeedback(page).click();
-    await page.getByPlaceholder(/wrong, missing, or confusing/i).fill('something');
+    await page.getByRole('radio', { name: /^feature$/i }).click();
+    await page.getByPlaceholder(/idea, a gap/i).fill('something');
     await page.getByRole('button', { name: /^send$/i }).click();
     await expect(page.getByText(/invalid job body/i)).toBeVisible();
     await expect(page.getByText(/opened a feedback Job/i)).toHaveCount(0);
+  });
+
+  test('a bug asks for both halves and files them as one message', async ({ page }) => {
+    // A bug is a claim that the software is wrong, and the claim needs
+    // what happened AND what was expected. Filed as one blob the pair
+    // was usually half-missing, because the reporter writes down only
+    // the surprising half.
+    let posted: Record<string, unknown> | null = null;
+    await page.route('**/api/jobs', async (route) => {
+      if (route.request().method() !== 'POST') return route.fallback();
+      posted = route.request().postDataJSON() as Record<string, unknown>;
+      return route.fulfill({ json: { id: 'job-fb-2', kind: 'user-feedback' } });
+    });
+
+    await mountPage(page, '/ux/views');
+    await chromeFeedback(page).click();
+
+    // Bug is the default, and Send stays disabled until BOTH halves are
+    // given — one half is the state this change exists to prevent.
+    const send = page.getByRole('button', { name: /^send$/i });
+    await page.getByPlaceholder(/actually did/i).fill('Saved and showed the old value');
+    await expect(send).toBeDisabled();
+    await page.getByPlaceholder(/should have done/i).fill('Showed the value I typed');
+    await expect(send).toBeEnabled();
+    await send.click();
+
+    await expect(page.getByText(/opened a feedback Job/i)).toBeVisible();
+    const body = posted as unknown as {
+      metadata: { message: string; feedback_kind: string; reality: string; expectation: string };
+      tags: string[];
+    };
+    // One `message` field, so every existing reader — the triage board,
+    // the detail modal, the queue script — keeps working unchanged.
+    expect(body.metadata.message).toContain('Saved and showed the old value');
+    expect(body.metadata.message).toContain('Showed the value I typed');
+    // The halves survive separately too, for a surface that wants them.
+    expect(body.metadata.feedback_kind).toBe('bug');
+    expect(body.metadata.reality).toBe('Saved and showed the old value');
+    expect(body.metadata.expectation).toBe('Showed the value I typed');
+    expect(body.tags).toContain('bug');
   });
 });
