@@ -99,7 +99,20 @@ fi
 # The deploy compares this against the working tree instead of
 # comparing mtimes, because git rewrites mtimes on every checkout and
 # rebase; see infra/src-fingerprint.sh for the incident.
-"$(dirname "$0")/src-fingerprint.sh" > "$RELEASE_DIR/.boss-src-fingerprint" || true
+#
+# The stamp failing IS a build failure: unstamped (or stale-stamped)
+# binaries cannot be verified against the tree, and the deploy
+# pre-flight will refuse them later with a far less useful message.
+# This line carried `|| true` and lived up to it on 2026-08-08 — a
+# root-owned stale stamp survived a sudo-era build, this script said
+# "complete", and the mismatch surfaced only at deploy time.
+if ! "$(dirname "$0")/src-fingerprint.sh" > "$RELEASE_DIR/.boss-src-fingerprint"; then
+    echo "FATAL: could not stamp $RELEASE_DIR/.boss-src-fingerprint — the binaries" >&2
+    echo "       are fine but unverifiable, so this build cannot be deployed." >&2
+    echo "       (Root-owned stamp from an old sudo build? fix with:" >&2
+    echo "        sudo chown $(id -un) $RELEASE_DIR/.boss-src-fingerprint )" >&2
+    exit 1
+fi
 
 echo "==> release build complete. Next: sudo infra/deploy-services.sh prod"
 

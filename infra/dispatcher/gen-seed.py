@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
-"""Generate infra/postgres/schema/41-dispatcher.sql from rules.toml.
+"""RETIRED as a regenerator — 41-dispatcher.sql is an applied migration.
 
-The dispatcher rules moved to a DB registry (the `dispatcher_rules` table);
-rules.toml stays as the human-authored source, and this script regenerates
-the schema seed from it so the two can't be hand-edited apart. Run from the
-repo root:  python3 infra/dispatcher/gen-seed.py
+This script used to regenerate infra/postgres/schema/41-dispatcher.sql
+from rules.toml. Since docs/design/schema-migrations.md, applied
+migrations are history: editing 41 trips migrate.sh's checksum guard on
+every live database. A rule added or changed after the runner landed
+gets its OWN manifest entry — a new NNN-dispatcher-rule-*.sql with an
+ON CONFLICT-safe INSERT (see 101-dispatcher-rule-step-assigned.sql),
+appended to manifest.txt and boss-testing's SCHEMA_FILES.
 
-The `dispatcher_rules_seed_matches_toml` test (boss-dispatcher) guards the
-committed seed against rules.toml drift.
+The `dispatcher_rules_seed_matches_toml` test still guards the union of
+all seed migrations against rules.toml, so drift still fails CI.
 """
 import json
+import sys
 import tomllib
 from pathlib import Path
+
+sys.exit(
+    "gen-seed.py: refusing to regenerate 41-dispatcher.sql — it is an applied\n"
+    "migration and applied migrations are history (checksum-guarded on every\n"
+    "live DB). Add the rule change as a new NNN-dispatcher-rule-*.sql manifest\n"
+    "entry instead; 101-dispatcher-rule-step-assigned.sql is the worked example."
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 RULES_TOML = ROOT / "infra" / "dispatcher" / "rules.toml"
