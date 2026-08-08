@@ -337,7 +337,7 @@ Scratch is disposable. Fastest recovery:
 sudo systemctl stop boss-*-api-scratch
 sudo -u postgres psql -c "DROP DATABASE IF EXISTS boss_scratch;"
 sudo -u postgres psql -c "CREATE DATABASE boss_scratch OWNER boss;"
-/opt/boss/infra/postgres/apply-schema.sh | sudo -u postgres psql -d boss_scratch
+/opt/boss/infra/postgres/migrate.sh -- sudo -u postgres psql -d boss_scratch
 sudo systemctl start boss-*-api-scratch
 ```
 

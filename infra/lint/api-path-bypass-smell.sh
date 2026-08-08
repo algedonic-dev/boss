@@ -19,7 +19,7 @@
 #                        the ONE legitimate place domain tables are written)
 #   - rebuilders:        crates/*/*/src/rebuild.rs    (recompute projections
 #                        FROM the audit_log — derived state, not new data)
-#   - schema / DDL:      CREATE / DROP / ALTER, dropdb / createdb, apply-schema
+#   - schema / DDL:      CREATE / DROP / ALTER, dropdb / createdb, migrate.sh
 #   - reads:             SELECT / to_regclass / EXISTS …
 #   - known stop-gaps:   the ALLOWLIST below — each tied to a reason. Clearing
 #                        an entry must re-trip the lint.
@@ -62,6 +62,10 @@ ALLOWLIST=(
     "infra/check-service-write-roundtrip.sh::diagnostic write-roundtrip probe"
     # Retention/GC, not data-loading: purges expired message events on a timer.
     "crates/modules/boss-messages/src/bin/boss_messages_events_purge.rs::message-events retention GC"
+    # Migration bookkeeping, not domain data: schema_migrations records which
+    # manifest entries a database has applied. Permanent — DDL's ledger is
+    # control-plane by nature (docs/design/schema-migrations.md).
+    "infra/postgres/migrate.sh::schema_migrations bookkeeping — control-plane, the migration runner itself"
 )
 
 allowlisted() {  # $1 = "file:line:content"
