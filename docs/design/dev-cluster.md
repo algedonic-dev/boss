@@ -18,9 +18,13 @@ expand/contract convention that unblocked rolling updates) ·
   separable from the modelling question.
 - **Direction after that**: review moves off GitHub; GitHub becomes a
   daily mirror. Five machines, one LAN, 4–8 cores each.
-- **No k3s.** It would rewrite the deploy model the fingerprint/
-  pre-flight work just made honest. If orchestration ever lands, it is
-  a later decision made against measured pain.
+- **No k3s** — *superseded 2026-08-08: the cluster is Talos Linux*,
+  which is Kubernetes beyond what this decision declined. What
+  survives of the rationale is its real content: the **playground's**
+  deploy model (systemd units, deploy-services.sh, the fingerprint
+  pre-flight) is untouched until Q4 moves it; the cluster's own
+  workloads are K8s-native from day one because Talos offers no other
+  mode — no shell, no SSH, no host packages, machine config by API.
 - **Don't distribute the build — share its cache.** sccache, not a
   build farm: the ~50-minute release build is embarrassingly parallel
   per crate, and a warm shared cache captures most of the win without
@@ -60,16 +64,35 @@ Roles, smallest-first:
    (Forgejo + the daily GitHub mirror) and the train conductor's home,
    once review moves in-house.
 
-## Bring-up mechanics
+## Bring-up mechanics (Talos)
 
-`infra/cluster/join-build-node.sh` is the one-command join for a
-build node: idempotent, checks-then-installs (toolchain, sccache,
-runner), and refuses loudly where a human credential is needed (the
-Tailscale login, the runner registration token) rather than
-half-completing. **First-contact honesty: the script is untested on
-real hardware until machine #1 joins** — the OSS-quickstart VM
-validations each surfaced install bugs only contact finds, and this
-will too. Budget for a first-contact fix pass.
+Talos supersedes the join-script model wholesale — there is no shell
+for `join-build-node.sh` to run in (the script is deleted with this
+revision; its checks-then-install, refuse-loudly spirit carries into
+the machine-config flow). Bring-up becomes:
+
+1. **Machine configs in the repo** (`infra/cluster/talos/`): a
+   control-plane patch and a worker patch, applied with `talosctl` —
+   the node inventory (Q1) fills in the addresses. Talos's KubeSpan
+   gives the WireGuard mesh natively (see Q2).
+2. **One builder image**, not per-node toolchains: Rust + sccache
+   client, built from a Dockerfile in-repo. The repo has exactly one
+   container image today (the devcontainer) — this is the second,
+   and the only one build-1 needs.
+3. **Runners as workloads**: actions-runner-controller (repo-scoped,
+   same trust question as before — now Q3 is pod-security-shaped
+   rather than unix-user-shaped).
+4. **sccache server as a Deployment** with a PVC for the cache.
+
+**First-contact honesty transfers**: none of this has touched real
+hardware; the OSS-quickstart VM validations each surfaced bugs only
+contact finds, and Talos adds an image/PKI bootstrap with its own
+first-contact class. Budget the fix pass.
+
+What deliberately does NOT containerize now: the ~30 BOSS services.
+Build-1's job is CI, and CI needs one image. Service images become
+real work only if Q4 moves the playground onto the cluster — decide
+there, not here.
 
 The train composes with this in two steps: first the conductor's
 `ci` step starts reading checks that ran on cluster runners (no
@@ -134,19 +157,24 @@ reached today. This gates everything; the design assumes only "Linux,
 
 ### Q2: Tailscale or bare WireGuard?
 
-Tailscale: zero-config mesh, MagicDNS, ACLs, a third-party control
-plane. Bare WireGuard: fully self-hosted, more per-node bookkeeping.
-The recorded instinct (self-host the pipeline) pulls toward WireGuard;
-the bring-up-cost instinct pulls toward Tailscale. Either satisfies
-the topology; picking is a values call.
+Largely answered by the Talos choice: **KubeSpan** (Talos's built-in
+WireGuard mesh) covers node↔node with zero extra machinery, and the
+self-host instinct is satisfied natively. What remains of Q2 is only
+the *non-Talos* edge: how does the GCP playground box reach the
+cluster? Deferrable — runners dial out to GitHub, so nothing needs
+inbound connectivity until deploy-from-cluster or the log-copy
+migration; decide then (Tailscale on both sides vs a WireGuard peer
+into KubeSpan).
 
 ### Q3: Runner scope and trust
 
 A self-hosted runner executes workflow code from PRs. Repo-scoped
 runner + no fork PRs on it (the fork model here means train branches
-come from `dauld/boss-fork`) needs an explicit decision: which events
-may run on cluster runners, and does the runner user get the same
-sudo-less containment the deploy scripts assume?
+come from `dauld:boss-fork`) needs an explicit decision: which events
+may run on cluster runners — and under Talos the containment question
+becomes pod-shaped: what securityContext/namespace isolation the
+runner pods get, rather than which unix user the runner daemon runs
+as.
 
 ### Q4: When does the playground move?
 
