@@ -63,6 +63,7 @@ catalog, and the open-PR list have reached the same disposition?
 | `8c55d799` | step focus | defect | Full-page step route demanded a plugin; fell back to the platform surface | **No** — needed the surface dispatcher |
 | `bd500848` | job page | defect | Same cause as above, older link shape | **Partly** — a dedupe rule could have paired them |
 | `74cbe627` | `/system/workflows` | defect (agent-filed) | Version pin defeated by in-place reconcile; both halves fixed | **No** — needed reconcile + re-eval together |
+| `f91831a6` | `/system/monitoring` | defect | IT tab's landing page rendered in Home chrome: the route→section ternary emitted camelCase ids that miss the kebab-case catalog keys; map extracted to a typed module + the section→catalog half pinned | **No** — the text says "still in home"; the cause is a vocabulary drift two files away |
 
 ### Notes per item
 
