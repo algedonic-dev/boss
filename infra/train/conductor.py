@@ -223,6 +223,11 @@ def ensure_clone():
         os.makedirs(HOME, exist_ok=True)
         sh("git", "clone", UPSTREAM_URL, CLONE)
         sh("git", "-C", CLONE, "remote", "add", "fork", FORK_URL)
+        # The merge commits the assembly makes need an author, and the
+        # honest one is the machine that made them (a fresh clone has
+        # no identity — the first real run failed exactly here).
+        sh("git", "-C", CLONE, "config", "user.name", "BOSS train conductor")
+        sh("git", "-C", CLONE, "config", "user.email", "train-conductor@boss.invalid")
     sh("git", "-C", CLONE, "fetch", "origin", "--prune")
     sh("git", "-C", CLONE, "fetch", "fork", "--prune")
 
