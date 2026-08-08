@@ -66,10 +66,24 @@ const ACK_WAIT: Duration = Duration::from_secs(30);
 /// way. Domain families with no rule topic still flow over core NATS
 /// only; the test starts failing the moment a rule consumes one.
 pub fn stream_subjects() -> Vec<String> {
-    ["jobs.>", "step.>", "inventory.>", "commerce.>", "ledger.>"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    // `asset.>` joined 2026-08-08 (feedback `0da79b36`): the assets
+    // ingress rebuilds its repository from these events, and consuming
+    // them at-most-once off core NATS silently dropped writes. The
+    // subject must be HERE for the `assets-ingress` durable consumer
+    // to receive anything — `ensure_stream` reconciles a live broker's
+    // subject list on every service start, so adding a subject in code
+    // reaches prod on deploy.
+    [
+        "jobs.>",
+        "step.>",
+        "inventory.>",
+        "commerce.>",
+        "ledger.>",
+        "asset.>",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// Per-attempt redelivery spacing. Entry `i` is the delay before delivery
@@ -393,7 +407,14 @@ mod tests {
         assert_eq!(c.name, "BOSS_EVENTS");
         assert_eq!(
             c.subjects,
-            vec!["jobs.>", "step.>", "inventory.>", "commerce.>", "ledger.>"]
+            vec![
+                "jobs.>",
+                "step.>",
+                "inventory.>",
+                "commerce.>",
+                "ledger.>",
+                "asset.>"
+            ]
         );
         assert_eq!(c.retention, stream::RetentionPolicy::Limits);
         assert_eq!(c.storage, stream::StorageType::File);
