@@ -55,8 +55,8 @@ fi
 
 # ---- 3. apply schema ---------------------------------------------------------
 
-echo "==> [1/3] applying per-module schema (manifest)"
-"$REPO/infra/postgres/apply-schema.sh" | psql -v ON_ERROR_STOP=1 >/dev/null
+echo "==> [1/3] applying per-module schema (migrate.sh, manifest order)"
+"$REPO/infra/postgres/migrate.sh" >/dev/null
 
 # The demo builds itself live: boss-services seeds the operator-baseline +
 # brewery tenant through the public API and starts the sim, which grows the

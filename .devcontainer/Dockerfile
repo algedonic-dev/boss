@@ -9,7 +9,7 @@ FROM mcr.microsoft.com/devcontainers/rust:1-bookworm@sha256:7d2b4e7912ea2913ce82
 
 # - cmake + clang: ring / aws-lc-sys (rustls) build their C/asm bits
 # - pkg-config + libssl-dev: native crates that probe for OpenSSL
-# - postgresql-client: psql, used by apply-schema.sh + the CLIs
+# - postgresql-client: psql, used by migrate.sh + the CLIs
 # - jq: the infra bring-up scripts parse JSON with it
 # (build-essential / gcc are already in the base image.)
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \

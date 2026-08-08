@@ -2,8 +2,8 @@
 //!
 //! Each `TestDb::new()` call creates a fresh, randomly-named database
 //! (`test_boss_<uuid>`), loads the per-module `infra/postgres/schema/`
-//! files (via `apply-schema.sh` / the `SCHEMA_FILES` list)
-//! into it, and returns a connection pool. On `Drop`, the database is
+//! files (the `SCHEMA_FILES` list — the same ordered manifest
+//! `migrate.sh` applies) into it, and returns a connection pool. On `Drop`, the database is
 //! dropped via a best-effort background task — if that fails (test
 //! process killed, runtime already shut down), the random name prefix
 //! makes orphans easy to find and clean up administratively.
@@ -42,8 +42,9 @@ const DEFAULT_ADMIN_URL: &str = "postgres://boss:boss@127.0.0.1/postgres";
 /// The per-module schema files, in manifest apply order. `include_str!`
 /// is compile-time, so each file is listed explicitly (rather than reading
 /// schema/manifest.txt at runtime); they're concatenated in `schema_sql`
-/// so `new_without` can skip a module's file, mirroring apply-schema.sh's
-/// `--without`. Keep this list in sync with infra/postgres/schema/manifest.txt.
+/// so `new_without` can skip a module's file, mirroring migrate.sh's
+/// `--without`. Pinned to infra/postgres/schema/manifest.txt by the
+/// `manifest_agreement` test below.
 const SCHEMA_FILES: &[(&str, &str)] = &[
     (
         "00-extensions",
@@ -181,7 +182,7 @@ impl TestDb {
     }
 
     /// Like [`new`](Self::new) but omits the schema files whose name
-    /// contains any entry in `without` (mirrors apply-schema.sh's
+    /// contains any entry in `without` (mirrors migrate.sh's
     /// `--without`). Lets a test prove the core + a subset of modules
     /// bootstrap with, e.g., the ledger absent: `new_without(&["ledger"])`.
     pub async fn new_without(without: &[&str]) -> Self {

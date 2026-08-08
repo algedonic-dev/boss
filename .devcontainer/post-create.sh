@@ -13,13 +13,19 @@ rustup component add rustfmt clippy >/dev/null 2>&1 || true
 echo "==> cargo fetch (warming the registry)"
 cargo fetch || echo "   (cargo fetch failed — retry after the container settles)"
 
-echo "==> applying Postgres schema (psql → the 'postgres' service via PG* env)"
-# The postgres service auto-creates the boss DB (POSTGRES_DB=boss); the
-# schema is idempotent (CREATE ... IF NOT EXISTS), so re-runs are safe.
-if infra/postgres/apply-schema.sh | psql -q 2>/dev/null; then
-  echo "   schema applied to boss"
+echo "==> applying Postgres schema (migrate.sh → the 'postgres' service via PG* env)"
+# The postgres service auto-creates the boss DB (POSTGRES_DB=boss);
+# migrate.sh applies only manifest entries not yet recorded, so re-runs
+# are no-ops. A dev volume from before the migration runner has tables
+# but no schema_migrations — adopt it once with --baseline.
+if [ -n "$(psql -Atc "SELECT to_regclass('audit_log')" 2>/dev/null)" ] \
+   && [ -z "$(psql -Atc "SELECT to_regclass('schema_migrations')" 2>/dev/null)" ]; then
+  infra/postgres/migrate.sh --baseline >/dev/null 2>&1 || true
+fi
+if infra/postgres/migrate.sh 2>/dev/null; then
+  echo "   schema migrated to current"
 else
-  echo "   (schema apply skipped — is the postgres service up? re-run: infra/postgres/apply-schema.sh | psql)"
+  echo "   (migrate skipped — is the postgres service up? re-run: infra/postgres/migrate.sh)"
 fi
 
 echo "==> web deps (bun install)"
@@ -45,7 +51,7 @@ cat <<'EOF'
  Reset the DB to an empty schema (boss is the postgres superuser here,
  so no sudo — the host scripts' `sudo -u postgres` path is for a *local*
  Postgres and isn't used in this container):
-   dropdb boss && createdb boss && infra/postgres/apply-schema.sh | psql
+   dropdb boss && createdb boss && infra/postgres/migrate.sh
 
  Run the full prebuilt brewery demo: see infra/oss-quickstart/.
 ────────────────────────────────────────────────────────────────────
