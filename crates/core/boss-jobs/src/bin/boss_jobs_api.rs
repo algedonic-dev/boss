@@ -75,8 +75,11 @@ async fn main() -> Result<()> {
     // a critical ticket lands on a platinum/gold account. Running
     // inside the jobs-api service keeps the subscriber close to the
     // publisher without a new deploy unit.
+    // Concrete bus, not the port: the router opens a JetStream durable
+    // consumer (at-least-once) and only falls back to the port-shaped
+    // core subscription when JetStream is absent.
     let _escalation_handle = boss_jobs::escalation::spawn_router(
-        bus.clone() as std::sync::Arc<dyn boss_core::port::EventBus>,
+        bus.clone(),
         boss_jobs::escalation::EscalationConfig::default(),
     );
 
