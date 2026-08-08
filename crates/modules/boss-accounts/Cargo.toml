@@ -20,7 +20,7 @@ axum = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"], optional = true }
+sqlx = { version = "0.9", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"], optional = true }
 uuid = { version = "1", features = ["v4"] }
 
 boss-clock-client = { path = "../../core/boss-clock-client" }
@@ -49,7 +49,7 @@ required-features = ["accounts-api"]
 [dev-dependencies]
 tower = { workspace = true }
 boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
-sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
+sqlx = { version = "0.9", default-features = false, features = ["macros", "runtime-tokio", "postgres", "chrono", "json"] }
 
 [lints]
 workspace = true
