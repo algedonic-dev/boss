@@ -43,8 +43,13 @@ async fn dispatcher_rules_seed_matches_toml() {
 
     assert_eq!(
         map_db, map_toml,
-        "dispatcher_rules seed (41-dispatcher.sql) drifted from rules.toml — \
-         regenerate with `python3 infra/dispatcher/gen-seed.py`"
+        "dispatcher_rules seed drifted from rules.toml. 41-dispatcher.sql is an \
+         APPLIED migration — history, never regenerated (the checksum guard \
+         trips on every live database). A rule added or changed after the \
+         migration runner landed gets its OWN manifest entry: a new \
+         NNN-dispatcher-rule-*.sql with an ON CONFLICT-safe INSERT (see \
+         101-dispatcher-rule-step-assigned.sql), appended to manifest.txt \
+         and SCHEMA_FILES."
     );
 }
 

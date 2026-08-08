@@ -552,6 +552,37 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         }
     }
 
+    // Assignment is a routable fact. The ready-path notification fires
+    // only at the READY transition, so a step assigned AFTER it was
+    // already ready told nobody (backlog 534a8dc8). Emitted only when
+    // the assignee actually changed — a metadata PATCH re-sending the
+    // same assignee is not an assignment. Payload mirrors
+    // `step.ready.<kind>` so `messages.notify` consumes both without
+    // forking; the handler's deterministic message id dedupes when the
+    // ready path already told the same person.
+    if step.assignee_id.is_some() && old.assignee_id != step.assignee_id && !step.kind.is_empty() {
+        let (subject_kind, subject_id) = if let Ok(Some(job)) = state.jobs.get_job(&job_id).await {
+            (
+                boss_core::primitives::Subject::kind(&job.subject).to_string(),
+                boss_core::primitives::Subject::id(&job.subject).to_string(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        step_events.push(stamp.event(
+            &format!("step.assigned.{}", step.kind),
+            serde_json::json!({
+                "job_id": job_id.to_string(),
+                "step_id": step_id.to_string(),
+                "kind": step.kind,
+                "subject_kind": subject_kind,
+                "subject_id": subject_id,
+                "assignee_id": step.assignee_id,
+                "metadata": step.metadata,
+            }),
+        ));
+    }
+
     if stamps_invalidated {
         let stale_roles: Vec<String> = step.sign_offs.iter().map(|st| st.role.clone()).collect();
         step_events.push(stamp.event(
@@ -1002,6 +1033,10 @@ pub(super) async fn build_step_ready_event<R: JobsRepository + 'static, B: Event
             "kind": step.kind,
             "subject_kind": subject_kind,
             "subject_id": subject_id,
+            // A step assigned BEFORE it became ready notifies its
+            // assignee, not the role's on-call member — the handler
+            // prefers a named assignee when the payload carries one.
+            "assignee_id": step.assignee_id,
             "metadata": step.metadata,
         }),
     )
