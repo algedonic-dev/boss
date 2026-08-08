@@ -109,7 +109,21 @@ html, body {
 .shell-inbox:hover { background: #f5f5f4; }
 .shell-inbox-active { background: #f5f5f4; color: #1c1917; }
 .shell-nav-home { margin-bottom: 12px; font-weight: 500; }
-.shell-content { min-height: calc(100vh - 45px); }
+/* The sidebar is `position: fixed`, and the grid's first column only
+   reserves its 200px — nothing put a gutter between that edge and the
+   content, so every page rendered flush against the dark sidebar.
+   Reported as "the panel on the flow page is visually smashed against
+   the left sidebar nav", but Flow was only where it got noticed; the
+   gutter was missing for all of them.
+
+   It belongs here rather than in each page: a page that forgets is
+   how this looked wrong in the first place. The three grids that were
+   compensating with their own `padding: 0 32px` have had it removed
+   so they do not now indent twice. */
+.shell-content {
+  min-height: calc(100vh - 45px);
+  padding: 0 32px 32px;
+}
 .shell-main { grid-column: 2; }
 
 /* My Day page */
@@ -1175,7 +1189,7 @@ html, body {
    IT panel — provider integration cards
    ========================================================================== */
 
-.provider-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; padding: 0 32px 32px; }
+.provider-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; padding-bottom: 32px; }
 .provider-card { border: 1px solid #e7e5e4; border-radius: 10px; background: #fff; overflow: hidden; }
 .provider-card-error { border-color: #fca5a5; }
 .provider-card-header {
@@ -1210,7 +1224,7 @@ html, body {
    CTO dashboard — technology operations
    ========================================================================== */
 
-.cto-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 0 32px 32px; }
+.cto-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding-bottom: 32px; }
 .cto-services { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
 .cto-svc-card { padding: 12px; border: 1px solid #e7e5e4; border-radius: 8px; background: #fafaf9; }
 .cto-svc-header { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
@@ -2842,7 +2856,7 @@ button.manual-tree-node {
    Unified Practice Detail View
    =========================================================================== */
 
-.account-page { padding: 0 32px 32px; }
+.account-page { padding-bottom: 32px; }
 
 .pp-glance {
   display: grid;

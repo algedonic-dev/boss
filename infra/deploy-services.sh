@@ -883,6 +883,36 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
     # freshness-guard the binaries and bounce them if running (the gateway
     # always; the sim only in a demo deployment, where its ExecStartPre gate
     # keeps it up). Their unit files are managed out-of-band.
+    # Gateway unit + drop-ins, from the repo. Sync BEFORE the binary
+    # refresh below, so a restart picks up config and code together.
+    #
+    # These were box-only until 2026-08-07, when infra/gateway/ held
+    # exactly one file — demo-mode.conf, for a mode removed that day —
+    # while the two live, load-bearing drop-ins existed nowhere in the
+    # repo. A rebuild would have deployed dead config and lost both
+    # authentication and guest access, and the directory would have
+    # looked authoritative while doing it.
+    #
+    # Copied, not symlinked: systemd reads these as root at boot, and a
+    # link into a user-writable checkout is a privilege path nobody
+    # should have to think about.
+    if [[ -d "$REPO_ROOT/infra/gateway" ]]; then
+        echo "==> sync gateway unit + drop-ins from infra/gateway"
+        install -m 0644 "$REPO_ROOT/infra/gateway/boss-gateway.service" \
+            /etc/systemd/system/boss-gateway.service
+        mkdir -p /etc/systemd/system/boss-gateway.service.d
+        for conf in "$REPO_ROOT"/infra/gateway/*.conf; do
+            [[ -e "$conf" ]] || continue
+            install -m 0644 "$conf" "/etc/systemd/system/boss-gateway.service.d/$(basename "$conf")"
+            echo "    $(basename "$conf")"
+        done
+        # Deliberately NOT deleting drop-ins absent from the repo. An
+        # operator may add a machine-local one (a secret EnvironmentFile,
+        # a host override), and a deploy that silently removed it would
+        # be a worse surprise than a stale file. Removal stays manual.
+        systemctl daemon-reload
+    fi
+
     echo "==> refresh non-port-table service binaries (gateway, brewery-sim)"
     for bin in boss-gateway boss-brewery-sim; do
         install_binary "$bin"

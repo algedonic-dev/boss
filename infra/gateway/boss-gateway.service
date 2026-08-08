@@ -1,0 +1,16 @@
+[Unit]
+Description=Boss Gateway
+After=network-online.target nats-server.service postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=RUST_LOG=info
+Environment=BOSS_LISTEN=127.0.0.1:4443
+Environment=BOSS_STATIC_DIR=/var/lib/boss-web/dist
+ExecStart=/usr/local/bin/boss-gateway
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

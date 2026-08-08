@@ -58,6 +58,39 @@
 
   let jobs = $state<ReadonlyArray<Job>>([]);
   let fork = $state<Fork | null>(null);
+
+  /// The Job shown in the detail modal, or null when it is closed.
+  ///
+  /// A card is deliberately terse — it is a thing you drag between
+  /// columns, and a card carrying a paragraph of feedback is a card
+  /// you cannot scan. But the detail was then reachable nowhere: the
+  /// full text of an item, and the state of the steps behind it, only
+  /// existed in the database. Double-click opens it.
+  ///
+  /// This holds the id rather than the Job so the modal re-reads from
+  /// `jobs` on every refresh; holding the object would freeze the
+  /// modal on a stale copy the moment a poll lands.
+  let detailId = $state<string | null>(null);
+  const detail = $derived(detailId ? (jobs.find((j) => j.id === detailId) ?? null) : null);
+
+  // Escape-to-close via $effect rather than a svelte:window tag. The
+  // bun+svelte bundler crashes on the svelte:window event lookup
+  // ($.window resolves undefined), which takes the WHOLE app down —
+  // not just this component: `.app-shell` never mounts and every route
+  // that renders a board dies with "Cannot read properties of
+  // undefined (reading 'addEventListener')".
+  //
+  // DebugGear.svelte hit this first and documented it there. A comment
+  // in one file does not stop the next person reaching for the obvious
+  // construct, which is exactly what happened here, so there is now a
+  // lint for it (CLAUDE.md §9a).
+  $effect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') detailId = null;
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  });
   let loading = $state(true);
   let error = $state<string | null>(null);
   let busy = $state<Record<string, boolean>>({});
@@ -355,6 +388,7 @@
             draggable={canDrag(j)}
             ondragstart={(e) => startDrag(e, j)}
             ondragend={endDrag}
+            ondblclick={() => (detailId = j.id)}
           >
             {#if card}
               {@render card(j)}
@@ -467,6 +501,88 @@
   </div>
 {/if}
 
+{#if detail}
+  <!-- Backdrop. Escape closes it too (window handler above), so the
+       click target here is a convenience rather than the only way
+       out — which is what keeps this reachable without a mouse. -->
+  <div
+    class="tb-modal-back"
+    role="presentation"
+    onclick={(e) => {
+      // Only a click on the backdrop itself closes. Testing the target
+      // rather than stopping propagation on the panel means the panel
+      // carries no click handler at all, so it needs no keyboard
+      // equivalent to match it.
+      if (e.target === e.currentTarget) detailId = null;
+    }}
+  >
+    <div class="tb-modal" role="dialog" aria-modal="true" aria-label={detail.title}>
+      <header class="tb-modal-head">
+        <div>
+          <h2 class="tb-modal-title">{detail.title}</h2>
+          <p class="tb-modal-sub">
+            {detail.kind} · {detail.status} · opened {detail.opened_on}
+            {#if detail.closed_on}· closed {detail.closed_on}{/if}
+          </p>
+        </div>
+        <button
+          class="tb-btn"
+          type="button"
+          onclick={() => (detailId = null)}
+          aria-label="Close">Close</button
+        >
+      </header>
+
+      <!-- The reason the modal exists: a feedback Job's `message` is
+           the whole content of the item and the card only had room for
+           a title derived from the route. -->
+      {#if typeof detail.metadata?.message === 'string'}
+        <p class="tb-modal-message">{detail.metadata.message}</p>
+      {/if}
+
+      <dl class="tb-modal-facts">
+        <dt>Job</dt>
+        <dd class="tb-mono">{detail.id}</dd>
+        <dt>Subject</dt>
+        <dd class="tb-mono">{detail.subject.subject_kind} / {detail.subject.id}</dd>
+        <dt>Owner</dt>
+        <dd>{detail.owner_id || 'unassigned'}</dd>
+        {#if detail.tags.length}
+          <dt>Tags</dt>
+          <dd>{detail.tags.join(', ')}</dd>
+        {/if}
+      </dl>
+
+      <!-- Steps are the program counter, so showing them is showing
+           where the Job actually is — not a restatement of the column
+           it was dragged into. -->
+      {#if detail.steps?.length}
+        <h3 class="tb-modal-h">Steps</h3>
+        <ol class="tb-modal-steps">
+          {#each detail.steps as s (s.id)}
+            <li class="tb-modal-step">
+              <span class="tb-modal-step-status tb-modal-step-{s.status}">{s.status}</span>
+              <span class="tb-modal-step-title">{s.title}</span>
+              {#if s.assignee_id}<span class="tb-modal-step-who">{s.assignee_id}</span>{/if}
+            </li>
+          {/each}
+        </ol>
+      {/if}
+
+      {#if Object.keys(detail.metadata ?? {}).filter((k) => k !== 'message').length}
+        <h3 class="tb-modal-h">Metadata</h3>
+        <pre class="tb-modal-json">{JSON.stringify(
+            Object.fromEntries(
+              Object.entries(detail.metadata).filter(([k]) => k !== 'message'),
+            ),
+            null,
+            2,
+          )}</pre>
+      {/if}
+    </div>
+  </div>
+{/if}
+
 <style>
   /* Columns scroll sideways rather than squeezing: a fork can declare
      six routes, and a 140px column is unreadable. The page body never
@@ -542,6 +658,134 @@
     border-style: solid;
     color: #1c1917;
     background: var(--card, #fff);
+  }
+
+  /* Detail modal — opened by double-clicking a card. */
+  .tb-modal-back {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    background: rgba(28, 25, 23, 0.45);
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 60px 20px 20px;
+    overflow-y: auto;
+  }
+  .tb-modal {
+    background: var(--card, #fff);
+    border: 1px solid var(--border, #e7e5e4);
+    border-radius: 10px;
+    padding: 20px 22px;
+    width: min(680px, 100%);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+  }
+  .tb-modal-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 14px;
+  }
+  .tb-modal-title {
+    font-size: 17px;
+    margin: 0 0 2px;
+    text-wrap: balance;
+  }
+  .tb-modal-sub {
+    margin: 0;
+    font-size: 12px;
+    color: var(--text-dim, #78716c);
+  }
+  .tb-modal-message {
+    margin: 0 0 16px;
+    padding: 12px 14px;
+    background: var(--bg, #f5f5f4);
+    border-radius: 6px;
+    border-left: 3px solid #0f766e;
+    font-size: 14px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+  }
+  .tb-modal-facts {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 4px 14px;
+    margin: 0 0 16px;
+    font-size: 12px;
+  }
+  .tb-modal-facts dt {
+    color: var(--text-dim, #78716c);
+  }
+  .tb-modal-facts dd {
+    margin: 0;
+  }
+  .tb-mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+  }
+  .tb-modal-h {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim, #78716c);
+    margin: 0 0 8px;
+  }
+  .tb-modal-steps {
+    list-style: none;
+    margin: 0 0 16px;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .tb-modal-step {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 13px;
+    padding: 3px 0;
+    border-bottom: 1px solid var(--bg, #f5f5f4);
+  }
+  .tb-modal-step-status {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: var(--bg, #f5f5f4);
+    color: var(--text-dim, #78716c);
+    flex: 0 0 auto;
+    min-width: 72px;
+    text-align: center;
+  }
+  .tb-modal-step-completed {
+    background: #ecfdf5;
+    color: #047857;
+  }
+  .tb-modal-step-ready,
+  .tb-modal-step-active {
+    background: #eff6ff;
+    color: #1d4ed8;
+  }
+  .tb-modal-step-skipped {
+    text-decoration: line-through;
+  }
+  .tb-modal-step-title {
+    flex: 1 1 auto;
+  }
+  .tb-modal-step-who {
+    font-size: 11px;
+    color: var(--text-dim, #78716c);
+  }
+  .tb-modal-json {
+    margin: 0;
+    padding: 10px 12px;
+    background: var(--bg, #f5f5f4);
+    border-radius: 6px;
+    font-size: 11px;
+    line-height: 1.5;
+    overflow-x: auto;
   }
   .tb-card {
     background: var(--card, #fff);

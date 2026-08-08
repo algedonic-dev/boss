@@ -13,7 +13,7 @@
   import { loadStepTypeRegistry } from './steps/surfaceRegistry.svelte';
   import { loadClasses } from '@boss/web-kit/session/classes.svelte';
   import AppShell from './shell/AppShell.svelte';
-  import { appForSection, APP_SUBJECT_KINDS, type AppId } from './shell/nav-catalog';
+  import { APPS, appForSection, APP_SUBJECT_KINDS, type AppId } from './shell/nav-catalog';
   import StepFocusPage from './steps/StepFocusPage.svelte';
   import PerspectiveTabs from '@boss/web-kit/PerspectiveTabs.svelte';
   import DebugGear from './debug/DebugGear.svelte';
@@ -41,7 +41,6 @@
   import NewJournalEntryPage from './finance/NewJournalEntryPage.svelte';
   import HrPage from './hr/HrPage.svelte';
   import QaPage from './qa/QaPage.svelte';
-  import OpsDashboard from './ops/OpsDashboard.svelte';
   // SimPage retired 2026-05-03 — boss-sim-api is gone (HumanWorker
   // generator retirement step 9b). Tenant runners are CLI tools now.
   import ItKnowledgeBasePage from './it/ItKnowledgeBasePage.svelte';
@@ -191,7 +190,6 @@
       : route.kind === 'support' ? 'support'
       : route.kind === 'hr' ? 'hr'
       : route.kind === 'qa' ? 'qa'
-      : route.kind === 'ops' ? 'ops'
       : route.kind === 'calendar' ? 'calendar'
       : route.kind === 'schedule' ? 'schedule'
       : route.kind === 'exec' ? 'exec'
@@ -207,12 +205,39 @@
       : route.kind === 'systemSubjects' ? 'system-subjects'
       : route.kind === 'systemModel' ? 'system-model'
       : route.kind === 'experiments' ? 'system-experiments'
+      // Everything below was falling through to 'me' — 21 of 74 route
+      // kinds, which meant the right page rendered inside the HOME
+      // chrome. Reported as "clicking Feedback triage took me to the
+      // Home app"; that was one symptom of twenty-one.
+      //
+      // The comment under this block used to claim the ternary
+      // "already resolves every route.kind down to" a section. It did
+      // not, and nothing checked, which is why the list below exists
+      // and why `every-route-has-a-section.test.ts` now pins it.
+      : route.kind === 'systemFeedback' ? 'system-feedback'
+      : route.kind === 'systemOsMap' ? 'system-os-map'
+      : route.kind === 'systemFlow' ? 'system-flow'
+      : route.kind === 'systemKb' ? 'system-kb'
+      : route.kind === 'systemDesign' ? 'system-design'
+      : route.kind === 'authAdmin' ? 'auth-admin'
+      : route.kind === 'views' ? 'views'
+      : route.kind === 'myCalendar' ? 'calendar'
+      : route.kind === 'products' || route.kind === 'product' ? 'products'
+      : route.kind === 'shop' || route.kind === 'shopProduct' ? 'shop'
+      : route.kind === 'newInvoice' || route.kind === 'newJournalEntry' ? 'finance'
+      // A purchase order and a vendor invoice are both about a vendor;
+      // neither has a sidebar row of its own.
+      : route.kind === 'po' || route.kind === 'vendorInvoice' ? 'vendors'
+      : route.kind === 'watchlist' ? 'accounts'
+      // 'me' is the honest answer for the rest, not a fallback:
+      // - login, stepFocus and home render OUTSIDE AppShell entirely,
+      //   so no section applies.
+      // - search is cross-cutting and has no sidebar row.
       : 'me',
   );
 
-  // Which app tab is active. Derived from `activeSection` — the id
-  // the ternary above already resolves every route.kind down to — via
-  // the catalog's `app` field.
+  // Which app tab is active. Derived from `activeSection` via the
+  // catalog's `app` field.
   //
   // This replaced a MODEL_KINDS set of Route['kind']s maintained here
   // alongside a MODEL_ROUTES set of RouteNames in AppShell.svelte.
@@ -234,10 +259,10 @@
   <!-- Outside AppShell on purpose: a full-page step surface has no
        sidebar. The chrome bar stays — you can still switch apps —
        but everything below it belongs to the step. -->
-  <PerspectiveTabs active={perspective} searchAppKinds={appKinds} />
+  <PerspectiveTabs active={perspective} apps={APPS} searchAppKinds={appKinds} />
   <StepFocusPage jobId={route.jobId} stepId={route.stepId} />
 {:else}
-  <PerspectiveTabs active={perspective} searchAppKinds={appKinds} />
+  <PerspectiveTabs active={perspective} apps={APPS} searchAppKinds={appKinds} />
 <AppShell {activeSection} {perspective}>
   {#if blockedModule}
     <ModuleDisabled module={blockedModule.id} label={blockedModule.label} />
@@ -330,8 +355,6 @@
       <HrPage />
     {:else if route.kind === 'qa'}
       <QaPage />
-    {:else if route.kind === 'ops'}
-      <OpsDashboard />
     {:else if route.kind === 'systemKb'}
       <ItKnowledgeBasePage />
     {:else if route.kind === 'policy'}

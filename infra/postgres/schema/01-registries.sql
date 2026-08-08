@@ -299,10 +299,15 @@ INSERT INTO classes (subject_kind, code, display_name, member_attribute, metadat
 -- validated against these by boss-people-api (subject_kind='employee',
 -- member_attribute='department').
 INSERT INTO classes (subject_kind, code, display_name, member_attribute, sort_order) VALUES
-    -- Platform-level identities (emp-bootstrap-admin, emp-audit, etc.)
-    -- carry department='platform' to distinguish "people who run the
-    -- BOSS deployment itself" from any tenant's org-chart departments.
-    ('employee', 'platform',  'Platform',  'department',  1),
+    -- The people who run the deployment (emp-bootstrap-admin,
+    -- emp-audit). This used to be a separate `platform` department, on
+    -- the theory that running BOSS is distinct from any tenant's org
+    -- chart. It is not: whoever runs the deployment works somewhere,
+    -- and the department they work in is IT. A `platform` department
+    -- put them in a silo the org chart did not have, and left the OS
+    -- map attributing their handoffs to a department with no other
+    -- members.
+    ('employee', 'it',        'IT',        'department',  1),
     ('employee', 'executive', 'Executive', 'department', 10),
     ('employee', 'sales',     'Sales',     'department', 20),
     ('employee', 'service',   'Service',   'department', 30),

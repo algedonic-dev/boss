@@ -11,6 +11,7 @@
   import { moduleEnabled, getLabel } from '@boss/web-kit/session/manifest.svelte';
   import { canSeeRoute, type RouteName, type Role } from '@boss/web-kit/session/permissions';
   import { workForRole } from '@boss/web-kit/session/work-by-role';
+  import { departmentLabel } from '@boss/web-kit/nav';
   import { navigate } from '../router';
   import {
     ROUTE_CATALOG,
@@ -50,31 +51,44 @@
   );
   let role = $derived((user?.role ?? null) as Role | null);
 
-  // Per-app surface order. Each domain app owns one group; the order
-  // is how an operator in that app would scan it, not alphabetical.
-  // `visible()` then drops whatever the role or the tenant manifest
-  // blocks, so a support-only persona simply sees a shorter CRM list.
+  // Per-department surface order. Each department app owns one group;
+  // the order is how someone in that department would scan it, not
+  // alphabetical. `visible()` then drops whatever the role or the
+  // tenant manifest blocks.
   //
-  // This replaced a single flat SURFACE_ORDER plus a "Knowledge Bases"
-  // group — one 24-entry list every operator scrolled regardless of
-  // what they were doing. The knowledge-base surfaces (equipment,
-  // ingredients & parts, products) weren't a category of their own so
-  // much as Supply Chain's reference data, and they read that way now.
+  // The keys are department codes because apps ARE departments now.
+  // The previous version keyed off invented apps — `crm` held
+  // accounts + sales + support + shop + marketing assets, and
+  // `supply-chain` held six surfaces spanning four real departments —
+  // so a marketer and a salesperson shared one list and neither list
+  // matched an org chart anybody recognised.
+  //
+  // Only the ORDER lives here. Which department owns a surface is
+  // answered once, by `app` in the nav catalog, and the test beside
+  // this asserts these two agree — an entry here for a surface the
+  // catalog assigns elsewhere is exactly the drift that put pages
+  // under the wrong tab before.
   const APP_SURFACES: Readonly<Partial<Record<AppId, ReadonlyArray<RouteName>>>> = {
-    crm: ['accounts', 'sales', 'support', 'shop', 'marketing-assets'],
+    sales: ['accounts', 'sales', 'shop'],
+    marketing: ['marketing-assets'],
+    support: ['support'],
+    service: ['service'],
+    refurb: ['refurb'],
+    qa: ['qa'],
+    executive: ['exec'],
     finance: ['finance', 'vendors'],
-    operations: ['ops', 'jobs', 'service', 'refurb', 'qa', 'calendar'],
-    'supply-chain': ['warehouse', 'shipping', 'parts', 'products', 'catalog', 'assets'],
+    warehouse: ['warehouse', 'parts'],
+    distribution: ['shipping'],
+    production: ['products', 'calendar'],
+    maintenance: ['catalog', 'assets'],
     people: ['people'],
   };
 
-  const APP_GROUP_LABEL: Readonly<Partial<Record<AppId, string>>> = {
-    crm: 'Customers',
-    finance: 'Finance',
-    operations: 'Operations',
-    'supply-chain': 'Supply chain',
-    people: 'People',
-  };
+  // The group header is the department's own label — derived, because
+  // a second spelling of "Finance" is a second thing to keep in step.
+  function appGroupLabel(app: AppId): string {
+    return app === 'home' || app === 'simulator' ? '' : departmentLabel(app);
+  }
 
   // Work group is role-keyed: each role gets a tailored 3-5 item
   // list of the surfaces they personally operate from. The same
@@ -168,7 +182,7 @@
         ? HOME_GROUPS
         : [
             {
-              label: APP_GROUP_LABEL[activeApp] ?? '',
+              label: appGroupLabel(activeApp),
               items: (APP_SURFACES[activeApp] ?? []).map(
                 (r: RouteName) => ROUTE_CATALOG[r],
               ),

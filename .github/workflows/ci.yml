@@ -93,6 +93,20 @@ jobs:
         # after the 2026-05-05 sweep.
         run: cargo clippy --workspace --all-features --tests -- -D warnings
 
+      - name: Build with default features
+        # Every other Rust step here passes `--all-features`, so a crate
+        # whose DEFAULT feature set does not compile is invisible to
+        # CI. That is not hypothetical: #180 deleted a `pub mod search;`
+        # sitting under a `#[cfg(feature = "postgres")]`, the orphaned
+        # attribute rebound onto the next item — `pub mod types;` — and
+        # `cargo build -p boss-people` was broken for anyone who ran it
+        # without the feature flag. Every gate above stayed green.
+        #
+        # A dangling `#[cfg]` always lands on whatever follows it, so
+        # this is a whole class of bug, not one typo. One cheap build
+        # closes it (CLAUDE.md §9a).
+        run: cargo build --workspace
+
       - name: Test
         run: cargo test --all-features
 
@@ -157,6 +171,16 @@ jobs:
       - name: Typecheck
         working-directory: apps/web
         run: bun run typecheck
+
+      # The unit suite did not run here at all until 2026-08-08 — 195
+      # tests, including every equality test that pins a fact living in
+      # two places (the nav catalog against the department registry, the
+      # route kinds against the section chain, the banned-construct
+      # lint). They ran only on a developer's machine, which means they
+      # ran when someone remembered.
+      - name: Unit tests
+        working-directory: apps/web
+        run: bun run test:unit
 
       - name: Build
         working-directory: apps/web

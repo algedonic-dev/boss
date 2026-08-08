@@ -26,9 +26,10 @@
 // second half.
 
 import type { RouteName } from '@boss/web-kit/session/permissions';
-import type { AppId } from '@boss/web-kit/nav';
+import type { AppId, AppTab } from '@boss/web-kit/nav';
+import { DEPARTMENTS, HOME_APP, SIMULATOR_APP } from '@boss/web-kit/nav';
 
-export type { AppId };
+export type { AppId, AppTab };
 
 // `AppId` and the tab list live in @boss/web-kit/nav (the bar is
 // rendered by apps/web AND apps/simulator). THIS file answers the
@@ -56,30 +57,29 @@ export type NavItem = Readonly<{
 export type NavGroup = Readonly<{ label: string; items: ReadonlyArray<NavItem> }>;
 
 export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
-  jobs:      { id: 'jobs',      label: 'All jobs',         path: '/ux/jobs',      permKey: 'jobs',      app: 'operations' },
-  sales:     { id: 'sales',     label: 'Sales pipeline',   path: '/ux/sales',     permKey: 'sales',     app: 'crm' },
-  service:   { id: 'service',   label: 'Service queue',    path: '/ux/service',   permKey: 'service',   module: 'support', app: 'operations' },
-  refurb:    { id: 'refurb',    label: 'Refurbishment',    path: '/ux/refurb',    permKey: 'refurb',    module: 'support', app: 'operations' },
-  qa:        { id: 'qa',        label: 'QA',               path: '/ux/qa',        permKey: 'qa',        module: 'qa',      app: 'operations' },
+  jobs:      { id: 'jobs',      label: 'All jobs',         path: '/ux/jobs',      permKey: 'jobs',      app: 'home' },
+  sales:     { id: 'sales',     label: 'Sales pipeline',   path: '/ux/sales',     permKey: 'sales',     app: 'sales' },
+  service:   { id: 'service',   label: 'Service queue',    path: '/ux/service',   permKey: 'service',   module: 'support', app: 'service' },
+  refurb:    { id: 'refurb',    label: 'Refurbishment',    path: '/ux/refurb',    permKey: 'refurb',    module: 'support', app: 'refurb' },
+  qa:        { id: 'qa',        label: 'QA',               path: '/ux/qa',        permKey: 'qa',        module: 'qa',      app: 'qa' },
   finance:   { id: 'finance',   label: 'Finance',          path: '/ux/finance',   permKey: 'finance',   module: 'finance', app: 'finance' },
-  warehouse: { id: 'warehouse', label: 'Inventory',        path: '/ux/warehouse', permKey: 'warehouse', module: 'warehouse', app: 'supply-chain' },
-  shipping:  { id: 'shipping',  label: 'Shipments',        path: '/ux/shipping',  permKey: 'shipping',  module: 'shipping', app: 'supply-chain' },
-  support:   { id: 'support',   label: 'Support',          path: '/ux/support',   permKey: 'support',   module: 'support', app: 'crm' },
-  ops:       { id: 'ops',       label: 'Operations',       path: '/ux/ops',       permKey: 'ops',       app: 'operations' },
-  exec:      { id: 'exec',      label: 'Exec',             path: '/ux/exec',      permKey: 'exec',      module: 'exec',    app: 'home' },
+  warehouse: { id: 'warehouse', label: 'Inventory',        path: '/ux/warehouse', permKey: 'warehouse', module: 'warehouse', app: 'warehouse' },
+  shipping:  { id: 'shipping',  label: 'Shipments',        path: '/ux/shipping',  permKey: 'shipping',  module: 'shipping', app: 'distribution' },
+  support:   { id: 'support',   label: 'Support',          path: '/ux/support',   permKey: 'support',   module: 'support', app: 'support' },
+  exec:      { id: 'exec',      label: 'Exec',             path: '/ux/exec',      permKey: 'exec',      module: 'exec',    app: 'executive' },
   schedule:  { id: 'schedule',  label: 'My schedule',      path: '/ux/calendar/me', permKey: 'schedule', app: 'home' },
-  catalog:   { id: 'catalog',   label: 'Equipment',        path: '/ux/catalog',   permKey: 'catalog',   module: 'equipment', app: 'supply-chain' },
-  parts:     { id: 'parts',     label: 'Ingredients & parts', path: '/ux/parts',  permKey: 'parts',     module: 'parts',   app: 'supply-chain' },
-  products:  { id: 'products',  label: 'Products',         path: '/ux/products',  permKey: 'parts',     module: 'parts',   app: 'supply-chain' },
-  accounts:  { id: 'accounts',  label: 'Accounts',         path: '/ux/accounts',  permKey: 'accounts',  app: 'crm' },
+  catalog:   { id: 'catalog',   label: 'Equipment',        path: '/ux/catalog',   permKey: 'catalog',   module: 'equipment', app: 'maintenance' },
+  parts:     { id: 'parts',     label: 'Ingredients & parts', path: '/ux/parts',  permKey: 'parts',     module: 'parts',   app: 'warehouse' },
+  products:  { id: 'products',  label: 'Products',         path: '/ux/products',  permKey: 'parts',     module: 'parts',   app: 'production' },
+  accounts:  { id: 'accounts',  label: 'Accounts',         path: '/ux/accounts',  permKey: 'accounts',  app: 'sales' },
   vendors:   { id: 'vendors',   label: 'Vendors',          path: '/ux/vendors',   permKey: 'vendors',   app: 'finance' },
   people:    { id: 'people',    label: 'Employees',        path: '/ux/people',    permKey: 'people',    app: 'people' },
-  assets:    { id: 'assets',    label: 'Assets',           path: '/ux/assets',    permKey: 'assets',    module: 'equipment', app: 'supply-chain' },
-  shop:      { id: 'shop',      label: 'Shop',             path: '/ux/shop',      permKey: 'shop',      app: 'crm' },
+  assets:    { id: 'assets',    label: 'Assets',           path: '/ux/assets',    permKey: 'assets',    module: 'equipment', app: 'maintenance' },
+  shop:      { id: 'shop',      label: 'Shop',             path: '/ux/shop',      permKey: 'shop',      app: 'sales' },
   inbox:     { id: 'inbox',     label: 'Inbox',            path: '/ux/inbox',     permKey: 'inbox',     app: 'home' },
   views:     { id: 'views',     label: 'Views',            path: '/ux/views',     permKey: 'views',     app: 'home' },
-  'marketing-assets': { id: 'marketing-assets', label: 'Marketing assets', path: '/ux/marketing-assets', permKey: 'marketing-assets', module: 'marketing-assets', app: 'crm' },
-  calendar:  { id: 'calendar',  label: 'Release calendar', path: '/ux/calendar',  permKey: 'calendar',  module: 'calendar', app: 'operations' },
+  'marketing-assets': { id: 'marketing-assets', label: 'Marketing assets', path: '/ux/marketing-assets', permKey: 'marketing-assets', module: 'marketing-assets', app: 'marketing' },
+  calendar:  { id: 'calendar',  label: 'Release calendar', path: '/ux/calendar',  permKey: 'calendar',  module: 'calendar', app: 'production' },
 
   // Modeling surfaces — operator-tier (no separate /admin tier).
   // policy + workflows are dept-head + COO authority (per the
@@ -118,54 +118,62 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
   workflows:                 { id: 'workflows',               label: 'Workflows',           path: '/system/workflows',    permKey: 'workflows',               app: 'it' },
 };
 
-/// Which app each employee **department** is served by.
+/// The apps this host offers: Home, Simulator, and one per department
+/// that actually owns a surface.
 ///
-/// Departments are Class-registry data — 19 of them, seeded in
-/// `infra/postgres/schema/01-registries.sql` with
-/// `member_attribute='department'`. The eight apps are a presentation
-/// decision, deliberately not one-per-department: production,
-/// packaging, taproom, maintenance, qa, service, support and refurb
-/// all work the same surfaces, so they share Operations.
+/// DERIVED, not listed. The previous version was a hand-maintained
+/// `DEPARTMENT_APP` map from each department to one of eight invented
+/// apps, and its own comment predicted this change — "the app list
+/// probably wants DERIVING from the Class registry rather than
+/// hand-listing". It does, and now it is: an app exists because a
+/// department owns a surface, so adding a surface with a new `app`
+/// creates the tab and nothing here changes (CLAUDE.md §9).
 ///
-/// So this is not a derivation, it is a **mapping that must stay
-/// exhaustive**. Deriving tabs from departments would produce
-/// nineteen of them and undo the app split the review settled;
-/// leaving the relationship implicit is how `audit` ended up with no
-/// app at all and nothing failing. The test beside this asserts every
-/// registry department lands somewhere, so adding one is a decision
-/// somebody makes rather than an omission nobody notices.
-export const DEPARTMENT_APP: Readonly<Record<string, AppId>> = {
-  // Runs the BOSS deployment itself, and the model that describes it.
-  platform: 'it',
-  it: 'it',
-  admin: 'it',
-  // Reads everything, writes nothing — its work is the audit log and
-  // the books, both of which live under IT's model surfaces.
-  audit: 'it',
+/// Departments with NO surface get no tab, deliberately. Algedonic
+/// Ales has packaging, taproom and audit employees and not one screen
+/// built for them yet; a tab opening an empty sidebar would claim
+/// otherwise. `departmentsWithoutSurfaces()` reports them so the gap
+/// stays visible instead of silently reading as covered.
+const OWNED = new Set<string>(
+  Object.values(ROUTE_CATALOG)
+    .map((e) => e.app)
+    .filter((a): a is AppId => a !== undefined && a !== 'home' && a !== 'simulator'),
+);
 
-  executive: 'home',
+/// Departments that own at least one surface, in registry order.
+export const DEPARTMENT_APPS: ReadonlyArray<AppTab> = DEPARTMENTS.filter((d) =>
+  OWNED.has(d.code),
+).map((d) => ({
+  id: d.code,
+  label: d.label,
+  // The department's landing page is its first surface in catalog
+  // order — the same order the sidebar lists them in, so the tab opens
+  // on the row the sidebar shows first rather than an arbitrary pick.
+  href:
+    Object.values(ROUTE_CATALOG).find((e) => e.app === d.code)?.path ?? '/',
+}));
 
-  finance: 'finance',
+/// The full tab list, left to right.
+export const APPS: ReadonlyArray<AppTab> = [
+  HOME_APP,
+  SIMULATOR_APP,
+  ...DEPARTMENT_APPS,
+];
 
-  sales: 'crm',
-  marketing: 'crm',
-  support: 'crm',
+/// Departments with no surface of their own. Not an error — a report.
+export function departmentsWithoutSurfaces(): ReadonlyArray<string> {
+  return DEPARTMENTS.filter((d) => !OWNED.has(d.code)).map((d) => d.code);
+}
 
-  // The floor: everything that turns inputs into product, plus the
-  // service and rework flows that share the Jobs/Steps surfaces.
-  production: 'operations',
-  packaging: 'operations',
-  taproom: 'operations',
-  maintenance: 'operations',
-  qa: 'operations',
-  service: 'operations',
-  refurb: 'operations',
-
-  warehouse: 'supply-chain',
-  distribution: 'supply-chain',
-
-  people: 'people',
-};
+/// Which app an employee of `department` lands in.
+///
+/// Identity now that apps are departments, except that a department
+/// with no surface falls back to Home rather than a tab that does not
+/// exist. That fallback is the honest one: Home is personal work
+/// whichever department it belongs to.
+export function appForDepartment(department: string): AppId {
+  return OWNED.has(department) ? (department as AppId) : 'home';
+}
 
 /// Which app a surface belongs to, looked up by the `activeSection`
 /// id `App.svelte` derives from the current route. Unknown ids (the
@@ -206,7 +214,7 @@ export function appForSection(section: string): AppId {
 /// floats it for the app whose surface shows it. That is what happened
 /// to `message`: Inbox is a Home surface listing 13,483 message
 /// Subjects, and no app claimed the kind.
-export const APP_SUBJECT_KINDS: Readonly<Record<AppId, ReadonlyArray<string>>> = {
+export const APP_SUBJECT_KINDS: Readonly<Partial<Record<AppId, ReadonlyArray<string>>>> = {
   // Inbox lives here, and messages are what it lists.
   home: ['message'],
   simulator: [],
@@ -214,9 +222,18 @@ export const APP_SUBJECT_KINDS: Readonly<Record<AppId, ReadonlyArray<string>>> =
   // domain Subjects — a design doc is the shipped example, and
   // /system/design is an IT surface.
   it: ['workflow', 'company', 'custom'],
-  crm: ['account', 'customer', 'campaign', 'marketing-asset'],
+  // Was one `crm` bucket. Split along the departments that actually do
+  // the work: Sales owns the accounts and the shop, Marketing owns the
+  // campaigns and their assets.
+  sales: ['account', 'customer'],
+  marketing: ['campaign', 'marketing-asset'],
   finance: ['invoice', 'vendor', 'vendor-invoice', 'purchase_order'],
-  operations: ['workflow', 'calendar', 'location'],
-  'supply-chain': ['product', 'asset', 'purchase_order', 'shipment', 'vendor'],
+  // Was `supply-chain`, which spanned four departments. A purchase
+  // order is Warehouse's to raise and Finance's to pay, and both claim
+  // it — this maps attention, not ownership.
+  warehouse: ['purchase_order', 'vendor'],
+  production: ['product', 'calendar'],
+  distribution: ['shipment'],
+  maintenance: ['asset', 'location'],
   people: ['employee'],
 };

@@ -21,6 +21,10 @@ pub struct StepEvent<'a> {
     pub subject_kind: &'a str,
     pub subject_id: &'a str,
     pub completed_on: Option<chrono::NaiveDate>,
+    /// Who the step is assigned to, if anyone. A named assignee is a
+    /// STRONGER routing signal than a role — a role says someone like
+    /// you should do this, an assignee says you specifically.
+    pub assignee_id: Option<&'a str>,
     pub metadata: &'a serde_json::Map<String, Value>,
 }
 
@@ -51,6 +55,10 @@ impl<'a> StepEvent<'a> {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let subject_id = obj.get("subject_id").and_then(|v| v.as_str()).unwrap_or("");
+        let assignee_id = obj
+            .get("assignee_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
         let completed_on = obj
             .get("completed_on")
             .and_then(|v| v.as_str())
@@ -69,6 +77,7 @@ impl<'a> StepEvent<'a> {
             subject_kind,
             subject_id,
             completed_on,
+            assignee_id,
             metadata,
         })
     }

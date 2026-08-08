@@ -128,8 +128,16 @@ test.describe('chrome bar', () => {
   });
 
   test('offers the same app tabs everywhere', async ({ page }) => {
-    // The tab list comes from APPS, so a surface rendering a different
-    // set would mean a second, drifted bar.
+    // The bar must not change shape as you navigate. Apps are
+    // departments now, so the full list is as long as the org chart —
+    // the bar pins Home, Simulator and YOUR department, and folds the
+    // rest into More.
+    //
+    // The count assertion is the point: an earlier version of that
+    // design also pinned whichever app you were currently in, which
+    // made the set grow by one whenever you left your own department.
+    // That is a second, drifted bar by another name, and this caught
+    // it.
     const counts: number[] = [];
     for (const path of SURFACES) {
       await mountPage(page, path);
@@ -138,7 +146,26 @@ test.describe('chrome bar', () => {
     expect(new Set(counts).size, `tab counts differed across surfaces: ${counts}`).toBe(
       1,
     );
-    expect(counts[0]).toBeGreaterThan(4);
+    // Home + Simulator at minimum; a signed-in operator also gets
+    // their own department. This used to assert `> 4`, which encoded
+    // the old seven-invented-app bar rather than anything true.
+    expect(counts[0]).toBeGreaterThanOrEqual(2);
+  });
+
+  test('folds the other departments into More rather than dropping them', async ({
+    page,
+  }) => {
+    // The apps not on the bar must still be reachable in one click —
+    // "very few people need most of the Apps" is a reason to demote
+    // them, never a reason to hide them.
+    await mountPage(page, '/ux/jobs');
+    const more = page.locator('.perspective-more-btn');
+    await expect(more).toBeVisible();
+    await more.click();
+    const items = page.locator('.perspective-more-item');
+    await expect(items.first()).toBeVisible();
+    // Every department app that is not pinned shows up here.
+    expect(await items.count()).toBeGreaterThan(4);
   });
 
   test('falls back to BOSS when the tenant has not named itself', async ({ page }) => {
