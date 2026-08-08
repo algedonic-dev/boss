@@ -1437,6 +1437,7 @@ where
             job_id,
             kind: spec_step.kind.clone(),
             title,
+            spec_slug: Some(spec_step.title.clone()),
             assignee_id: None,
             status: StepStatus::Pending,
             sort_order: idx as i32,
@@ -3362,6 +3363,34 @@ mod tests {
                 },
             ],
         )
+    }
+
+    #[test]
+    fn materialize_preserves_the_spec_slug_beside_the_rendered_title() {
+        // Machine callers (boss-step.sh, the deploy scripts) address a
+        // step by its spec slug — "trigger", "audit-stock" — while
+        // `title_template` renders display text. Materialisation used
+        // to discard the slug, so every self-closing step call no-op'd
+        // silently behind `|| true` (backlog 6c6b9e06). The slug and
+        // the title are two facts; a step must carry both.
+        let spec = two_trigger_spec();
+        let subject = Subject::new("vendor", "v-1");
+        let steps = materialize_steps_at(
+            &spec,
+            &subject,
+            JobId::new(),
+            &serde_json::Value::Object(Default::default()),
+            StepId::new,
+            None,
+            Some(&StepRegistry::v1()),
+        );
+        for (spec_step, step) in spec.steps.iter().zip(&steps) {
+            assert_eq!(
+                step.spec_slug.as_deref(),
+                Some(spec_step.title.as_str()),
+                "the materialised step keeps the slug its spec declared"
+            );
+        }
     }
 
     #[test]

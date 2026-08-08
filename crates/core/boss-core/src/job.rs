@@ -309,6 +309,14 @@ pub struct Step {
     #[serde(default = "default_step_kind")]
     pub kind: String,
     pub title: String,
+    /// The spec slug this step materialized from — the stable
+    /// machine-facing identifier ("build", "gate"), distinct from
+    /// `title`, which is rendered display text. Machine callers
+    /// (boss-step.sh, deploy scripts) address steps by this; `None`
+    /// on steps created outside a Workflow spec or before the column
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_slug: Option<String>,
     #[serde(default)]
     pub assignee_id: Option<String>,
     #[serde(default)]
@@ -384,6 +392,7 @@ impl Step {
             job_id,
             kind: kind.into(),
             title: title.into(),
+            spec_slug: None,
             assignee_id: None,
             // New Steps default to Pending (ready_when not yet
             // satisfied). The re-evaluator promotes Pending → Ready

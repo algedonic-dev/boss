@@ -2,7 +2,7 @@
 #
 # boss-step — close a step on the open Job of a given Workflow.
 #
-#   ./infra/boss-step.sh <workflow> <step-title> [key=value ...]
+#   ./infra/boss-step.sh <workflow> <step-slug-or-title> [key=value ...]
 #   ./infra/boss-step.sh regenerate-deployment build source_ref=abc1234
 #
 # The point: work a machine did should be recorded by the machine that
@@ -13,8 +13,11 @@
 #
 # ## Behaviour
 #
-# Finds the single OPEN Job of `<workflow>`, finds the step by title,
-# merges the key=value pairs into its metadata, completes it.
+# Finds the single OPEN Job of `<workflow>`, finds the step by its
+# spec slug (`steps.spec_slug`, the stable machine-facing identifier —
+# falling back to the rendered title for steps materialized before the
+# column existed), merges the key=value pairs into its metadata,
+# completes it.
 #
 # - No open Job → NO-OP, exit 0. These scripts run outside regens all
 #   the time; a build is not required to belong to one, and failing a
@@ -81,15 +84,26 @@ if len(rows) > 1:
     sys.exit(1)
 
 job = rows[0]
+# Slug first (the stable identifier), title as fallback for steps
+# materialized before spec_slug existed. Never both vocabularies in
+# one pass — an exact slug match must not lose to a title elsewhere.
 step = None
 for s in job.get("steps", []):
-    if s.get("title") == step_title:
+    if s.get("spec_slug") == step_title:
         step = s
         break
 if step is None:
-    titles = ", ".join(s.get("title", "?") for s in job.get("steps", []))
-    print("boss-step: no step %r on %s (has: %s)"
-          % (step_title, job["id"][:8], titles), file=sys.stderr)
+    for s in job.get("steps", []):
+        if s.get("title") == step_title:
+            step = s
+            break
+if step is None:
+    have = ", ".join(
+        "%s (%s)" % (s.get("spec_slug") or "?", s.get("title", "?"))
+        for s in job.get("steps", [])
+    )
+    print("boss-step: no step %r on %s (has slug (title): %s)"
+          % (step_title, job["id"][:8], have), file=sys.stderr)
     sys.exit(1)
 
 if step.get("status") in ("completed", "skipped"):

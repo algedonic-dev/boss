@@ -215,15 +215,16 @@ async fn upsert_step(
 ) -> Result<bool, RebuildError> {
     let result = sqlx::query(
         r#"
-        INSERT INTO steps (id, job_id, kind, title, assignee_id, status, sort_order,
+        INSERT INTO steps (id, job_id, kind, title, spec_slug, assignee_id, status, sort_order,
                            blocked_by, sign_offs_required, sign_offs, fields,
                            completed_on, metadata, notes, step_plugin_version,
                            embedded_job, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $17)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $18)
         ON CONFLICT (id) DO UPDATE SET
             job_id = EXCLUDED.job_id,
             kind = EXCLUDED.kind,
             title = EXCLUDED.title,
+            spec_slug = EXCLUDED.spec_slug,
             assignee_id = EXCLUDED.assignee_id,
             status = EXCLUDED.status,
             sort_order = EXCLUDED.sort_order,
@@ -244,6 +245,7 @@ async fn upsert_step(
     .bind(*step.job_id.inner().as_uuid())
     .bind(&step.kind)
     .bind(&step.title)
+    .bind(&step.spec_slug)
     .bind(&step.assignee_id)
     .bind(step_status_str(step.status))
     .bind(step.sort_order)

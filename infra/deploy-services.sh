@@ -1093,4 +1093,5 @@ echo "done."
 # are already running by this point, and a Job that cannot be updated
 # is a worse thing to abort a deploy over than to report.
 "$(dirname "$0")/boss-step.sh" regenerate-deployment deploy \
-    "deployed=$(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
+    "deployed=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    || echo "WARN: deploy step NOT recorded on the regen Job (boss-step failed above)" >&2
