@@ -92,6 +92,15 @@ fi
 # direction, and `check-binary-freshness.sh --rebuild` settles it for real —
 # cargo is the only thing that actually knows.
 
+# Stamp what this build was made from. `set -euo pipefail` is on, so
+# reaching this line means every cargo invocation above succeeded — the
+# stamp cannot outlive a failed build.
+#
+# The deploy compares this against the working tree instead of
+# comparing mtimes, because git rewrites mtimes on every checkout and
+# rebase; see infra/src-fingerprint.sh for the incident.
+"$(dirname "$0")/src-fingerprint.sh" > "$RELEASE_DIR/.boss-src-fingerprint" || true
+
 echo "==> release build complete. Next: sudo infra/deploy-services.sh prod"
 
 # The build is a step of a regen when one is open, and a no-op otherwise.
