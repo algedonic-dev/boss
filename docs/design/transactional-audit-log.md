@@ -185,69 +185,26 @@ on a clone table, realistic ~730-char payloads).
 
 ## Open questions
 
-### Q2: Chain maintenance — does the pipeline keep insert-time chaining forever?
+All 2 open questions were resolved 2026-08-08 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-Proposed resolution: **yes — keep insert-time chaining, and keep
-the relay single-writer, as one decision.** Measured, the question
-has no forcing function in sight: the chain costs 0.07 ms/row in
-the relay's batched shape, and the measured ceiling (~14.6K
-rows/sec) sits 75× above the worst burst ever observed and four
-orders of magnitude above steady state. The advisory lock is only
-a bottleneck for *concurrent* writers — which the single relay
-never is.
+---
 
-The end-state previously recorded here (checkpoint-time chaining
-computed by the integrity checkpointer over an unchained tail)
-keeps its skeleton warm: the nightly checker already logs a
-chain-head checkpoint and recomputes the full chain at ~72K
-rows/sec. But the serialized write side is now load-bearing beyond
-the chain itself: one writer inserting in sequence is what makes
-id order ≡ commit order, which is exactly the property a
-log-tailing consumer (Q6) needs to never miss a row. A sharded
-relay would break both at once — the chain serializes again at the
-lock, and BIGSERIAL commit-order inversions reintroduce the
-classic poller race. If sustained demand ever approaches ~1K/sec
-(an order of magnitude under the measured ceiling), Q2 and Q6
-reopen **together**: they are one decision about what the log's
-write side guarantees its read side.
 
-### Q6: Does the dispatcher eventually consume the log instead of NATS?
+## Decisions
 
-Proposed resolution: **affirm log-as-the-bus as the end-state, and
-stage it with the cluster work rather than standalone.** The
-clause that parked this question — "re-plumbing every consumer" —
-dissolved under measurement: there are two durable consumers, both
-in one crate, ~35 transport-coupled lines between them. Everything
-else on the bus either wants at-most-once (SSE fan-out) or isn't
-event-log traffic (cybernetics), and stays on NATS.
+### Q2: Chain maintenance — does the pipeline keep insert-time chaining forever? (resolved)
 
-What makes the swap small: `publish` sets subject = `event.kind`
-verbatim, so consumer filters map 1:1 onto `audit_log.kind`; and
-the cursor pattern already ships twice — `dispatcher_clock_cursor`
-(per-item durable advance, in the dispatcher itself) and the audit
-tail endpoint's id-cursor poll.
+Resolved 2026-08-08 — override.
 
-What it buys, measured: deletes the second durable log (219K
-msgs / 210 MB duplicating what `audit_log` holds with stronger
-guarantees); retires the delivery machinery behind two real
-incident classes (the ack_wait/backoff override that silently
-double-fired side effects; the redelivery state-leak class that
-receive-dedup exists to compensate — dedup collapses to a cursor
-compare); makes the "consumer filter names a subject the stream
-doesn't carry → silent zero deliveries" trap structurally
-impossible (today it's real and pinned by a test); and removes one
-stateful service from the correctness path of the planned
-five-machine cluster — NATS stays, but as stateless fan-out.
+That sounds good
 
-What it costs, measured: side effects trail the write by relay lag
-(p50 ~200 ms) plus one poll interval instead of ms-scale push —
-irrelevant at human timescale; retry/dead-letter (the 8-attempt
-budget, Retry-vs-Permanent classification, the `DEAD-LETTER:` line
-release gates grep for) and the concurrency-12 fan-out must be
-rebuilt on a cursor instead of JetStream primitives — this is the
-real work; and epoch trim must re-anchor cursors, the log-side
-analog of today's purge-stream-on-restart.
 
-Sequencing if affirmed: `dispatcher-rules` first (its `Settle`
-outcome is already transport-agnostic), then `dispatcher-steps`,
-then shrink the stream to fan-out-only retention.
+### Q6: Does the dispatcher eventually consume the log instead of NATS? (resolved)
+
+Resolved 2026-08-08 — override.
+
+This is an interesting architecture question. Every actor needs visibility into their personal queue and there are lots of abstract groups, like anyone with a certain skill, that we will have steps queued up for, and of course agents are actors that will want queues. Do they each just have a lens onto the one giant queue? What happens when it inevitably gets too large? Everyone still just has an API onto the queue and underneath the engineering team makes it work? Let's discuss these before settling. It might open more questions.
