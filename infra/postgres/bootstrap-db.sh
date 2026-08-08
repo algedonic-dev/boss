@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-APPLY_SCHEMA="$(dirname "$0")/apply-schema.sh"
+MIGRATE="$(dirname "$0")/migrate.sh"
 WITHOUT_ARGS=""
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DB_USER="boss"
@@ -84,8 +84,8 @@ if [ -z "$DB_NAME" ]; then
     exit 2
 fi
 
-if [ ! -x "$APPLY_SCHEMA" ]; then
-    echo "apply-schema.sh not found/executable at $APPLY_SCHEMA" >&2
+if [ ! -x "$MIGRATE" ]; then
+    echo "migrate.sh not found/executable at $MIGRATE" >&2
     exit 1
 fi
 
@@ -112,14 +112,14 @@ fi
 echo "  creating $DB_NAME"
 sudo -n -u postgres psql -d postgres -c "CREATE DATABASE $DB_NAME" > /dev/null
 
-echo "  applying per-module schema (manifest)"
-# apply-schema.sh concatenates the per-module schema/ files in manifest
-# order (honoring any --without). Stream via stdin instead of `-f` so the
-# postgres OS user doesn't need to traverse the calling user's home dir —
-# on GCP / OS Login the home is mode 0750, which makes `-f` fail with
-# `Permission denied` when the path crosses it (the dominant case for
-# evaluators cloning into ~/boss). Stdin avoids the traversal entirely.
-"$APPLY_SCHEMA" $WITHOUT_ARGS | sudo -n -u postgres psql -d "$DB_NAME" > /dev/null
+echo "  applying per-module schema (migrate.sh, manifest order)"
+# migrate.sh applies the manifest entries (honoring any --without) and
+# records them in schema_migrations. It streams each file to psql over
+# stdin rather than `-f`, so the postgres OS user never needs to traverse
+# the calling user's home dir — on GCP / OS Login the home is mode 0750,
+# which makes `-f` fail with `Permission denied` when the path crosses it
+# (the dominant case for evaluators cloning into ~/boss).
+"$MIGRATE" $WITHOUT_ARGS -- sudo -n -u postgres psql -d "$DB_NAME" > /dev/null
 
 echo "  granting table/sequence/function privileges to $DB_USER"
 sudo -n -u postgres psql -d "$DB_NAME" <<SQL > /dev/null

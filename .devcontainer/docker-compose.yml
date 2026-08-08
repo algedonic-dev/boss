@@ -22,7 +22,7 @@ services:
       BOSS_TEST_POSTGRES_ADMIN_URL: postgres://boss:boss@postgres:5432/postgres
       NATS_URL: nats://nats:4222
       BOSS_NATS_URL: nats://nats:4222
-      # Let bare `psql` + apply-schema.sh hit the postgres service with
+      # Let bare `psql` + migrate.sh hit the postgres service with
       # no -h/-U flags.
       PGHOST: postgres
       PGPORT: "5432"

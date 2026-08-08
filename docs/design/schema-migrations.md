@@ -1,0 +1,68 @@
+# Schema migrations — expand/contract
+
+**Status: living reference.** The contract of
+`infra/postgres/migrate.sh` and the convention for changing schema.
+Pinned by `crates/core/boss-testing/tests/migrate_sh.rs`.
+
+## The mechanism
+
+Schema reaches a database only through `infra/postgres/migrate.sh`.
+`infra/postgres/schema/manifest.txt` is the ordered migration list;
+`schema_migrations (id, checksum, applied_at)` records what a given
+database has run. A run applies the not-yet-recorded entries in
+manifest order, each in one transaction **with** its bookkeeping row —
+a failure keeps nothing, a re-run re-applies nothing, and an
+up-to-date database is a no-op.
+
+- `--baseline` records every current entry without running it. It
+  exists for databases that predate the runner (their tables already
+  exist) and is needed exactly once per such deployment. A database
+  that visibly predates the runner — core tables present, nothing
+  recorded — is refused rather than silently re-applied.
+- `--without <name>` skips matching entries without recording them
+  (the ledger-less bootstrap; `TestDb::new_without` mirrors it).
+- Everything after `--` is the psql command to run, so the same runner
+  serves CI (`-- psql -h localhost -U boss -d boss`), bare-metal
+  bootstrap (`-- sudo -n -u postgres psql -d boss`), and env-configured
+  containers (no args).
+
+`boss_testing::TestDb` loads the same manifest, compiled in as
+`SCHEMA_FILES`; the `manifest_agreement` test pins the two lists to
+each other (CLAUDE.md §9a).
+
+## The convention: applied migrations are history
+
+A schema change is a **new file appended to the manifest**, never an
+edit to an already-applied one. migrate.sh enforces this with the
+recorded checksum: an applied entry whose file has changed fails the
+run by name. A fresh database and a long-lived one converge because
+both replay the same ordered list.
+
+Destructive changes follow **expand/contract**, in separate deploys:
+
+1. **Expand** — add the new column/table; ship code that writes both
+   old and new; backfill.
+2. **Contract** — once nothing reads the old shape, drop it in a
+   *later* migration, shipped in a *later* deploy.
+
+Nothing is rolled back — roll-forward only. The cost is that a
+destructive change takes two deploys; the payoff is that old and new
+code can run against one database for the length of a rollout, which
+is the prerequisite for zero-downtime deploys.
+
+This supersedes the old "no back-compat: drop it and regen" policy.
+That policy rested on "BOSS has no prod data", which stopped being
+true when demo mode was removed to stop losing real events: the
+playground's audit log is a system of record now. The convention
+applies to new changes; history before the runner landed is not
+rewritten retroactively.
+
+## Operational notes
+
+- The schema seed INSERTs are mostly not re-runnable (one `ON
+  CONFLICT` across 34 statements). Under the runner each file runs
+  exactly once per database, so this is latent, not live — fix seeds
+  as they are touched.
+- Existing deployments (the playground, pre-runner dev-container and
+  quickstart volumes) need their one-time `migrate.sh --baseline`;
+  `post-create.sh` does it automatically for dev containers.

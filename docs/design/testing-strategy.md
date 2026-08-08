@@ -211,7 +211,7 @@ answer "yes" stops the search:
 `.github/workflows/ci.yml`:
 
 ```yaml
-- Apply schema (infra/postgres/apply-schema.sh — the per-module schema/ manifest)
+- Apply schema (infra/postgres/migrate.sh — the schema/ manifest as an ordered migration list)
 - Clippy: cargo clippy --workspace --all-features --tests -- -D warnings
 - Test:   cargo test --all-features
 - Format: cargo fmt -- --check

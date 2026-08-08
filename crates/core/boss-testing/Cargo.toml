@@ -20,5 +20,12 @@ async-trait = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres"], optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[test]]
+name = "migrate_sh"
+required-features = ["postgres"]
+
 [lints]
 workspace = true
