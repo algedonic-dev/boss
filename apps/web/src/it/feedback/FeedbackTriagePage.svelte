@@ -19,6 +19,41 @@
     return typeof m === 'string' ? m : '(no message)';
   }
 
+  /// Bug or feature, if the reporter said. `feedback_kind` arrives on
+  /// items filed after the form learned the difference; everything
+  /// older has no answer and gets no chip rather than a guessed one —
+  /// a wrong label on a card is worse than an absent one.
+  function kindOf(j: Job): 'bug' | 'feature' | null {
+    const k = j.metadata?.['feedback_kind'];
+    return k === 'bug' || k === 'feature' ? k : null;
+  }
+
+  /// The first sentence or line, for the card.
+  ///
+  /// Cards were rendering the WHOLE message, so one long report made a
+  /// card four times the height of its neighbours and the column
+  /// stopped being scannable — which is what "visually challenging"
+  /// meant. Nothing is lost: double-clicking opens the full text.
+  ///
+  /// Splits on the first line break or sentence end, whichever comes
+  /// first, then falls back to a hard clip. A summary that cuts
+  /// mid-word reads as broken, so the clip backs up to a space.
+  function summary(j: Job): string {
+    const full = message(j).trim();
+    const firstLine = full.split('\n')[0]!.trim();
+    const stop = firstLine.search(/[.!?](\s|$)/);
+    const candidate = stop > 20 ? firstLine.slice(0, stop + 1) : firstLine;
+    if (candidate.length <= 120) return candidate;
+    const cut = candidate.lastIndexOf(' ', 120);
+    return `${candidate.slice(0, cut > 40 ? cut : 120)}…`;
+  }
+
+  /// Whether the summary is actually shorter than what it summarises —
+  /// only then is there a reason to say "there is more".
+  function truncated(j: Job): boolean {
+    return summary(j).replace(/…$/, '').length < message(j).trim().length;
+  }
+
   /// The surface the feedback is about. Falls back to the Subject id,
   /// which is the same value — the route path IS the Subject id.
   function route(j: Job): string | null {
@@ -35,9 +70,12 @@
   emptyMessage="No feedback yet. It arrives from the Feedback control in the top bar, on whichever page the person was looking at."
 >
   {#snippet card(j)}
-    <p class="fb-card-msg">{message(j)}</p>
-    {#if route(j)}
-      <div class="fb-card-route">
+    <p class="fb-card-msg">{summary(j)}</p>
+    <div class="fb-card-meta">
+      {#if kindOf(j)}
+        <span class="fb-chip fb-chip-{kindOf(j)}">{kindOf(j)}</span>
+      {/if}
+      {#if route(j)}
         <button
           class="fb-route"
           type="button"
@@ -46,19 +84,56 @@
         >
           {route(j)}
         </button>
-      </div>
-    {/if}
+      {/if}
+      {#if truncated(j)}
+        <span class="fb-more" title="Double-click the card for the full report">more…</span>
+      {/if}
+    </div>
   {/snippet}
 </TriageBoard>
 
 <style>
   .fb-card-msg {
-    margin: 0;
+    margin: 0 0 8px;
     font-size: 13px;
     line-height: 1.45;
+    /* Two lines, so every card in a column is the same height and the
+       column scans as a list rather than a ragged stack. */
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
   }
-  .fb-card-route {
+  .fb-card-meta {
     display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .fb-chip {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-weight: 600;
+  }
+  /* Two different questions, so two different colours: a bug is a
+     claim something is wrong, a feature is a claim something is
+     missing. Not severity — the board has no severity. */
+  .fb-chip-bug {
+    background: #fef2f2;
+    color: #b91c1c;
+  }
+  .fb-chip-feature {
+    background: #eff6ff;
+    color: #1d4ed8;
+  }
+  .fb-more {
+    font-size: 11px;
+    color: var(--text-dim, #a8a29e);
+    margin-left: auto;
   }
   .fb-route {
     font: inherit;
