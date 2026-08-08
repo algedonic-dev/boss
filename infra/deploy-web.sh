@@ -33,17 +33,51 @@ fi
 # sources `.bash_profile`/`.profile`), so we add bun's default
 # install path manually — covers the common case where bun ships to
 # ~/.bun/bin and is put on PATH by the user's `.bashrc`.
-if [[ -n "${SUDO_USER:-}" ]]; then
-    echo "==> building web bundle (as ${SUDO_USER})"
-    sudo -u "${SUDO_USER}" bash -lc \
-        "export PATH=\"\$HOME/.bun/bin:\$PATH\"; cd '${WEB_DIR}' && bun run build"
+# Find bun. `$HOME/.bun/bin` for the invoking user is the common case
+# and was the only case this handled — which fails on any box where the
+# toolchain was installed under a different account than the one running
+# the deploy. That is this playground: bun lives in dauld's home, the
+# deploy runs as david, and the build died with "bun: command not found"
+# while every other part of the script worked. The web bundle then
+# silently stayed at whatever version was last built by hand, which is
+# how a CSS fix committed at 23:42 was still not in the browser at 04:05
+# and got reported as a bug twice.
+#
+# So: look in the obvious places and SAY which ones were tried.
+find_bun() {
+    local candidates=()
+    command -v bun >/dev/null 2>&1 && { command -v bun; return 0; }
+    [[ -n "${BOSS_BUN:-}" ]] && candidates+=("${BOSS_BUN}")
+    [[ -n "${SUDO_USER:-}" ]] && candidates+=("$(getent passwd "${SUDO_USER}" | cut -d: -f6)/.bun/bin/bun")
+    candidates+=("${HOME}/.bun/bin/bun" "/usr/local/bin/bun")
+    # Any user's bun install. Last resort, but a deploy that cannot find
+    # the toolchain is worse than one that looks a little harder.
+    local h
+    while IFS=: read -r _ _ _ _ _ h _; do
+        [[ -x "$h/.bun/bin/bun" ]] && candidates+=("$h/.bun/bin/bun")
+    done < <(getent passwd)
+    local c
+    for c in "${candidates[@]}"; do
+        [[ -x "$c" ]] && { echo "$c"; return 0; }
+    done
+    {
+        echo "bun not found. Tried:"
+        printf '  %s\n' "${candidates[@]}"
+        echo "Set BOSS_BUN=/path/to/bun, or install bun for the user running this."
+    } >&2
+    return 1
+}
+
+BUN="$(find_bun)" || exit 1
+echo "==> building web bundle (bun: ${BUN})"
+
+# Build as a user who can write node_modules + dist, not as root.
+BUILD_AS="${SUDO_USER:-$(id -un)}"
+if [[ "${BUILD_AS}" != "$(id -un)" ]]; then
+    sudo -u "${BUILD_AS}" env "PATH=$(dirname "${BUN}"):${PATH}" \
+        bash -c "cd '${WEB_DIR}' && bun run build"
 else
-    if ! command -v bun >/dev/null 2>&1; then
-        echo "bun not on PATH; install it or run from a shell where it is" >&2
-        exit 1
-    fi
-    echo "==> building web bundle"
-    (cd "${WEB_DIR}" && bun run build)
+    (cd "${WEB_DIR}" && PATH="$(dirname "${BUN}"):${PATH}" bun run build)
 fi
 
 if [[ ! -f "${DIST_SRC}/index.html" ]]; then
