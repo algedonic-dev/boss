@@ -51,6 +51,32 @@
   );
 
   let jobs = $state<JobSummary[]>([]);
+
+  /// The step of a Job that YOU can act on right now.
+  ///
+  /// The page was listing every Job with a step assigned to you in
+  /// `isPending || isInFlight` — and `isPending` covers BOTH `pending`
+  /// and `ready`. A `pending` step is yours but blocked: its
+  /// `ready_when` predicate is not satisfied, so there is nothing to
+  /// do. Mixed into one list with work you can actually start, that
+  /// reads as "a bunch of random jobs and steps", because half of it
+  /// is not addressable and nothing on the card says which half.
+  ///
+  /// `ready` and `active` are the ones waiting on you.
+  function actionableStep(j: JobSummary): StepSummary | null {
+    return (
+      j.steps?.find(
+        (s) =>
+          s.assignee_id === userId && (s.status === 'ready' || s.status === 'active'),
+      ) ?? null
+    );
+  }
+
+  /// Jobs you can start now. Blocked ones are still listed — a blocked
+  /// step is a commitment and hiding it would move the confusion
+  /// rather than remove it — but they sort below, and their card says
+  /// so, so the first thing on the page is the first thing to do.
+  let readyJobs = $derived(jobs.filter((j) => actionableStep(j) !== null));
   let openJobsCapped = $state(false);
   let openJobsTotal = $state(0);
   let openJobsLoaded = $state(0);
@@ -92,6 +118,20 @@
           scheduled: 3,
         };
         mine.sort((a, b) => {
+          // Actionable before blocked, then the existing order. Sorting
+          // by priority alone put an urgent BLOCKED step above a
+          // standard one you could actually finish.
+          const aa = a.steps?.some(
+            (s) => s.assignee_id === uid && (s.status === 'ready' || s.status === 'active'),
+          )
+            ? 0
+            : 1;
+          const ab = b.steps?.some(
+            (s) => s.assignee_id === uid && (s.status === 'ready' || s.status === 'active'),
+          )
+            ? 0
+            : 1;
+          if (aa !== ab) return aa - ab;
           const pa = priority[a.priority] ?? 3;
           const pb = priority[b.priority] ?? 3;
           if (pa !== pb) return pa - pb;
@@ -189,6 +229,13 @@
                 onclick={() => navigate(entityHref('job', job.id))}
               >
                 <div class="myday-job-header">
+                  {#if actionableStep(job)}
+                    <span class="myday-step myday-step-ready"
+                      >{actionableStep(job)?.title}</span
+                    >
+                  {:else}
+                    <span class="myday-step myday-step-blocked">blocked</span>
+                  {/if}
                   <span class="myday-workflow">{job.kind}</span>
                   <span class="myday-job-title">{job.title}</span>
                   {#if job.priority !== 'standard'}
@@ -235,6 +282,25 @@
 {/if}
 
 <style>
+  /* The step, not the Job, is what you act on — so it leads the card. */
+  .myday-step {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+  .myday-step-ready {
+    background: #ecfdf5;
+    color: #047857;
+  }
+  .myday-step-blocked {
+    background: var(--bg, #f5f5f4);
+    color: var(--text-dim, #78716c);
+  }
+
   .myday-cap-note {
     padding: 8px 12px;
     background: #fff7ed;
