@@ -1,18 +1,14 @@
 # Transactional audit log — the event write path
 
-**Status:** reopened — the contract below is settled and in force (the
-arc that established it completed 2026-07-29; decision history folded
-into [docs/architecture-decisions.md](../architecture-decisions.md)
-§Correctness protocol & the audit log), but Q2 and Q6 under Open
-questions are genuinely undecided, and `living` asserts a doc carries
-none. Every new write path in BOSS follows this contract;
+**Status:** approved — the contract below is settled and in force (the
+arc that established it completed 2026-07-29; earlier decision history
+folded into [docs/architecture-decisions.md](../architecture-decisions.md)
+§Correctness protocol & the audit log). Q2 and Q6, the two questions
+reopened while genuinely undecided, were resolved 2026-08-08 on
+measured grounding — §What the pipeline measures today for the
+numbers, §Decisions for the verdicts and the technical record. Every
+new write path in BOSS follows this contract;
 `infra/lint/outbox-migration-ratchet.sh` fails CI on any deviation.
-
-Flip back to `living` when Q2 and Q6 are resolved — or mark them
-`(resolved)` in their headings if they turn out to be settled and
-merely un-annotated. Measured grounding for both questions added
-2026-08-08 (§What the pipeline measures today); each now carries a
-proposed resolution awaiting decision at `/system/design`.
 
 ## The invariant
 
@@ -181,7 +177,8 @@ on a clone table, realistic ~730-char payloads).
   delivery** — the assets ingress (`asset.>` appends into the
   assets repository; the subject isn't even in the stream) and the
   jobs escalation notifier (`jobs.job.created`). Backlog items
-  filed; both need a durable leg whichever way Q6 resolves.
+  filed (`0da79b36`, `50ff6193`); both need a durable leg — under
+  the resolved Q6, the log-tail.
 
 ## Open questions
 
@@ -202,9 +199,57 @@ Resolved 2026-08-08 — override.
 
 That sounds good
 
+Technical record: insert-time chaining stays and the relay stays
+single-writer, **as one decision**. The measured ceiling (14.6K
+rows/sec in the relay's 100-row-batch shape, 0.07 ms/row) sits 75×
+above the worst burst ever observed; the advisory lock only
+bottlenecks *concurrent* writers (1.3× scaling at 4 clients), which
+the single relay never is. The checkpoint-time end-state keeps its
+skeleton warm — the nightly checker already logs a chain-head
+checkpoint and recomputes the full chain at ~72K rows/sec — but the
+serialized write side is load-bearing beyond the chain: one writer
+inserting in sequence makes id order ≡ commit order, exactly what
+Q6's log-tailing needs to never miss a row. If sustained demand
+ever approaches ~1K/sec, Q2 and Q6 reopen together: they are one
+decision about what the log's write side guarantees its read side.
 
 ### Q6: Does the dispatcher eventually consume the log instead of NATS? (resolved)
 
 Resolved 2026-08-08 — override.
 
 This is an interesting architecture question. Every actor needs visibility into their personal queue and there are lots of abstract groups, like anyone with a certain skill, that we will have steps queued up for, and of course agents are actors that will want queues. Do they each just have a lens onto the one giant queue? What happens when it inevitably gets too large? Everyone still just has an API onto the queue and underneath the engineering team makes it work? Let's discuss these before settling. It might open more questions.
+
+Settled the same evening: David confirmed in-session ("I am on
+board with both suggestions — let's do it") after reading the
+measured grounding. The queue-visibility questions above — personal,
+skill-group, and agent queues as lenses on the one queue; behavior
+at scale; API-only access — are tracked as feedback item `207236cc`
+for their own design pass.
+
+Technical record: log-as-the-bus is the end-state, **staged with
+the cluster work rather than standalone**. Two durable consumers
+exist, both in boss-dispatcher, ~35 transport-coupled lines between
+them; both handlers already consume `(kind, event_id, payload)` —
+audit_log's exact columns (`publish` sets subject = `event.kind`
+verbatim, so filters map 1:1 onto `audit_log.kind`) — and the
+cursor pattern already ships twice (`dispatcher_clock_cursor`, the
+audit tail endpoint's id-poll). Everything else on the bus either
+wants at-most-once (SSE fan-out) or isn't event-log traffic
+(cybernetics), and stays on NATS. The swap deletes the duplicate
+durable log (219K msgs / 210 MB / 3-day window), retires the
+delivery machinery behind two real incident classes (the
+ack_wait/backoff double-fire; the redelivery state-leak that
+receive-dedup compensates for), makes the silent-zero-deliveries
+filter trap structurally impossible, and removes one stateful
+service from the correctness path of the planned five-machine
+cluster. Costs accepted: side effects trail the write by relay lag
+plus a poll interval (human-timescale irrelevant); retry and
+dead-letter (the 8-attempt budget, Retry-vs-Permanent
+classification, the `DEAD-LETTER:` line release gates grep for)
+plus the concurrency-12 fan-out must be rebuilt on a cursor — the
+real work; and epoch trim re-anchors cursors, the log-side analog
+of purge-stream-on-restart. Sequence: `dispatcher-rules` first (its
+`Settle` outcome is already transport-agnostic), then
+`dispatcher-steps`, then shrink the stream to fan-out-only
+retention. Implementation queued with the cluster arc as feedback
+item `3d6d6bea`.
