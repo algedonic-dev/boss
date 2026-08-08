@@ -104,5 +104,8 @@ fi
 echo "==> release build complete. Next: sudo infra/deploy-services.sh prod"
 
 # The build is a step of a regen when one is open, and a no-op otherwise.
+# A bookkeeping failure must not fail the build, but it must be SEEN —
+# the bare `|| true` here hid a month of every call matching nothing.
 "$(dirname "$0")/boss-step.sh" regenerate-deployment build \
-    "source_ref=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" || true
+    "source_ref=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
+    || echo "WARN: build step NOT recorded on the regen Job (boss-step failed above)" >&2

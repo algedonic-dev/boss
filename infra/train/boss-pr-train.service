@@ -1,0 +1,17 @@
+[Unit]
+Description=BOSS PR train conductor — batch ready branches into one PR, record evidence
+Documentation=file:/opt/boss/infra/train/conductor.py
+After=network-online.target boss-jobs-api.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=david
+# /var/lib/boss-train — the conductor's own clone + lock live here,
+# never in the dev working tree.
+StateDirectory=boss-train
+WorkingDirectory=/opt/boss
+ExecStart=/opt/boss/infra/train/conductor.sh
+# Reconcile + assembly are quick; a deploy phase (build-release +
+# deploy-services) is not. Generous, and the flock makes overlap safe.
+TimeoutStartSec=45min

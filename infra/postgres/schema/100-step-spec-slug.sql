@@ -1,0 +1,15 @@
+-- 100-step-spec-slug.sql — steps keep the spec slug they materialized
+-- from.
+--
+-- The slug ("build", "gate") is the stable machine-facing identifier;
+-- `title` is rendered display text. Materialisation used to discard
+-- the slug, so every machine caller addressing a step by slug
+-- (boss-step.sh from the build/deploy scripts) silently found nothing
+-- (backlog 6c6b9e06).
+--
+-- Expand-only: nullable, no backfill. Steps materialized before this
+-- column stay NULL and machine callers fall back to title matching;
+-- new materializations always populate it. First new-style migration
+-- under docs/design/schema-migrations.md — appended to the manifest,
+-- never an edit to an applied file.
+ALTER TABLE steps ADD COLUMN IF NOT EXISTS spec_slug TEXT;

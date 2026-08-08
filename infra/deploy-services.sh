@@ -178,6 +178,10 @@ TIMERS=(
     # boss-rebuild-all nothing refreshed it. Measured stale at 0.5% job
     # coverage on a live box: search could not find 99% of the corpus.
     "boss-search-reindex:."
+    # The twice-daily PR train: batches ready branches into one PR and
+    # records CI/merge/deploy evidence on the pr-train Job. The
+    # conductor script is infra/train/conductor.py.
+    "boss-pr-train:train"
     # boss-backup deferred — backup script destination + retention
     # policy needs review before enabling on a fresh deploy.
 )
@@ -1093,4 +1097,5 @@ echo "done."
 # are already running by this point, and a Job that cannot be updated
 # is a worse thing to abort a deploy over than to report.
 "$(dirname "$0")/boss-step.sh" regenerate-deployment deploy \
-    "deployed=$(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
+    "deployed=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    || echo "WARN: deploy step NOT recorded on the regen Job (boss-step failed above)" >&2

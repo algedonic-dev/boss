@@ -237,6 +237,7 @@ fi
 # would be a worse record than none, since the Job would then assert
 # the artifacts were verified when they were not.
 "$(dirname "$0")/boss-step.sh" regenerate-deployment artifacts \
-    "verified=$fresh_count fresh, 0 not-deployed, 0 stale ($unknown_count unmapped)" || true
+    "verified=$fresh_count fresh, 0 not-deployed, 0 stale ($unknown_count unmapped)" \
+    || echo "WARN: artifacts step NOT recorded on the regen Job (boss-step failed above)" >&2
 
 exit 0

@@ -185,6 +185,7 @@ mod tests {
             job_id: boss_core::job::JobId::new(),
             kind: "service".into(),
             title: "test step".into(),
+            spec_slug: None,
             status,
             assignee_id: assignee.map(String::from),
             blocked_by: vec![],
