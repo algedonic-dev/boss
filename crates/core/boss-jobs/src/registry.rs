@@ -3860,32 +3860,45 @@ mod tests {
             .find(|k| k.kind == "pr-train")
             .expect("pr-train present");
 
-        // Every task is authority-gated: an ungated ready task gets
-        // role-matched and completed by the simulated workforce, and a
-        // train whose steps the sim closes records fiction.
-        for s in train.steps.iter().filter(|s| s.kind == "task") {
+        // Every evidence step — one that carries required fields for
+        // the conductor to fill — is authority-gated: an ungated ready
+        // step gets role-matched and completed by the simulated
+        // workforce, and a train whose steps the sim closes records
+        // fiction. Property-based, not kind-named (ADR-0021): "has
+        // evidence fields, is not a terminal" IS the conductor-closed
+        // set, whatever kinds those steps declare.
+        let evidence_steps: Vec<_> = train
+            .steps
+            .iter()
+            .filter(|s| s.terminal.is_none() && !s.fields.is_empty())
+            .collect();
+        assert!(
+            evidence_steps.len() >= 6,
+            "collect/assemble/pr/ci/merged/deployed all carry evidence fields"
+        );
+        for s in &evidence_steps {
             assert_eq!(
                 s.authority_role.as_deref(),
                 Some("platform-admin"),
-                "train task `{}` must be closed by the conductor or a person, \
+                "evidence step `{}` must be closed by the conductor or a person, \
                  never the sim workforce",
                 s.title
             );
         }
 
-        // `merged` is a TASK the conductor completes with the merge
-        // ref it observed on GitHub — not an outcome. An outcome ready
-        // on `review.done` gets completed by the dispatcher's
-        // complete-on-ready rule, which is exactly how ship-a-change
-        // Jobs came to read "merged" while their PR was still open.
+        // `merged` closes on evidence, not readiness: it must NOT be a
+        // terminal — the dispatcher's complete-on-ready rule fires
+        // ready terminals, which is exactly how ship-a-change Jobs
+        // came to read "merged" while their PR was still open — and it
+        // must demand the observed merge commit.
         let merged = train
             .steps
             .iter()
             .find(|s| s.title == "merged")
             .expect("merged step present");
-        assert_eq!(
-            merged.kind, "task",
-            "merged closes on evidence, not readiness"
+        assert!(
+            merged.terminal.is_none(),
+            "a terminal `merged` would be auto-completed the moment it became ready"
         );
         assert!(
             merged
