@@ -61,6 +61,7 @@ use boss_sim::event_routes::register_default_event_routes;
 use boss_sim::output::live::LiveApiOutput;
 use boss_sim::workforce::Workforce;
 use chrono::NaiveDate;
+use futures::StreamExt;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -139,8 +140,20 @@ async fn readiness_pass(client: &reqwest::Client, api_base: &str) -> Vec<(String
         out.push(("dispatcher:consumers".to_string(), ok, detail));
     }
 
-    // 3. The clock is primed: sim mode, a non-empty epoch range, not paused. A
-    //    wall-time / zero-length / paused clock means the sim won't advance.
+    // 3. The clock will advance. Two ways that is true, and the check
+    //    accepts both.
+    //
+    //    SIM mode needs priming: a non-empty epoch range and not
+    //    paused, or sim-time sits still and the sim would flood a
+    //    frozen clock with Jobs.
+    //
+    //    WALL mode needs nothing. Real time advances on its own — there
+    //    is no epoch to range and nothing to pause. This branch used to
+    //    be absent, so the check read `simulated && ranged && !paused`
+    //    and a wall clock failed it forever. That is not theoretical:
+    //    switching the playground to wall mode stalled the sim at this
+    //    gate, holding — by design — and creating nothing, on a clock
+    //    that was working perfectly.
     {
         let url = format!("{}/api/clock/now", readiness_base(api_base, "clock"));
         let (ok, detail) = match client.get(&url).send().await {
@@ -154,9 +167,13 @@ async fn readiness_pass(client: &reqwest::Client, api_base: &str) -> Vec<(String
                     let es = v.get("epoch_start").and_then(|x| x.as_str()).unwrap_or("");
                     let ee = v.get("epoch_end").and_then(|x| x.as_str()).unwrap_or("");
                     let ranged = !es.is_empty() && !ee.is_empty() && ee > es;
+                    // `simulated` is the clock's mode marker: true in
+                    // sim mode, false in wall mode.
+                    let advancing = if sim { ranged && !paused } else { true };
+                    let mode = if sim { "sim" } else { "wall" };
                     (
-                        sim && ranged && !paused,
-                        format!("simulated={sim} epoch={es}..{ee} paused={paused}"),
+                        advancing,
+                        format!("mode={mode} epoch={es}..{ee} paused={paused}"),
                     )
                 }
                 Err(e) => (false, format!("bad json ({e})")),
@@ -686,23 +703,49 @@ async fn main() -> Result<()> {
     // hiccups, NATS blips) log + retry on the next tick. The
     // engine is mutex-guarded so two ticks can't race; with
     // tick_interval_seconds ≥ 1 they realistically don't.
+    // How long to wait when the loop is watching for a STATE CHANGE
+    // (paused, restart in flight, waiting for the next sim-day) rather
+    // than pacing simulation.
+    //
+    // These used to sleep `tick_interval_seconds`, which is the
+    // wall-clock budget for one SIM-DAY. That is harmless at the demo
+    // default of 10s and wrong the moment the sim runs at real time:
+    // a day's budget is 86,400 seconds, so a paused daemon would take
+    // 24 HOURS to notice it had been unpaused, and the go-live retry
+    // would fire once a day. Pacing and polling are different
+    // questions and now use different numbers.
+    const POLL_SECS: u64 = 10;
     let mut global_tick: u64 = 0;
     // The last sim-day the daemon has fully run; persists across outer
     // passes so a day is never re-run while the warp clock sits on it
     // (the cold-start over-fire fix). `None` until the first pass.
     let mut cursor: Option<NaiveDate> = None;
-    loop {
-        let clock = read_clock().await?;
+    // Drive off the clock's tick stream rather than polling. One tick per
+    // wall-second, reconnecting on its own; a gap just resumes from live
+    // time, which `slices_to_run` turns into catch-up work.
+    let clock_url = std::env::var("BOSS_CLOCK_URL").unwrap_or_else(|_| boss_ports::url("clock"));
+    let mut ticks = Box::pin(boss_clock_client::subscribe_ticks(clock_url));
+    // The last slice actually run. Replaces the day cursor as the unit of
+    // progress; `cursor` survives only for rewind detection + logging.
+    let mut last_slice: Option<Slice> = None;
+    // One catch-up batch. Ticks arrive every second, so a long gap
+    // converges over several rather than arriving as one burst.
+    const MAX_CATCHUP: usize = 64;
+    // How often to drive the workforce while caught up. Every tick would
+    // be once a second, which is far hotter than the work warrants.
+    const WORKFORCE_EVERY_TICKS: u64 = 10;
+    let mut idle_ticks: u64 = 0;
+    while let Some(tick) = ticks.next().await {
+        let clock = clock_from_now(&tick);
         if clock.paused {
             info!(
                 current_sim_date = %clock.current_sim_date,
-                "sim_clock paused; sleeping {}s",
-                clock.tick_interval_seconds
+                "sim_clock paused; polling every {}s",
+                POLL_SECS
             );
             if let Ok(mut t) = telemetry.lock() {
                 t.note_cadence(cadence_of(&clock, None));
             }
-            tokio::time::sleep(Duration::from_secs(clock.tick_interval_seconds as u64)).await;
             continue;
         }
 
@@ -770,7 +813,6 @@ async fn main() -> Result<()> {
                     set_paused(true).await?;
                 }
             }
-            tokio::time::sleep(Duration::from_secs(clock.tick_interval_seconds as u64)).await;
             continue;
         }
         if clock.restart_in_progress {
@@ -778,7 +820,6 @@ async fn main() -> Result<()> {
                 current_sim_date = %clock.current_sim_date,
                 "restart-epoch in progress; idling"
             );
-            tokio::time::sleep(Duration::from_secs(clock.tick_interval_seconds as u64)).await;
             continue;
         }
 
@@ -826,9 +867,6 @@ async fn main() -> Result<()> {
             ticks_per_day
         };
         assert!(ticks_per_day > 0);
-        let per_tick_sleep_ms =
-            (clock.tick_interval_seconds as u64 * 1000) / (ticks_per_day as u64);
-
         // Run only sim-days the daemon hasn't run yet — (cursor,
         // current_sim_date], each exactly once. While the warp clock sits
         // on a day this is empty and the daemon idles instead of re-running
@@ -868,27 +906,23 @@ async fn main() -> Result<()> {
             std::process::exit(75);
         }
 
-        let days = days_to_run(
-            cursor,
-            clock.current_sim_date,
-            (clock.days_per_tick.max(1)) as u32,
-        );
-        let Some(&start_day) = days.first() else {
-            // No new sim-day yet: drive in-flight workforce, then idle.
-            if let Err(e) = run_workforce_pass(workforce.clone()).await {
+        let current = slice_of(tick.now, ticks_per_day);
+        let slices = slices_to_run(last_slice, current, ticks_per_day, MAX_CATCHUP);
+        if slices.is_empty() {
+            // Caught up with the clock. Keep driving in-flight workforce so
+            // the tail of assigned work still settles between slices.
+            idle_ticks += 1;
+            if idle_ticks.is_multiple_of(WORKFORCE_EVERY_TICKS)
+                && let Err(e) = run_workforce_pass(workforce.clone()).await
+            {
                 warn!(error = %e, "workforce pass failed; continuing");
             }
-            tokio::time::sleep(Duration::from_millis(per_tick_sleep_ms)).await;
             continue;
-        };
-        let total_ticks = (days.len() as u32) * ticks_per_day;
+        }
+        idle_ticks = 0;
+        let slices_this_pass = slices.len();
         let mut break_outer = false;
-        for tick_offset in 0..total_ticks {
-            let day_offset = tick_offset / ticks_per_day;
-            let tick_idx = tick_offset % ticks_per_day;
-            let day = start_day
-                .checked_add_signed(chrono::Duration::days(day_offset as i64))
-                .expect("date overflow");
+        for (day, tick_idx) in slices {
             if let Err(e) = advance_one_tick(
                 engine.clone(),
                 output.clone(),
@@ -957,14 +991,12 @@ async fn main() -> Result<()> {
                     );
                 }
             }
-            // Sleep between sim-ticks so events spread across the
-            // wall-clock window. Skip the sleep on the very last
-            // tick of the loop; the outer loop's sleep at the
-            // bottom covers it (preserves the
-            // tick_interval_seconds-per-sim-day total budget).
-            if tick_offset + 1 < total_ticks {
-                tokio::time::sleep(Duration::from_millis(per_tick_sleep_ms)).await;
-            }
+            // No sleep. The clock's tick stream is the pacing: one slice
+            // per wall-second of elapsed sim-time, which at hourly
+            // granularity on a wall clock is one sim-hour per real hour.
+            // Spreading work used to be this loop's job and is now a
+            // property of the clock it follows.
+            last_slice = Some((day, tick_idx));
         }
 
         if !break_outer && let Some(ran_through) = cursor {
@@ -974,14 +1006,13 @@ async fn main() -> Result<()> {
             // SPA a date older than the events being written.
             info!(
                 ran_through = %ran_through,
-                days_this_pass = days.len(),
+                slices_this_pass,
                 ticks_per_day,
-                "pass complete"
+                "sim-day complete"
             );
         }
-
-        tokio::time::sleep(Duration::from_millis(per_tick_sleep_ms)).await;
     }
+    Ok(())
 }
 
 /// Class (cockpit rollup label) for a brewery Account id. The synthetic
@@ -999,45 +1030,112 @@ fn brewery_account_class(account_id: &str) -> String {
     }
 }
 
-/// Decide which sim-days to run this pass, given `cursor` (the last day
-/// the daemon already ran) and `target` (the clock's current day).
-/// Forward-only, each day exactly once — the daemon never re-runs a day
-/// it already processed.
+/// Build the daemon's `Clock` view from a streamed tick.
 ///
-/// This is the fix for the cold-start over-firing: the old loop ran
-/// `current_sim_date` every pass regardless, so while the warp clock sat
-/// on a day the daemon re-ran it — double-firing periodics (6× facility/
-/// utilities/tax) and re-spawning rate jobs (~2× early revenue). Mirrors
-/// the dispatcher's `schedule_runner::advance_cursor`, except first
-/// observation *runs* the current day (the daemon builds the demo
-/// forward from wherever the clock sits — the epoch on a fresh reset)
-/// rather than establishing a fire-nothing baseline.
+/// The loop used to poll `GET /api/clock/now` once per pass and rebuild
+/// this by hand. It now drives off `GET /api/clock/ticks`, which emits
+/// the same `ClockNow` once per wall-second — the clock-client's own doc
+/// names this daemon as an intended consumer. The two pacing numbers are
+/// not the clock's to give: they are the simulator's batch settings and
+/// still come from the environment.
+fn clock_from_now(now: &boss_clock_client::ClockNow) -> Clock {
+    Clock {
+        current_sim_date: now.now.date_naive(),
+        days_per_tick: std::env::var("BOSS_SIM_DAYS_PER_TICK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1),
+        tick_interval_seconds: std::env::var("BOSS_SIM_TICK_SECONDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10),
+        paused: now.paused,
+        epoch_start_date: now.epoch_start,
+        epoch_end_date: now.epoch_end,
+        warp_factor: now.warp_factor,
+        restart_in_progress: now.restart_in_progress,
+    }
+}
+
+/// One unit of simulated work: a sim-day and which slice of it.
 ///
-/// - First observation (`cursor == None`) → run `target`.
-/// - No advance (`target <= cursor`, incl. an epoch-restart rewind) → run
-///   nothing; the daemon idles until the clock ticks over.
-/// - Forward (`target > cursor`) → the half-open range `(cursor, target]`,
-///   capped at `max_batch` days this pass. The cursor advances, so the
-///   next pass continues — catch-up never skips a day, only spreads it.
-fn days_to_run(cursor: Option<NaiveDate>, target: NaiveDate, max_batch: u32) -> Vec<NaiveDate> {
-    match cursor {
-        None => vec![target],
-        Some(c) if target <= c => Vec::new(),
-        Some(c) => {
-            let mut days = Vec::new();
-            let mut d = c;
-            while (days.len() as u32) < max_batch.max(1) {
-                match d.succ_opt() {
-                    Some(n) if n <= target => {
-                        d = n;
-                        days.push(d);
-                    }
-                    _ => break,
-                }
-            }
-            days
+/// The loop used to advance a whole sim-DAY at a time, driven by a date
+/// cursor. Under warp that was invisible — a new day arrived every ten
+/// seconds. On a wall clock it means the brewery does an entire day of
+/// business the instant midnight passes and then has nothing to do for
+/// 23 hours, which is not how a brewery works and is not what a live
+/// map should show.
+///
+/// A Slice is the smaller unit the loop advances now. The day is still
+/// the unit of ROLLUP — a daily close is a real business rhythm — but it
+/// is no longer the unit of progress.
+type Slice = (NaiveDate, u32);
+
+/// Which slice of its day an instant falls in.
+///
+/// `ticks_per_day` comes from the tenant (`tick_duration = "1h"` → 24),
+/// so the slice boundary is the tenant's own idea of granularity rather
+/// than anything this file decides.
+fn slice_of(now: chrono::DateTime<chrono::Utc>, ticks_per_day: u32) -> Slice {
+    use chrono::Timelike;
+    let tpd = ticks_per_day.max(1);
+    let secs_into_day = now.time().num_seconds_from_midnight();
+    // Integer division, clamped: a leap second would otherwise index one
+    // past the end of the day.
+    let idx = (secs_into_day / (86_400 / tpd)).min(tpd - 1);
+    (now.date_naive(), idx)
+}
+
+/// The slices to run, exclusive of `last` and inclusive of `current`.
+///
+/// The whole pacing rule lives here, which is why it is a pure function
+/// with tests rather than inline in the loop:
+///
+/// - `last = None` runs ONLY the current slice. A cold start must not
+///   replay the day it happens to boot into; the sim would emit a day's
+///   work on every restart.
+/// - Already caught up returns empty, so the loop idles rather than
+///   re-running a slice. Re-running is how periodics and rate-driven
+///   Jobs double-fired at cold start before the cursor existed.
+/// - A backward jump returns empty. The clock only moves backward on an
+///   epoch rewind, which the caller handles separately; advancing into
+///   it here would run the new epoch with the old epoch's state.
+/// - `max` caps one catch-up batch. Ticks arrive every wall-second, so
+///   a long gap converges over several of them instead of arriving as
+///   one enormous burst.
+fn slices_to_run(
+    last: Option<Slice>,
+    current: Slice,
+    ticks_per_day: u32,
+    max: usize,
+) -> Vec<Slice> {
+    let tpd = ticks_per_day.max(1);
+    let Some(last) = last else {
+        return vec![current];
+    };
+    if current <= last {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let (mut day, mut idx) = last;
+    while out.len() < max.max(1) {
+        // Step one slice forward, rolling into the next day at the end.
+        if idx + 1 < tpd {
+            idx += 1;
+        } else {
+            let Some(next) = day.succ_opt() else { break };
+            day = next;
+            idx = 0;
+        }
+        if (day, idx) > current {
+            break;
+        }
+        out.push((day, idx));
+        if (day, idx) == current {
+            break;
         }
     }
+    out
 }
 
 /// Reset the day cursor when the clock jumps backward. A restart-epoch
@@ -1075,6 +1173,119 @@ mod day_cursor_tests {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
     }
 
+    fn t(y: i32, m: u32, day: u32, h: u32, min: u32) -> chrono::DateTime<chrono::Utc> {
+        d(y, m, day).and_hms_opt(h, min, 0).unwrap().and_utc()
+    }
+
+    #[test]
+    fn slice_of_indexes_the_hour_at_hourly_granularity() {
+        assert_eq!(slice_of(t(2026, 8, 8, 0, 0), 24), (d(2026, 8, 8), 0));
+        assert_eq!(slice_of(t(2026, 8, 8, 0, 59), 24), (d(2026, 8, 8), 0));
+        assert_eq!(slice_of(t(2026, 8, 8, 1, 0), 24), (d(2026, 8, 8), 1));
+        assert_eq!(slice_of(t(2026, 8, 8, 23, 59), 24), (d(2026, 8, 8), 23));
+    }
+
+    #[test]
+    fn slice_of_collapses_to_one_slice_a_day_during_backfill() {
+        // Backfill forces ticks_per_day = 1; every instant in the day is
+        // slice 0, so a day is one unit of work as it was before.
+        assert_eq!(slice_of(t(2026, 8, 8, 0, 0), 1), (d(2026, 8, 8), 0));
+        assert_eq!(slice_of(t(2026, 8, 8, 23, 59), 1), (d(2026, 8, 8), 0));
+    }
+
+    #[test]
+    fn a_cold_start_runs_only_the_current_slice() {
+        // The bug this prevents: restarting the daemon must not re-emit
+        // the whole day it booted into.
+        let now = (d(2026, 8, 8), 14);
+        assert_eq!(slices_to_run(None, now, 24, 64), vec![now]);
+    }
+
+    #[test]
+    fn caught_up_runs_nothing() {
+        let now = (d(2026, 8, 8), 14);
+        assert!(slices_to_run(Some(now), now, 24, 64).is_empty());
+    }
+
+    #[test]
+    fn one_elapsed_slice_runs_exactly_one() {
+        assert_eq!(
+            slices_to_run(Some((d(2026, 8, 8), 14)), (d(2026, 8, 8), 15), 24, 64),
+            vec![(d(2026, 8, 8), 15)]
+        );
+    }
+
+    #[test]
+    fn a_gap_runs_every_missed_slice_in_order() {
+        // The wall clock does not wait for us: a slow tick, a restart, a
+        // reconnect all leave a gap, and every slice in it is work that
+        // should have happened.
+        let got = slices_to_run(Some((d(2026, 8, 8), 21)), (d(2026, 8, 9), 2), 24, 64);
+        assert_eq!(
+            got,
+            vec![
+                (d(2026, 8, 8), 22),
+                (d(2026, 8, 8), 23),
+                (d(2026, 8, 9), 0),
+                (d(2026, 8, 9), 1),
+                (d(2026, 8, 9), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_batch_is_capped_and_resumes_from_where_it_stopped() {
+        // Ticks arrive every wall-second, so a long gap converges over
+        // several of them rather than arriving as one enormous burst.
+        let first = slices_to_run(Some((d(2026, 8, 8), 0)), (d(2026, 8, 10), 0), 24, 3);
+        assert_eq!(
+            first,
+            vec![(d(2026, 8, 8), 1), (d(2026, 8, 8), 2), (d(2026, 8, 8), 3)]
+        );
+        let second = slices_to_run(Some(*first.last().unwrap()), (d(2026, 8, 10), 0), 24, 3);
+        assert_eq!(
+            second,
+            vec![(d(2026, 8, 8), 4), (d(2026, 8, 8), 5), (d(2026, 8, 8), 6)]
+        );
+    }
+
+    #[test]
+    fn a_backward_clock_runs_nothing() {
+        // Only an epoch rewind moves the clock backward, and the caller
+        // handles that by restarting with clean state. Advancing here
+        // would drive the new epoch with the old epoch's world.
+        assert!(slices_to_run(Some((d(2026, 8, 9), 3)), (d(2026, 8, 8), 3), 24, 64).is_empty());
+    }
+
+    #[test]
+    fn the_last_slice_of_a_day_is_reached_before_the_next_day_starts() {
+        // The end-of-day rollup fires on tick_idx == ticks_per_day - 1,
+        // so crossing midnight must never skip it.
+        let got = slices_to_run(Some((d(2026, 8, 8), 22)), (d(2026, 8, 9), 0), 24, 64);
+        assert_eq!(got, vec![(d(2026, 8, 8), 23), (d(2026, 8, 9), 0)]);
+    }
+
+    #[test]
+    fn cursor_resets_only_when_the_clock_jumps_backward() {
+        // Rewind detection outlived the day-batch loop it was written
+        // for: a restart-epoch rewinds the clock to epoch_start while
+        // this process still holds the finished epoch's world in memory,
+        // and driving the new epoch with it manufactures work for
+        // subjects the reset wiped.
+        assert_eq!(cursor_after_clock(Some(d(2026, 8, 9)), d(2026, 8, 1)), None);
+        // Forward or equal keeps the cursor: an ordinary tick is not a
+        // rewind, and treating it as one would restart the process daily.
+        assert_eq!(
+            cursor_after_clock(Some(d(2026, 8, 9)), d(2026, 8, 9)),
+            Some(d(2026, 8, 9))
+        );
+        assert_eq!(
+            cursor_after_clock(Some(d(2026, 8, 9)), d(2026, 8, 10)),
+            Some(d(2026, 8, 9))
+        );
+        assert_eq!(cursor_after_clock(None, d(2026, 8, 9)), None);
+    }
+
     #[test]
     fn epoch_rewind_cleanup_removes_checkpoint() {
         let dir = std::env::temp_dir().join(format!("rewind-cleanup-{}", std::process::id()));
@@ -1089,54 +1300,6 @@ mod day_cursor_tests {
     }
 
     #[test]
-    fn first_observation_runs_current_day() {
-        // Cold start: cursor None, clock at the epoch → run the epoch day,
-        // so the daemon still builds the demo forward from day 0.
-        assert_eq!(days_to_run(None, d(2025, 4, 1), 31), vec![d(2025, 4, 1)]);
-    }
-
-    #[test]
-    fn no_advance_runs_nothing() {
-        // The warp clock hasn't ticked over: same day → idle. (THE bug:
-        // the old loop re-ran this day, double-firing the periodics.)
-        assert!(days_to_run(Some(d(2025, 4, 5)), d(2025, 4, 5), 31).is_empty());
-    }
-
-    #[test]
-    fn backward_clock_runs_nothing() {
-        // An epoch restart rewinds the clock; never re-run on a rewind.
-        assert!(days_to_run(Some(d(2025, 4, 5)), d(2025, 4, 1), 31).is_empty());
-    }
-
-    #[test]
-    fn single_day_advance_runs_that_day_once() {
-        assert_eq!(
-            days_to_run(Some(d(2025, 4, 5)), d(2025, 4, 6), 31),
-            vec![d(2025, 4, 6)]
-        );
-    }
-
-    #[test]
-    fn multi_day_gap_runs_each_missing_day_in_order() {
-        // Daemon fell behind: clock jumped 04-05 → 04-08. Run 06, 07, 08
-        // (each once, oldest first) — no skip, no re-run.
-        assert_eq!(
-            days_to_run(Some(d(2025, 4, 5)), d(2025, 4, 8), 31),
-            vec![d(2025, 4, 6), d(2025, 4, 7), d(2025, 4, 8)]
-        );
-    }
-
-    #[test]
-    fn catch_up_is_capped_per_pass_without_skipping() {
-        // A big gap caps at max_batch this pass; the cursor advances so the
-        // next pass continues from there (no day skipped).
-        let first = days_to_run(Some(d(2025, 4, 1)), d(2025, 5, 1), 3);
-        assert_eq!(first, vec![d(2025, 4, 2), d(2025, 4, 3), d(2025, 4, 4)]);
-        let next = days_to_run(Some(d(2025, 4, 4)), d(2025, 5, 1), 3);
-        assert_eq!(next, vec![d(2025, 4, 5), d(2025, 4, 6), d(2025, 4, 7)]);
-    }
-
-    #[test]
     fn cursor_survives_a_forward_or_equal_clock() {
         // The common case — a monotonic clock keeps its cursor.
         assert_eq!(
@@ -1148,26 +1311,6 @@ mod day_cursor_tests {
             Some(d(2025, 4, 5))
         );
         assert_eq!(cursor_after_clock(None, d(2025, 4, 5)), None);
-    }
-
-    #[test]
-    fn cursor_resets_on_epoch_rewind_so_the_new_epoch_runs() {
-        // The stall: after a restart-epoch, current_sim_date rewinds to
-        // epoch_start while the cursor still holds the last day of the
-        // finished epoch (a year ahead). Without the detection days_to_run
-        // idles for a full year. `cursor_after_clock` is now the rewind
-        // DETECTOR — the daemon exits(75) on it for a clean-state restart
-        // (the fresh process boots with cursor None and runs from day
-        // one, the second assertion below).
-        let stale = Some(d(2026, 3, 31)); // last day of the finished epoch
-        let epoch_start = d(2025, 4, 1); // clock rewound here
-        assert_eq!(cursor_after_clock(stale, epoch_start), None);
-        // Regression guard: stale cursor → idle (the bug); reset cursor → runs.
-        assert!(days_to_run(stale, epoch_start, 31).is_empty());
-        assert_eq!(
-            days_to_run(cursor_after_clock(stale, epoch_start), epoch_start, 31),
-            vec![epoch_start]
-        );
     }
 
     #[test]
