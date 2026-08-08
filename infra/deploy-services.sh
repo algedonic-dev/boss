@@ -779,15 +779,6 @@ RELEASE_DIR="$TARGET_DIR/release"
 # hand-maintained feature list here: the old one drifted to 7 of the 37
 # gated bins and silently shipped stale/in-memory binaries every deploy.
 #
-# Freshness-guard input: the newest tracked-source mtime. `install_binary`
-# refuses to install any binary older than this — catching the "stale
-# binary" footgun (deploying yesterday's build) at deploy time, not via a
-# 000 health probe after the damage is done.
-# awk (not `head -1 | cut`) reads the whole stream — piping into a
-# truncating `head` SIGPIPEs `sort`/`find`, and under `set -o pipefail`
-# that 141 aborts the deploy before it installs anything.
-NEWEST_SRC_MTIME=$(find "$REPO_ROOT/crates" \( -name '*.rs' -o -name 'Cargo.toml' \) -printf '%T@\n' 2>/dev/null | sort -rn | awk 'NR==1{print int($1)}')
-
 echo "==> install fresh binaries from $RELEASE_DIR"
 echo "    (build first with: ./infra/build-release.sh)"
 declare -a TO_DEPLOY=()
@@ -818,6 +809,68 @@ else
     add_units_for_env "$TARGET"
 fi
 
+# ---------------------------------------------------------------------
+# Freshness PRE-FLIGHT — check everything before installing anything.
+#
+# Two defects, both found on 2026-08-08, both fixed here.
+#
+# 1. `install_binary` used to `exit 1` the moment it met a stale
+#    binary, from INSIDE the install loop. That aborted the deploy
+#    partway: some binaries already written to /usr/local/bin, none of
+#    the services restarted, and the run ending on a line that reads
+#    like a note rather than a failure. It installed ten binaries, hit
+#    a stale one, and stopped — leaving new code on disk with
+#    five-hour-old processes still serving it, while having printed
+#    `installed boss-jobs-api` for each. The mismatch took an hour to
+#    find because nothing said "aborted". So: validate first, act
+#    second. Either every binary is good and the deploy runs end to
+#    end, or nothing is touched.
+#
+# 2. The check itself compared MTIMES, which git rewrites. A rebase or
+#    a branch switch restamps every file it rewrites, so a clean tree
+#    whose binaries were built from exactly that content was reported
+#    stale — demanding a 50-minute rebuild for byte-identical output.
+#    Now it compares a content fingerprint recorded by the build; see
+#    infra/src-fingerprint.sh.
+# ---------------------------------------------------------------------
+SRC_FP="$("$REPO_ROOT/infra/src-fingerprint.sh" 2>/dev/null || true)"
+BUILT_FP="$(cat "$RELEASE_DIR/.boss-src-fingerprint" 2>/dev/null || true)"
+
+declare -a MISSING_BINS=()
+for unit in "${TO_DEPLOY[@]}" ; do
+    bin_name="${unit%.service}"
+    bin_name="${bin_name%-scratch}"
+    [[ -f "$RELEASE_DIR/$bin_name" ]] || MISSING_BINS+=("$bin_name")
+done
+
+# An empty fingerprint on either side means "cannot tell" — a tarball
+# deployment has no git metadata, and a build predating the stamp has
+# no record. Neither is evidence of staleness, so neither blocks.
+if [[ -n "$SRC_FP" && -n "$BUILT_FP" && "$SRC_FP" != "$BUILT_FP" ]]; then
+    {
+        echo
+        echo "!! DEPLOY ABORTED — nothing installed, nothing restarted."
+        echo
+        echo "   The release binaries were built from different sources"
+        echo "   than the tree on disk."
+        echo "     built from : $BUILT_FP"
+        echo "     tree is at : $SRC_FP"
+        echo
+        echo "   Fix: ./infra/build-release.sh   (then re-run this script)"
+        echo
+        echo "   The box is untouched and still serving the previous build,"
+        echo "   which is the correct state to be in after a failed deploy."
+    } >&2
+    exit 1
+fi
+if [[ -z "$BUILT_FP" ]]; then
+    echo "  note: no build stamp in $RELEASE_DIR — cannot verify the binaries"
+    echo "        match this tree. Re-run ./infra/build-release.sh to record one."
+fi
+if (( ${#MISSING_BINS[@]} > 0 )); then
+    echo "  note: not built, will be skipped: ${MISSING_BINS[*]}"
+fi
+
 # Install fresh binaries before restarting. `install -m 0755` is
 # atomic write+rename, which works even when the target is currently
 # executing a service (`cp` errors with "Text file busy" because
@@ -833,18 +886,13 @@ install_binary() {
         echo "  SKIP $bin_name (not built at $src)"
         return 0
     fi
-    # Freshness guard: a binary older than the newest source is a stale
-    # build — installing it ships old code (or, for a `default=[]` crate
-    # never rebuilt with --features, an in-memory binary). Refuse loudly;
-    # the fix is always `./infra/build-release.sh`.
-    if [[ -n "${NEWEST_SRC_MTIME:-}" ]]; then
-        local bin_mtime
-        bin_mtime=$(stat -c '%Y' "$src" 2>/dev/null || echo 0)
-        if [[ "$bin_mtime" -lt "$NEWEST_SRC_MTIME" ]]; then
-            echo "  STALE $bin_name ($(date -d "@$bin_mtime" '+%F %H:%M') < newest source) — rebuild via ./infra/build-release.sh" >&2
-            exit 1
-        fi
-    fi
+    # No per-binary freshness check here. It used to compare this
+    # binary's mtime against the newest source mtime and `exit 1` on
+    # failure — from inside the install loop, which is what left the
+    # box half-deployed. The question "were these binaries built from
+    # this tree" is answered once, up front, by the fingerprint
+    # pre-flight, and it is a property of the BUILD rather than of each
+    # file's timestamp.
     install -m 0755 "$src" "$dst"
     echo "  installed $bin_name"
 }
