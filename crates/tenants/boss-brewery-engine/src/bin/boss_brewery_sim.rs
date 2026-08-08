@@ -139,8 +139,20 @@ async fn readiness_pass(client: &reqwest::Client, api_base: &str) -> Vec<(String
         out.push(("dispatcher:consumers".to_string(), ok, detail));
     }
 
-    // 3. The clock is primed: sim mode, a non-empty epoch range, not paused. A
-    //    wall-time / zero-length / paused clock means the sim won't advance.
+    // 3. The clock will advance. Two ways that is true, and the check
+    //    accepts both.
+    //
+    //    SIM mode needs priming: a non-empty epoch range and not
+    //    paused, or sim-time sits still and the sim would flood a
+    //    frozen clock with Jobs.
+    //
+    //    WALL mode needs nothing. Real time advances on its own — there
+    //    is no epoch to range and nothing to pause. This branch used to
+    //    be absent, so the check read `simulated && ranged && !paused`
+    //    and a wall clock failed it forever. That is not theoretical:
+    //    switching the playground to wall mode stalled the sim at this
+    //    gate, holding — by design — and creating nothing, on a clock
+    //    that was working perfectly.
     {
         let url = format!("{}/api/clock/now", readiness_base(api_base, "clock"));
         let (ok, detail) = match client.get(&url).send().await {
@@ -154,9 +166,13 @@ async fn readiness_pass(client: &reqwest::Client, api_base: &str) -> Vec<(String
                     let es = v.get("epoch_start").and_then(|x| x.as_str()).unwrap_or("");
                     let ee = v.get("epoch_end").and_then(|x| x.as_str()).unwrap_or("");
                     let ranged = !es.is_empty() && !ee.is_empty() && ee > es;
+                    // `simulated` is the clock's mode marker: true in
+                    // sim mode, false in wall mode.
+                    let advancing = if sim { ranged && !paused } else { true };
+                    let mode = if sim { "sim" } else { "wall" };
                     (
-                        sim && ranged && !paused,
-                        format!("simulated={sim} epoch={es}..{ee} paused={paused}"),
+                        advancing,
+                        format!("mode={mode} epoch={es}..{ee} paused={paused}"),
                     )
                 }
                 Err(e) => (false, format!("bad json ({e})")),
@@ -686,6 +702,26 @@ async fn main() -> Result<()> {
     // hiccups, NATS blips) log + retry on the next tick. The
     // engine is mutex-guarded so two ticks can't race; with
     // tick_interval_seconds ≥ 1 they realistically don't.
+    // How long to wait when the loop is watching for a STATE CHANGE
+    // (paused, restart in flight, waiting for the next sim-day) rather
+    // than pacing simulation.
+    //
+    // These used to sleep `tick_interval_seconds`, which is the
+    // wall-clock budget for one SIM-DAY. That is harmless at the demo
+    // default of 10s and wrong the moment the sim runs at real time:
+    // a day's budget is 86,400 seconds, so a paused daemon would take
+    // 24 HOURS to notice it had been unpaused, and the go-live retry
+    // would fire once a day. Pacing and polling are different
+    // questions and now use different numbers.
+    const POLL_SECS: u64 = 10;
+    // The same idea for the "no new sim-day yet" branch, which runs a
+    // workforce pass each time round. Capped rather than fixed: at the
+    // demo cadence the per-tick sleep is already sub-second and there
+    // is no reason to slow it down, but at real-time pacing an hour of
+    // latency before noticing the date rolled is too coarse for a live
+    // map.
+    const IDLE_CAP_MS: u64 = 60_000;
+
     let mut global_tick: u64 = 0;
     // The last sim-day the daemon has fully run; persists across outer
     // passes so a day is never re-run while the warp clock sits on it
@@ -696,13 +732,13 @@ async fn main() -> Result<()> {
         if clock.paused {
             info!(
                 current_sim_date = %clock.current_sim_date,
-                "sim_clock paused; sleeping {}s",
-                clock.tick_interval_seconds
+                "sim_clock paused; polling every {}s",
+                POLL_SECS
             );
             if let Ok(mut t) = telemetry.lock() {
                 t.note_cadence(cadence_of(&clock, None));
             }
-            tokio::time::sleep(Duration::from_secs(clock.tick_interval_seconds as u64)).await;
+            tokio::time::sleep(Duration::from_secs(POLL_SECS)).await;
             continue;
         }
 
@@ -770,7 +806,7 @@ async fn main() -> Result<()> {
                     set_paused(true).await?;
                 }
             }
-            tokio::time::sleep(Duration::from_secs(clock.tick_interval_seconds as u64)).await;
+            tokio::time::sleep(Duration::from_secs(POLL_SECS)).await;
             continue;
         }
         if clock.restart_in_progress {
@@ -778,7 +814,7 @@ async fn main() -> Result<()> {
                 current_sim_date = %clock.current_sim_date,
                 "restart-epoch in progress; idling"
             );
-            tokio::time::sleep(Duration::from_secs(clock.tick_interval_seconds as u64)).await;
+            tokio::time::sleep(Duration::from_secs(POLL_SECS)).await;
             continue;
         }
 
@@ -878,7 +914,7 @@ async fn main() -> Result<()> {
             if let Err(e) = run_workforce_pass(workforce.clone()).await {
                 warn!(error = %e, "workforce pass failed; continuing");
             }
-            tokio::time::sleep(Duration::from_millis(per_tick_sleep_ms)).await;
+            tokio::time::sleep(Duration::from_millis(per_tick_sleep_ms.min(IDLE_CAP_MS))).await;
             continue;
         };
         let total_ticks = (days.len() as u32) * ticks_per_day;
