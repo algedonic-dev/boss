@@ -110,6 +110,7 @@ export const SECTION_FOR_ROUTE: Readonly<Record<Route['kind'], string>> = {
   systemFeedback: 'system-feedback',
   systemOsMap: 'system-os-map',
   systemFlow: 'system-flow',
+  systemFleet: 'system-fleet',
   systemKb: 'system-kb',
   systemDesign: 'system-design',
   experiments: 'system-experiments',

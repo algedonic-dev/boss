@@ -17,6 +17,7 @@
 
 pub mod error;
 pub mod filter;
+pub mod fleet;
 pub mod flow;
 pub mod in_memory;
 pub mod os_map;

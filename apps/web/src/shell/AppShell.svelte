@@ -113,6 +113,9 @@
         // below it answers the other question — what the machine is
         // doing, rather than what the people are getting through.
         ROUTE_CATALOG['system-flow'],
+        // Fleet beside Flow: Flow is the team's throughput, Fleet is
+        // where a kind's work is piling up on its Workflow.
+        ROUTE_CATALOG['system-fleet'],
         ROUTE_CATALOG['system-model'],
         ROUTE_CATALOG['system-monitoring'],
         // Audit Log + Atlas are sub-pages of monitoring with no
