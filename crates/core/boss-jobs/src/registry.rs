@@ -446,7 +446,13 @@ fn ship_a_change_spec() -> WorkflowSpec {
         StepSpec {
             title: "merged".into(),
             kind: "outcome".into(),
-            ready_when: "steps.review.done".into(),
+            // BOTH halves, same shape as `abandoned` below and for the
+            // same reason: the dispatcher completes any ready
+            // terminal, so gated on `review.done` alone this fired the
+            // moment review completed — Jobs read "merged" while their
+            // PR was still open. The marker is set by whatever
+            // OBSERVED the merge: the train conductor, or a person.
+            ready_when: "steps.review.done AND job.metadata.merged = \"true\"".into(),
             title_template: "Merged".into(),
             metadata_defaults: serde_json::json!({ "outcome_kind": "completed" }),
             terminal: Some(Terminal {
@@ -906,7 +912,178 @@ pub fn platform_workflows() -> Vec<WorkflowSpec> {
         ship_a_change_spec(),
         regenerate_deployment_spec(),
         backlog_item_spec(),
+        pr_train_spec(),
     ]
+}
+
+/// Build the canonical `pr-train` WorkflowSpec.
+///
+/// Changes do not open their own PRs. They accumulate on branches —
+/// each with its ship-a-change Job parked at `review` — and twice a
+/// day a train Job collects what is ready, assembles one batched
+/// branch, and opens ONE PR. The cadence is the system's, not the
+/// author's judgement: the ~2-PRs-a-day discipline stopped being a
+/// rule someone remembers and became a schedule something runs.
+///
+/// The Subject is a `custom` Subject whose id is the train branch
+/// (`train/2026-08-08-am`), the same shape ship-a-change uses — so
+/// "what shipped on this train" is Subject history.
+///
+/// Every step is closed by `infra/train/conductor.sh` with the
+/// evidence in hand — the branch it pushed, the PR it opened, the CI
+/// verdict it polled, the merge commit it observed, the deploys it
+/// ran. Two consequences shape the spec:
+///
+///  - every task carries `authority_role`: an ungated ready task gets
+///    role-matched and completed by the simulated workforce, and a
+///    train whose steps the sim closes records fiction;
+///  - `merged` is a task, not an outcome, and `cancelled` is
+///    marker-gated: the dispatcher completes any ready terminal, and
+///    this Workflow exists precisely because "merged" must mean the
+///    merge happened, not that review finished.
+///
+/// Step graph:
+///  -1. `scheduled` — the twice-daily timer fired
+///   0. `collect`   — what boarded (or `job.metadata.empty` → cancelled)
+///   1. `assemble`  — train branch built; conflicts skipped and named
+///   2. `pr`        — the one batched PR, url recorded
+///   3. `ci`        — the PR's checks, polled to a verdict
+///   3. `merged`    — the merge commit, observed on the remote
+///   4. `deployed`  — the deploys that carried it to the playground
+///   999. `arrived`/`cancelled` — outcomes
+fn pr_train_spec() -> WorkflowSpec {
+    let admin = Some("platform-admin".to_string());
+    let req = |name: &str| boss_core::job::StepField {
+        name: name.into(),
+        field_type: "string".into(),
+        required: true,
+    };
+    let steps = vec![
+        StepSpec {
+            title: "scheduled".into(),
+            kind: "trigger".into(),
+            ready_when: "true".into(),
+            title_template: "Train window opened".into(),
+            metadata_defaults: serde_json::json!({
+                "trigger_kind": "periodic",
+                "trigger_name": "pr-train-window",
+            }),
+            ..Default::default()
+        },
+        StepSpec {
+            title: "collect".into(),
+            kind: "task".into(),
+            ready_when: "steps.scheduled.done".into(),
+            title_template: "Collect what is ready to board".into(),
+            authority_role: admin.clone(),
+            // Which ship-a-change Jobs boarded, by id and branch. An
+            // empty window sets `job.metadata.empty` instead and the
+            // train cancels.
+            fields: vec![req("boarded")],
+            ..Default::default()
+        },
+        StepSpec {
+            title: "assemble".into(),
+            kind: "task".into(),
+            ready_when: "steps.collect.done".into(),
+            title_template: "Assemble the train branch".into(),
+            authority_role: admin.clone(),
+            // The pushed ref, plus any branch that failed to merge
+            // cleanly and was left for the next train.
+            fields: vec![req("train_ref")],
+            ..Default::default()
+        },
+        StepSpec {
+            title: "pr".into(),
+            kind: "task".into(),
+            ready_when: "steps.assemble.done".into(),
+            title_template: "Open the batched PR".into(),
+            authority_role: admin.clone(),
+            fields: vec![req("pr_url")],
+            ..Default::default()
+        },
+        StepSpec {
+            title: "ci".into(),
+            kind: "task".into(),
+            ready_when: "steps.pr.done".into(),
+            title_template: "CI verdict".into(),
+            authority_role: admin.clone(),
+            fields: vec![req("result")],
+            ..Default::default()
+        },
+        StepSpec {
+            title: "merged".into(),
+            kind: "task".into(),
+            // Gated on `pr`, not `ci`: the human can merge whenever
+            // they judge right, and the evidence of the merge does not
+            // depend on the conductor having polled the checks first.
+            ready_when: "steps.pr.done".into(),
+            title_template: "Merged into main".into(),
+            authority_role: admin.clone(),
+            fields: vec![req("merge_ref")],
+            ..Default::default()
+        },
+        StepSpec {
+            title: "deployed".into(),
+            kind: "task".into(),
+            ready_when: "steps.merged.done".into(),
+            title_template: "Deployed to the playground".into(),
+            authority_role: admin.clone(),
+            // What actually went out: migrations applied, services
+            // restarted, web bundle — as reported by the scripts that
+            // did it.
+            fields: vec![req("deployed")],
+            ..Default::default()
+        },
+        StepSpec {
+            title: "arrived".into(),
+            kind: "outcome".into(),
+            // Both evidence trails must be on the record: the deploys
+            // that carried it out AND the CI verdict — without the ci
+            // edge the verdict step is a leaf no terminal depends on,
+            // which the viability lint rightly rejects.
+            ready_when: "steps.deployed.done AND steps.ci.done".into(),
+            title_template: "Train arrived".into(),
+            metadata_defaults: serde_json::json!({ "outcome_kind": "completed" }),
+            terminal: Some(Terminal {
+                outcome: "arrived".into(),
+            }),
+            ..Default::default()
+        },
+        StepSpec {
+            title: "cancelled".into(),
+            kind: "outcome".into(),
+            // Marker-gated (see `abandoned` on ship-a-change): on
+            // collect.done alone the dispatcher would cancel every
+            // train the moment it collected.
+            ready_when: "steps.collect.done AND job.metadata.empty = \"true\"".into(),
+            title_template: "Cancelled — nothing to board".into(),
+            metadata_defaults: serde_json::json!({ "outcome_kind": "aborted" }),
+            terminal: Some(Terminal {
+                outcome: "cancelled".into(),
+            }),
+            ..Default::default()
+        },
+    ];
+
+    let mut spec = WorkflowSpec::platform_seed(
+        "pr-train",
+        "PR train",
+        "platform",
+        vec!["custom".into()],
+        steps,
+    );
+    // owner_role puts trains on /system/flow with the other platform
+    // meta-kinds — the visibility half of the ask.
+    spec.metadata = serde_json::json!({ "owner_role": "platform-admin" });
+    spec.description = Some(
+        "The twice-daily release train: collects branches whose ship-a-change Jobs \
+         are ready for review, assembles them into one batched PR, and closes each \
+         step on evidence — the CI verdict, the observed merge, the deploys that \
+         carried it out. Driven by infra/train/conductor.sh from a systemd timer."
+            .to_string(),
+    );
+    spec
 }
 
 /// Build the canonical `user-feedback` WorkflowSpec.
@@ -3676,13 +3853,95 @@ mod tests {
     // -----------------------------------------------------------
 
     #[test]
+    fn pr_train_steps_close_on_evidence_not_on_readiness() {
+        let kinds = platform_workflows();
+        let train = kinds
+            .iter()
+            .find(|k| k.kind == "pr-train")
+            .expect("pr-train present");
+
+        // Every task is authority-gated: an ungated ready task gets
+        // role-matched and completed by the simulated workforce, and a
+        // train whose steps the sim closes records fiction.
+        for s in train.steps.iter().filter(|s| s.kind == "task") {
+            assert_eq!(
+                s.authority_role.as_deref(),
+                Some("platform-admin"),
+                "train task `{}` must be closed by the conductor or a person, \
+                 never the sim workforce",
+                s.title
+            );
+        }
+
+        // `merged` is a TASK the conductor completes with the merge
+        // ref it observed on GitHub — not an outcome. An outcome ready
+        // on `review.done` gets completed by the dispatcher's
+        // complete-on-ready rule, which is exactly how ship-a-change
+        // Jobs came to read "merged" while their PR was still open.
+        let merged = train
+            .steps
+            .iter()
+            .find(|s| s.title == "merged")
+            .expect("merged step present");
+        assert_eq!(
+            merged.kind, "task",
+            "merged closes on evidence, not readiness"
+        );
+        assert!(
+            merged
+                .fields
+                .iter()
+                .any(|f| f.name == "merge_ref" && f.required),
+            "the merge commit is the evidence; without it the step is a claim"
+        );
+
+        // The empty-window bail-out needs the conductor's explicit
+        // marker — collect.done alone would cancel every train the
+        // moment it collected.
+        let cancelled = train
+            .steps
+            .iter()
+            .find(|s| s.title == "cancelled")
+            .expect("cancelled outcome present");
+        assert!(
+            cancelled.ready_when.contains("job.metadata.empty"),
+            "cancelled must be marker-gated; ready_when = {:?}",
+            cancelled.ready_when
+        );
+    }
+
+    #[test]
+    fn ship_a_change_merged_waits_for_the_actual_merge() {
+        // The dispatcher completes any ready terminal, so an outcome
+        // gated on `steps.review.done` alone fires when review
+        // completes — Job 606b40fb read "merged" while its PR was
+        // still open. The marker is what the conductor (or a person)
+        // sets when the merge has actually happened.
+        let kinds = platform_workflows();
+        let ship = kinds
+            .iter()
+            .find(|k| k.kind == "ship-a-change")
+            .expect("ship-a-change present");
+        let merged = ship
+            .steps
+            .iter()
+            .find(|s| s.title == "merged")
+            .expect("merged outcome present");
+        assert!(
+            merged.ready_when.contains("job.metadata.merged"),
+            "merged must wait for merge evidence; ready_when = {:?}",
+            merged.ready_when
+        );
+    }
+
+    #[test]
     fn platform_workflows_carries_the_shipped_meta_kinds() {
         let kinds = platform_workflows();
         assert_eq!(
             kinds.len(),
-            6,
+            7,
             "ships workflow-design + design-doc-review + user-feedback + ship-a-change \
-             + regenerate-deployment + backlog-item"
+             + regenerate-deployment + backlog-item + pr-train"
         );
 
         // The boundary declaration is the whole point of the kind, so

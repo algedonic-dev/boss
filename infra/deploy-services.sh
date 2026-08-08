@@ -178,6 +178,10 @@ TIMERS=(
     # boss-rebuild-all nothing refreshed it. Measured stale at 0.5% job
     # coverage on a live box: search could not find 99% of the corpus.
     "boss-search-reindex:."
+    # The twice-daily PR train: batches ready branches into one PR and
+    # records CI/merge/deploy evidence on the pr-train Job. The
+    # conductor script is infra/train/conductor.py.
+    "boss-pr-train:train"
     # boss-backup deferred — backup script destination + retention
     # policy needs review before enabling on a fresh deploy.
 )
