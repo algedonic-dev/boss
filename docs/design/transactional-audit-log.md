@@ -1,16 +1,14 @@
 # Transactional audit log — the event write path
 
-**Status:** reopened — the contract below is settled and in force (the
-arc that established it completed 2026-07-29; decision history folded
-into [docs/architecture-decisions.md](../architecture-decisions.md)
-§Correctness protocol & the audit log), but Q2 and Q6 under Open
-questions are genuinely undecided, and `living` asserts a doc carries
-none. Every new write path in BOSS follows this contract;
+**Status:** approved — the contract below is settled and in force (the
+arc that established it completed 2026-07-29; earlier decision history
+folded into [docs/architecture-decisions.md](../architecture-decisions.md)
+§Correctness protocol & the audit log). Q2 and Q6, the two questions
+reopened while genuinely undecided, were resolved 2026-08-08 on
+measured grounding — §What the pipeline measures today for the
+numbers, §Decisions for the verdicts and the technical record. Every
+new write path in BOSS follows this contract;
 `infra/lint/outbox-migration-ratchet.sh` fails CI on any deviation.
-
-Flip back to `living` when Q2 and Q6 are resolved — or mark them
-`(resolved)` in their headings if they turn out to be settled and
-merely un-annotated.
 
 ## The invariant
 
@@ -42,7 +40,10 @@ idempotent (JetStream durable consumers + receive-dedup).
 Consequences worth knowing:
 
 - **`audit_log` and NATS are eventually consistent** behind the
-  outbox by relay lag (ms-scale). Anything that must read a
+  outbox by relay lag (measured 2026-08-08: p50 ~200 ms steady —
+  the floor is the relay's 250 ms idle poll, not chain cost —
+  p99 5.4 s under the worst burst on record). Anything that must
+  read a
   state/log pair coherently (the deep replay-check, e2e tests)
   drains the outbox first — tests use
   `outbox::drain_outbox_once(pool, bus, n)` and deliberately wire
@@ -126,21 +127,129 @@ fact on failure.)
   events respectively), deterministic rebuild, and exact
   conservation.
 
-## Open questions (recorded endgames — out of scope, kept visible)
+## What the pipeline measures today (playground, 2026-08-08)
 
-### Q2: Chain maintenance — does the pipeline keep insert-time chaining forever?
+The numbers behind Q2 and Q6 — from the live system, not
+estimates. Box: the public playground, PostgreSQL 16.14.
 
-The single relay preserves insert-time chaining with zero
-contention. If audit volume ever needs a sharded relay, the chain
-serializes again at the log — checkpoint-time chaining (a chain
-computed by the integrity checkpointer over an unchained tail) is
-the likely end-state, with today's shape as the bridge.
+**Demand.**
 
-### Q6: Does the dispatcher eventually consume the log instead of NATS?
+- Steady state: 88K events/24 h (~1/sec sustained; busiest minute
+  4.7K).
+- Worst burst on record: the epoch bootstrap replay — 224K events
+  in 90 minutes, peaking at 11.8K/min (~197/sec). Relay lag under
+  that burst: p50 0.4 s, p99 5.4 s, max 7.6 s, zero pending rows
+  once it passed.
+- Whole-log scale: 300K rows / 275 MB live (~960 B/row); the two
+  full-year regens landed 484K and 1.84M events.
 
-With the outbox → log pipeline ordered and durable, NATS is a
-latency optimization, not a source of truth. A log-tailing consumer
-(cursor per consumer group) would collapse the delivery stack and
-make "the log is the queue" literal — Hickey would approve.
-JetStream works; re-plumbing every consumer is not worth it until
-something forces the issue.
+**Relay + chain cost** (pgbench on this box, the identical trigger
+on a clone table, realistic ~730-char payloads).
+
+- Steady relay lag p50/p90/p99 = 203 ms / 630 ms / 1.8 s — the p50
+  is the relay's 250 ms idle-poll sleep, not chain cost.
+- The chain trigger, single writer: 611 rows/sec chained vs 691
+  plain in row-per-tx shape (+0.2 ms/row). In the relay's actual
+  shape — 100-row batches, the advisory lock taken once per batch —
+  **14.6K rows/sec** (0.07 ms/row).
+- Four *concurrent* chained writers: 789 rows/sec vs 1,927 plain —
+  the advisory lock caps multi-writer scaling at 1.3× (vs 2.8×
+  unchained). This is the measured reason the relay stays
+  single-writer.
+- The nightly integrity checker already recomputes the entire chain
+  in SQL at ~72K rows/sec (1.32M rows in 18.3 s) and logs a
+  chain-head checkpoint (id + hash + row count) on every run.
+
+**Consumers.**
+
+- Durable consumers on the BOSS_EVENTS stream: **exactly two** —
+  `dispatcher-steps` and `dispatcher-rules`, both in
+  boss-dispatcher, both at 0 pending. Their transport coupling is
+  ~35 lines across two functions; both handlers are already
+  transport-agnostic, consuming `(subject, event_id, payload)`.
+- The JetStream stream is a second durable copy of the log: 219K
+  messages / 210 MB on file storage, 3-day / 4 GiB limits, purged
+  at every epoch restart alongside the outbox TRUNCATE.
+- Ephemeral core-NATS subscribers: five. Two are display-only SSE
+  fan-outs (assets, observability — at-most-once is correct there);
+  one is the cybernetics inter-agent message plane (not event-log
+  traffic); and two are **load-bearing over at-most-once
+  delivery** — the assets ingress (`asset.>` appends into the
+  assets repository; the subject isn't even in the stream) and the
+  jobs escalation notifier (`jobs.job.created`). Backlog items
+  filed (`0da79b36`, `50ff6193`); both need a durable leg — under
+  the resolved Q6, the log-tail.
+
+## Open questions
+
+All 2 open questions were resolved 2026-08-08 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
+
+---
+
+
+## Decisions
+
+### Q2: Chain maintenance — does the pipeline keep insert-time chaining forever? (resolved)
+
+Resolved 2026-08-08 — override.
+
+That sounds good
+
+Technical record: insert-time chaining stays and the relay stays
+single-writer, **as one decision**. The measured ceiling (14.6K
+rows/sec in the relay's 100-row-batch shape, 0.07 ms/row) sits 75×
+above the worst burst ever observed; the advisory lock only
+bottlenecks *concurrent* writers (1.3× scaling at 4 clients), which
+the single relay never is. The checkpoint-time end-state keeps its
+skeleton warm — the nightly checker already logs a chain-head
+checkpoint and recomputes the full chain at ~72K rows/sec — but the
+serialized write side is load-bearing beyond the chain: one writer
+inserting in sequence makes id order ≡ commit order, exactly what
+Q6's log-tailing needs to never miss a row. If sustained demand
+ever approaches ~1K/sec, Q2 and Q6 reopen together: they are one
+decision about what the log's write side guarantees its read side.
+
+### Q6: Does the dispatcher eventually consume the log instead of NATS? (resolved)
+
+Resolved 2026-08-08 — override.
+
+This is an interesting architecture question. Every actor needs visibility into their personal queue and there are lots of abstract groups, like anyone with a certain skill, that we will have steps queued up for, and of course agents are actors that will want queues. Do they each just have a lens onto the one giant queue? What happens when it inevitably gets too large? Everyone still just has an API onto the queue and underneath the engineering team makes it work? Let's discuss these before settling. It might open more questions.
+
+Settled the same evening: David confirmed in-session ("I am on
+board with both suggestions — let's do it") after reading the
+measured grounding. The queue-visibility questions above — personal,
+skill-group, and agent queues as lenses on the one queue; behavior
+at scale; API-only access — are tracked as feedback item `207236cc`
+for their own design pass.
+
+Technical record: log-as-the-bus is the end-state, **staged with
+the cluster work rather than standalone**. Two durable consumers
+exist, both in boss-dispatcher, ~35 transport-coupled lines between
+them; both handlers already consume `(kind, event_id, payload)` —
+audit_log's exact columns (`publish` sets subject = `event.kind`
+verbatim, so filters map 1:1 onto `audit_log.kind`) — and the
+cursor pattern already ships twice (`dispatcher_clock_cursor`, the
+audit tail endpoint's id-poll). Everything else on the bus either
+wants at-most-once (SSE fan-out) or isn't event-log traffic
+(cybernetics), and stays on NATS. The swap deletes the duplicate
+durable log (219K msgs / 210 MB / 3-day window), retires the
+delivery machinery behind two real incident classes (the
+ack_wait/backoff double-fire; the redelivery state-leak that
+receive-dedup compensates for), makes the silent-zero-deliveries
+filter trap structurally impossible, and removes one stateful
+service from the correctness path of the planned five-machine
+cluster. Costs accepted: side effects trail the write by relay lag
+plus a poll interval (human-timescale irrelevant); retry and
+dead-letter (the 8-attempt budget, Retry-vs-Permanent
+classification, the `DEAD-LETTER:` line release gates grep for)
+plus the concurrency-12 fan-out must be rebuilt on a cursor — the
+real work; and epoch trim re-anchors cursors, the log-side analog
+of purge-stream-on-restart. Sequence: `dispatcher-rules` first (its
+`Settle` outcome is already transport-agnostic), then
+`dispatcher-steps`, then shrink the stream to fan-out-only
+retention. Implementation queued with the cluster arc as feedback
+item `3d6d6bea`.
