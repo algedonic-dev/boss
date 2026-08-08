@@ -80,7 +80,7 @@ jobs:
           cache-on-failure: true
 
       - name: Apply schema
-        run: infra/postgres/apply-schema.sh | psql -h localhost -U boss -d boss
+        run: infra/postgres/migrate.sh -- psql -h localhost -U boss -d boss
         env:
           PGPASSWORD: boss
 

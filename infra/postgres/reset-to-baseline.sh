@@ -96,7 +96,7 @@ echo "==> [2/9] dropping + recreating boss DB"
 # missing from the stop-list) so the drop can't be blocked.
 sudo -u postgres dropdb --if-exists --force boss
 sudo -u postgres createdb -O boss boss
-"$REPO_ROOT/infra/postgres/apply-schema.sh" | PGPASSWORD=boss psql -U boss -d boss -h 127.0.0.1 >/dev/null
+PGPASSWORD=boss "$REPO_ROOT/infra/postgres/migrate.sh" -- psql -U boss -d boss -h 127.0.0.1 >/dev/null
 
 echo "==> [3/9] restarting core services"
 for svc in boss-policy-api boss-classes-api boss-locations-api \

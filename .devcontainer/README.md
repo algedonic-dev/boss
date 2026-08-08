@@ -48,7 +48,7 @@ bun run dev          # hot-reloading SPA dev server (port 3000)
 
 # Reset the DB to an empty schema (boss is the postgres superuser here —
 # no sudo; the host scripts' sudo -u postgres path is for a local Postgres)
-dropdb boss && createdb boss && infra/postgres/apply-schema.sh | psql
+dropdb boss && createdb boss && infra/postgres/migrate.sh
 ```
 
 To run the full prebuilt brewery demo (not needed for development), use
