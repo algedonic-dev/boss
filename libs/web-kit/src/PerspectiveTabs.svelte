@@ -102,8 +102,8 @@
 
   let moreOpen = $state(false);
 
-  // Escape closes the menu. A plain listener rather than
-  // <svelte:window>, which the bundler cannot resolve — see
+  // Escape closes the menu. A plain listener rather than a
+  // svelte:window tag, which the bundler cannot resolve — see
   // no-svelte-window.test.ts.
   $effect(() => {
     function onKeyDown(e: KeyboardEvent) {
