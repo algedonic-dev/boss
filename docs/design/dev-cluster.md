@@ -77,6 +77,53 @@ conductor change — gh reports them the same way); later the deploy
 phase consumes artifacts built on the cluster instead of building on
 the playground, which is the moment `884488c4` closes for good.
 
+## The migration is a copy of the log
+
+David's directive (2026-08-08), superseding any heavier plan sketched
+earlier: when the cluster is ready, migration = **clone main from
+algedonic-dev, copy `audit_log`, rebuild** — everything else is
+rebuildable. Verified against the actual state inventory, that holds,
+with a short named remainder.
+
+**The copy-set** (beyond `git clone` + `migrate.sh` from empty):
+
+- **`audit_log`** — the system of record, and the copy is
+  *self-verifying*: the hash chain travels with the rows, so
+  `boss-audit-integrity-check` green on the destination proves the
+  copy faithful end to end. The correctness protocol paying off at
+  migration time.
+- **The small non-derived registry tables**: `workflows`,
+  `step_plugins`, `classes`, `policy_rules` (+ `policy_rule_audit`),
+  `dispatcher_rules`. Workflow publishes do land in the log
+  (`jobs.kind.published`) but no rebuilder consumes them; classes
+  writes are eventless today — the same no-provenance class the
+  design-docs finding exposed, and the same territory
+  design-docs-as-data Q2 will settle. Until then: copy the tables.
+- **`design_pending_decisions` / `design_flush_jobs`** if any are
+  open — non-event-sourced by design (they survive epoch trims by
+  living outside the log).
+- **`sim_clock`** — the epoch baseline row; its
+  `epoch_baseline_audit_id` references audit ids, which copy
+  verbatim, so it stays coherent.
+- **`/var/lib/boss/auth/credentials.toml`** — the one file outside
+  both git and Postgres.
+
+**Procedure**: quiesce writers and drain the outbox first
+(`event_outbox` rows are pre-log; copying around a non-empty outbox
+loses staged events — the epoch-trim quiescence machinery is the
+model), copy, `boss-rebuild-all`, integrity check green, then
+`deploy-services` + `deploy-web` (which regenerate the SPA and the
+step-plugin bundles from the repo; `ensure_stream` recreates
+JetStream and durable consumers re-anchor on an empty stream).
+
+**Everything else regenerates.** Every projection rebuilds from the
+copied log — the rebuilder's full domain list, messages included
+(they rebuild from `audit_log`; the separate `messages_events`
+retention log needs copying only if message history beyond the
+projection matters). No snapshot, no export bundle, no
+service-by-service migration: the company is its log plus its rules,
+and moving the company is copying them.
+
 ## Open questions
 
 ### Q1: What are the five machines?
