@@ -43,3 +43,45 @@ async fn class_for_registered_kind_lands_and_unregistered_aborts_with_the_kind_n
         other => panic!("expected UnregisteredKind, got {other:?}"),
     }
 }
+
+/// The retire path against the real adapter: stamp once, hold the
+/// stamp on a repeat, refuse nothing that exists, 404 what doesn't —
+/// and the read primitives agree (`exists_active` refuses, `get`
+/// still returns the row).
+#[tokio::test(flavor = "multi_thread")]
+async fn retire_stamps_once_and_the_read_primitives_agree() {
+    let db = TestDb::new().await;
+    let repo = PgClasses::new(db.pool.clone());
+    repo.batch_upsert(&[class_row("employee", "retire-me")])
+        .await
+        .expect("seed row");
+    let cref = boss_core::primitives::ClassRef::new("employee", "retire-me");
+
+    assert!(
+        repo.retire(&cref).await.expect("retire"),
+        "existing row retires"
+    );
+    assert!(
+        !repo.exists_active(&cref).await.expect("exists_active"),
+        "a retired code is refused for new use"
+    );
+    let row = repo.get(&cref).await.expect("get").expect("row stays");
+    let first_stamp = row.retired_at.expect("stamped");
+
+    assert!(
+        repo.retire(&cref).await.expect("repeat retire"),
+        "repeat is a no-op success"
+    );
+    let row = repo.get(&cref).await.expect("get").expect("row stays");
+    assert_eq!(
+        row.retired_at.expect("still stamped"),
+        first_stamp,
+        "a repeat call must not move when it was withdrawn"
+    );
+
+    let missing = boss_core::primitives::ClassRef::new("employee", "never-was");
+    assert!(
+        !repo.retire(&missing).await.expect("missing"),
+        "no row, no retire"
+    );
+}

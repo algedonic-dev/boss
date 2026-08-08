@@ -75,4 +75,13 @@ pub trait ClassRepository: Send + Sync {
     /// point of the Class registry (CLAUDE.md §9) is that taxonomies
     /// are tenant-editable without forking core.
     async fn update(&self, class: &Class) -> Result<bool, ClassError>;
+
+    /// Withdraw a Class from active use by stamping `retired_at`. The
+    /// row STAYS — existing rows point at the code (`employees.role`,
+    /// step metadata), so retirement removes it from `list` and
+    /// `exists_active` without orphaning anything. Idempotent: the
+    /// first call stamps the timestamp, a repeat is a no-op that keeps
+    /// the original stamp (when it was withdrawn is a fact). Returns
+    /// `false` only when no row matches the composite key.
+    async fn retire(&self, class_ref: &ClassRef) -> Result<bool, ClassError>;
 }
