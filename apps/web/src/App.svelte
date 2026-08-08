@@ -13,7 +13,7 @@
   import { loadStepTypeRegistry } from './steps/surfaceRegistry.svelte';
   import { loadClasses } from '@boss/web-kit/session/classes.svelte';
   import AppShell from './shell/AppShell.svelte';
-  import { appForSection, APP_SUBJECT_KINDS, type AppId } from './shell/nav-catalog';
+  import { APPS, appForSection, APP_SUBJECT_KINDS, type AppId } from './shell/nav-catalog';
   import StepFocusPage from './steps/StepFocusPage.svelte';
   import PerspectiveTabs from '@boss/web-kit/PerspectiveTabs.svelte';
   import DebugGear from './debug/DebugGear.svelte';
@@ -259,10 +259,10 @@
   <!-- Outside AppShell on purpose: a full-page step surface has no
        sidebar. The chrome bar stays — you can still switch apps —
        but everything below it belongs to the step. -->
-  <PerspectiveTabs active={perspective} searchAppKinds={appKinds} />
+  <PerspectiveTabs active={perspective} apps={APPS} searchAppKinds={appKinds} />
   <StepFocusPage jobId={route.jobId} stepId={route.stepId} />
 {:else}
-  <PerspectiveTabs active={perspective} searchAppKinds={appKinds} />
+  <PerspectiveTabs active={perspective} apps={APPS} searchAppKinds={appKinds} />
 <AppShell {activeSection} {perspective}>
   {#if blockedModule}
     <ModuleDisabled module={blockedModule.id} label={blockedModule.label} />

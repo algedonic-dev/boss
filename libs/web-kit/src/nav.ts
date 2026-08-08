@@ -38,15 +38,71 @@ export function href(relative: string): string {
 // business knowing about /ux/warehouse.
 // ---------------------------------------------------------------------------
 
-export type AppId =
-  | 'home'
-  | 'simulator'
-  | 'it'
-  | 'crm'
-  | 'finance'
-  | 'operations'
-  | 'supply-chain'
-  | 'people';
+// ---------------------------------------------------------------------------
+// Apps ARE departments.
+//
+// They used to be invented groupings — `crm`, `supply-chain`,
+// `operations` — and none of those is a department Algedonic Ales has.
+// That was reported plainly: "CRM is not a department for example. The
+// only exception to the department-based apps is the Simulator."
+//
+// The earlier shape had 7 apps against 15 departments: 3 of the apps
+// were real departments, 11 departments had no app at all, and
+// `operations` represented nobody, so nobody could reclaim it. An app
+// that names no part of the org is a grouping the reader has to learn
+// instead of one they already know.
+//
+// Two things this does NOT mean. Apps partition PRESENTATION, never
+// data — one Subject read through several lenses, not several records
+// federated at the UI. And an app is not a permission boundary: "Apps
+// don't have any relationship to the data, so there is no actual or
+// technical silo behind the app grouping. It is really for helping the
+// humans navigate."
+//
+// Home and Simulator are the two exceptions, for opposite reasons.
+// Home is cross-cutting: personal work belongs to whoever is doing it
+// regardless of which department the Job sits in, and it is the answer
+// to "I shouldn't be jerked around through apps as I work" — following
+// your own queue must never bounce you between tabs. Simulator drives
+// the model rather than doing work inside it.
+// ---------------------------------------------------------------------------
+
+/// The department vocabulary, in registry sort order.
+///
+/// This is the Class registry's `(employee, *, department)` rows —
+/// core's in infra/postgres/schema/01-registries.sql plus the tenant's
+/// in the seed. It is duplicated here because the chrome bar cannot
+/// wait on a fetch to know what tabs exist, so it is pinned by an
+/// equality test against both sources (CLAUDE.md §9a): add a
+/// department to either registry and the test names it until it
+/// appears here.
+export const DEPARTMENTS = [
+  { code: 'it', label: 'IT' },
+  { code: 'executive', label: 'Executive' },
+  { code: 'sales', label: 'Sales' },
+  { code: 'service', label: 'Service' },
+  { code: 'refurb', label: 'Refurb' },
+  { code: 'qa', label: 'QA' },
+  { code: 'warehouse', label: 'Warehouse' },
+  { code: 'finance', label: 'Finance' },
+  { code: 'people', label: 'People' },
+  { code: 'support', label: 'Support' },
+  { code: 'marketing', label: 'Marketing' },
+  { code: 'production', label: 'Production' },
+  { code: 'packaging', label: 'Packaging' },
+  { code: 'distribution', label: 'Distribution' },
+  { code: 'maintenance', label: 'Maintenance' },
+  { code: 'taproom', label: 'Taproom' },
+  { code: 'audit', label: 'Audit' },
+] as const;
+
+export type DepartmentCode = (typeof DEPARTMENTS)[number]['code'];
+
+/// Every app: the two that are not departments, plus one per
+/// department. `AppId` stays a closed union so a typo in a catalog
+/// entry is a compile error rather than a surface that renders under
+/// no tab.
+export type AppId = 'home' | 'simulator' | DepartmentCode;
 
 export type AppTab = Readonly<{
   id: AppId;
@@ -58,28 +114,24 @@ export type AppTab = Readonly<{
   href: string;
 }>;
 
-/// Tab order, left to right. Home first: it is where sign-in lands
-/// and where personal work lives regardless of which domain it
-/// belongs to. Simulator second — it is the one app that is not a
-/// department, because it drives the model rather than doing work
-/// inside it. Then the **department apps**.
-///
-/// IT is a department like the rest, and System Model lives inside it
-/// (home-workspace-and-department-apps.md, Q2). The earlier shape had
-/// a top-level "System Model" tab sitting beside Simulator as a
-/// second model-facing app; the review rejected splitting platform
-/// work away from the department that does it. It sits last so the
-/// five domain tabs keep the positions operators already know.
-export const APPS: ReadonlyArray<AppTab> = [
-  { id: 'home', label: 'Home', href: '/' },
-  { id: 'simulator', label: 'Simulator', href: '/simulator' },
-  { id: 'crm', label: 'CRM', href: '/ux/accounts' },
-  { id: 'finance', label: 'Finance', href: '/ux/finance' },
-  { id: 'supply-chain', label: 'Supply Chain', href: '/ux/warehouse' },
-  { id: 'people', label: 'People', href: '/ux/people' },
-  // Flow, not the System Model. The IT tab should open on what the
-  // team is getting through, not on how the machine is wired — the
-  // System Model is a reference you go to, Flow is a dashboard you
-  // watch. It is still one click away in the sidebar.
-  { id: 'it', label: 'IT', href: '/system/flow' },
-];
+/// The two apps that are not departments. Home first — it is where
+/// sign-in lands and where personal work lives whichever department
+/// the work belongs to.
+export const HOME_APP: AppTab = { id: 'home', label: 'Home', href: '/' };
+export const SIMULATOR_APP: AppTab = {
+  id: 'simulator',
+  label: 'Simulator',
+  href: '/simulator',
+};
+
+/// The default tab list, for a host with no catalog of its own
+/// (apps/simulator). apps/web passes its own list, built from the nav
+/// catalog, because which department a SURFACE belongs to is the
+/// host's question — web-kit has no business knowing about
+/// /ux/warehouse.
+export const APPS: ReadonlyArray<AppTab> = [HOME_APP, SIMULATOR_APP];
+
+/// The label for a department code, or the code itself if unknown.
+export function departmentLabel(code: string): string {
+  return DEPARTMENTS.find((d) => d.code === code)?.label ?? code;
+}

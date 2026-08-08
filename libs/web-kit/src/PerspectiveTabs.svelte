@@ -17,16 +17,22 @@
   import SignInControl from './SignInControl.svelte';
   import GlobalSearch from './GlobalSearch.svelte';
   import FeedbackControl from './FeedbackControl.svelte';
-  import { APPS, type AppId } from './nav';
+  import { APPS as DEFAULT_APPS, type AppId, type AppTab } from './nav';
   import { manifest } from './session/manifest.svelte';
+  import { session } from './session/session.svelte';
 
   let {
     active,
+    apps = DEFAULT_APPS,
     brandName: brandNameProp,
     brandSub: brandSubProp,
     searchAppKinds = [] as ReadonlyArray<string>,
   } = $props<{
     active: AppId;
+    /// Every app this host offers. Defaults to Home + Simulator, which
+    /// is all apps/simulator has; apps/web passes the full list built
+    /// from its nav catalog.
+    apps?: ReadonlyArray<AppTab>;
     /// Overrides the tenant's own name. Left unset everywhere in the
     /// shipped apps — the brand comes from the manifest, because
     /// hardcoding it is how three render sites came to disagree and
@@ -64,6 +70,48 @@
   });
   let brandName = $derived(brand.name);
   let brandSub = $derived(brand.sub);
+
+  // Which tabs sit on the bar, and which fold into "More".
+  //
+  // There are as many department apps as the tenant has departments
+  // with surfaces — eleven for Algedonic Ales — and a bar of eleven
+  // tabs is a bar nobody reads. But hiding your OWN department behind
+  // a menu is worse.
+  //
+  // So the bar carries exactly Home, Simulator and your department, on
+  // every surface, always. It does NOT pin the app you happen to be
+  // in: that was the first attempt and it made the tab set change as
+  // you navigated, which is precisely the drift
+  // `chrome-consistency.mocked.spec.ts` exists to catch — a bar you
+  // cannot build muscle memory against.
+  //
+  // Orientation instead comes from the More control, which shows where
+  // you are when where you are is inside it. The set stays fixed; only
+  // the label of one control reflects state, the way a select shows
+  // its value.
+  let myDepartment = $derived(
+    session.value.kind === 'ready' ? session.value.user.department : '',
+  );
+
+  let pinned = $derived(
+    apps.filter((a: AppTab) => a.id === 'home' || a.id === 'simulator' || a.id === myDepartment),
+  );
+  let more = $derived(apps.filter((a: AppTab) => !pinned.some((p: AppTab) => p.id === a.id)));
+  /// The active app when it lives under More — so the bar can say so.
+  let activeInMore = $derived(more.find((a: AppTab) => a.id === active) ?? null);
+
+  let moreOpen = $state(false);
+
+  // Escape closes the menu. A plain listener rather than
+  // <svelte:window>, which the bundler cannot resolve — see
+  // no-svelte-window.test.ts.
+  $effect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') moreOpen = false;
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  });
 </script>
 
 <nav class="perspective-tabs" aria-label="Perspective">
@@ -72,7 +120,7 @@
     {#if brandSub}<span class="perspective-brand-sub">{brandSub}</span>{/if}
   </span>
   <div class="perspective-tablist">
-    {#each APPS as t (t.id)}
+    {#each pinned as t (t.id)}
       <a
         class="perspective-tab"
         class:active={active === t.id}
@@ -80,6 +128,39 @@
         aria-current={active === t.id ? 'page' : undefined}
       >{t.label}</a>
     {/each}
+    {#if more.length}
+      <div class="perspective-more">
+        <button
+          type="button"
+          class="perspective-tab perspective-more-btn"
+          class:active={activeInMore !== null}
+          aria-expanded={moreOpen}
+          aria-haspopup="true"
+          aria-current={activeInMore ? 'page' : undefined}
+          onclick={() => (moreOpen = !moreOpen)}
+        >{activeInMore ? activeInMore.label : 'More'}
+          <span aria-hidden="true">▾</span></button>
+        {#if moreOpen}
+          <!-- Click-away. Sits under the menu, over everything else. -->
+          <button
+            type="button"
+            class="perspective-more-scrim"
+            aria-label="Close menu"
+            onclick={() => (moreOpen = false)}
+          ></button>
+          <div class="perspective-more-menu">
+            {#each more as t (t.id)}
+              <a
+                class="perspective-more-item"
+                class:perspective-more-item-on={active === t.id}
+                href={t.href}
+                aria-current={active === t.id ? 'page' : undefined}
+              >{t.label}</a>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
   </div>
   <div class="perspective-right">
     <GlobalSearch appKinds={searchAppKinds} />
@@ -104,6 +185,59 @@
     border-bottom: 1px solid #292524;
     padding: 0 16px;
   }
+  .perspective-more {
+    position: relative;
+    display: flex;
+    align-items: stretch;
+  }
+  .perspective-more-btn {
+    font: inherit;
+    border: none;
+    cursor: pointer;
+    background: none;
+  }
+  /* Full-viewport click-away, beneath the menu. A button so it is
+     reachable and dismissable without a mouse. */
+  .perspective-more-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 1;
+    border: none;
+    padding: 0;
+    background: transparent;
+    cursor: default;
+  }
+  .perspective-more-menu {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 2;
+    min-width: 180px;
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    background: #1c1917;
+    border: 1px solid #292524;
+    border-radius: 0 0 8px 8px;
+    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.4);
+  }
+  .perspective-more-item {
+    padding: 7px 10px;
+    border-radius: 4px;
+    font-size: 13px;
+    color: #d6d3d1;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .perspective-more-item:hover {
+    background: #292524;
+    color: #fff;
+  }
+  .perspective-more-item-on {
+    color: #fff;
+    font-weight: 500;
+  }
+
   .perspective-brand {
     display: flex;
     align-items: baseline;

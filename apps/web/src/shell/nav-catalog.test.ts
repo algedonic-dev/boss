@@ -16,12 +16,14 @@
 // surface is stranded in an app with no tab.
 
 import { describe, it, expect } from 'bun:test';
-import { APPS, type AppId } from '@boss/web-kit/nav';
+import { DEPARTMENTS, type AppId } from '@boss/web-kit/nav';
 import {
+  APPS,
   APP_SUBJECT_KINDS,
-  DEPARTMENT_APP,
   ROUTE_CATALOG,
+  appForDepartment,
   appForSection,
+  departmentsWithoutSurfaces,
   type NavItem,
 } from './nav-catalog';
 import { readFileSync } from 'node:fs';
@@ -193,13 +195,16 @@ describe('nav catalog — app assignment', () => {
 describe('appForSection — the App.svelte tab derivation', () => {
   it('resolves surfaces to their app', () => {
     expect(appForSection('system-model')).toBe('it');
-    expect(appForSection('accounts')).toBe('crm');
+    expect(appForSection('accounts')).toBe('sales');
     expect(appForSection('finance')).toBe('finance');
-    // 'jobs' moved to home when the operations app was deleted:
-    // Algedonic Ales has 14 departments and none is operations, so
-    // the app represented nobody. Interim — see feedback 43b61794.
+    // 'All jobs' stays on Home deliberately. It is the cross-cutting
+    // queue, and pinning it to one department would be the thing
+    // feedback 4b454768 objected to: "I shouldn't be jerked around
+    // through apps as I work."
     expect(appForSection('jobs')).toBe('home');
-    expect(appForSection('warehouse')).toBe('supply-chain');
+    expect(appForSection('warehouse')).toBe('warehouse');
+    expect(appForSection('shipping')).toBe('distribution');
+    expect(appForSection('marketing-assets')).toBe('marketing');
     expect(appForSection('people')).toBe('people');
     expect(appForSection('inbox')).toBe('home');
   });
@@ -252,33 +257,60 @@ describe('departments map to apps', () => {
     return all;
   }
 
-  it('every department in the registry is served by some app', () => {
-    // `audit` had no app at all and nothing failed. A new department
-    // row should be a decision about where its people work, not a
-    // silent omission.
-    const missing = registryDepartments().filter((d) => !(d in DEPARTMENT_APP));
+  it('the DEPARTMENTS vocabulary matches the Class registry exactly', () => {
+    // web-kit hardcodes the department list because the chrome bar
+    // cannot wait on a fetch to know what tabs exist. This is the
+    // equality test that keeps the copy honest in BOTH directions
+    // (CLAUDE.md §9a) — it is what named `admin` the moment that
+    // department was folded into finance.
+    const registry: string[] = [...registryDepartments()].sort();
+    const vocabulary: string[] = DEPARTMENTS.map((d) => d.code as string).sort();
     expect(
-      missing,
-      `these departments are seeded but map to no app: ${missing.join(', ')}`,
+      vocabulary,
+      'DEPARTMENTS in libs/web-kit/src/nav.ts has drifted from the Class registry ' +
+        '(infra/postgres/schema/01-registries.sql + examples/brewery/seeds/classes.json)',
+    ).toEqual(registry);
+  });
+
+  it('every app is a department, except Home and Simulator', () => {
+    // The whole point of the change: "CRM is not a department for
+    // example. The only exception to the department-based apps is the
+    // Simulator." Home is the second exception — personal work belongs
+    // to whoever is doing it, not to a department.
+    const codes = new Set(DEPARTMENTS.map((d) => d.code));
+    const invented = APPS.map((a) => a.id).filter(
+      (id) => id !== 'home' && id !== 'simulator' && !codes.has(id as never),
+    );
+    expect(
+      invented,
+      `these apps name no department: ${invented.join(', ')}`,
     ).toEqual([]);
   });
 
-  it('every mapping target is an app the chrome bar offers', () => {
-    const tabbed = new Set<AppId>(APPS.map((a) => a.id));
-    for (const [dept, app] of Object.entries(DEPARTMENT_APP)) {
-      expect(
-        tabbed.has(app),
-        `department "${dept}" maps to app "${app}", which has no tab`,
-      ).toBe(true);
+  it('every department app has at least one surface behind it', () => {
+    for (const app of APPS) {
+      if (app.id === 'home' || app.id === 'simulator') continue;
+      const owns = Object.values(ROUTE_CATALOG).some((e) => e.app === app.id);
+      expect(owns, `app "${app.id}" has a tab but owns no surface`).toBe(true);
     }
   });
 
-  it('maps no department the registry does not have', () => {
-    // The other direction: a mapping for a department that was renamed
-    // or retired is dead weight that reads as coverage.
-    const known = new Set(registryDepartments());
-    const stale = Object.keys(DEPARTMENT_APP).filter((d) => !known.has(d));
-    expect(stale, `mapped but not in the registry: ${stale.join(', ')}`).toEqual([]);
+  it('an employee of any seeded department lands somewhere real', () => {
+    // `audit` once mapped to no app at all and nothing failed. Every
+    // department must resolve — to its own app if it owns a surface,
+    // to Home if it does not.
+    const tabbed = new Set(APPS.map((a) => a.id));
+    for (const d of registryDepartments()) {
+      expect(tabbed.has(appForDepartment(d)), `department "${d}" lands nowhere`).toBe(true);
+    }
+  });
+
+  it('reports the departments with no surface of their own', () => {
+    // Not a failure — a report, so the gap is visible rather than
+    // reading as covered. These are real departments with real people
+    // and no screen built for them yet; they land on Home.
+    const bare = [...departmentsWithoutSurfaces()].sort();
+    expect(bare).toEqual(['audit', 'packaging', 'taproom']);
   });
 });
 
