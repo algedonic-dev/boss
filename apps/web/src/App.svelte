@@ -14,6 +14,7 @@
   import { loadClasses } from '@boss/web-kit/session/classes.svelte';
   import AppShell from './shell/AppShell.svelte';
   import { APPS, appForSection, APP_SUBJECT_KINDS, type AppId } from './shell/nav-catalog';
+  import { SECTION_FOR_ROUTE } from './shell/sections';
   import StepFocusPage from './steps/StepFocusPage.svelte';
   import PerspectiveTabs from '@boss/web-kit/PerspectiveTabs.svelte';
   import DebugGear from './debug/DebugGear.svelte';
@@ -172,69 +173,11 @@
     return () => window.removeEventListener('popstate', onPop);
   });
 
-  // Map each route to the sidebar id that should highlight.
-  let activeSection = $derived(
-    route.kind === 'me' ? 'me'
-      : route.kind === 'inbox' ? 'inbox'
-      : route.kind === 'jobs' || route.kind === 'jobDetail' ? 'jobs'
-      : route.kind === 'service' ? 'service'
-      : route.kind === 'sales' ? 'sales'
-      : route.kind === 'refurb' ? 'refurb'
-      : route.kind === 'assets' || route.kind === 'asset' ? 'assets'
-      : route.kind === 'accounts' || route.kind === 'account' ? 'accounts'
-      : route.kind === 'vendors' || route.kind === 'vendor' ? 'vendors'
-      : route.kind === 'people' || route.kind === 'employee' ? 'people'
-      : route.kind === 'parts' || route.kind === 'part' ? 'parts'
-      : route.kind === 'finance' || route.kind === 'invoice' ? 'finance'
-      : route.kind === 'shipping' || route.kind === 'shipmentDetail' ? 'shipping'
-      : route.kind === 'support' ? 'support'
-      : route.kind === 'hr' ? 'hr'
-      : route.kind === 'qa' ? 'qa'
-      : route.kind === 'calendar' ? 'calendar'
-      : route.kind === 'schedule' ? 'schedule'
-      : route.kind === 'exec' ? 'exec'
-      : route.kind === 'systemMonitoring' || route.kind === 'systemMonitoringPerf' || route.kind === 'systemMonitoringEvents' || route.kind === 'systemMonitoringAtlas' ? 'systemMonitoring'
-      : route.kind === 'warehouse' ? 'warehouse'
-      : route.kind === 'catalog' || route.kind === 'device' ? 'catalog'
-      : route.kind === 'marketingAssets' || route.kind === 'marketingAsset' ? 'marketing-assets'
-      : route.kind === 'manual' || route.kind === 'manualSection' ? 'manual'
-      : route.kind === 'policy' ? 'policy'
-      : route.kind === 'workflows' || route.kind === 'workflowsAdmin' || route.kind === 'workflowNew' || route.kind === 'workflowDesign' || route.kind === 'workflowDetail' ? 'workflows'
-      : route.kind === 'systemStepPlugins' || route.kind === 'systemStepPluginDetail' ? 'systemStepPlugins'
-      : route.kind === 'dispatcherRules' || route.kind === 'dispatcherRulesList' || route.kind === 'dispatcherRuleEdit' ? 'system-dispatcher'
-      : route.kind === 'systemSubjects' ? 'system-subjects'
-      : route.kind === 'systemModel' ? 'system-model'
-      : route.kind === 'experiments' ? 'system-experiments'
-      // Everything below was falling through to 'me' — 21 of 74 route
-      // kinds, which meant the right page rendered inside the HOME
-      // chrome. Reported as "clicking Feedback triage took me to the
-      // Home app"; that was one symptom of twenty-one.
-      //
-      // The comment under this block used to claim the ternary
-      // "already resolves every route.kind down to" a section. It did
-      // not, and nothing checked, which is why the list below exists
-      // and why `every-route-has-a-section.test.ts` now pins it.
-      : route.kind === 'systemFeedback' ? 'system-feedback'
-      : route.kind === 'systemOsMap' ? 'system-os-map'
-      : route.kind === 'systemFlow' ? 'system-flow'
-      : route.kind === 'systemKb' ? 'system-kb'
-      : route.kind === 'systemDesign' ? 'system-design'
-      : route.kind === 'authAdmin' ? 'auth-admin'
-      : route.kind === 'views' ? 'views'
-      : route.kind === 'myCalendar' ? 'calendar'
-      : route.kind === 'products' || route.kind === 'product' ? 'products'
-      : route.kind === 'shop' || route.kind === 'shopProduct' ? 'shop'
-      : route.kind === 'newInvoice' || route.kind === 'newJournalEntry' ? 'finance'
-      // A purchase order and a vendor invoice are both about a vendor;
-      // neither has a sidebar row of its own.
-      : route.kind === 'po' || route.kind === 'vendorInvoice' ? 'vendors'
-      : route.kind === 'watchlist' ? 'accounts'
-      // 'me' is the honest answer for the rest, not a fallback:
-      // - login, stepFocus and home render OUTSIDE AppShell entirely,
-      //   so no section applies.
-      // - search is cross-cutting and has no sidebar row.
-      : 'me',
-  );
+  // Which sidebar section highlights. The route->section map lives in
+  // shell/sections.ts as a typed Record so a new route kind cannot fall
+  // through silently, and sections.test.ts pins every section id to a
+  // ROUTE_CATALOG key.
+  let activeSection = $derived(SECTION_FOR_ROUTE[route.kind]);
 
   // Which app tab is active. Derived from `activeSection` via the
   // catalog's `app` field.
