@@ -17,7 +17,13 @@
   import type { Node, Edge } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
-  import { layout, toEdges, type OsMap } from './osMapToGraph';
+  import { handoffDeltas, layout, toEdges, type OsMap, type OsMapEdge } from './osMapToGraph';
+  import PulseEdge from './PulseEdge.svelte';
+
+  // One custom edge type, drawing both the cumulative stroke and the
+  // live pulses. Registered here rather than in the mapping module
+  // because it is a rendering concern.
+  const edgeTypes = { pulse: PulseEdge };
 
   const POLL_MS = 5_000;
 
@@ -30,6 +36,14 @@
 
   let nodes = $state.raw<Node[]>([]);
   let edges = $state.raw<Edge[]>([]);
+
+  /// The previous read's edge counts, for computing what moved.
+  ///
+  /// Deliberately NOT derived from `map`: by the time `map` is
+  /// reassigned the old value is gone, and the delta needs both. Null
+  /// until the second poll, so a page load does not fire a pulse for
+  /// every handoff in the window.
+  let prevEdges: ReadonlyArray<OsMapEdge> | null = null;
 
   async function load(): Promise<void> {
     try {
@@ -52,10 +66,14 @@
           label: `${n.data.label}\n${Number(n.data.touched).toLocaleString()} handoffs`,
         },
       }));
-      edges = toEdges(next.edges).map((e) => ({
+      // What moved since the last read. Pulses render on those edges
+      // only; everything else keeps its stroke and stays still.
+      const deltas = handoffDeltas(prevEdges, next.edges);
+      edges = toEdges(next.edges, deltas, Date.now()).map((e) => ({
         ...e,
         markerEnd: { type: MarkerType.ArrowClosed },
       }));
+      prevEdges = next.edges;
       error = null;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -120,7 +138,7 @@
   </p>
 {:else}
   <div class="os-canvas">
-    <SvelteFlow bind:nodes bind:edges fitView>
+    <SvelteFlow bind:nodes bind:edges {edgeTypes} fitView>
       <Background />
       <Controls />
     </SvelteFlow>
