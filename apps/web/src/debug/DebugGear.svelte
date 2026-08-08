@@ -54,7 +54,7 @@
   }
 
   // Attach the Escape-to-close listener via $effect rather than
-  // <svelte:window>: the bun+svelte HMR bundler crashes on the
+  // a svelte:window tag: the bun+svelte HMR bundler crashes on the
   // svelte:window event lookup ($.window resolves undefined when
   // DebugGear's effect runs first), which takes the whole app down.
   // A direct addEventListener is the same behaviour without the

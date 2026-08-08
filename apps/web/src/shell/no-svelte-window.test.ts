@@ -1,4 +1,4 @@
-// `<svelte:window>` and friends are banned in this app.
+// `svelte:window` and friends are banned in this app.
 //
 // The bun+svelte bundler crashes on the svelte:window event lookup —
 // `$.window` resolves undefined — and the failure is not local to the
@@ -49,6 +49,19 @@ const ROOTS = [
 ];
 
 /// The special elements that go through the same broken lookup.
+///
+/// Matched WITH the opening angle bracket, which only ever appears in
+/// real markup — so prose can discuss `svelte:window` freely and this
+/// scan reads the source verbatim.
+///
+/// The first version stripped comments with a regex first, so that the
+/// explanatory comments naming the construct did not trip it. CodeQL
+/// flagged that as incomplete multi-character sanitization, correctly:
+/// a single-pass `<!--...-->` replace can leave an opening `<!--`
+/// behind. Not exploitable here — this reads source files at build
+/// time and renders nothing — but a lint whose own implementation
+/// trips a security scanner is not worth defending. Not writing the
+/// bracket in prose is simpler than sanitizing prose.
 const BANNED = ['<svelte:window', '<svelte:document', '<svelte:body'];
 
 describe('no svelte:window', () => {
@@ -56,11 +69,7 @@ describe('no svelte:window', () => {
     const offenders: string[] = [];
     for (const root of ROOTS) {
       for (const file of svelteFiles(root)) {
-        const src = readFileSync(file, 'utf8');
-        // Strip comments first — this file's own guidance, and the
-        // explanatory comments in TriageBoard/DebugGear, name the
-        // construct precisely so that they can explain it.
-        const code = src.replace(/<!--[\s\S]*?-->/g, '').replace(/\/\/.*$/gm, '');
+        const code = readFileSync(file, 'utf8');
         for (const banned of BANNED) {
           if (code.includes(banned)) {
             offenders.push(`${file.replace(/.*\/(apps|libs)\//, '$1/')} uses ${banned}`);

@@ -73,7 +73,7 @@
   let detailId = $state<string | null>(null);
   const detail = $derived(detailId ? (jobs.find((j) => j.id === detailId) ?? null) : null);
 
-  // Escape-to-close via $effect rather than <svelte:window>. The
+  // Escape-to-close via $effect rather than a svelte:window tag. The
   // bun+svelte bundler crashes on the svelte:window event lookup
   // ($.window resolves undefined), which takes the WHOLE app down —
   // not just this component: `.app-shell` never mounts and every route
