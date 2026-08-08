@@ -72,6 +72,25 @@
   /// modal on a stale copy the moment a poll lands.
   let detailId = $state<string | null>(null);
   const detail = $derived(detailId ? (jobs.find((j) => j.id === detailId) ?? null) : null);
+
+  // Escape-to-close via $effect rather than <svelte:window>. The
+  // bun+svelte bundler crashes on the svelte:window event lookup
+  // ($.window resolves undefined), which takes the WHOLE app down —
+  // not just this component: `.app-shell` never mounts and every route
+  // that renders a board dies with "Cannot read properties of
+  // undefined (reading 'addEventListener')".
+  //
+  // DebugGear.svelte hit this first and documented it there. A comment
+  // in one file does not stop the next person reaching for the obvious
+  // construct, which is exactly what happened here, so there is now a
+  // lint for it (CLAUDE.md §9a).
+  $effect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === 'Escape') detailId = null;
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  });
   let loading = $state(true);
   let error = $state<string | null>(null);
   let busy = $state<Record<string, boolean>>({});
@@ -481,8 +500,6 @@
     {/each}
   </div>
 {/if}
-
-<svelte:window onkeydown={(e) => e.key === 'Escape' && (detailId = null)} />
 
 {#if detail}
   <!-- Backdrop. Escape closes it too (window handler above), so the

@@ -172,6 +172,16 @@ jobs:
         working-directory: apps/web
         run: bun run typecheck
 
+      # The unit suite did not run here at all until 2026-08-08 — 195
+      # tests, including every equality test that pins a fact living in
+      # two places (the nav catalog against the department registry, the
+      # route kinds against the section chain, the banned-construct
+      # lint). They ran only on a developer's machine, which means they
+      # ran when someone remembered.
+      - name: Unit tests
+        working-directory: apps/web
+        run: bun run test:unit
+
       - name: Build
         working-directory: apps/web
         run: bun run build
