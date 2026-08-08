@@ -11,11 +11,26 @@
   import { href, navigate } from '../router';
   import { session } from '@boss/web-kit/session/session.svelte';
 
-  type KindFilter = MessageKind | 'all' | 'unread';
+  /// `needs-you` is the default view, and the reason this file changed.
+  ///
+  /// The inbox opened on `all`: every message ever addressed to you, in
+  /// one flat stream, thousands of them on a running deployment. The
+  /// actionable items were in there — "I think I have actionable items
+  /// somewhere in my Inbox, but it is unprocessable in its current
+  /// form" — but finding them meant reading past every signal the
+  /// machine had ever emitted.
+  ///
+  /// The distinction the data already carries: a `direct` message is a
+  /// person (or an agent) addressing YOU and expecting something; a
+  /// `signal` is the machine telling you a thing happened. Unread
+  /// directs are the only category that is waiting on you, so that is
+  /// what the page opens on. Everything else is one click away and
+  /// nothing is hidden.
+  type KindFilter = MessageKind | 'all' | 'unread' | 'needs-you';
 
   let messages = $state<Message[]>([]);
   let employees = $state<Employee[]>([]);
-  let kindFilter = $state<KindFilter>('all');
+  let kindFilter = $state<KindFilter>('needs-you');
   let query = $state('');
   let composing = $state(false);
 
@@ -62,11 +77,18 @@
   });
 
   let unread = $derived(messages.filter((m) => m.read_at === null));
+  /// Waiting on you: unread, and from someone rather than from the
+  /// machine.
+  let needsYou = $derived(
+    messages.filter((m) => m.read_at === null && m.kind === 'direct'),
+  );
   let directCount = $derived(messages.filter((m) => m.kind === 'direct').length);
   let signalCount = $derived(messages.filter((m) => m.kind === 'signal').length);
 
   let visible = $derived(
     messages.filter((m) => {
+      if (kindFilter === 'needs-you' && (m.read_at !== null || m.kind !== 'direct'))
+        return false;
       if (kindFilter === 'unread' && m.read_at !== null) return false;
       if (kindFilter === 'direct' && m.kind !== 'direct') return false;
       if (kindFilter === 'signal' && m.kind !== 'signal') return false;
@@ -135,8 +157,10 @@
 <div class="catalog theme-exec">
   <PageHeader
     eyebrow="Inbox"
-    title={`${messages.length} messages`}
-    subtitle={`${unread.length} unread · ${signalCount} signals · ${directCount} direct`}
+    title={needsYou.length === 0
+      ? 'Nothing is waiting on you'
+      : `${needsYou.length} waiting on you`}
+    subtitle={`${unread.length} unread · ${directCount} direct · ${signalCount} signals · ${messages.length} total`}
   />
 
   <div style="padding:0 32px 12px">
@@ -215,6 +239,14 @@
           <SearchInput bind:value={query} placeholder="Subject, sender…" />
       </FilterGroup>
       <FilterGroup label="Filter">
+          <!-- First and default. The other four are still here and
+               nothing is hidden — this only decides what you land on. -->
+          <FilterButton
+            active={kindFilter === 'needs-you'}
+            onclick={() => (kindFilter = 'needs-you')}
+          >
+            Waiting on you ({needsYou.length})
+          </FilterButton>
           <FilterButton active={kindFilter === 'all'} onclick={() => (kindFilter = 'all')}>
             All ({messages.length})
           </FilterButton>
