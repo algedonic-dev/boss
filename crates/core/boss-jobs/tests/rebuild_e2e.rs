@@ -176,6 +176,11 @@ fn fixture_step(step_id: &str, job_id: &str, sort_order: i32, title: &str) -> St
         // step-kind validation.
         kind: "generic".into(),
         title: title.into(),
+        // A real slug, deliberately different from the title: the
+        // before/after snapshot equality proves the rebuilder
+        // reproduces the column (a projection column lands WITH its
+        // rebuild source, or replay silently loses it).
+        spec_slug: Some(format!("slug-{sort_order}")),
         assignee_id: Some("emp-200".into()),
         status: StepStatus::Pending,
         sort_order,

@@ -154,6 +154,10 @@ const SCHEMA_FILES: &[(&str, &str)] = &[
         "99-search",
         include_str!("../../../../infra/postgres/schema/99-search.sql"),
     ),
+    (
+        "100-step-spec-slug",
+        include_str!("../../../../infra/postgres/schema/100-step-spec-slug.sql"),
+    ),
 ];
 
 /// Concatenate the schema files in manifest order, omitting any whose name

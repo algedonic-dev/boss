@@ -74,6 +74,7 @@ struct StepRow {
     job_id: uuid::Uuid,
     kind: String,
     title: String,
+    spec_slug: Option<String>,
     assignee_id: Option<String>,
     status: String,
     sort_order: i32,
@@ -130,6 +131,7 @@ fn row_to_step(r: StepRow) -> Result<Step, JobsError> {
         job_id: JobId::from_uuid(r.job_id),
         kind: r.kind,
         title: r.title,
+        spec_slug: r.spec_slug,
         assignee_id: r.assignee_id,
         status: parse_step_status(&r.status).ok_or_else(|| step_status_err(&r.status))?,
         sort_order: r.sort_order,
@@ -560,11 +562,11 @@ impl JobsRepository for PgJobs {
             .map_err(|e| JobsError::Storage(e.to_string()))?;
         let result = sqlx::query(
             r#"
-            INSERT INTO steps (id, job_id, kind, title, assignee_id, status, sort_order,
+            INSERT INTO steps (id, job_id, kind, title, spec_slug, assignee_id, status, sort_order,
                                blocked_by, sign_offs_required, sign_offs, fields,
                                completed_on, metadata, notes, step_plugin_version,
                                embedded_job, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $17)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $18)
             ON CONFLICT (id) DO NOTHING
             "#,
         )
@@ -572,6 +574,7 @@ impl JobsRepository for PgJobs {
         .bind(*step.job_id.inner().as_uuid())
         .bind(&step.kind)
         .bind(&step.title)
+        .bind(&step.spec_slug)
         .bind(&step.assignee_id)
         .bind(step_status_str(step.status))
         .bind(step.sort_order)
@@ -606,7 +609,7 @@ impl JobsRepository for PgJobs {
 
     async fn get_step(&self, id: &StepId) -> Result<Option<Step>, JobsError> {
         let row = sqlx::query_as::<_, StepRow>(
-            "SELECT id, job_id, kind, title, assignee_id, status, sort_order, blocked_by, sign_offs_required, sign_offs, fields, completed_on, metadata, notes, step_plugin_version, embedded_job FROM steps WHERE id = $1",
+            "SELECT id, job_id, kind, title, spec_slug, assignee_id, status, sort_order, blocked_by, sign_offs_required, sign_offs, fields, completed_on, metadata, notes, step_plugin_version, embedded_job FROM steps WHERE id = $1",
         )
         .bind(*id.inner().as_uuid())
         .fetch_optional(&self.pool)
@@ -744,7 +747,7 @@ impl JobsRepository for PgJobs {
 
     async fn list_steps(&self, job_id: &JobId) -> Result<Vec<Step>, JobsError> {
         let rows = sqlx::query_as::<_, StepRow>(
-            "SELECT id, job_id, kind, title, assignee_id, status, sort_order, blocked_by, sign_offs_required, sign_offs, fields, completed_on, metadata, notes, step_plugin_version, embedded_job FROM steps WHERE job_id = $1 ORDER BY sort_order",
+            "SELECT id, job_id, kind, title, spec_slug, assignee_id, status, sort_order, blocked_by, sign_offs_required, sign_offs, fields, completed_on, metadata, notes, step_plugin_version, embedded_job FROM steps WHERE job_id = $1 ORDER BY sort_order",
         )
         .bind(*job_id.inner().as_uuid())
         .fetch_all(&self.pool)
@@ -764,7 +767,7 @@ impl JobsRepository for PgJobs {
         // `authority_role` lives in step metadata JSONB. Ordered by
         // (opened_on, sort_order) for a stable executor queue.
         let rows = sqlx::query_as::<_, AssignmentRowSql>(
-            "SELECT s.id, s.job_id, s.kind, s.title, s.assignee_id, s.status, \
+            "SELECT s.id, s.job_id, s.kind, s.title, s.spec_slug, s.assignee_id, s.status, \
                     s.sort_order, s.blocked_by, s.sign_offs_required, s.sign_offs, \
                     s.fields, s.completed_on, s.metadata, s.notes, \
                     s.step_plugin_version, s.embedded_job, \
@@ -807,7 +810,7 @@ impl JobsRepository for PgJobs {
         // round-trip. The sim workforce pulls this each pass and drives
         // every assigned step, decoupled from who assigned it.
         let rows = sqlx::query_as::<_, AssignmentRowSql>(
-            "SELECT s.id, s.job_id, s.kind, s.title, s.assignee_id, s.status, \
+            "SELECT s.id, s.job_id, s.kind, s.title, s.spec_slug, s.assignee_id, s.status, \
                     s.sort_order, s.blocked_by, s.sign_offs_required, s.sign_offs, \
                     s.fields, s.completed_on, s.metadata, s.notes, \
                     s.step_plugin_version, s.embedded_job, \

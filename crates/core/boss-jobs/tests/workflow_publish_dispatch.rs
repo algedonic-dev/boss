@@ -104,6 +104,7 @@ async fn seed_publish_step(
         job_id,
         kind: "workflow-publish".into(),
         title: "Publish".into(),
+        spec_slug: None,
         assignee_id: None,
         status: StepStatus::Active,
         sort_order: 0,

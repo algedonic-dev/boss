@@ -25,3 +25,4 @@
 42-views.sql
 43-event-facts.sql
 99-search.sql
+100-step-spec-slug.sql
