@@ -120,6 +120,34 @@ impl ClassRepository for PgClasses {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn retire(&self, class_ref: &ClassRef) -> Result<bool, ClassError> {
+        // Stamp only when not already stamped — when a Class was
+        // withdrawn is a fact, and a repeat call must not move it.
+        let stamped = sqlx::query(
+            "UPDATE classes SET retired_at = now(), updated_at = now() \
+             WHERE subject_kind = $1 AND code = $2 AND retired_at IS NULL",
+        )
+        .bind(&class_ref.subject_kind)
+        .bind(&class_ref.code)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| ClassError::Storage(e.to_string()))?;
+        if stamped.rows_affected() > 0 {
+            return Ok(true);
+        }
+        // Nothing stamped: either already retired (idempotent success)
+        // or no such row (the caller's 404).
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM classes WHERE subject_kind = $1 AND code = $2)",
+        )
+        .bind(&class_ref.subject_kind)
+        .bind(&class_ref.code)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| ClassError::Storage(e.to_string()))?;
+        Ok(exists)
+    }
+
     async fn batch_upsert(&self, rows: &[Class]) -> Result<u64, ClassError> {
         // One `ON CONFLICT DO NOTHING` per row inside a single
         // transaction, mirroring the idempotent semantics of the seed

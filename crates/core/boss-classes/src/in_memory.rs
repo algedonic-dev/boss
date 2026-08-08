@@ -70,6 +70,24 @@ impl ClassRepository for InMemoryClasses {
         }
     }
 
+    async fn retire(&self, class_ref: &ClassRef) -> Result<bool, ClassError> {
+        let mut rows = self.rows.write().expect("rwlock poisoned");
+        match rows
+            .iter_mut()
+            .find(|c| c.subject_kind == class_ref.subject_kind && c.code == class_ref.code)
+        {
+            Some(existing) => {
+                // Keep the original stamp on a repeat call — when it
+                // was withdrawn is a fact, not a counter.
+                if existing.retired_at.is_none() {
+                    existing.retired_at = Some(chrono::Utc::now());
+                }
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     async fn batch_upsert(&self, incoming: &[Class]) -> Result<u64, ClassError> {
         // Mirror the Postgres `ON CONFLICT (subject_kind, code) DO
         // NOTHING`: a row whose composite key already exists is left

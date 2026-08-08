@@ -35,6 +35,10 @@ pub fn router(state: ClassesApiState) -> Router {
             "/api/classes/{subject_kind}/{code}/exists",
             get(class_exists),
         )
+        .route(
+            "/api/classes/{subject_kind}/{code}/retire",
+            axum::routing::post(retire_class),
+        )
         .with_state(state)
 }
 
@@ -119,6 +123,29 @@ async fn update_class(
     }
 }
 
+/// Withdraw a Class from active use. POST, not DELETE: the row stays
+/// (other rows point at the code), and what happens is a state
+/// transition — `retired_at` gets stamped, `list` and `exists_active`
+/// stop offering the code. Idempotent; 404 only when the composite
+/// key names nothing.
+async fn retire_class(
+    State(state): State<ClassesApiState>,
+    CurrentUser(user): CurrentUser,
+    Path((subject_kind, code)): Path<(String, String)>,
+) -> Response {
+    let sim = boss_core::sim_origin::is_in_sim_chain();
+    let tier_ok = matches!(user.access_tier, AccessTier::Operator);
+    if !(sim || tier_ok) {
+        return (StatusCode::FORBIDDEN, "operator tier required").into_response();
+    }
+    let class_ref = ClassRef::new(subject_kind, code);
+    match state.classes.retire(&class_ref).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such class").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 async fn class_exists(
     State(state): State<ClassesApiState>,
     Path((subject_kind, code)): Path<(String, String)>,
@@ -133,8 +160,9 @@ async fn class_exists(
 /// One row in a `POST /api/classes/batch` body. Mirrors the `classes`
 /// table's authorable columns; `retired_at` / `created_at` /
 /// `updated_at` are owned by the table and not accepted here (seeded
-/// rows arrive active). Optional fields default so a minimal seed row
-/// is `{"subject_kind","code","display_name"}`.
+/// rows arrive active; withdrawing one is its own action — POST
+/// `{subject_kind}/{code}/retire`). Optional fields default so a
+/// minimal seed row is `{"subject_kind","code","display_name"}`.
 #[derive(Deserialize)]
 struct ClassInput {
     subject_kind: String,
@@ -553,6 +581,112 @@ mod tests {
         assert_eq!(
             repo.list_for_subject_kind("employee").await.unwrap().len(),
             1
+        );
+    }
+    fn retire_request(user_header: Option<&str>, code: &str) -> Request<axum::body::Body> {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri(format!("/api/classes/employee/{code}/retire"));
+        if let Some(h) = user_header {
+            b = b.header("x-boss-user", h);
+        }
+        b.body(axum::body::Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn retire_withdraws_a_code_from_active_use_but_keeps_the_row() {
+        let app = build_app(vec![employee("ceo", 10), employee("cto", 11)]);
+        let h = operator_header();
+        let resp = app
+            .clone()
+            .oneshot(retire_request(Some(&h), "cto"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Withdrawn: the validation primitive refuses it…
+        let req = Request::builder()
+            .uri("/api/classes/employee/cto/exists")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["exists"],
+            json!(false),
+            "exists_active must refuse a retired code"
+        );
+
+        // …the list stops offering it…
+        let req = Request::builder()
+            .uri("/api/classes?subject_kind=employee")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v.as_array().unwrap().len(),
+            1,
+            "retired codes leave the list"
+        );
+
+        // …but the row stays readable: existing rows point at it.
+        let req = Request::builder()
+            .uri("/api/classes/employee/cto")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a retired Class is history, not gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn retire_is_idempotent() {
+        let app = build_app(vec![employee("ceo", 10)]);
+        let h = operator_header();
+        for _ in 0..2 {
+            let resp = app
+                .clone()
+                .oneshot(retire_request(Some(&h), "ceo"))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NO_CONTENT,
+                "a repeat retire is a no-op"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retire_of_a_missing_code_is_404() {
+        let app = build_app(vec![employee("ceo", 10)]);
+        let h = operator_header();
+        let resp = app
+            .clone()
+            .oneshot(retire_request(Some(&h), "no-such"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn retire_requires_operator_tier() {
+        let app = build_app(vec![employee("ceo", 10)]);
+        let resp = app
+            .clone()
+            .oneshot(retire_request(None, "ceo"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "withdrawing taxonomy is operator work"
         );
     }
 }
