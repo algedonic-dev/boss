@@ -16,6 +16,8 @@ path = "src/bin/boss_brewery_sim.rs"
 default = []
 
 [dependencies]
+boss-clock-client = { path = "../../core/boss-clock-client" }
+futures = { workspace = true }
 boss-ports = { path = "../../core/boss-ports" }
 anyhow = { workspace = true }
 chrono = { workspace = true }
