@@ -54,7 +54,16 @@ operating_days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 # gate on `is_first_in_day` (fire once per sim-day at tick 0).
 # That's enough to spread Poisson Job creation + step
 # completion + subject birth, which is the visible win.
-tick_duration = "1h"
+# One slice per sim-minute. The brewery is modelled at real time, so the
+# only honest way to spread a day's work is to spread it the way a day
+# actually spreads it — a brewery does not do a day's business in one
+# lump at midnight, or in 24 hourly lumps.
+#
+# NOT for visual interest. Total volume is invariant: the day_runner
+# scales Poisson rates by tick.day_fraction(), so per-day expected Job
+# volume, step completion and subject birth are unchanged at any
+# granularity. This only decides how finely the same work is distributed.
+tick_duration = "1m"
 
 # ---------------------------------------------------------------------------
 # Modules — which platform surfaces this tenant uses.
