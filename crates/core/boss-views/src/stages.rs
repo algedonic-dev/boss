@@ -34,6 +34,38 @@ pub struct StageDurations {
     pub as_of: String,
 }
 
+/// One step of one run: duration when the hop completed, None while
+/// it is still waiting (an age belongs to the fleet view, not here).
+#[derive(Debug, Clone, Serialize)]
+pub struct RunStage {
+    pub slug: String,
+    pub seconds: Option<f64>,
+}
+
+/// One Job of the kind, its stages in spec order — a row of the
+/// "last N runs" table (backlog `a5096c8f`: even a table of the last
+/// N trains with their stage durations answers "where does a change
+/// wait longest").
+#[derive(Debug, Clone, Serialize)]
+pub struct StageRun {
+    pub job_id: String,
+    pub title: String,
+    /// Wall-clock creation instant (`jobs.created_at`, ISO-8601 UTC) —
+    /// NOT the sim-calendar `opened_on`.
+    pub created_at: String,
+    pub status: String,
+    pub stages: Vec<RunStage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StageRuns {
+    pub workflow_kind: String,
+    pub limit: i64,
+    /// Newest first.
+    pub runs: Vec<StageRun>,
+    pub as_of: String,
+}
+
 #[async_trait]
 pub trait StageDurationsRepo: Send + Sync {
     async fn stage_durations(
@@ -41,6 +73,10 @@ pub trait StageDurationsRepo: Send + Sync {
         workflow_kind: &str,
         window_days: i64,
     ) -> Result<StageDurations, ViewsError>;
+
+    /// The last `limit` Jobs of the kind with per-step durations —
+    /// the per-run rows the aggregate above summarises.
+    async fn stage_runs(&self, workflow_kind: &str, limit: i64) -> Result<StageRuns, ViewsError>;
 }
 
 #[cfg(test)]
@@ -68,5 +104,37 @@ mod tests {
         assert_eq!(v["stages"][0]["slug"], "ci");
         assert_eq!(v["stages"][0]["completed"], 2);
         assert_eq!(v["stages"][0]["p50_seconds"], 900.0);
+    }
+
+    /// The per-run wire shape: a still-waiting hop serialises as
+    /// `"seconds": null`, not as an absent key — the table renders the
+    /// column either way and a dropped key would read as "no stage".
+    #[test]
+    fn stage_runs_serialise_with_null_for_a_waiting_hop() {
+        let out = StageRuns {
+            workflow_kind: "pr-train".into(),
+            limit: 10,
+            runs: vec![StageRun {
+                job_id: "j1".into(),
+                title: "PR train 2026-08-09 PM".into(),
+                created_at: "2026-08-09T20:26:30Z".into(),
+                status: "open".into(),
+                stages: vec![
+                    RunStage {
+                        slug: "ci".into(),
+                        seconds: Some(900.0),
+                    },
+                    RunStage {
+                        slug: "merged".into(),
+                        seconds: None,
+                    },
+                ],
+            }],
+            as_of: "2026-08-09T21:00:00Z".into(),
+        };
+        let v = serde_json::to_value(&out).expect("serialises");
+        assert_eq!(v["runs"][0]["stages"][0]["seconds"], 900.0);
+        assert!(v["runs"][0]["stages"][1]["seconds"].is_null());
+        assert_eq!(v["runs"][0]["created_at"], "2026-08-09T20:26:30Z");
     }
 }
