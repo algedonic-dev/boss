@@ -76,9 +76,10 @@ the machine-config flow). Bring-up becomes:
    the node inventory (Q1) fills in the addresses. Talos's KubeSpan
    gives the WireGuard mesh natively (see Q2).
 2. **One builder image**, not per-node toolchains: Rust + sccache
-   client, built from a Dockerfile in-repo. The repo has exactly one
-   container image today (the devcontainer) — this is the second,
-   and the only one build-1 needs.
+   client — `infra/cluster/builder/Dockerfile`, sharing the
+   OSS-quickstart image's digest-pinned toolchain base (one rustc
+   truth; the two diverge deliberately past the base). The only
+   image build-1 needs.
 3. **Runners as workloads**: actions-runner-controller (repo-scoped,
    same trust question as before — now Q3 is pod-security-shaped
    rather than unix-user-shaped).
