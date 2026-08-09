@@ -257,35 +257,113 @@ async fn run_server<R: AssetsRepository + 'static>(
     Ok(())
 }
 
-/// Subscribe to `asset.>` on the EventBus, decode into AssetEvents,
-/// and append to the assets repository. Duplicate events are logged and skipped.
+/// Consume `asset.>`, decode into AssetEvents, and append to the
+/// assets repository.
+///
+/// Delivery: a JetStream durable consumer (`assets-ingress`) — this
+/// is a WRITE path (the repository is rebuilt from these events), and
+/// it ran on plain core NATS until 2026-08-08: at-most-once, so a
+/// dropped message was a silently missing repository row until the
+/// next full rebuild (feedback `0da79b36`, the swallowed-write class).
+/// `asset.>` joined `stream_subjects()` in the same change;
+/// `ensure_stream` reconciles the live broker's subject list on
+/// connect, so the stream ingests it from the first post-deploy start.
+///
+/// Redelivery is safe: `append` dedups on the event id
+/// (`DuplicateEvent` → ACK). A failed append NAKs for redelivery
+/// instead of logging into the void. If the durable consumer cannot
+/// be opened, degrade loudly to the old at-most-once subscription.
 async fn run_nats_ingress<R: AssetsRepository + 'static>(
     bus: Arc<NatsEventBus>,
     assets: Arc<R>,
     mut cancel: watch::Receiver<bool>,
 ) -> Result<()> {
     use boss_core::port::EventBus;
+    use futures::StreamExt;
 
-    let mut stream = bus
-        .subscribe("asset.>")
-        .await
-        .map_err(|e| anyhow::anyhow!("subscribing to asset.>: {e}"))?;
-
-    loop {
-        tokio::select! {
-            _ = cancel.changed() => {
-                if *cancel.borrow() { break; }
+    let js = bus.jetstream();
+    match boss_nats::durable::open_durable(
+        &js,
+        boss_nats::durable::STREAM_NAME,
+        "assets-ingress",
+        vec!["asset.>".to_string()],
+    )
+    .await
+    {
+        Ok(messages) => {
+            info!("assets ingress: durable consumer 'assets-ingress' on asset.>");
+            let mut messages = std::pin::pin!(messages);
+            loop {
+                tokio::select! {
+                    _ = cancel.changed() => {
+                        if *cancel.borrow() { break; }
+                    }
+                    maybe_msg = messages.next() => {
+                        let Some(msg) = maybe_msg else { break; };
+                        let msg = match msg {
+                            Ok(m) => m,
+                            Err(e) => {
+                                warn!(error = %e, "assets ingress: message stream error");
+                                continue;
+                            }
+                        };
+                        let core_event: boss_core::event::Event =
+                            match serde_json::from_slice(&msg.payload) {
+                                Ok(ev) => ev,
+                                Err(e) => {
+                                    warn!(error = %e, "assets ingress: non-Event payload (ACK)");
+                                    let _ = msg.ack().await;
+                                    continue;
+                                }
+                            };
+                        let outcome: Result<(), String> = match core_event_to_system(&core_event) {
+                            // Not an asset system event (unknown kind) —
+                            // nothing to append, done with the message.
+                            None => Ok(()),
+                            Some(system_event) => match assets.append(system_event).await {
+                                Ok(()) => Ok(()),
+                                // Redelivered and already applied — the
+                                // dedup doing its job.
+                                Err(boss_assets::port::AssetsError::DuplicateEvent(id)) => {
+                                    warn!(event_id = %id, "duplicate event (redelivery), skipping");
+                                    Ok(())
+                                }
+                                Err(e) => Err(format!("append: {e}")),
+                            },
+                        };
+                        boss_nats::durable::settle(&msg, outcome).await;
+                    }
+                }
             }
-            maybe_event = stream.next() => {
-                let Some(core_event) = maybe_event else { break; };
-                if let Some(system_event) = core_event_to_system(&core_event) {
-                    match assets.append(system_event).await {
-                        Ok(()) => {}
-                        Err(boss_assets::port::AssetsError::DuplicateEvent(id)) => {
-                            warn!(event_id = %id, "duplicate event from NATS, skipping");
-                        }
-                        Err(e) => {
-                            error!(error = %e, "failed to append ingress event");
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "assets ingress: durable consumer unavailable — falling back to \
+                 at-most-once core subscription (a dropped event is a missing \
+                 repository row on this deployment)"
+            );
+            let mut stream = bus
+                .subscribe("asset.>")
+                .await
+                .map_err(|e| anyhow::anyhow!("subscribing to asset.>: {e}"))?;
+            loop {
+                tokio::select! {
+                    _ = cancel.changed() => {
+                        if *cancel.borrow() { break; }
+                    }
+                    maybe_event = stream.next() => {
+                        let Some(core_event) = maybe_event else { break; };
+                        if let Some(system_event) = core_event_to_system(&core_event) {
+                            match assets.append(system_event).await {
+                                Ok(()) => {}
+                                Err(boss_assets::port::AssetsError::DuplicateEvent(id)) => {
+                                    warn!(event_id = %id, "duplicate event from NATS, skipping");
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "failed to append ingress event");
+                                }
+                            }
                         }
                     }
                 }
