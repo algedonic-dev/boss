@@ -622,104 +622,25 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
             _ => None,
         };
         if let Some(job) = job_for_reeval {
-            // Resolve the version the Job was OPENED under, not
-            // whatever is active now. A Job materializes its steps once
-            // and keeps them; evaluating those steps against a newer
-            // spec asks predicates about steps the Job never had, and
-            // the length-guard below then bails and the Job stops
-            // advancing — silently, as a Job that simply never closes.
-            // Two feedback Jobs were stranded exactly this way.
-            match reg.get_version(&job.kind, job.workflow_version).await {
-                Ok(spec) => {
-                    if let Ok(mut steps) = state.jobs.list_steps(&job_id).await {
-                        // `reevaluate` requires steps in spec order
-                        // (sort_order == index); list_steps returns them
-                        // sorted by sort_order, so the invariant holds.
-                        // Invariant (expose, don't swallow): a Job's live
-                        // step set must match its active Workflow spec, or
-                        // `reevaluate`'s length-guard bails and the Job can
-                        // no longer advance. With atomic materialization
-                        // this only fires on a genuine mid-flight republish
-                        // that changed the step count. Surface it loudly
-                        // instead of silently stalling the Job.
-                        if spec.steps.len() != steps.len() {
-                            tracing::warn!(
-                                job_id = %job_id,
-                                kind = %job.kind,
-                                spec_len = spec.steps.len(),
-                                steps_len = steps.len(),
-                                "re-eval: live step count != active Workflow spec — \
-                                 readiness cannot advance this Job (its step graph \
-                                 is inconsistent with its Workflow)"
-                            );
-                        }
-                        let changed = crate::registry::reevaluate(
-                            &spec,
-                            &mut steps,
-                            &job.subject,
-                            &job.metadata,
-                        );
-                        for idx in changed {
-                            let changed_step = &steps[idx];
-                            // OUTBOX (phase 2): the promoted step's
-                            // state event + D6 ready marker (when it
-                            // lands in `Ready` — lets dispatcher rules
-                            // react to a step *becoming eligible*, the
-                            // delegate-subjob spawn fork D7) record in
-                            // the SAME transaction as the promotion.
-                            let mut reeval_events = vec![stamp.event(
-                                events::STEP_UPDATED,
-                                serde_json::to_value(changed_step).unwrap_or_default(),
-                            )];
-                            if changed_step.status == StepStatus::Ready
-                                && !changed_step.kind.is_empty()
-                            {
-                                reeval_events.push(
-                                    build_step_ready_event(&state, &job, changed_step, &actor, now)
-                                        .await,
-                                );
-                            }
-                            if let Err(e) = state
-                                .jobs
-                                .update_step_at(changed_step, now, &reeval_events)
-                                .await
-                            {
-                                tracing::warn!(
-                                    job_id = %job_id,
-                                    step_id = %changed_step.id,
-                                    error = %e,
-                                    "re-eval: failed to persist promoted step",
-                                );
-                                continue;
-                            }
-                        }
+            reevaluate_and_persist(&state, &job, &actor, now).await;
 
-                        // If the step we just completed is a declared
-                        // terminal, close the Job with that outcome and
-                        // skip every still-non-terminal step. Pair the
-                        // live Step back to its StepSpec by index (==
-                        // sort_order, the materializer's contract).
-                        let just_completed = old.status != StepStatus::Completed
-                            && step.status == StepStatus::Completed;
-                        let terminal_outcome = spec
-                            .steps
-                            .get(step.sort_order as usize)
-                            .and_then(|spec_step| spec_step.terminal.as_ref())
-                            .map(|t| t.outcome.clone());
-                        if just_completed && let Some(outcome) = terminal_outcome {
-                            close_job_on_terminal(&state, &job_id, &outcome, &actor, now).await;
-                        }
-                    }
-                }
-                Err(crate::registry::WorkflowError::NotFound(_)) => {
-                    // No active spec (ad-hoc / registry-less kind):
-                    // nothing to re-evaluate. The compute_job_status
-                    // auto-close below still handles the
-                    // all-steps-terminal case.
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, job_id = %job_id, version = job.workflow_version, "re-eval: pinned Workflow version not resolvable");
-                }
+            // If the step we just completed is a declared terminal,
+            // close the Job with that outcome and skip every
+            // still-non-terminal step. Pair the live Step back to its
+            // StepSpec by index (== sort_order, the materializer's
+            // contract). Resolve the pinned version — same rule as the
+            // re-evaluator.
+            let just_completed =
+                old.status != StepStatus::Completed && step.status == StepStatus::Completed;
+            if just_completed
+                && let Ok(spec) = reg.get_version(&job.kind, job.workflow_version).await
+                && let Some(outcome) = spec
+                    .steps
+                    .get(step.sort_order as usize)
+                    .and_then(|spec_step| spec_step.terminal.as_ref())
+                    .map(|t| t.outcome.clone())
+            {
+                close_job_on_terminal(&state, &job_id, &outcome, &actor, now).await;
             }
         }
     }
@@ -1023,6 +944,102 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
 /// `metadata` keys — so handlers reuse the same `StepEvent` view. The
 /// Subject identity comes from the parent `job` the caller already
 /// holds, so no extra fetch.
+/// Re-evaluate a Job's step readiness against its PINNED Workflow and
+/// persist every promotion (Pending → Ready, with the `step.ready`
+/// marker in the same transaction; Pending → Skipped). The single
+/// persistence glue over `registry::reevaluate` — shared by step
+/// updates (a status change flips downstream predicates) and Job
+/// updates (a metadata write can flip a metadata-gated predicate; the
+/// v3 ship-a-change `merged` marker was invisible without this,
+/// aa9980c8).
+///
+/// Resolves the version the Job was OPENED under, not whatever is
+/// active now. A Job materializes its steps once and keeps them;
+/// evaluating those steps against a newer spec asks predicates about
+/// steps the Job never had, and the length-guard then bails and the
+/// Job stops advancing — silently, as a Job that simply never closes.
+/// Two feedback Jobs were stranded exactly this way.
+pub(super) async fn reevaluate_and_persist<R: JobsRepository + 'static, B: EventBus + 'static>(
+    state: &Arc<JobsApiState<R, B>>,
+    job: &Job,
+    actor: &boss_core::actor::ActorId,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let Some(reg) = &state.kind_registry else {
+        return;
+    };
+    match reg.get_version(&job.kind, job.workflow_version).await {
+        Ok(spec) => {
+            let Ok(mut steps) = state.jobs.list_steps(&job.id).await else {
+                return;
+            };
+            // `reevaluate` requires steps in spec order (sort_order ==
+            // index); list_steps returns them sorted by sort_order, so
+            // the invariant holds. Invariant (expose, don't swallow):
+            // a Job's live step set must match its active Workflow
+            // spec, or `reevaluate`'s length-guard bails and the Job
+            // can no longer advance. With atomic materialization this
+            // only fires on a genuine mid-flight republish that
+            // changed the step count. Surface it loudly instead of
+            // silently stalling the Job.
+            if spec.steps.len() != steps.len() {
+                tracing::warn!(
+                    job_id = %job.id,
+                    kind = %job.kind,
+                    spec_len = spec.steps.len(),
+                    steps_len = steps.len(),
+                    "re-eval: live step count != active Workflow spec — \
+                     readiness cannot advance this Job (its step graph \
+                     is inconsistent with its Workflow)"
+                );
+            }
+            let changed =
+                crate::registry::reevaluate(&spec, &mut steps, &job.subject, &job.metadata);
+            let stamp = state
+                .publisher
+                .stamp_with_actor_at(actor.clone(), now)
+                .await;
+            for idx in changed {
+                let changed_step = &steps[idx];
+                // OUTBOX (phase 2): the promoted step's state event +
+                // D6 ready marker (when it lands in `Ready` — lets
+                // dispatcher rules react to a step *becoming
+                // eligible*, the delegate-subjob spawn fork D7) record
+                // in the SAME transaction as the promotion.
+                let mut reeval_events = vec![stamp.event(
+                    events::STEP_UPDATED,
+                    serde_json::to_value(changed_step).unwrap_or_default(),
+                )];
+                if changed_step.status == StepStatus::Ready && !changed_step.kind.is_empty() {
+                    reeval_events
+                        .push(build_step_ready_event(state, job, changed_step, actor, now).await);
+                }
+                if let Err(e) = state
+                    .jobs
+                    .update_step_at(changed_step, now, &reeval_events)
+                    .await
+                {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        step_id = %changed_step.id,
+                        error = %e,
+                        "re-eval: failed to persist promoted step",
+                    );
+                    continue;
+                }
+            }
+        }
+        Err(crate::registry::WorkflowError::NotFound(_)) => {
+            // No active spec (ad-hoc / registry-less kind): nothing to
+            // re-evaluate. The compute_job_status auto-close still
+            // handles the all-steps-terminal case.
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, job_id = %job.id, version = job.workflow_version, "re-eval: pinned Workflow version not resolvable");
+        }
+    }
+}
+
 pub(super) async fn build_step_ready_event<R: JobsRepository + 'static, B: EventBus + 'static>(
     state: &Arc<JobsApiState<R, B>>,
     job: &Job,
