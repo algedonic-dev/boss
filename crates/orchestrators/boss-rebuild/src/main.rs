@@ -84,8 +84,23 @@ async fn main() -> Result<()> {
             .with_context(|| format!("loading {}", seed.display()))?;
     }
 
+    // Replay is exempt from the write-time reference gates
+    // (`audit_log.ref_check` — the job_edges trigger et al.). Those
+    // gates validate NEW writes against CURRENT state; a rebuild
+    // replays history, and history legitimately passes through states
+    // that were invalid then and repaired since (the migration
+    // rehearsal hit exactly this: a pre-cleanup `backlog_item` value
+    // aborted the jobs rebuild on an otherwise chain-verified log).
+    // Replay's integrity guards are the hash chain + the rebuild
+    // reports, not the live-write gate.
     let pool = PgPoolOptions::new()
         .max_connections(2)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::Executor::execute(&mut *conn, "SET audit_log.ref_check = 'off'").await?;
+                Ok(())
+            })
+        })
         .connect(&cli.database_url)
         .await
         .with_context(|| "connecting to Postgres")?;
