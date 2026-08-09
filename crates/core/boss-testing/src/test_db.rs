@@ -166,6 +166,10 @@ const SCHEMA_FILES: &[(&str, &str)] = &[
         "102-authority-role-index",
         include_str!("../../../../infra/postgres/schema/102-authority-role-index.sql"),
     ),
+    (
+        "103-dispatcher-log-cursor",
+        include_str!("../../../../infra/postgres/schema/103-dispatcher-log-cursor.sql"),
+    ),
 ];
 
 /// Concatenate the schema files in manifest order, omitting any whose name

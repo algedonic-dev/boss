@@ -238,11 +238,28 @@ async fn main() -> Result<()> {
             });
             let js_for_runner = jetstream.clone();
             let live_for_runner = live.clone();
-            tokio::spawn(async move {
-                if let Err(e) = runner.run(js_for_runner, live_for_runner).await {
-                    tracing::error!(error = %e, "rules runner exited with error");
-                }
-            });
+            // Log-as-the-bus, stage 1 (transactional-audit-log Q6):
+            // `BOSS_RULES_SOURCE=log` tails audit_log by id cursor
+            // instead of the JetStream durable consumer. Default stays
+            // jetstream until the cutover is observed on the
+            // playground; the flip is one systemd drop-in, the
+            // rollback is deleting it.
+            let rules_source =
+                std::env::var("BOSS_RULES_SOURCE").unwrap_or_else(|_| "jetstream".into());
+            if rules_source == "log" {
+                let pool_for_runner = pool.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = runner.run_log_tail(pool_for_runner, live_for_runner).await {
+                        tracing::error!(error = %e, "rules log tail exited with error");
+                    }
+                });
+            } else {
+                tokio::spawn(async move {
+                    if let Err(e) = runner.run(js_for_runner, live_for_runner).await {
+                        tracing::error!(error = %e, "rules runner exited with error");
+                    }
+                });
+            }
 
             // Clock-driven schedule runner: fires schedule-triggered rules
             // on sim-day boundaries off the clock SSE feed. No-op (returns

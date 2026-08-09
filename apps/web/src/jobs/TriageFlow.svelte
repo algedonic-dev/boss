@@ -1,0 +1,363 @@
+<script lang="ts">
+  // TriageFlow — the Workflow-shaped triage surface (65fa5a1c).
+  //
+  // The TriageBoard answers "what did triage decide": flat columns
+  // keyed on the fork's options. This answers the question David
+  // actually asked — "where is everything, along the Workflow" — and
+  // makes the routing choices *edges*: the DAG's routing edges carry
+  // their parsed `ready_when` condition (workflowToDag), so clicking
+  // triage→build with an item selected completes that item's fork
+  // step with `disposition = "build"`. Selecting an edge IS the
+  // decision; there is no separate move.
+  //
+  // Per-step depth badges come from `/api/views/fleet/{kind}` — the
+  // server-truth aggregate — while the item cards under a node come
+  // from the same open-jobs fetch the board uses. The two can
+  // disagree under the 200-job cap; the node shows the server count
+  // and the panel says "N of M shown" when they differ, rather than
+  // pretending the cap doesn't exist.
+  //
+  // Every fetch decodes defensively at the call site: the route-smoke
+  // crawl runs this surface against an adversarial mock, and garbage
+  // must render as an empty state, not a crash.
+  import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import StepDag, { type DagEdge, type DagNode } from './StepDag.svelte';
+  import { workflowToDag } from './workflowToDag';
+  import { type Fork, readFork } from './fork';
+  import type { Job, Step } from './types';
+
+  type Props = Readonly<{
+    kind: string;
+    title: string;
+    subtitle?: string;
+  }>;
+  let {
+    kind,
+    title,
+    subtitle = 'Click a step to see its queue; with an item selected, click an outgoing edge to route it.',
+  }: Props = $props();
+
+  type FleetNode = Readonly<{
+    slug: string;
+    ready: number;
+    active: number;
+    unassigned: number;
+  }>;
+
+  let specSteps = $state<ReadonlyArray<unknown> | null>(null);
+  let fork = $state<Fork | null>(null);
+  let jobs = $state<ReadonlyArray<Job>>([]);
+  let fleetNodes = $state<ReadonlyArray<FleetNode>>([]);
+  let loading = $state(true);
+  let error = $state<string | null>(null);
+  let busy = $state(false);
+  let selectedNode = $state<string | null>(null);
+  let selectedJobId = $state<string | null>(null);
+
+  async function load(): Promise<void> {
+    loading = true;
+    error = null;
+    try {
+      const [specRes, jobsRes, fleetRes] = await Promise.all([
+        fetch(`/api/workflows/${encodeURIComponent(kind)}`),
+        fetch(`/api/jobs?kind=${encodeURIComponent(kind)}&status=open&limit=200`),
+        fetch(`/api/views/fleet/${encodeURIComponent(kind)}`),
+      ]);
+      if (!specRes.ok) throw new Error(`workflow ${kind}: HTTP ${specRes.status}`);
+      const spec: unknown = await specRes.json();
+      const steps = (spec as { steps?: unknown } | null)?.steps;
+      specSteps = Array.isArray(steps) ? steps : [];
+      fork = readFork(spec);
+
+      if (!jobsRes.ok) throw new Error(`jobs: HTTP ${jobsRes.status}`);
+      const jobsBody: unknown = await jobsRes.json();
+      const data = (jobsBody as { data?: unknown } | null)?.data;
+      jobs = Array.isArray(data) ? (data as ReadonlyArray<Job>) : [];
+
+      // Fleet counts are an enhancement, not a dependency — a failed
+      // aggregate read degrades to client-side counts.
+      if (fleetRes.ok) {
+        const f: unknown = await fleetRes.json();
+        const nodes = (f as { nodes?: unknown } | null)?.nodes;
+        fleetNodes = Array.isArray(nodes) ? (nodes as ReadonlyArray<FleetNode>) : [];
+      } else {
+        fleetNodes = [];
+      }
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    } finally {
+      loading = false;
+    }
+  }
+
+  $effect(() => {
+    void kind;
+    void load();
+  });
+
+  /// An item's position on the map: its first in-flight step, keyed
+  /// the way the server keys fleet nodes — spec_slug with the title
+  /// as the pre-migration fallback.
+  function positionOf(j: Job): string | null {
+    const steps = Array.isArray(j.steps) ? j.steps : [];
+    const current = steps.find((s) => s.status === 'ready' || s.status === 'active');
+    if (!current) return null;
+    const slug = (current as Step & { spec_slug?: string | null }).spec_slug;
+    return slug && slug !== '' ? slug : (current.title ?? null);
+  }
+
+  function currentStep(j: Job): Step | undefined {
+    const steps = Array.isArray(j.steps) ? j.steps : [];
+    return steps.find((s) => s.status === 'ready' || s.status === 'active');
+  }
+
+  const PRIORITY_ORDER: Record<string, number> = { emergency: 0, urgent: 1, standard: 2, scheduled: 3 };
+
+  let byNode = $derived.by(() => {
+    const out = new Map<string, Job[]>();
+    for (const j of jobs) {
+      const pos = positionOf(j);
+      if (!pos) continue;
+      (out.get(pos) ?? out.set(pos, []).get(pos)!).push(j);
+    }
+    for (const list of out.values()) {
+      list.sort(
+        (a, b) =>
+          (PRIORITY_ORDER[a.priority ?? 'standard'] ?? 2) -
+            (PRIORITY_ORDER[b.priority ?? 'standard'] ?? 2) ||
+          String(a.opened_on ?? '').localeCompare(String(b.opened_on ?? '')),
+      );
+    }
+    return out;
+  });
+
+  let fleetBySlug = $derived(new Map(fleetNodes.map((n) => [n.slug, n])));
+
+  let dag = $derived.by(() => {
+    if (!specSteps) return null;
+    const { nodes, edges } = workflowToDag(specSteps as never);
+    const decorated: DagNode[] = nodes.map((n) => {
+      const server = fleetBySlug.get(n.id);
+      const local = byNode.get(n.id)?.length ?? 0;
+      const depth = server ? server.ready + server.active : local;
+      return {
+        ...n,
+        status: depth > 0 ? ((server?.active ?? 0) > 0 ? 'active' : 'ready') : undefined,
+        badge: depth > 0 ? `${depth} waiting` : null,
+      };
+    });
+    return { nodes: decorated, edges };
+  });
+
+  let selectedJobs = $derived(selectedNode ? (byNode.get(selectedNode) ?? []) : []);
+  let selectedServerCount = $derived.by(() => {
+    if (!selectedNode) return 0;
+    const server = fleetBySlug.get(selectedNode);
+    return server ? server.ready + server.active : selectedJobs.length;
+  });
+  let selectedJob = $derived(
+    selectedJobId ? (jobs.find((j) => j.id === selectedJobId) ?? null) : null,
+  );
+
+  function selectNode(id: string): void {
+    selectedNode = id;
+    const list = byNode.get(id) ?? [];
+    selectedJobId = list.length === 1 ? list[0]!.id : null;
+  }
+
+  /// The edge click IS the routing decision. Only meaningful when the
+  /// selected item is sitting at the edge's origin and the item's
+  /// current step is the one the condition writes to.
+  async function routeAlong(edge: DagEdge): Promise<void> {
+    if (!edge.condition || busy) return;
+    const j = selectedJob;
+    if (!j) {
+      error = 'Select an item first — an edge routes the selected item.';
+      return;
+    }
+    if (positionOf(j) !== edge.from) {
+      error = `The selected item is not at "${edge.from}".`;
+      return;
+    }
+    const step = currentStep(j);
+    if (!step) return;
+    busy = true;
+    error = null;
+    try {
+      // PUT overlays top-level fields and replaces metadata wholesale
+      // — merge with the existing keys (authority_role lives there;
+      // see TriageBoard's patchStep for the incident this prevents).
+      const r = await fetch(`/api/jobs/${j.id}/steps/${step.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          status: 'completed',
+          metadata: { ...(step.metadata ?? {}), [edge.condition.field]: edge.condition.value },
+        }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      selectedJobId = null;
+      await load();
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    } finally {
+      busy = false;
+    }
+  }
+</script>
+
+<PageHeader {title} {subtitle} />
+
+{#if loading}
+  <p class="tf-msg">Reading the queue…</p>
+{:else if error && !dag}
+  <p class="tf-msg tf-err">{error}</p>
+{:else if dag}
+  {#if error}<p class="tf-msg tf-err">{error}</p>{/if}
+  <StepDag
+    nodes={dag.nodes}
+    edges={dag.edges}
+    selectedId={selectedNode}
+    onNodeClick={selectNode}
+    onEdgeClick={(e) => void routeAlong(e)}
+  />
+
+  {#if selectedNode}
+    <section class="tf-queue">
+      <h3 class="tf-queue-h">
+        {selectedNode}
+        <span class="tf-queue-n">
+          {selectedJobs.length === selectedServerCount
+            ? `${selectedJobs.length} waiting`
+            : `${selectedJobs.length} of ${selectedServerCount} shown`}
+        </span>
+      </h3>
+      {#if selectedJobs.length === 0}
+        <p class="tf-msg">Nothing waiting at this step.</p>
+      {:else}
+        <ul class="tf-items">
+          {#each selectedJobs as j (j.id)}
+            <li>
+              <button
+                type="button"
+                class="tf-item"
+                class:selected={selectedJobId === j.id}
+                onclick={() => (selectedJobId = selectedJobId === j.id ? null : j.id)}
+              >
+                <span class="tf-item-pri" data-pri={j.priority ?? 'standard'}>{j.priority ?? 'standard'}</span>
+                <span class="tf-item-title">{j.title}</span>
+                <span class="tf-item-age">{j.opened_on ?? ''}</span>
+              </button>
+            </li>
+          {/each}
+        </ul>
+        {#if selectedJob && fork && positionOf(selectedJob) === selectedNode}
+          {@const routes = dag.edges.filter((e) => e.from === selectedNode && e.condition)}
+          {#if routes.length > 0}
+            <p class="tf-hint">
+              Route “{selectedJob.title}”: click an outgoing edge on the map
+              {#if routes.length > 0}
+                — or here:
+                {#each routes as e (e.to)}
+                  <button
+                    type="button"
+                    class="tf-route"
+                    disabled={busy}
+                    onclick={() => void routeAlong(e)}
+                  >{e.label}</button>
+                {/each}
+              {/if}
+            </p>
+          {/if}
+        {/if}
+      {/if}
+    </section>
+  {:else}
+    <p class="tf-msg">Click a step on the map to open its queue.</p>
+  {/if}
+{/if}
+
+<style>
+  .tf-msg {
+    margin: 16px 0;
+    color: var(--color-fg-muted, #8a7a5f);
+  }
+  .tf-err {
+    color: var(--color-danger, #a33);
+  }
+  .tf-queue {
+    margin-top: 18px;
+  }
+  .tf-queue-h {
+    font-size: 14px;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+  .tf-queue-n {
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--color-fg-muted, #8a7a5f);
+  }
+  .tf-items {
+    list-style: none;
+    margin: 8px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-width: 720px;
+  }
+  .tf-item {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    width: 100%;
+    text-align: left;
+    padding: 8px 12px;
+    border: 1px solid var(--color-border, #e3d9c4);
+    border-radius: 6px;
+    background: var(--color-surface, #fff);
+    cursor: pointer;
+  }
+  .tf-item.selected {
+    border-color: var(--color-accent, #7a3f1f);
+  }
+  .tf-item-pri {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--color-fg-muted, #8a7a5f);
+  }
+  .tf-item-pri[data-pri='urgent'],
+  .tf-item-pri[data-pri='emergency'] {
+    color: var(--color-danger, #a33);
+  }
+  .tf-item-title {
+    flex: 1;
+    font-size: 13px;
+  }
+  .tf-item-age {
+    font-size: 12px;
+    color: var(--color-fg-muted, #8a7a5f);
+  }
+  .tf-hint {
+    margin-top: 10px;
+    font-size: 13px;
+    color: var(--color-fg-muted, #8a7a5f);
+  }
+  .tf-route {
+    margin-left: 6px;
+    padding: 3px 10px;
+    border: 1px solid var(--color-accent, #7a3f1f);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--color-accent, #7a3f1f);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .tf-route:disabled {
+    opacity: 0.5;
+  }
+</style>
