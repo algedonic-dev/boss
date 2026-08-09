@@ -13,7 +13,7 @@ use boss_dispatcher::liveness::DispatcherLiveness;
 use boss_dispatcher::rules::handler::HandlerRegistry;
 use boss_dispatcher::rules::helpers_inventory::InventoryHelpers;
 use boss_dispatcher::rules::jobs_spawn::JobsSpawn;
-use boss_dispatcher::rules::registry::{Registry as RuleRegistry, load_active_rules};
+use boss_dispatcher::rules::registry::{Registry as RuleRegistry, wait_for_rules};
 use boss_dispatcher::rules::runner::RulesRunner;
 use boss_dispatcher::rules::schedule_runner::{DEFAULT_CATCHUP_CAP, ScheduleRunner};
 use boss_dispatcher_handlers::handlers::{
@@ -105,9 +105,17 @@ async fn main() -> Result<()> {
     // runner alongside the legacy role-assignment loop. They share the NATS
     // connection but subscribe to disjoint topics — the legacy loop owns
     // jobs.step.>, the runner owns whatever the registry declares.
-    match load_active_rules(&pool)
-        .await
-        .and_then(RuleRegistry::from_raw)
+    // Wait out an empty-at-boot rules table instead of accepting it
+    // as final (823fcb22 mechanism 2: the one-shot load raced the
+    // seed and the runner dead-aired forever). 60s covers any honest
+    // init; past it we proceed empty, loudly.
+    match wait_for_rules(
+        &pool,
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .and_then(RuleRegistry::from_raw)
     {
         Ok(registry) => {
             info!(
