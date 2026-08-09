@@ -64,6 +64,8 @@ catalog, and the open-PR list have reached the same disposition?
 | `bd500848` | job page | defect | Same cause as above, older link shape | **Partly** — a dedupe rule could have paired them |
 | `74cbe627` | `/system/workflows` | defect (agent-filed) | Version pin defeated by in-place reconcile; both halves fixed | **No** — needed reconcile + re-eval together |
 | `f91831a6` | `/system/monitoring` | defect | IT tab's landing page rendered in Home chrome: the route→section ternary emitted camelCase ids that miss the kebab-case catalog keys; map extracted to a typed module + the section→catalog half pinned | **No** — the text says "still in home"; the cause is a vocabulary drift two files away |
+| `15c6004e` | `/system/feedback` | defect | "Flashing periodically": the 15s polls added that morning call load(), which flips `loading` and re-renders the surface into its spinner every tick — the flash WAS the poll; background refreshes made silent in both triage surfaces | **No** — the report describes the symptom; the cause is a state flag in a poll added the same day, invisible to any rule |
+| `39d5bfde` | `/system/flow` | capability | "Visualize job flow through IT's queues": the operator's message IS the design decision (dashboards Q2 node-set + Q4 absorb-into-Flow); built as composition of the shipped instruments (kind DAGs + job_edges links + fleet depth + stage durations) | **Partly** — routing was mechanical once read as a decision; the recognition that the message answers open design questions is the model-shaped part |
 
 ### Notes per item
 
