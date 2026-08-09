@@ -158,12 +158,32 @@ impl Handler for MessagesNotify {
         // Jobs produce seven identical "Ready: task step needs the
         // platform-admin team" lines, and an inbox where every row
         // reads the same is a list you scroll past.
-        let subject = format!("Ready: {} — {}", ev.kind, ev.subject_id);
-        let body = format!(
-            "A '{}' step is ready on {} {}, {}. \
-             Opening this message goes straight to the step.",
-            ev.kind, ev.subject_kind, ev.subject_id, waiting_on
-        );
+        //
+        // The VERB follows the life moment on the triggering topic:
+        // this handler serves both step.ready.* (its original job)
+        // and step.done.* (the wait-over signal, rule
+        // `notify-on-step-done-marked`). The first live done
+        // notification read "Ready: …" (backlog `2f2565fb`) — a
+        // wait-over signal announcing itself as new work.
+        let done = ctx.triggering_topic.starts_with("step.done.");
+        let subject = if done {
+            format!("Done: {} — {}", ev.kind, ev.subject_id)
+        } else {
+            format!("Ready: {} — {}", ev.kind, ev.subject_id)
+        };
+        let body = if done {
+            format!(
+                "The '{}' step on {} {} completed — the wait it gated is \
+                 over. Opening this message goes straight to the step.",
+                ev.kind, ev.subject_kind, ev.subject_id
+            )
+        } else {
+            format!(
+                "A '{}' step is ready on {} {}, {}. \
+                 Opening this message goes straight to the step.",
+                ev.kind, ev.subject_kind, ev.subject_id, waiting_on
+            )
+        };
         let msg = json!({
             // Deterministic id `notify:{step_id}:{recipient}`. A
             // redelivered `step.ready.<kind>` event (JetStream
@@ -223,12 +243,51 @@ mod tests {
     use super::*;
 
     fn ctx(payload: serde_json::Value) -> InvocationContext {
+        ctx_on("step.ready.bill-approval", payload)
+    }
+
+    fn ctx_on(topic: &str, payload: serde_json::Value) -> InvocationContext {
         InvocationContext {
             rule_name: "notify-assignee-on-step-ready".into(),
             triggering_event_id: "evt-1".into(),
-            triggering_topic: "step.ready.bill-approval".into(),
+            triggering_topic: topic.into(),
             event_payload: payload,
         }
+    }
+
+    /// The FIRST live done-notification (backlog `2f2565fb`, fired
+    /// 2026-08-09 by the `notify-on-step-done-marked` rule) read
+    /// "Ready: task — train/20260809-1931": the wait-over signal
+    /// announced itself as new work, because the subject hardcoded
+    /// the READY wording. The verb follows the triggering topic's
+    /// life moment.
+    #[tokio::test]
+    async fn a_done_topic_announces_done_not_ready() {
+        let (people, messages, captured) = mock_services().await;
+        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        h.invoke(&[], &ctx_on("step.done.task", ready_payload()))
+            .await
+            .expect("notify");
+
+        let sent = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a message was sent");
+        let subject = sent["subject"].as_str().unwrap_or_default();
+        let body = sent["body"].as_str().unwrap_or_default();
+        assert!(
+            subject.starts_with("Done:"),
+            "a done topic must announce Done, got: {subject}"
+        );
+        assert!(
+            body.contains("completed"),
+            "the body must say the step completed, got: {body}"
+        );
+        assert!(
+            !body.contains("is ready"),
+            "a done body must not claim readiness, got: {body}"
+        );
     }
 
     /// Stand-ins for `boss-people` and `boss-messages`. The messages
