@@ -101,7 +101,7 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
   'system-design':           { id: 'system-design',           label: 'Design review',       path: '/system/design',       permKey: 'system-design',           app: 'it' },
   'system-os-map':           { id: 'system-os-map',           label: 'Operating system',    path: '/system/os-map',       permKey: 'system-os-map',           app: 'it' },
   'system-flow':             { id: 'system-flow',             label: 'Flow',                path: '/system/flow',         permKey: 'system-flow',             app: 'it' },
-  'system-fleet':            { id: 'system-fleet',            label: 'Fleet',               path: '/system/fleet',        permKey: 'system-fleet',            app: 'it' },
+  'system-fleet':            { id: 'system-fleet',            label: 'Bottlenecks',               path: '/system/fleet',        permKey: 'system-fleet',            app: 'it' },
   'system-feedback':         { id: 'system-feedback',         label: 'Feedback triage',     path: '/system/feedback',     permKey: 'system-feedback',         app: 'it' },
   // The "Evolve" surface — controlled, sandboxed model modifications
   // (placeholder for now; visible to every role via canSeeRoute).
