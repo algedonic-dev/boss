@@ -11,8 +11,15 @@
   // If that ratio looks lopsided, that is the point. Adding the next
   // triage queue should be a route and a filter, not another board.
   import TriageBoard from '../../jobs/TriageBoard.svelte';
+  import TriageFlow from '../../jobs/TriageFlow.svelte';
   import type { Job } from '../../jobs/types';
   import { navigate } from '../../router';
+
+  // Two views of the same queue: Board (flat columns keyed on the
+  // triage fork) and Flow (the Workflow DAG with per-step depth and
+  // routing edges — 65fa5a1c). Board stays the default; the toggle
+  // is view state, not routing state.
+  let view = $state<'board' | 'flow'>('board');
 
   function message(j: Job): string {
     const m = j.metadata?.['message'];
@@ -63,6 +70,28 @@
   }
 </script>
 
+<div class="fb-viewbar">
+  <button
+    type="button"
+    class="fb-view"
+    class:active={view === 'board'}
+    onclick={() => (view = 'board')}
+  >Board</button>
+  <button
+    type="button"
+    class="fb-view"
+    class:active={view === 'flow'}
+    onclick={() => (view = 'flow')}
+  >Flow</button>
+</div>
+
+{#if view === 'flow'}
+  <TriageFlow
+    kind="user-feedback"
+    title="Feedback triage — the Workflow"
+    subtitle="Per-step queues along the Workflow. Select an item at a step, then click an outgoing edge to route it."
+  />
+{:else}
 <TriageBoard
   kind="user-feedback"
   title="Feedback triage"
@@ -91,6 +120,7 @@
     </div>
   {/snippet}
 </TriageBoard>
+{/if}
 
 <style>
   .fb-card-msg {
@@ -144,5 +174,25 @@
     padding: 1px 6px;
     cursor: pointer;
     color: inherit;
+  }
+  .fb-viewbar {
+    display: flex;
+    gap: 6px;
+    margin: 4px 0 10px;
+  }
+  .fb-view {
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 3px 12px;
+    border: 1px solid var(--border, #e7e5e4);
+    border-radius: 999px;
+    background: transparent;
+    cursor: pointer;
+    color: inherit;
+  }
+  .fb-view.active {
+    border-color: var(--color-accent, #7a3f1f);
+    color: var(--color-accent, #7a3f1f);
   }
 </style>
