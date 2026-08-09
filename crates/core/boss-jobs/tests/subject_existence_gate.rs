@@ -98,6 +98,7 @@ fn build_app(existence: Option<Arc<dyn SubjectExistenceCheck>>) -> (Router, Arc<
             .build(),
     );
     let state = JobsApiState {
+        job_edges: None,
         jobs: jobs.clone(),
         bus,
         publisher,

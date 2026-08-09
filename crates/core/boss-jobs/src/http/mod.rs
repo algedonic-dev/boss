@@ -62,6 +62,9 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// Step UX plugin registry — authored via /api/jobs/step-plugins.
     /// Same optionality semantics as `kind_registry`.
     pub plugin_registry: Option<Arc<dyn StepPluginRegistry>>,
+    /// The job_edges registry (read-only; edges are declared in
+    /// migrations). None → 503 on the read route.
+    pub job_edges: Option<Arc<dyn crate::job_edges::JobEdgesRegistry>>,
     /// Cross-service client for the global calendar primitive
     /// (`docs/architecture-decisions.md` §Calendar). When set, scheduling
     /// steps that transition `ready → active` with full
@@ -87,6 +90,25 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     pub roster: Option<Arc<dyn crate::owner_resolution::RosterLookup>>,
     /// Authoritative clock. See `boss-clock-client`.
     pub clock: Arc<dyn boss_clock_client::ClockClient>,
+}
+
+/// `GET /api/jobs/job-edges` — the declared job-to-job link fields.
+/// Read-only: authoring an edge is a migration (it changes what the
+/// write path refuses).
+async fn list_job_edges<R: JobsRepository, B: EventBus>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+) -> Response {
+    let Some(reg) = state.job_edges.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "job_edges registry not configured",
+        )
+            .into_response();
+    };
+    match reg.list().await {
+        Ok(edges) => Json(edges).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 /// Build the jobs API router.
@@ -151,6 +173,7 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         .route("/api/workflows/{kind}/retire", post(retire_kind::<R, B>))
         // Step UX plugin registry — see docs/architecture-decisions.md
         // §Step UX & frontend
+        .route("/api/jobs/job-edges", get(list_job_edges))
         .route(
             "/api/jobs/step-plugins",
             get(list_plugins::<R, B>).post(create_plugin::<R, B>),

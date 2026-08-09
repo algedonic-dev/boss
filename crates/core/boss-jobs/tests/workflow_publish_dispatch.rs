@@ -65,6 +65,7 @@ fn build_app(
             .build(),
     );
     let state = JobsApiState {
+        job_edges: None,
         jobs: jobs.clone(),
         bus: bus.clone(),
         publisher,
@@ -296,6 +297,7 @@ async fn publish_step_without_kind_registry_returns_503() {
             .build(),
     );
     let state = JobsApiState {
+        job_edges: None,
         jobs: jobs.clone(),
         bus: bus.clone(),
         publisher,

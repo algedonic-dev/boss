@@ -25,6 +25,7 @@
   // brewery's restocking into the IT team's numbers.
   import { onMount } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import FlowNetwork from './FlowNetwork.svelte';
   import { type Fork, readFork, forkStep, disposition } from '../../jobs/fork';
   import type { Job } from '../../jobs/types';
 
@@ -208,6 +209,8 @@
   title="Flow"
   subtitle="What the team filed, routed and closed — and how long someone waited for an answer."
 />
+
+<FlowNetwork />
 
 {#if loading}
   <p class="flow-msg">Reading the queue…</p>

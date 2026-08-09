@@ -55,8 +55,9 @@
   let selectedNode = $state<string | null>(null);
   let selectedJobId = $state<string | null>(null);
 
-  async function load(): Promise<void> {
-    loading = true;
+  async function load(background = false): Promise<void> {
+    // Same silent-refresh rule as TriageBoard (feedback 15c6004e).
+    if (!background) loading = true;
     error = null;
     try {
       const [specRes, jobsRes, fleetRes] = await Promise.all([
@@ -103,7 +104,7 @@
   // action already reloads immediately.
   $effect(() => {
     const t = setInterval(() => {
-      if (!busy && !loading) void load();
+      if (!busy && !loading) void load(true);
     }, 15_000);
     return () => clearInterval(t);
   });

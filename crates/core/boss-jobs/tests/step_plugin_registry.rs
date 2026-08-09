@@ -63,6 +63,7 @@ fn build_app(registry: Arc<dyn StepPluginRegistry>, policy: Arc<dyn PolicyClient
     let publisher = DomainPublisher::new(bus_dyn, "jobs");
     let step_registry = Arc::new(StepRegistry::v1());
     let state = JobsApiState {
+        job_edges: None,
         jobs,
         bus,
         publisher,

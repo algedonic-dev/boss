@@ -70,6 +70,7 @@ async fn new_job_pins_to_active_version_not_default_one() {
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let state = JobsApiState {
+        job_edges: None,
         jobs: jobs.clone(),
         bus,
         publisher: DomainPublisher::new(bus_dyn, "jobs"),
@@ -215,6 +216,7 @@ async fn a_republish_does_not_strand_a_job_opened_under_the_old_version() {
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let app = router(JobsApiState {
+        job_edges: None,
         jobs: jobs.clone(),
         bus,
         publisher: DomainPublisher::new(bus_dyn, "jobs"),

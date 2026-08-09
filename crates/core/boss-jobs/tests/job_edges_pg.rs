@@ -8,11 +8,10 @@
 //! 2. **Resolution is prefix-aware**: an exact Job id resolves; an
 //!    unambiguous prefix of length >= 8 resolves (the folklore's
 //!    dominant shape, measured live); a garbage value does not.
-//! 3. **on_missing='warn' does not break writers**: a Job write with
-//!    an unresolvable declared link still lands (the 14 dirty
-//!    historical links must stay writable until cleaned). The dial
-//!    to 'abort' is a registry row update, pinned here by flipping
-//!    one edge and watching the same write refuse.
+//! 3. **The dial is real in both directions**: shipped default is
+//!    'abort' since migration 105 (the folklore was cleaned first);
+//!    dialing an edge back to 'warn' permits the dirty write again.
+//!    Both directions pinned by flipping one edge.
 
 use boss_testing::TestDb;
 
@@ -88,6 +87,15 @@ async fn registry_seeds_the_three_real_edges() {
 async fn warn_permits_dirty_links_and_prefixes_resolve() {
     let db = TestDb::new().await;
     let pool = &db.pool;
+
+    // Shipped default is abort (105); this test pins the warn
+    // direction of the dial explicitly.
+    sqlx::query(
+        "UPDATE job_edges SET on_missing = 'warn'          WHERE source_kind = 'ship-a-change' AND field_path = 'backlog_item'",
+    )
+    .execute(pool)
+    .await
+    .expect("dial back to warn");
 
     let target = seed_job(pool, "pr-train").await;
     let src = seed_job(pool, "ship-a-change").await;

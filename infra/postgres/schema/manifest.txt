@@ -30,3 +30,4 @@
 102-authority-role-index.sql
 103-dispatcher-log-cursor.sql
 104-job-edges.sql
+105-job-edges-abort.sql

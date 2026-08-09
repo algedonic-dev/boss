@@ -14,6 +14,7 @@ pub mod escalation;
 pub mod events;
 pub mod http;
 pub mod in_memory;
+pub mod job_edges;
 pub mod jobs_config;
 pub mod policy_glue;
 pub mod port;
