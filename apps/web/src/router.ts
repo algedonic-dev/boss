@@ -84,6 +84,7 @@ export type Route =
   | { kind: 'systemDesign' }
   | { kind: 'systemOsMap' }
   | { kind: 'systemFlow' }
+  | { kind: 'systemFleet' }
   | { kind: 'systemSubjects' }
   | { kind: 'systemModel' }
   | { kind: 'experiments' }
@@ -125,6 +126,7 @@ export function parseRoute(pathname: string): Route {
     if (p === '/design') return { kind: 'systemDesign' };
     if (p === '/os-map') return { kind: 'systemOsMap' };
     if (p === '/flow') return { kind: 'systemFlow' };
+    if (p === '/fleet') return { kind: 'systemFleet' };
     if (p === '/feedback') return { kind: 'systemFeedback' };
     if (p === '/experiments') return { kind: 'experiments' };
     if (p === '/subjects') return { kind: 'systemSubjects' };

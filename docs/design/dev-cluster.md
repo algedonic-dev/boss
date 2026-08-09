@@ -18,9 +18,13 @@ expand/contract convention that unblocked rolling updates) ·
   separable from the modelling question.
 - **Direction after that**: review moves off GitHub; GitHub becomes a
   daily mirror. Five machines, one LAN, 4–8 cores each.
-- **No k3s.** It would rewrite the deploy model the fingerprint/
-  pre-flight work just made honest. If orchestration ever lands, it is
-  a later decision made against measured pain.
+- **No k3s** — *superseded 2026-08-08: the cluster is Talos Linux*,
+  which is Kubernetes beyond what this decision declined. What
+  survives of the rationale is its real content: the **playground's**
+  deploy model (systemd units, deploy-services.sh, the fingerprint
+  pre-flight) is untouched until Q4 moves it; the cluster's own
+  workloads are K8s-native from day one because Talos offers no other
+  mode — no shell, no SSH, no host packages, machine config by API.
 - **Don't distribute the build — share its cache.** sccache, not a
   build farm: the ~50-minute release build is embarrassingly parallel
   per crate, and a warm shared cache captures most of the win without
@@ -60,22 +64,88 @@ Roles, smallest-first:
    (Forgejo + the daily GitHub mirror) and the train conductor's home,
    once review moves in-house.
 
-## Bring-up mechanics
+## Bring-up mechanics (Talos)
 
-`infra/cluster/join-build-node.sh` is the one-command join for a
-build node: idempotent, checks-then-installs (toolchain, sccache,
-runner), and refuses loudly where a human credential is needed (the
-Tailscale login, the runner registration token) rather than
-half-completing. **First-contact honesty: the script is untested on
-real hardware until machine #1 joins** — the OSS-quickstart VM
-validations each surfaced install bugs only contact finds, and this
-will too. Budget for a first-contact fix pass.
+Talos supersedes the join-script model wholesale — there is no shell
+for `join-build-node.sh` to run in (the script is deleted with this
+revision; its checks-then-install, refuse-loudly spirit carries into
+the machine-config flow). Bring-up becomes:
+
+1. **Machine configs in the repo** (`infra/cluster/talos/`): a
+   control-plane patch and a worker patch, applied with `talosctl` —
+   the node inventory (Q1) fills in the addresses. Talos's KubeSpan
+   gives the WireGuard mesh natively (see Q2).
+2. **One builder image**, not per-node toolchains: Rust + sccache
+   client, built from a Dockerfile in-repo. The repo has exactly one
+   container image today (the devcontainer) — this is the second,
+   and the only one build-1 needs.
+3. **Runners as workloads**: actions-runner-controller (repo-scoped,
+   same trust question as before — now Q3 is pod-security-shaped
+   rather than unix-user-shaped).
+4. **sccache server as a Deployment** with a PVC for the cache.
+
+**First-contact honesty transfers**: none of this has touched real
+hardware; the OSS-quickstart VM validations each surfaced bugs only
+contact finds, and Talos adds an image/PKI bootstrap with its own
+first-contact class. Budget the fix pass.
+
+What deliberately does NOT containerize now: the ~30 BOSS services.
+Build-1's job is CI, and CI needs one image. Service images become
+real work only if Q4 moves the playground onto the cluster — decide
+there, not here.
 
 The train composes with this in two steps: first the conductor's
 `ci` step starts reading checks that ran on cluster runners (no
 conductor change — gh reports them the same way); later the deploy
 phase consumes artifacts built on the cluster instead of building on
 the playground, which is the moment `884488c4` closes for good.
+
+## The migration is a copy of the log
+
+David's directive (2026-08-08), superseding any heavier plan sketched
+earlier: when the cluster is ready, migration = **clone main from
+algedonic-dev, copy `audit_log`, rebuild** — everything else is
+rebuildable. Verified against the actual state inventory, that holds,
+with a short named remainder.
+
+**The copy-set** (beyond `git clone` + `migrate.sh` from empty):
+
+- **`audit_log`** — the system of record, and the copy is
+  *self-verifying*: the hash chain travels with the rows, so
+  `boss-audit-integrity-check` green on the destination proves the
+  copy faithful end to end. The correctness protocol paying off at
+  migration time.
+- **The small non-derived registry tables**: `workflows`,
+  `step_plugins`, `classes`, `policy_rules` (+ `policy_rule_audit`),
+  `dispatcher_rules`. Workflow publishes do land in the log
+  (`jobs.kind.published`) but no rebuilder consumes them; classes
+  writes are eventless today — the same no-provenance class the
+  design-docs finding exposed, and the same territory
+  design-docs-as-data Q2 will settle. Until then: copy the tables.
+- **`design_pending_decisions` / `design_flush_jobs`** if any are
+  open — non-event-sourced by design (they survive epoch trims by
+  living outside the log).
+- **`sim_clock`** — the epoch baseline row; its
+  `epoch_baseline_audit_id` references audit ids, which copy
+  verbatim, so it stays coherent.
+- **`/var/lib/boss/auth/credentials.toml`** — the one file outside
+  both git and Postgres.
+
+**Procedure**: quiesce writers and drain the outbox first
+(`event_outbox` rows are pre-log; copying around a non-empty outbox
+loses staged events — the epoch-trim quiescence machinery is the
+model), copy, `boss-rebuild-all`, integrity check green, then
+`deploy-services` + `deploy-web` (which regenerate the SPA and the
+step-plugin bundles from the repo; `ensure_stream` recreates
+JetStream and durable consumers re-anchor on an empty stream).
+
+**Everything else regenerates.** Every projection rebuilds from the
+copied log — the rebuilder's full domain list, messages included
+(they rebuild from `audit_log`; the separate `messages_events`
+retention log needs copying only if message history beyond the
+projection matters). No snapshot, no export bundle, no
+service-by-service migration: the company is its log plus its rules,
+and moving the company is copying them.
 
 ## Open questions
 
@@ -87,19 +157,24 @@ reached today. This gates everything; the design assumes only "Linux,
 
 ### Q2: Tailscale or bare WireGuard?
 
-Tailscale: zero-config mesh, MagicDNS, ACLs, a third-party control
-plane. Bare WireGuard: fully self-hosted, more per-node bookkeeping.
-The recorded instinct (self-host the pipeline) pulls toward WireGuard;
-the bring-up-cost instinct pulls toward Tailscale. Either satisfies
-the topology; picking is a values call.
+Largely answered by the Talos choice: **KubeSpan** (Talos's built-in
+WireGuard mesh) covers node↔node with zero extra machinery, and the
+self-host instinct is satisfied natively. What remains of Q2 is only
+the *non-Talos* edge: how does the GCP playground box reach the
+cluster? Deferrable — runners dial out to GitHub, so nothing needs
+inbound connectivity until deploy-from-cluster or the log-copy
+migration; decide then (Tailscale on both sides vs a WireGuard peer
+into KubeSpan).
 
 ### Q3: Runner scope and trust
 
 A self-hosted runner executes workflow code from PRs. Repo-scoped
 runner + no fork PRs on it (the fork model here means train branches
-come from `dauld/boss-fork`) needs an explicit decision: which events
-may run on cluster runners, and does the runner user get the same
-sudo-less containment the deploy scripts assume?
+come from `dauld:boss-fork`) needs an explicit decision: which events
+may run on cluster runners — and under Talos the containment question
+becomes pod-shaped: what securityContext/namespace isolation the
+runner pods get, rather than which unix user the runner daemon runs
+as.
 
 ### Q4: When does the playground move?
 

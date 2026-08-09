@@ -33,6 +33,9 @@ export type RouteName =
   // question (job traffic, not rule wiring).
   | 'system-os-map'
   | 'system-flow'
+  // The fleet overlay — every in-flight Job of a kind on its
+  // Workflow's DAG; per-step depth is the queue-visibility signal.
+  | 'system-fleet'
   // The model-vocabulary surface — SubjectKind taxonomy + Class registry
   // (read-only). Same `it-*` audience as the dispatcher cascade it sits beside.
   | 'system-subjects'
@@ -54,7 +57,7 @@ const ALL: ReadonlyArray<RouteName> = [
   'shipping', 'vendors', 'marketing-assets', 'calendar',
   'schedule', 'jobs',
   'policy', 'workflows', 'system-step-plugins', 'system-dispatcher',
-  'system-dispatcher-rules', 'system-dispatcher-rule', 'system-design', 'system-os-map', 'system-flow', 'system-subjects', 'system-model', 'system-kb', 'auth-admin',
+  'system-dispatcher-rules', 'system-dispatcher-rule', 'system-design', 'system-os-map', 'system-flow', 'system-fleet', 'system-subjects', 'system-model', 'system-kb', 'auth-admin',
   'system-experiments',
   'workflows',
 ];

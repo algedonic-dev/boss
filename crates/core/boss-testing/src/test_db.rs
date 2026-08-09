@@ -162,6 +162,10 @@ const SCHEMA_FILES: &[(&str, &str)] = &[
         "101-dispatcher-rule-step-assigned",
         include_str!("../../../../infra/postgres/schema/101-dispatcher-rule-step-assigned.sql"),
     ),
+    (
+        "102-authority-role-index",
+        include_str!("../../../../infra/postgres/schema/102-authority-role-index.sql"),
+    ),
 ];
 
 /// Concatenate the schema files in manifest order, omitting any whose name

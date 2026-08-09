@@ -86,8 +86,19 @@ struct Employee {
 /// `JoinHandle` so the caller can await it on shutdown; normally you
 /// just drop the handle and let the task run for the lifetime of the
 /// service.
+///
+/// Delivery: a JetStream durable consumer (`jobs-escalation`) on the
+/// BOSS_EVENTS stream — `jobs.job.created` is already in the stream's
+/// subjects, so a missed escalation redelivers instead of vanishing
+/// (this ran on plain core NATS until 2026-08-08: at-most-once, and a
+/// drop silently never notified anyone — feedback `50ff6193`).
+/// Redelivery is safe because the signal's deterministic message id
+/// collapses duplicates (`signal_payload`). If the durable consumer
+/// cannot be opened (no JetStream on this deployment), the router
+/// degrades loudly to the old at-most-once subscription rather than
+/// disabling itself.
 pub fn spawn_router(
-    bus: Arc<dyn EventBus>,
+    bus: Arc<boss_nats::NatsEventBus>,
     config: EscalationConfig,
 ) -> tokio::task::JoinHandle<()> {
     let client = match reqwest::Client::builder()
@@ -102,25 +113,87 @@ pub fn spawn_router(
     };
 
     tokio::spawn(async move {
-        let mut stream = match bus.subscribe(JOB_CREATED).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, "escalation router: subscribe failed; disabled");
-                return;
+        use futures::StreamExt;
+        let js = bus.jetstream();
+        match boss_nats::durable::open_durable(
+            &js,
+            boss_nats::durable::STREAM_NAME,
+            "jobs-escalation",
+            vec![JOB_CREATED.to_string()],
+        )
+        .await
+        {
+            Ok(messages) => {
+                info!(
+                    people_url = %config.people_url,
+                    messages_url = %config.messages_url,
+                    "escalation router: durable consumer 'jobs-escalation' on {}",
+                    JOB_CREATED,
+                );
+                messages
+                    .for_each(|msg| {
+                        let client = client.clone();
+                        let config = config.clone();
+                        async move {
+                            let msg = match msg {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    warn!(error = %e, "escalation router: message stream error");
+                                    return;
+                                }
+                            };
+                            // The publisher's envelope IS the serialized
+                            // Event — decode it whole; `handle_event`
+                            // reads the Job out of `payload` itself.
+                            let event: Event = match serde_json::from_slice(&msg.payload) {
+                                Ok(ev) => ev,
+                                Err(e) => {
+                                    debug!(error = %e, "escalation router: non-Event payload (ACK)");
+                                    let _ = msg.ack().await;
+                                    return;
+                                }
+                            };
+                            // Inherit the triggering event's sim-ness so a
+                            // simulated Job's escalation writes simulated
+                            // messages (same task-local the dispatcher sets).
+                            let simulated = event
+                                .payload
+                                .get("_simulated")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let outcome = boss_core::sim_origin::with_sim_chain(
+                                simulated,
+                                handle_event(&client, &config, &event),
+                            )
+                            .await;
+                            boss_nats::durable::settle(&msg, outcome).await;
+                        }
+                    })
+                    .await;
+                info!("escalation router durable stream closed");
             }
-        };
-        info!(
-            people_url = %config.people_url,
-            messages_url = %config.messages_url,
-            "escalation router subscribed to {}",
-            JOB_CREATED,
-        );
-        while let Some(event) = stream.next().await {
-            if let Err(e) = handle_event(&client, &config, &event).await {
-                warn!(error = %e, "escalation router: handler error");
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "escalation router: durable consumer unavailable — falling back \
+                     to at-most-once core subscription (a dropped event is a lost \
+                     escalation on this deployment)"
+                );
+                let mut stream = match bus.subscribe(JOB_CREATED).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(error = %e, "escalation router: subscribe failed; disabled");
+                        return;
+                    }
+                };
+                while let Some(event) = stream.next().await {
+                    if let Err(e) = handle_event(&client, &config, &event).await {
+                        warn!(error = %e, "escalation router: handler error");
+                    }
+                }
+                info!("escalation router stream closed");
             }
         }
-        info!("escalation router stream closed");
     })
 }
 
@@ -275,16 +348,20 @@ async fn fetch_employees(
     resp.json().await.map_err(|e| format!("decode {url}: {e}"))
 }
 
-async fn send_signal(
-    client: &reqwest::Client,
-    messages_url: &str,
+/// The wire payload for one escalation signal. Pure so the dedup
+/// contract is unit-testable: the deterministic `id` collapses
+/// redelivered events on the messages `ON CONFLICT (id) DO NOTHING`
+/// insert (same shape as the dispatcher's `notify:{step}:{recipient}`)
+/// — under at-least-once delivery a fresh id per attempt would
+/// double-message every executive.
+fn signal_payload(
     recipient_id: &str,
     subject: &str,
     body: &str,
     job_id: &str,
-) -> Result<(), String> {
-    let url = format!("{messages_url}/api/messages/send");
-    let body_json = serde_json::json!({
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("escalation:{job_id}:{recipient_id}"),
         "sender_id": "automation:escalation-router",
         "recipient_id": recipient_id,
         "subject": subject,
@@ -295,9 +372,31 @@ async fn send_signal(
             "entity_id": job_id,
             "entity_path": format!("/jobs/{job_id}"),
         },
-    });
+    })
+}
+
+async fn send_signal(
+    client: &reqwest::Client,
+    messages_url: &str,
+    recipient_id: &str,
+    subject: &str,
+    body: &str,
+    job_id: &str,
+) -> Result<(), String> {
+    let url = format!("{messages_url}/api/messages/send");
+    let body_json = signal_payload(recipient_id, subject, body, job_id);
+    // Say the sim-ness out loud rather than relying on absence — the
+    // dispatcher handlers stamp every downstream call the same way. A
+    // simulated Job's escalation must write a simulated message, or
+    // rebuilds diverge on the marker.
+    let sim_origin = if boss_core::sim_origin::is_in_sim_chain() {
+        "true"
+    } else {
+        "false"
+    };
     let resp = client
         .post(&url)
+        .header("x-sim-origin", sim_origin)
         .json(&body_json)
         .send()
         .await
@@ -352,6 +451,36 @@ mod tests {
     /// If the accounts API ever changes its response shape (drops
     /// the flatten, renames `tier`, etc.) this test breaks loudly
     /// instead of letting the escalation router silently no-op.
+    #[test]
+    fn signal_payload_carries_the_deterministic_dedup_id() {
+        let p = signal_payload("emp-ceo", "subj", "body", "job-123");
+        assert_eq!(
+            p["id"], "escalation:job-123:emp-ceo",
+            "redelivered events must collapse on the messages ON CONFLICT (id) \
+             insert — a fresh id per attempt double-messages executives"
+        );
+        assert_eq!(p["recipient_id"], "emp-ceo");
+        assert_eq!(p["kind"], "signal");
+        assert_eq!(p["entity_ref"]["entity_id"], "job-123");
+    }
+
+    /// The dispatcher shipped a consumer whose filter named a subject
+    /// the stream doesn't ingest — silent zero deliveries, pinned by
+    /// its own seed test. Same guard here: the escalation filter must
+    /// be covered by the durable stream's subjects, or the durable
+    /// swap silently consumes nothing.
+    #[test]
+    fn escalation_subject_is_captured_by_the_durable_stream() {
+        let covered = boss_nats::durable::stream_subjects().iter().any(|s| {
+            s == JOB_CREATED || (s.ends_with('>') && JOB_CREATED.starts_with(&s[..s.len() - 1]))
+        });
+        assert!(
+            covered,
+            "{JOB_CREATED} is not covered by stream_subjects() — the durable \
+             escalation consumer would open cleanly and deliver nothing"
+        );
+    }
+
     #[test]
     fn account_summary_decodes_flat_wire_shape() {
         let body = serde_json::json!({

@@ -78,6 +78,10 @@ describe('nav catalog — app assignment', () => {
     // from System Monitoring on purpose: monitoring answers what the
     // machine is doing, Flow answers what the people got through.
     'system-flow',
+    // Fleet — every in-flight Job of a kind on its Workflow's DAG.
+    // Beside Flow deliberately: Flow is throughput, Fleet is where
+    // the work is piling up (queue-visibility Q4's depth signal).
+    'system-fleet',
   ];
 
   it('the IT app contains the System Model set plus what we added deliberately', () => {

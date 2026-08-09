@@ -33,6 +33,8 @@ pub struct ViewsApiState {
     pub os_map: Option<Arc<dyn crate::os_map::OsMapRepo>>,
     /// The team's flow. Optional for the same reason as `os_map`.
     pub flow: Option<Arc<dyn crate::flow::FlowRepo>>,
+    /// The per-kind fleet. Optional for the same reason as `os_map`.
+    pub fleet: Option<Arc<dyn crate::fleet::FleetRepo>>,
 }
 
 #[derive(Deserialize)]
@@ -122,6 +124,25 @@ async fn flow(State(state): State<Arc<ViewsApiState>>, Query(q): Query<FlowQuery
     }
 }
 
+/// `GET /api/views/fleet/{kind}` — every in-flight Job of one
+/// Workflow kind, as per-step depth over the Workflow's shape.
+///
+/// Wall-clock for the same reason as `flow`; O(work-in-flight) by
+/// construction — see `crate::fleet`.
+async fn fleet(State(state): State<Arc<ViewsApiState>>, Path(kind): Path<String>) -> Response {
+    let Some(repo) = state.fleet.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "fleet needs a postgres-backed views service",
+        )
+            .into_response();
+    };
+    match repo.fleet(&kind).await {
+        Ok(f) => Json(f).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ResultsQuery {
     #[serde(default)]
@@ -139,6 +160,7 @@ pub fn router(state: ViewsApiState) -> Router {
         .route("/api/views/{id}/results", get(view_results))
         .route("/api/views/os-map", get(os_map))
         .route("/api/views/flow", get(flow))
+        .route("/api/views/fleet/{kind}", get(fleet))
         .with_state(Arc::new(state))
 }
 
@@ -289,6 +311,7 @@ mod tests {
             // own coverage and needs Postgres.
             os_map: None,
             flow: None,
+            fleet: None,
             repo: Arc::new(InMemoryViewsRepo::new(
                 DateTime::from_timestamp(1_700_000_000, 0).expect("valid ts"),
             )),

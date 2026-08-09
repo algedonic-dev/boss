@@ -50,6 +50,9 @@ async fn main() -> Result<()> {
         // Flow reads `audit_log` — the only view that does, because
         // it is the only place the wall clock survives.
         flow: Some(Arc::new(boss_views::PgViewsRepo::new(pool.clone()))),
+        // Fleet reads the live step set + audit_log for wall-clock
+        // ages (crate::fleet — same doctrine as flow).
+        fleet: Some(Arc::new(boss_views::PgViewsRepo::new(pool.clone()))),
         resolver: Arc::new(boss_views::PgViewResolver::new(pool, policy)),
     });
     let addr = format!("127.0.0.1:{}", cli.http_port);
