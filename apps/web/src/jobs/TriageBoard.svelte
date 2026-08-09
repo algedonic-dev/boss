@@ -98,6 +98,17 @@
 
   let me = $derived(session.value.kind === 'ready' ? session.value.user.id : '');
 
+  // Items move through triage from outside this tab (an agent
+  // routes, a step completes) — without a poll the board shows the
+  // world as of page-load and "nothing is moving" reads as a bug.
+  // 15s, skipped while any card's action is in flight.
+  $effect(() => {
+    const t = setInterval(() => {
+      if (!loading && !Object.values(busy).some(Boolean)) void load();
+    }, 15_000);
+    return () => clearInterval(t);
+  });
+
   const WAITING = '__waiting__';
   const CLOSED = '__closed__';
 

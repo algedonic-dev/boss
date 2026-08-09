@@ -23,6 +23,9 @@
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import StepDag, { type DagNode } from '../../jobs/StepDag.svelte';
   import { workflowToDag } from '../../jobs/workflowToDag';
+  import { groupByPosition } from '../../jobs/position';
+  import type { Job } from '../../jobs/types';
+  import { navigate } from '../../router';
 
   type FleetNode = Readonly<{
     slug: string;
@@ -52,6 +55,8 @@
   let kind = $state<string | null>(null);
   let specSteps = $state<ReadonlyArray<SpecStep> | null>(null);
   let fleet = $state<Fleet | null>(null);
+  let jobs = $state<ReadonlyArray<Job>>([]);
+  let selectedNode = $state<string | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
 
@@ -92,12 +97,24 @@
     };
   }
 
+  // The node badges are server counts; the item list under a
+  // clicked node comes from the same capped jobs fetch every board
+  // uses — the panel says "N of M" when the two disagree.
+  async function loadJobs(k: string): Promise<void> {
+    const res = await fetch(`/api/jobs?kind=${encodeURIComponent(k)}&status=open&limit=200`);
+    if (!res.ok) throw new Error(`jobs: HTTP ${res.status}`);
+    const body: unknown = await res.json();
+    const data = (body as { data?: unknown } | null)?.data;
+    jobs = Array.isArray(data) ? (data as ReadonlyArray<Job>) : [];
+  }
+
   async function switchTo(k: string): Promise<void> {
     kind = k;
     loading = true;
     error = null;
     try {
-      await Promise.all([loadSpec(k), loadFleet(k)]);
+      selectedNode = null;
+      await Promise.all([loadSpec(k), loadFleet(k), loadJobs(k)]);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -120,7 +137,10 @@
       }
     })();
     const timer = setInterval(() => {
-      if (kind) void loadFleet(kind).catch(() => {});
+      if (kind) {
+        void loadFleet(kind).catch(() => {});
+        void loadJobs(kind).catch(() => {});
+      }
     }, POLL_MS);
     return () => clearInterval(timer);
   });
@@ -152,6 +172,13 @@
   }
 
   let bySlug = $derived(new Map((fleet?.nodes ?? []).map((n) => [n.slug, n])));
+  let byNode = $derived(groupByPosition(jobs));
+  let selectedJobs = $derived(selectedNode ? (byNode.get(selectedNode) ?? []) : []);
+  let selectedServerCount = $derived.by(() => {
+    if (!selectedNode) return 0;
+    const server = bySlug.get(selectedNode);
+    return server ? server.ready + server.active : selectedJobs.length;
+  });
 
   /// The spec's DAG with fleet depth decorated on. A node with active
   /// work lights up active; ready-only lights up ready; idle stays
@@ -215,7 +242,40 @@
 {:else if error}
   <p class="fleet-msg fleet-err">{error}</p>
 {:else if dag}
-  <StepDag nodes={dag.nodes} edges={dag.edges} />
+  <StepDag
+    nodes={dag.nodes}
+    edges={dag.edges}
+    selectedId={selectedNode}
+    onNodeClick={(id) => (selectedNode = selectedNode === id ? null : id)}
+  />
+
+  {#if selectedNode}
+    <section class="fleet-node-items">
+      <h3 class="fleet-node-h">
+        {selectedNode}
+        <span class="fleet-node-n">
+          {selectedJobs.length === selectedServerCount
+            ? `${selectedJobs.length} here`
+            : `${selectedJobs.length} of ${selectedServerCount} shown`}
+        </span>
+      </h3>
+      {#if selectedJobs.length === 0}
+        <p class="fleet-msg">Nothing visible at this step (server may count steps of Jobs beyond the 200 shown).</p>
+      {:else}
+        <ul class="fleet-items">
+          {#each selectedJobs as j (j.id)}
+            <li>
+              <button type="button" class="fleet-item" onclick={() => navigate(`/jobs/${j.id}`)}>
+                <span class="fleet-item-pri" data-pri={j.priority ?? 'standard'}>{j.priority ?? 'standard'}</span>
+                <span class="fleet-item-title">{j.title}</span>
+                <span class="fleet-item-age">{j.opened_on ?? ''}</span>
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
+  {/if}
 
   {#if fleet && fleet.nodes.length > 0}
     <table class="fleet-table">
@@ -290,6 +350,61 @@
   }
   .fleet-table th {
     font-weight: 600;
+    color: var(--color-fg-muted, #8a7a5f);
+  }
+  .fleet-node-items {
+    margin-top: 14px;
+  }
+  .fleet-node-h {
+    font-size: 14px;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+  .fleet-node-n {
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--color-fg-muted, #8a7a5f);
+  }
+  .fleet-items {
+    list-style: none;
+    margin: 8px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-width: 720px;
+  }
+  .fleet-item {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    width: 100%;
+    text-align: left;
+    padding: 7px 12px;
+    border: 1px solid var(--color-border, #e4dccb);
+    border-radius: 6px;
+    background: var(--color-surface, #fff);
+    cursor: pointer;
+    font: inherit;
+    color: inherit;
+  }
+  .fleet-item-pri {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--color-fg-muted, #8a7a5f);
+  }
+  .fleet-item-pri[data-pri='urgent'],
+  .fleet-item-pri[data-pri='emergency'] {
+    color: var(--color-danger, #a33);
+  }
+  .fleet-item-title {
+    flex: 1;
+    font-size: 13px;
+  }
+  .fleet-item-age {
+    font-size: 12px;
     color: var(--color-fg-muted, #8a7a5f);
   }
   .fleet-offmap {

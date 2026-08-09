@@ -24,7 +24,8 @@
   import StepDag, { type DagEdge, type DagNode } from './StepDag.svelte';
   import { workflowToDag } from './workflowToDag';
   import { type Fork, readFork } from './fork';
-  import type { Job, Step } from './types';
+  import { currentStep, groupByPosition, positionOf } from './position';
+  import type { Job } from './types';
 
   type Props = Readonly<{
     kind: string;
@@ -95,41 +96,19 @@
     void load();
   });
 
-  /// An item's position on the map: its first in-flight step, keyed
-  /// the way the server keys fleet nodes — spec_slug with the title
-  /// as the pre-migration fallback.
-  function positionOf(j: Job): string | null {
-    const steps = Array.isArray(j.steps) ? j.steps : [];
-    const current = steps.find((s) => s.status === 'ready' || s.status === 'active');
-    if (!current) return null;
-    const slug = (current as Step & { spec_slug?: string | null }).spec_slug;
-    return slug && slug !== '' ? slug : (current.title ?? null);
-  }
-
-  function currentStep(j: Job): Step | undefined {
-    const steps = Array.isArray(j.steps) ? j.steps : [];
-    return steps.find((s) => s.status === 'ready' || s.status === 'active');
-  }
-
-  const PRIORITY_ORDER: Record<string, number> = { emergency: 0, urgent: 1, standard: 2, scheduled: 3 };
-
-  let byNode = $derived.by(() => {
-    const out = new Map<string, Job[]>();
-    for (const j of jobs) {
-      const pos = positionOf(j);
-      if (!pos) continue;
-      (out.get(pos) ?? out.set(pos, []).get(pos)!).push(j);
-    }
-    for (const list of out.values()) {
-      list.sort(
-        (a, b) =>
-          (PRIORITY_ORDER[a.priority ?? 'standard'] ?? 2) -
-            (PRIORITY_ORDER[b.priority ?? 'standard'] ?? 2) ||
-          String(a.opened_on ?? '').localeCompare(String(b.opened_on ?? '')),
-      );
-    }
-    return out;
+  // The queue moves without this page's involvement (agents route
+  // items, steps complete downstream) — re-fetch on a poll so the
+  // map reflects it. SSE-policy bucket (b): this is an aggregate
+  // surface; 15s is the operator-attention cadence, and a routing
+  // action already reloads immediately.
+  $effect(() => {
+    const t = setInterval(() => {
+      if (!busy && !loading) void load();
+    }, 15_000);
+    return () => clearInterval(t);
   });
+
+  let byNode = $derived(groupByPosition(jobs));
 
   let fleetBySlug = $derived(new Map(fleetNodes.map((n) => [n.slug, n])));
 
