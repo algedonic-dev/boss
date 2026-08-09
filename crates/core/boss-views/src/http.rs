@@ -35,6 +35,8 @@ pub struct ViewsApiState {
     pub flow: Option<Arc<dyn crate::flow::FlowRepo>>,
     /// The per-kind fleet. Optional for the same reason as `os_map`.
     pub fleet: Option<Arc<dyn crate::fleet::FleetRepo>>,
+    /// Per-stage wall-clock durations. Optional like the others.
+    pub stages: Option<Arc<dyn crate::stages::StageDurationsRepo>>,
 }
 
 #[derive(Deserialize)]
@@ -144,6 +146,33 @@ async fn fleet(State(state): State<Arc<ViewsApiState>>, Path(kind): Path<String>
 }
 
 #[derive(Deserialize)]
+pub struct StagesQuery {
+    #[serde(default)]
+    pub days: Option<i64>,
+}
+
+/// `GET /api/views/stage-durations/{kind}` — per-hop wall-clock
+/// latency for one Workflow kind (see `crate::stages`).
+async fn stage_durations(
+    State(state): State<Arc<ViewsApiState>>,
+    Path(kind): Path<String>,
+    Query(q): Query<StagesQuery>,
+) -> Response {
+    let Some(repo) = state.stages.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stage durations need a postgres-backed views service",
+        )
+            .into_response();
+    };
+    let days = q.days.unwrap_or(7).clamp(1, 90);
+    match repo.stage_durations(&kind, days).await {
+        Ok(s) => Json(s).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 pub struct ResultsQuery {
     #[serde(default)]
     pub limit: Option<usize>,
@@ -161,6 +190,7 @@ pub fn router(state: ViewsApiState) -> Router {
         .route("/api/views/os-map", get(os_map))
         .route("/api/views/flow", get(flow))
         .route("/api/views/fleet/{kind}", get(fleet))
+        .route("/api/views/stage-durations/{kind}", get(stage_durations))
         .with_state(Arc::new(state))
 }
 
@@ -312,6 +342,7 @@ mod tests {
             os_map: None,
             flow: None,
             fleet: None,
+            stages: None,
             repo: Arc::new(InMemoryViewsRepo::new(
                 DateTime::from_timestamp(1_700_000_000, 0).expect("valid ts"),
             )),

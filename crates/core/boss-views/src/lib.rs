@@ -23,6 +23,7 @@ pub mod in_memory;
 pub mod os_map;
 pub mod port;
 pub mod pushdown;
+pub mod stages;
 pub mod types;
 
 #[cfg(feature = "postgres")]

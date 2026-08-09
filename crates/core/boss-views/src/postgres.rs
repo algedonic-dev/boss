@@ -546,3 +546,82 @@ impl crate::fleet::FleetRepo for PgViewsRepo {
         })
     }
 }
+
+#[async_trait]
+impl crate::stages::StageDurationsRepo for PgViewsRepo {
+    async fn stage_durations(
+        &self,
+        workflow_kind: &str,
+        window_days: i64,
+    ) -> Result<crate::stages::StageDurations, ViewsError> {
+        use crate::stages::{Stage, StageDurations};
+
+        // Wall clock throughout (`created_at`), never the
+        // sim-authoritative `timestamp` — see flow.rs for the doctrine
+        // and the incident behind it. Duration = first done minus
+        // first ready per step; steps with no done yet have an age
+        // (fleet's oldest-wait), not a duration, and stay out.
+        let rows: Vec<(String, i64, f64, f64, f64)> = sqlx::query_as(
+            "WITH ready AS (
+                     SELECT a.payload->>'step_id' AS sid, min(a.created_at) AS t
+                     FROM audit_log a
+                     WHERE a.kind LIKE 'step.ready.%'
+                     GROUP BY 1
+                 ),
+                 done AS (
+                     SELECT a.payload->>'step_id' AS sid, min(a.created_at) AS t
+                     FROM audit_log a
+                     WHERE a.kind LIKE 'step.done.%'
+                       AND a.created_at > now() - make_interval(days => $2::int)
+                     GROUP BY 1
+                 ),
+                 hops AS (
+                     SELECT COALESCE(NULLIF(s.spec_slug, ''), s.title) AS slug,
+                            EXTRACT(EPOCH FROM (done.t - ready.t)) AS secs
+                     FROM steps s
+                     JOIN jobs j ON j.id = s.job_id
+                     JOIN done ON done.sid = s.id::text
+                     JOIN ready ON ready.sid = s.id::text
+                     WHERE j.kind = $1 AND done.t >= ready.t
+                 )
+                 SELECT slug,
+                        count(*)::bigint,
+                        percentile_cont(0.5) WITHIN GROUP (ORDER BY secs)::float8,
+                        percentile_cont(0.9) WITHIN GROUP (ORDER BY secs)::float8,
+                        max(secs)::float8
+                 FROM hops
+                 GROUP BY slug
+                 ORDER BY slug",
+        )
+        .bind(workflow_kind)
+        .bind(window_days)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ViewsError::Storage(e.to_string()))?;
+
+        let stages = rows
+            .into_iter()
+            .map(|(slug, completed, p50, p90, max)| Stage {
+                slug,
+                completed,
+                p50_seconds: p50,
+                p90_seconds: p90,
+                max_seconds: max,
+            })
+            .collect();
+
+        let as_of: String = sqlx::query_scalar(
+            "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| ViewsError::Storage(e.to_string()))?;
+
+        Ok(StageDurations {
+            workflow_kind: workflow_kind.to_string(),
+            window_days,
+            stages,
+            as_of,
+        })
+    }
+}
