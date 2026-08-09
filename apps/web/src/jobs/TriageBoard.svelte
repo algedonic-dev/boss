@@ -104,7 +104,7 @@
   // 15s, skipped while any card's action is in flight.
   $effect(() => {
     const t = setInterval(() => {
-      if (!loading && !Object.values(busy).some(Boolean)) void load();
+      if (!loading && !Object.values(busy).some(Boolean)) void load(true);
     }, 15_000);
     return () => clearInterval(t);
   });
@@ -176,8 +176,12 @@
   });
 
 
-  async function load(): Promise<void> {
-    loading = true;
+  async function load(background = false): Promise<void> {
+    // Background refreshes are silent (feedback 15c6004e): flipping
+    // `loading` re-renders the whole board into its spinner every
+    // poll tick — the flash WAS the poll. First load and explicit
+    // reloads keep the spinner; the 15s tick updates data in place.
+    if (!background) loading = true;
     error = null;
     try {
       const [jobsRes, kindsRes] = await Promise.all([
