@@ -624,4 +624,89 @@ impl crate::stages::StageDurationsRepo for PgViewsRepo {
             as_of,
         })
     }
+
+    async fn stage_runs(
+        &self,
+        workflow_kind: &str,
+        limit: i64,
+    ) -> Result<crate::stages::StageRuns, ViewsError> {
+        use crate::stages::{RunStage, StageRun, StageRuns};
+
+        // Same doctrine as the aggregate above: wall clock
+        // (`created_at`), duration = first done minus first ready per
+        // step, a ready-only step is a wait (None), not a duration.
+        // `jobs.created_at` orders recency — NOT the sim-calendar
+        // `opened_on`.
+        let rows: Vec<(uuid::Uuid, String, String, String, String, Option<f64>)> = sqlx::query_as(
+            "WITH recent AS (
+                     SELECT id, title, status, created_at
+                     FROM jobs
+                     WHERE kind = $1
+                     ORDER BY created_at DESC
+                     LIMIT $2
+                 ),
+                 ready AS (
+                     SELECT a.payload->>'step_id' AS sid, min(a.created_at) AS t
+                     FROM audit_log a
+                     WHERE a.kind LIKE 'step.ready.%'
+                     GROUP BY 1
+                 ),
+                 done AS (
+                     SELECT a.payload->>'step_id' AS sid, min(a.created_at) AS t
+                     FROM audit_log a
+                     WHERE a.kind LIKE 'step.done.%'
+                     GROUP BY 1
+                 )
+                 SELECT r.id,
+                        r.title,
+                        r.status,
+                        to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+                        COALESCE(NULLIF(s.spec_slug, ''), s.title) AS slug,
+                        CASE WHEN done.t >= ready.t
+                             THEN EXTRACT(EPOCH FROM (done.t - ready.t))::float8
+                        END AS secs
+                 FROM recent r
+                 JOIN steps s ON s.job_id = r.id
+                 LEFT JOIN ready ON ready.sid = s.id::text
+                 LEFT JOIN done ON done.sid = s.id::text
+                 ORDER BY r.created_at DESC, r.id, s.sort_order",
+        )
+        .bind(workflow_kind)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ViewsError::Storage(e.to_string()))?;
+
+        let mut runs: Vec<StageRun> = Vec::new();
+        for (id, title, status, created_at, slug, secs) in rows {
+            let job_id = id.to_string();
+            if runs.last().map(|r| r.job_id != job_id).unwrap_or(true) {
+                runs.push(StageRun {
+                    job_id,
+                    title,
+                    created_at,
+                    status,
+                    stages: Vec::new(),
+                });
+            }
+            runs.last_mut().expect("just pushed").stages.push(RunStage {
+                slug,
+                seconds: secs,
+            });
+        }
+
+        let as_of: String = sqlx::query_scalar(
+            "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| ViewsError::Storage(e.to_string()))?;
+
+        Ok(StageRuns {
+            workflow_kind: workflow_kind.to_string(),
+            limit,
+            runs,
+            as_of,
+        })
+    }
 }

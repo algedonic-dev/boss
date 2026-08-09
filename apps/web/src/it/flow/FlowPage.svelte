@@ -26,6 +26,7 @@
   import { onMount } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import FlowNetwork from './FlowNetwork.svelte';
+  import StageRunsCard from './StageRunsCard.svelte';
   import { type Fork, readFork, forkStep, disposition } from '../../jobs/fork';
   import type { Job } from '../../jobs/types';
 
@@ -211,6 +212,8 @@
 />
 
 <FlowNetwork />
+
+<StageRunsCard />
 
 {#if loading}
   <p class="flow-msg">Reading the queue…</p>
