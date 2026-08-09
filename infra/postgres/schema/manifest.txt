@@ -28,3 +28,4 @@
 100-step-spec-slug.sql
 101-dispatcher-rule-step-assigned.sql
 102-authority-role-index.sql
+103-dispatcher-log-cursor.sql
