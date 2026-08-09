@@ -182,6 +182,12 @@ TIMERS=(
     # records CI/merge/deploy evidence on the pr-train Job. The
     # conductor script is infra/train/conductor.py.
     "boss-pr-train:train"
+    # Reconcile-only sibling on a 10-minute cadence: records CI/merge
+    # evidence and lands merged trains near the event instead of at
+    # the next boarding window — the stage-duration measurements and
+    # the notify_on_done alerts are only as honest as this cadence.
+    # Never boards, so the 2/day PR budget is untouched.
+    "boss-pr-train-reconcile:train"
     # boss-backup deferred — backup script destination + retention
     # policy needs review before enabling on a fresh deploy.
 )
