@@ -325,6 +325,7 @@
           <th>Oldest wait</th>
           <th>Done (7d)</th>
           <th>p50 / max</th>
+          <th>Expected wait</th>
         </tr>
       </thead>
       <tbody>
@@ -344,6 +345,11 @@
             <td>{age(n)}</td>
             <td>{st?.completed ?? 0}</td>
             <td>{st && st.completed > 0 ? `${fmtDur(st.p50_seconds)} / ${fmtDur(st.max_seconds)}` : '—'}</td>
+            <td title="Little's law: depth ÷ drain rate over the window — what a new arrival should expect if nothing changes">
+              {st && st.completed > 0 && n.ready + n.active > 0
+                ? `~${fmtDur(((n.ready + n.active) * 7 * 86400) / st.completed)}`
+                : '—'}
+            </td>
           </tr>
         {/each}
       </tbody>
