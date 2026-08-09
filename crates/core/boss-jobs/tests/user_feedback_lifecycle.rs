@@ -106,6 +106,7 @@ fn app() -> axum::Router {
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let state = JobsApiState {
+        job_edges: None,
         jobs,
         bus,
         publisher: DomainPublisher::new(bus_dyn, "jobs"),

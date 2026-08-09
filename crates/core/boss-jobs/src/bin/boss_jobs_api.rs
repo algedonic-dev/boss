@@ -165,7 +165,7 @@ async fn main() -> Result<()> {
         let plugin_registry: Arc<dyn boss_jobs::StepPluginRegistry> =
             Arc::new(boss_jobs::PgStepPlugins::new(pool.clone()));
         let scheduling: Arc<dyn boss_jobs::scheduling::SchedulingRepository> =
-            Arc::new(boss_jobs::scheduling::PgScheduling::new(pool));
+            Arc::new(boss_jobs::scheduling::PgScheduling::new(pool.clone()));
         // Q7: human job-owner resolution over the people roster.
         let people_url =
             std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people"));
@@ -174,6 +174,10 @@ async fn main() -> Result<()> {
         ));
         info!(%people_url, "human job-owner resolution wired (Q7)");
         return run_server(
+            Some(
+                std::sync::Arc::new(boss_jobs::job_edges::PgJobEdges::new(pool.clone()))
+                    as std::sync::Arc<dyn boss_jobs::job_edges::JobEdgesRegistry>,
+            ),
             jobs,
             bus,
             publisher,
@@ -204,6 +208,8 @@ async fn main() -> Result<()> {
     let subject_existence: Option<Arc<dyn boss_jobs::subject_existence::SubjectExistenceCheck>> =
         None;
     run_server(
+        Some(std::sync::Arc::new(boss_jobs::job_edges::InMemoryJobEdges)
+            as std::sync::Arc<dyn boss_jobs::job_edges::JobEdgesRegistry>),
         jobs,
         bus,
         publisher,
@@ -224,6 +230,7 @@ async fn main() -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_server<R: JobsRepository + 'static>(
+    job_edges: Option<std::sync::Arc<dyn boss_jobs::job_edges::JobEdgesRegistry>>,
     jobs: Arc<R>,
     bus: Arc<NatsEventBus>,
     publisher: boss_core::publisher::DomainPublisher,
@@ -283,6 +290,7 @@ async fn run_server<R: JobsRepository + 'static>(
     let scheduling_publisher = publisher.clone();
 
     let state = JobsApiState {
+        job_edges,
         jobs,
         bus,
         publisher,

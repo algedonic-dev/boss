@@ -58,6 +58,7 @@ fn build_app(policy: Arc<dyn PolicyClient>) -> (Router, Arc<InMemoryJobs>) {
     let publisher = DomainPublisher::new(bus_dyn, "jobs");
     let step_registry = Arc::new(StepRegistry::v1());
     let state = JobsApiState {
+        job_edges: None,
         jobs: jobs.clone(),
         bus,
         publisher,

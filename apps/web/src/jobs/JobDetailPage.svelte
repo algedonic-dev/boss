@@ -24,6 +24,51 @@
   let loading = $state(true);
   let error = $state<string | null>(null);
 
+  // The declared job-to-job link fields (job_edges registry) — the
+  // registry's first consumer. Read once; resolve this Job's
+  // metadata against the declarations. Outbound only in v1 (inbound
+  // needs a server-side query; it arrives with the department
+  // network view).
+  type JobEdgeSpec = Readonly<{
+    source_kind: string;
+    field_path: string;
+    field_kind: string;
+    description: string;
+  }>;
+  let edgeSpecs = $state<ReadonlyArray<JobEdgeSpec>>([]);
+  $effect(() => {
+    void (async () => {
+      try {
+        const r = await fetch('/api/jobs/job-edges');
+        if (!r.ok) return;
+        const body: unknown = await r.json();
+        edgeSpecs = Array.isArray(body) ? (body as ReadonlyArray<JobEdgeSpec>) : [];
+      } catch {
+        edgeSpecs = [];
+      }
+    })();
+  });
+
+  let jobLinks = $derived.by(() => {
+    const j = job;
+    if (!j) return [];
+    const out: { label: string; description: string; ids: string[] }[] = [];
+    for (const e of edgeSpecs) {
+      if (e.source_kind !== j.kind) continue;
+      const raw = (j.metadata as Record<string, unknown> | undefined)?.[e.field_path];
+      const ids =
+        e.field_kind === 'job_id_list'
+          ? Array.isArray(raw)
+            ? raw.filter((v): v is string => typeof v === 'string')
+            : []
+          : typeof raw === 'string' && raw !== ''
+            ? [raw]
+            : [];
+      if (ids.length > 0) out.push({ label: e.field_path, description: e.description, ids });
+    }
+    return out;
+  });
+
   // Two paths:
   // 1. /api/jobs/{id}/stream — SSE that pushes a JobDetail frame
   //    on every observable change (job status / priority / closed_on,
@@ -121,6 +166,27 @@
     />
 
     <div class="tab-grid">
+      {#if jobLinks.length > 0}
+        <Section title="Linked Jobs">
+          {#each jobLinks as link (link.label)}
+            <div class="jd-info-row">
+              <span class="jd-info-label" title={link.description}>{link.label}</span>
+              <span class="jd-info-value jd-mono">
+                {#each link.ids as lid, i (lid)}
+                  {#if i > 0}<span>, </span>{/if}
+                  <a
+                    href={href(`/jobs/${lid}`)}
+                    onclick={(e) => {
+                      e.preventDefault();
+                      navigate(href(`/jobs/${lid}`));
+                    }}
+                  >{lid.slice(0, 8)}</a>
+                {/each}
+              </span>
+            </div>
+          {/each}
+        </Section>
+      {/if}
       <Section title="Subject">
           <div class="jd-info-row">
             <span class="jd-info-label">Kind</span>
