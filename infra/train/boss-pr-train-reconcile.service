@@ -1,0 +1,17 @@
+[Unit]
+Description=BOSS PR train reconcile — record evidence + land merged trains, no boarding
+Documentation=file:/opt/boss/infra/train/conductor.py
+After=network-online.target boss-jobs-api.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=david
+# Shares the board timer's clone + flock via StateDirectory — the
+# lock makes overlap with the 06:00/18:00 window safe.
+StateDirectory=boss-train
+WorkingDirectory=/opt/boss
+ExecStart=/opt/boss/infra/train/conductor.sh --reconcile-only
+# Reconcile is quick unless it lands a deploy (build + services), so
+# the budget matches the board unit's.
+TimeoutStartSec=45min

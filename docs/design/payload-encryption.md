@@ -1,0 +1,142 @@
+# Design: payload encryption — confidentiality in a log that proves plaintext
+
+**Status**: in-review — open questions tracked at `/system/design`.
+**Source**: feedback `a32ea8c0` (David, 2026-08-09): "We should think
+about encrypting job payloads given they are the atomic unit of
+information in the system. We will need a sophisticated system to
+allow actors to decrypt and view only the policy-approved elements
+of the payload."
+**Related**:
+[transactional-audit-log.md](./transactional-audit-log.md) (the chain
+that proves plaintext) · [correctness-protocol.md](./correctness-protocol.md)
+· [human-powered-state-machine.md](./human-powered-state-machine.md)
+(the semantic layer this classifies)
+
+---
+
+## Why this is hard here specifically, measured
+
+The exhibit: `people.employee.created` payloads carry
+`annual_salary_cents` and `email` — plaintext, in a log that is
+append-only, hash-chained, replicated into projections, and by
+design **never redactable** (the immutability triggers reject UPDATE
+at the SQL level; that is the feature). 120 distinct event kinds
+flow through the same log; nothing today distinguishes a salary
+from a step id.
+
+And plaintext is load-bearing, mechanically. Inventory of consumers
+that read payload fields as data:
+
+- **The chain itself**: canonical bytes are
+  `event_id|timestamp|source|kind|payload::text` — the hash chain
+  *proves the plaintext*. Encrypt a payload after the fact and every
+  verification fails; encrypt before insert and the chain proves
+  ciphertext — replay/rebuild then needs decryption to reproduce
+  projections, and determinism must survive key rotation.
+- **Referential guards**: `audit_log_ref_checks` and
+  `subject_edges` resolve `payload->>field` inside the write
+  transaction.
+- **The dispatcher**: `when` expressions bind payload fields;
+  handlers read them.
+- **Views**: ten payload reads in boss-views alone (OS map, flow,
+  fleet, stage durations); `event_facts` lifts payload wholesale;
+  search indexes it.
+
+Any design that encrypts fields these consumers read either breaks
+them, moves them behind decryption, or classifies those fields as
+never-encrypted. There is no free layer.
+
+## The shape of an answer
+
+**Classification lives in the semantic layer, not in crypto config.**
+The ontology David is converging is exactly where "this field is
+salary-grade, that one is routing-grade" belongs: `metadata_schema`
+and the event-kind registry gain a sensitivity class per field.
+Policy then maps `(actor, sensitivity class) → disclosure` — the
+same row-level policy engine, extended one level down, into fields.
+That is the "sophisticated system" in his sentence: not key
+ceremony, but **policy-scoped field disclosure as a first-class read
+path** — the API returns the payload an actor is entitled to see,
+with sealed fields marked as sealed rather than silently absent
+(absence lies; sealing is honest).
+
+**Layers, from cheap to deep** (not mutually exclusive):
+
+1. **At-rest disk encryption** — protects stolen disks, nothing
+   else; every DB session sees plaintext. Table stakes, not the ask.
+2. **Read-path redaction** (no crypto): policy-scoped field
+   disclosure at the API, plaintext in the DB. Delivers the visible
+   half of the ask immediately; DB access still sees everything.
+   Honest as a stage, dishonest as an endpoint.
+3. **Field-level encryption at write, policy-mediated decryption at
+   read**: sensitive fields sealed before the outbox insert (the
+   chain proves ciphertext + everything else stays plaintext and
+   functional if classification keeps routing-grade fields clear).
+   Rebuilders decrypt sealed fields to rebuild projections that need
+   them — projections themselves become classified surfaces.
+4. **Per-actor / envelope encryption (E2E)** — keys held per
+   principal, the server cannot read sealed fields at all. Breaks
+   rebuild-from-log for those fields unless rebuilders hold a
+   rebuild principal; the deepest honesty and the deepest cost.
+
+## What this deliberately is not
+
+- Not redaction of history: the log stays immutable. Classification
+  applies to *reads* and to *future writes*; the existing plaintext
+  history is a migration question (Q4) with no pretty answer, named
+  rather than hidden.
+- Not a new policy engine: the existing `(action, resource, scope)`
+  model extends to field classes; a second authorization system
+  would drift from the first.
+
+## Open questions
+
+### Q1: Which layer is the target, and which is the first stage?
+
+Proposal: stage 2 (read-path redaction) ships first — it delivers
+the operator-visible half of the ask with zero crypto risk and
+forces the classification work that every deeper layer needs
+anyway. Layer 3 follows for the fields whose classification proves
+stable. Layer 4 only if a tenant's threat model demands it.
+
+### Q2: Where does field sensitivity live in the ontology?
+
+A `sensitivity` attribute on `metadata_schema` fields and on the
+event-kind registry's payload schemas — or a standalone
+classification registry keyed `(kind, field_path)` like
+`job_edges`. The registry shape keeps classification independent of
+the many schema owners; the inline shape keeps one source of truth
+per field. Both must answer: who may *author* a classification
+change (it is a disclosure decision).
+
+### Q3: What does the chain prove once fields seal?
+
+Sealed-before-insert means the chain honestly proves what was
+written (ciphertext + clear fields). Verification stays mechanical.
+But the *determinism* property — rebuild reproduces projections —
+now requires rebuild-time decryption for sealed fields. Does the
+integrity checker learn to verify sealed payloads structurally, and
+does replay carry a decryption principal?
+
+### Q4: What happens to the existing plaintext history?
+
+The log cannot be rewritten. Options: accept plaintext history with
+a classification cutover date (honest, cheap, leaves salaries
+readable in old rows); epoch-reset the demo tenant post-cutover
+(viable here, not for a real tenant); or a sealed re-log migration
+(new epoch whose baseline is a sealed transform of the old log —
+heavy machinery, the only full answer). A real tenant decides this
+before their first sensitive write, which is the strongest argument
+for deciding classification early.
+
+### Q5: How do sealed fields read in the UI?
+
+Sealed-and-marked (the field exists, shows as sealed, requests
+elevation) versus policy-filtered (absent for the unauthorized).
+Sealed-and-marked is the honest surface and matches the
+"decrypt and view only the policy-approved elements" framing —
+you can see that there is something you cannot see.
+
+## Decision history
+
+_None yet._
