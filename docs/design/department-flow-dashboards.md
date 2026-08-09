@@ -75,7 +75,7 @@ network aggregable — stops one hop short of job→job.
 
 ## Open questions
 
-### Q1: How do job links become data?
+### Q1: How do job links become data? (resolved)
 
 A `job_edges` registry declaring `(source_kind, field_path)` →
 target Job (subject_edges' shape, minus the kind resolution — a Job
@@ -121,4 +121,13 @@ architecture carry the weight from day one?
 
 ## Decision history
 
-_None yet._
+**Q1 — the registry (decided by David in-session, 2026-08-09).**
+`job_edges` ships in migration 104: the three real job→job edges
+seeded (`backlog_item`, `train`, `boarded_jobs`; `spec`/`branch`/
+`merge_ref` are external references, out of scope), a write-path
+guard with subject_edges' `on_missing` dial, and — encoding the
+measured folklore — prefix-aware resolution (unambiguous ≥8-char id
+prefixes resolve; 14 of ~15 live links were prefixes) with `warn` as
+the default until the values are cleaned. The abort dial is a
+one-row update, pinned by test. An HTTP read surface for the
+registry lands with the first instrument that consumes it.

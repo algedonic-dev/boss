@@ -29,3 +29,4 @@
 101-dispatcher-rule-step-assigned.sql
 102-authority-role-index.sql
 103-dispatcher-log-cursor.sql
+104-job-edges.sql
