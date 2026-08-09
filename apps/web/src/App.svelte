@@ -60,6 +60,7 @@
   import SystemModelPage from './it/system/SystemModelPage.svelte';
   import OsMapPage from './it/osmap/OsMapPage.svelte';
   import FlowPage from './it/flow/FlowPage.svelte';
+  import FleetPage from './it/fleet/FleetPage.svelte';
   import DesignReviewPage from './it/design/DesignReviewPage.svelte';
   import ExperimentsPage from './it/experiments/ExperimentsPage.svelte';
   import InboxPage from './inbox/InboxPage.svelte';
@@ -320,6 +321,8 @@
       <OsMapPage />
     {:else if route.kind === 'systemFlow'}
       <FlowPage />
+    {:else if route.kind === 'systemFleet'}
+      <FleetPage />
     {:else if route.kind === 'experiments'}
       <ExperimentsPage />
     {:else if route.kind === 'dispatcherRules'}

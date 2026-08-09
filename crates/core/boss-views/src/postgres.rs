@@ -434,3 +434,115 @@ impl crate::flow::FlowRepo for PgViewsRepo {
         })
     }
 }
+
+#[async_trait]
+impl crate::fleet::FleetRepo for PgViewsRepo {
+    async fn fleet(&self, workflow_kind: &str) -> Result<crate::fleet::Fleet, ViewsError> {
+        use crate::fleet::{Fleet, FleetNode};
+        use std::collections::BTreeMap;
+
+        let open_jobs: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = $1 AND status = 'open'")
+                .bind(workflow_kind)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| ViewsError::Storage(e.to_string()))?;
+
+        // Depth per step of the Workflow's shape. The group key falls
+        // back to the title for slug-less steps (pre-migration-100
+        // rows, slug-less Workflow specs) so they pile up visibly
+        // instead of vanishing — the client buckets unmatched keys
+        // off-map. Only the live set enters: in-flight steps of open
+        // Jobs, which is what keeps this O(work-in-flight) and lets
+        // the partial indexes (steps_assignee, steps_authority_role)
+        // cover their branches.
+        let depth_rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT COALESCE(NULLIF(s.spec_slug, ''), s.title) AS slug,
+                    count(*) FILTER (WHERE s.status = 'ready'),
+                    count(*) FILTER (WHERE s.status = 'active'),
+                    count(*) FILTER (WHERE s.assignee_id IS NULL OR s.assignee_id = '')
+             FROM steps s
+             JOIN jobs j ON j.id = s.job_id
+             WHERE j.kind = $1 AND j.status = 'open'
+               AND s.status IN ('ready', 'active')
+             GROUP BY 1",
+        )
+        .bind(workflow_kind)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ViewsError::Storage(e.to_string()))?;
+
+        let role_rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT COALESCE(NULLIF(s.spec_slug, ''), s.title) AS slug,
+                    s.metadata->>'authority_role',
+                    count(*)
+             FROM steps s
+             JOIN jobs j ON j.id = s.job_id
+             WHERE j.kind = $1 AND j.status = 'open'
+               AND s.status IN ('ready', 'active')
+               AND s.metadata->>'authority_role' IS NOT NULL
+             GROUP BY 1, 2",
+        )
+        .bind(workflow_kind)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ViewsError::Storage(e.to_string()))?;
+
+        // Wall clock, deliberately — `created_at`, never `timestamp`
+        // (which is sim-authoritative on a demo deployment; see
+        // flow.rs, the same doctrine). The still-ready steps are
+        // gathered first so the audit scan is bounded by the live
+        // set, not the log.
+        let oldest_rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "WITH live AS (
+                     SELECT s.id, COALESCE(NULLIF(s.spec_slug, ''), s.title) AS slug
+                     FROM steps s
+                     JOIN jobs j ON j.id = s.job_id
+                     WHERE j.kind = $1 AND j.status = 'open' AND s.status = 'ready'
+                 )
+                 SELECT live.slug,
+                        to_char(min(a.created_at) AT TIME ZONE 'UTC',
+                                'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                 FROM live
+                 JOIN audit_log a ON a.payload->>'step_id' = live.id::text
+                                 AND a.kind LIKE 'step.ready.%'
+                 GROUP BY 1",
+        )
+        .bind(workflow_kind)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| ViewsError::Storage(e.to_string()))?;
+
+        let mut by_role: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
+        for (slug, role, n) in role_rows {
+            by_role.entry(slug).or_default().insert(role, n);
+        }
+        let oldest: BTreeMap<String, Option<String>> = oldest_rows.into_iter().collect();
+
+        let nodes = depth_rows
+            .into_iter()
+            .map(|(slug, ready, active, unassigned)| FleetNode {
+                by_role: by_role.remove(&slug).unwrap_or_default(),
+                oldest_ready_wall: oldest.get(&slug).cloned().flatten(),
+                slug,
+                ready,
+                active,
+                unassigned,
+            })
+            .collect();
+
+        let as_of: String = sqlx::query_scalar(
+            "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| ViewsError::Storage(e.to_string()))?;
+
+        Ok(Fleet {
+            workflow_kind: workflow_kind.to_string(),
+            open_jobs,
+            nodes,
+            as_of,
+        })
+    }
+}
