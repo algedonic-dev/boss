@@ -132,6 +132,7 @@ fn build_app(pool: PgPool) -> Router {
     );
 
     let state = JobsApiState {
+        job_edges: None,
         jobs,
         bus,
         publisher,

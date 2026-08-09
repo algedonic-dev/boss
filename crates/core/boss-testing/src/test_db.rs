@@ -174,6 +174,10 @@ const SCHEMA_FILES: &[(&str, &str)] = &[
         "104-job-edges",
         include_str!("../../../../infra/postgres/schema/104-job-edges.sql"),
     ),
+    (
+        "105-job-edges-abort",
+        include_str!("../../../../infra/postgres/schema/105-job-edges-abort.sql"),
+    ),
 ];
 
 /// Concatenate the schema files in manifest order, omitting any whose name

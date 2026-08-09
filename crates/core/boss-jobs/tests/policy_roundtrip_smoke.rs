@@ -81,6 +81,7 @@ async fn smoke_tester_can_read_workflows_through_real_policy_api() {
     let kind_registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
 
     let state = JobsApiState {
+        job_edges: None,
         jobs,
         bus,
         publisher,

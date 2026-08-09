@@ -100,6 +100,7 @@ fn app_with(specs: Vec<WorkflowSpec>) -> (axum::Router, Arc<InMemoryJobs>) {
     let bus = RecordingEventBus::new();
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let state = JobsApiState {
+        job_edges: None,
         jobs: jobs.clone(),
         bus,
         publisher: DomainPublisher::new(bus_dyn, "jobs"),
