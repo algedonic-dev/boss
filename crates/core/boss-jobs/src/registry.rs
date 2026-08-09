@@ -1768,6 +1768,22 @@ pub fn predicate_step_refs(ready_when: &str) -> Vec<String> {
     slugs
 }
 
+/// Does this predicate reference mutable Job state (`job.metadata.*`)?
+/// Step terminality proves nothing about such a predicate — the
+/// metadata can be written later (a marker like `merged = "true"`
+/// arrives at merge time, long after every referenced step is done) —
+/// so `reevaluate` must never infer Skipped from it (aa9980c8: four
+/// ship-a-change Jobs closed with their Merged outcome skipped 134ms
+/// after boarding).
+pub fn predicate_refs_job_metadata(ready_when: &str) -> bool {
+    let Ok(expr) = boss_expr::parse(ready_when) else {
+        return false;
+    };
+    boss_expr::references(&expr)
+        .into_iter()
+        .any(|path| path.first().map(|s| s == "job").unwrap_or(false))
+}
+
 /// Build the predicate-evaluation payload for a Job's current state:
 /// `{ subject, job: { metadata }, steps: { <slug>: { done, metadata } } }`.
 /// `steps` is keyed by each `StepSpec.title` slug, paired to the live
@@ -1864,9 +1880,9 @@ pub fn reevaluate(
             }
             let next = match eval_ready_when(&spec.steps[idx].ready_when, &ctx) {
                 Some(true) => Some(StepStatus::Ready),
-                Some(false) | None => {
-                    refs_all_terminal(spec, steps, idx).then_some(StepStatus::Skipped)
-                }
+                Some(false) | None => (refs_all_terminal(spec, steps, idx)
+                    && !predicate_refs_job_metadata(&spec.steps[idx].ready_when))
+                .then_some(StepStatus::Skipped),
             };
             if let Some(status) = next {
                 steps[idx].status = status;
@@ -3503,6 +3519,63 @@ mod tests {
         steps[0].status = StepStatus::Completed;
         let changed = reevaluate(&spec, &mut steps, &subject, &job_metadata);
         assert_eq!(changed, vec![1]);
+        assert_eq!(steps[1].status, StepStatus::Ready);
+    }
+
+    #[test]
+    fn reevaluate_never_skips_a_metadata_gated_outcome() {
+        // aa9980c8: four ship-a-change Jobs closed with their Merged
+        // outcome SKIPPED 134ms after boarding. The outcome's gate —
+        // `steps.review.done AND job.metadata.merged = "true"` — was
+        // false the instant review completed, and with `review`
+        // terminal the re-evaluator inferred "provably unsatisfiable".
+        // A predicate referencing job.metadata is NOT provable from
+        // step terminality: the marker arrives later (the conductor
+        // writes it at actual merge time). The step must stay Pending
+        // — awaiting data — and promote once the marker lands.
+        let spec = WorkflowSpec::platform_seed(
+            "mini-ship",
+            "Mini ship",
+            "test",
+            vec!["account".into()],
+            vec![
+                StepSpec {
+                    title: "review".into(),
+                    kind: "task".into(),
+                    ready_when: "true".into(),
+                    ..Default::default()
+                },
+                StepSpec {
+                    title: "merged".into(),
+                    kind: "outcome".into(),
+                    ready_when: "steps.review.done AND job.metadata.merged = \"true\"".into(),
+                    terminal: Some(Terminal {
+                        outcome: "merged".into(),
+                    }),
+                    ..Default::default()
+                },
+            ],
+        );
+        let subject = Subject::new("account", "a-1");
+        let no_marker = serde_json::Value::Object(Default::default());
+        let mut steps = materialize_steps(&spec, &subject, JobId::new(), &no_marker, StepId::new);
+
+        steps[0].status = StepStatus::Completed;
+        let changed = reevaluate(&spec, &mut steps, &subject, &no_marker);
+        assert!(
+            changed.is_empty(),
+            "no promotion and no skip before the marker: {changed:?}"
+        );
+        assert_eq!(
+            steps[1].status,
+            StepStatus::Pending,
+            "metadata-gated outcome awaits its marker"
+        );
+
+        // The marker lands (the metadata write at actual merge time).
+        let marker = serde_json::json!({ "merged": "true" });
+        let changed = reevaluate(&spec, &mut steps, &subject, &marker);
+        assert_eq!(changed, vec![1], "marker write promotes the outcome");
         assert_eq!(steps[1].status, StepStatus::Ready);
     }
 
