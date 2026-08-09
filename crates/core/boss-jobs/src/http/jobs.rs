@@ -885,5 +885,17 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
+    // A Job update can flip a metadata-gated `ready_when` (the v3
+    // ship-a-change Merged outcome waits on `job.metadata.merged` —
+    // the conductor writes that marker through THIS endpoint at merge
+    // time, aa9980c8). Wake any Pending step whose predicate now
+    // holds; closed/cancelled Jobs stay untouched.
+    if job.status == JobStatus::Open {
+        let actor = user
+            .ambient_actor()
+            .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+        super::steps::reevaluate_and_persist(&state, &job, &actor, now).await;
+    }
+
     StatusCode::NO_CONTENT.into_response()
 }

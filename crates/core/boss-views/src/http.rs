@@ -173,6 +173,34 @@ async fn stage_durations(
 }
 
 #[derive(Deserialize)]
+pub struct RunsQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// `GET /api/views/stage-runs/{kind}` — the last N Jobs of the kind
+/// with per-step durations, newest first (the per-run rows behind the
+/// stage-durations aggregate; backlog `a5096c8f`).
+async fn stage_runs(
+    State(state): State<Arc<ViewsApiState>>,
+    Path(kind): Path<String>,
+    Query(q): Query<RunsQuery>,
+) -> Response {
+    let Some(repo) = state.stages.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "stage runs need a postgres-backed views service",
+        )
+            .into_response();
+    };
+    let limit = q.limit.unwrap_or(10).clamp(1, 50);
+    match repo.stage_runs(&kind, limit).await {
+        Ok(s) => Json(s).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 pub struct ResultsQuery {
     #[serde(default)]
     pub limit: Option<usize>,
@@ -191,6 +219,7 @@ pub fn router(state: ViewsApiState) -> Router {
         .route("/api/views/flow", get(flow))
         .route("/api/views/fleet/{kind}", get(fleet))
         .route("/api/views/stage-durations/{kind}", get(stage_durations))
+        .route("/api/views/stage-runs/{kind}", get(stage_runs))
         .with_state(Arc::new(state))
 }
 
