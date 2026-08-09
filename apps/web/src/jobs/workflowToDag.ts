@@ -54,7 +54,24 @@ export function workflowToDag(steps: ReadonlyArray<DagStep>): {
   const edges: DagEdge[] = steps.flatMap((s) =>
     referencedSlugs(s.ready_when)
       .filter((src) => declared.has(src) && src !== s.title)
-      .map((src) => ({ from: src, to: s.title })),
+      .map((src) => {
+        const edge: DagEdge = { from: src, to: s.title };
+        // A `steps.<src>.metadata.<field> = "<value>"` comparison in
+        // the downstream predicate makes this a ROUTING edge — the
+        // fork choice that opens it. Label it with the value so the
+        // DAG reads as the decision graph it is, and carry the parsed
+        // condition so a surface can complete the fork by clicking
+        // the edge (TriageFlow). Predicates without a comparison stay
+        // plain dependency edges.
+        const cond = new RegExp(
+          `steps\\.${src}\\.metadata\\.([a-zA-Z0-9_-]+)\\s*=\\s*"([^"]+)"`,
+        ).exec(s.ready_when ?? '');
+        if (cond) {
+          edge.label = cond[2]!;
+          edge.condition = { field: cond[1]!, value: cond[2]! };
+        }
+        return edge;
+      }),
   );
   return { nodes, edges };
 }
