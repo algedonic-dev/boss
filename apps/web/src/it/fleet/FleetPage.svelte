@@ -24,6 +24,7 @@
   import StepDag, { type DagNode } from '../../jobs/StepDag.svelte';
   import { workflowToDag } from '../../jobs/workflowToDag';
   import { groupByPosition } from '../../jobs/position';
+  import { decorateDagNodes, fmtDur } from '../../jobs/decorateDag';
   import type { Job } from '../../jobs/types';
   import { navigate } from '../../router';
 
@@ -200,12 +201,7 @@
   let byNode = $derived(groupByPosition(jobs));
   let statBySlug = $derived(new Map(stageStats.map((s) => [s.slug, s])));
 
-  function fmtDur(seconds: number): string {
-    if (seconds < 90) return `${Math.round(seconds)}s`;
-    const m = seconds / 60;
-    if (m < 120) return `${Math.round(m)}m`;
-    return `${(m / 60).toFixed(1)}h`;
-  }
+
   let selectedJobs = $derived(selectedNode ? (byNode.get(selectedNode) ?? []) : []);
   let selectedServerCount = $derived.by(() => {
     if (!selectedNode) return 0;
