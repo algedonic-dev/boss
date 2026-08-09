@@ -113,6 +113,28 @@ for svc in "${SERVICES[@]}"; do
     # by now, having been started earlier in this loop).
     if [[ "$svc" == "boss-brewery-sim" ]]; then
         publish_brewery_tenant
+        # The sim posts jobs the moment it starts, and their side
+        # effects (invoices, COGS, shipping) fire only if the
+        # dispatcher's consumers are BOUND — a process that answers
+        # /health can still be seconds from consuming (823fcb22
+        # mechanism 1: nothing gated on it; the flake profile is
+        # closed_jobs climbing while invoices stay 0 forever). Gate on
+        # /api/dispatcher/readyz, which flips only when both consumer
+        # loops are live. Bounded and loud: past the budget we start
+        # the sim anyway and say so, because a wedged gate hiding the
+        # whole stack is worse than a diagnosable race.
+        echo "    waiting for dispatcher readyz before the sim"
+        for i in $(seq 1 60); do
+            if curl -fsS -m 2 "http://127.0.0.1:7950/api/dispatcher/readyz" 2>/dev/null \
+                | grep -q '"ready":[[:space:]]*true'; then
+                echo "    dispatcher ready after ${i}s"
+                break
+            fi
+            if [[ "$i" == "60" ]]; then
+                echo "    WARN: dispatcher not ready after 60s — starting the sim anyway (side effects may lag or dead-air; check /api/dispatcher/readyz)"
+            fi
+            sleep 1
+        done
     fi
     if ! command -v "$svc" >/dev/null 2>&1; then
         echo "    SKIP: $svc (binary not in image)"
