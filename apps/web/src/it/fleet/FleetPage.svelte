@@ -41,6 +41,13 @@
     nodes: ReadonlyArray<FleetNode>;
     as_of: string;
   }>;
+  type StageStat = Readonly<{
+    slug: string;
+    completed: number;
+    p50_seconds: number;
+    p90_seconds: number;
+    max_seconds: number;
+  }>;
   type SpecStep = Readonly<{
     title: string;
     kind: string;
@@ -56,6 +63,7 @@
   let specSteps = $state<ReadonlyArray<SpecStep> | null>(null);
   let fleet = $state<Fleet | null>(null);
   let jobs = $state<ReadonlyArray<Job>>([]);
+  let stageStats = $state<ReadonlyArray<StageStat>>([]);
   let selectedNode = $state<string | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
@@ -108,13 +116,29 @@
     jobs = Array.isArray(data) ? (data as ReadonlyArray<Job>) : [];
   }
 
+  // The flow through the process, not just the live set: completed
+  // hops + wall-clock latency per stage over the trailing week, from
+  // /api/views/stage-durations. An empty station still shows the
+  // process breathing. Enhancement, not dependency — a failed read
+  // degrades to live-only.
+  async function loadStages(k: string): Promise<void> {
+    const res = await fetch(`/api/views/stage-durations/${encodeURIComponent(k)}?days=7`);
+    if (!res.ok) {
+      stageStats = [];
+      return;
+    }
+    const body: unknown = await res.json();
+    const stages = (body as { stages?: unknown } | null)?.stages;
+    stageStats = Array.isArray(stages) ? (stages as ReadonlyArray<StageStat>) : [];
+  }
+
   async function switchTo(k: string): Promise<void> {
     kind = k;
     loading = true;
     error = null;
     try {
       selectedNode = null;
-      await Promise.all([loadSpec(k), loadFleet(k), loadJobs(k)]);
+      await Promise.all([loadSpec(k), loadFleet(k), loadJobs(k), loadStages(k)]);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -140,6 +164,7 @@
       if (kind) {
         void loadFleet(kind).catch(() => {});
         void loadJobs(kind).catch(() => {});
+        void loadStages(kind).catch(() => {});
       }
     }, POLL_MS);
     return () => clearInterval(timer);
@@ -173,6 +198,14 @@
 
   let bySlug = $derived(new Map((fleet?.nodes ?? []).map((n) => [n.slug, n])));
   let byNode = $derived(groupByPosition(jobs));
+  let statBySlug = $derived(new Map(stageStats.map((s) => [s.slug, s])));
+
+  function fmtDur(seconds: number): string {
+    if (seconds < 90) return `${Math.round(seconds)}s`;
+    const m = seconds / 60;
+    if (m < 120) return `${Math.round(m)}m`;
+    return `${(m / 60).toFixed(1)}h`;
+  }
   let selectedJobs = $derived(selectedNode ? (byNode.get(selectedNode) ?? []) : []);
   let selectedServerCount = $derived.by(() => {
     if (!selectedNode) return 0;
@@ -214,8 +247,8 @@
 </script>
 
 <PageHeader
-  title="Fleet"
-  subtitle="Every in-flight Job of a kind, projected onto its Workflow"
+  title="Bottlenecks"
+  subtitle="Where work piles up: per-step depth, completed flow, and wall-clock latency for a Workflow kind"
 />
 
 <div class="fleet-bar">
@@ -277,7 +310,14 @@
     </section>
   {/if}
 
-  {#if fleet && fleet.nodes.length > 0}
+  {@const tableRows = (() => {
+    const live = new Set((fleet?.nodes ?? []).map((n) => n.slug));
+    const flowOnly = stageStats
+      .filter((s) => !live.has(s.slug) && s.completed > 0)
+      .map((s) => ({ slug: s.slug, ready: 0, active: 0, unassigned: 0, by_role: {}, oldest_ready_wall: null }));
+    return [...(fleet?.nodes ?? []), ...flowOnly];
+  })()}
+  {#if tableRows.length > 0}
     <table class="fleet-table">
       <thead>
         <tr>
@@ -287,10 +327,13 @@
           <th>Unclaimed</th>
           <th>Role lenses</th>
           <th>Oldest wait</th>
+          <th>Done (7d)</th>
+          <th>p50 / max</th>
         </tr>
       </thead>
       <tbody>
-        {#each fleet.nodes as n (n.slug)}
+        {#each tableRows as n (n.slug)}
+          {@const st = statBySlug.get(n.slug)}
           <tr>
             <td>
               {n.slug}
@@ -303,6 +346,8 @@
             <td>{n.unassigned}</td>
             <td>{roles(n)}</td>
             <td>{age(n)}</td>
+            <td>{st?.completed ?? 0}</td>
+            <td>{st && st.completed > 0 ? `${fmtDur(st.p50_seconds)} / ${fmtDur(st.max_seconds)}` : '—'}</td>
           </tr>
         {/each}
       </tbody>
