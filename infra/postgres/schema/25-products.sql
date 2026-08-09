@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS finished_product_inventory (
     -- recognized` JE (DR 5100 / CR 1320 FG), the final unit taking
     -- the remainder so zero on_hand forces zero value. Model B COGS
     -- still recognizes at sale time at actual cost — now exactly.
-    -- Design: docs/design/inventory-value-conservation.md.
+    -- Design: docs/architecture-decisions.md §Finance & ledger.
     value_cents     BIGINT NOT NULL DEFAULT 0,
     -- Display-only per-unit cost, derived — never an input to a GL
     -- amount, never writable (stale writers fail loudly here).

@@ -21,7 +21,7 @@ pub struct InventoryItem {
     /// line totals; consumes drain the proportional share with the
     /// final unit absorbing the remainder, so zero `on_hand` forces
     /// zero value. Every GL amount posted for the row IS a value
-    /// delta. Design: docs/design/inventory-value-conservation.md.
+    /// delta. Design: docs/architecture-decisions.md §Finance & ledger.
     #[serde(default)]
     pub value_cents: i64,
     /// Display-only unit cost (`value / on_hand`), derived by the

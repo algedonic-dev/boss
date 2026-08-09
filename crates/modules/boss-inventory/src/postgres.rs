@@ -148,7 +148,7 @@ impl InventoryRepository for PgInventory {
         // — there is no code path that decrements raw inventory
         // without moving the same cents raw → WIP in the same tx, so
         // balance(1300) == Σ value_cents holds by construction
-        // (costing PR 6a; docs/design/inventory-value-conservation.md).
+        // (costing PR 6a; docs/architecture-decisions.md §Finance & ledger).
         let mut tx = self
             .pool
             .begin()

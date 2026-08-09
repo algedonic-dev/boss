@@ -270,7 +270,7 @@ impl CommerceRepository for PgCommerce {
             .map_err(|e| CommerceError::Storage(e.to_string()))?;
 
         // The FG drawdown + COGS moved OUT of the invoice tx (Q2,
-        // docs/design/inventory-value-conservation.md, 6b): the
+        // docs/architecture-decisions.md §Finance & ledger, 6b): the
         // dispatcher's `products-consume-on-invoice-created` rule
         // reacts to the `commerce.invoice.created` event this issue
         // emits and drives `/api/products/{sku}/inventory/consume` per

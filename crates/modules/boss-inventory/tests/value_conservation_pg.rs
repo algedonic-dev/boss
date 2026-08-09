@@ -15,7 +15,7 @@
 //! The old scheme (integer-cent weighted averages) leaked $100–$200
 //! per truncation at 10–20K-unit scale; the 2026-07-06 365d regen
 //! measured the class at +$6,597.77/yr on FG. Design + decisions:
-//! docs/design/inventory-value-conservation.md (Q1–Q3 resolved
+//! docs/architecture-decisions.md §Finance & ledger (Q1–Q3 resolved
 //! 2026-07-07).
 
 #![cfg(feature = "postgres")]

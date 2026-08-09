@@ -2,7 +2,7 @@
 //! recognition for every finished-goods line on an issued invoice,
 //! through the products surface.
 //!
-//! The Q2 decision (docs/design/inventory-value-conservation.md,
+//! The Q2 decision (docs/architecture-decisions.md §Finance & ledger,
 //! resolved 2026-07-07): the CONSUME — the physical event — owns COGS.
 //! Commerce used to UPDATE `finished_product_inventory` directly inside
 //! the invoice tx (a cross-module projection write) and the

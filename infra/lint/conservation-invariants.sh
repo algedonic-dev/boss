@@ -391,7 +391,7 @@ SQL
 # posts exactly the value delta, so the pre-6a $100 rounding band
 # is ZERO. Any cent of divergence is a mutation that missed its JE
 # or a JE that missed its mutation.
-# Design: docs/design/inventory-value-conservation.md.
+# Design: docs/architecture-decisions.md §Finance & ledger.
 run_invariant "P. FG GL balance ≡ Σ value_cents (exact)" "$(cat <<'SQL'
 WITH gl_1320 AS (
        SELECT coalesce(sum(jl.debit_cents - jl.credit_cents), 0) AS bal
@@ -513,7 +513,7 @@ SQL
 # path mutated inventory_items without posting the matching JE (or
 # vice versa). The pre-6a ±$50k tolerance absorbed weighted-average
 # truncation drift; that class no longer exists, so the band is
-# ZERO. Design: docs/design/inventory-value-conservation.md.
+# ZERO. Design: docs/architecture-decisions.md §Finance & ledger.
 run_invariant "N. Raw inventory GL balance ≡ Σ value_cents (exact)" "$(cat <<'SQL'
 WITH gl_1300 AS (
        SELECT coalesce(sum(jl.debit_cents - jl.credit_cents), 0) AS bal

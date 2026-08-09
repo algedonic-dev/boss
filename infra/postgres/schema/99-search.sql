@@ -5,7 +5,7 @@
 -- A projection of `audit_log`, like `jobs` or `financial_facts` — NOT a
 -- query over the domain tables.
 --
--- Recorded in docs/design/global-search.md §Decision history (Q2).
+-- Recorded in docs/architecture-decisions.md §Search §Decision history (Q2).
 -- Reading `accounts`/`assets`/`employees` in place is cheaper and is
 -- what the previous implementation did, but it means anything that has
 -- fallen out of a domain projection is unfindable — the wrong answer
@@ -81,7 +81,7 @@ CREATE INDEX IF NOT EXISTS search_index_kind ON search_index (ref_kind);
 -- /api/people/search, for an Omnibox that no longer exists in the SPA.
 --
 -- Superseded rather than extended. Every decision in
--- docs/design/global-search.md points away from it: it read domain
+-- docs/architecture-decisions.md §Search points away from it: it read domain
 -- tables directly (Q2 chose a log-rooted projection), it lived in a
 -- Tier-2 crate (Q1 put core identity in core), and it covered no Jobs
 -- and no events at all — which is the entire unified-layer claim (Q3).
