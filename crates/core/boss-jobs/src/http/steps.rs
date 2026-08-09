@@ -547,6 +547,17 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                     "subject_id": subject_id,
                     "completed_on": step.completed_on,
                     "metadata": step.metadata,
+                    // ALWAYS present, defaulting false: the dispatcher
+                    // expr binder resolves flat identifiers only, and an
+                    // absent identifier is a PredicateFailed → Retry →
+                    // dead-letter storm, not a quiet false. The
+                    // notify-on-step-done-marked rule (migration 106)
+                    // matches this field.
+                    "notify_on_done": step
+                        .metadata
+                        .get("notify_on_done")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                 }),
             ));
         }
