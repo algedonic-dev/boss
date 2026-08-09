@@ -442,6 +442,22 @@ Finished products are tracked per-location with cost basis
 (produce/consume handlers + the products KB); invoices are
 line-item based with header rollups checked on write.
 
+**Inventory value is primary; the average is display.** Every
+inventory-bearing row carries `value_cents`; per-unit averages are
+derived (`value / on_hand`), shown but never an input to a GL amount.
+Adds (receive/produce) post exact line totals; drains consume
+proportional value with the final unit taking the remainder, so
+`on_hand → 0` forces `value → 0` and nothing strands. Conservation —
+`balance(1300/1320) == Σ row value`, to the cent, live and rebuilt —
+holds by construction because every mutation's GL amount IS the row's
+value delta, and it is **gated**, not discovered: a per-account
+GL-vs-physical reconciliation runs in the sim validation and the
+nightly integrity timers, so the class is never findable by hand
+again. **The consume owns COGS** through the products surface — one
+writer on the 1320 credit; a module reaching into another module's
+projection with direct SQL (the invoice-issue path once UPDATEd
+`finished_product_inventory` in place) is the prohibited shape.
+
 ## Policy & auth
 
 Every write passes `boss-policy` via the `PolicyClient` port.
@@ -542,6 +558,27 @@ KB keeps typed columns for stable queried fields and a
 schema-validated `extras` blob for tenant-specific evolution; the
 event stream remains the source of truth for asset state.
 
+## Search
+
+One core endpoint (`boss-search`) queries `subjects`, `jobs` and
+`audit_log` in a single round trip; each app contributes its own
+scoped search for domain detail — the global box answers "what and
+where", the app answers "which one". **Search reads its own
+projections, rebuilt from the log** — not the live domain tables and
+not the log directly — so a Subject absent from a domain projection is
+still findable and the index reproduces rather than drifts. Results
+group by kind in a hard order (Subjects → Jobs → Events, recency
+within a kind); there is deliberately no cross-kind relevance score,
+because unexplainable ranking is how search boxes lose trust. Policy
+scoping is server-side in the same `PolicyClient` path as every other
+read — a result the caller could not open must not appear, and
+client-side filtering of a wider set is prohibited. The chrome
+dropdown is the current app's scoped preview; the full cross-app
+results page lives in Home. v1 shipped the unified claim whole (one
+query returning a Subject with its Jobs with their events) rather
+than name-lookup-first — the join on system-issued identity is the
+point, not a later feature.
+
 ## Step UX & frontend
 
 Step surfaces ship as **data**: the registry row names a
@@ -560,6 +597,28 @@ complements the HQ map; account detail composes KB panels
 domain APIs. The ports table (`boss-ports`) is the single source
 of truth for service names/ports — the SPA's generated copy is
 lint-checked against the Rust registry.
+
+**The personal unit is a View, not a gadget.** A View is a saved
+composition — a query plus a layout — holding no authoritative state
+of its own; it is a pure function of the log, so it rebuilds, cannot
+drift, and two people running the same View see the same numbers.
+This is the deliberate inversion of the private-durable-state
+micro-app (Cloudflare OS's gadget), which is the federation problem
+returning one user at a time. Local state is allowed **while it stays
+local**: inside a Step until the Step completes, scratch on a View
+until it flows into a Job, Step or Event — the test is whether
+anything outside depends on it, not whether it exists. Views are
+declarative compositions (reviewable, diffable, deterministic);
+agent-authored full-code apps are a later phase gated on
+safe-user-code infrastructure. The promotion ladder: personal View →
+shared (frictionless, the individual curates their own shareables) →
+inclusion in a department's views (a submitted Job) — ceremony lands
+only where something becomes the company's. **IT is the department
+app and System Model lives inside it**: modeling the company is work
+the IT department does, so dispatcher rules, step plugins and
+experiments need no IT-vs-model line. Department Apps are the decided
+workflows (registry-governed, the same for everyone in the role);
+Home is where an individual explores what has not been decided yet.
 
 ## OSS posture & tier boundaries
 

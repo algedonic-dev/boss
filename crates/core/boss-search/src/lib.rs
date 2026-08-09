@@ -7,7 +7,7 @@
 //! joined on identity the system issued — so one query answers with the
 //! Subject, its Jobs, and the events behind them.
 //!
-//! Design + decision history: docs/design/global-search.md.
+//! Design + decision history: docs/architecture-decisions.md §Search.
 
 pub mod error;
 pub mod types;

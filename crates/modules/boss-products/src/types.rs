@@ -47,7 +47,7 @@ pub struct ProductInventory {
     /// exact line total the WIP drain allocated; `consume` drains the
     /// proportional share to size the `finance.cogs.recognized` JE,
     /// the final unit taking the remainder so zero on_hand forces
-    /// zero value. Design: docs/design/inventory-value-conservation.md.
+    /// zero value. Design: docs/architecture-decisions.md §Finance & ledger.
     #[serde(default)]
     pub value_cents: i64,
     /// Display-only per-unit cost (`value / on_hand`), derived by the

@@ -184,7 +184,7 @@ handler = "inventory.parts.consume"
 args = { reason = "\"morning-brew-packaging\"" }
 
 # FG drawdown + COGS per issued invoice — the consume owns COGS
-# (Q2, docs/design/inventory-value-conservation.md). Commerce posts
+# (Q2, docs/architecture-decisions.md §Finance & ledger). Commerce posts
 # revenue/AR/tax only; this rule drives the physical drain + the
 # DR 5100 / CR 1320 recognition through the products surface, at the
 # drained value, tagged with each line's revenue_category. Insufficient

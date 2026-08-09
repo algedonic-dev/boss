@@ -6,7 +6,8 @@
 //! other surface reads, so two people running the same View see the
 //! same numbers because there is only one set of numbers.
 //!
-//! See `docs/design/home-workspace-and-department-apps.md`.
+//! See `docs/architecture-decisions.md` §Step UX & frontend (the
+//! folded home of the Views / department-apps decisions).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

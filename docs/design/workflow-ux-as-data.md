@@ -10,8 +10,8 @@ way I can pull in and render all the useful contextual data riding
 along with the job."
 **Related**:
 [architecture-decisions.md](../architecture-decisions.md) §Step UX &
-frontend · [home-workspace-and-department-apps.md](./home-workspace-and-department-apps.md)
-· [queue-visibility.md](./queue-visibility.md) ·
+frontend (which also holds the folded Views / department-apps
+decisions) · [queue-visibility.md](./queue-visibility.md) ·
 [public-api-mcp.md](./public-api-mcp.md)
 
 ---
