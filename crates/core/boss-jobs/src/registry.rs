@@ -1009,6 +1009,10 @@ fn pr_train_spec() -> WorkflowSpec {
             title_template: "CI verdict".into(),
             authority_role: admin.clone(),
             fields: vec![req("result")],
+            // The wait-over signal (rule notify-on-step-done-marked):
+            // CI landing is the "we can keep going" moment David asked
+            // BOSS itself to deliver.
+            metadata_defaults: serde_json::json!({ "notify_on_done": true }),
             ..Default::default()
         },
         StepSpec {
@@ -1021,6 +1025,7 @@ fn pr_train_spec() -> WorkflowSpec {
             title_template: "Merged into main".into(),
             authority_role: admin.clone(),
             fields: vec![req("merge_ref")],
+            metadata_defaults: serde_json::json!({ "notify_on_done": true }),
             ..Default::default()
         },
         StepSpec {
@@ -1033,6 +1038,7 @@ fn pr_train_spec() -> WorkflowSpec {
             // restarted, web bundle — as reported by the scripts that
             // did it.
             fields: vec![req("deployed")],
+            metadata_defaults: serde_json::json!({ "notify_on_done": true }),
             ..Default::default()
         },
         StepSpec {

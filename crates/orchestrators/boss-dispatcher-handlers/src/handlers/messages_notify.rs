@@ -63,10 +63,24 @@ impl Handler for MessagesNotify {
 
     async fn invoke(
         &self,
-        _args: &[(String, Value)],
+        args: &[(String, Value)],
         ctx: &InvocationContext,
     ) -> Result<(), HandlerError> {
         let ev = StepEvent::from_payload(&ctx.event_payload)?;
+
+        // `id_prefix` (optional rule arg, default "notify"): a step
+        // may legitimately notify twice in its life — at READY (this
+        // handler's original job) and at DONE (the wait-over signal;
+        // rule `notify-on-step-done-marked`). The dedup id must not
+        // collapse the two, so the done-rule passes its own prefix.
+        let id_prefix = args
+            .iter()
+            .find(|(k, _)| k == "id_prefix")
+            .and_then(|(_, v)| match v {
+                Value::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .unwrap_or("notify");
 
         // An ASSIGNEE wins over a role, and a step with neither is the
         // only no-op.
@@ -157,7 +171,7 @@ impl Handler for MessagesNotify {
             // on the messages `ON CONFLICT (id) DO NOTHING` insert instead
             // of stacking a duplicate inbox row. Per-recipient so a future
             // role-fan-out keys cleanly; one row per (step, recipient).
-            "id": format!("notify:{}:{}", ev.step_id, recipient),
+            "id": format!("{id_prefix}:{}:{}", ev.step_id, recipient),
             "sender_id": "automation:dispatcher",
             "recipient_id": recipient,
             "subject": subject,
@@ -443,5 +457,27 @@ mod tests {
             .invoke(&[], &ctx(serde_json::json!("not-an-object")))
             .await;
         assert!(matches!(res, Err(HandlerError::Downstream(_))));
+    }
+
+    /// A step can notify at READY and again at DONE (the train's
+    /// keep-going signal — feedback from David 2026-08-09: BOSS
+    /// itself alerts us when a wait ends). The two must not collapse
+    /// on the dedup id, so the rule passes `id_prefix = "done"` and
+    /// the posted message id changes prefix.
+    #[tokio::test]
+    async fn id_prefix_arg_separates_done_notifications_from_ready() {
+        let (people, messages, captured) = mock_services().await;
+        let h = MessagesNotify::with_client(reqwest::Client::new(), people, messages);
+        let payload = ready_payload();
+        let args = vec![(
+            "id_prefix".to_string(),
+            boss_dispatcher::rules::expr::Value::String("done".into()),
+        )];
+        h.invoke(&args, &ctx(payload)).await.expect("handles");
+        let body = captured.lock().unwrap().clone().expect("posted");
+        assert_eq!(
+            body["id"], "done:22222222-2222-2222-2222-222222222222:emp-aa",
+            "the id prefix must come from the rule arg"
+        );
     }
 }
