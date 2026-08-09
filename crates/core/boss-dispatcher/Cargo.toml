@@ -32,6 +32,7 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 boss-testing = { path = "../boss-testing", features = ["postgres"] }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

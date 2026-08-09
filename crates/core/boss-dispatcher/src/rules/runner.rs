@@ -59,6 +59,51 @@ impl RulesRunner {
     /// it on a backoff schedule and the work self-heals once a transient
     /// condition clears — instead of the silent drop that orphaned Jobs
     /// under plain core-NATS subscribe.
+    /// Consume the rules feed from `audit_log` by id cursor instead
+    /// of JetStream — log-as-the-bus, stage 1 (transactional-audit-log
+    /// Q6). Same `handle`, same Settle semantics; delivery is the
+    /// [`crate::rules::log_tail`] contract: per-item durable advance,
+    /// retry blocks the cursor on the JetStream pacing schedule,
+    /// budget exhaustion dead-letters loudly and moves on. Selected
+    /// by `BOSS_RULES_SOURCE=log`; the JetStream path below remains
+    /// the default until the cutover is observed.
+    pub async fn run_log_tail(
+        &self,
+        pool: sqlx::PgPool,
+        live: std::sync::Arc<crate::liveness::DispatcherLiveness>,
+    ) -> Result<()> {
+        use crate::rules::log_tail::{LogTail, retry_delay};
+        let mut tail = LogTail::new(pool, "dispatcher-rules-log");
+        tail.ensure_cursor().await?;
+        live.mark_rules_running();
+        info!("rules runner: tailing audit_log as 'dispatcher-rules-log' (BOSS_RULES_SOURCE=log)");
+        loop {
+            let report = tail
+                .drain_once(500, |topic, event_id, payload| async move {
+                    self.handle(&topic, &event_id, &payload).await
+                })
+                .await;
+            match report {
+                Ok(r) => {
+                    if r.processed > 0 || r.dead_lettered > 0 {
+                        live.record_rules();
+                    }
+                    match r.blocked {
+                        Some(b) => tokio::time::sleep(retry_delay(b.attempts)).await,
+                        // Idle: one poll interval behind the relay's
+                        // own ~200ms lag — side effects stay
+                        // sub-second behind the write.
+                        None => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "rules log tail: drain error; retrying");
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
+
     pub async fn run(
         &self,
         js: async_nats::jetstream::Context,
