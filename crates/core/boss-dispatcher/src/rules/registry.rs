@@ -269,6 +269,43 @@ pub fn parse_raw(src: &str) -> Result<RawRegistry, RegistryError> {
 /// table into the raw shape. The dispatcher reads this at startup
 /// (replacing the legacy rules.toml file read) and `/api/dispatcher/rules`
 /// serves it. `do_steps` is stored as JSONB matching `RawDoStep`.
+/// Load the active rules, waiting out an empty table instead of
+/// accepting it as final (backlog `823fcb22`, mechanism 2: the
+/// one-shot load raced the seed and the runner dead-aired forever —
+/// "no rules registered" once at boot, then nothing, ever, while
+/// health stayed green). Polls until rules appear or `max_wait`
+/// elapses; a genuinely rule-less deployment proceeds empty, but
+/// LOUDLY — an error every poll interval and a final one, because a
+/// dispatcher with no rules runs zero side effects and should read
+/// that way in the journal.
+pub async fn wait_for_rules(
+    pool: &sqlx::PgPool,
+    poll: std::time::Duration,
+    max_wait: std::time::Duration,
+) -> Result<RawRegistry, RegistryError> {
+    let started = std::time::Instant::now();
+    loop {
+        let raw = load_active_rules(pool).await?;
+        if !raw.rules.is_empty() {
+            return Ok(raw);
+        }
+        if started.elapsed() >= max_wait {
+            tracing::error!(
+                waited_secs = started.elapsed().as_secs(),
+                "dispatcher_rules is EMPTY after the boot wait — proceeding with no \
+                 rules; every side effect is dead air until rules are seeded and the \
+                 dispatcher restarts"
+            );
+            return Ok(raw);
+        }
+        tracing::warn!(
+            waited_secs = started.elapsed().as_secs(),
+            "dispatcher_rules is empty (seed race at boot?) — retrying"
+        );
+        tokio::time::sleep(poll).await;
+    }
+}
+
 pub async fn load_active_rules(pool: &sqlx::PgPool) -> Result<RawRegistry, RegistryError> {
     #[derive(sqlx::FromRow)]
     struct Row {
