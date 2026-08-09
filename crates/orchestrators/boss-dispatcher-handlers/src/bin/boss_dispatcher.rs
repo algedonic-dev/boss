@@ -13,7 +13,9 @@ use boss_dispatcher::liveness::DispatcherLiveness;
 use boss_dispatcher::rules::handler::HandlerRegistry;
 use boss_dispatcher::rules::helpers_inventory::InventoryHelpers;
 use boss_dispatcher::rules::jobs_spawn::JobsSpawn;
-use boss_dispatcher::rules::registry::{Registry as RuleRegistry, wait_for_rules};
+use boss_dispatcher::rules::registry::{
+    Registry as RuleRegistry, load_active_rules, rules_changed, rules_fingerprint, wait_for_rules,
+};
 use boss_dispatcher::rules::runner::RulesRunner;
 use boss_dispatcher::rules::schedule_runner::{DEFAULT_CATCHUP_CAP, ScheduleRunner};
 use boss_dispatcher_handlers::handlers::{
@@ -231,21 +233,23 @@ async fn main() -> Result<()> {
                 cfg.inventory_api_url.clone(),
                 cfg.jobs_api_url.clone(),
             ));
-            // The schedule runner shares the SAME handlers (jobs.spawn et
+            // Both runners rebuild per reload iteration below. The
+            // schedule runner shares the SAME handlers (jobs.spawn et
             // al.) + the SAME parsed registry as the event runner — only
             // the trigger differs (clock day vs NATS event). Both are
-            // Clone (handlers are Arc'd; the registry is parsed Exprs), so
-            // clone before moving the originals into the event runner.
-            let sched_registry = registry.clone();
-            let sched_handlers = handlers.clone();
-
-            let runner = Arc::new(RulesRunner {
-                registry,
-                handlers,
-                helpers,
-            });
-            let js_for_runner = jetstream.clone();
-            let live_for_runner = live.clone();
+            // Clone (handlers are Arc'd; the registry is parsed Exprs).
+            //
+            // Live reload (backlog `1e576baf`): the registry used to be
+            // frozen at boot, so an authored rule silently did nothing
+            // until the next restart. This supervision loop polls a
+            // content fingerprint of `dispatcher_rules` and, when it
+            // moves, aborts both runners and rebuilds them from a fresh
+            // load — rebinding the durable consumer in case the topic
+            // set grew. Aborting mid-event is safe by the existing
+            // delivery contracts: an unACK'd JetStream message
+            // redelivers after ack_wait, an unadvanced log-tail cursor
+            // re-presents its row, and handlers are idempotent.
+            //
             // Log-as-the-bus, stage 1 (transactional-audit-log Q6):
             // `BOSS_RULES_SOURCE=log` tails audit_log by id cursor
             // instead of the JetStream durable consumer. Default stays
@@ -254,36 +258,85 @@ async fn main() -> Result<()> {
             // rollback is deleting it.
             let rules_source =
                 std::env::var("BOSS_RULES_SOURCE").unwrap_or_else(|_| "jetstream".into());
-            if rules_source == "log" {
-                let pool_for_runner = pool.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = runner.run_log_tail(pool_for_runner, live_for_runner).await {
-                        tracing::error!(error = %e, "rules log tail exited with error");
-                    }
-                });
-            } else {
-                tokio::spawn(async move {
-                    if let Err(e) = runner.run(js_for_runner, live_for_runner).await {
-                        tracing::error!(error = %e, "rules runner exited with error");
-                    }
-                });
-            }
-
-            // Clock-driven schedule runner: fires schedule-triggered rules
-            // on sim-day boundaries off the clock SSE feed. No-op (returns
-            // immediately) when the registry has no schedule rules.
-            let schedule_runner = Arc::new(ScheduleRunner {
-                registry: sched_registry,
-                handlers: sched_handlers,
-                clock_url: cfg.clock_api_url.clone(),
-                pool: pool.clone(),
-                calendar: Arc::new(ReqwestCalendarClient::new(cfg.calendar_api_url.clone())),
-                catchup_cap: DEFAULT_CATCHUP_CAP,
+            let fp = rules_fingerprint(&pool).await.unwrap_or_else(|e| {
+                warn!(error = %e, "initial rules fingerprint failed; first poll will reload");
+                String::new()
             });
-            let live_for_schedule = live.clone();
+            let js_for_rules = jetstream.clone();
+            let clock_url = cfg.clock_api_url.clone();
+            let calendar = Arc::new(ReqwestCalendarClient::new(cfg.calendar_api_url.clone()));
+            let live_rules = live.clone();
+            let pool_rules = pool.clone();
             tokio::spawn(async move {
-                if let Err(e) = schedule_runner.run(live_for_schedule).await {
-                    tracing::error!(error = %e, "schedule runner exited with error");
+                let mut registry = registry;
+                let mut fp = fp;
+                loop {
+                    let runner = Arc::new(RulesRunner {
+                        registry: registry.clone(),
+                        handlers: handlers.clone(),
+                        helpers: helpers.clone(),
+                    });
+                    let ev = {
+                        let live = live_rules.clone();
+                        if rules_source == "log" {
+                            let pool = pool_rules.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = runner.run_log_tail(pool, live).await {
+                                    tracing::error!(error = %e, "rules log tail exited with error");
+                                }
+                            })
+                        } else {
+                            let js = js_for_rules.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = runner.run(js, live).await {
+                                    tracing::error!(error = %e, "rules runner exited with error");
+                                }
+                            })
+                        }
+                    };
+                    // Clock-driven schedule runner: fires schedule-triggered
+                    // rules on sim-day boundaries off the clock SSE feed.
+                    // No-op (returns immediately) when the registry has no
+                    // schedule rules.
+                    let schedule_runner = Arc::new(ScheduleRunner {
+                        registry: registry.clone(),
+                        handlers: handlers.clone(),
+                        clock_url: clock_url.clone(),
+                        pool: pool_rules.clone(),
+                        calendar: calendar.clone(),
+                        catchup_cap: DEFAULT_CATCHUP_CAP,
+                    });
+                    let sched = {
+                        let live = live_rules.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = schedule_runner.run(live).await {
+                                tracing::error!(error = %e, "schedule runner exited with error");
+                            }
+                        })
+                    };
+                    fp = rules_changed(&pool_rules, &fp, std::time::Duration::from_secs(30)).await;
+                    info!(
+                        "dispatcher_rules changed — reloading the registry and rebinding runners"
+                    );
+                    ev.abort();
+                    sched.abort();
+                    match load_active_rules(&pool_rules)
+                        .await
+                        .and_then(RuleRegistry::from_raw)
+                    {
+                        Ok(next) => {
+                            info!(rule_count = next.rules().len(), "rules registry reloaded");
+                            registry = next;
+                        }
+                        Err(e) => {
+                            // Keep the running registry; the fingerprint has
+                            // advanced, so a corrective write re-triggers.
+                            tracing::error!(
+                                error = %e,
+                                "reloaded dispatcher_rules failed to parse; keeping the running registry"
+                            );
+                        }
+                    }
                 }
             });
         }

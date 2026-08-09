@@ -265,10 +265,6 @@ pub fn parse_raw(src: &str) -> Result<RawRegistry, RegistryError> {
     toml::from_str(src).map_err(|e| RegistryError::Toml(e.to_string()))
 }
 
-/// Load the ACTIVE dispatcher rules from the `dispatcher_rules` registry
-/// table into the raw shape. The dispatcher reads this at startup
-/// (replacing the legacy rules.toml file read) and `/api/dispatcher/rules`
-/// serves it. `do_steps` is stored as JSONB matching `RawDoStep`.
 /// Load the active rules, waiting out an empty table instead of
 /// accepting it as final (backlog `823fcb22`, mechanism 2: the
 /// one-shot load raced the seed and the runner dead-aired forever —
@@ -306,6 +302,52 @@ pub async fn wait_for_rules(
     }
 }
 
+/// Content fingerprint of the whole `dispatcher_rules` table (backlog
+/// `1e576baf`): the binary's reload supervision polls this and
+/// rebuilds + rebinds the runners when it moves. Hashes FULL row
+/// content ordered by primary key — not a count, because the
+/// authoring lifecycle mutates in place (publish retires the prior
+/// active version) at an unchanged row count. All statuses hash, so
+/// draft → active flips register too.
+pub async fn rules_fingerprint(pool: &sqlx::PgPool) -> Result<String, RegistryError> {
+    sqlx::query_scalar(
+        "SELECT COALESCE(md5(string_agg(concat_ws('|', \
+             name, version::text, status, on_event, when_expr, do_steps::text, delay, \
+             schedule_cadence, schedule_anchor::text, schedule_calendar), \
+             '~' ORDER BY name, version)), 'empty') \
+         FROM dispatcher_rules",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| RegistryError::Storage(e.to_string()))
+}
+
+/// Resolve once `dispatcher_rules` no longer matches `current`,
+/// returning the fingerprint it moved to. Polls at `poll`; a
+/// transient query error is logged and waited out rather than
+/// returned, because the caller is a supervision loop that must
+/// outlive a DB blip.
+pub async fn rules_changed(
+    pool: &sqlx::PgPool,
+    current: &str,
+    poll: std::time::Duration,
+) -> String {
+    loop {
+        match rules_fingerprint(pool).await {
+            Ok(fp) if fp != current => return fp,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "rules_changed: fingerprint poll failed; retrying");
+            }
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Load the ACTIVE dispatcher rules from the `dispatcher_rules` registry
+/// table into the raw shape. The dispatcher reads this at startup
+/// (replacing the legacy rules.toml file read) and `/api/dispatcher/rules`
+/// serves it. `do_steps` is stored as JSONB matching `RawDoStep`.
 pub async fn load_active_rules(pool: &sqlx::PgPool) -> Result<RawRegistry, RegistryError> {
     #[derive(sqlx::FromRow)]
     struct Row {
