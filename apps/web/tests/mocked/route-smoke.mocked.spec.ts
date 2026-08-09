@@ -41,6 +41,9 @@ const ROUTES: ReadonlyArray<string> = [
   // drift test at the bottom of this file for why that can no longer
   // happen quietly.
   '/system/feedback', '/system/flow',
+  // Fleet renders its no-Workflows empty state under the mock's
+  // empty /api/workflows — a real crawl of the page chrome + picker.
+  '/system/fleet',
 ];
 
 // DEFERRED, group 1 — aggregation dashboards that read OBJECT-shaped

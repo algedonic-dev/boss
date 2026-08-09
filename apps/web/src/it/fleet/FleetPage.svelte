@@ -55,11 +55,17 @@
   let loading = $state(true);
   let error = $state<string | null>(null);
 
+  // Decode once, defensively, at the fetch site — the route-smoke
+  // crawl runs every page against an adversarial mock, and a
+  // non-array where an array belongs must render as an empty state,
+  // not a runtime crash.
   async function loadKinds(): Promise<void> {
     const res = await fetch('/api/workflows');
     if (!res.ok) throw new Error(`workflows: HTTP ${res.status}`);
-    const rows: ReadonlyArray<{ kind: string }> = await res.json();
-    kinds = [...new Set(rows.map((r) => r.kind))].sort();
+    const rows: unknown = await res.json();
+    kinds = Array.isArray(rows)
+      ? [...new Set(rows.map((r) => r?.kind).filter((k) => typeof k === 'string'))].sort()
+      : [];
     // Deep-linkable: /system/fleet?kind=wholesale-keg-order.
     const asked = new URLSearchParams(window.location.search).get('kind');
     kind = asked && kinds.includes(asked) ? asked : (kinds[0] ?? null);
@@ -68,14 +74,22 @@
   async function loadSpec(k: string): Promise<void> {
     const res = await fetch(`/api/workflows/${encodeURIComponent(k)}`);
     if (!res.ok) throw new Error(`workflow ${k}: HTTP ${res.status}`);
-    const spec = await res.json();
-    specSteps = (spec.steps ?? []) as ReadonlyArray<SpecStep>;
+    const spec: unknown = await res.json();
+    const steps = (spec as { steps?: unknown } | null)?.steps;
+    specSteps = Array.isArray(steps) ? (steps as ReadonlyArray<SpecStep>) : [];
   }
 
   async function loadFleet(k: string): Promise<void> {
     const res = await fetch(`/api/views/fleet/${encodeURIComponent(k)}`);
     if (!res.ok) throw new Error(`fleet ${k}: HTTP ${res.status}`);
-    fleet = (await res.json()) as Fleet;
+    const raw: unknown = await res.json();
+    const f = (raw ?? {}) as Partial<Fleet> & { nodes?: unknown };
+    fleet = {
+      workflow_kind: typeof f.workflow_kind === 'string' ? f.workflow_kind : k,
+      open_jobs: typeof f.open_jobs === 'number' ? f.open_jobs : 0,
+      nodes: Array.isArray(f.nodes) ? (f.nodes as Fleet['nodes']) : [],
+      as_of: typeof f.as_of === 'string' ? f.as_of : '',
+    };
   }
 
   async function switchTo(k: string): Promise<void> {
