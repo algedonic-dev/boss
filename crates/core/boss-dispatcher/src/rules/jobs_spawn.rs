@@ -142,13 +142,21 @@ impl Handler for JobsSpawn {
             }
         }
 
+        // The docstring always promised an optional `title` arg; the
+        // body ignored it until the design-review spawn needed one (a
+        // review titled "Auto-spawn from rule …" in an operator's
+        // queue is a label, not a title).
+        let title = match arg(args, "title") {
+            Some(Value::String(s)) if !s.is_empty() => s.clone(),
+            _ => format!("Auto-spawn from rule {}", ctx.rule_name),
+        };
         let body = json!({
             "kind": kind,
             "subject": {
                 "subject_kind": subject_kind,
                 "id": subject,
             },
-            "title": format!("Auto-spawn from rule {}", ctx.rule_name),
+            "title": title,
             "owner_id": actor_id,
             "priority": "standard",
             "status": "open",

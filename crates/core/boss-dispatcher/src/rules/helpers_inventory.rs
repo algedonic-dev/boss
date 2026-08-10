@@ -78,6 +78,11 @@ impl HelperResolver for InventoryHelpers {
             "open_po_exists" => open_po_exists(self, args),
             "vendor_for" => vendor_for(self, args),
             "open_restock_exists" => open_restock_exists(self, args),
+            // Not inventory-flavored, but this is the ONE resolver the
+            // runner binds and it already holds jobs_base; the module
+            // outgrew its name the day a second domain needed a dedup
+            // helper (design-review-spawn, dogfooding arc e556c000).
+            "open_review_exists" => open_review_exists(self, args),
             other => Err(EvalError::UnknownHelper(other.to_string())),
         }
     }
@@ -142,6 +147,34 @@ struct JobsListResponse {
 /// on the Job's `metadata.part_sku` (stamped by the reorder rule via
 /// `jobs.spawn`'s `metadata.<field>` args), since the restock's subject is
 /// the vendor, not the part.
+/// Is there an open design-doc-review Job for this doc path? The
+/// spawn rule's dedup: `docs.design.indexed` re-fires on every
+/// question-count change, and each firing must not open another
+/// review. Subject-filtered server-side — the doc path IS the Job's
+/// subject id.
+fn open_review_exists(h: &InventoryHelpers, args: &[Value]) -> Result<Value, EvalError> {
+    let doc_path = first_string(args, "open_review_exists")?;
+    // Minimal percent-encoding, no new crate: doc paths are repo
+    // paths (`docs/design/x.md` — slashes are legal in query values),
+    // this guards the day one carries a space or '&'.
+    let encoded: String = doc_path
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    let url = format!(
+        "{}/api/jobs?kind=design-doc-review&status=open&subject_id={}&limit=1",
+        h.jobs_base.trim_end_matches('/'),
+        encoded,
+    );
+    let r: JobsListResponse = h.get_json(&url, "open_review_exists")?;
+    Ok(Value::Bool(!r.data.is_empty()))
+}
+
 fn open_restock_exists(h: &InventoryHelpers, args: &[Value]) -> Result<Value, EvalError> {
     let part_sku = first_string(args, "open_restock_exists")?;
     let url = format!(
