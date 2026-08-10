@@ -84,77 +84,16 @@ jobs:
         env:
           PGPASSWORD: boss
 
-      - name: Clippy
-        # `--workspace` covers every member crate; `--tests` includes
-        # the test code (where most non-determinism + dead-code
-        # patterns surface). `-D warnings` flips clippy's default
-        # warn-level lints into hard errors — this is the gate that
-        # prevents the workspace from drifting back above 0 warnings
-        # after the 2026-05-05 sweep.
-        run: cargo clippy --workspace --all-features --tests -- -D warnings
-
-      - name: Build with default features
-        # Every other Rust step here passes `--all-features`, so a crate
-        # whose DEFAULT feature set does not compile is invisible to
-        # CI. That is not hypothetical: #180 deleted a `pub mod search;`
-        # sitting under a `#[cfg(feature = "postgres")]`, the orphaned
-        # attribute rebound onto the next item — `pub mod types;` — and
-        # `cargo build -p boss-people` was broken for anyone who ran it
-        # without the feature flag. Every gate above stayed green.
-        #
-        # A dangling `#[cfg]` always lands on whatever follows it, so
-        # this is a whole class of bug, not one typo. One cheap build
-        # closes it (CLAUDE.md §9a).
-        run: cargo build --workspace
-
-      - name: Test
-        run: cargo test --all-features
-
-      - name: Format check
-        run: cargo fmt -- --check
-
-      - name: Seed bypass-smell lint
-        run: infra/lint/seed-bypass-smell.sh
-
-      - name: No-TODO-citation lint
-        run: infra/lint/no-todo-citation.sh
-
-      - name: No step-kind matches in core (ADR-0021)
-        run: infra/lint/no-step-kind-match.sh
-
-      - name: API-path bypass-smell (no direct-DB data writes)
-        run: infra/lint/api-path-bypass-smell.sh
-
-      - name: Dispatcher calls stamp their actor
-        run: infra/lint/dispatcher-actor-stamp.sh
-
-      # Linchpin for seed-event realism: the sim may only reach the
-      # system through *-client crates (the public API), so event
-      # ordering is forced by the live write-time guards. If the sim
-      # could bulk-write domain state, ordering realism would be lost.
-      - name: Sim-boundary audit (sim goes through the API only)
-        run: infra/lint/sim-boundary-audit.sh
-
-      - name: Tier-import audit (Tier-1 must not depend on Tier-2)
-        run: infra/lint/tier-import-audit.sh
-
-      # Temporal realism: every timestamp routes through clock-api, so
-      # sim-epoch events aren't stamped with wallclock.
-      - name: No-wallclock (timestamps route through clock-api)
-        run: infra/lint/no-wallclock.sh
-
-      # Outbox phase 2: migrated crates record events in the domain
-      # transaction; post-commit publisher emits are pinned per crate
-      # and only ratchet down.
-      - name: Outbox migration ratchet (events record in-tx)
-        run: infra/lint/outbox-migration-ratchet.sh
-
-      # Idempotence: the bus is at-least-once, so an accumulating write
-      # (`col = col + $n`) double-applies on redelivery. Ratchet, not
-      # ban — the two known stock sites are reviewed; a third fails
-      # until someone looks at it.
-      - name: Idempotence ratchet (accumulating writes are reviewed)
-        run: infra/lint/idempotence-ratchet.sh
+      - name: Gate
+        # ONE definition of the rust gate — the same script an agent
+        # runs before pushing a car (`infra/gate.sh -p <crate>`), so CI
+        # and the local gate cannot drift (CLAUDE.md §9a; on the
+        # 2026-08-10 train they were two definitions and drifted twice
+        # in one day). The check roster, each check's flags, and the
+        # provenance comments for both live IN the script; environment
+        # setup (toolchain, cache, schema) stays above.
+        # boss-testing/tests/gate_sh.rs pins this step and the roster.
+        run: infra/gate.sh
 
   web:
     runs-on: ubuntu-latest
