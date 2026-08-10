@@ -63,6 +63,26 @@ company: departments as stations) and one down (inside a workflow:
 steps as stations). If the IT canvas cannot re-scale, the design is
 wrong.
 
+## Reevaluating the prior visualization docs
+
+David, 2026-08-10: the earlier visualization attempts should be
+reread against stations-as-queues rather than answered in their
+original frame.
+
+- **department-flow-dashboards.md** — its remaining questions are
+  network questions now: per-hop latency becomes station service
+  time, edge pulses became FlowMotion and feed the canvas, and the
+  "node set" question dissolves (nodes are queues, settled). Answer
+  its review WITH this doc open; expect most of it to fold in here
+  and the source doc to head toward the architecture-decisions fold.
+- **queue-visibility.md** — ALIGNED, not superseded: it was already
+  the queue lens. Q1 (My Day onto the lens) is strengthened — `/me`
+  is a personal-queue station at another zoom; its claim-CAS question
+  becomes the integrity of the claim hop.
+- **The FlowNetwork stacked-DAG sections** (`df8a694c`) and
+  **os-map** (`e66fe50c`) carry their own items: the canvas absorbs
+  both.
+
 ## Open questions
 
 ### Q1: How does the claim hop render, and do personal queues always show?
