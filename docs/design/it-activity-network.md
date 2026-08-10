@@ -26,12 +26,25 @@ route cannot show the shared stations.
 
 ## The vocabulary, grounded in what exists
 
-- **Station** — where work waits plus who acts: a role-queue and the
-  executors that pull from it; the dispatcher's rule-machine as one
-  station; NAMED external stations (GitHub/CI — the second half of
-  `39d5bfde`) where packets leave the department and return changed.
-- **Rails (declared edges)** — the workflow graphs and the
-  `job_edges` registry: the SDN control plane, drawn faint.
+- **Station = a queue where work can sit** (David's clarification,
+  2026-08-10). Two kinds: shared role-queues, and each actor's
+  personal queue. Actors are the PROCESSORS attached to queues —
+  they drain them and make hand-offs — not nodes themselves. The
+  data model already speaks this exactly: `list_assignments` takes
+  `assignee_id` (the personal queue) and `roles` (the claimable
+  shared queues). The dispatcher needs no special case: its personal
+  queue is the JetStream durable consumer. External stations
+  (GitHub/CI — the second half of `39d5bfde`) are external queues
+  where packets leave the department and return changed. `/me` and
+  the canvas's personal-queue station are the same object at two
+  zoom levels.
+- **Claiming is motion**: a packet claimed from a role-queue HOPS to
+  the claimant's personal queue — the assignment moment, invisible
+  bookkeeping today, renders as a transfer.
+- **Rails (declared routes + routing rules)** — the workflow graphs
+  and the `job_edges` registry, with `ready_when` predicates as the
+  routing rules that move a packet between queues: the SDN control
+  plane, drawn faint.
 - **Traffic (observed edges)** — actual handoffs. Already built:
   `os_map.rs` pairs consecutive step completions into actor→actor
   handoffs (`e66fe50c`: the os-map is this design's traffic layer,
@@ -52,14 +65,17 @@ wrong.
 
 ## Open questions
 
-### Q1: What exactly is a station on the IT canvas, v1?
+### Q1: How does the claim hop render, and do personal queues always show?
 
-Proposed: one station per role-queue that IT's workflows reference
-(platform-admin dominates today), one per named human executor, ONE
-for the dispatcher's whole rule-machine, one per named external
-(github-ci). Deliberately not (role × step-kind) — that multiplies
-stations back toward the DAG view. Executors group visually inside
-their role-queue's station.
+Stations are settled (operator, 2026-08-10): queues only — shared
+role-queues + personal queues, actors as attached processors. What
+remains: does every actor's personal queue draw permanently (N
+stations for N staff — noisy at company scale) or materialize when
+occupied? And does the role→personal claim hop animate like any
+other transfer, or as a distinct "pull" gesture? Proposed: personal
+queues render when non-empty or recently active; the claim hop is
+the same motion grammar as every transfer — one grammar, no special
+cases.
 
 ### Q2: Are rails drawn per-kind or merged?
 
