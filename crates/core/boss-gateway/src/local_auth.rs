@@ -316,17 +316,17 @@ fn sha256_hex(s: &str) -> String {
 // --------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-struct BootstrapScope {
-    id: String,
-    role: String,
-    department: Option<String>,
+pub(crate) struct BootstrapScope {
+    pub(crate) id: String,
+    pub(crate) role: String,
+    pub(crate) department: Option<String>,
     #[serde(default)]
-    territory_account_ids: Vec<String>,
+    pub(crate) territory_account_ids: Vec<String>,
     #[serde(default)]
-    direct_report_ids: Vec<String>,
+    pub(crate) direct_report_ids: Vec<String>,
 }
 
-async fn bootstrap_email(http: &reqwest::Client, email: &str) -> Option<BootstrapScope> {
+pub(crate) async fn bootstrap_email(http: &reqwest::Client, email: &str) -> Option<BootstrapScope> {
     let upstream =
         std::env::var("BOSS_PEOPLE_UPSTREAM").unwrap_or_else(|_| boss_ports::url("people"));
     let url = format!(
@@ -374,6 +374,9 @@ pub struct LocalAuthState {
     /// cost of mailbombing a known address and of probing, and it
     /// does not survive horizontal scaling.
     pub forgot_seen: std::sync::Arc<RwLock<HashMap<String, std::time::Instant>>>,
+    /// OIDC runtime when the IdP is configured (idm-kanidm.md).
+    /// None → the oidc routes answer honestly that they are off.
+    pub oidc: Option<std::sync::Arc<crate::oidc::OidcRuntime>>,
     /// Whether this deployment offers the read-only guest session.
     /// Off unless the deployment declares itself a demo — a tenant
     /// running BOSS on real data does not hand out a session that
@@ -814,6 +817,7 @@ mod tests {
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
             guest_access: false,
+            oidc: None,
             mail: transport.clone(),
             public_url: "https://boss.test".into(),
             forgot_seen: Default::default(),
@@ -918,6 +922,7 @@ mod tests {
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
             guest_access: enabled,
+            oidc: None,
             mail: Arc::new(crate::mail::LogTransport),
             public_url: "https://boss.test".into(),
             forgot_seen: Default::default(),

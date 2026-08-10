@@ -121,6 +121,11 @@ async fn main() -> Result<()> {
             // access, and neither effect was visible from the name.
             guest_access: std::env::var("BOSS_GUEST_ACCESS").as_deref() == Ok("1"),
             mail: boss_gateway::mail::from_env(),
+            // The IdP front door (idm-kanidm.md). Absent config →
+            // None → the oidc routes answer that they are off, the
+            // same honesty pattern as the mail transport above.
+            oidc: boss_gateway::oidc::OidcConfig::from_env()
+                .map(boss_gateway::oidc::OidcRuntime::new),
             // Origin the reset link points at. Falls back to the
             // loopback listener, which is right for a laptop and
             // obviously wrong in a deploy — a link nobody outside the
@@ -584,7 +589,23 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
         )
         .route(
             "/api/auth/reset",
-            axum::routing::post(local_auth::reset).with_state(la),
+            axum::routing::post(local_auth::reset).with_state(la.clone()),
+        )
+        // The IdP front door (idm-kanidm.md): probe, redirect,
+        // callback. Same state as local auth on purpose — OIDC is
+        // another way to authenticate an email, and everything after
+        // the email is the local-login pipeline.
+        .route(
+            "/api/auth/oidc/available",
+            axum::routing::get(boss_gateway::oidc::available).with_state(la.clone()),
+        )
+        .route(
+            "/api/auth/oidc/login",
+            axum::routing::get(boss_gateway::oidc::login).with_state(la.clone()),
+        )
+        .route(
+            "/api/auth/oidc/callback",
+            axum::routing::get(boss_gateway::oidc::callback).with_state(la),
         )
     } else {
         app
@@ -867,6 +888,7 @@ mod routing_tests {
             session_key: vec![0u8; 32],
             http: reqwest::Client::new(),
             guest_access: true,
+            oidc: None,
             mail: boss_gateway::mail::from_env(),
             public_url: "https://boss.test".into(),
             forgot_seen: Default::default(),
