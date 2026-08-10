@@ -157,9 +157,35 @@
     }
   }
 
-  let extraMetadataEntries = $derived(
-    Object.entries(step.metadata).filter(([k]) => k !== 'due_on'),
-  );
+  /// System/structured leftovers only — human-written string context
+  /// renders as prose via contextEntries; declared fields render as
+  /// the form. What remains (objects, flags) shows as a small dump.
+  let extraMetadataEntries = $derived.by(() => {
+    const declared = new Set((step.fields ?? []).map((f) => f.name));
+    return Object.entries(step.metadata ?? {}).filter(
+      ([k, v]) =>
+        !declared.has(k) &&
+        !HIDDEN_KEYS.has(k) &&
+        !(typeof v === 'string' && v.trim().length > 0),
+    );
+  });
+
+  /// Undeclared string metadata is CONTEXT someone wrote for the
+  /// operator (a decision brief, options, an agent's analysis) — it
+  /// was invisible because only declared fields render, which turned
+  /// context-rich steps into bare forms. Internal routing keys stay
+  /// hidden.
+  const HIDDEN_KEYS = new Set([
+    'authority_role', 'due_on', 'notify_on_done', 'trigger_kind', 'trigger_name',
+  ]);
+  let contextEntries = $derived.by(() => {
+    const declared = new Set((step.fields ?? []).map((f) => f.name));
+    return Object.entries(step.metadata ?? {})
+      .filter(([k, v]) =>
+        !declared.has(k) && !HIDDEN_KEYS.has(k) &&
+        typeof v === 'string' && v.trim().length > 0)
+      .map(([k, v]) => ({ key: k.replaceAll('_', ' '), value: v as string }));
+  });
 </script>
 
 <div class="step-surface step-generic">
@@ -198,41 +224,58 @@
     />
   </div>
 
-  {#if extraMetadataEntries.length > 0}
-    {#if (step.fields ?? []).length > 0 && !terminal}
-      <!-- The step's own completion contract, rendered from data.
-           Validators run at `completed`, so a required field missing
-           here is not a warning — it is a step that cannot close. -->
-      <div class="step-fields">
-        {#each step.fields ?? [] as f (f.name)}
-          {@const options = optionsFor(f)}
-          <label class="step-field">
-            <span class="step-field-label">
-              {f.name.replace(/_/g, ' ')}{#if f.required}<span
-                  class="step-field-required"
-                  aria-hidden="true">*</span
-                >{/if}
-            </span>
-            {#if options}
-              <select class="step-field-input" bind:value={fieldValues[f.name]}>
-                <option value="">Choose…</option>
-                {#each options as o (o)}
-                  <option value={o}>{o}</option>
-                {/each}
-              </select>
-            {:else}
-              <input
-                class="step-field-input"
-                type="text"
-                bind:value={fieldValues[f.name]}
-                placeholder={f.field_type}
-              />
-            {/if}
-          </label>
-        {/each}
-      </div>
-    {/if}
+  {#if contextEntries.length > 0}
+    <!-- Human-written context (a decision brief, options, an agent's
+         analysis). This existed in metadata and never rendered — the
+         step page was "start buttons with no context" (2026-08-10). -->
+    <div class="gs-context">
+      {#each contextEntries as c (c.key)}
+        <div class="gs-context-item">
+          <span class="gs-context-k">{c.key}</span>
+          <p class="gs-context-v">{c.value}</p>
+        </div>
+      {/each}
+    </div>
+  {/if}
 
+  {#if (step.fields ?? []).length > 0 && !terminal}
+    <!-- The step's own completion contract, rendered from data.
+         Validators run at `completed`, so a required field missing
+         here is not a warning — it is a step that cannot close.
+         Independent of any metadata: the form's presence depends on
+         the CONTRACT, not on whether context happens to exist (they
+         were tangled, and a context-less step lost its form). -->
+    <div class="step-fields">
+      {#each step.fields ?? [] as f (f.name)}
+        {@const options = optionsFor(f)}
+        <label class="step-field">
+          <span class="step-field-label">
+            {f.name.replace(/_/g, ' ')}{#if f.required}<span
+                class="step-field-required"
+                aria-hidden="true">*</span
+              >{/if}
+          </span>
+          {#if options}
+            <select class="step-field-input" bind:value={fieldValues[f.name]}>
+              <option value="">Choose…</option>
+              {#each options as o (o)}
+                <option value={o}>{o}</option>
+              {/each}
+            </select>
+          {:else}
+            <input
+              class="step-field-input"
+              type="text"
+              bind:value={fieldValues[f.name]}
+              placeholder={f.field_type}
+            />
+          {/if}
+        </label>
+      {/each}
+    </div>
+  {/if}
+
+  {#if extraMetadataEntries.length > 0}
     <div class="step-metadata-display">
       {#each extraMetadataEntries as [k, v] (k)}
         <div class="step-meta-row">

@@ -94,6 +94,15 @@
   });
 
   onMount(load);
+
+  /// The Job's own brief — the filing message a feedback/backlog item
+  /// carries. Without it the step page is a form with no problem
+  /// statement ("start buttons with no context", 2026-08-10).
+  let jobBrief = $derived.by(() => {
+    const m = (job as unknown as { metadata?: Record<string, unknown> } | null)?.metadata;
+    const msg = m?.message ?? m?.body;
+    return typeof msg === 'string' && msg.trim() ? msg : null;
+  });
 </script>
 
 <div class="step-focus">
@@ -106,6 +115,13 @@
       <span class="step-focus-status">{step.status}</span>
     {/if}
   </div>
+
+  {#if jobBrief}
+    <details class="step-focus-brief" open>
+      <summary>Why this Job exists</summary>
+      <p>{jobBrief}</p>
+    </details>
+  {/if}
 
   <div class="step-focus-body">
     {#if loading}
@@ -136,6 +152,28 @@
 </div>
 
 <style>
+  .step-focus-brief {
+    margin: 10px 0 14px;
+    border: 1px solid var(--color-border, #e7e0d2);
+    border-radius: 8px;
+    padding: 10px 14px;
+    background: var(--color-bg-raised, #fff);
+  }
+  .step-focus-brief summary {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--color-fg-muted, #8a7a5f);
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .step-focus-brief p {
+    margin: 8px 0 0;
+    font-size: 13.5px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    max-width: 74ch;
+  }
   /* Offset below the fixed 44px chrome bar, then take everything. */
   .step-focus {
     position: absolute;
