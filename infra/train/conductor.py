@@ -57,10 +57,57 @@ BOSS_USER = json.dumps({
 
 DRY = "--dry-run" in sys.argv
 RECONCILE_ONLY = "--reconcile-only" in sys.argv
+PREFLIGHT_ONLY = "--preflight" in sys.argv
 
 
 def log(msg):
     print(f"conductor: {msg}", flush=True)
+
+
+# Phase 0 — pre-flight the locomotive
+#
+# The 2026-08-10 18:01 window crashed before boarding: a sudo probe had
+# left root-owned objects in the clone, and the conductor's fetch died
+# at the moment the window opened. The consist had been rehearsed; the
+# locomotive had not. Every entry (including the 10-minute reconcile,
+# which is thereby the early-warning cadence) proves the clone healthy
+# before touching train state, and a sick locomotive exits 3 — loud in
+# the unit's status — instead of surfacing at departure time.
+
+def preflight():
+    """Return a list of problems; empty means the locomotive is fit."""
+    problems = []
+    if os.geteuid() == 0:
+        # A root run is how the clone got poisoned in the first place:
+        # everything it touches stops belonging to the service user.
+        problems.append("running as root — the conductor owns its clone "
+                        "and a root run leaves root-owned objects behind")
+        return problems
+    if not os.path.isdir(os.path.join(CLONE, ".git")):
+        log("preflight: no clone yet — first boarding will create it")
+        return problems
+    me = os.geteuid()
+    foreign = []
+    for dirpath, _dirnames, filenames in os.walk(os.path.join(CLONE, ".git")):
+        for name in filenames:
+            p = os.path.join(dirpath, name)
+            try:
+                if os.lstat(p).st_uid != me:
+                    foreign.append(p)
+            except FileNotFoundError:
+                continue  # gc'd mid-walk; ownership of what remains is what matters
+    if foreign:
+        shown = ", ".join(foreign[:3])
+        problems.append(f"{len(foreign)} object(s) in the clone not owned "
+                        f"by uid {me} (e.g. {shown}) — a foreign-uid run "
+                        f"has poisoned {CLONE}")
+    for remote in ("origin", "fork"):
+        r = sh("git", "-C", CLONE, "fetch", remote, "--prune", "--dry-run",
+               check=False)
+        if r.returncode != 0:
+            problems.append(f"dry fetch of {remote} failed: "
+                            f"{r.stderr.strip().splitlines()[-1] if r.stderr.strip() else 'rc=' + str(r.returncode)}")
+    return problems
 
 
 def api(method, path, payload=None):
@@ -282,6 +329,12 @@ def candidates():
                 f"fork/{branch}", check=False)
         if ok.returncode != 0:
             log(f"{j['id'][:8]}: branch {branch} not on fork — leaving behind")
+            if not DRY:
+                # Loud on the Job, not just in the journal: the author
+                # parked this at review believing it would board.
+                merge_job_metadata(j["id"], skip_reason=f"branch {branch} "
+                                   "not found on the fork — push it, then "
+                                   "the next train boards it")
             continue
         out.append((j, branch))
     return out
@@ -333,9 +386,15 @@ def board(now):
         if r.returncode == 0:
             boarded.append((j, branch))
         else:
+            conflicted = sh("git", "-C", CLONE, "diff", "--name-only",
+                            "--diff-filter=U", check=False).stdout.split()
             sh("git", "-C", CLONE, "merge", "--abort", check=False)
             skipped.append((j, branch))
-            log(f"conflict merging {branch} — left for the next train")
+            files = ", ".join(conflicted) or "unresolved (merge died before conflict markers)"
+            merge_job_metadata(j["id"], skip_reason=f"merge conflict with "
+                               f"this window's train in: {files} — rebase "
+                               "onto main and repark at review")
+            log(f"conflict merging {branch} ({files}) — left for the next train")
 
     if not boarded:
         merge_job_metadata(train["id"], empty="true")
@@ -373,7 +432,9 @@ def board(now):
         review = find_step(j, "review", "Open for review")
         complete_step(j, review, pr_url=pr_url,
                       note=f"boarded train {train['id'][:8]} ({train_branch})")
-        merge_job_metadata(j["id"], train=train["id"])
+        # skip_reason cleared on boarding: an earlier window's skip note
+        # must not outlive the skip.
+        merge_job_metadata(j["id"], train=train["id"], skip_reason="")
     log(f"train {train['id'][:8]} boarded {len(boarded)}, PR {pr_url}")
 
 
@@ -383,7 +444,18 @@ def main():
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
+        # A held lock means a conductor run is active right now — the
+        # locomotive is demonstrably pulling; a standalone pre-flight
+        # has nothing further to prove.
         log("another conductor run holds the lock — leaving")
+        return 0
+    problems = preflight()
+    if problems:
+        for p in problems:
+            log(f"preflight FAIL: {p}")
+        return 3
+    log("preflight ok")
+    if PREFLIGHT_ONLY:
         return 0
     reconcile()
     if not RECONCILE_ONLY:
