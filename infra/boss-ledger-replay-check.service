@@ -15,7 +15,13 @@ Type=oneshot
 # every fact write nightly). Exit code 1 → divergence →
 # systemctl is-failed → OnFailure hook fires the alert.
 Environment=RUST_LOG=info
+# Maintenance visibility (internal-forge Q6): the run is a Job.
+# Pre ensures the open Job (spawns today's, or reuses a standing
+# failure so recovery closes it); Post completes `run` on SUCCESS
+# only — a failed run leaves the Job open and loud.
+ExecStartPre=/opt/boss/infra/boss-maintenance-wrap.sh maintenance-ledger-replay "Ledger replay check"
 ExecStart=/usr/local/bin/boss-ledger-replay-check --deep --config /etc/boss-ledger-api.toml
+ExecStartPost=/opt/boss/infra/boss-step.sh maintenance-ledger-replay run result=ok
 # Runs as root to match the boss-audit-integrity-check timer pattern. The
 # check authenticates to Postgres via the `boss` role in postgres_url, not
 # the Linux user. Tighten to a dedicated service user once Boss adopts
