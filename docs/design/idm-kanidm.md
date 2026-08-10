@@ -53,6 +53,8 @@ outage must not lock the operators out of the system that runs the
 company. The migration plan is untouched — the move happens on local
 auth; OIDC lands after.
 
+## Open questions
+
 ### Q1: Does the gateway hold the session, or does every request carry the token?
 
 Today the gateway issues its own session after local auth. Keeping

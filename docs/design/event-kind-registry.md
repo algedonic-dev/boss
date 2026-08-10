@@ -56,6 +56,19 @@ So the registry is compositional: a family row says "kinds matching
 shape is the step-done envelope." Declaring the family once covers
 every current and future step kind without a migration per step type.
 
+## What this unblocks
+
+- `payload-encryption.md` Q2 gets its home: sensitivity classification
+  becomes columns/rows hanging off `event_kinds` fields.
+- Dispatcher rule authoring can validate `on_event` against declared
+  kinds at draft time — the typo'd-topic class dies at authoring
+  instead of silently delivering zero.
+- The ontology David asked for ("a good initial central ontology of
+  meaningful semantics") gets its system-of-record surface: 120 kinds
+  with descriptions, browsable in the UI like every other registry.
+
+## Open questions
+
 ### Q1: Registry table or generated manifest?
 
 A `event_kinds` table (authored like `job_edges`, seeded by migration)
@@ -96,14 +109,3 @@ sweep for anything the constants miss; families from the three `step.*`
 patterns. One migration, reviewed against the measured inventory. The
 per-crate constants stay (they are the emit-site spelling); the §9a
 test pins constants ↔ registry rows so neither drifts.
-
-## What this unblocks
-
-- `payload-encryption.md` Q2 gets its home: sensitivity classification
-  becomes columns/rows hanging off `event_kinds` fields.
-- Dispatcher rule authoring can validate `on_event` against declared
-  kinds at draft time — the typo'd-topic class dies at authoring
-  instead of silently delivering zero.
-- The ontology David asked for ("a good initial central ontology of
-  meaningful semantics") gets its system-of-record surface: 120 kinds
-  with descriptions, browsable in the UI like every other registry.
