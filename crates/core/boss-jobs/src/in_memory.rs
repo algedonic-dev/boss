@@ -79,6 +79,19 @@ fn matches_filter(job: &Job, filter: &JobFilter) -> bool {
     {
         return false;
     }
+    if let Some(ref blocker) = filter.waiting_on {
+        // Same resolution contract as the Pg predicate: the waiter
+        // wrote the blocker's full id or a >= 8-char prefix of it.
+        let wrote = job
+            .metadata
+            .get("waiting_on")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let matches = wrote == blocker.as_str() || (wrote.len() >= 8 && blocker.starts_with(wrote));
+        if !matches {
+            return false;
+        }
+    }
     match &filter.scope {
         JobScope::All => {}
         JobScope::None => return false,

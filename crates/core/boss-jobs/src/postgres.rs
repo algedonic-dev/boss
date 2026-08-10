@@ -483,6 +483,15 @@ impl JobsRepository for PgJobs {
                     AND subject_id = ANY($9))
               )
               AND ($10::text IS NULL OR subject_id = $10)
+              -- $11 is the BLOCKER's full id: a waiter matches on the
+              -- full id or a >= 8-char prefix of it, mirroring
+              -- job_edge_resolves so every accepted wait is findable.
+              AND (
+                $11::text IS NULL
+                OR metadata->>'waiting_on' = $11
+                OR (length(metadata->>'waiting_on') >= 8
+                    AND $11 LIKE (metadata->>'waiting_on') || '%')
+              )
             ORDER BY opened_on DESC
             LIMIT $5 OFFSET $6
         "#;
@@ -498,6 +507,7 @@ impl JobsRepository for PgJobs {
             .bind(scope_owners.as_deref())
             .bind(scope_accounts.as_deref())
             .bind(filter.subject_id.as_deref())
+            .bind(filter.waiting_on.as_deref())
             .fetch_all(&self.pool)
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -517,6 +527,12 @@ impl JobsRepository for PgJobs {
                     AND subject_id = ANY($7))
               )
               AND ($8::text IS NULL OR subject_id = $8)
+              AND (
+                $9::text IS NULL
+                OR metadata->>'waiting_on' = $9
+                OR (length(metadata->>'waiting_on') >= 8
+                    AND $9 LIKE (metadata->>'waiting_on') || '%')
+              )
             "#,
         )
         .bind(filter.kind.as_deref())
@@ -527,6 +543,7 @@ impl JobsRepository for PgJobs {
         .bind(scope_owners.as_deref())
         .bind(scope_accounts.as_deref())
         .bind(filter.subject_id.as_deref())
+        .bind(filter.waiting_on.as_deref())
         .fetch_one(&self.pool)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;

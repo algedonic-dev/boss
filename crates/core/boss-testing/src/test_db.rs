@@ -196,6 +196,10 @@ const SCHEMA_FILES: &[(&str, &str)] = &[
         "109-dispatcher-rule-flush-queue",
         include_str!("../../../../infra/postgres/schema/109-dispatcher-rule-flush-queue.sql"),
     ),
+    (
+        "110-waiting-on-edge",
+        include_str!("../../../../infra/postgres/schema/110-waiting-on-edge.sql"),
+    ),
 ];
 
 /// Concatenate the schema files in manifest order, omitting any whose name

@@ -440,3 +440,16 @@ name = "design-decision-flush-queue"
 on_event = "docs.design.decision_recorded"
 [[rule.do]]
 handler = "docs.flush_queue"
+
+# A closed Job wakes its waiters (e9291570, reopening 50e78d70): any
+# Job carrying `metadata.waiting_on` naming the closed Job (full id or
+# >= 8-char prefix — the `('*','waiting_on')` edge, migration 110)
+# gets the key cleared through jobs-api, whose update path re-evaluates
+# metadata-gated steps (aa9980c8) in the same write. No `when`: every
+# close runs one indexed usually-empty query. Seeded live by
+# 110-waiting-on-edge.sql.
+[[rule]]
+name = "jobs-clear-waiting-on"
+on_event = "jobs.job.closed"
+[[rule.do]]
+handler = "jobs.clear_waiting"
