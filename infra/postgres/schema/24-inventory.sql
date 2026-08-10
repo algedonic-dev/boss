@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS inventory_items (
     -- so balance(1300) == Σ value_cents cannot drift — the old
     -- integer-cent weighted average leaked a truncated cent per
     -- receive, a $100–$200 valuation step at 10–20K-unit scale.
-    -- Design + decisions: docs/architecture-decisions.md §Finance & ledger.
+    -- Design + decisions: docs/design/inventory-value-conservation.md.
     value_cents         BIGINT NOT NULL DEFAULT 0,
     -- Display-only unit cost, derived — never an input to a GL
     -- amount, never writable (a stale writer that still tries to

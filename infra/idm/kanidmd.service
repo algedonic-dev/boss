@@ -1,0 +1,24 @@
+# kanidmd — the company IdP (docs/design/idm-kanidm.md).
+# Installed by install-kanidm.sh. Runs as its own user; state under
+# /var/lib/kanidm (in the backup set — losing it loses passkeys).
+[Unit]
+Description=Kanidm identity server — the front door for real people
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+DynamicUser=yes
+StateDirectory=kanidm
+ExecStart=/usr/local/bin/kanidmd server -c /etc/kanidm/server.toml
+Restart=on-failure
+RestartSec=5
+# The cert dir is root-owned; kanidmd only needs read.
+SupplementaryGroups=ssl-cert
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/kanidm
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

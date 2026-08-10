@@ -14,7 +14,7 @@
 -- running the same View see the same numbers. A row here that cached its
 -- own results would be the silo this design exists to refuse.
 --
--- Recorded in docs/architecture-decisions.md §Step UX & frontend.
+-- Recorded in docs/design/home-workspace-and-department-apps.md.
 
 CREATE TABLE IF NOT EXISTS views (
     id          TEXT PRIMARY KEY,
