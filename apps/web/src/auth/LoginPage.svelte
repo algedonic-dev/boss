@@ -18,6 +18,10 @@
   let busy = $state<boolean>(false);
   let error = $state<string | null>(null);
   let guestOffered = $state<boolean>(false);
+  // Same ask-before-offering contract as guest: the IdP button only
+  // renders where the gateway says OIDC is configured (idm-kanidm) -
+  // a deployment without the front door never shows a door.
+  let oidcOffered = $state<boolean>(false);
 
   // If the SPA already has a session (someone hit /login while
   // logged in), redirect to home rather than bury them in a form.
@@ -46,6 +50,12 @@
       if (r.ok) guestOffered = (await r.json()).enabled === true;
     } catch {
       // no availability endpoint — no button.
+    }
+    try {
+      const r = await fetch('/api/auth/oidc/available');
+      if (r.ok) oidcOffered = (await r.json()).enabled === true;
+    } catch {
+      // gateway predates the front door — no button.
     }
   });
 
@@ -254,6 +264,12 @@
     height: 1px;
     background: #e7e5e4;
   }
+  .oidc-btn {
+    display: block;
+    text-align: center;
+    text-decoration: none;
+    box-sizing: border-box;
+  }
   .guest-btn {
     width: 100%;
     background: #fff;
@@ -357,6 +373,20 @@
       </div>
     </form>
 
+    {#if oidcOffered && mode === 'login'}
+      <div class="guest-block">
+        <div class="guest-divider"><span>or</span></div>
+        <!-- A NAVIGATION, not a fetch: the auth-code flow is a round
+             trip through the IdP and back to the callback. -->
+        <a class="guest-btn oidc-btn" href="/api/auth/oidc/login">
+          Sign in with Algedonic ID
+        </a>
+        <p class="guest-note">
+          Your company passkey, via the identity server. Same account,
+          stronger door.
+        </p>
+      </div>
+    {/if}
     {#if guestOffered && mode === 'login'}
       <div class="guest-block">
         <div class="guest-divider"><span>or</span></div>
