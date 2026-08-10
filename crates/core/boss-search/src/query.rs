@@ -1,7 +1,7 @@
 //! The query — one round trip that returns a Subject with the Jobs
 //! about it and the events behind those.
 //!
-//! Q3 in docs/design/global-search.md refused a Subjects-only v1: it
+//! Q3 in docs/architecture-decisions.md §Search refused a Subjects-only v1: it
 //! ships sooner and demonstrates nothing a conventional search box
 //! does not, while setting the expectation that search IS a name
 //! lookup. So the unified shape is here from the first release.

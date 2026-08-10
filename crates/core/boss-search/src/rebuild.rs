@@ -9,7 +9,7 @@
 //! previous `search_all()` UNION-ed seven Tier-2 tables live. That is
 //! cheaper and it is what most systems do, but it makes search a view
 //! of whatever the domain projections currently say. Q2 in
-//! docs/design/global-search.md chose a projection instead, so search
+//! docs/architecture-decisions.md §Search chose a projection instead, so search
 //! reproduces from the log rather than drifting from it, and a thing
 //! absent from a domain table is still findable.
 

@@ -32,7 +32,7 @@ import { readFileSync } from 'node:fs';
 /// surfaces have now moved wholesale from the retired `model` app
 /// into `it` — the review resolved that IT is the department and
 /// System Model lives inside it, rather than the two being separate
-/// tabs (home-workspace-and-department-apps.md, Q2). The MEMBERSHIP
+/// tabs (architecture-decisions.md §Step UX & frontend). The MEMBERSHIP
 /// is still pinned verbatim: the app they belong to changed, which
 /// surfaces belong together did not. If a future change moves a
 /// surface into or out of the set, this list is the thing to update,

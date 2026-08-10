@@ -13,7 +13,7 @@
 //! numbers.
 //!
 //! Design + decision history:
-//! `docs/design/home-workspace-and-department-apps.md`.
+//! `docs/architecture-decisions.md §Step UX & frontend`.
 
 pub mod error;
 pub mod filter;

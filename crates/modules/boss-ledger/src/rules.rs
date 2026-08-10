@@ -1214,7 +1214,7 @@ fn invoice_issued(fact: &FactRef<'_>) -> Result<JournalEntryDraft, LedgerError> 
     let mut deferred_by_category: std::collections::BTreeMap<String, i64> =
         std::collections::BTreeMap::new();
     // COGS is NOT part of the invoice JE. Per Q2
-    // (docs/design/inventory-value-conservation.md, resolved
+    // (docs/architecture-decisions.md §Finance & ledger, resolved
     // 2026-07-07) the consume owns it: the dispatcher's
     // `products-consume-on-invoice-created` rule drives
     // `/api/products/{sku}/inventory/consume` per FG line, which
