@@ -145,6 +145,35 @@ impl DocsRepository for PgDocsRepo {
     ) -> Result<(), DocsError> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
 
+        // Change detection for the `docs.design.indexed` event
+        // (dogfooding arc e556c000, S1): the startup auto-reindex
+        // re-upserts every doc on every boot, so emitting
+        // unconditionally would spam the log ~23 events per restart
+        // and re-fire any spawn-review rule forever. Emit only when
+        // the review-relevant surface moved: title, status, or the
+        // open/resolved question counts.
+        let prior: Option<(String, String, i64, i64)> = sqlx::query_as(
+            "SELECT d.title, d.status,
+                    count(*) FILTER (WHERE NOT q.resolved),
+                    count(*) FILTER (WHERE q.resolved)
+             FROM design_docs d
+             LEFT JOIN design_questions q ON q.doc_path = d.path
+             WHERE d.path = $1
+             GROUP BY d.title, d.status",
+        )
+        .bind(&doc.path)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(storage)?;
+        let open = questions.iter().filter(|q| !q.resolved).count() as i64;
+        let resolved = questions.iter().filter(|q| q.resolved).count() as i64;
+        let changed = match &prior {
+            None => true,
+            Some((t, s, o, r)) => {
+                t != &doc.title || s != doc.status.as_str() || *o != open || *r != resolved
+            }
+        };
+
         sqlx::query(
             "INSERT INTO design_docs (
                 path, title, status, pending_count, word_count,
@@ -174,6 +203,26 @@ impl DocsRepository for PgDocsRepo {
         .execute(&mut *tx)
         .await
         .map_err(storage)?;
+
+        if changed {
+            let event = boss_core::event::Event {
+                id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                source: "docs".to_string(),
+                kind: "docs.design.indexed".to_string(),
+                payload: serde_json::json!({
+                    "path": doc.path,
+                    "title": doc.title,
+                    "status": doc.status.as_str(),
+                    "open_questions": open,
+                    "resolved_questions": resolved,
+                    "first_index": prior.is_none(),
+                }),
+            };
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(storage)?;
+        }
 
         // Delete-and-reinsert the question set for this doc.
         sqlx::query("DELETE FROM design_questions WHERE doc_path = $1")
@@ -303,6 +352,27 @@ impl DocsRepository for PgDocsRepo {
         .execute(&mut *tx)
         .await
         .map_err(storage)?;
+
+        // The decision is the event the review lifecycle turns on
+        // (dogfooding arc e556c000, S1): a dispatcher rule can now
+        // complete the review step / queue the flush instead of a
+        // human noticing.
+        let event = boss_core::event::Event {
+            id: Uuid::new_v4(),
+            timestamp: now,
+            source: "docs".to_string(),
+            kind: "docs.design.decision_recorded".to_string(),
+            payload: serde_json::json!({
+                "doc_path": input.doc_path,
+                "anchor": input.anchor,
+                "kind": input.kind.as_str(),
+                "resolution": input.resolution,
+                "decided_by": decided_by,
+            }),
+        };
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(storage)?;
 
         // Refresh pending_count on the doc row.
         sqlx::query(
