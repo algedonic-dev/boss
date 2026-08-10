@@ -17,10 +17,11 @@ path = "src/bin/boss_docs_api.rs"
 # crashlooped on startup with the "without the postgres feature"
 # error. Same fix shape as boss-events::bin (2026-05-05).
 default = ["postgres"]
-postgres = ["dep:sqlx"]
+postgres = ["dep:sqlx", "boss-events/postgres"]
 
 [dependencies]
 boss-core = { path = "../boss-core" }
+boss-events = { path = "../boss-events" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
