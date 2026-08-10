@@ -12,7 +12,7 @@
 //! is decided (it commits on the operator's checkout and pushes
 //! origin blind — the item names it; docs-as-data owns the answer).
 
-use super::common::dispatcher_actor_header;
+use super::common::{dispatcher_actor_header, sim_origin_value};
 use async_trait::async_trait;
 use boss_dispatcher::rules::expr::Value;
 use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext};
@@ -61,6 +61,11 @@ impl Handler for DocsFlushQueue {
             .client
             .post(&url)
             .header("x-boss-user", dispatcher_actor_header(&ctx.rule_name))
+            // Sim-ness inheritance: a flush queued off a simulated
+            // decision must record as simulated (the jobs.spawn
+            // precedent — an unstamped call once made sim Jobs real
+            // and immune to the epoch trim).
+            .header("x-sim-origin", sim_origin_value())
             .json(&serde_json::json!({ "doc_path": doc_path }))
             .send()
             .await
