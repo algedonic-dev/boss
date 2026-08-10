@@ -197,7 +197,7 @@ fn slug_for(doc_path: &str) -> String {
 
 /// Try to extract a stable anchor from an H3 heading like "Q1: foo".
 /// Returns the anchor (`Q1`) and the remaining title text.
-fn parse_h3_anchor(heading: &str) -> Option<(String, String)> {
+pub(crate) fn parse_h3_anchor(heading: &str) -> Option<(String, String)> {
     let trimmed = heading.trim_start();
     // Accept "Q<number>:" or "D<number>:" (we only care about Q here,
     // but the same shape works for future decision anchors).

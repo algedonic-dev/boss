@@ -504,6 +504,25 @@
       }
       try {
         const r = await fetch(`/api/design/docs/${docPath}`);
+        if (r.status === 404) {
+          // The honest miss (2e6dfde7): review Jobs are instant data
+          // but docs ride trains, so a review can exist before its
+          // doc reaches deployed main. A bare 404 read as a dead end
+          // to the first operator who hit it; say what is actually
+          // happening and when it resolves.
+          loadError =
+            `${docPath} is not on the deployed main yet — docs ride ` +
+            `release trains, and this review was opened ahead of its ` +
+            `doc's landing. It becomes reviewable when the train ` +
+            `carrying the doc merges and deploys. If this persists ` +
+            `after a landing, the doc may have been REJECTED at ` +
+            `reindex (stray questions outside '## Open questions') — ` +
+            `the rejection reason is recorded at /system/design.`;
+          renderBody();
+          renderProgress();
+          renderActions();
+          return;
+        }
         if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
         const detail = await r.json();
         doc = detail;

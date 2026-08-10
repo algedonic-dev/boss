@@ -80,6 +80,14 @@ pub fn stream_subjects() -> Vec<String> {
         "commerce.>",
         "ledger.>",
         "asset.>",
+        // `docs.>` joined 2026-08-10 (dogfooding arc e556c000, S2):
+        // the design-review-spawn rule consumes `docs.design.indexed`,
+        // and the coverage tripwire below this comment's lineage
+        // (stream_covers_every_rule_topic) failed the build until the
+        // family flowed into the stream — the exact silent-zero class
+        // it was written for, caught at compile-adjacent time instead
+        // of in production.
+        "docs.>",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -413,7 +421,8 @@ mod tests {
                 "inventory.>",
                 "commerce.>",
                 "ledger.>",
-                "asset.>"
+                "asset.>",
+                "docs.>"
             ]
         );
         assert_eq!(c.retention, stream::RetentionPolicy::Limits);

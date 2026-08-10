@@ -87,8 +87,16 @@ async fn drop_db(name: &str) {
 
 /// Run a migrate.sh (real or copied) against `db_url` with the given
 /// script args, connecting via `-- psql <url>`.
+///
+/// Spawned via `bash <script>`, never by exec'ing the copy directly:
+/// tests run as threads of one process, and a fork in thread A can
+/// inherit thread B's still-open write-fd from `fs::copy` — exec'ing
+/// B's file then fails ETXTBSY ("Text file busy", first struck on
+/// train #222, `df69249e`). bash opens the script READ-ONLY, so the
+/// race is impossible by construction.
 fn run(script: &Path, args: &[&str], db_url: &str) -> Output {
-    std::process::Command::new(script)
+    std::process::Command::new("bash")
+        .arg(script)
         .args(args)
         .args(["--", "psql", db_url])
         .output()

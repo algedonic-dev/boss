@@ -26,6 +26,13 @@ for f in /etc/boss-*.toml; do
   [ -f "$f" ] && cp "$f" "${DEST}/"
 done
 
+# Kanidm IdP state (idm-kanidm.md Q4): the online-backup dir joins
+# the set — losing it loses every person's credentials and passkeys.
+if [ -d /var/lib/kanidm ]; then
+  echo "  copying kanidm state..."
+  cp -a /var/lib/kanidm/backups/ "${DEST}/kanidm-backups/" 2>/dev/null || echo "  (kanidm present but no backups yet)"
+fi
+
 # Postgres dump
 echo "  dumping Postgres..."
 sudo -u postgres pg_dump boss --no-owner --no-privileges > "${DEST}/boss.sql" 2>/dev/null || echo "  (skipped — pg_dump failed)"

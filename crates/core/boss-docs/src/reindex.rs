@@ -147,6 +147,47 @@ async fn reindex_one(
         )));
     }
 
+    // A live `### Qn:` heading OUTSIDE `## Open questions` is worse
+    // than a rejected doc: the tracker ingests questions only from
+    // that section, so the doc indexes cleanly with the question
+    // silently absent — an operator opens the review panel and sees
+    // nothing to answer. Two docs shipped exactly that way
+    // (`c6b426f3`); the silence was the bug, so the miss is now loud.
+    // Compare by ANCHOR, not title text: the doc-wide scan keeps the
+    // full "Qn: …" heading while section questions store the anchor
+    // and the remainder separately — a text comparison would flag
+    // every legitimate in-section question as stray.
+    let in_section: std::collections::HashSet<&str> = parsed
+        .questions
+        .iter()
+        .filter(|q| !q.resolved)
+        .map(|q| q.anchor.as_str())
+        .collect();
+    let stray: Vec<&String> = parsed
+        .unresolved_questions
+        .iter()
+        .filter(|t| {
+            crate::parser::parse_h3_anchor(t)
+                .map(|(anchor, _)| !in_section.contains(anchor.as_str()))
+                .unwrap_or(false)
+        })
+        .collect();
+    if !stray.is_empty() {
+        return Err(DocsError::BadRequest(format!(
+            "{rel_path}: {n} live question{plural} outside `## Open questions` \
+             ({titles}) — the tracker cannot see them there. Move each \
+             `### Qn:` heading into the `## Open questions` section \
+             (or mark it `(resolved)` if it is settled).",
+            n = stray.len(),
+            plural = if stray.len() == 1 { "" } else { "s" },
+            titles = stray
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )));
+    }
+
     // Fetch git metadata; fall back to filesystem mtime + "unknown"
     // author if git fails.
     let (last_modified, last_author, last_commit_sha) = git_metadata(repo_root, abs_path)
@@ -272,6 +313,57 @@ mod tests {
         assert!(doc.last_commit_sha.len() >= 7);
         let questions = repo.questions_for_doc(target).await.unwrap();
         assert_eq!(questions.len(), 0, "framing doc has no open questions");
+    }
+
+    /// The silent-zero class (`c6b426f3`): two docs shipped with live
+    /// `### Qn:` headings OUTSIDE `## Open questions` and indexed
+    /// cleanly with zero tracker rows — an operator opened the review
+    /// panel and saw nothing to answer. The miss is now a loud
+    /// rejection naming the stray anchors; docs whose questions live
+    /// in the section (plus resolved history anywhere) stay clean.
+    #[tokio::test]
+    async fn a_live_question_outside_the_section_rejects_loudly() {
+        let dir = std::env::temp_dir().join(format!("boss-docs-stray-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("docs/design")).unwrap();
+        std::fs::write(
+            dir.join("docs/design/stray.md"),
+            "# Design: stray\n\n**Status:** draft\n\n## Body\n\n### Q1: Where does this live?\n\nSomewhere.\n",
+        )
+        .unwrap();
+        let repo = InMemoryDocsRepo::new();
+        let stats = reindex(&repo, &dir).await.unwrap();
+        assert_eq!(stats.docs_indexed, 0, "the stray doc must not index");
+        assert_eq!(stats.rejected.len(), 1, "{:?}", stats.rejected);
+        let reason = &stats.rejected[0].reason;
+        assert!(reason.contains("Q1"), "names the stray anchor: {reason}");
+        assert!(
+            reason.contains("Open questions"),
+            "tells the author where it goes: {reason}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn in_section_questions_plus_resolved_history_index_cleanly() {
+        // The settled-doc shape: live questions under the section,
+        // resolved ones in a Decision-history — both legitimate.
+        let dir = std::env::temp_dir().join(format!("boss-docs-clean-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("docs/design")).unwrap();
+        std::fs::write(
+            dir.join("docs/design/clean.md"),
+            "# Design: clean\n\n**Status:** draft\n\n## Open questions\n\n### Q1: Open one?\n\nBody.\n\n## Decisions\n\n### Q2: Settled one? (resolved)\n\nDone.\n",
+        )
+        .unwrap();
+        let repo = InMemoryDocsRepo::new();
+        let stats = reindex(&repo, &dir).await.unwrap();
+        assert_eq!(stats.rejected.len(), 0, "{:?}", stats.rejected);
+        assert_eq!(stats.docs_indexed, 1);
+        let qs = repo
+            .questions_for_doc("docs/design/clean.md")
+            .await
+            .unwrap();
+        assert_eq!(qs.len(), 1, "the section question is tracked");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

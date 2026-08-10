@@ -182,6 +182,12 @@ const SCHEMA_FILES: &[(&str, &str)] = &[
         "106-notify-on-step-done",
         include_str!("../../../../infra/postgres/schema/106-notify-on-step-done.sql"),
     ),
+    (
+        "107-dispatcher-rule-design-review-spawn",
+        include_str!(
+            "../../../../infra/postgres/schema/107-dispatcher-rule-design-review-spawn.sql"
+        ),
+    ),
 ];
 
 /// Concatenate the schema files in manifest order, omitting any whose name
