@@ -32,3 +32,4 @@
 104-job-edges.sql
 105-job-edges-abort.sql
 106-notify-on-step-done.sql
+107-dispatcher-rule-design-review-spawn.sql
