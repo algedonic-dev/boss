@@ -17,6 +17,7 @@
   // second half of 39d5bfde) and edge pulses (dashboards Q3) — both
   // noted on the item.
   import StepDag from '../../jobs/StepDag.svelte';
+  import { connectLiveFlow, type FlowHit } from './liveFlow';
   import { workflowToDag } from '../../jobs/workflowToDag';
   import { decorateDagNodes, type FleetNodeStat, type StageStat } from '../../jobs/decorateDag';
   import { navigate } from '../../router';
@@ -39,6 +40,13 @@
   let sections = $state<ReadonlyArray<KindData>>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
+  // FlowMotion (1fb51180): live pulses per `${kind}:${slug}` node and
+  // the machine-activity ticker, fed by the audit SSE stream. The
+  // operator asked to SEE the automation working — ⚙ rows are the
+  // rules and dispatchers acting; 👤 rows are people.
+  let pulses = $state<Record<string, number>>({});
+  let ticker = $state<ReadonlyArray<FlowHit>>([]);
+  let liveSeen = $state(false);
 
   async function jsonOr<T>(url: string, fallback: T): Promise<T> {
     try {
@@ -141,6 +149,27 @@
     return () => clearInterval(t);
   });
 
+  $effect(() => {
+    const stop = connectLiveFlow((hit) => {
+      liveSeen = true;
+      const key = `${hit.jobKind}:${hit.slug}`;
+      pulses = { ...pulses, [key]: (pulses[key] ?? 0) + 1 };
+      ticker = [hit, ...ticker].slice(0, 30);
+    });
+    return stop;
+  });
+
+  function pulsedNodes(sec: KindData): KindData['nodes'] {
+    return sec.nodes.map((n) => {
+      const pulse = pulses[`${sec.kind}:${n.id}`];
+      return pulse ? { ...n, pulse } : n;
+    });
+  }
+
+  function clock(at: number): string {
+    return new Date(at).toISOString().slice(11, 19);
+  }
+
   function linksOutOf(kind: string): { field: string; count: number }[] {
     const section = sections.find((s) => s.kind === kind);
     if (!section) return [];
@@ -163,6 +192,26 @@
   {:else if error}
     <p class="fn-msg fn-err">{error}</p>
   {:else}
+    <div class="fn-ticker" aria-live="off">
+      <span class="fn-ticker-h">
+        machine activity
+        <span class="fn-dot" class:fn-dot-live={liveSeen} title={liveSeen ? 'events flowing' : 'waiting for events'}></span>
+      </span>
+      {#if ticker.length === 0}
+        <span class="fn-ticker-empty">quiet — the next step transition appears here live</span>
+      {:else}
+        <ul class="fn-ticker-list">
+          {#each ticker.slice(0, 12) as h (h.at + h.slug + h.jobId)}
+            <li class="fn-ticker-row" class:fn-machine={h.machine}>
+              <span class="fn-t">{clock(h.at)}</span>
+              <span class="fn-who">{h.machine ? '⚙' : '👤'}</span>
+              <span class="fn-what">{h.jobKind}/{h.slug} {h.phase}</span>
+              <span class="fn-job" title={h.jobTitle}>{h.jobTitle}</span>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
     {#each sections as sec, i (sec.kind)}
       {#if i > 0}
         {@const prev = sections[i - 1]}
@@ -180,7 +229,7 @@
           {sec.kind}
           <span class="fn-kind-n">{sec.openJobs} open</span>
         </button>
-        <StepDag nodes={sec.nodes} edges={sec.edges} />
+        <StepDag nodes={pulsedNodes(sec)} edges={sec.edges} />
       </div>
     {/each}
   {/if}
@@ -208,6 +257,69 @@
   }
   .fn-err {
     color: var(--color-danger, #a33);
+  }
+  .fn-ticker {
+    margin: 6px 0 14px;
+    padding: 10px 12px;
+    border: 1px solid var(--color-border, #e7e0d2);
+    border-radius: 8px;
+    background: var(--color-bg-raised, #fff);
+  }
+  .fn-ticker-h {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--color-fg-muted, #8a7a5f);
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .fn-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--color-border, #e7e0d2);
+    display: inline-block;
+  }
+  .fn-dot-live {
+    background: #16a34a;
+  }
+  .fn-ticker-empty {
+    margin-left: 10px;
+    font-size: 12px;
+    color: var(--color-fg-muted, #8a7a5f);
+  }
+  .fn-ticker-list {
+    list-style: none;
+    margin: 8px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+  .fn-ticker-row {
+    display: grid;
+    grid-template-columns: 4.6rem 1.2rem minmax(10rem, auto) 1fr;
+    gap: 8px;
+    font-size: 12px;
+    align-items: baseline;
+  }
+  .fn-ticker-row .fn-t {
+    font-variant-numeric: tabular-nums;
+    color: var(--color-fg-muted, #8a7a5f);
+  }
+  .fn-machine .fn-what {
+    color: #0f766e;
+    font-weight: 600;
+  }
+  .fn-ticker-row .fn-job {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--color-fg-muted, #8a7a5f);
   }
   .fn-kind {
     margin-top: 10px;
