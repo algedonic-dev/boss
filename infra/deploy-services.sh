@@ -188,8 +188,13 @@ TIMERS=(
     # the notify_on_done alerts are only as honest as this cadence.
     # Never boards, so the 2/day PR budget is untouched.
     "boss-pr-train-reconcile:train"
-    # boss-backup deferred — backup script destination + retention
-    # policy needs review before enabling on a fresh deploy.
+    # boss-backup: previously deferred over destination + retention
+    # review — but the UNIT is live on this box regardless, and the
+    # maintenance family (internal-forge Q6) needs deploy to own the
+    # unit file so the Pre/Post visibility hooks actually reach
+    # systemd. Managing the unit is not resolving retention; that
+    # review stands, now with a Job making every run visible.
+    "boss-backup:."
 )
 
 # Long-running daemons that aren't `boss-*-api` services. Each
