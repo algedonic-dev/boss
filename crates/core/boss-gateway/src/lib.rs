@@ -8,4 +8,5 @@
 
 pub mod local_auth;
 pub mod mail;
+pub mod oidc;
 pub mod session;
