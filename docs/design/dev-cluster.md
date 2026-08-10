@@ -156,16 +156,23 @@ Per box: hostname, cores/RAM/disk, OS + version, and how they are
 reached today. This gates everything; the design assumes only "Linux,
 4–8 cores, one LAN".
 
-### Q2: Tailscale or bare WireGuard?
+### Q2: Tailscale or bare WireGuard? (resolved)
 
-Largely answered by the Talos choice: **KubeSpan** (Talos's built-in
-WireGuard mesh) covers node↔node with zero extra machinery, and the
-self-host instinct is satisfied natively. What remains of Q2 is only
-the *non-Talos* edge: how does the GCP playground box reach the
-cluster? Deferrable — runners dial out to GitHub, so nothing needs
-inbound connectivity until deploy-from-cluster or the log-copy
-migration; decide then (Tailscale on both sides vs a WireGuard peer
-into KubeSpan).
+Resolved 2026-08-10 — David: **bare WireGuard from the GCP box to the
+cluster** (node↔node inside the cluster stays KubeSpan). The GCP box
+is the hub — stable public IP, UDP 51820, overlay `10.99.0.0/24`,
+hub at `10.99.0.1`; cluster nodes are spokes that dial OUT (no
+inbound hole in the home router; `PersistentKeepalive` holds the NAT
+mapping). **The hub is already live**: `infra/cluster/wireguard/`
+holds `setup-hub.sh` (ran 2026-08-10; key generated, `wg-quick@wg0`
+enabled, GCP firewall rule `allow-wireguard` created),
+`peer-template.conf` (the spoke shape Talos machine config consumes),
+and `add-peer.sh` (append + hot-add; re-running setup cannot drop
+peers). Registering a node is: generate a spoke key on the node, fill
+the template with the hub pubkey + endpoint, `add-peer.sh <name>
+<pubkey> <10.99.0.N>` on the hub. Kanidm and the log-copy migration
+both ride this wire: the cluster reaches `id.algedonic.dev` and the
+export tarball over the overlay if the public path is ever down.
 
 ### Q3: Runner scope and trust
 
