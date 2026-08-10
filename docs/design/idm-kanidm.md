@@ -55,7 +55,7 @@ auth; OIDC lands after.
 
 ## Open questions
 
-### Q1: Does the gateway hold the session, or does every request carry the token?
+### Q1: Does the gateway hold the session, or does every request carry the token? (resolved)
 
 Today the gateway issues its own session after local auth. Keeping
 that (gateway session, OIDC only at login) is the small change and
@@ -64,7 +64,7 @@ validating bearer tokens themselves — buys per-service revocation at
 the cost of every service growing an OIDC dependency. Proposed:
 **gateway session**, revisit only if service-to-service auth needs it.
 
-### Q2: What is the employee-mapping key, and what happens on a miss?
+### Q2: What is the employee-mapping key, and what happens on a miss? (resolved)
 
 Email is the obvious join (Kanidm account email ↔ employee email).
 A login with no matching employee: fail closed with a message, or
@@ -72,7 +72,7 @@ land in a "pending access" surface an admin can act on? Proposed:
 **fail closed + audit event**; a pending-access Job is a nice later
 step (the Job model doing IdP onboarding) but not v1.
 
-### Q3: Do agents get Kanidm service accounts?
+### Q3: Do agents get Kanidm service accounts? (resolved)
 
 The executor model says agents are CPUs in the same machine. Today
 agent identity is a forged claim header on a trusted box. Kanidm
@@ -82,7 +82,7 @@ independently verifiable against the IdP. Cost: every agent caller
 grows a token flow. Proposed: **yes, but phase 2** — humans first,
 agents while the header path still works, then the header path dies.
 
-### Q4: Where does Kanidm's own state live in the backup/migration story?
+### Q4: Where does Kanidm's own state live in the backup/migration story? (resolved)
 
 Kanidm's DB is the second member of the outside-git-and-Postgres
 class (with `credentials.toml`). Its loss means every real person's
@@ -91,7 +91,7 @@ existing `backup.sh` timer (kanidm has an online backup facility),
 and dev-cluster.md's copy-set section gains the pointer — the GCP
 box is now stateful in one more way the cluster is not.
 
-### Q5: DNS and TLS shape?
+### Q5: DNS and TLS shape? (resolved)
 
 Kanidm terminates its own TLS and historically rejects
 TLS-stripping proxies. Proposed: `id.algedonic.dev`, DNS-only
@@ -99,3 +99,19 @@ TLS-stripping proxies. Proposed: `id.algedonic.dev`, DNS-only
 support or certbot — verify against current Kanidm docs at install
 time. The gateway's OIDC callback stays behind the existing
 Cloudflare front.
+
+## Decision history
+
+Resolved 2026-08-10 through the in-app review flow — the
+`design-doc-review` Job (c57d0b37), answered in the review
+surface; flushed here by hand (no flush job queued).
+
+**Q1 — “Agreed”** (emp-bootstrap-admin): Gateway session: OIDC at login only; the gateway keeps issuing its own session and every downstream service stays untouched. Revisit only if service-to-service auth demands per-service tokens.
+
+**Q2 — “failed closed + audit event sounds good”** (emp-bootstrap-admin): Email is the join key to an EXISTING employee Subject. A login with no match fails closed and lands an audit event; a pending-access Job is a later nicety, not v1.
+
+**Q3 — “Sounds good”** (emp-bootstrap-admin): Agents get Kanidm service accounts in phase 2 — humans first, agents while the header path still works, then the header path dies.
+
+**Q4 — “That works”** (emp-bootstrap-admin): Kanidm's online backup rides the existing backup.sh timer; /var/lib/kanidm joins the outside-git-and-Postgres backup set; dev-cluster.md carries the pointer.
+
+**Q5 — “Sounds good”** (emp-bootstrap-admin): id.algedonic.dev grey-cloud (DNS-only); Kanidm terminates its own TLS via certbot/ACME; the gateway's OIDC callback stays behind the Cloudflare front.
