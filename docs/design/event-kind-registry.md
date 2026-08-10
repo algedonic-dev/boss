@@ -69,43 +69,40 @@ every current and future step kind without a migration per step type.
 
 ## Open questions
 
-### Q1: Registry table or generated manifest?
+All 4 open questions were resolved 2026-08-10 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-A `event_kinds` table (authored like `job_edges`, seeded by migration)
-versus a repo-generated manifest (harvested from emission sites at
-build time, pinned by a §9a drift test). The table is queryable by the
-UI and by other registries (encryption classification wants to hang
-rows off it); the manifest cannot drift from code but cannot be
-referenced by data either. Proposed: **table**, because two consumers
-(encryption, dispatcher authoring validation) need to join against it,
-and a §9a pin test closes the drift risk the manifest would have
-solved — live-log kinds vs registry rows, failing with the undeclared
-kind named.
+---
 
-### Q2: What does a declaration carry?
 
-Minimum useful row: `(kind_pattern, source, description,
-suffix_domain NULLABLE → registry name, payload_fields JSONB)`.
-The open call is `payload_fields`: full JSON Schema per kind is
-heavyweight and will rot; a flat field inventory (name, type, note) is
-enough for the encryption doc's classification to reference and for
-the dispatcher authoring UI to offer `when`-expression completions.
-Proposed: **flat field inventory now**; JSON Schema only if a consumer
-actually validates payloads later.
+## Decisions
 
-### Q3: Enforcement posture at emit time?
+### Q1: Registry table or generated manifest? (resolved)
 
-`job_edges` established the dial: `on_missing = warn | abort`, honoring
-`audit_log.ref_check`. An undeclared kind at emit time could warn
-(count it, keep writing) or abort the transaction. Emit-time abort
-turns a missing registry row into a production outage; warn turns it
-into a queue item. Proposed: **warn + the §9a drift test failing CI**
-— the log stays available under drift, the build does not.
+Resolved 2026-08-10 — override.
 
-### Q4: Who seeds the 120?
+Table is good
 
-Harvest: static kinds from the per-crate constants plus a live-log
-sweep for anything the constants miss; families from the three `step.*`
-patterns. One migration, reviewed against the measured inventory. The
-per-crate constants stay (they are the emit-site spelling); the §9a
-test pins constants ↔ registry rows so neither drifts.
+
+### Q4: Who seeds the 120? (resolved)
+
+Resolved 2026-08-10 — override.
+
+Sounds good
+
+
+### Q2: What does a declaration carry? (resolved)
+
+Resolved 2026-08-10 — override.
+
+flat field works now
+
+
+### Q3: Enforcement posture at emit time? (resolved)
+
+Resolved 2026-08-10 — override.
+
+Agreed

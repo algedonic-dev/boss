@@ -16,6 +16,7 @@
 pub mod bill_payment_batch;
 pub mod commerce_invoice_issue;
 pub mod common;
+pub mod docs_flush_queue;
 pub mod gate_resolve;
 pub mod inventory_bill_approve;
 pub mod inventory_overhead_absorb;

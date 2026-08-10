@@ -117,6 +117,22 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| "running integrity scan")?;
 
+    // The event-kind drift guard (registry 108; warn-not-abort per
+    // the review): an emitted kind nothing declares is a vocabulary
+    // hole — loud in the journal, never a failed run.
+    match boss_events::integrity::unregistered_kinds(&pool).await {
+        Ok(missing) if !missing.is_empty() => tracing::warn!(
+            count = missing.len(),
+            kinds = %missing.join(", "),
+            "event kinds EMITTED but not declared in the event_kinds registry — \
+             add rows (or a family pattern) in a new migration"
+        ),
+        Ok(_) => info!("event-kind registry covers every emitted kind"),
+        Err(e) => {
+            tracing::warn!(error = %e, "event-kind drift check failed (registry table missing?)")
+        }
+    }
+
     // Layer 3: the daily checkpoint — log the current chain head so
     // each run leaves a journal entry an auditor can compare against
     // on a future DB snapshot. Cheap, no external service. Empty log

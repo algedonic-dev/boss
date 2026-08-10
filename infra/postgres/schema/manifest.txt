@@ -33,3 +33,5 @@
 105-job-edges-abort.sql
 106-notify-on-step-done.sql
 107-dispatcher-rule-design-review-spawn.sql
+108-event-kinds.sql
+109-dispatcher-rule-flush-queue.sql
