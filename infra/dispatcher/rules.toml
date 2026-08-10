@@ -431,3 +431,12 @@ when = "open_questions > 0 AND NOT open_review_exists(path)"
 [[rule.do]]
 handler = "jobs.spawn"
 args = { kind = "\"design-doc-review\"", subject_kind = "\"custom\"", subject = "path", title = "title", "metadata.doc_path" = "path", "metadata.doc_title" = "title" }
+
+# A recorded design decision queues its doc's flush (cea82de0; the
+# handler no-ops the no-pending 400 so answer bursts settle clean).
+# Seeded live by 109-dispatcher-rule-flush-queue.sql.
+[[rule]]
+name = "design-decision-flush-queue"
+on_event = "docs.design.decision_recorded"
+[[rule.do]]
+handler = "docs.flush_queue"

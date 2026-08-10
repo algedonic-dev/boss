@@ -51,7 +51,7 @@ jobs:
         ports:
           - 4222:4222
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4 (pinned per OpenSSF Scorecard)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4 (pinned per OpenSSF Scorecard)
 
       - name: Free up runner disk space
         # The default GitHub-hosted runner has ~14 GB free; the large
@@ -75,7 +75,7 @@ jobs:
         # third-party dependencies stop being recompiled on every run.
         # cache-on-failure: a red clippy/test run still saves the
         # dependency build it just paid for.
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1 (pinned per OpenSSF Scorecard)
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.1 (pinned per OpenSSF Scorecard)
         with:
           cache-on-failure: true
 
@@ -159,7 +159,7 @@ jobs:
   web:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4 (pinned per OpenSSF Scorecard)
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4 (pinned per OpenSSF Scorecard)
 
       - name: Install Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0

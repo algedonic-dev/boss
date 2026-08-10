@@ -167,3 +167,28 @@ async fn the_abort_dial_refuses_what_warn_permits() {
         "refusal names the disease: {msg}"
     );
 }
+
+/// The guard's refusal reaches the caller as a 400 CARRYING ITS
+/// MESSAGE, not a bare 500 (`8424fb8d` — it took the guard's own
+/// builder two attempts to understand the blank 500). Exercised at
+/// the classification seam the HTTP handlers share.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_trigger_text_classifies_as_a_caller_error() {
+    let db = TestDb::new().await;
+    let mut conn = guarded_conn(&db.pool).await;
+    let job_id = uuid::Uuid::new_v4();
+    let err = sqlx::query(
+        "INSERT INTO jobs (id, kind, subject_kind, subject_id, title, owner_id, priority, status, opened_on, metadata) \
+         VALUES ($1, 'ship-a-change', 'custom', 'x', 'T', 'emp-o', 'standard', 'open', CURRENT_DATE, \
+                 '{\"backlog_item\": \"totally-not-a-job\"}')",
+    )
+    .bind(job_id)
+    .execute(&mut *conn)
+    .await
+    .expect_err("the guard must reject");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("job edge") && msg.contains("unresolvable"),
+        "the classification signature the HTTP mapping keys on must hold: {msg}"
+    );
+}

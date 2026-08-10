@@ -129,9 +129,44 @@ def merge_job_metadata(job_id, **kv):
 # Phase 1 — reconcile open trains against reality
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# The forge seam (internal-forge.md Q7a): every talk-to-the-code-host
+# call goes through Forge, so internalizing Git/CI is an adapter swap
+# — a ForgejoForge sibling selected by BOSS_TRAIN_FORGE — instead of
+# a conductor rewrite at cutover. The GitHub adapter shells to `gh`
+# exactly as before; behavior is unchanged by this refactor.
+# ---------------------------------------------------------------------------
+
+class GitHubForge:
+    """The code host as the conductor sees it: two verbs."""
+
+    def pr_info(self, url):
+        """-> {state, mergeCommit, statusCheckRollup} for a PR url."""
+        r = sh("gh", "pr", "view", url,
+               "--json", "state,mergeCommit,statusCheckRollup")
+        return json.loads(r.stdout)
+
+    def pr_create(self, repo, head, title, body):
+        """Open a PR head->main on repo; return its url."""
+        r = sh("gh", "pr", "create", "--repo", repo,
+               "--head", head, "--base", "main",
+               "--title", title, "--body", body)
+        return r.stdout.strip().splitlines()[-1]
+
+
+def make_forge():
+    kind = os.environ.get("BOSS_TRAIN_FORGE", "github")
+    if kind == "github":
+        return GitHubForge()
+    raise RuntimeError(f"unknown BOSS_TRAIN_FORGE {kind!r} — "
+                       "the Forgejo adapter lands with the internal forge")
+
+
+FORGE = make_forge()
+
+
 def gh_pr(url):
-    r = sh("gh", "pr", "view", url, "--json", "state,mergeCommit,statusCheckRollup")
-    return json.loads(r.stdout)
+    return FORGE.pr_info(url)
 
 
 def ci_verdict(rollup):
@@ -319,11 +354,9 @@ def board(now):
     body = (f"The {window} train: {len(boarded)} change(s) batched by the conductor.\n\n"
             + "\n".join(lines)
             + "\n\n🤖 opened by infra/train/conductor.py (pr-train Workflow)")
-    r = sh("gh", "pr", "create", "--repo", GH_REPO,
-           "--head", f"{HEAD_OWNER}:{train_branch}", "--base", "main",
-           "--title", f"train: {window} ({len(boarded)} changes)",
-           "--body", body)
-    pr_url = r.stdout.strip().splitlines()[-1]
+    pr_url = FORGE.pr_create(
+        GH_REPO, f"{HEAD_OWNER}:{train_branch}",
+        f"train: {window} ({len(boarded)} changes)", body)
 
     merge_job_metadata(train["id"],
                        boarded_jobs=[j["id"] for j, _ in boarded],

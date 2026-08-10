@@ -44,6 +44,11 @@
   border-bottom: 1px solid var(--border, #e7e5e4);
 }
 .step-review-design .srd-head h3 { margin: 0; font-size: 17px; flex: 1 1 auto; }
+.step-review-design .srd-fullpage {
+  font-size: 12px; color: var(--accent, #2563eb); text-decoration: none;
+  white-space: nowrap; align-self: center;
+}
+.step-review-design .srd-fullpage:hover { text-decoration: underline; }
 .step-review-design .srd-progress {
   display: flex; align-items: center; gap: 8px;
   font-size: 12px; color: var(--text-dim, #78716c); white-space: nowrap;
@@ -265,9 +270,23 @@
     }
 
     function renderHeader() {
+      // The reviewer's escape hatch (7501ef82: "give me the option
+      // for a full-panel experience if I want. I know we have it") —
+      // the full-page step surface exists at /jobs/{job}/steps/{step};
+      // the embedded panel just never pointed at it.
+      const fullPage = h(
+        'a',
+        {
+          className: 'srd-fullpage',
+          href: `/jobs/${jobId}/steps/${step.id}`,
+          title: 'Open this review as a full page',
+        },
+        'Full page \u2197',
+      );
       headerDiv.replaceChildren(
         h('h3', null, step.title),
         h('span', { className: `step-status step-status-${step.status}` }, step.status),
+        fullPage,
         progressSpan,
       );
     }

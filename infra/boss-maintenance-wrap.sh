@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# boss-maintenance-wrap — ensure the open maintenance Job a timer run
+# will complete (internal-forge.md Q6; the maintenance family).
+#
+#   ./infra/boss-maintenance-wrap.sh <kind> <chore-label>
+#   e.g. ./infra/boss-maintenance-wrap.sh maintenance-backup "Nightly backup"
+#
+# Called from the timer service's ExecStartPre. If an open Job of the
+# kind exists (yesterday's run FAILED and nobody closed it), reuse it:
+# today's successful run completing it is the recovery, and the pile
+# staying at one open Job per chore keeps boss-step's single-open
+# contract intact. Otherwise spawn today's Job.
+#
+# The visibility contract, stated once: the timer is the EXECUTOR,
+# the Job is the VISIBILITY. Success (ExecStartPost → boss-step.sh)
+# completes `run` and the outcome marker closes the Job; failure
+# completes nothing and the Job stays OPEN — on the fleet, the
+# canvas, and the stage numbers — until a successful run or a human
+# closes it.
+#
+# Deliberately NOT the dispatcher's schedule runner: that fires on
+# SIM-day boundaries, and at warp a daily rule fires every couple of
+# wall-minutes. Maintenance is wall-clock work.
+
+set -euo pipefail
+
+KIND="${1:?usage: boss-maintenance-wrap.sh <kind> <chore-label>}"
+LABEL="${2:?chore label required}"
+BASE="${BOSS_JOBS_URL:-http://127.0.0.1:7900}"
+BOSS_USER='{"id":"automation:maintenance-timer","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
+
+open_count=$(curl -fsS -H "x-boss-user: $BOSS_USER" \
+    "$BASE/api/jobs?kind=$KIND&status=open&limit=2" \
+    | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']))")
+
+if [ "$open_count" != "0" ]; then
+    echo "boss-maintenance-wrap: open $KIND Job exists — this run will complete it (recovery)"
+    exit 0
+fi
+
+curl -fsS -X POST "$BASE/api/jobs" \
+    -H "x-boss-user: $BOSS_USER" -H "content-type: application/json" \
+    -d "$(python3 - "$KIND" "$LABEL" <<'PY'
+import json, sys, datetime
+kind, label = sys.argv[1], sys.argv[2]
+print(json.dumps({
+    "kind": kind,
+    "subject": {"subject_kind": "custom", "id": f"infra/{kind}"},
+    "title": f"{label} — {datetime.date.today().isoformat()}",
+    "owner_id": "emp-bootstrap-admin",
+    "priority": "standard",
+    "status": "open",
+    "metadata": {"chore": kind},
+    "tags": ["maintenance"],
+}))
+PY
+)" >/dev/null
+echo "boss-maintenance-wrap: spawned today's $KIND Job"

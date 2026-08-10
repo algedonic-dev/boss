@@ -906,6 +906,21 @@ fn backlog_item_spec() -> WorkflowSpec {
 /// `INSERT INTO workflows` SQL.
 pub fn platform_workflows() -> Vec<WorkflowSpec> {
     vec![
+        maintenance_spec(
+            "maintenance-backup",
+            "Nightly backup",
+            "The 03:00 backup run — configs, Postgres dump, kanidm state.",
+        ),
+        maintenance_spec(
+            "maintenance-audit-integrity",
+            "Audit-log integrity check",
+            "The 03:00 chain scan + event-kind drift guard.",
+        ),
+        maintenance_spec(
+            "maintenance-ledger-replay",
+            "Ledger replay check",
+            "The 03:30 rooted-at-audit-log replay comparison.",
+        ),
         workflow_design_spec(),
         design_doc_review_spec(),
         user_feedback_spec(),
@@ -914,6 +929,69 @@ pub fn platform_workflows() -> Vec<WorkflowSpec> {
         backlog_item_spec(),
         pr_train_spec(),
     ]
+}
+
+/// One maintenance kind per chore (internal-forge.md Q6): the systemd
+/// timer stays the EXECUTOR; the Job is the visibility layer. The
+/// timer's unit ensures the open Job exists at start
+/// (`boss-maintenance-wrap.sh`) and completes `run` on success via
+/// `boss-step.sh` — which is also why it is one KIND per chore:
+/// boss-step's contract is "the single open Job of a workflow".
+/// Failure completes nothing, so the Job stays OPEN — visible on the
+/// fleet and the canvas until a later successful run (or a human)
+/// closes it. A failed backup is an algedonic signal, not a journal
+/// line.
+///
+/// Deliberately NOT spawned by the dispatcher's schedule runner: it
+/// fires on SIM-day boundaries, and at warp a "daily" rule fires
+/// every couple of wall-minutes — maintenance is wall-clock work.
+fn maintenance_spec(kind: &str, label: &str, description: &str) -> WorkflowSpec {
+    let steps = vec![
+        StepSpec {
+            title: "scheduled".into(),
+            kind: "trigger".into(),
+            ready_when: "true".into(),
+            title_template: "Timer fired".into(),
+            metadata_defaults: serde_json::json!({
+                "trigger_kind": "periodic",
+                "trigger_name": "systemd-timer",
+            }),
+            ..Default::default()
+        },
+        StepSpec {
+            title: "run".into(),
+            kind: "task".into(),
+            ready_when: "steps.scheduled.done".into(),
+            title_template: "Run to completion".into(),
+            // Gated so the simulated workforce cannot role-match and
+            // "complete" real maintenance (the ship-a-change scope
+            // comment's hazard); the timer's boss-step call presents
+            // the automation actor with this role.
+            authority_role: Some("platform-admin".into()),
+            fields: vec![boss_core::job::StepField {
+                name: "result".into(),
+                field_type: "string".into(),
+                required: true,
+            }],
+            ..Default::default()
+        },
+        StepSpec {
+            title: "completed".into(),
+            kind: "outcome".into(),
+            ready_when: "steps.run.done".into(),
+            title_template: "Maintenance completed".into(),
+            terminal: Some(Terminal {
+                outcome: "completed".into(),
+            }),
+            ..Default::default()
+        },
+    ];
+    let mut spec =
+        WorkflowSpec::platform_seed(kind, label, description, vec!["custom".into()], steps);
+    // Owner + /system/flow membership: maintenance is the department's
+    // own labor, so it appears with the other platform kinds.
+    spec.metadata = serde_json::json!({ "owner_role": "platform-admin" });
+    spec
 }
 
 /// Build the canonical `pr-train` WorkflowSpec.
@@ -4060,9 +4138,10 @@ mod tests {
         let kinds = platform_workflows();
         assert_eq!(
             kinds.len(),
-            7,
+            10,
             "ships workflow-design + design-doc-review + user-feedback + ship-a-change \
-             + regenerate-deployment + backlog-item + pr-train"
+             + regenerate-deployment + backlog-item + pr-train + the three maintenance \
+             kinds (backup / audit-integrity / ledger-replay — internal-forge Q6)"
         );
 
         // The boundary declaration is the whole point of the kind, so

@@ -86,6 +86,10 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         ("gate.resolve", vec!["jobs.step.completed"]),
         ("packaging.allocate", vec!["jobs.step.completed"]),
         ("messages.notify", vec![]),
+        // Queues a docs flush job (rule 109) — a docs-api write, no
+        // event emitted back into the cascade (the flush WORKER's
+        // eventual commit is outside the dispatcher's loop).
+        ("docs.flush_queue", vec![]),
         ("webhook.notify", vec![]),
     ])
 }
