@@ -415,7 +415,7 @@ Read that to know which layer a new test belongs in.
 
 ## Design docs
 
-When writing or editing a file under `docs/design/*.md`, follow the in-repo convention: open questions must be authored as `### Qn: <title>` subheadings (not numbered lists), so the in-app decision tracker parses stable anchors that survive reordering. If you skip this, the review workflow silently falls back to positional ids and the open questions you wrote don't show up in the UI.
+When writing or editing a file under `docs/design/*.md`, follow the in-repo convention: open questions must be authored as `### Qn: <title>` subheadings (not numbered lists), **inside a `## Open questions` section** — the tracker ingests questions from that section only, and the reindex rejects a doc with a live `Qn:` heading anywhere else (resolved ones may live in a Decision-history section). If you use numbered lists instead, the review workflow silently falls back to positional ids and the open questions you wrote don't show up in the UI.
 
 Resolutions flush into the source doc's Decision-history section via the tracker. Each release, settled material folds into [docs/architecture-decisions.md](docs/architecture-decisions.md) — the Baseline Architecture Decisions, the one current-truth decision record — and the flattened source doc is deleted. Docs that survive under `docs/design/` are living references (reading frames, contracts, governance rules), not decision archives.
 
