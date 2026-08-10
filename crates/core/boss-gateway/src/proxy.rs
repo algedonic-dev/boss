@@ -119,6 +119,55 @@ pub async fn handle(
     forward_to_upstream(state, req, config).await
 }
 
+/// App-shaped proxy variant — for sub-apps the browser NAVIGATES to
+/// (the /simulator SPA). A document navigation without a session gets
+/// the login page with a return path instead of a bare
+/// "authentication required" (572b100b: an expired session made the
+/// simulator read as broken). Everything that is not a text/html GET
+/// — the sub-app's own fetch/XHR traffic — keeps the plain 401 so
+/// API callers see a status, not a login page.
+pub async fn handle_app(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    config: &'static ProxyConfig,
+) -> Response {
+    if !has_valid_session(req.headers(), &state.session_key) {
+        if is_document_navigation(req.method(), req.headers()) {
+            let next: String = req
+                .uri()
+                .path()
+                .bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                        (b as char).to_string()
+                    }
+                    _ => format!("%{b:02X}"),
+                })
+                .collect();
+            let mut headers = HeaderMap::new();
+            if let Ok(v) = header::HeaderValue::from_str(&format!("/login?next={next}")) {
+                headers.insert(header::LOCATION, v);
+            }
+            return (StatusCode::SEE_OTHER, headers).into_response();
+        }
+        return unauthorized();
+    }
+    forward_to_upstream(state, req, config).await
+}
+
+/// A browser typing/clicking a URL: GET with an Accept that asks for
+/// HTML. Fetch/XHR sends application/json or */* without text/html
+/// unless explicitly configured — good enough to route people to
+/// login and machines to a status code.
+fn is_document_navigation(method: &axum::http::Method, headers: &HeaderMap) -> bool {
+    method == axum::http::Method::GET
+        && headers
+            .get(header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .map(|a| a.contains("text/html"))
+            .unwrap_or(false)
+}
+
 /// Public proxy variant — skips the session check. Used for endpoints
 /// where the URL itself carries sufficient authentication (e.g. the
 /// `/ics/{token}.ics` calendar feed, where `token` is a 256-bit random
@@ -400,5 +449,42 @@ mod tests {
         assert!(!is_blocked_request_header("x-boss-role"));
         assert!(!is_blocked_request_header("cookie"));
         assert!(!is_blocked_request_header("content-type"));
+    }
+}
+
+#[cfg(test)]
+mod app_gate_tests {
+    use super::*;
+
+    fn headers_accepting(v: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::ACCEPT, header::HeaderValue::from_str(v).unwrap());
+        h
+    }
+
+    /// The discrimination the whole fix rides on: people go to login,
+    /// machines get a status code.
+    #[test]
+    fn browser_navigations_and_only_those_redirect() {
+        let get = axum::http::Method::GET;
+        let post = axum::http::Method::POST;
+        // A browser address-bar / link navigation.
+        assert!(is_document_navigation(
+            &get,
+            &headers_accepting("text/html,application/xhtml+xml,*/*;q=0.8")
+        ));
+        // fetch() default and JSON callers: status code, not a login page.
+        assert!(!is_document_navigation(&get, &headers_accepting("*/*")));
+        assert!(!is_document_navigation(
+            &get,
+            &headers_accepting("application/json")
+        ));
+        // Non-GET never redirects, whatever it accepts.
+        assert!(!is_document_navigation(
+            &post,
+            &headers_accepting("text/html")
+        ));
+        // No Accept header at all: a machine.
+        assert!(!is_document_navigation(&get, &HeaderMap::new()));
     }
 }

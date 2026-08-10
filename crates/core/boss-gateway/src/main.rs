@@ -536,11 +536,11 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
         // routes win over the /{*rest} SPA fallback below.
         .route(
             "/simulator",
-            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::SIMULATOR)),
+            axum::routing::any(|s, r| proxy::handle_app(s, r, &proxy::SIMULATOR)),
         )
         .route(
             "/simulator/{*rest}",
-            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::SIMULATOR)),
+            axum::routing::any(|s, r| proxy::handle_app(s, r, &proxy::SIMULATOR)),
         )
         // Step UX plugin bundles — served from the plugins dir on
         // disk. See docs/architecture-decisions.md §Step UX & frontend.

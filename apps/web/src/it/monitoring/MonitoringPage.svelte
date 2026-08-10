@@ -27,6 +27,12 @@
     /// has no SPA-proxied health endpoint (NATS, Postgres, the
     /// gateway itself) — those render as "n/a" instead of probing.
     healthSlug: string | null;
+    /// Full probe path when the service breaks the /api/<slug>/health
+    /// convention — the simulator is a path-first sub-app, its health
+    /// lives at /simulator/api/health, and probing the convention
+    /// path 404s forever (c46057fe: rendered a healthy service as
+    /// unanswerable, which reads as broken).
+    healthPath?: string;
   };
 
   // Per-service description. Keyed by the canonical name from
@@ -68,6 +74,7 @@
       name: `boss-${p.name}-api`,
       port: p.prod,
       healthSlug: p.name,
+      healthPath: p.name === 'simulator' ? '/simulator/api/health' : undefined,
       description: DESCRIPTIONS[p.name] ?? '(no description)',
     })),
     { name: 'NATS', port: 4222, healthSlug: null, description: 'Event bus — every service fans out via DomainPublisher' },
@@ -90,9 +97,9 @@
   // is likewise `unknown`. Only a 5xx or a network/timeout failure — a
   // genuinely unreachable upstream — is `down`. This stops live, healthy
   // deployments painting half their rows red/yellow.
-  async function probeHealth(slug: string): Promise<ServiceStatus> {
+  async function probeHealth(path: string): Promise<ServiceStatus> {
     try {
-      const r = await fetch(`/api/${slug}/health`, {
+      const r = await fetch(path, {
         // Health routes are auth-bypass at the gateway; keep a modest
         // timeout so a flap doesn't hang the row (the interval retries).
         signal: AbortSignal.timeout(5000),
@@ -112,7 +119,7 @@
     const probeable = SERVICES.filter((s) => s.healthSlug !== null);
     const pollAll = () => {
       for (const s of probeable) {
-        probeHealth(s.healthSlug as string).then((status) => {
+        probeHealth(s.healthPath ?? `/api/${s.healthSlug}/health`).then((status) => {
           if (!cancelled) serviceStatus = { ...serviceStatus, [s.name]: status };
         });
       }
