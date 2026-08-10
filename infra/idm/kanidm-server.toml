@@ -1,0 +1,23 @@
+# Kanidm server config — the GCP box as the company's IdP
+# (docs/design/idm-kanidm.md). Installed to /etc/kanidm/server.toml.
+#
+# TLS: Kanidm terminates its own — id.algedonic.dev must be a
+# grey-cloud (DNS-only) A record to this box, cert via certbot:
+#   certbot certonly --standalone -d id.algedonic.dev
+# then the paths below hold. Renewal hook must restart kanidmd.
+
+bindaddress = "0.0.0.0:8443"
+domain = "id.algedonic.dev"
+origin = "https://id.algedonic.dev:8443"
+
+db_path = "/var/lib/kanidm/kanidm.db"
+# The IdP database is the third member of the outside-git-and-Postgres
+# state class (credentials.toml, the audit tarballs). backup.sh gains
+# this path; losing it loses every person's passkeys.
+online_backup.path = "/var/lib/kanidm/backups/"
+online_backup.schedule = "00 3 * * *"
+
+tls_chain = "/etc/letsencrypt/live/id.algedonic.dev/fullchain.pem"
+tls_key = "/etc/letsencrypt/live/id.algedonic.dev/privkey.pem"
+
+log_level = "info"
