@@ -398,6 +398,22 @@ fn default_materialize_steps() -> bool {
     true
 }
 
+/// Map a persistence error to the response the caller deserves. The
+/// `job_edges` check trigger rejects an unresolvable declared link
+/// with a message that IS the guard's whole value ("job edge
+/// ship-a-change.backlog_item references unresolvable Job X") — as a
+/// bare 500 it took its own builder two attempts to understand
+/// (`8424fb8d`). A caller error gets a 400 carrying the guard's text;
+/// everything else stays a 500.
+fn persist_error_response(e: impl std::fmt::Display) -> Response {
+    let msg = e.to_string();
+    if msg.contains("job edge") && msg.contains("unresolvable") {
+        (StatusCode::BAD_REQUEST, msg).into_response()
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+    }
+}
+
 pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,
@@ -546,7 +562,7 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
         serde_json::to_value(&job).unwrap_or_default(),
     );
     if let Err(e) = state.jobs.create_job_at(&job, now, &[job_event]).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        return persist_error_response(e);
     }
 
     // Materialize the Workflow's steps into actual `steps` rows. Job
@@ -882,7 +898,7 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
         }
     }
     if let Err(e) = state.jobs.update_job_at(&job, now, &job_events).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        return persist_error_response(e);
     }
 
     // A Job update can flip a metadata-gated `ready_when` (the v3
