@@ -306,6 +306,28 @@ async fn check_foreign_refs(pool: &PgPool) -> Result<Vec<DanglingForeignRef>, sq
 /// encoding stays in one place — the trigger and the verifier read
 /// from the same `payload::text` representation, eliminating the
 /// cross-language canonicalization bug.
+/// The event-kind drift guard (event_kinds registry, 108; Q3 of
+/// af1586e1's review: WARN, never abort — the log stays available
+/// under drift, the check makes it visible). A kind matches a
+/// registry row exactly, or by prefix when the row is a family
+/// pattern ending `.*` (`step.done.*` covers every step type — the
+/// suffix domain is the StepType registry's, not this table's).
+/// Returns the distinct emitted kinds nothing declares.
+pub async fn unregistered_kinds(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT a.kind FROM audit_log a
+         WHERE NOT EXISTS (
+             SELECT 1 FROM event_kinds k
+             WHERE a.kind = k.kind_pattern
+                OR (k.kind_pattern LIKE '%.*'
+                    AND a.kind LIKE replace(k.kind_pattern, '.*', '.%'))
+         )
+         ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 async fn verify_chain(pool: &PgPool) -> Result<Vec<ChainBreak>, sqlx::Error> {
     // The verifier reproduces the trigger's canonical hash. Must
     // match `audit_log_compute_row_hash`'s encoding exactly — a
