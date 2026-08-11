@@ -4,6 +4,12 @@
 # same gate running on our own iron, so a change is validated where it is
 # built and deployed rather than by someone else's infrastructure.
 #
+# The container image is ours, from our registry, and carries node as
+# well as the Rust toolchain: Forgejo runs actions/checkout as a
+# JavaScript action *inside* the job container, so an image without node
+# fails every run at checkout with exitcode 127 before a line of the
+# gate executes.
+#
 # Deliberately split into two jobs. `fast` is fmt + clippy and returns in
 # under a minute on the Ryzen — that is the feedback loop you actually
 # live in. `test` carries the Postgres service and the full suite, and is
@@ -26,12 +32,9 @@ jobs:
   fast:
     runs-on: docker
     container:
-      image: rust:1.96-slim-bookworm
+      image: 10.20.0.15:3000/david/boss-ci:rust1.96
     steps:
       - uses: actions/checkout@v4
-
-      - name: Toolchain components
-        run: rustup component add rustfmt clippy
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -43,7 +46,7 @@ jobs:
   test:
     runs-on: docker
     container:
-      image: rust:1.96-slim-bookworm
+      image: 10.20.0.15:3000/david/boss-ci:rust1.96
     services:
       postgres:
         image: postgres:16
@@ -63,11 +66,6 @@ jobs:
       BOSS_POSTGRES_URL: postgres://boss:boss@postgres:5432/boss
     steps:
       - uses: actions/checkout@v4
-
-      - name: Build deps
-        run: |
-          apt-get update -qq
-          apt-get install -y --no-install-recommends postgresql-client pkg-config libssl-dev >/dev/null
 
       - name: Apply schema
         run: infra/postgres/migrate.sh -- psql "$DATABASE_URL"
