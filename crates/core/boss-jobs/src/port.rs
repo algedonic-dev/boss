@@ -30,6 +30,11 @@ pub struct JobFilter {
     pub owner_id: Option<String>,
     /// Filter by subject reference (e.g., device serial, account id).
     pub subject_id: Option<String>,
+    /// Only jobs waiting on this Job (its full id): matches a
+    /// `metadata.waiting_on` holding the full id or a >= 8-char
+    /// prefix of it — the same resolution contract as
+    /// `job_edge_resolves`. The clear-on-close handler's query.
+    pub waiting_on: Option<String>,
     /// Row-level policy scope — translated from `boss_policy_client::Predicate`
     /// by the HTTP handler before calling the adapter. Pushing it down
     /// into SQL here means scoped roles get accurate `total` counts

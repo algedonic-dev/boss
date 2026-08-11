@@ -2,8 +2,8 @@
 //! (department-flow-dashboards Q1, decided 2026-08-09: registry).
 //!
 //! Contracts pinned:
-//! 1. **The registry seeds the three real edges** (backlog_item,
-//!    train, boarded_jobs) — instruments derive topology from rows,
+//! 1. **The registry seeds the four real edges** (backlog_item,
+//!    train, boarded_jobs, and the every-kind '*' waiting_on) — instruments derive topology from rows,
 //!    never from hardcoded key names.
 //! 2. **Resolution is prefix-aware**: an exact Job id resolves; an
 //!    unambiguous prefix of length >= 8 resolves (the folklore's
@@ -57,7 +57,7 @@ async fn set_meta(
 }
 
 #[tokio::test]
-async fn registry_seeds_the_three_real_edges() {
+async fn registry_seeds_the_four_real_edges() {
     let db = TestDb::new().await;
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT source_kind, field_path, field_kind FROM job_edges ORDER BY source_kind, field_path",
@@ -68,6 +68,8 @@ async fn registry_seeds_the_three_real_edges() {
     assert_eq!(
         rows,
         vec![
+            // '*' applies to every kind (migration 110, waiting_on).
+            ("*".into(), "waiting_on".into(), "job_id".into()),
             (
                 "pr-train".into(),
                 "boarded_jobs".into(),

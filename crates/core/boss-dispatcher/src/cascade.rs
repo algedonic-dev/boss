@@ -82,6 +82,10 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         ("shipping.create", vec!["shipping.shipment.created"]),
         ("jobs.spawn", vec!["jobs.job.created"]),
         ("jobs.complete_step", vec!["jobs.step.completed"]),
+        // Clears waiting_on via PUT /api/jobs — the update emits
+        // jobs.job.updated (and wakes metadata-gated steps in the
+        // same write, aa9980c8).
+        ("jobs.clear_waiting", vec!["jobs.job.updated"]),
         ("jobs.subjob_resolve", vec!["jobs.step.completed"]),
         ("gate.resolve", vec!["jobs.step.completed"]),
         ("packaging.allocate", vec!["jobs.step.completed"]),
