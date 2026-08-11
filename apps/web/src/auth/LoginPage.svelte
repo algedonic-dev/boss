@@ -22,6 +22,12 @@
   // renders where the gateway says OIDC is configured (idm-kanidm) -
   // a deployment without the front door never shows a door.
   let oidcOffered = $state<boolean>(false);
+  // Break-glass, not the front door. idm-kanidm.md keeps local auth so an
+  // IdP outage cannot lock operators out of the system that runs the
+  // company — but with an IdP configured, a password box is the wrong
+  // thing to lead with. Hidden behind a deliberate click; shown outright
+  // when OIDC is unavailable, which is exactly when it is needed.
+  let showLocalAuth = $state<boolean>(false);
 
   // If the SPA already has a session (someone hit /login while
   // logged in), redirect to home rather than bury them in a form.
@@ -289,6 +295,19 @@
     line-height: 1.5;
     color: #78716c;
   }
+  .local-toggle {
+    display: block;
+    margin: 1.5rem auto 0;
+    padding: 0;
+    background: none;
+    border: none;
+    color: #a8a29e;
+    font-size: 0.78rem;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .local-toggle:hover { color: #78716c; }
+
   .guest-note code {
     font-size: 11px;
     background: #f5f5f4;
@@ -303,12 +322,17 @@
     <h1 class="login-title">{mode === 'login' ? 'Welcome back' : 'Set a new password'}</h1>
     <p class="login-subtitle">
       {#if mode === 'login'}
-        Sign in with your work email + password.
+        {#if oidcOffered}
+          Sign in with your passkey — or look around as a guest.
+        {:else}
+          Sign in with your work email + password.
+        {/if}
       {:else}
         Enter the one-time token an admin shared with you.
       {/if}
     </p>
 
+    {#if !oidcOffered || showLocalAuth || mode !== 'login'}
     <div class="login-banner">
       <strong>This is the OSS evaluation setup.</strong> Credentials live in a local file;
       there's no email-based reset, no MFA, no account lockout. Production deployments
@@ -372,10 +396,11 @@
         </button>
       </div>
     </form>
+    {/if}
 
     {#if oidcOffered && mode === 'login'}
       <div class="guest-block">
-        <div class="guest-divider"><span>or</span></div>
+        {#if showLocalAuth}<div class="guest-divider"><span>or</span></div>{/if}
         <!-- A NAVIGATION, not a fetch: the auth-code flow is a round
              trip through the IdP and back to the callback. -->
         <a class="guest-btn oidc-btn" href="/api/auth/oidc/login">
@@ -398,6 +423,16 @@
           any record and follow the audit log; nothing you do changes anything.
         </p>
       </div>
+    {/if}
+
+    <!-- Break-glass. Deliberately understated and deliberately present:
+         idm-kanidm.md keeps local auth precisely so an IdP outage cannot
+         lock operators out. Hiding it entirely would trade one lockout
+         risk for another. -->
+    {#if oidcOffered && !showLocalAuth && mode === 'login'}
+      <button type="button" class="local-toggle" on:click={() => (showLocalAuth = true)}>
+        Operator sign-in
+      </button>
     {/if}
   </div>
 </div>
