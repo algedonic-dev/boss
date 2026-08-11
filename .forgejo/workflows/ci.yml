@@ -64,6 +64,12 @@ jobs:
     env:
       DATABASE_URL: postgres://boss:boss@postgres:5432/boss
       BOSS_POSTGRES_URL: postgres://boss:boss@postgres:5432/boss
+      # boss-testing creates a scratch database per test and defaults its
+      # admin connection to loopback. That holds on GitHub, where the
+      # service binds to the runner itself, but in a container job
+      # Postgres is a separate host on the job network — without this
+      # every DB-backed test dies on "Connection refused".
+      BOSS_TEST_POSTGRES_ADMIN_URL: postgres://boss:boss@postgres:5432/postgres
     steps:
       - uses: actions/checkout@v4
 
