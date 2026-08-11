@@ -25,11 +25,12 @@ use boss_dispatcher_handlers::handlers::{
     inventory_overhead_absorb::InventoryOverheadAbsorb,
     inventory_parts_consume::InventoryPartsConsume, inventory_parts_produce::InventoryPartsProduce,
     inventory_po_place::InventoryPoPlace, inventory_receive::InventoryReceive,
-    jobs_complete_step::JobsCompleteStep, jobs_subjob_resolve::JobsSubjobResolve,
-    ledger_bill_approve::LedgerBillApprove, ledger_payroll_run_submit::LedgerPayrollRunSubmit,
-    ledger_tax_accrue::LedgerTaxAccrue, ledger_tax_remit::LedgerTaxRemit,
-    messages_notify::MessagesNotify, packaging_allocate::PackagingAllocate,
-    people_hire::PeopleHire, people_terminate::PeopleTerminate, products_consume::ProductsConsume,
+    jobs_clear_waiting::JobsClearWaiting, jobs_complete_step::JobsCompleteStep,
+    jobs_subjob_resolve::JobsSubjobResolve, ledger_bill_approve::LedgerBillApprove,
+    ledger_payroll_run_submit::LedgerPayrollRunSubmit, ledger_tax_accrue::LedgerTaxAccrue,
+    ledger_tax_remit::LedgerTaxRemit, messages_notify::MessagesNotify,
+    packaging_allocate::PackagingAllocate, people_hire::PeopleHire,
+    people_terminate::PeopleTerminate, products_consume::ProductsConsume,
     products_consume_from_invoice::ProductsConsumeFromInvoice, products_produce::ProductsProduce,
     shipping_create::ShippingCreate, webhook_notify::WebhookNotify,
 };
@@ -130,6 +131,9 @@ async fn main() -> Result<()> {
             // D7 delegate-subjob write-back: on a child Job's
             // close, resolve the parent delegate-subjob step.
             handlers.register(JobsSubjobResolve::new(cfg.jobs_api_url.clone()));
+            // A closed Job wakes its waiters: clears metadata.waiting_on
+            // (the '*' job edge) so blocked steps re-evaluate (e9291570).
+            handlers.register(JobsClearWaiting::new(cfg.jobs_api_url.clone()));
             // System-completes zero-duration, no-role markers
             // (trigger / outcome / milestone) the moment they go
             // Ready, so a Job flows past its structural checkpoints

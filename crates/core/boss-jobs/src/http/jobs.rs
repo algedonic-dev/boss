@@ -34,6 +34,10 @@ pub(super) struct ListJobsQuery {
     /// generic spelling for every kind — there are no per-kind aliases
     /// to pick the wrong one of.
     subject_id: Option<String>,
+    /// Only jobs whose `metadata.waiting_on` names this Job (full id
+    /// here; the stored value may be a >= 8-char prefix). The
+    /// clear-on-close handler's query.
+    waiting_on: Option<String>,
 }
 
 pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static>(
@@ -84,6 +88,7 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
         status: q.status,
         owner_id: q.owner_id,
         subject_id: q.subject_id,
+        waiting_on: q.waiting_on,
         scope,
         ..Default::default()
     };
@@ -251,6 +256,7 @@ pub(super) async fn jobs_live<R: JobsRepository + 'static, B: EventBus + 'static
         priority: None,
         owner_id: None,
         subject_id: None,
+        waiting_on: None,
         scope: JobScope::All,
     };
     let jobs = match state.jobs.list_jobs(&filter, 12, 0).await {

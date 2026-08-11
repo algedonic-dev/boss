@@ -44,6 +44,12 @@ impl JobEdgesRegistry for InMemoryJobEdges {
         };
         Ok(vec![
             mk(
+                "*",
+                "waiting_on",
+                "job_id",
+                "The Job whose closure this Job waits on",
+            ),
+            mk(
                 "pr-train",
                 "boarded_jobs",
                 "job_id_list",
@@ -118,9 +124,11 @@ mod tests {
     async fn in_memory_serialises_with_the_field_names_the_panel_reads() {
         let edges = InMemoryJobEdges.list().await.expect("list");
         let v = serde_json::to_value(&edges).expect("serialises");
-        assert_eq!(v[0]["source_kind"], "pr-train");
-        assert_eq!(v[0]["field_kind"], "job_id_list");
-        assert_eq!(v[1]["field_path"], "backlog_item");
-        assert_eq!(v[1]["on_missing"], "abort");
+        assert_eq!(v[0]["source_kind"], "*");
+        assert_eq!(v[0]["field_path"], "waiting_on");
+        assert_eq!(v[1]["source_kind"], "pr-train");
+        assert_eq!(v[1]["field_kind"], "job_id_list");
+        assert_eq!(v[2]["field_path"], "backlog_item");
+        assert_eq!(v[2]["on_missing"], "abort");
     }
 }
