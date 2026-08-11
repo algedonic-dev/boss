@@ -1,0 +1,79 @@
+# Forgejo CI — the validation half of the internalized loop.
+#
+# .github/workflows/ci.yml stays as-is for the public mirror; this is the
+# same gate running on our own iron, so a change is validated where it is
+# built and deployed rather than by someone else's infrastructure.
+#
+# Deliberately split into two jobs. `fast` is fmt + clippy and returns in
+# under a minute on the Ryzen — that is the feedback loop you actually
+# live in. `test` carries the Postgres service and the full suite, and is
+# allowed to take as long as it takes. Reporting them separately means a
+# formatting slip is not hidden behind a ten-minute test run, and the
+# bottleneck is visible rather than averaged away.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    runs-on: docker
+    container:
+      image: rust:1.96-slim-bookworm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain components
+        run: rustup component add rustfmt clippy
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        # -D warnings per CLAUDE.md: warnings are errors in this workspace.
+        run: cargo clippy --workspace --all-features --tests -- -D warnings
+
+  test:
+    runs-on: docker
+    container:
+      image: rust:1.96-slim-bookworm
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: boss
+          POSTGRES_PASSWORD: boss
+          POSTGRES_DB: boss
+        # Matches the deployed cluster: ~24 services each hold an sqlx
+        # pool, so the default max_connections=100 saturates.
+        options: >-
+          --health-cmd "pg_isready -U boss"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgres://boss:boss@postgres:5432/boss
+      BOSS_POSTGRES_URL: postgres://boss:boss@postgres:5432/boss
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build deps
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends postgresql-client pkg-config libssl-dev >/dev/null
+
+      - name: Apply schema
+        run: infra/postgres/migrate.sh -- psql "$DATABASE_URL"
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --all-features
