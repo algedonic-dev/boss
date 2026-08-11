@@ -22,11 +22,10 @@
   // renders where the gateway says OIDC is configured (idm-kanidm) -
   // a deployment without the front door never shows a door.
   let oidcOffered = $state<boolean>(false);
-  // Break-glass, not the front door. idm-kanidm.md keeps local auth so an
-  // IdP outage cannot lock operators out of the system that runs the
-  // company — but with an IdP configured, a password box is the wrong
-  // thing to lead with. Hidden behind a deliberate click; shown outright
-  // when OIDC is unavailable, which is exactly when it is needed.
+  // Passwords are not offered. The form renders only if BOTH the IdP and
+  // guest access are unavailable — a last-resort surface for a deployment
+  // with neither configured, not a path anyone here is meant to take.
+  // Break-glass for this deployment is POST /api/auth/login via curl.
   let showLocalAuth = $state<boolean>(false);
 
   // If the SPA already has a session (someone hit /login while
@@ -332,7 +331,7 @@
       {/if}
     </p>
 
-    {#if !oidcOffered || showLocalAuth || mode !== 'login'}
+    {#if (!oidcOffered && !guestOffered) || showLocalAuth || mode !== 'login'}
     <div class="login-banner">
       <strong>This is the OSS evaluation setup.</strong> Credentials live in a local file;
       there's no email-based reset, no MFA, no account lockout. Production deployments
@@ -429,10 +428,9 @@
          idm-kanidm.md keeps local auth precisely so an IdP outage cannot
          lock operators out. Hiding it entirely would trade one lockout
          risk for another. -->
-    {#if oidcOffered && !showLocalAuth && mode === 'login'}
-      <button type="button" class="local-toggle" on:click={() => (showLocalAuth = true)}>
-        Operator sign-in
-      </button>
-    {/if}
+    <!-- No password affordance. Passwords are not an accepted factor on
+         this network; identity is a passkey at the IdP. Break-glass is
+         still reachable for an operator with curl (POST /api/auth/login)
+         — deliberately not a button, so nobody drifts back to it. -->
   </div>
 </div>
