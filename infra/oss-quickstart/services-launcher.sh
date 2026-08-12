@@ -65,6 +65,18 @@ SERVICES=(
     # configure [demo_agents] so the snapshot ships synthetic agent
     # telemetry (with the SPA-side "demo mode" banner on /ops).
     "boss-observability"
+    # The views tier + search + ML + the simulator UX. These four
+    # were absent from this roster while present in boss-ports and
+    # deploy-services.sh — the fact-lives-thrice drift (CLAUDE.md
+    # §9a) surfacing as 502s on /system/os-map, /api/search/*,
+    # /api/ml/* and /simulator in every quickstart/container deploy
+    # (aab30bbf). The binaries were always in the image; only this
+    # list forgot them. A pin tying this roster to boss-ports (the
+    # deploy-services.sh treatment) is proposed on the feedback item.
+    "boss-views-api"
+    "boss-search-api"
+    "boss-ml-api"
+    "boss-simulator"
     "boss-dispatcher"
     "boss-brewery-sim"
     # Gateway last — depends on every other service being reachable.
