@@ -80,11 +80,14 @@ The packet's parts, named against what exists:
   sign-offs — the log's record for this packet.
 - **Protocol set** — the workflows this packet is following, each as
   `(kind, version)`. Today: exactly one, fixed at open. Proposed end
-  state: a list, where layered protocols conjoin requirements and add
-  obligations (requirements-based-addressing Q6: narrowing only in
-  v1). "A protocol of protocols" is a workflow whose spec declares
-  companion protocols the way `on_complete_create` already declares
-  cross-protocol spawns.
+  state: a **list, still fixed at creation** — admission composes the
+  declared set once (requirements conjoin, obligations union) and the
+  envelope never mutates after. A packet that needs different
+  governance mid-life is **translated**: a new packet under the new
+  set, edge-linked to the old — the operator-initiated sibling of
+  what `on_complete_create` already declares. "A protocol of
+  protocols" is a workflow whose spec declares companions composed at
+  creation.
 
 ## What the queue explains
 
@@ -176,13 +179,28 @@ flips.
 
 ### Q3: What is the v1 protocol set on the envelope?
 
-Proposed: keep the single `(kind, workflow_version)` pin as
-`protocols[0]`, and add **layers** as the only v1 mutation: a layered
-protocol conjoins requirements (narrowing only, per
-requirements-based-addressing Q6) and appends obligations as steps in
-its own lane. Every layering is itself a packet write, so the
-envelope's protocol set at any log position is reconstructible.
-`workflow_lint`'s viability proof runs per layer at layering time.
+Proposed (revised 2026-08-12, David's simplification): **a fixed set
+of compatible protocols declared at creation, with translation as the
+only protocol change.** The pin generalizes to `protocols[]`, written
+once; admission composes the set at creation — requirements conjoin
+(narrowing-only composition stays commutative, per
+requirements-based-addressing Q6), obligations union, and
+`workflow_lint`'s viability proof runs over the whole composed set at
+the one moment it can be complete. Mid-flight change is **packet
+translation**: a new packet under the new set, created through the
+same admission edge, carrying a declared mapping (headers per the
+registry, subject identity, a translation summary) and a
+`translated_from` edge (`job_edges` already speaks this); the source
+packet closes with a `translated` terminal so cadence views tell it
+apart from abandonment. This keeps the envelope genuinely immutable,
+makes every protocol change visible traffic (a gateway hop on the
+canvas, with an actor), and deletes the mid-flight machinery whole:
+no layering-time lint, no lane namespacing, no subtract semantics.
+Dynamic layering — conjoining a protocol onto a live packet — is the
+rejected-for-v1 alternative; revisit only if translation volume shows
+in-place layering earning its complexity. The hold/compliance case
+that motivated layering routes through policy (a hold is an access
+restriction, boss-policy's job) or an explicit translation.
 
 ### Q4: Which metadata keys become declared headers?
 
