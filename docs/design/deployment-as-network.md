@@ -53,37 +53,57 @@ and the SPA's content-hashed dist is make-before-break natively.
 
 ## Open questions
 
-### Q1: What is the generation store, and how many do we keep?
+All 5 open questions were resolved 2026-08-12 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-Proposed: `releases/<train-merge-sha>/` holding bin + web dist;
-`current` and `previous` symlinks; keep 3. The conductor's deploy
-phase stamps which generation a train landed as, so the Job record
-names the artifact.
+---
 
-### Q2: What constitutes the confirm, and what is N?
 
-Proposed: every service health 200 + dispatcher readyz + one
-end-to-end probe (a jobs-api write round-trip), evaluated at 2 and
-8 minutes; N=10. Confirmation is recorded on the train Job
-(`deployed` completes only on confirm — an auto-revert reopens it
-loudly).
+## Decisions
 
-### Q3: What does auto-revert cover?
+### Q1: What is the generation store, and how many do we keep? (resolved)
 
-Proposed: binaries + web dist only. Schema stays forward-only
-(expand/contract holds N-1 both directions); registries and data are
-intent that rolled forward and stays. A revert is derived-state
-reconvergence, never history surgery.
+Resolved 2026-08-12 — accept.
 
-### Q4: Who owns the mechanism?
+releases/<sha>/ holding bin/ + web-dist/ + step-plugins/ + the .boss-src-fingerprint stamp, with current/previous symlinks and unit ExecStart lines going through the symlink. Keyed by the deployed HEAD short sha — what the conductor records after pull; the fingerprint pre-flight verifies HEAD's content. Keep 3 generations, with an explicit prune step that prints sizes (this box has had its disk-full day). The web dist joins the generation: rsync --delete retires, and the SPA's content-hashed naming becomes real make-before-break with a revert path.
 
-Proposed: deploy-services.sh grows generations + confirm/revert (it
-already owns install + health); the conductor's deploy phase calls
-it and interprets the confirm for the train Job. The maintenance
-family watches for a standing UNCONFIRMED/reverted state.
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
 
-### Q5: When do waves become real?
 
-Proposed: scratch-first ordering lands with this design; per-node
-waves and true drains wait for the cluster and are Q4 of
-dev-cluster's territory — named here so the two docs stay joined.
+### Q2: What constitutes the confirm, and what is N? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+Confirm = every deployed unit's health probe 200, reusing the probe_one roster so the confirm cannot drift from the deploy list; plus dispatcher readyz; plus one jobs-api write round-trip through the HTTP API (sentinel POST, read back, delete). Read at +2 and +8 minutes — the delayed second reading catches the dispatcher silent-death class — with N=10, aligned to the reconcile cadence. The conductor completes the train Job's deployed step only on the confirm marker; an auto-revert reopens it. Brewery-calibrated verify-replay floors stay out of the confirm.
+
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
+
+
+### Q3: What does auto-revert cover? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+Auto-revert re-points binaries + web dist (+ step-plugins) and restarts. Schema (expand/contract, roll-forward only), registries, the log, and data stay. Two riders: the emitted /etc config bodies snapshot into the generation and restore on revert — or config legislates the same N-1 tolerance expand/contract gives schema; and events written during the unconfirmed window stay in the log forever (traffic never rolls back), so projections and rebuilders tolerate unknown event kinds — closure doing revert-safety work.
+
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
+
+
+### Q4: Who owns the mechanism? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+The proposed split, with one hard amendment: the confirm/revert evaluator is a separate systemd unit (boss-deploy-confirm in the TIMERS array), armed at flip — never in-process waiting inside the deployer. The 45-minute TimeoutStartSec kill mid-build is the proof: a dead-man switch that dies with the deployer reverts nothing. deploy-services.sh grows generation/flip/revert verbs; the evaluator reads +2/+8 and fires revert at +10 on UNCONFIRMED; the conductor's reconcile does the Job bookkeeping; the maintenance family opens a Job on any standing UNCONFIRMED. TimeoutStartSec gets fixed regardless.
+
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
+
+
+### Q5: When do waves become real? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+Scratch-first ordering lands with the generations work — per-env current symlinks are what make a wave seam possible at all; today scratch units run the same binary file as prod, so installing flips both environments in the same instant. Named honestly: scratch's confirm covers the 9 paired services only (dispatcher and gateway are prod-only), so wave 1 reduces prod's exposure but never replaces prod's own confirm + dead-man. Per-node waves and true drains stay parked on dev-cluster Q4.
+
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
