@@ -36,3 +36,41 @@ pub const STEP_SIGNED_OFF: &str = "jobs.step.signed_off";
 /// named roles must re-sign before the step can complete.
 pub const STEP_STAMPS_INVALIDATED: &str = "jobs.step.stamps_invalidated";
 pub const JOB_CLOSED: &str = "jobs.job.closed";
+
+/// The state-event payload for a Step: the serialized struct plus a
+/// top-level `step_id` — the same key every marker event uses.
+///
+/// The struct's own identity key serializes as `id`, the markers say
+/// `step_id`, and the intersection of the two identifier sets over
+/// the whole audit_log was measured EMPTY
+/// (requirements-based-addressing.md, Constraints) — every
+/// queue-drain metric joining creation to completion silently read
+/// zero rows. One payload key ends the schism going forward;
+/// historical rows stay as they were written.
+pub fn step_state_payload(step: &boss_core::job::Step) -> serde_json::Value {
+    let mut v = serde_json::to_value(step).unwrap_or_default();
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "step_id".to_string(),
+            serde_json::Value::String(step.id.to_string()),
+        );
+    }
+    v
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::step_state_payload;
+    use boss_core::job::{JobId, Step};
+
+    #[test]
+    fn state_payloads_carry_the_marker_key() {
+        let step = Step::new(JobId::new(), "task", "Do it", 0);
+        let p = step_state_payload(&step);
+        assert_eq!(
+            p["step_id"], p["id"],
+            "state events and marker events must agree on the step's identity key"
+        );
+        assert_eq!(p["step_id"], step.id.to_string().as_str());
+    }
+}

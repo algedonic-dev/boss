@@ -93,10 +93,7 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
             .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into())),
     };
     let stamp = state.publisher.stamp_with_actor_at(actor, now).await;
-    let step_event = stamp.event(
-        events::STEP_CREATED,
-        serde_json::to_value(&step).unwrap_or_default(),
-    );
+    let step_event = stamp.event(events::STEP_CREATED, events::step_state_payload(&step));
     if let Err(e) = state.jobs.add_step_at(&step, now, &[step_event]).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
@@ -492,10 +489,8 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         .publisher
         .stamp_with_actor_at(actor.clone(), now)
         .await;
-    let mut step_events = vec![stamp.event(
-        events::STEP_UPDATED,
-        serde_json::to_value(&step).unwrap_or_default(),
-    )];
+    let mut step_events =
+        vec![stamp.event(events::STEP_UPDATED, events::step_state_payload(&step))];
 
     // The `workflow-publish` dispatch produces an audit-bearing
     // event with the full published spec — what `rebuild_workflows`
@@ -864,10 +859,8 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
                 s.status = StepStatus::Skipped;
                 // OUTBOX (phase 2): the skip's state event records in
                 // the SAME transaction as the row.
-                let skip_event = terminal_stamp.event(
-                    events::STEP_UPDATED,
-                    serde_json::to_value(&s).unwrap_or_default(),
-                );
+                let skip_event =
+                    terminal_stamp.event(events::STEP_UPDATED, events::step_state_payload(&s));
                 if let Err(e) = state.jobs.update_step_at(&s, now, &[skip_event]).await {
                     tracing::warn!(
                         job_id = %job_id,
@@ -1008,7 +1001,7 @@ pub(super) async fn reevaluate_and_persist<R: JobsRepository + 'static, B: Event
                 // in the SAME transaction as the promotion.
                 let mut reeval_events = vec![stamp.event(
                     events::STEP_UPDATED,
-                    serde_json::to_value(changed_step).unwrap_or_default(),
+                    events::step_state_payload(changed_step),
                 )];
                 if changed_step.status == StepStatus::Ready && !changed_step.kind.is_empty() {
                     reeval_events

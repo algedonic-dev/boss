@@ -617,10 +617,8 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
                 .ambient_actor()
                 .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
             let step_stamp = state.publisher.stamp_with_actor_at(step_actor, now).await;
-            let step_event = step_stamp.event(
-                events::STEP_CREATED,
-                serde_json::to_value(step).unwrap_or_default(),
-            );
+            let step_event =
+                step_stamp.event(events::STEP_CREATED, events::step_state_payload(step));
             if let Err(e) = state.jobs.add_step_at(step, now, &[step_event]).await {
                 tracing::warn!(
                     job_id = %job_id,

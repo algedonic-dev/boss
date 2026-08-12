@@ -147,6 +147,17 @@ fn find_h2_section(lines: &[String], heading_lower: &str) -> Option<H2Section> {
 /// and a flag indicating whether the numbered list in the section
 /// was fully drained (i.e. the caller should replace the whole
 /// section body with an empty-section placeholder).
+/// A live `### Qn…` subheading — the explicit-anchor question form
+/// the tracker convention mandates (CLAUDE.md §Design docs).
+fn is_open_question_heading(line: &str) -> bool {
+    let t = line.trim_start();
+    let Some(rest) = t.strip_prefix("### Q") else {
+        return false;
+    };
+    let digits: &str = rest.split([':', ' ']).next().unwrap_or("");
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
 fn remove_decisions_from_open(
     body: &[String],
     decisions: &[FlushDecision],
@@ -238,6 +249,16 @@ fn remove_decisions_from_open(
             remove_numbered_items(&body_after_explicit, &fallback_indexes)?;
         (body, titles_vec, drained)
     };
+
+    // Drained means DRAINED: no numbered items left AND no `### Qn`
+    // headings left. The first version computed it from numbered
+    // items alone, so on an explicit-anchor doc (every current design
+    // doc) ANY partial flush read as "fully drained" and the
+    // placeholder pass deleted the unresolved questions wholesale —
+    // the 2026-08-12 live failure (1dd28e4c). A surviving question
+    // heading is the definition of not-drained.
+    let fallback_drained =
+        fallback_drained && !filtered.iter().any(|l| is_open_question_heading(l));
 
     // Attach picked titles back to their anchors.
     for (pos, (_idx, di)) in fallback.iter().enumerate() {
@@ -784,6 +805,52 @@ Other content.
         assert!(goal_idx < open_idx);
         assert!(open_idx < dec_idx);
         assert!(dec_idx < next_idx);
+    }
+
+    #[test]
+    fn a_partial_flush_leaves_the_unresolved_questions_standing() {
+        // The 2026-08-12 live failure (feedback 1dd28e4c): flushing
+        // [Q1] on a doc whose questions are `### Qn` headings read as
+        // "fully drained" — the drained check counted numbered-list
+        // items, of which such docs have none — and replaced the whole
+        // section body, deleting Q2's text with no resolution
+        // recorded. Every follow-up flush then failed "anchor not
+        // found". A partial flush must be partial.
+        let md = r#"# Design: Foo
+
+**Status**: in-review.
+
+## Open questions
+
+### Q1: Where does X live?
+
+**Proposal**: a new crate.
+
+### Q2: Async or sync?
+
+Prose about Y.
+
+## Next section
+"#;
+        let decisions = vec![accept("Q1", "a new crate")];
+        let out = apply_decisions(md, &decisions, test_date()).unwrap();
+
+        let open_section = section_content(&out, "Open questions");
+        assert!(!open_section.contains("### Q1:"), "Q1 resolved away");
+        assert!(
+            open_section.contains("### Q2:") && open_section.contains("Prose about Y"),
+            "unresolved Q2 must survive a partial flush, got: {open_section:?}"
+        );
+        assert!(
+            !out.contains("approved"),
+            "a partially-open doc must not be status-promoted"
+        );
+
+        // And the second flush completes the drain cleanly.
+        let out2 = apply_decisions(&out, &[accept("Q2", "async")], test_date()).unwrap();
+        let open2 = section_content(&out2, "Open questions");
+        assert!(!open2.contains("### Q2:"));
+        assert!(section_content(&out2, "Decisions").contains("async"));
     }
 
     #[test]

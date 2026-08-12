@@ -1,0 +1,27 @@
+# CI runner image for the BOSS gate (internal-forge Q2's recorded
+# debt: this Dockerfile lived off-repo on the forge host; now the
+# image and the workflow that runs in it share one tree).
+#
+# Forgejo Actions runs JavaScript actions (actions/checkout) inside
+# the job container, so node must be present or every job dies at
+# checkout with exitcode 127. python3 is here because the rust suite
+# shells out to it — boss-testing's conductor_preflight tests drive
+# infra/train/conductor.py directly, and their absence-of-python
+# failure mode is a panic that read as "3 tests failed" while the
+# real story was "the container can't run what the suite runs"
+# (forge train #1's red signal, 2026-08-12). Carrying rustfmt/clippy
+# and the postgres client means a CI run does no toolchain
+# installation at all.
+#
+# Build + push (forge host):
+#   docker build -t 10.20.0.15:3000/david/boss-ci:rust1.96 infra/forge/boss-ci
+#   docker push 10.20.0.15:3000/david/boss-ci:rust1.96
+FROM rust:1.96-slim-bookworm
+
+RUN apt-get update -qq \
+ && apt-get install -y --no-install-recommends \
+      nodejs git ca-certificates postgresql-client pkg-config libssl-dev curl \
+      python3 \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN rustup component add rustfmt clippy
