@@ -29,8 +29,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The locomotive goes first. On 2026-08-12 forge train #1 burned five
+  # red rounds and every cause was environment, not car code — so the
+  # environment is now checked in seconds before either heavy job
+  # spends minutes in it. Costs ~15s of serialization on a green run;
+  # buys a named failure with its remediation in the log instead of a
+  # panic 20 minutes into the suite.
+  locomotive:
+    runs-on: docker
+    container:
+      image: 10.20.0.15:3000/david/boss-ci:rust1.96
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locomotive check
+        run: bash infra/forge/locomotive.sh
+
   fast:
     runs-on: docker
+    needs: [locomotive]
     container:
       image: 10.20.0.15:3000/david/boss-ci:rust1.96
     steps:
@@ -45,6 +62,7 @@ jobs:
 
   test:
     runs-on: docker
+    needs: [locomotive]
     container:
       image: 10.20.0.15:3000/david/boss-ci:rust1.96
     services:

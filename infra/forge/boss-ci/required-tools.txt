@@ -1,0 +1,16 @@
+# Every binary the CI gate invokes, one per line. This is the manifest
+# the locomotive check reads: a tool listed here and absent from the
+# runner image is a red signal in seconds, not a panic 20 minutes into
+# the suite (forge train #1 round 1: python3 missing read as "3 tests
+# failed" when the story was "the container can't run what the suite
+# runs"). The pair (this file ↔ the Dockerfile's apt list) is pinned by
+# the stamp check in locomotive.sh — CLAUDE.md 9a's equality test,
+# enforced at run time where the drift actually bites.
+node
+git
+cargo
+rustc
+rustfmt
+cargo-clippy
+psql
+curl

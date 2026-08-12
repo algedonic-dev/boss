@@ -25,3 +25,11 @@ RUN apt-get update -qq \
  && rm -rf /var/lib/apt/lists/*
 
 RUN rustup component add rustfmt clippy
+
+# Provenance stamp: build.sh injects the sha256 of (Dockerfile +
+# required-tools.txt); the locomotive CI job recomputes the same hash
+# from its checkout and goes red on a mismatch. That is the equality
+# test (CLAUDE.md 9a) between the image a runner cached and the image
+# this tree describes — build with build.sh, not bare docker build.
+ARG BOSS_CI_STAMP=unstamped
+RUN echo "$BOSS_CI_STAMP" > /etc/boss-ci-stamp

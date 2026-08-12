@@ -63,13 +63,67 @@ type SessionEnvelope = {
   value: SessionState;
   roster: ReadonlyArray<Employee>;
   fromGateway: boolean;
+  /// True for the audit-readonly guest: every read surface renders,
+  /// and surfaces that offer writes may hide or soften them.
+  readonly: boolean;
 };
 
 export const session = $state<SessionEnvelope>({
   value: { kind: 'loading' },
   roster: [],
   fromGateway: false,
+  readonly: false,
 });
+
+/// The honest synthetic identity for a read-only visitor. The old
+/// demo-mode sin was dressing a visitor in a REAL employee's name,
+/// role and department; the fix is not to strip the visitor of a
+/// renderable identity, it is to give them their own: named Guest,
+/// carrying the audit-readonly role they actually hold, colliding
+/// with no roster id, assignable to nothing.
+export function guestEmployee(username: string): Employee {
+  return {
+    id: username,
+    name: 'Guest',
+    email: username,
+    role: 'audit-readonly',
+    department: 'visitor',
+    hire_date: new Date().toISOString().slice(0, 10),
+    status: 'active',
+    location: '—',
+    employment_type: 'guest',
+    skills: [],
+    certifications: [],
+  };
+}
+
+export type ProbeBody = {
+  username?: string;
+  employee_id?: string;
+  role?: string;
+};
+
+/// Pure classification of the gateway probe — extracted so the
+/// guest/unrecognized boundary is a tested decision, not a branch
+/// buried in a fetch handler.
+export function classifyProbe(
+  body: ProbeBody,
+  byId: Map<string, Employee>,
+): { value: SessionState; readonly: boolean } | null {
+  const username = body.username ?? '';
+  const emp = body.employee_id ? (byId.get(body.employee_id) ?? null) : null;
+  if (emp) return { value: { kind: 'ready', user: emp }, readonly: false };
+  // A session with no employee and the audit-readonly role is the
+  // guest — a first-class read-only persona, not a broken login.
+  if (username && body.role === 'audit-readonly') {
+    return {
+      value: { kind: 'ready', user: guestEmployee(username) },
+      readonly: true,
+    };
+  }
+  if (username) return { value: { kind: 'unrecognized', username }, readonly: false };
+  return null;
+}
 
 function readStoredPersona(byId: Map<string, Employee>): string {
   try {
@@ -99,28 +153,12 @@ export async function loadSession(): Promise<void> {
   try {
     const r = await fetch('/api/session', { credentials: 'same-origin' });
     if (r.ok) {
-      const body = (await r.json()) as {
-        username?: string;
-        employee_id?: string;
-      };
-      const username = body.username ?? '';
-      // Use the gateway-resolved employee_id directly (set at
-      // session-mint time from the auth provider's email lookup).
-      const emp = body.employee_id ? byId.get(body.employee_id) ?? null : null;
-      if (emp) {
+      const body = (await r.json()) as ProbeBody;
+      const classified = classifyProbe(body, byId);
+      if (classified) {
         session.fromGateway = true;
-        session.value = { kind: 'ready', user: emp };
-        return;
-      }
-      // A session that resolves to no employee is still a real
-      // session — since demo mode was removed, that means a guest.
-      // This used to substitute a persona from localStorage, which
-      // put an employee's name, role and department on a visitor
-      // holding none of them, and left the shell offering actions
-      // that could only 403. Report who they actually are; the
-      // roster fallback below is for having no session at all.
-      if (username) {
-        session.value = { kind: 'unrecognized', username };
+        session.readonly = classified.readonly;
+        session.value = classified.value;
         return;
       }
     }

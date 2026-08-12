@@ -1,13 +1,26 @@
 #!/usr/bin/env bash
-# Build + install the Boss web dashboard to the live static dir.
+# Build + install the Boss web dashboard into the deploy generation.
 #
-# The gateway (`boss-gateway`) serves the SPA from
-# `/var/lib/boss-web/dist/` (see `BOSS_STATIC_DIR` in
-# `crates/core/boss-gateway/src/static_files.rs`). Frontend changes don't
-# land in the browser until we run `bun run build` and rsync the
-# output into that directory — this script wraps both steps.
+# The web dist lives IN the generation (deployment-as-network Q2):
+# this builds the SPA and rsyncs it into
+# /usr/local/boss/releases/<sha>/web-dist/, where <sha> is this
+# checkout's HEAD — the generation deploy-services.sh stages for the
+# same commit. The gateway serves through the `current` symlink
+# (`BOSS_STATIC_DIR=/usr/local/boss/current/web-dist` in
+# infra/gateway/boss-gateway.service), so one symlink flip rolls the
+# UI back together with the binaries.
 #
 #   sudo ./infra/deploy-web.sh
+#
+# Destination resolution, in order:
+#   1. an explicit BOSS_STATIC_DIR / BOSS_STEP_PLUGIN_DIR override
+#   2. releases/<HEAD sha>/ when that generation exists (the normal
+#      services-then-web train order lands here, already live)
+#   3. the `current` generation, when HEAD was never service-deployed
+#      (a web-only iteration loop) — said out loud, since it updates
+#      the live generation in place
+#   4. the pre-generation paths (/var/lib/boss-web/dist), for a box
+#      with no generation store yet
 #
 # Idempotent — safe to re-run. No service restart required: the
 # browser picks up the new chunk filenames (from index.html) on next
@@ -19,7 +32,38 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WEB_DIR="${REPO_ROOT}/apps/web"
 DIST_SRC="${WEB_DIR}/dist"
-DIST_DST="${BOSS_STATIC_DIR:-/var/lib/boss-web/dist}"
+
+# Generation store paths, shared with deploy-services.sh +
+# deploy-confirm.sh so they cannot drift.
+# shellcheck source=infra/generation.sh
+. "${REPO_ROOT}/infra/generation.sh"
+
+GEN_DEST=""
+if [[ -z "${BOSS_STATIC_DIR:-}" && -z "${BOSS_STEP_PLUGIN_DIR:-}" ]]; then
+    HEAD_KEY="$(gen_head_key "$REPO_ROOT")"
+    CURRENT_KEY="$(gen_link_key current)"
+    if [[ -n "$HEAD_KEY" && -d "$GEN_RELEASES/$HEAD_KEY" ]]; then
+        GEN_DEST="$GEN_RELEASES/$HEAD_KEY"
+        if [[ "$HEAD_KEY" == "$CURRENT_KEY" ]]; then
+            echo "==> target: generation $HEAD_KEY (live)"
+        else
+            echo "==> target: generation $HEAD_KEY (staged, not current — goes live at its flip)"
+        fi
+    elif [[ -n "$CURRENT_KEY" && -d "$GEN_RELEASES/$CURRENT_KEY" ]]; then
+        GEN_DEST="$GEN_RELEASES/$CURRENT_KEY"
+        echo "==> target: LIVE generation $CURRENT_KEY (HEAD ${HEAD_KEY:-unknown} has no"
+        echo "    generation of its own — web-only deploy updates the live one in place;"
+        echo "    the next deploy-services.sh run gives this UI a generation of its own)"
+    fi
+fi
+if [[ -n "$GEN_DEST" ]]; then
+    DIST_DST="$GEN_DEST/web-dist"
+    PLUGIN_DST="$GEN_DEST/step-plugins"
+else
+    # Pre-generation box (or explicit override): the legacy fixed paths.
+    DIST_DST="${BOSS_STATIC_DIR:-/var/lib/boss-web/dist}"
+    PLUGIN_DST="${BOSS_STEP_PLUGIN_DIR:-/var/lib/boss/step-plugins}"
+fi
 
 if [[ ! -d "${WEB_DIR}" ]]; then
     echo "web source not found: ${WEB_DIR}" >&2
@@ -93,13 +137,13 @@ rsync -a --delete "${DIST_SRC}/" "${DIST_DST}/"
 
 # Step-plugin bundles. Authored as static JS in `infra/step-plugins/`
 # (no build step — each plugin is hand-authored vanilla DOM). Gateway
-# serves them at `/plugins/*` from `/var/lib/boss/step-plugins` (see
-# `crates/core/boss-gateway/src/plugin_files.rs`). Without this copy
-# the gateway returns 404 for every plugin URL the step_plugins
-# registry references — which renders broken step surfaces in the
-# SPA's Job Detail view.
+# serves them at `/plugins/*` through the generation symlink (see
+# `crates/core/boss-gateway/src/plugin_files.rs` + BOSS_PLUGINS_DIR in
+# the gateway unit). Without this copy the gateway returns 404 for
+# every plugin URL the step_plugins registry references — which
+# renders broken step surfaces in the SPA's Job Detail view. In the
+# generation with the SPA, so a revert rolls both together.
 PLUGIN_SRC="${REPO_ROOT}/infra/step-plugins"
-PLUGIN_DST="${BOSS_STEP_PLUGIN_DIR:-/var/lib/boss/step-plugins}"
 if [[ -d "${PLUGIN_SRC}" ]]; then
     echo "==> installing step-plugin bundles to ${PLUGIN_DST}"
     mkdir -p "${PLUGIN_DST}"

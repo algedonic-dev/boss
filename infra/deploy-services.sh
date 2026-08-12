@@ -20,41 +20,76 @@
 #   1. Writes /etc/boss-<name>-api[-scratch].toml
 #   2. Writes /etc/systemd/system/boss-<name>-api[-scratch].service
 #   3. systemctl daemon-reload
-#   4. systemctl enable --now each unit
-#   5. Probes /api/<name>/health and reports the status code
+#   4. Stages binaries (+ carried web-dist / step-plugins) into a
+#      generation at /usr/local/boss/releases/<sha>/, then atomically
+#      flips the `current` symlink (previous generation stays on disk
+#      as the revert target — see infra/generation.sh for the layout)
+#   5. systemctl enable + restart each unit (units exec through the
+#      `current` symlink), arms boss-deploy-confirm, prunes to the 3
+#      newest generations (logging what was pruned, with sizes)
+#   6. Probes /api/<name>/health and reports the status code
 #
-# Idempotent — safe to re-run. Use `check` mode to diff generated
-# files against what's on disk without writing anything:
+# Idempotent — safe to re-run. Re-deploying the sha that is already
+# live re-activates the standing generation (stage is skipped when the
+# build stamp matches) and restarts; it never clobbers a live
+# generation mid-copy — staging is a dot-dir, activation is one rename.
 #
-#   sudo ./infra/deploy-services.sh check prod
-#   sudo ./infra/deploy-services.sh check scratch
-#   sudo ./infra/deploy-services.sh check both
+# Modes beyond deploy:
+#
+#   sudo ./infra/deploy-services.sh check prod|scratch|both
+#       diff generated configs/units against disk, write nothing
+#   ./infra/deploy-services.sh probe [prod|scratch|both]
+#       strict health probes — exit 1 on any failure. This is the
+#       roster boss-deploy-confirm evaluates, so the confirm cannot
+#       drift from the deploy list (defaults to prod).
+#   sudo ./infra/deploy-services.sh revert
+#       flip current <-> previous and restart the prod fleet — the
+#       make-before-break rollback (seconds, no build)
+#   sudo ./infra/deploy-services.sh prune
+#       prune the generation store to the newest 3, printing sizes
 
 set -euo pipefail
 
-if [[ $# -lt 1 ]]; then
-    echo "usage: $0 <prod|scratch|both|check> [prod|scratch|both]" >&2
+usage() {
+    echo "usage: $0 <prod|scratch|both>" >&2
+    echo "       $0 check <prod|scratch|both>" >&2
+    echo "       $0 probe [prod|scratch|both]" >&2
+    echo "       $0 revert" >&2
+    echo "       $0 prune" >&2
     exit 2
+}
+
+if [[ $# -lt 1 ]]; then
+    usage
 fi
 
 MODE="apply"
-if [[ "${1:-}" == "check" ]]; then
-    MODE="check"
-    shift
-    if [[ $# -lt 1 ]]; then
-        echo "usage: $0 check <prod|scratch|both>" >&2
-        exit 2
-    fi
-fi
-
-TARGET="${1:-}"
-case "$TARGET" in
-    prod|scratch|both) ;;
-    *)
-        echo "error: target must be 'prod', 'scratch', or 'both', got '$TARGET'" >&2
-        exit 2
-        ;;
+case "${1:-}" in
+    check)  MODE="check";  shift; [[ $# -ge 1 ]] || usage ;;
+    probe)  MODE="probe";  shift ;;
+    revert) MODE="revert"; shift ;;
+    prune)  MODE="prune";  shift ;;
 esac
+
+if [[ "$MODE" == "revert" || "$MODE" == "prune" ]]; then
+    # No env argument: both operate on the generation store itself.
+    # TARGET drives the restart roster on revert — prod, because the
+    # confirm (the caller that matters) is prod-scoped; scratch units
+    # pick the reverted generation up on their next restart.
+    TARGET="prod"
+else
+    TARGET="${1:-}"
+    if [[ "$MODE" == "probe" && -z "$TARGET" ]]; then
+        TARGET="prod"
+    fi
+    case "$TARGET" in
+        prod|scratch|both) ;;
+        *)
+            echo "error: target must be 'prod', 'scratch', or 'both', got '$TARGET'" >&2
+            exit 2
+            ;;
+    esac
+fi
 
 NATS_URL="nats://127.0.0.1:4222"
 # Services connect directly to PG :5432. The roster has grown to ~24
@@ -72,6 +107,11 @@ NATS_URL="nats://127.0.0.1:4222"
 PROD_DB_URL="postgres://boss:boss@127.0.0.1/boss"
 SCRATCH_DB_URL="postgres://boss:boss@127.0.0.1/boss_scratch"
 REPO_ROOT="/opt/boss"
+
+# Generation store paths + atomic-flip helpers, shared with
+# deploy-web.sh and deploy-confirm.sh so they cannot drift.
+# shellcheck source=infra/generation.sh
+. "$(dirname "$0")/generation.sh"
 
 # Port tables sourced from `boss-ports-list` — single source of
 # truth shared with the Rust binaries (boss_ports::PAIRED / SOLO).
@@ -195,6 +235,13 @@ TIMERS=(
     # systemd. Managing the unit is not resolving retention; that
     # review stands, now with a Job making every run visible.
     "boss-backup:."
+    # The deploy dead-man switch (deployment-as-network Q4): armed by
+    # `systemctl restart boss-deploy-confirm.timer` at generation flip,
+    # it reads the probe roster at +2 and +8 minutes and flips
+    # current -> previous (revert) on a failed reading. A separate
+    # unit, never in-process waiting inside the deployer — a dead-man
+    # that dies with the deployer reverts nothing.
+    "boss-deploy-confirm:."
 )
 
 # Long-running daemons that aren't `boss-*-api` services. Each
@@ -662,12 +709,19 @@ emit_unit() {
     # '--config' found") — so the unit would have failed to start on
     # the next deploy. Both only run today because their units were
     # written by hand.
+    #
+    # ExecStart goes THROUGH the `current` symlink (deployment-as-
+    # network Q1): a restart always execs the live generation, and a
+    # revert re-points every service with one symlink flip. Hand-
+    # authored units keep /usr/local/bin/<name> paths — those are
+    # symlinks into current/bin/ (see ensure_bin_links), so they ride
+    # the same flip.
     local exec_start
     if [[ "$name" == "clock" || "$name" == "dispatcher" || "$name" == "simulator" \
           || "$name" == "search" || "$name" == "views" ]]; then
-        exec_start="ExecStart=/usr/local/bin/${stem}"
+        exec_start="ExecStart=$BOSS_GEN_ROOT/current/bin/${stem}"
     else
-        exec_start="ExecStart=/usr/local/bin/${stem} --config $cfg_path"
+        exec_start="ExecStart=$BOSS_GEN_ROOT/current/bin/${stem} --config $cfg_path"
     fi
 
     cat <<EOF
@@ -758,6 +812,244 @@ run_env() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# Generation store + probe machinery (deployment-as-network Q1–Q4)
+# ---------------------------------------------------------------------------
+
+declare -a TO_DEPLOY=()
+add_units_for_env() {
+    local env="$1"
+    local stem
+    for entry in "${PAIRED_SERVICES[@]}"; do
+        IFS=: read -r name _ _ <<<"$entry"
+        stem=$(stem_for "$name")
+        if [[ "$env" == "scratch" ]]; then
+            TO_DEPLOY+=("${stem}-scratch.service")
+        else
+            TO_DEPLOY+=("${stem}.service")
+        fi
+    done
+    if [[ "$env" == "prod" ]]; then
+        for entry in "${SOLO_SERVICES[@]}"; do
+            IFS=: read -r name _ <<<"$entry"
+            stem=$(stem_for "$name")
+            TO_DEPLOY+=("${stem}.service")
+        done
+    fi
+}
+
+# Health probes. probe_one prints the status code AND records failures
+# in PROBE_FAILED — the deploy path reports them, `probe` mode (what
+# boss-deploy-confirm evaluates) exits nonzero on any of them. One
+# roster for both, so the confirm cannot drift from the deploy list.
+declare -a PROBE_FAILED=()
+probe_one() {
+    local kind="$1" name="$2" env="$3"
+    local port
+    port=$(port_of "$name" "$env")
+    # Most services mount routes under /api/<name>; boss-docs-api is
+    # named "docs" internally but serves at /api/design/*; boss-
+    # observability is a non-`-api` service that mounts /api/health
+    # directly (no per-service prefix) — it's a NATS aggregator, not
+    # a domain-CRUD service.
+    local url
+    case "$name" in
+        docs)          url="http://127.0.0.1:${port}/api/design/health" ;;
+        simulator)     url="http://127.0.0.1:${port}/simulator/api/health" ;;
+        observability) url="http://127.0.0.1:${port}/api/health" ;;
+        *)             url="http://127.0.0.1:${port}/api/${name}/health" ;;
+    esac
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "$url" || echo "???")
+    local label="${name}-${env}"
+    [[ "$code" == "200" ]] || PROBE_FAILED+=("${label}=${code}")
+    printf '  %-20s  GET %-45s  %s\n' "$label" "$url" "$code"
+}
+
+run_probes() {
+    local target="$1"
+    PROBE_FAILED=()
+    for entry in "${PAIRED_SERVICES[@]}"; do
+        IFS=: read -r name _ _ <<<"$entry"
+        if [[ "$target" == "prod" || "$target" == "both" ]]; then probe_one paired "$name" prod; fi
+        if [[ "$target" == "scratch" || "$target" == "both" ]]; then probe_one paired "$name" scratch; fi
+    done
+    if [[ "$target" == "prod" || "$target" == "both" ]]; then
+        for entry in "${SOLO_SERVICES[@]}"; do
+            IFS=: read -r name _ <<<"$entry"
+            probe_one solo "$name" prod
+        done
+    fi
+}
+
+# Read-only front-door check (the apply path has a separate block that
+# also STARTS a downed gateway; a probe must not mutate).
+probe_front_door() {
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1:4443/ || echo "000")
+    printf '  %-20s  GET %-45s  %s\n' "gateway(front-door)" "http://127.0.0.1:4443/" "$code"
+    [[ "$code" =~ ^(200|302|401|403)$ ]] || PROBE_FAILED+=("gateway-front-door=${code}")
+}
+
+restart_deployed_units() {
+    local unit
+    for unit in "${TO_DEPLOY[@]}"; do
+        systemctl enable "$unit" >/dev/null 2>&1 || true
+        systemctl restart "$unit"
+        echo "  restarted $unit"
+    done
+}
+
+# Bounce a unit only when it is running — non-demo hosts keep e.g.
+# boss-brewery-sim down on purpose.
+restart_if_active() {
+    local unit="$1"
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+        systemctl restart "$unit" && echo "  restarted $unit"
+    fi
+}
+
+restart_prod_daemons() {
+    local stem
+    for entry in "${DAEMONS[@]}"; do
+        IFS=: read -r stem _ <<<"$entry"
+        if [[ -f "/etc/systemd/system/${stem}.service" ]]; then
+            systemctl enable "${stem}.service" >/dev/null 2>&1 || true
+            systemctl restart "${stem}.service"
+            echo "  restarted ${stem}.service"
+        fi
+    done
+}
+
+# /usr/local/bin/boss-* as symlinks THROUGH the current symlink.
+# Hand-authored units (the maintenance timers, boss-event-relay,
+# boss-brewery-sim's out-of-band unit) and service shell-outs
+# (jobs-api → boss-rebuild-all) all say /usr/local/bin/<name>; making
+# each of those a link to current/bin/<name> means one flip re-points
+# every one of them. Idempotent, and it also repairs links that a
+# bootstrap-vm run overwrote with real files.
+ensure_bin_links() {
+    local gen_bin="$BOSS_GEN_ROOT/current/bin"
+    local f name link
+    [[ -d "$gen_bin" ]] || return 0
+    for f in "$gen_bin"/*; do
+        [[ -f "$f" ]] || continue
+        name="$(basename "$f")"
+        link="/usr/local/bin/$name"
+        if [[ "$(readlink "$link" 2>/dev/null || true)" == "$gen_bin/$name" ]]; then
+            continue
+        fi
+        gen_atomic_link "$gen_bin/$name" "$link"
+        echo "  linked $link -> $gen_bin/$name"
+    done
+}
+
+# Q3: keep the GEN_KEEP newest generations, prune the rest — and say
+# what was removed AND how big it was (this box has had its disk-full
+# day; a prune that frees space silently teaches nobody anything).
+# The current/previous targets are never pruned, whatever their age.
+prune_generations() {
+    if [[ ! -d "$GEN_RELEASES" ]]; then
+        echo "  no generation store at $GEN_RELEASES — nothing to prune"
+        return 0
+    fi
+    local cur prev
+    cur="$(readlink -f "$BOSS_GEN_ROOT/current" 2>/dev/null || true)"
+    prev="$(readlink -f "$BOSS_GEN_ROOT/previous" 2>/dev/null || true)"
+    # Newest first by directory mtime (set once, at activation swap).
+    # Staging/retire temp dirs are dot-prefixed, so ls skips them.
+    local -a gens=()
+    local g
+    while IFS= read -r g; do gens+=("$g"); done < <(ls -1t "$GEN_RELEASES" 2>/dev/null)
+    local idx=0 pruned=0 path rp size
+    if (( ${#gens[@]} > 0 )); then
+        for g in "${gens[@]}"; do
+            path="$GEN_RELEASES/$g"
+            [[ -d "$path" && ! -L "$path" ]] || continue
+            idx=$((idx + 1))
+            (( idx <= GEN_KEEP )) && continue
+            rp="$(readlink -f "$path")"
+            if [[ -n "$cur" && "$rp" == "$cur" ]] || [[ -n "$prev" && "$rp" == "$prev" ]]; then
+                echo "  keeping $g (current/previous points at it)"
+                continue
+            fi
+            size="$(du -sh "$path" 2>/dev/null | cut -f1)"
+            rm -rf "$path"
+            echo "  pruned generation $g (${size:-?})"
+            gen_log "prune sha=$g size=${size:-?}"
+            pruned=$((pruned + 1))
+        done
+    fi
+    if (( pruned == 0 )); then
+        echo "  nothing to prune ($idx generation(s) on disk, keeping $GEN_KEEP)"
+    fi
+    return 0
+}
+
+# The make-before-break rollback: flip current <-> previous, restart.
+# Seconds, no build — the previous generation never left the disk.
+# Called by boss-deploy-confirm on a failed reading, and by operators.
+do_revert() {
+    if [[ "$(id -u)" != "0" ]]; then
+        echo "error: revert needs root (it restarts the fleet)" >&2
+        exit 1
+    fi
+    local cur_key prev_key
+    cur_key="$(gen_link_key current)"
+    prev_key="$(gen_link_key previous)"
+    if [[ -z "$cur_key" || -z "$prev_key" ]]; then
+        echo "error: revert needs both current and previous generations" >&2
+        echo "       current=${cur_key:-unset} previous=${prev_key:-unset} (store: $BOSS_GEN_ROOT)" >&2
+        exit 1
+    fi
+    if [[ "$cur_key" == "$prev_key" ]]; then
+        echo "error: current and previous both point at $cur_key — nothing to revert to" >&2
+        exit 1
+    fi
+    echo "==> revert: current $cur_key -> $prev_key (symlink flip, no build)"
+    gen_atomic_link "releases/$prev_key" "$BOSS_GEN_ROOT/current"
+    gen_atomic_link "releases/$cur_key" "$BOSS_GEN_ROOT/previous"
+    # A standing unconfirmed marker refers to the generation being
+    # rolled away — clear it so the dead-man cannot fire on (and try
+    # to "revert") the revert itself.
+    rm -f "$GEN_PENDING"
+    gen_log "revert current=$prev_key was=$cur_key"
+    ensure_bin_links
+    echo "==> restart services on the reverted generation"
+    add_units_for_env prod
+    restart_deployed_units
+    restart_if_active boss-gateway.service
+    restart_if_active boss-brewery-sim.service
+    restart_prod_daemons
+    echo "revert done — current=$prev_key previous=$cur_key"
+    echo "(scratch units, if running, pick the reverted generation up on their next restart)"
+}
+
+case "$MODE" in
+    probe)
+        echo "==> strict health probes (env=$TARGET)"
+        run_probes "$TARGET"
+        if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
+            probe_front_door
+        fi
+        if (( ${#PROBE_FAILED[@]} > 0 )); then
+            echo "probe FAILED (${#PROBE_FAILED[@]}): ${PROBE_FAILED[*]}" >&2
+            exit 1
+        fi
+        echo "probe ok — every roster probe answered 200"
+        exit 0
+        ;;
+    revert)
+        do_revert
+        exit 0
+        ;;
+    prune)
+        echo "==> prune generation store (keep $GEN_KEEP newest)"
+        prune_generations
+        exit 0
+        ;;
+esac
+
 if [[ "$TARGET" == "both" ]]; then
     run_env prod
     run_env scratch
@@ -794,29 +1086,8 @@ RELEASE_DIR="$TARGET_DIR/release"
 # hand-maintained feature list here: the old one drifted to 7 of the 37
 # gated bins and silently shipped stale/in-memory binaries every deploy.
 #
-echo "==> install fresh binaries from $RELEASE_DIR"
+echo "==> plan deployable units (binaries from $RELEASE_DIR)"
 echo "    (build first with: ./infra/build-release.sh)"
-declare -a TO_DEPLOY=()
-add_units_for_env() {
-    local env="$1"
-    local stem
-    for entry in "${PAIRED_SERVICES[@]}"; do
-        IFS=: read -r name _ _ <<<"$entry"
-        stem=$(stem_for "$name")
-        if [[ "$env" == "scratch" ]]; then
-            TO_DEPLOY+=("${stem}-scratch.service")
-        else
-            TO_DEPLOY+=("${stem}.service")
-        fi
-    done
-    if [[ "$env" == "prod" ]]; then
-        for entry in "${SOLO_SERVICES[@]}"; do
-            IFS=: read -r name _ <<<"$entry"
-            stem=$(stem_for "$name")
-            TO_DEPLOY+=("${stem}.service")
-        done
-    fi
-}
 if [[ "$TARGET" == "both" ]]; then
     add_units_for_env prod
     add_units_for_env scratch
@@ -886,17 +1157,92 @@ if (( ${#MISSING_BINS[@]} > 0 )); then
     echo "  note: not built, will be skipped: ${MISSING_BINS[*]}"
 fi
 
-# Install fresh binaries before restarting. `install -m 0755` is
-# atomic write+rename, which works even when the target is currently
-# executing a service (`cp` errors with "Text file busy" because
-# Restart=on-failure brings the service back up too quickly between
-# stop and the cp call). Skips silently when the source binary
-# isn't built — useful for partial deploys after a focused
-# `cargo build -p <one-service>`.
-install_binary() {
+# ---------------------------------------------------------------------
+# Generation staging (deployment-as-network Q1/Q2). Nothing the fleet
+# runs is touched here: binaries + carried web assets land in a
+# dot-prefixed staging dir, one rename makes it releases/<sha>/, and
+# the `current` symlink flip below is the whole activation. Re-running
+# the sha that is already live skips the copy — the build stamp proves
+# the standing generation IS this build — and just re-activates, so a
+# live generation is never clobbered mid-copy.
+# ---------------------------------------------------------------------
+GEN_KEY="$(gen_head_key "$REPO_ROOT")"
+if [[ -z "$GEN_KEY" ]]; then
+    # No git metadata (tarball deploy). The store still works; the key
+    # is just not a sha. Content is still pinned by the build stamp.
+    GEN_KEY="unversioned"
+fi
+GEN_DIR="$GEN_RELEASES/$GEN_KEY"
+GEN_STAGE="$GEN_RELEASES/.staging-$GEN_KEY"
+GEN_REUSE=0
+GEN_STAMP="$(cat "$GEN_DIR/.boss-src-fingerprint" 2>/dev/null || true)"
+if [[ -d "$GEN_DIR" && -n "$BUILT_FP" && "$GEN_STAMP" == "$BUILT_FP" ]]; then
+    GEN_REUSE=1
+    echo "==> generation $GEN_KEY already staged from this exact build — re-activating"
+else
+    echo "==> stage generation $GEN_KEY"
+    rm -rf "$GEN_RELEASES"/.staging-* 2>/dev/null || true
+    mkdir -p "$GEN_STAGE/bin"
+    # Seed the bin set from what is live today, so a partial build (or
+    # a scratch-only deploy, which stages no helper binaries) can never
+    # produce a generation MISSING a binary the fleet needs. Freshly
+    # built binaries overwrite their seed copy right below.
+    if [[ -d "$BOSS_GEN_ROOT/current/bin" ]]; then
+        cp -a "$BOSS_GEN_ROOT/current/bin/." "$GEN_STAGE/bin/"
+        echo "  seeded bin/ from generation $(gen_link_key current)"
+    else
+        # First-ever generation: adopt the real files the
+        # pre-generation deploys left in /usr/local/bin (they become
+        # symlinks through `current` at activation).
+        seeded=0
+        for f in /usr/local/bin/boss-*; do
+            [[ -f "$f" && ! -L "$f" ]] || continue
+            cp -a "$f" "$GEN_STAGE/bin/"
+            seeded=$((seeded + 1))
+        done
+        echo "  seeded bin/ with $seeded binar(ies) from /usr/local/bin (first generation)"
+    fi
+    # Q2: web dist + step-plugins live IN the generation, so a revert
+    # rolls the UI back with the code. Carry the currently served
+    # assets forward so the flip never serves an empty SPA;
+    # deploy-web.sh then overwrites them with the freshly built bundle.
+    for asset in web-dist step-plugins; do
+        if [[ "$asset" == "web-dist" ]]; then
+            legacy="/var/lib/boss-web/dist"
+        else
+            legacy="/var/lib/boss/step-plugins"
+        fi
+        asset_src=""
+        if [[ -d "$GEN_DIR/$asset" ]]; then
+            asset_src="$GEN_DIR/$asset"            # restage of this sha
+        elif [[ -d "$BOSS_GEN_ROOT/current/$asset" ]]; then
+            asset_src="$BOSS_GEN_ROOT/current/$asset"
+        elif [[ -d "$legacy" ]]; then
+            asset_src="$legacy"                    # first generation
+        fi
+        mkdir -p "$GEN_STAGE/$asset"
+        if [[ -n "$asset_src" ]]; then
+            cp -a "$asset_src/." "$GEN_STAGE/$asset/"
+            echo "  carried $asset from $asset_src"
+        else
+            echo "  note: no $asset found to carry — run ./infra/deploy-web.sh to populate it"
+        fi
+    done
+fi
+
+# Stage a binary into the generation being assembled. `install` is
+# still the copy tool (write+rename), but the destination is the
+# staging dir — /usr/local/bin only ever holds symlinks through
+# `current` (see ensure_bin_links), so nothing live is overwritten
+# mid-copy. Skips silently when the source binary isn't built — the
+# seed copy above keeps the previous build of it in the generation,
+# same net effect as the old partial-deploy behavior.
+stage_binary() {
     local bin_name="$1"
     local src="$RELEASE_DIR/$bin_name"
-    local dst="/usr/local/bin/$bin_name"
+    if (( GEN_REUSE )); then
+        return 0
+    fi
     if [[ ! -f "$src" ]]; then
         echo "  SKIP $bin_name (not built at $src)"
         return 0
@@ -908,23 +1254,19 @@ install_binary() {
     # this tree" is answered once, up front, by the fingerprint
     # pre-flight, and it is a property of the BUILD rather than of each
     # file's timestamp.
-    install -m 0755 "$src" "$dst"
-    echo "  installed $bin_name"
+    install -m 0755 "$src" "$GEN_STAGE/bin/$bin_name"
+    echo "  staged $bin_name"
 }
+if (( ! GEN_REUSE )); then
+    echo "==> stage service binaries"
+fi
 for unit in "${TO_DEPLOY[@]}"; do
     # boss-shipping-api.service → boss-shipping-api;
     # boss-shipping-api-scratch.service → boss-shipping-api
     # (scratch units run the same binary against a different config).
     bin_name="${unit%.service}"
     bin_name="${bin_name%-scratch}"
-    install_binary "$bin_name"
-done
-
-echo "==> restart services"
-for unit in "${TO_DEPLOY[@]}"; do
-    systemctl enable "$unit" >/dev/null 2>&1 || true
-    systemctl restart "$unit"
-    echo "  restarted $unit"
+    stage_binary "$bin_name"
 done
 
 # Daemons + timers are environment-agnostic — they always land in
@@ -937,8 +1279,8 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
     # audit_log; left out of every install list, it silently rotted to a
     # pre-migration build and Reset failed mid-rebuild. Freshness-guarded
     # like every other binary, so a stale one now fails the deploy loudly.
-    echo "==> install on-demand helper binaries"
-    install_binary "boss-rebuild-all"
+    echo "==> stage on-demand helper binaries"
+    stage_binary "boss-rebuild-all"
 
     # boss-gateway + boss-brewery-sim aren't port-table *-api services and have
     # no DAEMONS entry, so no install list refreshed them — they rotted to
@@ -976,15 +1318,12 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
         systemctl daemon-reload
     fi
 
-    echo "==> refresh non-port-table service binaries (gateway, brewery-sim)"
+    echo "==> stage non-port-table service binaries (gateway, brewery-sim)"
     for bin in boss-gateway boss-brewery-sim; do
-        install_binary "$bin"
-        if systemctl is-active --quiet "$bin" 2>/dev/null; then
-            systemctl restart "$bin" && echo "  restarted $bin"
-        fi
+        stage_binary "$bin"
     done
 
-    echo "==> install + enable daemons"
+    echo "==> install daemon units + stage their binaries"
     for entry in "${DAEMONS[@]}"; do
         IFS=: read -r stem subdir <<<"$entry"
         src_dir="$REPO_ROOT/infra"
@@ -995,20 +1334,11 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
             continue
         fi
         install -m 0644 "$svc_src" "/etc/systemd/system/${stem}.service"
-        install_binary "$stem"
-        echo "  installed $stem unit + binary"
-    done
-    systemctl daemon-reload
-    for entry in "${DAEMONS[@]}"; do
-        IFS=: read -r stem _ <<<"$entry"
-        if [[ -f "/etc/systemd/system/${stem}.service" ]]; then
-            systemctl enable "${stem}.service" >/dev/null 2>&1 || true
-            systemctl restart "${stem}.service"
-            echo "  restarted ${stem}.service"
-        fi
+        stage_binary "$stem"
+        echo "  installed $stem unit"
     done
 
-    echo "==> install + enable timers"
+    echo "==> install timer units + stage their binaries"
     for entry in "${TIMERS[@]}"; do
         IFS=: read -r stem subdir <<<"$entry"
         src_dir="$REPO_ROOT/infra"
@@ -1021,12 +1351,70 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
         fi
         install -m 0644 "$svc_src" "/etc/systemd/system/${stem}.service"
         install -m 0644 "$tmr_src" "/etc/systemd/system/${stem}.timer"
-        # Install the timer's binary if it's been built. The unit
-        # stem matches the binary name (e.g. boss-ledger-recognize).
-        install_binary "$stem"
-        echo "  installed $stem unit + binary"
+        # Stage the timer's binary if it's been built. The unit stem
+        # matches the binary name (e.g. boss-ledger-recognize); pure-
+        # script timers (boss-pr-train, boss-deploy-confirm) have no
+        # binary and SKIP here, which is fine.
+        stage_binary "$stem"
+        echo "  installed $stem unit + timer"
     done
     systemctl daemon-reload
+fi
+
+# ---------------------------------------------------------------------
+# Activate: one rename completes the generation, one symlink flip makes
+# it live. `previous` is re-pointed FIRST — if the run dies between the
+# two flips, previous==current (revert refuses, harmlessly) instead of
+# previous naming a two-generations-old build (revert to the wrong
+# code).
+# ---------------------------------------------------------------------
+echo "==> activate generation $GEN_KEY"
+if (( ! GEN_REUSE )); then
+    # Stamp last: a generation without a stamp reads as an unfinished
+    # stage and will be restaged on the next run, never reused.
+    if [[ -f "$RELEASE_DIR/.boss-src-fingerprint" ]]; then
+        install -m 0644 "$RELEASE_DIR/.boss-src-fingerprint" \
+            "$GEN_STAGE/.boss-src-fingerprint"
+    fi
+    if [[ -d "$GEN_DIR" ]]; then
+        # Restage of an existing sha (stamp drift, or an interrupted
+        # earlier deploy). Two renames swap the dirs; running processes
+        # hold their inodes, so nothing serving traffic is disturbed.
+        mv -T "$GEN_DIR" "$GEN_RELEASES/.retire-$GEN_KEY.$$"
+        mv -T "$GEN_STAGE" "$GEN_DIR"
+        rm -rf "$GEN_RELEASES/.retire-$GEN_KEY.$$"
+    else
+        mv -T "$GEN_STAGE" "$GEN_DIR"
+    fi
+fi
+GEN_PREVIOUS_KEY="$(gen_link_key current)"
+if [[ "$GEN_PREVIOUS_KEY" == "$GEN_KEY" ]]; then
+    # Re-deploy of the live sha: current already points here; previous
+    # stays whatever it was.
+    GEN_PREVIOUS_KEY="$(gen_link_key previous)"
+    echo "  current already -> releases/$GEN_KEY (previous stays ${GEN_PREVIOUS_KEY:-unset})"
+else
+    if [[ -n "$GEN_PREVIOUS_KEY" ]]; then
+        gen_atomic_link "releases/$GEN_PREVIOUS_KEY" "$BOSS_GEN_ROOT/previous"
+    fi
+    gen_atomic_link "releases/$GEN_KEY" "$BOSS_GEN_ROOT/current"
+    echo "  current -> releases/$GEN_KEY (previous ${GEN_PREVIOUS_KEY:-unset})"
+fi
+gen_log "activate sha=$GEN_KEY previous=${GEN_PREVIOUS_KEY:-none} target=$TARGET"
+ensure_bin_links
+
+echo "==> restart services"
+restart_deployed_units
+
+if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
+    echo "==> restart gateway + brewery-sim (if running) and daemons"
+    # The gateway always runs; the sim only in a demo deployment, where
+    # its ExecStartPre gate keeps it up — bounce each only if active.
+    restart_if_active boss-gateway.service
+    restart_if_active boss-brewery-sim.service
+    restart_prod_daemons
+
+    echo "==> enable timers"
     for entry in "${TIMERS[@]}"; do
         IFS=: read -r stem _ <<<"$entry"
         if [[ -f "/etc/systemd/system/${stem}.timer" ]]; then
@@ -1034,41 +1422,41 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
             echo "  enabled ${stem}.timer"
         fi
     done
+
+    # Q4: arm the dead-man switch — a SEPARATE unit, never in-process
+    # waiting here (a dead-man that dies with the deployer reverts
+    # nothing; the 45-minute TimeoutStartSec kill mid-build was the
+    # proof). `restart` resets the timer's monotonic clock so its
+    # readings land at +2m/+8m from THIS flip; boss-deploy-confirm
+    # evaluates the probe roster and flips current back to previous on
+    # a failed reading.
+    echo "==> arm deploy confirm (dead-man readings at +2m/+8m)"
+    mkdir -p "$GEN_STATE"
+    {
+        echo "sha=$GEN_KEY"
+        echo "previous=${GEN_PREVIOUS_KEY:-none}"
+        echo "flipped_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$GEN_PENDING"
+    if systemctl restart boss-deploy-confirm.timer 2>/dev/null; then
+        echo "  armed boss-deploy-confirm.timer"
+    else
+        echo "  !! could not arm boss-deploy-confirm.timer — this deploy stands" >&2
+        echo "     UNCONFIRMED with no dead-man; run infra/deploy-confirm.sh by hand." >&2
+    fi
 fi
+
+echo "==> prune old generations (keep $GEN_KEEP)"
+prune_generations
 
 echo "==> health probes"
 sleep 1
-probe_one() {
-    local kind="$1" name="$2" env="$3"
-    local port
-    port=$(port_of "$name" "$env")
-    # Most services mount routes under /api/<name>; boss-docs-api is
-    # named "docs" internally but serves at /api/design/*; boss-
-    # observability is a non-`-api` service that mounts /api/health
-    # directly (no per-service prefix) — it's a NATS aggregator, not
-    # a domain-CRUD service.
-    local url
-    case "$name" in
-        docs)          url="http://127.0.0.1:${port}/api/design/health" ;;
-        simulator)     url="http://127.0.0.1:${port}/simulator/api/health" ;;
-        observability) url="http://127.0.0.1:${port}/api/health" ;;
-        *)             url="http://127.0.0.1:${port}/api/${name}/health" ;;
-    esac
-    local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "$url" || echo "???")
-    local label="${name}-${env}"
-    printf '  %-20s  GET %-45s  %s\n' "$label" "$url" "$code"
-}
-for entry in "${PAIRED_SERVICES[@]}"; do
-    IFS=: read -r name _ _ <<<"$entry"
-    if [[ "$TARGET" == "prod"  || "$TARGET" == "both" ]]; then probe_one paired "$name" prod; fi
-    if [[ "$TARGET" == "scratch" || "$TARGET" == "both" ]]; then probe_one paired "$name" scratch; fi
-done
-if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
-    for entry in "${SOLO_SERVICES[@]}"; do
-        IFS=: read -r name _ <<<"$entry"
-        probe_one solo "$name" prod
-    done
+run_probes "$TARGET"
+if (( ${#PROBE_FAILED[@]} > 0 )); then
+    # Report, don't fail: the verdict on this deploy belongs to
+    # boss-deploy-confirm, which re-reads the same roster at +2m/+8m
+    # and reverts if the failure stands.
+    echo "  note: ${#PROBE_FAILED[@]} probe(s) not 200 (${PROBE_FAILED[*]})"
+    echo "        boss-deploy-confirm re-reads at +2m/+8m and auto-reverts if this persists."
 fi
 
 # Front door. deploy-services manages the API services but NOT the

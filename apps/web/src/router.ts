@@ -83,6 +83,7 @@ export type Route =
   | { kind: 'systemStepPluginDetail'; pluginSlug: string }
   | { kind: 'systemDesign' }
   | { kind: 'systemOsMap' }
+  | { kind: 'systemYard' }
   | { kind: 'systemFlow' }
   | { kind: 'systemFleet' }
   | { kind: 'systemSubjects' }
@@ -125,6 +126,7 @@ export function parseRoute(pathname: string): Route {
     if (p === '/kb') return { kind: 'systemKb' };
     if (p === '/design') return { kind: 'systemDesign' };
     if (p === '/os-map') return { kind: 'systemOsMap' };
+    if (p === '/yard') return { kind: 'systemYard' };
     if (p === '/flow') return { kind: 'systemFlow' };
     if (p === '/fleet') return { kind: 'systemFleet' };
     if (p === '/feedback') return { kind: 'systemFeedback' };

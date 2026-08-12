@@ -40,7 +40,7 @@ const ROUTES: ReadonlyArray<string> = [
   // releases and the crawl reported success the whole time — see the
   // drift test at the bottom of this file for why that can no longer
   // happen quietly.
-  '/system/feedback', '/system/flow',
+  '/system/feedback', '/system/flow', '/system/yard',
   // Fleet renders its no-Workflows empty state under the mock's
   // empty /api/workflows — a real crawl of the page chrome + picker.
   '/system/fleet',
