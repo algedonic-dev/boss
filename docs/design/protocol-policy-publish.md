@@ -104,11 +104,14 @@ mold, so the count only goes down.
   it must not become a second authorization surface. The same warning
   requirements-based-addressing gives address predicates applies to
   protocol consequences that touch other actors' work.
-- **Pinning governs evaluation.** A packet is evaluated against its
-  *pinned* protocol versions — a republish changes nothing for
-  in-flight packets, and changing a live packet's behavior is a
-  layering operation (job-packet-network Q3), visible on the
-  envelope.
+- **Pinning governs evaluation.** A packet is evaluated against the
+  protocol set fixed on its envelope at creation — a republish
+  changes nothing for in-flight packets, and changing a live packet's
+  governance is a **translation** (job-packet-network Q3, revised):
+  a new packet under the new set, admitted through this same edge
+  with a `translated_from` edge back. Admission therefore composes a
+  protocol set exactly once per packet — at creation — which is what
+  keeps the evaluator simple.
 - **Protocol changes are routing changes.** The workflow registry's
   draft/publish/bootstrap writes are un-evented today. Under 3P a
   protocol edit *is* a network configuration change; landing registry
