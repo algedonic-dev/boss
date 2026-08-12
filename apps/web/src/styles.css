@@ -1,23 +1,151 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&display=swap');
+/* =============================================================================
+   Algedonic Ales — Design Language v1.0
+   --------------------------------------------------------------------------
+   "The brand is a control system with a sense of humor. Everything reads
+   like instrumentation — monospace labels, signal green, hairline rules —
+   but the voice underneath is warm. Precision in the chrome, wit in the
+   copy."
+
+   Self-hosted faces, not a CDN @import. The playground is a public
+   deployment: an external font host is a third-party dependency on every
+   page load and leaks visitor IPs to it. These are the same Google
+   subsets, served from our own origin.
+
+   Bun inlines CSS-referenced assets as base64 data: URIs and offers no
+   knob to stop it (the `loader` map only governs JS imports), so these
+   land inside the render-blocking stylesheet rather than as separate
+   files. That makes the payload a real cost, which is why the set is cut
+   to what an English-language console needs: latin + latin-ext for DM
+   Mono 400/500 and the Space Grotesk variable. Vietnamese and the mono
+   italic were dropped — 84KB of font in total.
+
+   If this stylesheet ever needs to shrink, moving @font-face out to its
+   own non-blocking <link> is the lever, not re-adding a CDN.
+   ========================================================================== */
+
+/* DM Mono — instrument type. 400/500 roman, 400 italic. */
+@font-face {
+  font-family: 'DM Mono'; font-style: normal; font-weight: 400; font-display: swap;
+  src: url('./assets/fonts/dmmono-400-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'DM Mono'; font-style: normal; font-weight: 400; font-display: swap;
+  src: url('./assets/fonts/dmmono-400-latin-ext.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'DM Mono'; font-style: normal; font-weight: 500; font-display: swap;
+  src: url('./assets/fonts/dmmono-500-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'DM Mono'; font-style: normal; font-weight: 500; font-display: swap;
+  src: url('./assets/fonts/dmmono-500-latin-ext.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+/* Space Grotesk — voice type. One variable file per subset covers 400-700. */
+@font-face {
+  font-family: 'Space Grotesk'; font-style: normal; font-weight: 300 700; font-display: swap;
+  src: url('./assets/fonts/spacegrotesk-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Space Grotesk'; font-style: normal; font-weight: 300 700; font-display: swap;
+  src: url('./assets/fonts/spacegrotesk-latin-ext.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+:root {
+  /* --- Ground. Depth comes from border + background steps, never shadow. --- */
+  --void: #0d1014;      /* page background */
+  --ink: #12161c;       /* cards, panels */
+  --fog: #e8ecef;       /* primary text */
+  --signal: #5fd4a8;    /* accent, links, live states */
+  --static: #7a838c;    /* secondary text */
+  --hairline: #2a3138;  /* every border in the system */
+
+  /* Two derived grounds the spec implies but doesn't name: a raised panel
+     (rows, nested cards) and a hover wash. Both are steps between VOID and
+     INK, so they stay inside the no-shadow rule. */
+  --ink-raised: #171c24;
+  --wash: rgba(232, 236, 239, 0.04);
+
+  /* --- Status. Palette extension: the spec assigns SIGNAL to accent AND
+     live state and caps it at "one thing per view", which a console with
+     concurrent error/warn/ok on screen cannot honor. OK is a desaturated
+     SIGNAL so the family reads as one system.
+
+     The rule that keeps the spec intact: SIGNAL is never used for status,
+     and status colors are never used for emphasis. --- */
+  --ok: #4fb98a;
+  --warn: #d9a441;
+  --err: #e2685c;
+
+  /* --- Type. Space Grotesk is voice, DM Mono is instrument. --- */
+  --font-body: 'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'DM Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  /* Retained so the ~40 call sites still referencing a display face resolve
+     to the new voice type rather than falling back to a system serif. */
+  --font-display: var(--font-body);
+
+  /* Mono is ALWAYS caps + letterspaced. These three cover the whole range
+     the spec allows (0.1em data -> 0.3em section numbers). */
+  --ls-label: 0.1em;
+  --ls-nav: 0.14em;
+  --ls-eyebrow: 0.3em;
+
+  /* --- Space. 4px base. The spec's ad-hoc 72/28/14 values round onto this. --- */
+  --s1: 4px;  --s2: 8px;  --s3: 12px; --s4: 16px;
+  --s5: 24px; --s6: 32px; --s7: 48px; --s8: 72px;
+
+  /* Square corners are load-bearing in this language. Kept as a token so
+     the ~200 `border-radius` declarations still to be converted have one
+     place to land. */
+  --radius: 0;
+}
 
 /* =============================================================================
-   Brewery palette + type system
+   Compatibility layer — legacy token names -> the new language
    --------------------------------------------------------------------------
-   Boss Brewery whimsy. Selectively threaded into hero surfaces (page
-   titles, eyebrows, dividers, primary CTAs) — dense data tables stay
-   on the existing neutral stone palette so readability isn't sacrificed
-   for vibe. Fraunces is an opsz-aware display serif that pairs cleanly
-   with Inter at body sizes.
+   These names (--bg, --card, --text, --accent, --brew-*) are referenced
+   throughout the app. Re-pointing them here converts every call site that
+   already uses var() without touching a single component file.
+
+   Hoisted to :root deliberately. They previously lived only inside
+   .theme-exec / .theme-ops, so a component rendered outside either wrapper
+   resolved them to nothing. Now that both themes share one palette, the
+   theme classes carry layout only and every surface can resolve a token.
+
+   This layer is scaffolding for the conversion, not a permanent fixture:
+   it should shrink to nothing as components move to the real token names.
    ========================================================================== */
 :root {
-  --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  --font-display: 'Fraunces', 'Iowan Old Style', 'Palatino Linotype', Georgia, serif;
-  --brew-amber: #d99b3a;
-  --brew-amber-soft: #f4d790;
-  --brew-amber-bg: #fff7e0;
-  --brew-malt: #7a3f1f;
-  --brew-malt-dark: #4a2510;
-  --brew-cream: #fffaf0;
+  --bg: var(--void);
+  --card: var(--ink);
+  --panel: var(--ink);
+  --border: var(--hairline);
+  --panel-border: var(--hairline);
+  --border-strong: #3a434d;
+  --text: var(--fog);
+  --text-dim: var(--static);
+  --text-faint: #5c656e;
+  --accent: var(--signal);
+  --mono: var(--font-mono);
+
+  /* Exec "surprise" scale is a severity ramp — maps onto status, not accent. */
+  --surprise-high: var(--err);
+  --surprise-med: var(--warn);
+  --surprise-low: var(--static);
+
+  /* Brewery amber survives as the WARN hue; the creams and malts were
+     light-theme grounds and become dark equivalents so any remaining call
+     site renders legibly instead of painting a cream block on VOID. */
+  --brew-amber: var(--warn);
+  --brew-amber-soft: #e8c37a;
+  --brew-amber-bg: rgba(217, 164, 65, 0.12);
+  --brew-malt: var(--static);
+  --brew-malt-dark: var(--fog);
+  --brew-cream: var(--ink);
 }
 
 /* =============================================================================
@@ -30,9 +158,68 @@ html, body {
   margin: 0;
   padding: 0;
   font-family: var(--font-body);
+  /* 14px base, not the spec's 16-18px. The spec sets body copy for a
+     marketing page; this is a console whose densest tables carry a dozen
+     columns. The type SCALE below is the spec's — only the base differs. */
   font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  /* VOID is painted here, not on a wrapper: several routes render outside
+     .theme-exec/.theme-ops, and without this they showed the browser's
+     white behind the app. */
+  background: var(--void);
+  color: var(--fog);
+}
+
+a { color: var(--signal); }
+a:hover { color: #8ce4c2; }
+
+/* Keyboard focus. The spec is silent on it; nothing else in the system
+   uses a SIGNAL outline, so it stays unambiguous as a focus affordance. */
+:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 2px;
+}
+
+/* --- Instrument type utilities -------------------------------------------
+   Mono is always caps and letterspaced — never set as running text. These
+   three cover the spec's whole range so call sites stop hand-rolling
+   font/letter-spacing pairs. */
+.mono-label {
+  font: 400 11px var(--font-mono);
+  letter-spacing: var(--ls-label);
+  text-transform: uppercase;
+  color: var(--static);
+}
+.mono-nav {
+  font: 500 12px var(--font-mono);
+  letter-spacing: var(--ls-nav);
+  text-transform: uppercase;
+}
+.mono-eyebrow {
+  font: 400 12px var(--font-mono);
+  letter-spacing: var(--ls-eyebrow);
+  text-transform: uppercase;
+  color: var(--signal);
+}
+
+/* Section header: numbered mono eyebrow + hairline rule running to the
+   edge. The spec's core structural device — it echoes the badge's circular
+   index and makes a page read like a system diagram.
+
+   Numbering is only honest where order carries meaning, so this is a
+   layout primitive, not a decorator: pass a number when the sequence is
+   real, omit it when it isn't. */
+.section-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s4);
+  margin: 0 0 var(--s5);
+}
+.section-head > .rule {
+  flex: 1;
+  height: 1px;
+  background: var(--hairline);
 }
 
 /* ==========================================================================
@@ -48,9 +235,14 @@ html, body {
   padding-top: 44px;
 }
 
+/* The sidebar was already dark, but on the old warm-stone ramp
+   (#1c1917 / #292524 / #44403c). Against VOID those browns read as a
+   different product bolted on, so the whole chrome moves onto the
+   shared cool palette. */
 .shell-sidebar {
-  background: #1c1917;
-  color: #e7e5e4;
+  background: var(--ink);
+  color: var(--fog);
+  border-right: 1px solid var(--hairline);
   display: flex;
   flex-direction: column;
   position: fixed;
@@ -61,31 +253,47 @@ html, body {
 }
 /* Sidebar leads with the nav now — the tenant wordmark moved up to
    the perspective tab bar. */
-.shell-nav { flex: 1; padding: 16px 8px 0; overflow-y: auto; }
+.shell-nav { flex: 1; padding: var(--s4) var(--s2) 0; overflow-y: auto; }
 .shell-nav-personal {
-  margin-bottom: 24px;
-  padding-bottom: 16px;
-  border-bottom: 1px solid #292524;
+  margin-bottom: var(--s5);
+  padding-bottom: var(--s4);
+  border-bottom: 1px solid var(--hairline);
 }
-.shell-nav-group { margin-bottom: 16px; }
+.shell-nav-group { margin-bottom: var(--s4); }
 /* Group headers are now clickable chevron toggles (Nav IA v2). */
 .shell-nav-group-label {
   display: flex; align-items: center; gap: 6px;
   width: 100%; background: none; border: none;
   text-align: left; cursor: pointer;
-  font-size: 10px; font-weight: 600; text-transform: uppercase;
-  letter-spacing: 0.08em; color: #a8a29e; padding: 4px 12px; margin-bottom: 4px;
+  font: 400 10px var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-eyebrow);
+  color: var(--static); padding: 4px 12px; margin-bottom: var(--s1);
 }
-.shell-nav-group-label:hover { color: #fff; }
-.shell-nav-group-chevron { font-size: 10px; color: #78716c; width: 10px; }
+.shell-nav-group-label:hover { color: var(--fog); }
+.shell-nav-group-chevron { font-size: 10px; color: var(--static); width: 10px; letter-spacing: 0; }
+/* Nav is instrument type: DM Mono, caps, letterspaced — §03 assigns NAV
+   to the mono face explicitly. */
 .shell-nav-item {
-  display: flex; align-items: center; gap: 8px;
-  padding: 6px 12px; border-radius: 6px;
-  font-size: 13px; color: #d6d3d1; text-decoration: none;
-  transition: background 0.1s, color 0.1s;
+  display: flex; align-items: center; gap: var(--s2);
+  padding: 7px 12px;
+  border-radius: var(--radius);
+  border-left: 2px solid transparent;
+  font: 400 12px var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: var(--ls-label);
+  color: var(--static); text-decoration: none;
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
 }
-.shell-nav-item:hover { background: #292524; color: #fff; }
-.shell-nav-item-active { background: #44403c; color: #fff; font-weight: 500; }
+.shell-nav-item:hover { background: var(--wash); color: var(--fog); }
+/* Active is a SIGNAL rule, not a filled block. Filled signal is capped at
+   one per view (§02) and the nav would spend it on every page load. */
+.shell-nav-item-active {
+  background: var(--ink-raised);
+  border-left-color: var(--signal);
+  color: var(--fog);
+  font-weight: 500;
+}
 /* Admin footer: visually separated, smaller type, shifted to the
    bottom of the sidebar. Nav IA v2 Q4 (b). */
 .shell-sidebar-admin {
@@ -204,33 +412,25 @@ html, body {
 .nav-link-active { opacity: 1; font-weight: 600; }
 
 /* =============================================================================
-   Theme — EXEC (light, editorial)
+   Theme — EXEC (editorial layout)
+   --------------------------------------------------------------------------
+   Was a light theme with its own palette. Under Design Language v1.0 there
+   is one palette for the whole app, so this class now carries only what
+   makes exec views editorial: a wider measure and generous vertical rhythm.
    ========================================================================== */
 
 .theme-exec {
-  --bg: #fafaf9;
-  --card: #ffffff;
-  --border: #e7e5e4;
-  --border-strong: #d6d3d1;
-  --text: #1c1917;
-  --text-dim: #78716c;
-  --text-faint: #a8a29e;
-  --accent: #0284c7;
-  --surprise-high: #dc2626;
-  --surprise-med: #d97706;
-  --surprise-low: #a8a29e;
-
   background: var(--bg);
   color: var(--text);
   min-height: 100vh;
-  padding: 40px max(24px, calc((100vw - 1280px) / 2)) 80px;
+  padding: var(--s7) max(var(--s5), calc((100vw - 1280px) / 2)) var(--s8);
 }
 
 .theme-exec .theme-nav {
   background: var(--card);
   border: 1px solid var(--border);
 }
-.theme-exec .nav-link-active { background: #f5f5f4; }
+.theme-exec .nav-link-active { background: var(--wash); }
 
 /* Omnibox — global search in nav bar */
 .omnibox { position: relative; margin-right: 4px; }
@@ -942,21 +1142,14 @@ html, body {
 .list-section { min-width: 0; }
 
 /* =============================================================================
-   Theme — OPS (dark, monospace console)
+   Theme — OPS (console layout)
+   --------------------------------------------------------------------------
+   This theme was already the closest thing in the app to Design Language
+   v1.0 — dark ground, mono data, hairline rules. Its private palette is
+   gone; it now inherits the shared one and keeps its console layout.
    ========================================================================== */
 
 .theme-ops {
-  --bg: #0b0e14;
-  --panel: #141925;
-  --panel-border: #1f2738;
-  --text: #d7dae0;
-  --text-dim: #7f879a;
-  --accent: #6ab0ff;
-  --ok: #3ec28f;
-  --warn: #f5a623;
-  --err: #e25c5c;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-
   background: var(--bg);
   color: var(--text);
   min-height: 100vh;
@@ -967,7 +1160,7 @@ html, body {
   border: 1px solid var(--panel-border);
   color: var(--text);
 }
-.theme-ops .nav-link-active { background: #0b0e14; }
+.theme-ops .nav-link-active { background: var(--void); }
 
 .theme-ops.app {
   max-width: 1400px;
