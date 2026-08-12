@@ -972,7 +972,14 @@ mod tests {
     async fn a_bad_password_lands_a_denied_event() {
         let cap = std::sync::Arc::new(crate::audit::testing::Captured::default());
         let (_td, store) = temp_store();
-        store.upsert("op@example.com", "right-pw").expect("seed");
+        // Runtime-generated: no credential-shaped literal in the test
+        // binary (CodeQL flags them), and the test can't quietly grow
+        // a dependency on a magic value.
+        let good_pw = format!("pw-{}", {
+            use rand::RngExt;
+            rand::rng().random::<u64>()
+        });
+        store.upsert("op@example.com", &good_pw).expect("seed");
         let st = Arc::new(LocalAuthState {
             store,
             session_key: vec![7u8; 32],
@@ -992,7 +999,7 @@ mod tests {
             State(st.clone()),
             Json(LoginRequest {
                 email: "op@example.com".into(),
-                password: "wrong-pw".into(),
+                password: format!("{good_pw}-wrong"),
             }),
         )
         .await;
