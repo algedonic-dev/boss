@@ -6,6 +6,7 @@
 //! keeps the implementation in one place; main.rs just `use`s
 //! these instead of redeclaring them.
 
+pub mod audit;
 pub mod local_auth;
 pub mod mail;
 pub mod oidc;

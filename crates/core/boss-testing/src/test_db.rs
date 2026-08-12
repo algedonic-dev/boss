@@ -200,6 +200,10 @@ const SCHEMA_FILES: &[(&str, &str)] = &[
         "110-waiting-on-edge",
         include_str!("../../../../infra/postgres/schema/110-waiting-on-edge.sql"),
     ),
+    (
+        "111-gateway-audit-events",
+        include_str!("../../../../infra/postgres/schema/111-gateway-audit-events.sql"),
+    ),
 ];
 
 /// Concatenate the schema files in manifest order, omitting any whose name

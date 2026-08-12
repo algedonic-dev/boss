@@ -49,6 +49,44 @@ pub(crate) struct AppState {
     pub perf: Arc<PerfCollector>,
 }
 
+/// Auth-event staging (gateway-audit-events.md Q1). The URL is its
+/// own variable — not BOSS_POSTGRES_URL — because it is expected to
+/// carry the INSERT-only `boss_gateway_audit` role
+/// (111-gateway-audit-events.sql), not the service superuser. Absent
+/// → the disabled emitter, whose record is the structured warn line.
+/// `connect_lazy` on purpose: the edge must come up whether or not
+/// the database is reachable, and a failed INSERT already degrades
+/// to the warn backstop.
+fn build_auth_audit() -> boss_gateway::audit::AuthAudit {
+    match std::env::var("BOSS_GATEWAY_AUDIT_DB_URL") {
+        Err(_) => {
+            tracing::info!("BOSS_GATEWAY_AUDIT_DB_URL unset — auth events degrade to warn lines");
+            boss_gateway::audit::AuthAudit::disabled()
+        }
+        Ok(url) => match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy(&url)
+        {
+            Ok(pool) => {
+                // Clock-as-service: the drain task stamps each event
+                // via the clock so the log's timeline stays coherent
+                // under sim warp; ReqwestClockClient already falls
+                // back to wall time on transport error.
+                let clock_url =
+                    std::env::var("BOSS_CLOCK_URL").unwrap_or_else(|_| boss_ports::url("clock"));
+                boss_gateway::audit::AuthAudit::spawn(
+                    Arc::new(boss_events::outbox::PgOutboxRecorder::new(pool)),
+                    Arc::new(boss_clock_client::ReqwestClockClient::new(clock_url)),
+                )
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "audit DB URL unusable — auth events degrade to warn lines");
+                boss_gateway::audit::AuthAudit::disabled()
+            }
+        },
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -110,6 +148,7 @@ async fn main() -> Result<()> {
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .context("local-auth http client")?,
+            audit: build_auth_audit(),
             // One flag, one question: does this deployment hand out
             // a read-only session to anyone who asks?
             //
@@ -887,6 +926,7 @@ mod routing_tests {
             store,
             session_key: vec![0u8; 32],
             http: reqwest::Client::new(),
+            audit: boss_gateway::audit::AuthAudit::disabled(),
             guest_access: true,
             oidc: None,
             mail: boss_gateway::mail::from_env(),
