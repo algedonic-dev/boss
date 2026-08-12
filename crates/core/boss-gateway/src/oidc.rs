@@ -15,10 +15,11 @@
 //! Absent configuration disables the routes honestly (the mail.rs
 //! pattern): `/api/auth/oidc/available` says so, login/callback 404.
 //!
-//! The denial record is a structured `tracing::warn!` for now: the
-//! gateway has no outbox and events-api is read-only, so a proper
-//! audit event needs a gateway→log path that does not exist yet —
-//! tracked as a follow-up, not silently skipped.
+//! Denials and mints land registered audit events via the gateway's
+//! outbox staging path (`crate::audit`, gateway-audit-events.md Q1+Q2
+//! resolved 2026-08-11) — the follow-up the earlier warn-line-only
+//! record tracked. The warn lines remain as the local echo and the
+//! backstop when staging is unavailable.
 //!
 //! Flow (auth-code + PKCE, confidential client):
 //!   GET /api/auth/oidc/login     → 302 to the IdP authorize endpoint;
@@ -258,6 +259,20 @@ pub async fn callback(
     };
     if let Some(err) = q.error {
         tracing::warn!(error = %err, "oidc: IdP returned an error");
+        // `access_denied` is the IdP refusing the USER — an
+        // authentication decision, so it lands the denied event
+        // (reason `idp_denied`, no claimed email: the refusal
+        // happened before any identity reached us). Every other
+        // error value is transport/config trouble and stays a warn
+        // line only (gateway-audit-events Q2).
+        if err == "access_denied" {
+            state.audit.login_denied(
+                None,
+                crate::audit::AuthMethod::Oidc,
+                crate::audit::DeniedReason::IdpDenied,
+                Some(&oidc.config.issuer),
+            );
+        }
         return (
             StatusCode::UNAUTHORIZED,
             format!("identity provider: {err}"),
@@ -353,10 +368,16 @@ pub async fn callback(
     let scope = match bootstrap_email(&state.http, &email).await {
         Some(s) => s,
         None => {
-            // The denial RECORD (structured, greppable) — a proper
-            // audit event needs a gateway→log path that does not
-            // exist yet; until then this line is the record, on the
-            // LogTransport principle: never silently pretend.
+            // The denial event is the record now (gateway-audit-
+            // events Q1 paid this IOU); the warn line stays as the
+            // greppable local echo, and as the backstop when the
+            // staging path is down.
+            state.audit.login_denied(
+                Some(&email),
+                crate::audit::AuthMethod::Oidc,
+                crate::audit::DeniedReason::NoEmployeeRecord,
+                Some(&oidc.config.issuer),
+            );
             tracing::warn!(
                 email = %email,
                 idp = %oidc.config.issuer,
@@ -381,6 +402,12 @@ pub async fn callback(
     sess.department = scope.department;
     sess.territory_account_ids = scope.territory_account_ids;
     sess.direct_report_ids = scope.direct_report_ids;
+
+    state.audit.login_succeeded(
+        &email,
+        sess.employee_id.as_deref(),
+        crate::audit::AuthMethod::Oidc,
+    );
 
     let session_cookie = session::set_cookie(
         session::COOKIE_NAME,
@@ -508,12 +535,17 @@ mod tests {
     }
 
     fn oidc_state(issuer: &str) -> Arc<LocalAuthState> {
+        oidc_state_with_audit(issuer, crate::audit::AuthAudit::disabled())
+    }
+
+    fn oidc_state_with_audit(issuer: &str, audit: crate::audit::AuthAudit) -> Arc<LocalAuthState> {
         let store = crate::local_auth::CredentialStore::load("/nonexistent/oidc-test-creds.toml")
             .expect("empty store");
         Arc::new(LocalAuthState {
             store,
             session_key: vec![9u8; 32],
             http: reqwest::Client::new(),
+            audit,
             guest_access: false,
             oidc: Some(OidcRuntime::new(OidcConfig {
                 issuer: issuer.to_string(),
@@ -541,7 +573,14 @@ mod tests {
         let idp = mock_idp().await;
         let people = mock_people().await;
         unsafe { std::env::set_var("BOSS_PEOPLE_UPSTREAM", &people) };
-        let st = oidc_state(&idp);
+        let cap = std::sync::Arc::new(crate::audit::testing::Captured::default());
+        let st = oidc_state_with_audit(
+            &idp,
+            crate::audit::AuthAudit::spawn(
+                cap.clone(),
+                std::sync::Arc::new(boss_clock_client::WallClockClient),
+            ),
+        );
 
         let cookie = encode_state_cookie(&st.session_key, "st-9", "ver-9");
         let resp = callback(
@@ -589,6 +628,16 @@ mod tests {
             cookies.iter().any(|c| c.starts_with(STATE_COOKIE)),
             "state cookie cleared: {cookies:?}"
         );
+
+        // gateway-audit-events Q2: the mint moment is the succeeded
+        // event, and it names its method so the passkey path lands
+        // as a value, not a schema change.
+        let events = crate::audit::testing::drain(&cap, 1).await;
+        assert_eq!(events.len(), 1, "one succeeded event");
+        assert_eq!(events[0].kind, "auth.login.succeeded");
+        assert_eq!(events[0].payload["method"], "oidc");
+        assert_eq!(events[0].payload["email"], "op@example.com");
+        assert_eq!(events[0].payload["employee_id"], "emp-op");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -626,7 +675,14 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let people = mock_people().await;
         unsafe { std::env::set_var("BOSS_PEOPLE_UPSTREAM", &people) };
-        let st = oidc_state(&base);
+        let cap = std::sync::Arc::new(crate::audit::testing::Captured::default());
+        let st = oidc_state_with_audit(
+            &base,
+            crate::audit::AuthAudit::spawn(
+                cap.clone(),
+                std::sync::Arc::new(boss_clock_client::WallClockClient),
+            ),
+        );
 
         let cookie = encode_state_cookie(&st.session_key, "st-x", "ver-x");
         let resp = callback(
@@ -650,6 +706,17 @@ mod tests {
                 .any(|c| c.to_str().unwrap_or("").starts_with(session::COOKIE_NAME)),
             "fail closed mints nothing"
         );
+
+        // gateway-audit-events Q2: the fail-closed denial lands a
+        // registered event — no longer only a warn line — naming the
+        // claimed email and the IdP, asserting no employee.
+        let events = crate::audit::testing::drain(&cap, 1).await;
+        assert_eq!(events.len(), 1, "one denied event");
+        assert_eq!(events[0].kind, "auth.login.denied");
+        assert_eq!(events[0].payload["reason"], "no_employee_record");
+        assert_eq!(events[0].payload["method"], "oidc");
+        assert_eq!(events[0].payload["email_claimed"], "stranger@example.com");
+        assert!(events[0].payload.get("employee_id").is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]

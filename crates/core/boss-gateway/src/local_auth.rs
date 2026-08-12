@@ -358,6 +358,10 @@ pub struct LocalAuthState {
     pub store: CredentialStore,
     pub session_key: Vec<u8>,
     pub http: reqwest::Client,
+    /// Auth events for the edge (gateway-audit-events.md). Always
+    /// present; a deployment without the staging pool carries the
+    /// disabled emitter, whose record is the structured warn line.
+    pub audit: crate::audit::AuthAudit,
     /// How auth mail leaves the building. Defaults to a transport
     /// that logs and sends nothing, so a deployment with no provider
     /// configured still completes resets — the operator reads the
@@ -409,6 +413,14 @@ pub async fn login(
     Json(req): Json<LoginRequest>,
 ) -> Response {
     if let Err(e) = state.store.verify(&req.email, &req.password) {
+        // The decision record (gateway-audit-events Q2): before the
+        // denied event, a bad password left no trace at all.
+        state.audit.login_denied(
+            Some(&req.email.to_lowercase()),
+            crate::audit::AuthMethod::Password,
+            crate::audit::DeniedReason::BadCredentials,
+            None,
+        );
         return (StatusCode::UNAUTHORIZED, format!("{e}")).into_response();
     }
     let email = req.email.to_lowercase();
@@ -432,6 +444,12 @@ pub async fn login(
     let scope = match bootstrap_email(&state.http, &email).await {
         Some(s) => s,
         None => {
+            state.audit.login_denied(
+                Some(&email),
+                crate::audit::AuthMethod::Password,
+                crate::audit::DeniedReason::NoEmployeeRecord,
+                None,
+            );
             return (
                 StatusCode::FORBIDDEN,
                 format!(
@@ -450,6 +468,15 @@ pub async fn login(
     sess.department = scope.department;
     sess.territory_account_ids = scope.territory_account_ids;
     sess.direct_report_ids = scope.direct_report_ids;
+
+    // The mint moment IS the succeeded event (gateway-audit-events
+    // Q2); `method` is how the passkey path joins without a schema
+    // change.
+    state.audit.login_succeeded(
+        &email,
+        sess.employee_id.as_deref(),
+        crate::audit::AuthMethod::Password,
+    );
 
     let cookie_value = sess.encode(&state.session_key);
     let set_cookie = session::set_cookie(
@@ -527,6 +554,11 @@ pub async fn guest(State(state): State<Arc<LocalAuthState>>) -> Response {
 
     let mut sess = Session::new(GUEST_EMAIL, session::DEFAULT_TTL_SECONDS);
     sess.role = Some(boss_core::roles::AUDIT_READONLY_ROLE.to_string());
+
+    // Counted, deliberately (gateway-audit-events Q2): an
+    // unauthenticated endpoint that mints real read access gets a
+    // record per mint. Constant identity — no PII rides along.
+    state.audit.guest_session(GUEST_EMAIL);
 
     let cookie_value = sess.encode(&state.session_key);
     let set_cookie = session::set_cookie(
@@ -816,6 +848,7 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
+            audit: crate::audit::AuthAudit::disabled(),
             guest_access: false,
             oidc: None,
             mail: transport.clone(),
@@ -921,6 +954,7 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
+            audit: crate::audit::AuthAudit::disabled(),
             guest_access: enabled,
             oidc: None,
             mail: Arc::new(crate::mail::LogTransport),
@@ -928,6 +962,82 @@ mod tests {
             forgot_seen: Default::default(),
         });
         (td, st)
+    }
+
+    /// gateway-audit-events Q2: a bad local password is an
+    /// authentication decision, and today it leaves no record at
+    /// all. The denied event is the fix; `bad_credentials` is its
+    /// closed reason.
+    #[tokio::test]
+    async fn a_bad_password_lands_a_denied_event() {
+        let cap = std::sync::Arc::new(crate::audit::testing::Captured::default());
+        let (_td, store) = temp_store();
+        store.upsert("op@example.com", "right-pw").expect("seed");
+        let st = Arc::new(LocalAuthState {
+            store,
+            session_key: vec![7u8; 32],
+            http: reqwest::Client::new(),
+            audit: crate::audit::AuthAudit::spawn(
+                cap.clone(),
+                std::sync::Arc::new(boss_clock_client::WallClockClient),
+            ),
+            guest_access: false,
+            oidc: None,
+            mail: Arc::new(crate::mail::LogTransport),
+            public_url: "https://boss.test".into(),
+            forgot_seen: Default::default(),
+        });
+
+        let resp = login(
+            State(st.clone()),
+            Json(LoginRequest {
+                email: "op@example.com".into(),
+                password: "wrong-pw".into(),
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let events = crate::audit::testing::drain(&cap, 1).await;
+        assert_eq!(events.len(), 1, "one denied event");
+        assert_eq!(events[0].kind, "auth.login.denied");
+        assert_eq!(events[0].payload["reason"], "bad_credentials");
+        assert_eq!(events[0].payload["method"], "password");
+        assert_eq!(events[0].payload["email_claimed"], "op@example.com");
+        assert!(
+            events[0].payload.get("employee_id").is_none(),
+            "denied asserts no employee"
+        );
+    }
+
+    /// Q2: the guest mint is an unauthenticated capability; counting
+    /// it is the minimum honest record.
+    #[tokio::test]
+    async fn a_guest_mint_lands_its_own_event_kind() {
+        let cap = std::sync::Arc::new(crate::audit::testing::Captured::default());
+        let (_td, store) = temp_store();
+        let st = Arc::new(LocalAuthState {
+            store,
+            session_key: vec![7u8; 32],
+            http: reqwest::Client::new(),
+            audit: crate::audit::AuthAudit::spawn(
+                cap.clone(),
+                std::sync::Arc::new(boss_clock_client::WallClockClient),
+            ),
+            guest_access: true,
+            oidc: None,
+            mail: Arc::new(crate::mail::LogTransport),
+            public_url: "https://boss.test".into(),
+            forgot_seen: Default::default(),
+        });
+
+        let resp = guest(State(st.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let events = crate::audit::testing::drain(&cap, 1).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "auth.session.guest");
+        assert_eq!(events[0].payload["email"], GUEST_EMAIL);
     }
 
     async fn body_json(resp: Response) -> serde_json::Value {
