@@ -325,23 +325,27 @@
      Matching `.signin-btn` rather than inventing another treatment:
      the two are the only bordered buttons in the bar, and they sat
      one gap apart with different borders, radii, and padding. */
+  /* Ghost button, §04 — matches .signin-btn beside it. */
   .fb-trigger {
     background: transparent;
-    border: 1px solid #44403c;
-    border-radius: 6px;
-    padding: 4px 11px;
-    font-family: inherit;
-    font-size: 12px;
+    border: 1px solid var(--hairline, #2a3138);
+    border-radius: var(--radius, 0);
+    padding: 5px 12px;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11px;
     font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: var(--ls-nav, 0.14em);
     line-height: 1.4;
-    color: #e7e5e4;
+    color: var(--fog, #e8ecef);
     cursor: pointer;
     white-space: nowrap;
+    transition: background 0.1s, color 0.1s, border-color 0.1s;
   }
   .fb-trigger:hover {
-    background: #292524;
-    color: #fff;
-    border-color: #57534e;
+    background: var(--fog, #e8ecef);
+    color: var(--void, #0d1014);
+    border-color: var(--fog, #e8ecef);
   }
   .fb-trigger:focus-visible,
   .fb-send:focus-visible {

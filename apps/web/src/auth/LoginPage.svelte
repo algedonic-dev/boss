@@ -22,6 +22,11 @@
   // renders where the gateway says OIDC is configured (idm-kanidm) -
   // a deployment without the front door never shows a door.
   let oidcOffered = $state<boolean>(false);
+  // Passwords are not offered. The form renders only if BOTH the IdP and
+  // guest access are unavailable — a last-resort surface for a deployment
+  // with neither configured, not a path anyone here is meant to take.
+  // Break-glass for this deployment is POST /api/auth/login via curl.
+  let showLocalAuth = $state<boolean>(false);
 
   // If the SPA already has a session (someone hit /login while
   // logged in), redirect to home rather than bury them in a form.
@@ -289,6 +294,19 @@
     line-height: 1.5;
     color: #78716c;
   }
+  .local-toggle {
+    display: block;
+    margin: 1.5rem auto 0;
+    padding: 0;
+    background: none;
+    border: none;
+    color: #a8a29e;
+    font-size: 0.78rem;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .local-toggle:hover { color: #78716c; }
+
   .guest-note code {
     font-size: 11px;
     background: #f5f5f4;
@@ -303,12 +321,17 @@
     <h1 class="login-title">{mode === 'login' ? 'Welcome back' : 'Set a new password'}</h1>
     <p class="login-subtitle">
       {#if mode === 'login'}
-        Sign in with your work email + password.
+        {#if oidcOffered}
+          Sign in with your passkey — or look around as a guest.
+        {:else}
+          Sign in with your work email + password.
+        {/if}
       {:else}
         Enter the one-time token an admin shared with you.
       {/if}
     </p>
 
+    {#if (!oidcOffered && !guestOffered) || showLocalAuth || mode !== 'login'}
     <div class="login-banner">
       <strong>This is the OSS evaluation setup.</strong> Credentials live in a local file;
       there's no email-based reset, no MFA, no account lockout. Production deployments
@@ -372,10 +395,11 @@
         </button>
       </div>
     </form>
+    {/if}
 
     {#if oidcOffered && mode === 'login'}
       <div class="guest-block">
-        <div class="guest-divider"><span>or</span></div>
+        {#if showLocalAuth}<div class="guest-divider"><span>or</span></div>{/if}
         <!-- A NAVIGATION, not a fetch: the auth-code flow is a round
              trip through the IdP and back to the callback. -->
         <a class="guest-btn oidc-btn" href="/api/auth/oidc/login">
@@ -399,5 +423,14 @@
         </p>
       </div>
     {/if}
+
+    <!-- Break-glass. Deliberately understated and deliberately present:
+         idm-kanidm.md keeps local auth precisely so an IdP outage cannot
+         lock operators out. Hiding it entirely would trade one lockout
+         risk for another. -->
+    <!-- No password affordance. Passwords are not an accepted factor on
+         this network; identity is a passkey at the IdP. Break-glass is
+         still reachable for an operator with curl (POST /api/auth/login)
+         — deliberately not a button, so nobody drifts back to it. -->
   </div>
 </div>

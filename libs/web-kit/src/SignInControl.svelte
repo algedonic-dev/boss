@@ -34,23 +34,29 @@
 {/if}
 
 <style>
+  /* Ghost button, §04: square corners, hairline border, mono caps.
+     Hover inverts rather than tinting — the spec's one hover rule for
+     buttons, and it keeps SIGNAL free for state that means something. */
   .signin-btn {
     background: transparent;
-    border: 1px solid #44403c;
-    border-radius: 6px;
-    padding: 4px 11px;
-    font-size: 12px;
+    border: 1px solid var(--hairline, #2a3138);
+    border-radius: var(--radius, 0);
+    padding: 5px 12px;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11px;
     font-weight: 500;
-    color: #e7e5e4;
+    text-transform: uppercase;
+    letter-spacing: var(--ls-nav, 0.14em);
+    color: var(--fog, #e8ecef);
     text-decoration: none;
     cursor: pointer;
-    font-family: inherit;
     line-height: 1.4;
     white-space: nowrap;
+    transition: background 0.1s, color 0.1s, border-color 0.1s;
   }
   .signin-btn:hover {
-    background: #292524;
-    color: #fff;
-    border-color: #57534e;
+    background: var(--fog, #e8ecef);
+    color: var(--void, #0d1014);
+    border-color: var(--fog, #e8ecef);
   }
 </style>
