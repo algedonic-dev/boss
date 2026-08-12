@@ -18,6 +18,12 @@ fn spec(kind: &str, label: &str) -> WorkflowSpec {
     WorkflowSpec::platform_seed(kind, label, "platform", vec!["account".into()], Vec::new())
 }
 
+/// Shared write-path actor + now: every registry write records an
+/// event with a who and a when (tests are wallclock-exempt).
+fn reconciler() -> boss_core::actor::ActorId {
+    boss_core::actor::ActorId::Automation("bootstrap-reconciler".into())
+}
+
 async fn created_by(db: &TestDb, kind: &str) -> Option<String> {
     let row = sqlx::query("SELECT created_by FROM workflows WHERE kind = $1 AND status = 'active'")
         .bind(kind)
@@ -33,7 +39,11 @@ async fn pg_inserts_missing_kinds_as_bootstrap_owned() {
     let registry = PgWorkflows::new(db.pool.clone());
 
     let stats = registry
-        .bootstrap_reconcile(&[spec("workflow-design", "Design a Workflow")])
+        .bootstrap_reconcile(
+            &[spec("workflow-design", "Design a Workflow")],
+            &reconciler(),
+            chrono::Utc::now(),
+        )
         .await
         .expect("reconcile");
 
@@ -67,12 +77,20 @@ async fn pg_republishes_drifted_bootstrap_rows_as_a_new_version() {
     let registry = PgWorkflows::new(db.pool.clone());
 
     registry
-        .bootstrap_reconcile(&[spec("workflow-design", "Old Label")])
+        .bootstrap_reconcile(
+            &[spec("workflow-design", "Old Label")],
+            &reconciler(),
+            chrono::Utc::now(),
+        )
         .await
         .expect("seed bootstrap");
 
     let stats = registry
-        .bootstrap_reconcile(&[spec("workflow-design", "New Label")])
+        .bootstrap_reconcile(
+            &[spec("workflow-design", "New Label")],
+            &reconciler(),
+            chrono::Utc::now(),
+        )
         .await
         .expect("republish");
 
@@ -135,7 +153,11 @@ async fn pg_preserves_operator_edits() {
     .expect("seed operator row");
 
     let stats = registry
-        .bootstrap_reconcile(&[spec("workflow-design", "Default Label")])
+        .bootstrap_reconcile(
+            &[spec("workflow-design", "Default Label")],
+            &reconciler(),
+            chrono::Utc::now(),
+        )
         .await
         .expect("reconcile");
 
@@ -163,11 +185,15 @@ async fn pg_no_op_when_already_matching() {
 
     let body = spec("workflow-design", "Design a Workflow");
     registry
-        .bootstrap_reconcile(std::slice::from_ref(&body))
+        .bootstrap_reconcile(
+            std::slice::from_ref(&body),
+            &reconciler(),
+            chrono::Utc::now(),
+        )
         .await
         .expect("seed");
     let stats = registry
-        .bootstrap_reconcile(&[body])
+        .bootstrap_reconcile(&[body], &reconciler(), chrono::Utc::now())
         .await
         .expect("reconcile");
 
@@ -185,13 +211,22 @@ async fn pg_publish_authored_supersedes_active_and_stamps_provenance() {
     // Seed a bootstrap row first, so the publish path actually
     // exercises the supersede branch (not just an insert).
     registry
-        .bootstrap_reconcile(&[spec("morning-brew", "Bootstrap Label")])
+        .bootstrap_reconcile(
+            &[spec("morning-brew", "Bootstrap Label")],
+            &reconciler(),
+            chrono::Utc::now(),
+        )
         .await
         .expect("seed bootstrap");
 
     let job_id = JobId::new();
     let published = registry
-        .publish_authored(spec("morning-brew", "Job-Authored Label"), job_id)
+        .publish_authored(
+            spec("morning-brew", "Job-Authored Label"),
+            job_id,
+            &boss_core::actor::ActorId::Human("emp-cto".into()),
+            chrono::Utc::now(),
+        )
         .await
         .expect("publish");
 
@@ -230,7 +265,11 @@ async fn pg_publish_authored_supersedes_active_and_stamps_provenance() {
     // Sanity check: the next bootstrap_reconcile against an updated
     // default does NOT touch the operator-published row.
     let stats = registry
-        .bootstrap_reconcile(&[spec("morning-brew", "Updated Bootstrap Default")])
+        .bootstrap_reconcile(
+            &[spec("morning-brew", "Updated Bootstrap Default")],
+            &reconciler(),
+            chrono::Utc::now(),
+        )
         .await
         .expect("reconcile post-publish");
     assert_eq!(

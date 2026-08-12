@@ -17,6 +17,7 @@ boss-assets = { path = "../../modules/boss-assets", features = ["postgres"] }
 boss-ledger = { path = "../../modules/boss-ledger", features = ["postgres"] }
 sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres"] }
 clap = { workspace = true }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -4,14 +4,16 @@
 #
 # Forgejo Actions runs JavaScript actions (actions/checkout) inside
 # the job container, so node must be present or every job dies at
-# checkout with exitcode 127. python3 is here because the rust suite
-# shells out to it — boss-testing's conductor_preflight tests drive
+# checkout with exitcode 127. python3 used to be here for one reason
+# only: boss-testing's conductor_preflight tests drove
 # infra/train/conductor.py directly, and their absence-of-python
-# failure mode is a panic that read as "3 tests failed" while the
+# failure mode was a panic that read as "3 tests failed" while the
 # real story was "the container can't run what the suite runs"
-# (forge train #1's red signal, 2026-08-12). Carrying rustfmt/clippy
-# and the postgres client means a CI run does no toolchain
-# installation at all.
+# (forge train #1's red signal, 2026-08-12). Directive 26d61c97 ported
+# the conductor to `boss train` and the tests now drive the compiled
+# boss binary, so the interpreter — only ever there for the conductor
+# tests — is out. Carrying rustfmt/clippy and the postgres client
+# means a CI run does no toolchain installation at all.
 #
 # Build + push (forge host):
 #   docker build -t 10.20.0.15:3000/david/boss-ci:rust1.96 infra/forge/boss-ci
@@ -21,7 +23,6 @@ FROM rust:1.96-slim-bookworm
 RUN apt-get update -qq \
  && apt-get install -y --no-install-recommends \
       nodejs git ca-certificates postgresql-client pkg-config libssl-dev curl \
-      python3 \
  && rm -rf /var/lib/apt/lists/*
 
 RUN rustup component add rustfmt clippy

@@ -19,12 +19,30 @@ pub const JOB_CREATED: &str = "jobs.job.created";
 pub const JOB_UPDATED: &str = "jobs.job.updated";
 pub const STEP_CREATED: &str = "jobs.step.created";
 pub const STEP_UPDATED: &str = "jobs.step.updated";
-/// Emitted when a `workflow-publish` Step flips to `Done` and the
-/// dispatch path successfully writes a WorkflowSpec into the
-/// registry. Payload is the full published `WorkflowSpec` (with
-/// `authoring_job_id` set to the meta-Job's id), matching what
-/// `rebuild_workflows` consumes to reconstruct the projection.
+/// A WorkflowSpec version went live: an author's publish, a
+/// `workflow-publish` Step's `publish_authored` dispatch, or a
+/// bootstrap reconcile inserting/republishing a platform default.
+/// Recorded by the registry adapter atomically with the workflows
+/// row. Payload is the full published `WorkflowSpec` (with
+/// `authoring_job_id` set to the meta-Job's id when a Job authored
+/// it), matching what `rebuild_workflows` consumes to reconstruct
+/// the projection.
 pub const WORKFLOW_PUBLISHED: &str = "jobs.kind.published";
+/// A draft row was appended to the registry (author saved, not live).
+pub const WORKFLOW_DRAFT_SAVED: &str = "jobs.kind.draft_saved";
+/// The active row of a kind was retired with no successor.
+pub const WORKFLOW_RETIRED: &str = "jobs.kind.retired";
+/// A draft StepPlugin row was appended to the registry (author
+/// saved, not live). Recorded by the registry adapter atomically
+/// with the step_plugins row; payload is the full `StepPluginSpec`.
+pub const STEP_PLUGIN_DRAFT_SAVED: &str = "jobs.step_plugin.draft_saved";
+/// A StepPluginSpec version went live: the latest draft flipped to
+/// active, retiring any prior active row. Payload is the promoted
+/// `StepPluginSpec`.
+pub const STEP_PLUGIN_PUBLISHED: &str = "jobs.step_plugin.published";
+/// The active StepPlugin version of a kind was retired with no
+/// successor. Payload is the retired `StepPluginSpec`.
+pub const STEP_PLUGIN_RETIRED: &str = "jobs.step_plugin.retired";
 
 // Marker events — informational only; rebuild ignores them.
 pub const JOB_STATUS_CHANGED: &str = "jobs.job.status_changed";
@@ -56,6 +74,40 @@ pub fn step_state_payload(step: &boss_core::job::Step) -> serde_json::Value {
         );
     }
     v
+}
+
+/// A workflow-registry event, built inside the adapter that owns the
+/// row transaction. Under 3P a protocol edit IS a network
+/// configuration change (protocol-policy-publish.md, Constraints):
+/// the registry's writes were the one un-evented path in boss-jobs,
+/// which made "protocols as data the log witnesses" false. The actor
+/// rides as `_actor` exactly as EventStamp injects it, so consumers
+/// and the rebuild read one shape.
+pub fn workflow_registry_event(
+    kind: &str,
+    actor: &boss_core::actor::ActorId,
+    now: chrono::DateTime<chrono::Utc>,
+    spec: &crate::registry::WorkflowSpec,
+) -> boss_core::event::Event {
+    let payload =
+        boss_core::publisher::inject_actor(serde_json::to_value(spec).unwrap_or_default(), actor);
+    boss_core::event::Event::new("jobs", kind, payload, now)
+}
+
+/// A step-plugin registry event — same contract as
+/// [`workflow_registry_event`], for the `step_plugins` table: built
+/// inside the adapter that owns the row transaction, payload is the
+/// serialized `StepPluginSpec` with the actor riding as `_actor`
+/// exactly as EventStamp injects it.
+pub fn step_plugin_registry_event(
+    kind: &str,
+    actor: &boss_core::actor::ActorId,
+    now: chrono::DateTime<chrono::Utc>,
+    spec: &crate::step_plugins::StepPluginSpec,
+) -> boss_core::event::Event {
+    let payload =
+        boss_core::publisher::inject_actor(serde_json::to_value(spec).unwrap_or_default(), actor);
+    boss_core::event::Event::new("jobs", kind, payload, now)
 }
 
 #[cfg(test)]

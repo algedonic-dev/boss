@@ -220,7 +220,8 @@ TIMERS=(
     "boss-search-reindex:."
     # The twice-daily PR train: batches ready branches into one PR and
     # records CI/merge/deploy evidence on the pr-train Job. The
-    # conductor script is infra/train/conductor.py.
+    # conductor is `boss train` (crates/orchestrators/boss-cli), entered
+    # through infra/train/conductor.sh.
     "boss-pr-train:train"
     # Reconcile-only sibling on a 10-minute cadence: records CI/merge
     # evidence and lands merged trains near the event instead of at

@@ -1,4 +1,4 @@
-//! `conductor.py --preflight` — the locomotive check.
+//! `boss train preflight` — the locomotive check.
 //!
 //! The 2026-08-10 18:01 window crashed before boarding: root-owned
 //! objects in the conductor's clone (left by a sudo probe) made its
@@ -9,19 +9,17 @@
 //! owned by the running user, remotes reachable — and fails LOUDLY
 //! with a distinct exit code before touching any train state.
 //!
-//! Same idiom as migrate_sh.rs: build a scratch fixture (bare local
-//! "upstream" + "fork" repos, a clone wired to both), run the real
-//! script against it, assert on exit codes and named problems.
+//! Same idiom as boss-testing's migrate_sh.rs: build a scratch fixture
+//! (bare local "upstream" + "fork" repos, a clone wired to both), run
+//! the real conductor against it, assert on exit codes and named
+//! problems. Moved here from
+//! crates/core/boss-testing/tests/conductor_preflight.rs when the
+//! python conductor became `boss train` (directive 26d61c97) — the
+//! conductor under test is now the compiled `boss` binary, not a
+//! script in the repo tree.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .canonicalize()
-        .expect("repo root resolves")
-}
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -109,18 +107,22 @@ impl Fixture {
     }
 
     fn preflight(&self) -> Output {
-        Command::new("python3")
-            .arg(repo_root().join("infra/train/conductor.py"))
-            .arg("--preflight")
+        Command::new(env!("CARGO_BIN_EXE_boss"))
+            .args(["train", "preflight"])
             .env("BOSS_TRAIN_HOME", &self.home)
             .env("BOSS_TRAIN_UPSTREAM_URL", &self.upstream)
             .env("BOSS_TRAIN_FORK_URL", &self.fork)
+            // Preflight never talks to the forge, but the adapter is
+            // built at entry (import-time in the python) — pin github
+            // so a developer's BOSS_TRAIN_FORGE=forgejo (whose token
+            // file is read at construction) can't fail these tests.
+            .env("BOSS_TRAIN_FORGE", "github")
             // Never contacted by preflight; a wrong port makes any
             // accidental API call fail the test instead of touching
             // a real jobs-api.
             .env("BOSS_JOBS_URL", "http://127.0.0.1:1")
             .output()
-            .expect("conductor.py runs")
+            .expect("boss train preflight runs")
     }
 }
 

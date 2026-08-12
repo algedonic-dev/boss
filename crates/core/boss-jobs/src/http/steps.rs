@@ -112,6 +112,10 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
 /// published spec on success or a (status, message) pair the
 /// caller can short-circuit with.
 ///
+/// The stamp's `actor` + `now` ride into `publish_authored` so the
+/// registry adapter records `jobs.kind.published` atomically with
+/// the workflows row — the step path no longer emits its own copy.
+///
 /// Validation = `boss_jobs::workflow_lint::validate_all` —
 /// catches required-field mismatches, unknown step kinds, and the
 /// other static guarantees a published spec needs. The lint
@@ -120,6 +124,8 @@ async fn dispatch_workflow_publish(
     registry: &dyn crate::registry::WorkflowRegistry,
     step: &boss_core::job::Step,
     job_id: boss_core::job::JobId,
+    actor: &boss_core::actor::ActorId,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<crate::registry::WorkflowSpec, (StatusCode, String)> {
     use crate::workflow_lint::validate_all;
 
@@ -146,12 +152,15 @@ async fn dispatch_workflow_publish(
         return Err((StatusCode::BAD_REQUEST, msg));
     }
 
-    registry.publish_authored(spec, job_id).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("publish_authored failed: {e}"),
-        )
-    })
+    registry
+        .publish_authored(spec, job_id, actor, now)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("publish_authored failed: {e}"),
+            )
+        })
 }
 
 pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'static>(
@@ -429,31 +438,6 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         }
     }
 
-    // In-process dispatch for the `workflow-publish` StepType. When a
-    // step of this kind flips to Done, read `workflow_spec` from
-    // metadata, lint it via `validate_all`, and call
-    // `WorkflowRegistry::publish_authored` so the meta-Job's authoring
-    // closes by writing a real registry row.
-    //
-    // Registry-write-first: if publish_authored fails, `update_step_at`
-    // is never called and no STEP_UPDATED accumulates in audit_log for
-    // a step whose side effect couldn't fire — keeping audit_log
-    // integrity on partial failure.
-    let mut published_kind: Option<crate::registry::WorkflowSpec> = None;
-    if is_flipping_to_done && step.kind == "workflow-publish" {
-        let Some(reg) = &state.kind_registry else {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Workflow registry unavailable for workflow-publish dispatch",
-            )
-                .into_response();
-        };
-        match dispatch_workflow_publish(reg.as_ref(), &step, job_id).await {
-            Ok(spec) => published_kind = Some(spec),
-            Err((status, msg)) => return (status, msg).into_response(),
-        }
-    }
-
     let now = boss_clock_client::now_from(&state.clock).await;
 
     // OUTBOX (phase 2): the state event + every marker this
@@ -466,7 +450,9 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // field in the body that names the real Employee whose work the
     // step represents; we honor that override when the calling
     // identity is an automation slug so the audit_log row attributes
-    // work to a person, not a process.
+    // work to a person, not a process. Computed BEFORE the
+    // workflow-publish dispatch below — the registry write records
+    // its event under this same actor + now.
     let body_completed_by = body
         .get("completed_by")
         .and_then(|v| v.as_str())
@@ -485,6 +471,32 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
             .ambient_actor()
             .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into())),
     };
+
+    // In-process dispatch for the `workflow-publish` StepType. When a
+    // step of this kind flips to Done, read `workflow_spec` from
+    // metadata, lint it via `validate_all`, and call
+    // `WorkflowRegistry::publish_authored` so the meta-Job's authoring
+    // closes by writing a real registry row.
+    //
+    // Registry-write-first: if publish_authored fails, `update_step_at`
+    // is never called and no STEP_UPDATED accumulates in audit_log for
+    // a step whose side effect couldn't fire — keeping audit_log
+    // integrity on partial failure.
+    if is_flipping_to_done && step.kind == "workflow-publish" {
+        let Some(reg) = &state.kind_registry else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Workflow registry unavailable for workflow-publish dispatch",
+            )
+                .into_response();
+        };
+        if let Err((status, msg)) =
+            dispatch_workflow_publish(reg.as_ref(), &step, job_id, &actor, now).await
+        {
+            return (status, msg).into_response();
+        }
+    }
+
     let stamp = state
         .publisher
         .stamp_with_actor_at(actor.clone(), now)
@@ -492,15 +504,13 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     let mut step_events =
         vec![stamp.event(events::STEP_UPDATED, events::step_state_payload(&step))];
 
-    // The `workflow-publish` dispatch produces an audit-bearing
-    // event with the full published spec — what `rebuild_workflows`
-    // reads to reconstruct the registry from audit_log.
-    if let Some(spec) = &published_kind {
-        step_events.push(stamp.event(
-            events::WORKFLOW_PUBLISHED,
-            serde_json::to_value(spec).unwrap_or_default(),
-        ));
-    }
+    // The `workflow-publish` dispatch's WORKFLOW_PUBLISHED event —
+    // the full published spec `rebuild_workflows` reads to
+    // reconstruct the registry — used to be pushed into
+    // `step_events` here. It moved into the registry adapter
+    // (`publish_authored` records it atomically with the workflows
+    // ROW), so the step path no longer duplicates it. The rebuild
+    // reads the same kind either way.
 
     // Marker events for downstream consumers — informational
     // duplicates of state already in STEP_UPDATED. Rebuild ignores.

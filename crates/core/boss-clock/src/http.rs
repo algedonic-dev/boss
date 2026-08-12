@@ -551,11 +551,17 @@ mod tests {
         // before-read and the configure to land in the SAME wall
         // millisecond — free on an idle laptop, hopeless on a loaded
         // runner (flaked on forge train #1, 2026-08-12, in a crate no
-        // car touched). The honest bound: drift may be at most the
-        // MEASURED wall gap times the old warp (plus slack), which
-        // scheduler jitter cannot break — while the bug this test
-        // exists to catch re-derives sim-time from today and jumps
-        // ~half a year, far beyond any jitter bound.
+        // car touched). The second version bounded drift by the
+        // MEASURED wall gap times the old warp — and flaked on forge
+        // train #4 with drift exactly 86400s between two midnight
+        // stamps: at this warp the sim clock only EXISTS in whole-day
+        // quanta (1 wall ms = 1 sim day), so two reads a hair apart
+        // in wall time can still straddle a millisecond boundary and
+        // legitimately differ by a full quantum the wall gap does not
+        // predict. The bound therefore carries one quantum on both
+        // sides — while the bug this test exists to catch re-derives
+        // sim-time from today and jumps ~half a year, far beyond a
+        // day.
         let (_, after) = get_json(app, "/api/clock/now").await;
         let sim_after = after["now"].as_str().expect("now");
         let parse = |t: &str| {
@@ -563,13 +569,15 @@ mod tests {
                 .map(|d| d.with_timezone(&chrono::Utc))
                 .expect("clock timestamps parse")
         };
+        const QUANTUM_SECS: f64 = 86_400.0; // one sim-day per wall ms
         let drift = parse(sim_after) - parse(&sim_before);
-        let allowed_secs = wall_anchor.elapsed().as_secs_f64() * 86_400_000.0 + 60.0;
+        let drift_secs = drift.num_seconds() as f64;
+        let allowed_secs = wall_anchor.elapsed().as_secs_f64() * 86_400_000.0 + QUANTUM_SECS + 60.0;
         assert!(
-            drift >= chrono::Duration::zero() && (drift.num_seconds() as f64) <= allowed_secs,
+            drift_secs >= -QUANTUM_SECS && drift_secs <= allowed_secs,
             "sim-time teleported across the warp change: {sim_before} -> {sim_after} \
-             (drift {}s, jitter allows at most {allowed_secs:.0}s)",
-            drift.num_seconds()
+             (drift {drift_secs:.0}s, quantized jitter allows [-{QUANTUM_SECS:.0}, \
+             {allowed_secs:.0}]s)"
         );
     }
 

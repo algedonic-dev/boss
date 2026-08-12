@@ -677,6 +677,7 @@ name = "boss-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "boss-assets",
  "boss-core",
  "boss-events",

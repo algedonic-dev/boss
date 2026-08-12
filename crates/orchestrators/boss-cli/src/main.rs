@@ -8,7 +8,9 @@ mod docs_flush;
 mod doctor;
 mod inspect;
 mod ops;
+mod queue;
 mod script;
+mod train;
 mod upgrade;
 
 #[derive(Parser)]
@@ -106,6 +108,24 @@ enum Commands {
         #[command(subcommand)]
         action: InspectAction,
     },
+    /// PR-train conductor — drive the pr-train Workflow: reconcile
+    /// open trains against reality, board this window's train. The
+    /// systemd timers enter through `boss train run` (via
+    /// infra/train/conductor.sh).
+    Train {
+        #[command(subcommand)]
+        action: TrainAction,
+    },
+    /// Read the feedback triage board from a terminal. Read-only on
+    /// purpose: taking an item, annotating it, or closing it goes
+    /// through the board or the step API, so every state change
+    /// carries an actor.
+    Queue {
+        /// Column to show: all | waiting | with-agent |
+        /// routed[:disposition] | done
+        #[arg(default_value = "all")]
+        column: String,
+    },
     /// Query the audit log for domain events
     Audit {
         /// Filter by event kind prefix (e.g., "catalog.model")
@@ -120,6 +140,41 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrainAction {
+    /// Prove the locomotive fit — clone owned by the running user,
+    /// both remotes reachable — and exit. A sick locomotive exits 3,
+    /// loud in the unit's status, instead of surfacing at departure.
+    Preflight {
+        /// Say what would happen without writing anywhere
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Record evidence on open trains — the CI verdict, the merge
+    /// (observed, never assumed), the deploys that carried it out.
+    /// No boarding. This is the 10-minute early-warning cadence.
+    Reconcile {
+        /// Say what would happen without writing anywhere
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Board this window's train without reconciling first: collect
+    /// ready ship-a-change Jobs, assemble the train branch, open the
+    /// one batched PR.
+    Board {
+        /// Say what would happen without writing anywhere
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// The timer entry: reconcile open trains, then board this
+    /// window's train.
+    Run {
+        /// Say what would happen without writing anywhere
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -418,6 +473,20 @@ async fn main() -> Result<()> {
                 inspect::employees(role.as_deref(), limit, json, &gw).await
             }
         },
+        Commands::Train { action } => {
+            let (phase, dry) = match action {
+                TrainAction::Preflight { dry_run } => (train::Phase::Preflight, dry_run),
+                TrainAction::Reconcile { dry_run } => (train::Phase::Reconcile, dry_run),
+                TrainAction::Board { dry_run } => (train::Phase::Board, dry_run),
+                TrainAction::Run { dry_run } => (train::Phase::Run, dry_run),
+            };
+            // Wall-clock at the CLI boundary: the train window IS the
+            // operator's now (the systemd timer cadence), and nothing
+            // here stamps audit_log directly — jobs-api does that on
+            // the far side of the HTTP calls.
+            train::run(phase, dry, chrono::Utc::now()).await
+        }
+        Commands::Queue { column } => queue::run(&column).await,
         Commands::Audit {
             kind,
             source,

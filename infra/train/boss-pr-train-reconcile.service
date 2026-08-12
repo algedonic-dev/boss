@@ -1,6 +1,6 @@
 [Unit]
 Description=BOSS PR train reconcile — record evidence + land merged trains, no boarding
-Documentation=file:/opt/boss/infra/train/conductor.py
+Documentation=file:/opt/boss/infra/train/conductor.sh
 After=network-online.target boss-jobs-api.service
 Wants=network-online.target
 

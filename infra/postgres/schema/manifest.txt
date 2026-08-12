@@ -37,3 +37,5 @@
 109-dispatcher-rule-flush-queue.sql
 110-waiting-on-edge.sql
 111-gateway-audit-events.sql
+112-event-kinds-workflow-registry.sql
+113-event-kinds-step-plugins.sql

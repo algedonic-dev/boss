@@ -331,7 +331,10 @@ pub fn inject_simulated(mut payload: serde_json::Value, simulated: bool) -> serd
     serde_json::json!({ "_simulated": simulated, "value": payload })
 }
 
-fn inject_actor(mut payload: serde_json::Value, actor: &ActorId) -> serde_json::Value {
+/// Public because it is THE actor-embedding shape: adapters that
+/// mint events inside their own transactions (the workflow registry)
+/// must produce payloads indistinguishable from EventStamp's.
+pub fn inject_actor(mut payload: serde_json::Value, actor: &ActorId) -> serde_json::Value {
     let actor_value = serde_json::to_value(actor).unwrap_or(serde_json::Value::Null);
     if let serde_json::Value::Object(ref mut map) = payload {
         // Don't overwrite an explicit `_actor` already on the

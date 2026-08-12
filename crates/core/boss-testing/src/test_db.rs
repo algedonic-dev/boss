@@ -204,6 +204,14 @@ const SCHEMA_FILES: &[(&str, &str)] = &[
         "111-gateway-audit-events",
         include_str!("../../../../infra/postgres/schema/111-gateway-audit-events.sql"),
     ),
+    (
+        "112-event-kinds-workflow-registry",
+        include_str!("../../../../infra/postgres/schema/112-event-kinds-workflow-registry.sql"),
+    ),
+    (
+        "113-event-kinds-step-plugins",
+        include_str!("../../../../infra/postgres/schema/113-event-kinds-step-plugins.sql"),
+    ),
 ];
 
 /// Concatenate the schema files in manifest order, omitting any whose name

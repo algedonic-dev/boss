@@ -139,7 +139,8 @@ pub(super) async fn create_plugin<R: JobsRepository + 'static, B: EventBus + 'st
     if let Err(r) = plugin_policy_check(&state, &user, Action::Create).await {
         return r;
     }
-    match reg.create_draft(spec).await {
+    let (actor, now) = write_stamp(&state, &user).await;
+    match reg.create_draft(spec, &actor, now).await {
         Ok(stored) => (StatusCode::CREATED, Json(stored)).into_response(),
         Err(e) => plugin_err_response(e),
     }
@@ -159,7 +160,8 @@ pub(super) async fn update_plugin<R: JobsRepository + 'static, B: EventBus + 'st
         return r;
     }
     spec.kind = kind;
-    match reg.create_draft(spec).await {
+    let (actor, now) = write_stamp(&state, &user).await;
+    match reg.create_draft(spec, &actor, now).await {
         Ok(stored) => (StatusCode::CREATED, Json(stored)).into_response(),
         Err(e) => plugin_err_response(e),
     }
@@ -177,7 +179,8 @@ pub(super) async fn publish_plugin<R: JobsRepository + 'static, B: EventBus + 's
     if let Err(r) = plugin_policy_check(&state, &user, Action::Publish).await {
         return r;
     }
-    match reg.publish(&kind).await {
+    let (actor, now) = write_stamp(&state, &user).await;
+    match reg.publish(&kind, &actor, now).await {
         Ok(spec) => Json(spec).into_response(),
         Err(e) => plugin_err_response(e),
     }
@@ -195,7 +198,8 @@ pub(super) async fn retire_plugin<R: JobsRepository + 'static, B: EventBus + 'st
     if let Err(r) = plugin_policy_check(&state, &user, Action::Retire).await {
         return r;
     }
-    match reg.retire(&kind).await {
+    let (actor, now) = write_stamp(&state, &user).await;
+    match reg.retire(&kind, &actor, now).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => plugin_err_response(e),
     }

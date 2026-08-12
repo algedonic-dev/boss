@@ -21,6 +21,25 @@ pub(super) fn kind_registry_or_503<R: JobsRepository, B: EventBus>(
     })
 }
 
+/// The who + when every registry write hands to the adapter, which
+/// builds and records the outbox event atomically with the row.
+/// Actor per the Level-B stamping invariant: the authenticated
+/// session identity, falling back to the platform automation for
+/// header-less internal calls. `now` is clock-routed — never
+/// wallclock — so sim-mode registry edits stamp sim time.
+/// Shared with the step-plugin handlers (`plugins.rs`), whose
+/// writes carry the same stamp contract.
+pub(super) async fn write_stamp<R: JobsRepository, B: EventBus>(
+    state: &JobsApiState<R, B>,
+    user: &boss_policy_client::User,
+) -> (boss_core::actor::ActorId, chrono::DateTime<chrono::Utc>) {
+    let actor = user
+        .ambient_actor()
+        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+    let now = boss_clock_client::now_from(&state.clock).await;
+    (actor, now)
+}
+
 pub(super) fn kind_err_response(err: WorkflowError) -> Response {
     match err {
         WorkflowError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
@@ -135,7 +154,8 @@ pub(super) async fn create_kind<R: JobsRepository + 'static, B: EventBus + 'stat
     if let Err(r) = policy_check(&state, &user, Action::Create).await {
         return r;
     }
-    match reg.create_draft(spec).await {
+    let (actor, now) = write_stamp(&state, &user).await;
+    match reg.create_draft(spec, &actor, now).await {
         Ok(stored) => (StatusCode::CREATED, Json(stored)).into_response(),
         Err(e) => kind_err_response(e),
     }
@@ -208,7 +228,8 @@ pub(super) async fn update_kind<R: JobsRepository + 'static, B: EventBus + 'stat
     }
     // Force kind match — a PUT for /kinds/foo always edits foo.
     spec.kind = kind;
-    match reg.create_draft(spec).await {
+    let (actor, now) = write_stamp(&state, &user).await;
+    match reg.create_draft(spec, &actor, now).await {
         Ok(stored) => (StatusCode::CREATED, Json(stored)).into_response(),
         Err(e) => kind_err_response(e),
     }
@@ -226,7 +247,8 @@ pub(super) async fn publish_kind<R: JobsRepository + 'static, B: EventBus + 'sta
     if let Err(r) = policy_check(&state, &user, Action::Publish).await {
         return r;
     }
-    match reg.publish(&kind).await {
+    let (actor, now) = write_stamp(&state, &user).await;
+    match reg.publish(&kind, &actor, now).await {
         Ok(spec) => Json(spec).into_response(),
         Err(e) => kind_err_response(e),
     }
@@ -244,7 +266,8 @@ pub(super) async fn retire_kind<R: JobsRepository + 'static, B: EventBus + 'stat
     if let Err(r) = policy_check(&state, &user, Action::Retire).await {
         return r;
     }
-    match reg.retire(&kind).await {
+    let (actor, now) = write_stamp(&state, &user).await;
+    match reg.retire(&kind, &actor, now).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => kind_err_response(e),
     }

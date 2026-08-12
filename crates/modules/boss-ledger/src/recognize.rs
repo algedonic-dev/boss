@@ -21,7 +21,6 @@
 //! transaction as the fact insert, so either both land or neither does.
 
 #[cfg(feature = "postgres")]
-#[cfg(feature = "postgres")]
 use crate::error::LedgerError;
 use chrono::{Datelike, Months, NaiveDate};
 #[cfg(feature = "postgres")]

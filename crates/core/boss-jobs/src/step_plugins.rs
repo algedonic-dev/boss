@@ -113,13 +113,42 @@ pub trait StepPluginRegistry: Send + Sync {
     async fn list_versions(&self, kind: &str) -> Result<Vec<StepPluginSpec>, StepPluginError>;
 
     /// Append a new draft row. Version = max(version)+1 or 1.
-    async fn create_draft(&self, spec: StepPluginSpec) -> Result<StepPluginSpec, StepPluginError>;
+    ///
+    /// Every write method takes `actor` + `now` because under 3P a
+    /// registry write IS a network configuration change
+    /// (protocol-policy-publish.md, Constraints): the adapter builds
+    /// the corresponding event via
+    /// `events::step_plugin_registry_event` and records it atomically
+    /// with the row — the caller supplies the who (session actor, or
+    /// a named automation) and the when (clock-routed, never
+    /// wallclock in production paths). Records
+    /// `jobs.step_plugin.draft_saved` (payload = the stored draft).
+    async fn create_draft(
+        &self,
+        spec: StepPluginSpec,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<StepPluginSpec, StepPluginError>;
 
-    /// Flip the latest draft to active and demote the previous active.
-    async fn publish(&self, kind: &str) -> Result<StepPluginSpec, StepPluginError>;
+    /// Flip the latest draft to active and demote the previous
+    /// active. Transactional; records `jobs.step_plugin.published`
+    /// (payload = the promoted spec) with the row flips.
+    async fn publish(
+        &self,
+        kind: &str,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<StepPluginSpec, StepPluginError>;
 
-    /// Flip the active row to retired. Idempotent.
-    async fn retire(&self, kind: &str) -> Result<(), StepPluginError>;
+    /// Flip the active row to retired. Idempotent if already retired
+    /// — and silent then too: only a write that touched a row records
+    /// `jobs.step_plugin.retired` (payload = the retired spec).
+    async fn retire(
+        &self,
+        kind: &str,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<(), StepPluginError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,6 +157,11 @@ pub trait StepPluginRegistry: Send + Sync {
 
 pub struct InMemoryStepPlugins {
     rows: Arc<Mutex<HashMap<(String, i32), StepPluginSpec>>>,
+    /// What the Pg adapter records into `event_outbox` inside the
+    /// row transaction, this adapter collects here — same events at
+    /// the same write points, so tests assert the event contract
+    /// through the port without a database.
+    recorded: Arc<Mutex<Vec<boss_core::event::Event>>>,
 }
 
 impl Default for InMemoryStepPlugins {
@@ -140,7 +174,18 @@ impl InMemoryStepPlugins {
     pub fn new() -> Self {
         Self {
             rows: Arc::new(Mutex::new(HashMap::new())),
+            recorded: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Every event a write method recorded, in write order — the
+    /// in-memory stand-in for `SELECT ... FROM event_outbox`.
+    pub fn recorded_events(&self) -> Vec<boss_core::event::Event> {
+        self.recorded.lock().unwrap().clone()
+    }
+
+    fn record(&self, event: boss_core::event::Event) {
+        self.recorded.lock().unwrap().push(event);
     }
 
     /// Seed helper for tests. Inserts as-is without versioning logic.
@@ -218,19 +263,32 @@ impl StepPluginRegistry for InMemoryStepPlugins {
     async fn create_draft(
         &self,
         mut spec: StepPluginSpec,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
     ) -> Result<StepPluginSpec, StepPluginError> {
         let next = self.max_version(&spec.kind).unwrap_or(0) + 1;
         spec.version = next;
         spec.status = WorkflowStatus::Draft;
-        spec.created_at = Utc::now();
+        spec.created_at = now;
         self.rows
             .lock()
             .unwrap()
             .insert((spec.kind.clone(), spec.version), spec.clone());
+        self.record(crate::events::step_plugin_registry_event(
+            crate::events::STEP_PLUGIN_DRAFT_SAVED,
+            actor,
+            now,
+            &spec,
+        ));
         Ok(spec)
     }
 
-    async fn publish(&self, kind: &str) -> Result<StepPluginSpec, StepPluginError> {
+    async fn publish(
+        &self,
+        kind: &str,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<StepPluginSpec, StepPluginError> {
         let mut rows = self.rows.lock().unwrap();
         let latest_draft = rows
             .values()
@@ -249,15 +307,46 @@ impl StepPluginRegistry for InMemoryStepPlugins {
         let key = (latest_draft.kind.clone(), latest_draft.version);
         let row = rows.get_mut(&key).unwrap();
         row.status = WorkflowStatus::Active;
-        Ok(row.clone())
+        let promoted = row.clone();
+        drop(rows);
+        self.record(crate::events::step_plugin_registry_event(
+            crate::events::STEP_PLUGIN_PUBLISHED,
+            actor,
+            now,
+            &promoted,
+        ));
+        Ok(promoted)
     }
 
-    async fn retire(&self, kind: &str) -> Result<(), StepPluginError> {
+    async fn retire(
+        &self,
+        kind: &str,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<(), StepPluginError> {
         let mut rows = self.rows.lock().unwrap();
+        let any_active = rows
+            .values()
+            .any(|r| r.kind == kind && r.status == WorkflowStatus::Active);
+        if !any_active {
+            // Idempotent — nothing to do, so nothing to record.
+            return Ok(());
+        }
+        let mut retired: Option<StepPluginSpec> = None;
         for ((k, _), row) in rows.iter_mut() {
             if k == kind && row.status == WorkflowStatus::Active {
                 row.status = WorkflowStatus::Retired;
+                retired = Some(row.clone());
             }
+        }
+        drop(rows);
+        if let Some(spec) = retired {
+            self.record(crate::events::step_plugin_registry_event(
+                crate::events::STEP_PLUGIN_RETIRED,
+                actor,
+                now,
+                &spec,
+            ));
         }
         Ok(())
     }
@@ -388,6 +477,8 @@ mod pg {
         async fn create_draft(
             &self,
             mut spec: StepPluginSpec,
+            actor: &boss_core::actor::ActorId,
+            now: DateTime<Utc>,
         ) -> Result<StepPluginSpec, StepPluginError> {
             let mut tx = self
                 .pool
@@ -403,7 +494,7 @@ mod pg {
                     .map_err(|e| StepPluginError::Storage(e.to_string()))?;
             spec.version = max.0.map(|v| v + 1).unwrap_or(1);
             spec.status = WorkflowStatus::Draft;
-            spec.created_at = Utc::now();
+            spec.created_at = now;
 
             sqlx::query(
                 "INSERT INTO step_plugins
@@ -425,30 +516,50 @@ mod pg {
             .await
             .map_err(|e| StepPluginError::Storage(e.to_string()))?;
 
+            let event = crate::events::step_plugin_registry_event(
+                crate::events::STEP_PLUGIN_DRAFT_SAVED,
+                actor,
+                now,
+                &spec,
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(StepPluginError::Storage)?;
+
             tx.commit()
                 .await
                 .map_err(|e| StepPluginError::Storage(e.to_string()))?;
             Ok(spec)
         }
 
-        async fn publish(&self, kind: &str) -> Result<StepPluginSpec, StepPluginError> {
+        async fn publish(
+            &self,
+            kind: &str,
+            actor: &boss_core::actor::ActorId,
+            now: DateTime<Utc>,
+        ) -> Result<StepPluginSpec, StepPluginError> {
             let mut tx = self
                 .pool
                 .begin()
                 .await
                 .map_err(|e| StepPluginError::Storage(e.to_string()))?;
 
-            let draft_version: Option<(i32,)> = sqlx::query_as(
-                "SELECT version FROM step_plugins
-                 WHERE kind = $1 AND status = 'draft'
-                 ORDER BY version DESC LIMIT 1",
-            )
+            // Read the full draft row inside the tx — the published
+            // event's payload is the promoted spec, and it must
+            // describe the row THIS transaction flips (a post-commit
+            // re-fetch could race a concurrent writer and record a
+            // spec the flip never produced).
+            let draft: Option<Row> = sqlx::query_as(&format!(
+                "{SELECT} WHERE kind = $1 AND status = 'draft'
+                 ORDER BY version DESC LIMIT 1"
+            ))
             .bind(kind)
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| StepPluginError::Storage(e.to_string()))?;
-            let draft_version = draft_version
-                .map(|(v,)| v)
+            let mut promoted = draft
+                .map(row_to_spec)
+                .transpose()?
                 .ok_or_else(|| StepPluginError::NotFound(format!("no draft to publish: {kind}")))?;
 
             sqlx::query(
@@ -465,27 +576,81 @@ mod pg {
                  WHERE kind = $1 AND version = $2",
             )
             .bind(kind)
-            .bind(draft_version)
+            .bind(promoted.version)
             .execute(&mut *tx)
             .await
             .map_err(|e| StepPluginError::Storage(e.to_string()))?;
+            promoted.status = WorkflowStatus::Active;
+
+            let event = crate::events::step_plugin_registry_event(
+                crate::events::STEP_PLUGIN_PUBLISHED,
+                actor,
+                now,
+                &promoted,
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(StepPluginError::Storage)?;
 
             tx.commit()
                 .await
                 .map_err(|e| StepPluginError::Storage(e.to_string()))?;
 
-            self.get_version(kind, draft_version).await
+            Ok(promoted)
         }
 
-        async fn retire(&self, kind: &str) -> Result<(), StepPluginError> {
+        async fn retire(
+            &self,
+            kind: &str,
+            actor: &boss_core::actor::ActorId,
+            now: DateTime<Utc>,
+        ) -> Result<(), StepPluginError> {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| StepPluginError::Storage(e.to_string()))?;
+
+            // Read the active row first — the event payload is the
+            // retired spec, and the idempotent no-op path (nothing
+            // active) must record nothing. At most one row can be
+            // active per kind (partial unique index).
+            let active: Option<Row> =
+                sqlx::query_as(&format!("{SELECT} WHERE kind = $1 AND status = 'active'"))
+                    .bind(kind)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| StepPluginError::Storage(e.to_string()))?;
+
+            let Some(row) = active else {
+                // Idempotent — nothing to do, so nothing to record.
+                return Ok(());
+            };
+            let mut spec = row_to_spec(row)?;
+
             sqlx::query(
                 "UPDATE step_plugins SET status = 'retired'
                  WHERE kind = $1 AND status = 'active'",
             )
             .bind(kind)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| StepPluginError::Storage(e.to_string()))?;
+            spec.status = WorkflowStatus::Retired;
+
+            let event = crate::events::step_plugin_registry_event(
+                crate::events::STEP_PLUGIN_RETIRED,
+                actor,
+                now,
+                &spec,
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(StepPluginError::Storage)?;
+
+            tx.commit()
+                .await
+                .map_err(|e| StepPluginError::Storage(e.to_string()))?;
             Ok(())
         }
     }
@@ -512,17 +677,24 @@ mod tests {
         )
     }
 
+    /// Shared write-path actor: every registry write records an
+    /// event, and the event needs a who. Tests are exempt from the
+    /// no-wallclock lint, so `Utc::now()` rides along at call sites.
+    fn test_actor() -> boss_core::actor::ActorId {
+        boss_core::actor::ActorId::Human("emp-test".into())
+    }
+
     #[tokio::test]
     async fn create_draft_assigns_next_version() {
         let reg = InMemoryStepPlugins::new();
         let v1 = reg
-            .create_draft(sample("emerald-inspection"))
+            .create_draft(sample("emerald-inspection"), &test_actor(), Utc::now())
             .await
             .unwrap();
         assert_eq!(v1.version, 1);
         assert_eq!(v1.status, WorkflowStatus::Draft);
         let v2 = reg
-            .create_draft(sample("emerald-inspection"))
+            .create_draft(sample("emerald-inspection"), &test_actor(), Utc::now())
             .await
             .unwrap();
         assert_eq!(v2.version, 2);
@@ -531,12 +703,16 @@ mod tests {
     #[tokio::test]
     async fn publish_retires_previous_active() {
         let reg = InMemoryStepPlugins::new();
-        reg.create_draft(sample("kk")).await.unwrap();
-        let active = reg.publish("kk").await.unwrap();
+        reg.create_draft(sample("kk"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        let active = reg.publish("kk", &test_actor(), Utc::now()).await.unwrap();
         assert_eq!(active.status, WorkflowStatus::Active);
 
-        reg.create_draft(sample("kk")).await.unwrap();
-        reg.publish("kk").await.unwrap();
+        reg.create_draft(sample("kk"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        reg.publish("kk", &test_actor(), Utc::now()).await.unwrap();
 
         let v1 = reg.get_version("kk", 1).await.unwrap();
         assert_eq!(v1.status, WorkflowStatus::Retired);
@@ -547,8 +723,12 @@ mod tests {
     #[tokio::test]
     async fn retire_is_idempotent() {
         let reg = InMemoryStepPlugins::new();
-        reg.retire("never-existed").await.unwrap();
-        reg.retire("never-existed").await.unwrap();
+        reg.retire("never-existed", &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        reg.retire("never-existed", &test_actor(), Utc::now())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -570,5 +750,95 @@ mod tests {
 
         let all = reg.list_active(None).await.unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    // -----------------------------------------------------------
+    // Registry events — every write records an outbox event with
+    // the row (protocol-policy-publish.md, Constraints). The
+    // InMemory adapter collects what the Pg adapter records inside
+    // the row transaction; `recorded_events()` is the test window.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn publish_records_exactly_one_published_event() {
+        let reg = InMemoryStepPlugins::new();
+        let actor = test_actor();
+        reg.create_draft(sample("emerald-inspection"), &actor, Utc::now())
+            .await
+            .unwrap();
+        let published = reg
+            .publish("emerald-inspection", &actor, Utc::now())
+            .await
+            .unwrap();
+
+        let events: Vec<_> = reg
+            .recorded_events()
+            .into_iter()
+            .filter(|e| e.kind == crate::events::STEP_PLUGIN_PUBLISHED)
+            .collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "publish must record exactly one jobs.step_plugin.published"
+        );
+        let payload = &events[0].payload;
+        // The actor rides as `_actor` in EventStamp's exact shape —
+        // a Human serializes as the bare employee id.
+        assert_eq!(payload["_actor"], "emp-test");
+        // The payload IS the promoted spec.
+        assert_eq!(payload["kind"], "emerald-inspection");
+        assert_eq!(payload["version"], published.version);
+        assert_eq!(payload["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn create_draft_records_draft_saved() {
+        let reg = InMemoryStepPlugins::new();
+        let draft = reg
+            .create_draft(sample("emerald-inspection"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+
+        let events = reg.recorded_events();
+        assert_eq!(events.len(), 1, "one write, one event");
+        assert_eq!(events[0].kind, crate::events::STEP_PLUGIN_DRAFT_SAVED);
+        assert_eq!(events[0].payload["kind"], "emerald-inspection");
+        assert_eq!(events[0].payload["version"], draft.version);
+        assert_eq!(events[0].payload["status"], "draft");
+    }
+
+    #[tokio::test]
+    async fn retire_records_once_and_stays_silent_when_already_retired() {
+        let reg = InMemoryStepPlugins::new();
+        let actor = test_actor();
+        reg.create_draft(sample("emerald-inspection"), &actor, Utc::now())
+            .await
+            .unwrap();
+        reg.publish("emerald-inspection", &actor, Utc::now())
+            .await
+            .unwrap();
+
+        reg.retire("emerald-inspection", &actor, Utc::now())
+            .await
+            .unwrap();
+        // Second retire is the idempotent no-op path: rows_affected
+        // is 0, so no event — the log records what happened, and
+        // nothing happened (transactional-audit-log.md discipline).
+        reg.retire("emerald-inspection", &actor, Utc::now())
+            .await
+            .unwrap();
+
+        let retired: Vec<_> = reg
+            .recorded_events()
+            .into_iter()
+            .filter(|e| e.kind == crate::events::STEP_PLUGIN_RETIRED)
+            .collect();
+        assert_eq!(
+            retired.len(),
+            1,
+            "idempotent retire must not record a second event"
+        );
+        assert_eq!(retired[0].payload["kind"], "emerald-inspection");
+        assert_eq!(retired[0].payload["status"], "retired");
     }
 }

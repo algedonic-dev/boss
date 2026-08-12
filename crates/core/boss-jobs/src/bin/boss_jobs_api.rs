@@ -119,6 +119,17 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Authoritative clock — every audit_log row + every "now" the
+    // jobs API stamps comes from clock-api. Default URL pulled
+    // from boss-ports; override via BOSS_CLOCK_URL. Constructed
+    // here (not in run_server) because the boot-time registry
+    // reconcile below already needs a clock-routed "now" for the
+    // events its writes record.
+    let clock_url = std::env::var("BOSS_CLOCK_URL").unwrap_or_else(|_| boss_ports::url("clock"));
+    info!(%clock_url, "clock client wired");
+    let clock: Arc<dyn boss_clock_client::ClockClient> =
+        Arc::new(boss_clock_client::ReqwestClockClient::new(clock_url));
+
     // Choose storage backend: Postgres when configured, in-memory otherwise.
     #[cfg(feature = "postgres")]
     if let Some(ref pg_url) = cfg.postgres_url {
@@ -161,7 +172,7 @@ async fn main() -> Result<()> {
         ));
         let kind_registry: Arc<dyn boss_jobs::WorkflowRegistry> =
             Arc::new(boss_jobs::PgWorkflows::new(pool.clone()));
-        reconcile_platform_workflows(kind_registry.as_ref()).await;
+        reconcile_platform_workflows(kind_registry.as_ref(), &clock).await;
         let plugin_registry: Arc<dyn boss_jobs::StepPluginRegistry> =
             Arc::new(boss_jobs::PgStepPlugins::new(pool.clone()));
         let scheduling: Arc<dyn boss_jobs::scheduling::SchedulingRepository> =
@@ -188,6 +199,7 @@ async fn main() -> Result<()> {
             subject_kinds,
             subject_existence,
             roster,
+            clock.clone(),
             cancel_tx,
             cancel_rx,
             &cfg.http_bind,
@@ -202,7 +214,7 @@ async fn main() -> Result<()> {
         Arc::new(boss_jobs::InMemoryWorkflows::new());
     let plugin_registry: Arc<dyn boss_jobs::StepPluginRegistry> =
         Arc::new(boss_jobs::InMemoryStepPlugins::new());
-    reconcile_platform_workflows(kind_registry.as_ref()).await;
+    reconcile_platform_workflows(kind_registry.as_ref(), &clock).await;
     // No subjects table without Postgres — the in-memory spike path
     // skips the existence gate, same as before.
     let subject_existence: Option<Arc<dyn boss_jobs::subject_existence::SubjectExistenceCheck>> =
@@ -221,6 +233,7 @@ async fn main() -> Result<()> {
         subject_existence,
         // In-memory spike path: no people stack to resolve against.
         None,
+        clock,
         cancel_tx,
         cancel_rx,
         &cfg.http_bind,
@@ -241,6 +254,7 @@ async fn run_server<R: JobsRepository + 'static>(
     subject_kinds: Option<Arc<dyn boss_subject_kinds_client::SubjectKindsClient>>,
     subject_existence: Option<Arc<dyn boss_jobs::subject_existence::SubjectExistenceCheck>>,
     roster: Option<Arc<dyn boss_jobs::owner_resolution::RosterLookup>>,
+    clock: Arc<dyn boss_clock_client::ClockClient>,
     cancel_tx: watch::Sender<bool>,
     cancel_rx: watch::Receiver<bool>,
     http_bind: &str,
@@ -271,14 +285,6 @@ async fn run_server<R: JobsRepository + 'static>(
         Arc::new(boss_policy_client::SimBypassPolicyClient::new(Arc::new(
             boss_policy_client::ReqwestPolicyClient::new(policy_url),
         )));
-
-    // Authoritative clock — every audit_log row + every "now" the
-    // jobs API stamps comes from clock-api. Default URL pulled
-    // from boss-ports; override via BOSS_CLOCK_URL.
-    let clock_url = std::env::var("BOSS_CLOCK_URL").unwrap_or_else(|_| boss_ports::url("clock"));
-    info!(%clock_url, "clock client wired");
-    let clock: Arc<dyn boss_clock_client::ClockClient> =
-        Arc::new(boss_clock_client::ReqwestClockClient::new(clock_url));
 
     // Wire the sim-mode probe into the publisher so every emit_at
     // injects `_simulated: bool` into the audit_log payload without
@@ -364,10 +370,20 @@ async fn run_server<R: JobsRepository + 'static>(
 /// short (just one kind in v1) so a missing default surfaces
 /// instantly: the next boot logs `inserted=1` if someone
 /// retired the meta-kind by hand.
-async fn reconcile_platform_workflows(registry: &dyn boss_jobs::WorkflowRegistry) {
+///
+/// Each inserted/republished row records `jobs.kind.published`
+/// with the row (registry-events invariant), attributed to the
+/// named `bootstrap-reconciler` automation at a clock-routed
+/// "now" — a boot-time reconcile in sim mode stamps sim time.
+async fn reconcile_platform_workflows(
+    registry: &dyn boss_jobs::WorkflowRegistry,
+    clock: &Arc<dyn boss_clock_client::ClockClient>,
+) {
     use boss_jobs::registry::platform_workflows;
     let defaults = platform_workflows();
-    match registry.bootstrap_reconcile(&defaults).await {
+    let actor = boss_core::actor::ActorId::Automation("bootstrap-reconciler".into());
+    let now = boss_clock_client::now_from(clock).await;
+    match registry.bootstrap_reconcile(&defaults, &actor, now).await {
         Ok(stats) => {
             info!(
                 inserted = stats.inserted,

@@ -2032,15 +2032,42 @@ pub trait WorkflowRegistry: Send + Sync {
     /// Append a new version with `status = Draft`. If no prior rows
     /// exist, the new row is version 1; otherwise it's max(version)+1.
     /// Returns the stored spec (with its assigned version + created_at).
-    async fn create_draft(&self, spec: WorkflowSpec) -> Result<WorkflowSpec, WorkflowError>;
+    ///
+    /// Every write method takes `actor` + `now` because under 3P a
+    /// registry write IS a network configuration change
+    /// (protocol-policy-publish.md, Constraints): the adapter builds
+    /// the corresponding event via `events::workflow_registry_event`
+    /// and records it atomically with the row — the caller supplies
+    /// the who (session actor, or a named automation) and the when
+    /// (clock-routed, never wallclock in production paths).
+    async fn create_draft(
+        &self,
+        spec: WorkflowSpec,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<WorkflowSpec, WorkflowError>;
 
     /// Flip the latest draft row of this kind to active and any
-    /// previous active row to retired. Transactional.
-    async fn publish(&self, kind: &str) -> Result<WorkflowSpec, WorkflowError>;
+    /// previous active row to retired. Transactional; records
+    /// `jobs.kind.published` (payload = the promoted spec) with the
+    /// row flips.
+    async fn publish(
+        &self,
+        kind: &str,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<WorkflowSpec, WorkflowError>;
 
     /// Flip the active row of this kind to retired. Idempotent if
-    /// already retired.
-    async fn retire(&self, kind: &str) -> Result<(), WorkflowError>;
+    /// already retired — and silent then too: only a write that
+    /// touched a row records `jobs.kind.retired` (payload = the
+    /// retired spec).
+    async fn retire(
+        &self,
+        kind: &str,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<(), WorkflowError>;
 
     /// Look up the active spec and materialize its step DAG against
     /// the given subject. Default impl fetches + delegates to the
@@ -2085,12 +2112,17 @@ pub trait WorkflowRegistry: Send + Sync {
     ///   `status='retired'`.
     ///
     /// Returns the published spec with `version` + `created_at`
-    /// reflecting the durable row. See
-    /// `docs/architecture-decisions.md` §Jobs, Workflows, Steps.
+    /// reflecting the durable row. Records `jobs.kind.published`
+    /// (payload = the promoted spec) in the same transaction — the
+    /// step-update path that dispatches here no longer emits its own
+    /// copy. See `docs/architecture-decisions.md` §Jobs, Workflows,
+    /// Steps.
     async fn publish_authored(
         &self,
         spec: WorkflowSpec,
         authoring_job_id: JobId,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
     ) -> Result<WorkflowSpec, WorkflowError>;
 
     /// Reconcile the active rows in the registry against a set of
@@ -2116,9 +2148,15 @@ pub trait WorkflowRegistry: Send + Sync {
     /// — including `workflow-design`, the meta-kind that owns the
     /// design / review / publish workflow for every other kind in
     /// the registry.
+    ///
+    /// Records `jobs.kind.published` per inserted/republished row;
+    /// preserved and unchanged rows write nothing and record
+    /// nothing (rows_affected > 0 means event).
     async fn bootstrap_reconcile(
         &self,
         defaults: &[WorkflowSpec],
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
     ) -> Result<KindReconcileStats, WorkflowError>;
 }
 
@@ -2176,6 +2214,11 @@ pub struct InMemoryWorkflows {
     /// adapter uses, so reconcile semantics match across adapters
     /// in tests.
     bootstrap_owned: Arc<Mutex<std::collections::HashSet<(String, i32)>>>,
+    /// What the Pg adapter records into `event_outbox` inside the
+    /// row transaction, this adapter collects here — same events at
+    /// the same write points, so tests assert the event contract
+    /// through the port without a database.
+    recorded: Arc<Mutex<Vec<boss_core::event::Event>>>,
 }
 
 impl Default for InMemoryWorkflows {
@@ -2189,7 +2232,18 @@ impl InMemoryWorkflows {
         Self {
             rows: Arc::new(Mutex::new(HashMap::new())),
             bootstrap_owned: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            recorded: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Every event a write method recorded, in write order — the
+    /// in-memory stand-in for `SELECT ... FROM event_outbox`.
+    pub fn recorded_events(&self) -> Vec<boss_core::event::Event> {
+        self.recorded.lock().unwrap().clone()
+    }
+
+    fn record(&self, event: boss_core::event::Event) {
+        self.recorded.lock().unwrap().push(event);
     }
 
     /// Seed helper for tests + bootstrap. Inserts a row as-is without
@@ -2262,17 +2316,34 @@ impl WorkflowRegistry for InMemoryWorkflows {
         Ok(rows)
     }
 
-    async fn create_draft(&self, mut spec: WorkflowSpec) -> Result<WorkflowSpec, WorkflowError> {
+    async fn create_draft(
+        &self,
+        mut spec: WorkflowSpec,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<WorkflowSpec, WorkflowError> {
         let next = self.max_version(&spec.kind).unwrap_or(0) + 1;
         spec.version = next;
         spec.status = WorkflowStatus::Draft;
-        spec.created_at = Utc::now();
+        spec.created_at = now;
         let mut rows = self.rows.lock().unwrap();
         rows.insert((spec.kind.clone(), spec.version), spec.clone());
+        drop(rows);
+        self.record(crate::events::workflow_registry_event(
+            crate::events::WORKFLOW_DRAFT_SAVED,
+            actor,
+            now,
+            &spec,
+        ));
         Ok(spec)
     }
 
-    async fn publish(&self, kind: &str) -> Result<WorkflowSpec, WorkflowError> {
+    async fn publish(
+        &self,
+        kind: &str,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<WorkflowSpec, WorkflowError> {
         let mut rows = self.rows.lock().unwrap();
 
         // Find the latest draft for this kind.
@@ -2296,22 +2367,46 @@ impl WorkflowRegistry for InMemoryWorkflows {
         let key = (latest_draft.kind.clone(), latest_draft.version);
         let row = rows.get_mut(&key).unwrap();
         row.status = WorkflowStatus::Active;
-        Ok(row.clone())
+        let promoted = row.clone();
+        drop(rows);
+        self.record(crate::events::workflow_registry_event(
+            crate::events::WORKFLOW_PUBLISHED,
+            actor,
+            now,
+            &promoted,
+        ));
+        Ok(promoted)
     }
 
-    async fn retire(&self, kind: &str) -> Result<(), WorkflowError> {
+    async fn retire(
+        &self,
+        kind: &str,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<(), WorkflowError> {
         let mut rows = self.rows.lock().unwrap();
         let any_active = rows
             .values()
             .any(|r| r.kind == kind && r.status == WorkflowStatus::Active);
         if !any_active {
-            // Idempotent — nothing to do.
+            // Idempotent — nothing to do, so nothing to record.
             return Ok(());
         }
+        let mut retired: Option<WorkflowSpec> = None;
         for ((k, _), row) in rows.iter_mut() {
             if k == kind && row.status == WorkflowStatus::Active {
                 row.status = WorkflowStatus::Retired;
+                retired = Some(row.clone());
             }
+        }
+        drop(rows);
+        if let Some(spec) = retired {
+            self.record(crate::events::workflow_registry_event(
+                crate::events::WORKFLOW_RETIRED,
+                actor,
+                now,
+                &spec,
+            ));
         }
         Ok(())
     }
@@ -2320,11 +2415,13 @@ impl WorkflowRegistry for InMemoryWorkflows {
         &self,
         mut spec: WorkflowSpec,
         authoring_job_id: JobId,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
     ) -> Result<WorkflowSpec, WorkflowError> {
         let next = self.max_version(&spec.kind).unwrap_or(0) + 1;
         spec.version = next;
         spec.status = WorkflowStatus::Active;
-        spec.created_at = Utc::now();
+        spec.created_at = now;
         spec.authoring_job_id = Some(*authoring_job_id.inner().as_uuid());
 
         let key = (spec.kind.clone(), spec.version);
@@ -2336,21 +2433,36 @@ impl WorkflowRegistry for InMemoryWorkflows {
             }
         }
         rows.insert(key.clone(), spec.clone());
+        drop(rows);
 
         // The new row was published via a Job — operator-owned, NOT
         // bootstrap. Make sure the discriminator reflects that so
         // future reconciles preserve it.
         let mut owned = self.bootstrap_owned.lock().unwrap();
         owned.remove(&key);
+        drop(owned);
 
+        self.record(crate::events::workflow_registry_event(
+            crate::events::WORKFLOW_PUBLISHED,
+            actor,
+            now,
+            &spec,
+        ));
         Ok(spec)
     }
 
     async fn bootstrap_reconcile(
         &self,
         defaults: &[WorkflowSpec],
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
     ) -> Result<KindReconcileStats, WorkflowError> {
         let mut stats = KindReconcileStats::default();
+        // Inserted/republished rows record `jobs.kind.published`;
+        // preserved/unchanged rows touched nothing and record
+        // nothing. Collected here and pushed after the row locks
+        // drop.
+        let mut events: Vec<boss_core::event::Event> = Vec::new();
         let mut rows = self.rows.lock().unwrap();
         let mut owned = self.bootstrap_owned.lock().unwrap();
 
@@ -2372,8 +2484,14 @@ impl WorkflowRegistry for InMemoryWorkflows {
                     spec.version = 1;
                     spec.status = WorkflowStatus::Active;
                     let key = (spec.kind.clone(), spec.version);
-                    rows.insert(key.clone(), spec);
+                    rows.insert(key.clone(), spec.clone());
                     owned.insert(key);
+                    events.push(crate::events::workflow_registry_event(
+                        crate::events::WORKFLOW_PUBLISHED,
+                        actor,
+                        now,
+                        &spec,
+                    ));
                     stats.inserted += 1;
                 }
                 Some(key) => {
@@ -2407,8 +2525,14 @@ impl WorkflowRegistry for InMemoryWorkflows {
                             published.version = next;
                             published.status = WorkflowStatus::Active;
                             let new_key = (published.kind.clone(), next);
-                            rows.insert(new_key.clone(), published);
+                            rows.insert(new_key.clone(), published.clone());
                             owned.insert(new_key);
+                            events.push(crate::events::workflow_registry_event(
+                                crate::events::WORKFLOW_PUBLISHED,
+                                actor,
+                                now,
+                                &published,
+                            ));
                             stats.republished += 1;
                         } else {
                             stats.unchanged += 1;
@@ -2419,6 +2543,11 @@ impl WorkflowRegistry for InMemoryWorkflows {
                     }
                 }
             }
+        }
+        drop(rows);
+        drop(owned);
+        for event in events {
+            self.record(event);
         }
 
         Ok(stats)
@@ -2588,6 +2717,8 @@ mod pg {
         async fn create_draft(
             &self,
             mut spec: WorkflowSpec,
+            actor: &boss_core::actor::ActorId,
+            now: DateTime<Utc>,
         ) -> Result<WorkflowSpec, WorkflowError> {
             let mut tx = self
                 .pool
@@ -2608,7 +2739,7 @@ mod pg {
 
             spec.version = next;
             spec.status = WorkflowStatus::Draft;
-            spec.created_at = Utc::now();
+            spec.created_at = now;
 
             let subject_kinds_json = serde_json::to_value(&spec.subject_kinds)
                 .map_err(|e| WorkflowError::Invalid(e.to_string()))?;
@@ -2642,22 +2773,44 @@ mod pg {
             .await
             .map_err(|e| WorkflowError::Storage(e.to_string()))?;
 
+            let event = crate::events::workflow_registry_event(
+                crate::events::WORKFLOW_DRAFT_SAVED,
+                actor,
+                now,
+                &spec,
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(WorkflowError::Storage)?;
+
             tx.commit()
                 .await
                 .map_err(|e| WorkflowError::Storage(e.to_string()))?;
             Ok(spec)
         }
 
-        async fn publish(&self, kind: &str) -> Result<WorkflowSpec, WorkflowError> {
+        async fn publish(
+            &self,
+            kind: &str,
+            actor: &boss_core::actor::ActorId,
+            now: DateTime<Utc>,
+        ) -> Result<WorkflowSpec, WorkflowError> {
             let mut tx = self
                 .pool
                 .begin()
                 .await
                 .map_err(|e| WorkflowError::Storage(e.to_string()))?;
 
-            // Pick the latest draft.
-            let draft_version: Option<(i32,)> = sqlx::query_as(
-                "SELECT version FROM workflows
+            // Pick the latest draft — the full row, not just the
+            // version: the event payload is the promoted spec, and
+            // it must come from data read INSIDE this transaction
+            // (a post-commit re-fetch could observe a concurrent
+            // writer and record a spec the flip never produced).
+            let draft: Option<Row> = sqlx::query_as(
+                "SELECT kind, version, status, label, description, category,
+                        subject_kinds, steps, metadata_schema, entitlements, metadata,
+                        on_complete_create, owning_team, authoring_job_id, created_at
+                 FROM workflows
                  WHERE kind = $1 AND status = 'draft'
                  ORDER BY version DESC LIMIT 1",
             )
@@ -2666,8 +2819,9 @@ mod pg {
             .await
             .map_err(|e| WorkflowError::Storage(e.to_string()))?;
 
-            let draft_version = draft_version
-                .map(|(v,)| v)
+            let mut promoted = draft
+                .map(row_to_spec)
+                .transpose()?
                 .ok_or_else(|| WorkflowError::NotFound(format!("no draft to publish: {kind}")))?;
 
             // Retire any currently-active row.
@@ -2686,27 +2840,86 @@ mod pg {
                  WHERE kind = $1 AND version = $2",
             )
             .bind(kind)
-            .bind(draft_version)
+            .bind(promoted.version)
             .execute(&mut *tx)
             .await
             .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            promoted.status = WorkflowStatus::Active;
+
+            let event = crate::events::workflow_registry_event(
+                crate::events::WORKFLOW_PUBLISHED,
+                actor,
+                now,
+                &promoted,
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(WorkflowError::Storage)?;
 
             tx.commit()
                 .await
                 .map_err(|e| WorkflowError::Storage(e.to_string()))?;
 
-            self.get_version(kind, draft_version).await
+            Ok(promoted)
         }
 
-        async fn retire(&self, kind: &str) -> Result<(), WorkflowError> {
+        async fn retire(
+            &self,
+            kind: &str,
+            actor: &boss_core::actor::ActorId,
+            now: DateTime<Utc>,
+        ) -> Result<(), WorkflowError> {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+
+            // Read the active row first — the event payload is the
+            // retired spec, and the idempotent no-op path (nothing
+            // active) must record nothing. At most one row can be
+            // active per kind (partial unique index).
+            let active: Option<Row> = sqlx::query_as(
+                "SELECT kind, version, status, label, description, category,
+                        subject_kinds, steps, metadata_schema, entitlements, metadata,
+                        on_complete_create, owning_team, authoring_job_id, created_at
+                 FROM workflows
+                 WHERE kind = $1 AND status = 'active'",
+            )
+            .bind(kind)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+
+            let Some(row) = active else {
+                // Idempotent — nothing to do, so nothing to record.
+                return Ok(());
+            };
+            let mut spec = row_to_spec(row)?;
+
             sqlx::query(
                 "UPDATE workflows SET status = 'retired'
                  WHERE kind = $1 AND status = 'active'",
             )
             .bind(kind)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            spec.status = WorkflowStatus::Retired;
+
+            let event = crate::events::workflow_registry_event(
+                crate::events::WORKFLOW_RETIRED,
+                actor,
+                now,
+                &spec,
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(WorkflowError::Storage)?;
+
+            tx.commit()
+                .await
+                .map_err(|e| WorkflowError::Storage(e.to_string()))?;
             Ok(())
         }
 
@@ -2714,6 +2927,8 @@ mod pg {
             &self,
             mut spec: WorkflowSpec,
             authoring_job_id: JobId,
+            actor: &boss_core::actor::ActorId,
+            now: DateTime<Utc>,
         ) -> Result<WorkflowSpec, WorkflowError> {
             let mut tx = self
                 .pool
@@ -2733,7 +2948,7 @@ mod pg {
 
             spec.version = next;
             spec.status = WorkflowStatus::Active;
-            spec.created_at = Utc::now();
+            spec.created_at = now;
             spec.authoring_job_id = Some(*authoring_job_id.inner().as_uuid());
 
             // Retire any existing active row of this kind first —
@@ -2787,6 +3002,16 @@ mod pg {
             .await
             .map_err(|e| WorkflowError::Storage(e.to_string()))?;
 
+            let event = crate::events::workflow_registry_event(
+                crate::events::WORKFLOW_PUBLISHED,
+                actor,
+                now,
+                &spec,
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(WorkflowError::Storage)?;
+
             tx.commit()
                 .await
                 .map_err(|e| WorkflowError::Storage(e.to_string()))?;
@@ -2797,6 +3022,8 @@ mod pg {
         async fn bootstrap_reconcile(
             &self,
             defaults: &[WorkflowSpec],
+            actor: &boss_core::actor::ActorId,
+            now: DateTime<Utc>,
         ) -> Result<KindReconcileStats, WorkflowError> {
             // Dedicated row shape that includes the bootstrap
             // discriminator alongside the body. The non-reconcile
@@ -2841,7 +3068,9 @@ mod pg {
 
                 match row {
                     None => {
-                        // Insert as v1, active, bootstrap-owned.
+                        // Insert as v1, active, bootstrap-owned —
+                        // in a transaction so the published event
+                        // records with the row it describes.
                         let subject_kinds_json = serde_json::to_value(&default.subject_kinds)
                             .map_err(|e| WorkflowError::Invalid(e.to_string()))?;
                         let steps_json = serde_json::to_value(&default.steps)
@@ -2850,6 +3079,17 @@ mod pg {
                             serde_json::to_value(&default.on_complete_create)
                                 .map_err(|e| WorkflowError::Invalid(e.to_string()))?;
 
+                        let mut inserted = default.clone();
+                        inserted.version = 1;
+                        inserted.status = WorkflowStatus::Active;
+                        inserted.created_at = now;
+
+                        let mut tx = self
+                            .pool
+                            .begin()
+                            .await
+                            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+
                         sqlx::query(
                             "INSERT INTO workflows
                                 (kind, version, status, label, description, category,
@@ -2857,7 +3097,7 @@ mod pg {
                                  on_complete_create, owning_team, authoring_job_id,
                                  created_by, created_at)
                              VALUES ($1, 1, 'active', $2, $3, $4, $5, $6, $7, $8, $9,
-                                     $10, $11, $12, 'bootstrap', NOW())",
+                                     $10, $11, $12, 'bootstrap', $13)",
                         )
                         .bind(&default.kind)
                         .bind(&default.label)
@@ -2871,9 +3111,24 @@ mod pg {
                         .bind(&on_complete_create_json)
                         .bind(&default.owning_team)
                         .bind(default.authoring_job_id)
-                        .execute(&self.pool)
+                        .bind(now)
+                        .execute(&mut *tx)
                         .await
                         .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+
+                        let event = crate::events::workflow_registry_event(
+                            crate::events::WORKFLOW_PUBLISHED,
+                            actor,
+                            now,
+                            &inserted,
+                        );
+                        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                            .await
+                            .map_err(WorkflowError::Storage)?;
+
+                        tx.commit()
+                            .await
+                            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
 
                         stats.inserted += 1;
                     }
@@ -2952,7 +3207,7 @@ mod pg {
                                          metadata, on_complete_create, owning_team,
                                          authoring_job_id, created_by, created_at)
                                      VALUES ($1, $2, 'active', $3, $4, $5, $6, $7, $8, $9,
-                                             $10, $11, $12, NULL, 'bootstrap', NOW())",
+                                             $10, $11, $12, NULL, 'bootstrap', $13)",
                                 )
                                 .bind(&default.kind)
                                 .bind(next)
@@ -2966,9 +3221,25 @@ mod pg {
                                 .bind(&default.metadata)
                                 .bind(&on_complete_create_json)
                                 .bind(&default.owning_team)
+                                .bind(now)
                                 .execute(&mut *tx)
                                 .await
                                 .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+
+                                let mut published = default.clone();
+                                published.version = next;
+                                published.status = WorkflowStatus::Active;
+                                published.created_at = now;
+                                published.authoring_job_id = None;
+                                let event = crate::events::workflow_registry_event(
+                                    crate::events::WORKFLOW_PUBLISHED,
+                                    actor,
+                                    now,
+                                    &published,
+                                );
+                                boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                                    .await
+                                    .map_err(WorkflowError::Storage)?;
 
                                 tx.commit()
                                     .await
@@ -3153,14 +3424,27 @@ mod tests {
         )
     }
 
+    /// Shared write-path actor: every registry write records an
+    /// event, and the event needs a who. Tests are exempt from the
+    /// no-wallclock lint, so `Utc::now()` rides along at call sites.
+    fn test_actor() -> boss_core::actor::ActorId {
+        boss_core::actor::ActorId::Human("emp-test".into())
+    }
+
     #[tokio::test]
     async fn create_draft_assigns_next_version() {
         let reg = InMemoryWorkflows::new();
-        let v1 = reg.create_draft(seed_spec("repair")).await.unwrap();
+        let v1 = reg
+            .create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
         assert_eq!(v1.version, 1);
         assert_eq!(v1.status, WorkflowStatus::Draft);
 
-        let v2 = reg.create_draft(seed_spec("repair")).await.unwrap();
+        let v2 = reg
+            .create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
         assert_eq!(v2.version, 2);
         assert_eq!(v2.status, WorkflowStatus::Draft);
     }
@@ -3170,14 +3454,24 @@ mod tests {
         let reg = InMemoryWorkflows::new();
 
         // v1 drafted and published.
-        reg.create_draft(seed_spec("repair")).await.unwrap();
-        let active_v1 = reg.publish("repair").await.unwrap();
+        reg.create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        let active_v1 = reg
+            .publish("repair", &test_actor(), Utc::now())
+            .await
+            .unwrap();
         assert_eq!(active_v1.version, 1);
         assert_eq!(active_v1.status, WorkflowStatus::Active);
 
         // v2 drafted and published.
-        reg.create_draft(seed_spec("repair")).await.unwrap();
-        let active_v2 = reg.publish("repair").await.unwrap();
+        reg.create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        let active_v2 = reg
+            .publish("repair", &test_actor(), Utc::now())
+            .await
+            .unwrap();
         assert_eq!(active_v2.version, 2);
         assert_eq!(active_v2.status, WorkflowStatus::Active);
 
@@ -3191,10 +3485,16 @@ mod tests {
     #[tokio::test]
     async fn retire_flips_active_to_retired() {
         let reg = InMemoryWorkflows::new();
-        reg.create_draft(seed_spec("repair")).await.unwrap();
-        reg.publish("repair").await.unwrap();
+        reg.create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        reg.publish("repair", &test_actor(), Utc::now())
+            .await
+            .unwrap();
 
-        reg.retire("repair").await.unwrap();
+        reg.retire("repair", &test_actor(), Utc::now())
+            .await
+            .unwrap();
         let err = reg.get_active("repair").await.unwrap_err();
         match err {
             WorkflowError::NotFound(_) => {}
@@ -3206,14 +3506,21 @@ mod tests {
     async fn retire_is_idempotent() {
         let reg = InMemoryWorkflows::new();
         // Retiring a kind with no active row is a no-op, not an error.
-        reg.retire("never-existed").await.unwrap();
-        reg.retire("never-existed").await.unwrap();
+        reg.retire("never-existed", &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        reg.retire("never-existed", &test_actor(), Utc::now())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn publish_without_draft_returns_not_found() {
         let reg = InMemoryWorkflows::new();
-        let err = reg.publish("repair").await.unwrap_err();
+        let err = reg
+            .publish("repair", &test_actor(), Utc::now())
+            .await
+            .unwrap_err();
         match err {
             WorkflowError::NotFound(_) => {}
             other => panic!("expected NotFound, got {other:?}"),
@@ -3445,11 +3752,21 @@ mod tests {
     #[tokio::test]
     async fn list_versions_returns_oldest_first() {
         let reg = InMemoryWorkflows::new();
-        reg.create_draft(seed_spec("repair")).await.unwrap();
-        reg.publish("repair").await.unwrap();
-        reg.create_draft(seed_spec("repair")).await.unwrap();
-        reg.publish("repair").await.unwrap();
-        reg.create_draft(seed_spec("repair")).await.unwrap();
+        reg.create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        reg.publish("repair", &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        reg.create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        reg.publish("repair", &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        reg.create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
 
         let versions = reg.list_versions("repair").await.unwrap();
         assert_eq!(versions.len(), 3);
@@ -3863,7 +4180,10 @@ mod tests {
     async fn bootstrap_reconcile_inserts_missing_kinds() {
         let registry = InMemoryWorkflows::new();
         let defaults = vec![reconcile_spec("workflow-design", "Design a Workflow")];
-        let stats = registry.bootstrap_reconcile(&defaults).await.unwrap();
+        let stats = registry
+            .bootstrap_reconcile(&defaults, &test_actor(), Utc::now())
+            .await
+            .unwrap();
         assert_eq!(stats.inserted, 1);
         assert_eq!(stats.republished, 0);
         assert_eq!(stats.preserved, 0);
@@ -3880,13 +4200,13 @@ mod tests {
         // Seed a stale bootstrap row.
         let stale = reconcile_spec("workflow-design", "Old Label");
         registry
-            .bootstrap_reconcile(&[stale])
+            .bootstrap_reconcile(&[stale], &test_actor(), Utc::now())
             .await
             .expect("seed bootstrap");
         // Defaults now carry the corrected label.
         let updated = reconcile_spec("workflow-design", "Design a Workflow");
         let stats = registry
-            .bootstrap_reconcile(&[updated])
+            .bootstrap_reconcile(&[updated], &test_actor(), Utc::now())
             .await
             .expect("republish");
         assert_eq!(stats.inserted, 0);
@@ -3919,12 +4239,12 @@ mod tests {
         let registry = InMemoryWorkflows::new();
         let spec = reconcile_spec("workflow-design", "Design a Workflow");
         registry
-            .bootstrap_reconcile(std::slice::from_ref(&spec))
+            .bootstrap_reconcile(std::slice::from_ref(&spec), &test_actor(), Utc::now())
             .await
             .expect("seed");
         for _ in 0..3 {
             let stats = registry
-                .bootstrap_reconcile(std::slice::from_ref(&spec))
+                .bootstrap_reconcile(std::slice::from_ref(&spec), &test_actor(), Utc::now())
                 .await
                 .expect("reboot");
             assert_eq!(stats.republished, 0);
@@ -3952,7 +4272,10 @@ mod tests {
         registry.seed(operator_spec).expect("seed operator row");
 
         let updated = reconcile_spec("workflow-design", "Default Label");
-        let stats = registry.bootstrap_reconcile(&[updated]).await.unwrap();
+        let stats = registry
+            .bootstrap_reconcile(&[updated], &test_actor(), Utc::now())
+            .await
+            .unwrap();
         assert_eq!(stats.inserted, 0);
         assert_eq!(stats.republished, 0);
         assert_eq!(stats.preserved, 1);
@@ -3969,10 +4292,13 @@ mod tests {
         let registry = InMemoryWorkflows::new();
         let spec = reconcile_spec("workflow-design", "Design a Workflow");
         registry
-            .bootstrap_reconcile(std::slice::from_ref(&spec))
+            .bootstrap_reconcile(std::slice::from_ref(&spec), &test_actor(), Utc::now())
             .await
             .expect("seed");
-        let stats = registry.bootstrap_reconcile(&[spec]).await.unwrap();
+        let stats = registry
+            .bootstrap_reconcile(&[spec], &test_actor(), Utc::now())
+            .await
+            .unwrap();
         assert_eq!(stats.inserted, 0);
         assert_eq!(stats.republished, 0);
         assert_eq!(stats.preserved, 0);
@@ -3990,7 +4316,7 @@ mod tests {
         let job_id = JobId::new();
 
         let published = registry
-            .publish_authored(spec, job_id)
+            .publish_authored(spec, job_id, &test_actor(), Utc::now())
             .await
             .expect("publish");
 
@@ -4014,11 +4340,21 @@ mod tests {
         let job_b = JobId::new();
 
         registry
-            .publish_authored(reconcile_spec("morning-brew", "v1 label"), job_a)
+            .publish_authored(
+                reconcile_spec("morning-brew", "v1 label"),
+                job_a,
+                &test_actor(),
+                Utc::now(),
+            )
             .await
             .expect("first publish");
         let updated = registry
-            .publish_authored(reconcile_spec("morning-brew", "v2 label"), job_b)
+            .publish_authored(
+                reconcile_spec("morning-brew", "v2 label"),
+                job_b,
+                &test_actor(),
+                Utc::now(),
+            )
             .await
             .expect("supersede");
 
@@ -4464,7 +4800,11 @@ mod tests {
         // next reconcile must preserve the operator-published row.
         let registry = InMemoryWorkflows::new();
         registry
-            .bootstrap_reconcile(&[reconcile_spec("morning-brew", "Bootstrap Label")])
+            .bootstrap_reconcile(
+                &[reconcile_spec("morning-brew", "Bootstrap Label")],
+                &test_actor(),
+                Utc::now(),
+            )
             .await
             .expect("seed bootstrap");
 
@@ -4472,12 +4812,18 @@ mod tests {
             .publish_authored(
                 reconcile_spec("morning-brew", "Job-Authored Label"),
                 JobId::new(),
+                &test_actor(),
+                Utc::now(),
             )
             .await
             .expect("publish via Job");
 
         let stats = registry
-            .bootstrap_reconcile(&[reconcile_spec("morning-brew", "Default Label")])
+            .bootstrap_reconcile(
+                &[reconcile_spec("morning-brew", "Default Label")],
+                &test_actor(),
+                Utc::now(),
+            )
             .await
             .expect("reconcile after publish");
         assert_eq!(
@@ -4486,5 +4832,136 @@ mod tests {
         );
         let live = registry.get_active("morning-brew").await.unwrap();
         assert_eq!(live.label, "Job-Authored Label");
+    }
+
+    // -----------------------------------------------------------
+    // Registry events — every write records an outbox event with
+    // the row (protocol-policy-publish.md, Constraints). The
+    // InMemory adapter collects what the Pg adapter records inside
+    // the row transaction; `recorded_events()` is the test window.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn publish_records_exactly_one_published_event() {
+        let reg = InMemoryWorkflows::new();
+        let actor = test_actor();
+        reg.create_draft(seed_spec("repair"), &actor, Utc::now())
+            .await
+            .unwrap();
+        let published = reg.publish("repair", &actor, Utc::now()).await.unwrap();
+
+        let events: Vec<_> = reg
+            .recorded_events()
+            .into_iter()
+            .filter(|e| e.kind == crate::events::WORKFLOW_PUBLISHED)
+            .collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "publish must record exactly one jobs.kind.published"
+        );
+        let payload = &events[0].payload;
+        // The actor rides as `_actor` in EventStamp's exact shape —
+        // a Human serializes as the bare employee id.
+        assert_eq!(payload["_actor"], "emp-test");
+        // The payload IS the promoted spec.
+        assert_eq!(payload["kind"], "repair");
+        assert_eq!(payload["version"], published.version);
+        assert_eq!(payload["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn create_draft_records_draft_saved() {
+        let reg = InMemoryWorkflows::new();
+        let draft = reg
+            .create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+
+        let events = reg.recorded_events();
+        assert_eq!(events.len(), 1, "one write, one event");
+        assert_eq!(events[0].kind, crate::events::WORKFLOW_DRAFT_SAVED);
+        assert_eq!(events[0].payload["kind"], "repair");
+        assert_eq!(events[0].payload["version"], draft.version);
+        assert_eq!(events[0].payload["status"], "draft");
+    }
+
+    #[tokio::test]
+    async fn retire_records_once_and_stays_silent_when_already_retired() {
+        let reg = InMemoryWorkflows::new();
+        let actor = test_actor();
+        reg.create_draft(seed_spec("repair"), &actor, Utc::now())
+            .await
+            .unwrap();
+        reg.publish("repair", &actor, Utc::now()).await.unwrap();
+
+        reg.retire("repair", &actor, Utc::now()).await.unwrap();
+        // Second retire is the idempotent no-op path: rows_affected
+        // is 0, so no event — the log records what happened, and
+        // nothing happened (transactional-audit-log.md discipline).
+        reg.retire("repair", &actor, Utc::now()).await.unwrap();
+
+        let retired: Vec<_> = reg
+            .recorded_events()
+            .into_iter()
+            .filter(|e| e.kind == crate::events::WORKFLOW_RETIRED)
+            .collect();
+        assert_eq!(
+            retired.len(),
+            1,
+            "idempotent retire must not record a second event"
+        );
+        assert_eq!(retired[0].payload["kind"], "repair");
+        assert_eq!(retired[0].payload["status"], "retired");
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_published_per_touched_row_only() {
+        let registry = InMemoryWorkflows::new();
+        let actor = boss_core::actor::ActorId::Automation("bootstrap-reconciler".into());
+
+        // Fresh insert → one event.
+        registry
+            .bootstrap_reconcile(
+                &[reconcile_spec("workflow-design", "Design a Workflow")],
+                &actor,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.recorded_events().len(), 1);
+
+        // No drift → untouched row, no event.
+        registry
+            .bootstrap_reconcile(
+                &[reconcile_spec("workflow-design", "Design a Workflow")],
+                &actor,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.recorded_events().len(),
+            1,
+            "an unchanged reconcile row writes nothing and must record nothing"
+        );
+
+        // Drift → republish, one more event carrying the new version.
+        registry
+            .bootstrap_reconcile(
+                &[reconcile_spec("workflow-design", "Renamed")],
+                &actor,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let events = registry.recorded_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, crate::events::WORKFLOW_PUBLISHED);
+        assert_eq!(events[1].payload["version"], 2);
+        assert_eq!(
+            events[1].payload["_actor"],
+            "automation:bootstrap-reconciler"
+        );
     }
 }
