@@ -252,6 +252,37 @@ impl JobsRepository for InMemoryJobs {
         Ok(())
     }
 
+    async fn claim_step_at(
+        &self,
+        step_id: &StepId,
+        actor: &str,
+        _now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<Step, JobsError> {
+        let claimed = {
+            let mut state = self.inner.lock().expect("poisoned");
+            let key = step_key(step_id);
+            let Some(existing) = state.steps.get_mut(&key) else {
+                return Err(JobsError::StepNotFound(*step_id));
+            };
+            let held_by_actor = existing.assignee_id.as_deref() == Some(actor);
+            let claimable = existing.status == StepStatus::Ready
+                && (existing.assignee_id.is_none() || held_by_actor);
+            let idempotent = existing.status == StepStatus::Active && held_by_actor;
+            if !claimable && !idempotent {
+                return Err(JobsError::ClaimConflict {
+                    holder: existing.assignee_id.clone(),
+                    status: format!("{:?}", existing.status).to_lowercase(),
+                });
+            }
+            existing.assignee_id = Some(actor.to_string());
+            existing.status = StepStatus::Active;
+            existing.clone()
+        };
+        self.record_all(events);
+        Ok(claimed)
+    }
+
     async fn append_sign_off(
         &self,
         step_id: &StepId,

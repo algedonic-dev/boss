@@ -213,6 +213,12 @@ COPY infra/operator-baseline /opt/boss/infra/operator-baseline
 # can't start and Jobs get assigned + worked but never close.
 COPY infra/dispatcher /opt/boss/infra/dispatcher
 COPY examples /opt/boss/examples
+# The design decision tracker (boss-docs-api, repo_root=/opt/boss)
+# reads docs/design/*.md from the image. Without this COPY the
+# tracker serves only DB-cached content, reindex finds zero docs,
+# and design reviews never spawn on a container deploy - exactly
+# how the cluster SoR went review-blind on 2026-08-12.
+COPY docs /opt/boss/docs
 
 # Post-API seed scripts boss-launch (services-launcher) runs once the
 # API stack is up: the platform operator-baseline, then the brewery

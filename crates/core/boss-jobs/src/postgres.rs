@@ -97,6 +97,8 @@ struct StepRow {
 struct AssignmentRowSql {
     #[sqlx(flatten)]
     step: StepRow,
+    job_title: String,
+    due_on: Option<chrono::NaiveDate>,
     workflow: String,
     subject_kind: String,
     subject_id: String,
@@ -704,6 +706,69 @@ impl JobsRepository for PgJobs {
         Ok(())
     }
 
+    async fn claim_step_at(
+        &self,
+        step_id: &StepId,
+        actor: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<Step, JobsError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // The compare half of the CAS lives in the WHERE clause, so
+        // two racing claims serialize on the row lock and exactly one
+        // sees a matching predicate. Idempotent re-claim by the
+        // holder matches too (ready or already active).
+        let row = sqlx::query(
+            r#"
+            UPDATE steps SET assignee_id = $2, status = 'active', updated_at = $3
+            WHERE id = $1
+              AND (
+                    (status = 'ready' AND (assignee_id IS NULL OR assignee_id = $2))
+                 OR (status = 'active' AND assignee_id = $2)
+              )
+            RETURNING id
+            "#,
+        )
+        .bind(*step_id.inner().as_uuid())
+        .bind(actor)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+
+        if row.is_none() {
+            // Lost the race (or the step was never claimable). Read
+            // the row in the same tx so the conflict names the truth
+            // the claimant collided with.
+            let cur: Option<(Option<String>, String)> =
+                sqlx::query_as("SELECT assignee_id, status FROM steps WHERE id = $1")
+                    .bind(*step_id.inner().as_uuid())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| JobsError::Storage(e.to_string()))?;
+            return match cur {
+                None => Err(JobsError::StepNotFound(*step_id)),
+                Some((holder, status)) => Err(JobsError::ClaimConflict { holder, status }),
+            };
+        }
+
+        for event in events {
+            boss_events::outbox::record_event_in_tx(&mut tx, event)
+                .await
+                .map_err(JobsError::Storage)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        self.get_step(step_id)
+            .await?
+            .ok_or(JobsError::StepNotFound(*step_id))
+    }
+
     async fn append_sign_off(
         &self,
         step_id: &StepId,
@@ -788,7 +853,7 @@ impl JobsRepository for PgJobs {
                     s.sort_order, s.blocked_by, s.sign_offs_required, s.sign_offs, \
                     s.fields, s.completed_on, s.metadata, s.notes, \
                     s.step_plugin_version, s.embedded_job, \
-                    j.kind AS workflow, j.subject_kind, j.subject_id, j.priority \
+                    j.title AS job_title, j.due_on, j.kind AS workflow, j.subject_kind, j.subject_id, j.priority \
              FROM steps s \
              JOIN jobs j ON s.job_id = j.id \
              WHERE j.status = 'open' \
@@ -811,6 +876,8 @@ impl JobsRepository for PgJobs {
             .map(|r| {
                 Ok(AssignmentRow {
                     job_id: JobId::from_uuid(r.step.job_id),
+                    job_title: r.job_title,
+                    due_on: r.due_on,
                     workflow: r.workflow,
                     subject_kind: r.subject_kind,
                     subject_id: r.subject_id,
@@ -831,7 +898,7 @@ impl JobsRepository for PgJobs {
                     s.sort_order, s.blocked_by, s.sign_offs_required, s.sign_offs, \
                     s.fields, s.completed_on, s.metadata, s.notes, \
                     s.step_plugin_version, s.embedded_job, \
-                    j.kind AS workflow, j.subject_kind, j.subject_id, j.priority \
+                    j.title AS job_title, j.due_on, j.kind AS workflow, j.subject_kind, j.subject_id, j.priority \
              FROM steps s \
              JOIN jobs j ON s.job_id = j.id \
              WHERE j.status = 'open' \
@@ -848,6 +915,8 @@ impl JobsRepository for PgJobs {
             .map(|r| {
                 Ok(AssignmentRow {
                     job_id: JobId::from_uuid(r.step.job_id),
+                    job_title: r.job_title,
+                    due_on: r.due_on,
                     workflow: r.workflow,
                     subject_kind: r.subject_kind,
                     subject_id: r.subject_id,

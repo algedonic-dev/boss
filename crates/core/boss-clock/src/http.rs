@@ -523,6 +523,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+        let wall_anchor = std::time::Instant::now();
         let (_, before) = get_json(app.clone(), "/api/clock/now").await;
         let sim_before = before["now"].as_str().expect("now").to_string();
         assert_ne!(
@@ -545,14 +546,30 @@ mod tests {
         );
 
         // And the point of the re-anchor still holds: sim-time must
-        // not jump. Compared to the second, since the formula is
-        // millisecond-quantised and a teleport would be days.
+        // not jump. The first version asserted second-level string
+        // equality, which at day-per-millisecond warp requires the
+        // before-read and the configure to land in the SAME wall
+        // millisecond — free on an idle laptop, hopeless on a loaded
+        // runner (flaked on forge train #1, 2026-08-12, in a crate no
+        // car touched). The honest bound: drift may be at most the
+        // MEASURED wall gap times the old warp (plus slack), which
+        // scheduler jitter cannot break — while the bug this test
+        // exists to catch re-derives sim-time from today and jumps
+        // ~half a year, far beyond any jitter bound.
         let (_, after) = get_json(app, "/api/clock/now").await;
         let sim_after = after["now"].as_str().expect("now");
-        assert_eq!(
-            &sim_before[..19],
-            &sim_after[..19],
-            "sim-time teleported across the warp change: {sim_before} -> {sim_after}"
+        let parse = |t: &str| {
+            chrono::DateTime::parse_from_rfc3339(t)
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .expect("clock timestamps parse")
+        };
+        let drift = parse(sim_after) - parse(&sim_before);
+        let allowed_secs = wall_anchor.elapsed().as_secs_f64() * 86_400_000.0 + 60.0;
+        assert!(
+            drift >= chrono::Duration::zero() && (drift.num_seconds() as f64) <= allowed_secs,
+            "sim-time teleported across the warp change: {sim_before} -> {sim_after} \
+             (drift {}s, jitter allows at most {allowed_secs:.0}s)",
+            drift.num_seconds()
         );
     }
 

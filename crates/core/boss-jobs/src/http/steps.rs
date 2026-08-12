@@ -728,6 +728,114 @@ pub(super) struct SignOffBody {
 /// the role-scoped resource `step-signoff:<role>`.
 /// Idempotent per (role, current shape): re-stamping unchanged
 /// content returns the step unchanged.
+/// `POST /api/jobs/{id}/steps/{step_id}/claim` — the claim hop
+/// (queue-visibility Q2). Ready→Active as a compare-and-set owned by
+/// the adapter: exactly one claimant wins; the loser gets 409 with
+/// the holder. Idempotent for the holder. The generic PUT keeps its
+/// PATCH semantics and never adjudicates claims.
+pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    Path((id, step_id_str)): Path<(String, String)>,
+    CurrentUser(user): CurrentUser,
+) -> Response {
+    let job_id = match parse_job_id(&id) {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, "invalid job id").into_response(),
+    };
+    let step_id = match parse_step_id(&step_id_str) {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, "invalid step id").into_response(),
+    };
+    match state
+        .policy
+        .check(&user, Action::Update, Resource::step())
+        .await
+    {
+        Ok(Decision::Deny { reason }) => {
+            return (StatusCode::FORBIDDEN, reason).into_response();
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("policy check failed: {e}"),
+            )
+                .into_response();
+        }
+    }
+    let old = match state.jobs.get_step(&step_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return (StatusCode::NOT_FOUND, "step not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    if old.job_id != job_id {
+        return (StatusCode::NOT_FOUND, "step not on this job").into_response();
+    }
+
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let actor = user
+        .ambient_actor()
+        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+    let stamp = state.publisher.stamp_with_actor_at(actor, now).await;
+
+    // Optimistic post-state for the events; the CAS makes it the
+    // real post-state on success, and on conflict nothing records.
+    let mut claimed = old.clone();
+    claimed.assignee_id = Some(user.id.clone());
+    claimed.status = StepStatus::Active;
+
+    let mut claim_events = vec![stamp.event(
+        events::STEP_UPDATED,
+        serde_json::to_value(&claimed).unwrap_or_default(),
+    )];
+    // Same grammar as the PUT path: an assignment marker only when
+    // the assignee genuinely changed (a re-claim is not an
+    // assignment), payload mirroring step.ready for messages.notify.
+    if old.assignee_id.as_deref() != Some(user.id.as_str()) && !claimed.kind.is_empty() {
+        let (subject_kind, subject_id) = if let Ok(Some(job)) = state.jobs.get_job(&job_id).await {
+            (
+                boss_core::primitives::Subject::kind(&job.subject).to_string(),
+                boss_core::primitives::Subject::id(&job.subject).to_string(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        claim_events.push(stamp.event(
+            &format!("step.assigned.{}", claimed.kind),
+            serde_json::json!({
+                "job_id": job_id.to_string(),
+                "step_id": step_id.to_string(),
+                "kind": claimed.kind,
+                "subject_kind": subject_kind,
+                "subject_id": subject_id,
+                "assignee_id": claimed.assignee_id,
+                "metadata": claimed.metadata,
+            }),
+        ));
+    }
+
+    match state
+        .jobs
+        .claim_step_at(&step_id, &user.id, now, &claim_events)
+        .await
+    {
+        Ok(step) => Json(step).into_response(),
+        Err(crate::port::JobsError::ClaimConflict { holder, status }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "step already claimed or not claimable",
+                "holder": holder,
+                "status": status,
+            })),
+        )
+            .into_response(),
+        Err(crate::port::JobsError::StepNotFound(_)) => {
+            (StatusCode::NOT_FOUND, "step not found").into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     Path((id, step_id_str)): Path<(String, String)>,

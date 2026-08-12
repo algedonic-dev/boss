@@ -143,6 +143,10 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         .route("/api/jobs/{id}/steps", post(add_step::<R, B>))
         .route("/api/jobs/{id}/steps/{step_id}", put(update_step::<R, B>))
         .route(
+            "/api/jobs/{id}/steps/{step_id}/claim",
+            post(claim_step::<R, B>),
+        )
+        .route(
             "/api/jobs/{id}/steps/{step_id}/sign-offs",
             post(post_step_sign_off::<R, B>),
         )

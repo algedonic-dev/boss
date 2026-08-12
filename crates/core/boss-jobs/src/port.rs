@@ -15,6 +15,14 @@ pub enum JobsError {
     StepNotFound(StepId),
     #[error("storage failure: {0}")]
     Storage(String),
+    /// A claim lost its race (or targeted an unclaimable step). The
+    /// loser learns the current holder and status so the queue lens
+    /// can say "taken by X" instead of failing blankly.
+    #[error("step not claimable: held by {holder:?}, status {status}")]
+    ClaimConflict {
+        holder: Option<String>,
+        status: String,
+    },
 }
 
 /// Optional filters for listing jobs.
@@ -95,6 +103,10 @@ pub struct LaunchCalendarRow {
 #[derive(Debug, Clone, Serialize)]
 pub struct AssignmentRow {
     pub job_id: JobId,
+    /// The envelope's identity, so a queue lens can name the packet
+    /// without a second fetch.
+    pub job_title: String,
+    pub due_on: Option<chrono::NaiveDate>,
     pub workflow: String,
     pub subject_kind: String,
     pub subject_id: String,
@@ -188,6 +200,21 @@ pub trait JobsRepository: Send + Sync {
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError>;
 
+    /// Claim a ready step for an actor — the Ready→Active
+    /// compare-and-set (queue-visibility Q2). Succeeds only while
+    /// the step is `ready` and unassigned; a re-claim by the current
+    /// holder (ready or active) is an idempotent success. Everything
+    /// else is `ClaimConflict` naming the holder. Like
+    /// `append_sign_off`, this write path owns its fields — the
+    /// generic step UPDATE racing a claim cannot un-decide it.
+    async fn claim_step_at(
+        &self,
+        step_id: &StepId,
+        actor: &str,
+        now: DateTime<Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<Step, JobsError>;
+
     /// Append one sign-off stamp atomically. Stamps are
     /// append-only and owned by this path — the generic step UPDATE
     /// never writes `sign_offs`, so a concurrent read-modify-write
@@ -262,6 +289,8 @@ pub trait JobsRepository: Send + Sync {
                 if assignee_match || role_match {
                     out.push(AssignmentRow {
                         job_id: job.id,
+                        job_title: job.title.clone(),
+                        due_on: job.due_on,
                         workflow: job.kind.clone(),
                         subject_kind: boss_core::primitives::Subject::kind(&job.subject)
                             .to_string(),
@@ -312,6 +341,8 @@ pub trait JobsRepository: Send + Sync {
                 }
                 out.push(AssignmentRow {
                     job_id: job.id,
+                    job_title: job.title.clone(),
+                    due_on: job.due_on,
                     workflow: job.kind.clone(),
                     subject_kind: boss_core::primitives::Subject::kind(&job.subject).to_string(),
                     subject_id: boss_core::primitives::Subject::id(&job.subject).to_string(),

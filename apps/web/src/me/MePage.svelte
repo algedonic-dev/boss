@@ -14,146 +14,67 @@
 
   import { session } from '@boss/web-kit/session/session.svelte';
   import { appNow } from '@boss/web-kit/sim-clock';
-  import { isPending, isInFlight, isTerminal, type StepStatus } from '../jobs/types';
+  import {
+    fetchMyDay,
+    claimStep,
+    type MyDayQueues,
+    type AssignmentRow,
+  } from './assignments';
   import { navigate, href } from '../router';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
 
-  type StepSummary = {
-    id: string;
-    kind: string;
-    title: string;
-    status: StepStatus;
-    assignee_id: string | null;
-    sign_offs_required?: string[];
-    sort_order: number;
-  };
-
-  type JobSummary = {
-    id: string;
-    kind: string;
-    title: string;
-    status: string;
-    priority: string;
-    owner_id: string;
-    opened_on: string;
-    due_on: string | null;
-    steps: StepSummary[];
-  };
-
-  // The session rune exposes the current user. We read the id into
-  // a local $derived so our fetch effect tracks exactly that
-  // dependency. If the user changes (persona switch in phase 1),
-  // the effect re-runs.
+  // The session rune exposes the current user. The fetch effect
+  // tracks exactly (id, role) — the two halves of the lens query:
+  // the personal queue and the role's group queue.
   let userId = $derived(
     session.value.kind === 'ready' ? session.value.user.id : null,
   );
+  let userRole = $derived(
+    session.value.kind === 'ready' ? session.value.user.role : null,
+  );
 
-  let jobs = $state<JobSummary[]>([]);
-
-  /// The step of a Job that YOU can act on right now.
-  ///
-  /// The page was listing every Job with a step assigned to you in
-  /// `isPending || isInFlight` — and `isPending` covers BOTH `pending`
-  /// and `ready`. A `pending` step is yours but blocked: its
-  /// `ready_when` predicate is not satisfied, so there is nothing to
-  /// do. Mixed into one list with work you can actually start, that
-  /// reads as "a bunch of random jobs and steps", because half of it
-  /// is not addressable and nothing on the card says which half.
-  ///
-  /// `ready` and `active` are the ones waiting on you.
-  function actionableStep(j: JobSummary): StepSummary | null {
-    return (
-      j.steps?.find(
-        (s) =>
-          s.assignee_id === userId && (s.status === 'ready' || s.status === 'active'),
-      ) ?? null
-    );
-  }
-
-  /// Jobs you can start now. Blocked ones are still listed — a blocked
-  /// step is a commitment and hiding it would move the confusion
-  /// rather than remove it — but they sort below, and their card says
-  /// so, so the first thing on the page is the first thing to do.
-  let readyJobs = $derived(jobs.filter((j) => actionableStep(j) !== null));
-  let openJobsCapped = $state(false);
-  let openJobsTotal = $state(0);
-  let openJobsLoaded = $state(0);
+  // My Day is the assignments lens now (queue-visibility Q1): one
+  // indexed call whose WHERE clause IS the queue definition, instead
+  // of the capped jobs?status=open scan filtered client-side. The
+  // page just presents the queues.
+  let queues = $state<MyDayQueues | null>(null);
   let loading = $state(true);
+  let claimNote = $state<string | null>(null);
 
   $effect(() => {
     const uid = userId;
-    if (!uid) return;
+    const role = userRole;
+    if (!uid || !role) return;
     loading = true;
     let cancelled = false;
-
-    async function load() {
-      try {
-        const resp = await fetch('/api/jobs?status=open&limit=200');
-        if (!resp.ok) {
-          if (!cancelled) loading = false;
-          return;
-        }
-        const body = (await resp.json()) as {
-          data: JobSummary[];
-          total?: number;
-        };
-        const all = body.data ?? [];
-        openJobsLoaded = all.length;
-        openJobsTotal =
-          typeof body.total === 'number' ? body.total : all.length;
-        openJobsCapped = openJobsTotal > all.length;
-        const mine = all.filter(j =>
-          j.steps?.some(
-            s =>
-              s.assignee_id === uid &&
-              (isPending(s.status) || isInFlight(s.status)),
-          ),
-        );
-        const priority: Record<string, number> = {
-          emergency: 0,
-          urgent: 1,
-          standard: 2,
-          scheduled: 3,
-        };
-        mine.sort((a, b) => {
-          // Actionable before blocked, then the existing order. Sorting
-          // by priority alone put an urgent BLOCKED step above a
-          // standard one you could actually finish.
-          const aa = a.steps?.some(
-            (s) => s.assignee_id === uid && (s.status === 'ready' || s.status === 'active'),
-          )
-            ? 0
-            : 1;
-          const ab = b.steps?.some(
-            (s) => s.assignee_id === uid && (s.status === 'ready' || s.status === 'active'),
-          )
-            ? 0
-            : 1;
-          if (aa !== ab) return aa - ab;
-          const pa = priority[a.priority] ?? 3;
-          const pb = priority[b.priority] ?? 3;
-          if (pa !== pb) return pa - pb;
-          if (a.due_on && b.due_on) return a.due_on.localeCompare(b.due_on);
-          if (a.due_on) return -1;
-          if (b.due_on) return 1;
-          return 0;
-        });
-        if (!cancelled) {
-          jobs = mine;
-          loading = false;
-        }
-      } catch {
-        if (!cancelled) loading = false;
+    (async () => {
+      const q = await fetchMyDay(uid, role);
+      if (!cancelled) {
+        queues = q;
+        loading = false;
       }
-    }
-
-    load();
+    })();
     return () => {
       cancelled = true;
     };
   });
+
+  // The claim hop. A 409 names the winner — losing a race is
+  // ordinary queue life, so it reads as information, not an error.
+  async function onClaim(row: AssignmentRow) {
+    claimNote = null;
+    const res = await claimStep(row.job_id, row.step.id);
+    if (res.kind === 'conflict') {
+      claimNote = `"${row.step.title}" was taken by ${res.holder ?? 'someone else'} first`;
+    } else if (res.kind === 'error') {
+      claimNote = `Claim failed (${res.message})`;
+    }
+    if (userId && userRole) {
+      queues = await fetchMyDay(userId, userRole);
+    }
+  }
 
   function timeOfDay(): string {
     const h = new Date().getHours();
@@ -196,72 +117,38 @@
     />
 
     <div class="me-grid">
-      <Section title="My Jobs" wide>
-        {#if openJobsCapped}
-          <div class="myday-cap-note" role="status">
-            Scanned the most recent <strong>{openJobsLoaded.toLocaleString()}</strong>
-            of <strong>{openJobsTotal.toLocaleString()}</strong> open jobs for your assignments —
-            steps you own on older open jobs may not appear here yet.
-          </div>
-        {/if}
+      <Section title="My queue" wide>
         {#if loading}
-          <div class="myday-loading">Loading jobs…</div>
-        {:else if jobs.length === 0}
+          <div class="myday-loading">Loading your queue…</div>
+        {:else if !queues || queues.mine.length === 0}
           <div class="myday-empty">
-            No active jobs assigned to you right now.
+            Nothing in your personal queue right now.
           </div>
         {:else}
           <div class="myday-jobs-list">
-            {#each jobs as job (job.id)}
-              {@const mySteps = job.steps.filter(
-                s =>
-                  s.assignee_id === userId &&
-                  (isPending(s.status) || isInFlight(s.status)),
-              )}
-              {@const total = job.steps.length}
-              {@const done = job.steps.filter(
-                s => isTerminal(s.status),
-              ).length}
+            {#each queues.mine as row (row.step.id)}
               <!-- svelte-ignore a11y_click_events_have_key_events -->
               <!-- svelte-ignore a11y_no_static_element_interactions -->
               <div
                 class="myday-job-card"
-                onclick={() => navigate(entityHref('job', job.id))}
+                onclick={() => navigate(entityHref('job', row.job_id))}
               >
                 <div class="myday-job-header">
-                  {#if actionableStep(job)}
-                    <span class="myday-step myday-step-ready"
-                      >{actionableStep(job)?.title}</span
-                    >
-                  {:else}
-                    <span class="myday-step myday-step-blocked">blocked</span>
+                  <span
+                    class="myday-step"
+                    class:myday-step-ready={row.step.status === 'ready' ||
+                      row.step.status === 'active'}
+                    class:myday-step-blocked={row.step.status !== 'ready' &&
+                      row.step.status !== 'active'}>{row.step.title}</span
+                  >
+                  <span class="myday-workflow">{row.workflow}</span>
+                  <span class="myday-job-title">{row.job_title}</span>
+                  {#if row.priority !== 'standard'}
+                    <span class="chip chip-sm">{row.priority}</span>
                   {/if}
-                  <span class="myday-workflow">{job.kind}</span>
-                  <span class="myday-job-title">{job.title}</span>
-                  {#if job.priority !== 'standard'}
-                    <span class="chip chip-sm">{job.priority}</span>
-                  {/if}
                 </div>
-                <div class="myday-job-progress">
-                  <div class="myday-progress-bar">
-                    <div
-                      class="myday-progress-fill"
-                      style="width: {total > 0
-                        ? (done / total) * 100
-                        : 0}%"
-                    ></div>
-                  </div>
-                  <span class="myday-progress-label">
-                    {done}/{total} steps
-                  </span>
-                </div>
-                <div class="myday-job-mysteps">
-                  {#each mySteps as step (step.id)}
-                    <span class="myday-step">→ "{step.title}"</span>
-                  {/each}
-                </div>
-                {#if job.due_on}
-                  <div class="myday-job-due">Due {job.due_on}</div>
+                {#if row.due_on}
+                  <div class="myday-job-due">Due {row.due_on}</div>
                 {/if}
               </div>
             {/each}
@@ -269,11 +156,45 @@
         {/if}
       </Section>
 
+      <Section title="Up for grabs" wide>
+        {#if claimNote}
+          <div class="myday-claim-note" role="status">{claimNote}</div>
+        {/if}
+        {#if !queues || queues.upForGrabs.length === 0}
+          <div class="myday-empty">
+            Nothing waiting on your role's queue.
+          </div>
+        {:else}
+          <div class="myday-jobs-list">
+            {#each queues.upForGrabs as row (row.step.id)}
+              <div class="myday-job-card">
+                <div class="myday-job-header">
+                  <span class="myday-step myday-step-ready">{row.step.title}</span>
+                  <span class="myday-workflow">{row.workflow}</span>
+                  <span class="myday-job-title">{row.job_title}</span>
+                  {#if row.priority !== 'standard'}
+                    <span class="chip chip-sm">{row.priority}</span>
+                  {/if}
+                  <button class="myday-claim-btn" onclick={() => onClaim(row)}>
+                    Claim
+                  </button>
+                </div>
+              </div>
+            {/each}
+          </div>
+          {#if queues.inFlightElsewhere.length > 0}
+            <div class="myday-inflight-note">
+              {queues.inFlightElsewhere.length} role-matched step{queues.inFlightElsewhere.length === 1 ? '' : 's'} in flight with teammates
+            </div>
+          {/if}
+        {/if}
+      </Section>
+
       <Section title="At a glance">
         <div class="me-stats">
           <div class="me-stat-card">
-            <div class="me-stat-num">{jobs.length}</div>
-            <div class="me-stat-label">active jobs</div>
+            <div class="me-stat-num">{queues ? queues.mine.length : 0}</div>
+            <div class="me-stat-label">steps in your queue</div>
           </div>
         </div>
       </Section>
@@ -301,13 +222,32 @@
     color: var(--text-dim, #78716c);
   }
 
-  .myday-cap-note {
+  .myday-claim-btn {
+    margin-left: auto;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 10px;
+    border: 1px solid var(--accent, #0284c7);
+    color: var(--accent, #0284c7);
+    background: transparent;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .myday-claim-btn:hover {
+    background: var(--accent, #0284c7);
+    color: #fff;
+  }
+  .myday-claim-note {
     padding: 8px 12px;
-    background: #fff7ed;
-    border: 1px solid #fdba74;
+    background: var(--bg, #f5f5f4);
+    border: 1px solid var(--border, #d6d3d1);
     border-radius: 6px;
     font-size: 13px;
-    color: #7c2d12;
     margin: 0 0 12px 0;
+  }
+  .myday-inflight-note {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--text-dim, #78716c);
   }
 </style>
