@@ -45,6 +45,11 @@ JOBS = os.environ.get("BOSS_JOBS_URL", "http://127.0.0.1:7900")
 GH_REPO = os.environ.get("BOSS_TRAIN_GH_REPO", "algedonic-dev/boss")
 HEAD_OWNER = os.environ.get("BOSS_TRAIN_HEAD_OWNER", "dauld")
 FORK_URL = os.environ.get("BOSS_TRAIN_FORK_URL", "https://github.com/dauld/boss-fork.git")
+# The train protocol revision (directive 27ab7680): under the forge,
+# CI-green trains merge themselves — GitHub was a 10-hour permission
+# wall on an all-green train, and the human wall in this protocol is
+# the car review at parking, not a mechanical click at landing.
+AUTO_MERGE = os.environ.get("BOSS_TRAIN_AUTO_MERGE") == "1"
 UPSTREAM_URL = os.environ.get("BOSS_TRAIN_UPSTREAM_URL", f"https://github.com/{GH_REPO}.git")
 HOME = os.environ.get("BOSS_TRAIN_HOME", "/var/lib/boss-train")
 CLONE = os.path.join(HOME, "repo")
@@ -185,7 +190,7 @@ def merge_job_metadata(job_id, **kv):
 # ---------------------------------------------------------------------------
 
 class GitHubForge:
-    """The code host as the conductor sees it: two verbs."""
+    """The code host as the conductor sees it: three verbs."""
 
     def pr_info(self, url):
         """-> {state, mergeCommit, statusCheckRollup} for a PR url."""
@@ -193,20 +198,91 @@ class GitHubForge:
                "--json", "state,mergeCommit,statusCheckRollup")
         return json.loads(r.stdout)
 
-    def pr_create(self, repo, head, title, body):
+    def pr_create(self, repo, head_branch, title, body):
         """Open a PR head->main on repo; return its url."""
         r = sh("gh", "pr", "create", "--repo", repo,
-               "--head", head, "--base", "main",
+               "--head", f"{HEAD_OWNER}:{head_branch}", "--base", "main",
                "--title", title, "--body", body)
         return r.stdout.strip().splitlines()[-1]
+
+    def merge(self, url):
+        sh("gh", "pr", "merge", url, "--squash")
+
+
+class ForgejoForge:
+    """The same three verbs against the internal forge's API. PRs are
+    same-repo (no fork dance): the train branch pushes to the one
+    repo and the PR head is the bare branch name."""
+
+    def __init__(self):
+        self.base = os.environ.get(
+            "BOSS_TRAIN_FORGE_URL", "http://10.20.0.15:3000").rstrip("/")
+        self.repo = os.environ.get("BOSS_TRAIN_FORGE_REPO", "david/boss")
+        token_file = os.environ.get(
+            "BOSS_TRAIN_FORGE_TOKEN_FILE", "/etc/boss-train/forge.token")
+        with open(token_file) as f:
+            self.token = f.read().strip()
+
+    def _api(self, method, path, payload=None):
+        req = urllib.request.Request(
+            f"{self.base}/api/v1{path}", method=method,
+            headers={"Authorization": f"token {self.token}",
+                     "Content-Type": "application/json"},
+            data=json.dumps(payload).encode() if payload is not None else None)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            body = r.read()
+        return json.loads(body) if body.strip() else None
+
+    def _index(self, url):
+        return url.rstrip("/").rsplit("/", 1)[-1]
+
+    def pr_info(self, url):
+        """Shape Forgejo's PR + combined status into the exact dict
+        the GitHub adapter returns, so reconcile stays forge-blind."""
+        idx = self._index(url)
+        pr = self._api("GET", f"/repos/{self.repo}/pulls/{idx}")
+        state = "MERGED" if pr.get("merged") else (
+            "OPEN" if pr.get("state") == "open" else "CLOSED")
+        head_sha = (pr.get("head") or {}).get("sha", "")
+        rollup = []
+        if head_sha:
+            combined = self._api(
+                "GET", f"/repos/{self.repo}/commits/{head_sha}/status")
+            for st in (combined or {}).get("statuses", []) or []:
+                verdict = (st.get("status") or "").lower()
+                rollup.append({
+                    "conclusion": {"success": "SUCCESS",
+                                   "failure": "FAILURE",
+                                   "error": "FAILURE"}.get(verdict, ""),
+                    "status": "PENDING" if verdict == "pending" else "COMPLETED",
+                })
+        return {
+            "state": state,
+            "mergeCommit": {"oid": pr.get("merge_commit_sha") or ""},
+            "statusCheckRollup": rollup,
+        }
+
+    def pr_create(self, repo, head_branch, title, body):
+        pr = self._api("POST", f"/repos/{self.repo}/pulls", {
+            "head": head_branch, "base": "main",
+            "title": title, "body": body,
+        })
+        return pr["html_url"]
+
+    def merge(self, url):
+        idx = self._index(url)
+        self._api("POST", f"/repos/{self.repo}/pulls/{idx}/merge",
+                  {"Do": "squash"})
 
 
 def make_forge():
     kind = os.environ.get("BOSS_TRAIN_FORGE", "github")
     if kind == "github":
         return GitHubForge()
+    if kind == "forgejo":
+        return ForgejoForge()
     raise RuntimeError(f"unknown BOSS_TRAIN_FORGE {kind!r} — "
-                       "the Forgejo adapter lands with the internal forge")
+                       "expected github or forgejo")
 
 
 FORGE = make_forge()
@@ -246,7 +322,10 @@ def deploy(train, deployed_step):
     if DRY:
         log("DRY: would pull main, migrate, build, deploy services + web")
         return
-    sh("git", "-C", tree, "pull", "origin", "main")
+    # Under the forge protocol the playground converges on forge
+    # main; GitHub is the mirror, never the source (27ab7680).
+    pull_remote = os.environ.get("BOSS_TRAIN_DEPLOY_REMOTE", "origin")
+    sh("git", "-C", tree, "pull", pull_remote, "main")
     main_ref = sh("git", "-C", tree, "rev-parse", "--short", "HEAD").stdout.strip()
     env = {**os.environ, "PGPASSWORD": "boss"}
     mig = subprocess.run(
@@ -279,6 +358,12 @@ def reconcile():
         verdict = ci_verdict(info.get("statusCheckRollup"))
         if not step_done(ci_step) and verdict != "pending":
             complete_step(t, ci_step, result=verdict)
+
+        if AUTO_MERGE and verdict == "green" and info.get("state") == "OPEN":
+            log(f"CI green — merging {pr_url} (train protocol 27ab7680)")
+            if not DRY:
+                FORGE.merge(pr_url)
+                info = gh_pr(pr_url)
 
         merged_step = find_step(t, "merged", "Merged into main")
         if info.get("state") == "MERGED" and not step_done(merged_step):
@@ -414,7 +499,7 @@ def board(now):
             + "\n".join(lines)
             + "\n\n🤖 opened by infra/train/conductor.py (pr-train Workflow)")
     pr_url = FORGE.pr_create(
-        GH_REPO, f"{HEAD_OWNER}:{train_branch}",
+        GH_REPO, train_branch,
         f"train: {window} ({len(boarded)} changes)", body)
 
     merge_job_metadata(train["id"],

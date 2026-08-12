@@ -1,0 +1,9 @@
+[Unit]
+Description=BOSS cluster converges on forge main (build + push + roll)
+
+[Service]
+Type=oneshot
+User=david
+# The build is a cached docker build (~minutes warm, ~an hour cold).
+TimeoutStartSec=90min
+ExecStart=/home/david/boss/infra/forge/cluster-deploy-runner.sh
