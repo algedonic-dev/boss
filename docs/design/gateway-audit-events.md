@@ -37,18 +37,30 @@ difference worth a decision rather than a reflex.
 
 ## Open questions
 
-### Q1: Pool-in-the-gateway or ingest-endpoint?
+All 2 open questions were resolved 2026-08-12 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-Proposed: **(a)**, scoped hard: one pool, max 2 connections, used
-exclusively by an `audit_outbox` module; the login path never blocks
-on it (fire-and-forget task with a bounded queue — a slow database
-must not slow a login, and a lost telemetry event is a warn-line
-regression to today's behavior, not a correctness loss).
+---
 
-### Q2: Which auth events, day one?
 
-Proposed: `auth.login.denied` (local + OIDC, with reason class),
-`auth.login.succeeded` (email + method — the session mint moment),
-`auth.session.guest` (the demo path, counted). Not proposed:
-per-request events of any kind — the gateway sees everything, and
-the log must not become a request log.
+## Decisions
+
+### Q1: Pool-in-the-gateway or ingest-endpoint? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+(a): the gateway gains one pg pool (max 2 connections) used only by an audit-outbox module on the existing recipe-3 machinery (EventRecorder/PgOutboxRecorder) — no new event plumbing. The pool's credentials are a dedicated Postgres role with INSERT-only on event_outbox. The tracing::warn stays as the backstop when the bounded queue is full or the pool is down: degrade to today's behavior, never to silence, and never block a login. (b) rejected — it either reopens the measured single-writer decision or reintroduces the retired post-commit-publish shape over an HTTP hop, and spends a new service-credential class to get strictly worse durability.
+
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
+
+
+### Q2: Which auth events, day one? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+auth.login.denied, auth.login.succeeded, auth.session.guest — all three registered in event_kinds with source='gateway' in the same change. denied carries a closed reason enum (bad_credentials | no_employee_record | idp_denied) and declares no subject reference (none exists; the ref-check trigger would abort one). IdP transport failures — discovery, token exchange, userinfo — stay warn-lines: plumbing facts, not who-tried-the-door facts. succeeded carries method (password | oidc | passkey | guest), sized for the passkey work in flight. No per-request events — ratified as a standing constraint, not a deferral.
+
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.

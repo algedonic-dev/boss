@@ -56,51 +56,75 @@ signal instead of a quiet journal line.
 
 ## Open questions
 
-### Q1: Forgejo, and where does it live?
+All 7 open questions were resolved 2026-08-12 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-dev-cluster named Forgejo. Propose: confirm it; it runs on the
-cluster (repos are exactly the always-rebuildable-from-mirrors
-state the cluster may hold), with its data in the backup set and
-GitHub as the safety mirror.
+---
 
-### Q2: CI engine?
 
-Propose Forgejo Actions — GitHub-Actions-compatible, so the six
-checks port near-verbatim onto the cluster runners (builder image +
-sccache per dev-cluster).
+## Decisions
 
-### Q3: What exactly is the internal review protocol?
+### Q1: Forgejo, and where does it live? (resolved)
 
-Propose: the ship-a-change `review` step gains a sign-off gated on
-the operator role; completing it (with the sign-off) is the merge
-authorization; the conductor merges via forge API. The PR page
-becomes a diff viewer; the decision lives in BOSS.
+Resolved 2026-08-12 — accept.
 
-### Q4: Mirror shape?
+Forgejo — decided de facto and running (10.20.0.15:3000: git, the OCI registry the CI image pulls from, and a registered Actions runner; fa7191b is the adoption act). Placement in two stages: the interim LAN box is legitimate for CI-shadowing, and its Forgejo data dir enters the backup set now — until then the GitHub mirror is its only off-host copy. Cluster placement lands per dev-cluster topology, now schedulable: the cluster is up and running BOSS, Kanidm, and Longhorn.
 
-Propose: Forgejo → GitHub push-mirror on every main update; the
-public OSS presence is unchanged; inbound contributions arrive via
-GitHub and are pulled in deliberately.
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
 
-### Q5: Do forge events land on the outbox?
 
-Propose yes — push/check/merge webhooks → a small ingress (the
-webhook handler pattern) → `forge.*` kinds in the registry → the
-pipeline grains above become queryable and animatable like
-everything else.
+### Q2: CI engine? (resolved)
 
-### Q6: What is the maintenance Workflow family?
+Resolved 2026-08-12 — accept.
 
-Propose: one `maintenance` kind per chore, spawned by schedule
-rules (the clock runner exists), steps auto-executed by handlers,
-failure leaving the Job OPEN and loud on the canvas. The systemd
-timers remain the executors initially — the Job is the visibility
-layer — and migrate into handlers where it pays.
+Forgejo Actions — de facto (fa7191b, c4361cd, e6d612f: GitHub-Actions compatibility held with exactly two container-job deltas). Two debts close before cutover makes them load-bearing: the Forgejo jobs invoke infra/gate.sh and gate_sh.rs extends to pin .forgejo/workflows/ci.yml the same way it pins the GitHub side (the workflow currently inlines a second gate definition); and the boss-ci image Dockerfile comes into the repo, reconciled with infra/cluster/builder/Dockerfile — one rustc truth. The web job ports when a bun-bearing image exists; CodeQL and Scorecard stay on the GitHub mirror where they are native and free.
 
-### Q7: Sequencing — what preps before the cluster is up?
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
 
-Propose: (a) the conductor's gh calls behind a thin forge seam
-(adapter swap at cutover); (b) the maintenance family needs no
-forge at all and could ship next; (c) forge install + runner
-config staged like infra/idm; actual cutover waits on Talos + a
-rehearsal like the migration's.
+
+### Q3: What exactly is the internal review protocol? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+The ship-a-change review step gains sign_offs_required: [operator] — a versioned registry change; in-flight Jobs stay pinned. The conductor's reconcile, on seeing a signed-off review, calls the forge adapter's new merge verb and then sets the merged marker exactly as today: the observe-then-mark shape survives, the observer becomes the executor. No bespoke review UI first — the PR page becomes a diff viewer. Sequenced behind Q7's rehearsal: a broken merge path stops all shipping.
+
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
+
+
+### Q4: Mirror shape? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+Forgejo-to-GitHub push-mirror on every main update, superseding dev-cluster's 'daily'. The mirror is a disaster-recovery artifact of the system of record — a day-stale copy is a day of lost commits — and the GitHub-native checks (CodeQL, Scorecard, install-smoke) only audit what the mirror shows them. Inbound stays deliberate-pull via GitHub PRs; the fork model keeps external code off internal runners.
+
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
+
+
+### Q5: Do forge events land on the outbox? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+Yes. A small ingress validates Forgejo's webhook secret and stages via record_event_in_tx — never post-commit publish; the ratchet already bans the alternative. forge.push, forge.check.completed, and forge.merge are born declared in the event-kind registry as it lands. The conductor's reconcile may later consume these instead of polling; polling stays until then. Converges with the infrastructure-as-Subjects item (8016504c): forge events get a subject to be about.
+
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
+
+
+### Q6: What is the maintenance Workflow family? (resolved)
+
+Resolved 2026-08-12 — override.
+
+Resolved by the shipped implementation (train #226): maintenance_spec() kinds plus the ExecStartPre wrapper; success completes the run step, failure completes nothing and the Job stays open and loud, recovery closes the standing Job. One deliberate amendment to the doc's proposal, ratified: the spawner is the systemd timer's wrapper on wall-clock — not the dispatcher's schedule runner, whose sim-day rules fire every couple of wall-minutes at warp. Remaining rollout is mechanical: wrap the five uncovered timers (files-gc, ledger-recognize, messages-events-purge, search-reindex, views-catchup).
+
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
+
+
+### Q7: Sequencing — what preps before the cluster is up? (resolved)
+
+Resolved 2026-08-12 — override.
+
+(a) the conductor's forge seam and (b) the maintenance family are done — landed via #227 and #226. (c) amends to the ladder reality already proved better than staging-first: 1) Forgejo CI shadows GitHub CI on the interim host — the shadow surfaced three real port bugs at zero cutover risk; 2) the forge's configuration comes into the repo infra/idm-style (install script, runner registration, the boss-ci Dockerfile) and its data dir into the backup set, so the cluster install is a re-run, not a reinvention; 3) the ForgejoForge adapter lands behind the existing seam, exercised with BOSS_TRAIN_FORGE=forgejo in --dry-run; 4) the git-host and review cutover (Q3, Q4) waits on a log-copy-style rehearsal on the now-live cluster.
+
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.

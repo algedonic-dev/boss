@@ -17,6 +17,7 @@
   import SignInControl from './SignInControl.svelte';
   import GlobalSearch from './GlobalSearch.svelte';
   import FeedbackControl from './FeedbackControl.svelte';
+  import LoopMark from './ui/LoopMark.svelte';
   import { APPS as DEFAULT_APPS, type AppId, type AppTab } from './nav';
   import { manifest } from './session/manifest.svelte';
   import { session } from './session/session.svelte';
@@ -116,6 +117,7 @@
 
 <nav class="perspective-tabs" aria-label="Perspective">
   <span class="perspective-brand">
+    <LoopMark size={22} />
     <span class="perspective-brand-name">{brandName}</span>
     {#if brandSub}<span class="perspective-brand-sub">{brandSub}</span>{/if}
   </span>
@@ -181,8 +183,8 @@
     display: flex;
     align-items: stretch;
     gap: 20px;
-    background: #0c0a09;
-    border-bottom: 1px solid #292524;
+    background: var(--void, #0d1014);
+    border-bottom: 1px solid var(--hairline, #2a3138);
     padding: 0 16px;
   }
   .perspective-more {
@@ -216,8 +218,8 @@
     padding: 6px;
     display: flex;
     flex-direction: column;
-    background: #1c1917;
-    border: 1px solid #292524;
+    background: var(--ink, #12161c);
+    border: 1px solid var(--hairline, #2a3138);
     border-radius: 0 0 8px 8px;
     box-shadow: 0 10px 24px rgba(0, 0, 0, 0.4);
   }
@@ -225,51 +227,63 @@
     padding: 7px 10px;
     border-radius: 4px;
     font-size: 13px;
-    color: #d6d3d1;
+    color: var(--static, #7a838c);
     text-decoration: none;
     white-space: nowrap;
   }
   .perspective-more-item:hover {
-    background: #292524;
-    color: #fff;
+    background: var(--wash, rgba(232,236,239,.04));
+    color: var(--fog, #e8ecef);
   }
   .perspective-more-item-on {
-    color: #fff;
+    color: var(--fog, #e8ecef);
     font-weight: 500;
   }
 
+  /* The lockup: loop mark + mono wordmark, per §03. Center-aligned rather
+     than baseline now that a mark sits beside the text. */
   .perspective-brand {
     display: flex;
-    align-items: baseline;
-    gap: 5px;
+    align-items: center;
+    gap: 9px;
     flex: 0 0 auto;
   }
   .perspective-brand-name {
-    font-family: var(--font-display, inherit);
-    font-size: 16px;
-    font-weight: 700;
-    letter-spacing: -0.01em;
-    color: #fafaf9;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 14px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: var(--ls-nav, 0.14em);
+    color: var(--fog, #e8ecef);
+    white-space: nowrap;
   }
   .perspective-brand-sub {
+    font-family: var(--font-mono, ui-monospace, monospace);
     font-size: 10px;
-    font-weight: 600;
+    font-weight: 400;
     text-transform: uppercase;
-    letter-spacing: 0.14em;
-    color: var(--brew-amber, #d99b3a);
+    letter-spacing: 0.2em;
+    /* Was brewery amber. Not SIGNAL either: the active-tab underline
+       already spends the bar's one green on answering "where am I",
+       which is the more useful signal of the two. */
+    color: var(--static, #7a838c);
   }
   .perspective-tablist {
     display: flex;
     align-items: stretch;
   }
+  /* Nav is instrument type — §03 assigns NAV to DM Mono, caps and
+     letterspaced. */
   .perspective-tab {
     display: flex;
     align-items: center;
     padding: 0 18px;
-    font-size: 13px;
-    font-weight: 600;
-    letter-spacing: 0.01em;
-    color: #a8a29e;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 12px;
+    font-weight: 400;
+    text-transform: uppercase;
+    letter-spacing: var(--ls-label, 0.1em);
+    color: var(--static, #7a838c);
     text-decoration: none;
     /* Reserve the active underline on every tab so selecting one
        doesn't shift the row. */
@@ -280,20 +294,22 @@
       border-color 0.1s;
   }
   .perspective-tab:hover {
-    color: #e7e5e4;
-    background: rgba(255, 255, 255, 0.04);
+    color: var(--fog, #e8ecef);
+    background: var(--wash, rgba(232, 236, 239, 0.04));
   }
-  /* Selected perspective: amber-tinted fill + bright bold label + a
-     thick amber underline — distinctly "you are here" against the
-     muted inactive tabs. */
+  /* Selected perspective: a neutral raised ground + the SIGNAL underline.
+     The fill was an amber tint left from the brewery palette, which read
+     olive against VOID. It also doesn't need a hue of its own — the
+     underline is already spending this bar's one green on "you are
+     here", and tinting the fill to match would just say it twice. */
   .perspective-tab.active {
-    color: #fff;
-    font-weight: 700;
-    background: rgba(217, 155, 58, 0.18);
-    border-bottom-color: var(--brew-amber, #d99b3a);
+    color: var(--fog, #e8ecef);
+    font-weight: 500;
+    background: var(--ink-raised, #171c24);
+    border-bottom-color: var(--signal, #5fd4a8);
   }
   .perspective-tab.active:hover {
-    background: rgba(217, 155, 58, 0.24);
+    background: var(--ink, #12161c);
   }
   .perspective-right {
     margin-left: auto;
