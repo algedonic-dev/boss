@@ -85,39 +85,57 @@ original frame.
 
 ## Open questions
 
-### Q1: How does the claim hop render, and do personal queues always show?
+All 5 open questions were resolved 2026-08-12 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-Stations are settled (operator, 2026-08-10): queues only — shared
-role-queues + personal queues, actors as attached processors. What
-remains: does every actor's personal queue draw permanently (N
-stations for N staff — noisy at company scale) or materialize when
-occupied? And does the role→personal claim hop animate like any
-other transfer, or as a distinct "pull" gesture? Proposed: personal
-queues render when non-empty or recently active; the claim hop is
-the same motion grammar as every transfer — one grammar, no special
-cases.
+---
 
-### Q2: Are rails drawn per-kind or merged?
 
-Proposed: merged with per-kind tint on hover/selection — the canvas
-stays one picture; a kind's route appears when asked for (the route
-ghost), not by default.
+## Decisions
 
-### Q3: What moves — every event, or meaningful transitions?
+### Q1: How does the claim hop render, and do personal queues always show? (resolved)
 
-Proposed: packet dots move on step.done/step.ready/step.assigned
-(FlowMotion's set); the ticker keeps the full feed. Sub-step chatter
-(metadata writes) does not move packets.
+Resolved 2026-08-12 — accept.
 
-### Q4: Does the network canvas replace /system/flow's DAG sections or sit beside them?
+Personal queues materialize when non-empty or recently active — the os-map nodes-from-edges rule restated for queues, honest at the measured 14-of-411 occupancy. The claim hop renders in the one transfer grammar; the machine/human actor split (dispatcher push vs self-claim, already computed in liveFlow) is a tint/glyph modifier, not a second gesture. Hard dependency: queue-visibility Q2's claim compare-and-set lands before the claim hop renders, or the canvas can animate two actors winning the same packet.
 
-Proposed: replace the stacked sections as the page's hero; the
-per-kind DAGs remain reachable as route inspectors (click a kind).
-The os-map page retires into the traffic layer (`e66fe50c`).
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
 
-### Q5: What is the company-level recursion, and when?
 
-Proposed: not in v1 — but v1's data contract (stations, rails,
-traffic, packets as four queryable layers) must already answer
-"give me this per department" so the company canvas is a filter
-change, not a rebuild.
+### Q2: Are rails drawn per-kind or merged? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+Merged — one faint overlay of all declared rails, per-kind tint on hover/selection. Stations are keyed by authority-role/assignee and serve many kinds by construction; per-kind rails would re-partition exactly what stations-as-queues unified. Retires FlowNetwork's hardcoded 'pr-train' rank and the adjacent-sections-only link bars.
+
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
+
+
+### Q3: What moves — every event, or meaningful transitions? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+Packets move on the marker topics — step.ready, step.assigned, step.done — plus jobs.job.closed as the departure. jobs.step.updated metadata chatter stays ticker-only. Hybrid transport per sse-policy: dots ride the existing /api/events/stream push; depth piles and edge thickness ride the polled aggregate. The stream's Operator/Auditor gate currently bounds the live audience; widening it is a deliberate access decision, not an accident.
+
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
+
+
+### Q4: Does the network canvas replace /system/flow's DAG sections or sit beside them? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+Replace. The canvas becomes /system/flow's hero; per-kind decorated DAGs demote to the route ghost and the Fleet inspector; /system/os-map retires (page, route, nav row) once the traffic layer renders in the canvas. The LAG-pairing SQL survives as the traffic-layer repo, re-keyed from department to station. Simulated traffic stays counted separately.
+
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
+
+
+### Q5: What is the company-level recursion, and when? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+No company canvas in v1. Every layer endpoint takes a scope parameter (department / owner-role set) from its first version, per the /api/views/flow?owner_roles= pattern. Acceptance check: the layer queries filtered to one department return a self-consistent sub-canvas, pinned by test. The traffic-layer repo keeps its grouping key parameterizable so the company zoom reuses os-map's proven department grouping. Four-layers-vs-one-composite endpoint stays open until the first client forces it.
+
+**Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
