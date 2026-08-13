@@ -74,6 +74,7 @@ check "no-wallclock"             infra/lint/no-wallclock.sh
 check "outbox-migration-ratchet" infra/lint/outbox-migration-ratchet.sh
 check "idempotence-ratchet"      infra/lint/idempotence-ratchet.sh
 check "dispatcher-rules-ratchet" infra/lint/dispatcher-rules-ratchet.sh
+check "no-secrets"               infra/lint/no-secrets.sh
 
 if [ "${#FAILED[@]}" -gt 0 ]; then
     echo "" >&2
