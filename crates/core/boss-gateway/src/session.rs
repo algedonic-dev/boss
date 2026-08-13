@@ -18,7 +18,11 @@ use subtle::ConstantTimeEq;
 type HmacSha256 = Hmac<Sha256>;
 
 pub const COOKIE_NAME: &str = "boss_session";
-pub const DEFAULT_TTL_SECONDS: u64 = 8 * 60 * 60; // 8 hours
+// 24 hours (David, 2026-08-13, filed from the front door itself:
+// "TTL on sign-in auth is too short... I think it should be 24 hrs
+// for now"). Scope staleness (territory/reports baked at login)
+// is now bounded by a day instead of a workday.
+pub const DEFAULT_TTL_SECONDS: u64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Session {
@@ -47,7 +51,7 @@ pub struct Session {
     /// rep + account-team membership. Captured at login from
     /// `GET /api/people/{id}/scope`; serialised only when non-empty
     /// (empty covers every unrecognized user without cookie bloat).
-    /// Staleness bounded by the 8h session TTL — a newly-assigned rep
+    /// Staleness bounded by the 24h session TTL — a newly-assigned rep
     /// picks up their territory at next login.
     #[serde(rename = "tp", default, skip_serializing_if = "Vec::is_empty")]
     pub territory_account_ids: Vec<String>,

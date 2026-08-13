@@ -249,27 +249,27 @@
   .fn-sub {
     font-size: 12px;
     font-weight: 400;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .fn-msg {
     margin: 12px 0;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .fn-err {
-    color: var(--color-danger, #a33);
+    color: var(--err, #e2685c);
   }
   .fn-ticker {
     margin: 6px 0 14px;
     padding: 10px 12px;
-    border: 1px solid var(--color-border, #e7e0d2);
+    border: 1px solid var(--hairline, #2A3138);
     border-radius: 8px;
-    background: var(--color-bg-raised, #fff);
+    background: var(--card, var(--ink, #12161C));
   }
   .fn-ticker-h {
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
     font-weight: 600;
     display: inline-flex;
     align-items: center;
@@ -279,16 +279,16 @@
     width: 7px;
     height: 7px;
     border-radius: 50%;
-    background: var(--color-border, #e7e0d2);
+    background: var(--hairline, #2A3138);
     display: inline-block;
   }
   .fn-dot-live {
-    background: #16a34a;
+    background: var(--signal, #5FD4A8);
   }
   .fn-ticker-empty {
     margin-left: 10px;
     font-size: 12px;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .fn-ticker-list {
     list-style: none;
@@ -309,17 +309,17 @@
   }
   .fn-ticker-row .fn-t {
     font-variant-numeric: tabular-nums;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .fn-machine .fn-what {
-    color: #0f766e;
+    color: var(--signal, #5FD4A8);
     font-weight: 600;
   }
   .fn-ticker-row .fn-job {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .fn-kind {
     margin-top: 10px;
@@ -338,12 +338,12 @@
     padding: 0;
   }
   .fn-kind-h:hover {
-    color: var(--color-accent, #7a3f1f);
+    color: var(--signal, #5FD4A8);
   }
   .fn-kind-n {
     font-size: 12px;
     font-weight: 400;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .fn-link-bar {
     margin: 12px 0 4px;
@@ -354,6 +354,6 @@
   .fn-link {
     font-size: 12px;
     font-weight: 600;
-    color: var(--color-accent, #7a3f1f);
+    color: var(--signal, #5FD4A8);
   }
 </style>

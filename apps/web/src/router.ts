@@ -82,7 +82,6 @@ export type Route =
   | { kind: 'systemStepPlugins' }
   | { kind: 'systemStepPluginDetail'; pluginSlug: string }
   | { kind: 'systemDesign' }
-  | { kind: 'systemOsMap' }
   | { kind: 'systemYard' }
   | { kind: 'systemFlow' }
   | { kind: 'systemFleet' }
@@ -125,7 +124,6 @@ export function parseRoute(pathname: string): Route {
     if (p === '/monitoring/atlas') return { kind: 'systemMonitoringAtlas' };
     if (p === '/kb') return { kind: 'systemKb' };
     if (p === '/design') return { kind: 'systemDesign' };
-    if (p === '/os-map') return { kind: 'systemOsMap' };
     if (p === '/yard') return { kind: 'systemYard' };
     if (p === '/flow') return { kind: 'systemFlow' };
     if (p === '/fleet') return { kind: 'systemFleet' };

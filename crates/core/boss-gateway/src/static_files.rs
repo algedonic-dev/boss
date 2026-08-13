@@ -202,7 +202,7 @@ mod tests {
     /// check has been widened into a no-op.
     #[test]
     fn application_pages_are_not_public() {
-        for path in ["/ux/jobs", "/system", "/it/os-map", "/me", "/finance"] {
+        for path in ["/ux/jobs", "/system", "/me", "/finance"] {
             assert!(!is_public_path(path), "{path} must require a session");
         }
     }

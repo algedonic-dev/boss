@@ -92,9 +92,9 @@
     gap: 14px;
   }
   .sg-detail {
-    border: 1px solid var(--color-border, #e3d9c4);
+    border: 1px solid var(--hairline, #2A3138);
     border-radius: 8px;
-    background: var(--color-surface-alt, #fafafa);
+    background: var(--card, var(--ink, #12161C));
     padding: 12px 14px;
   }
 </style>

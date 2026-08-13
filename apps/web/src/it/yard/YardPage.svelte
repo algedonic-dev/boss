@@ -6,7 +6,7 @@
   // audit-readonly-safe by construction.
   import { onMount } from 'svelte';
   import { fetchYard, type YardState, type TrainRow } from './yard';
-  import PacketCard from './PacketCard.svelte';
+  import PacketCard from '@boss/web-kit/ui/PacketCard.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
 
   let yard = $state<YardState | null>(null);

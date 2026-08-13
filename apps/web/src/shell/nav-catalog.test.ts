@@ -73,7 +73,6 @@ describe('nav catalog — app assignment', () => {
     // The Operating System map — the executor network. Sits beside
     // the dispatcher cascade: same IT audience, different question
     // (job traffic, not rule wiring).
-    'system-os-map',
     // Flow — the team's own throughput, in wall-clock time. Distinct
     // from System Monitoring on purpose: monitoring answers what the
     // machine is doing, Flow answers what the people got through.

@@ -15,7 +15,10 @@
 //!     forge), the merge (observed, never assumed), and the deploys that
 //!     carried the merge out. Steps close only when the conductor holds
 //!     the evidence in hand; a train whose PR nobody merged just stays
-//!     open, visibly.
+//!     open, visibly. Once a train has arrived, the sweep deletes each
+//!     landed car's branch from the forge — on the job record's
+//!     evidence, because squash-merged trains leave no git ancestry to
+//!     prove a landing (see `deletable_branches`).
 //!
 //!  2. BOARD — open this window's train Job, collect the ship-a-change
 //!     Jobs that are ready (review step ready/active, a branch pushed to
@@ -356,6 +359,62 @@ pub(crate) fn parked_ready(job: &Value) -> bool {
     review_status == "ready" || review_status == "active"
 }
 
+/// The branch-sweep decision at arrival (protocol decision, David):
+/// train PRs squash-merge, so git ancestry can never prove a car's
+/// content landed — the JOB RECORD is the proof. Given the cars a
+/// landed train boarded and the branches still-open cars name, a
+/// car's branch is deletable iff:
+///   - the car's own bookkeeping completed: closed with the `merged`
+///     outcome (an abandoned car closes too, but its branch holds
+///     unmerged work — never touch it);
+///   - the branch is named and is not `main`;
+///   - no still-open car rides the same branch (a follow-up car's
+///     claim keeps it alive).
+/// Two landed cars naming one branch delete it once. Pure — the
+/// forge call and the journal line belong to the caller.
+pub(crate) fn deletable_branches(
+    boarded_cars: &[Value],
+    open_branches: &BTreeSet<String>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for car in boarded_cars {
+        let Some(cid) = car.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let md = car.get("metadata");
+        let branch = md
+            .and_then(|m| m.get("branch"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let landed = car.get("status").and_then(Value::as_str) == Some("closed")
+            && md.and_then(|m| m.get("outcome")).and_then(Value::as_str) == Some("merged");
+        if branch.is_empty()
+            || branch == "main"
+            || !landed
+            || open_branches.contains(branch)
+            || out.iter().any(|(b, _)| b == branch)
+        {
+            continue;
+        }
+        out.push((branch.to_string(), cid.to_string()));
+    }
+    out
+}
+
+/// A train's sweep is settled once every boarded car has reached a
+/// terminal status — each branch is then deleted, deliberately kept
+/// (main / a still-open car's claim), or the car never landed and
+/// its branch outlives the train. A car still open keeps the train
+/// on the sweep list for the next reconcile.
+pub(crate) fn sweep_settled(boarded_cars: &[Value]) -> bool {
+    boarded_cars.iter().all(|car| {
+        matches!(
+            car.get("status").and_then(Value::as_str),
+            Some("closed") | Some("cancelled")
+        )
+    })
+}
+
 // The DRY log lines mirror the python conductor's dict/list reprs —
 // the journal is operator surface, and the port keeps its lines.
 
@@ -400,7 +459,7 @@ fn py_pairs(cands: &[(Value, String)]) -> String {
 // exactly as before; behavior is unchanged by this refactor.
 // ---------------------------------------------------------------------------
 
-/// The code host as the conductor sees it: three verbs.
+/// The code host as the conductor sees it: four verbs.
 #[async_trait]
 trait Forge: Send + Sync {
     /// -> {state, mergeCommit, statusCheckRollup} for a PR url.
@@ -414,10 +473,30 @@ trait Forge: Send + Sync {
         body: &str,
     ) -> Result<String>;
     async fn merge(&self, url: &str) -> Result<()>;
+    /// Delete `branch` from the repo car branches are pushed to.
+    /// Ok(true) = deleted; Ok(false) = already gone (404) — an
+    /// expected state, the repo auto-deletes merged `train/*` PR
+    /// heads and hand sweeps happen. Anything else is an error.
+    async fn delete_branch(&self, branch: &str) -> Result<bool>;
+}
+
+/// `owner/name` from a clone url — https or ssh, with or without
+/// `.git`: `https://github.com/dauld/boss-fork.git` and
+/// `git@github.com:dauld/boss-fork` both give `dauld/boss-fork`.
+pub(crate) fn repo_path(url: &str) -> String {
+    let u = url.trim_end_matches('/').trim_end_matches(".git");
+    let mut segs = u.rsplit(['/', ':']);
+    let name = segs.next().unwrap_or_default();
+    let owner = segs.next().unwrap_or_default();
+    format!("{owner}/{name}")
 }
 
 struct GitHubForge {
     head_owner: String,
+    /// The fork holding car branches (`owner/name`) — under GitHub
+    /// the cars push to the fork, so that is where a landed car's
+    /// branch gets deleted from.
+    fork_repo: String,
 }
 
 #[async_trait]
@@ -454,11 +533,25 @@ impl Forge for GitHubForge {
         sh(&["gh", "pr", "merge", url, "--squash"])?;
         Ok(())
     }
+
+    async fn delete_branch(&self, branch: &str) -> Result<bool> {
+        let path = format!("repos/{}/git/refs/heads/{branch}", self.fork_repo);
+        let r = sh_unchecked(&["gh", "api", "--method", "DELETE", &path])?;
+        if r.status.success() {
+            return Ok(true);
+        }
+        let stderr = String::from_utf8_lossy(&r.stderr);
+        if stderr.contains("HTTP 404") || stderr.contains("Not Found") {
+            return Ok(false);
+        }
+        bail!("gh api DELETE {path}: {}", stderr.trim());
+    }
 }
 
-/// The same three verbs against the internal forge's API. PRs are
+/// The same four verbs against the internal forge's API. PRs are
 /// same-repo (no fork dance): the train branch pushes to the one
-/// repo and the PR head is the bare branch name.
+/// repo, the PR head is the bare branch name, and car branches get
+/// deleted from that same repo at arrival.
 struct ForgejoForge {
     base: String,
     repo: String,
@@ -630,13 +723,43 @@ impl Forge for ForgejoForge {
         .await?;
         Ok(())
     }
+
+    /// DELETE /repos/{owner}/{repo}/branches/{branch}. Not through
+    /// `api()` — a 404 here is an answer (already gone), not an
+    /// error, and `api()` bails on every non-2xx.
+    async fn delete_branch(&self, branch: &str) -> Result<bool> {
+        let resp = self
+            .http
+            .request(
+                Method::DELETE,
+                format!("{}/api/v1/repos/{}/branches/{branch}", self.base, self.repo),
+            )
+            .header("Authorization", format!("token {}", self.token))
+            .send()
+            .await
+            .with_context(|| format!("forge DELETE branches/{branch}"))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let body = resp.text().await?;
+        if !status.is_success() {
+            bail!(
+                "forge DELETE /repos/{}/branches/{branch}: HTTP {status}: {}",
+                self.repo,
+                body.trim()
+            );
+        }
+        Ok(true)
+    }
 }
 
-fn make_forge(head_owner: &str) -> Result<Box<dyn Forge>> {
+fn make_forge(cfg: &Config) -> Result<Box<dyn Forge>> {
     let kind = env_or("BOSS_TRAIN_FORGE", "github");
     match kind.as_str() {
         "github" => Ok(Box::new(GitHubForge {
-            head_owner: head_owner.to_string(),
+            head_owner: cfg.head_owner.clone(),
+            fork_repo: repo_path(&cfg.fork_url),
         })),
         "forgejo" => Ok(Box::new(ForgejoForge::new()?)),
         other => bail!("unknown BOSS_TRAIN_FORGE {other:?} — expected github or forgejo"),
@@ -978,7 +1101,111 @@ impl Conductor {
                 self.deploy(&t, deployed_step).await?;
             }
         }
+        self.sweep_landed_branches().await?;
         Ok(())
+    }
+
+    /// Reconcile's arrival sweep: delete landed cars' branches from
+    /// the forge (protocol decision, David). The repo auto-deletes
+    /// merged `train/*` PR heads, but each CAR branch survives its
+    /// squash-merged content landing — and ancestry cannot prove the
+    /// landing, so nothing git-side can ever say "safe to sweep".
+    /// The job record can: once a train has closed (arrived) and a
+    /// boarded car closed with the merged outcome, that branch's
+    /// work is on main and the conductor deletes it. A 404 is a fine
+    /// answer — something got there first. A train whose cars have
+    /// all reached a terminal is stamped `branches_swept`, so the
+    /// steady state costs one list call and no per-car fetches.
+    async fn sweep_landed_branches(&self) -> Result<()> {
+        let arrived = rows(
+            self.api(
+                Method::GET,
+                "/api/jobs?kind=pr-train&status=closed&limit=50",
+                None,
+            )
+            .await?,
+        )?;
+        // Filter on the list rows (they carry metadata): swept trains
+        // and cancelled ones (nothing boarded) drop out fetch-free.
+        let pending: Vec<&Value> = arrived
+            .iter()
+            .filter(|t| {
+                let md = t.get("metadata");
+                !truthy(md.and_then(|m| m.get("branches_swept")))
+                    && truthy(md.and_then(|m| m.get("boarded_jobs")))
+            })
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        // Branches still-open cars name, fetched once per pass: a
+        // live car's claim beats any landed car's deletion.
+        let open_branches = self.open_car_branches().await?;
+        for t in pending {
+            let tid = job_id(t)?;
+            let boarded: Vec<String> = t
+                .get("metadata")
+                .and_then(|m| m.get("boarded_jobs"))
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut cars = Vec::with_capacity(boarded.len());
+            for cid in &boarded {
+                cars.push(self.get_job(cid).await?);
+            }
+            for (branch, car) in deletable_branches(&cars, &open_branches) {
+                if self.cfg.dry {
+                    log(format!(
+                        "DRY: would delete branch {branch} (car {} landed)",
+                        id8(&car)
+                    ));
+                } else if self.forge.delete_branch(&branch).await? {
+                    log(format!(
+                        "deleted branch {branch} (car {} landed)",
+                        id8(&car)
+                    ));
+                } else {
+                    log(format!(
+                        "branch {branch} already gone (car {} landed)",
+                        id8(&car)
+                    ));
+                }
+            }
+            if sweep_settled(&cars) {
+                self.merge_job_metadata(tid, vec![("branches_swept", json!("true"))])
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The branches named by still-open ship-a-change cars — never
+    /// deletable, whoever landed on them. Read off the list rows
+    /// (the jobs list returns full metadata); an open car with no
+    /// branch yet contributes nothing.
+    async fn open_car_branches(&self) -> Result<BTreeSet<String>> {
+        let listed = rows(
+            self.api(
+                Method::GET,
+                "/api/jobs?kind=ship-a-change&status=open&limit=100",
+                None,
+            )
+            .await?,
+        )?;
+        Ok(listed
+            .iter()
+            .filter_map(|j| {
+                j.get("metadata")
+                    .and_then(|m| m.get("branch"))
+                    .and_then(Value::as_str)
+                    .filter(|b| !b.is_empty())
+                    .map(str::to_string)
+            })
+            .collect())
     }
 
     // -----------------------------------------------------------------------
@@ -1371,7 +1598,7 @@ pub async fn run(phase: Phase, dry: bool, now: DateTime<Utc>) -> Result<()> {
     // conductor constructed FORGE at import, so a misconfigured
     // BOSS_TRAIN_FORGE fails every entry loudly, not just the boarding
     // that needed it.
-    let forge = make_forge(&cfg.head_owner)?;
+    let forge = make_forge(&cfg)?;
     fs::create_dir_all(&cfg.home)?;
     let lock = File::create(Path::new(&cfg.home).join("lock"))?;
     match lock.try_lock() {
@@ -1412,8 +1639,9 @@ pub async fn run(phase: Phase, dry: bool, now: DateTime<Utc>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parked_ready;
+    use super::{deletable_branches, parked_ready, repo_path, sweep_settled};
     use serde_json::json;
+    use std::collections::BTreeSet;
 
     /// A car parked at review, branch pushed, not on a train.
     fn ready_car() -> serde_json::Value {
@@ -1464,5 +1692,120 @@ mod tests {
         // No review step at all.
         j["steps"] = json!([]);
         assert!(!parked_ready(&j));
+    }
+
+    // -- the branch-sweep decision at arrival ------------------------------
+    //
+    // Train PRs squash-merge, so git ancestry can never prove a car's
+    // content landed; the JOB RECORD is the proof (protocol decision,
+    // David). These pin exactly which branches the conductor may
+    // delete once a train has arrived.
+
+    /// A boarded car whose bookkeeping completed: closed with the
+    /// `merged` outcome stamped by the terminal close.
+    fn landed_car(id: &str, branch: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "status": "closed",
+            "metadata": {"branch": branch, "outcome": "merged", "merged": "true"},
+        })
+    }
+
+    fn no_open() -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
+    #[test]
+    fn a_landed_cars_branch_is_deletable() {
+        let cars = vec![landed_car("car-1", "feat/x")];
+        assert_eq!(
+            deletable_branches(&cars, &no_open()),
+            vec![("feat/x".to_string(), "car-1".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_car_still_open_keeps_its_branch() {
+        // Bookkeeping incomplete — the dispatcher has not closed the
+        // car yet, whatever the train did.
+        let mut car = landed_car("car-1", "feat/x");
+        car["status"] = json!("open");
+        assert!(deletable_branches(&[car], &no_open()).is_empty());
+    }
+
+    #[test]
+    fn an_abandoned_car_keeps_its_branch() {
+        // Abandoned cars close too — but their branch holds unmerged
+        // work. Only the `merged` outcome is landing evidence.
+        let mut car = landed_car("car-1", "feat/x");
+        car["metadata"]["outcome"] = json!("abandoned");
+        assert!(deletable_branches(&[car], &no_open()).is_empty());
+    }
+
+    #[test]
+    fn a_closed_car_without_an_outcome_keeps_its_branch() {
+        // Closed by hand, no terminal outcome on the record: not proof.
+        let mut car = landed_car("car-1", "feat/x");
+        car["metadata"].as_object_mut().unwrap().remove("outcome");
+        assert!(deletable_branches(&[car], &no_open()).is_empty());
+    }
+
+    #[test]
+    fn main_is_never_deletable() {
+        let cars = vec![landed_car("car-1", "main")];
+        assert!(deletable_branches(&cars, &no_open()).is_empty());
+    }
+
+    #[test]
+    fn a_branch_a_still_open_car_names_survives() {
+        // A follow-up car may ride a landed car's branch; the open
+        // car's claim wins.
+        let open: BTreeSet<String> = ["feat/x".to_string()].into();
+        let cars = vec![landed_car("car-1", "feat/x")];
+        assert!(deletable_branches(&cars, &open).is_empty());
+    }
+
+    #[test]
+    fn a_car_without_a_branch_contributes_nothing() {
+        let empty = landed_car("car-1", "");
+        assert!(deletable_branches(&[empty], &no_open()).is_empty());
+        let mut none = landed_car("car-2", "feat/x");
+        none["metadata"] = json!({"outcome": "merged"});
+        assert!(deletable_branches(&[none], &no_open()).is_empty());
+    }
+
+    #[test]
+    fn two_landed_cars_on_one_branch_delete_it_once() {
+        let cars = vec![landed_car("car-1", "feat/x"), landed_car("car-2", "feat/x")];
+        assert_eq!(
+            deletable_branches(&cars, &no_open()),
+            vec![("feat/x".to_string(), "car-1".to_string())]
+        );
+    }
+
+    #[test]
+    fn the_sweep_settles_only_when_every_boarded_car_is_terminal() {
+        let landed = landed_car("car-1", "feat/x");
+        let mut still_open = landed_car("car-2", "feat/y");
+        still_open["status"] = json!("open");
+        let mut cancelled = landed_car("car-3", "feat/z");
+        cancelled["status"] = json!("cancelled");
+        assert!(sweep_settled(std::slice::from_ref(&landed)));
+        assert!(sweep_settled(&[landed.clone(), cancelled]));
+        assert!(!sweep_settled(&[landed, still_open]));
+        // Nothing boarded is trivially settled.
+        assert!(sweep_settled(&[]));
+    }
+
+    #[test]
+    fn repo_path_reads_https_and_ssh_clone_urls() {
+        assert_eq!(
+            repo_path("https://github.com/dauld/boss-fork.git"),
+            "dauld/boss-fork"
+        );
+        assert_eq!(
+            repo_path("git@github.com:dauld/boss-fork"),
+            "dauld/boss-fork"
+        );
     }
 }

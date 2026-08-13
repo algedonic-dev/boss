@@ -7,7 +7,6 @@ am trying to do it for the IT department with the release trains and
 such, but it isn't coming together yet."
 **Related**: [queue-visibility.md](./queue-visibility.md) ·
 [workflow-ux-as-data.md](./workflow-ux-as-data.md) ·
-[operating-system-view.md](./operating-system-view.md) ·
 [human-powered-state-machine.md](./human-powered-state-machine.md)
 
 ---

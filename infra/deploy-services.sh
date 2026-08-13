@@ -1200,12 +1200,27 @@ else
     if [[ -d "$BOSS_GEN_ROOT/current/bin" ]]; then
         cp -a "$BOSS_GEN_ROOT/current/bin/." "$GEN_STAGE/bin/"
         echo "  seeded bin/ from generation $(gen_link_key current)"
+        # Adopt a real-file /usr/local/bin/boss the same way the first
+        # generation adopts pre-generation binaries: generations that
+        # predate the CLI joining the roster carry no bin/boss to
+        # seed, and the live file is then the only copy on the box. A
+        # freshly built CLI overwrites this seed right below;
+        # ensure_bin_links turns the real file into a symlink through
+        # `current` at activation either way.
+        if [[ ! -f "$GEN_STAGE/bin/boss" \
+              && -f /usr/local/bin/boss && ! -L /usr/local/bin/boss ]]; then
+            cp -a /usr/local/bin/boss "$GEN_STAGE/bin/"
+            echo "  adopted real-file /usr/local/bin/boss into the generation"
+        fi
     else
         # First-ever generation: adopt the real files the
         # pre-generation deploys left in /usr/local/bin (they become
-        # symlinks through `current` at activation).
+        # symlinks through `current` at activation). The bare `boss`
+        # CLI is named alongside the boss-* glob — the glob misses it,
+        # and a generation without the CLI leaves boss-train.service
+        # and conductor.sh on whatever stale file the box carries.
         seeded=0
-        for f in /usr/local/bin/boss-*; do
+        for f in /usr/local/bin/boss /usr/local/bin/boss-*; do
             [[ -f "$f" && ! -L "$f" ]] || continue
             cp -a "$f" "$GEN_STAGE/bin/"
             seeded=$((seeded + 1))
@@ -1292,6 +1307,16 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
     echo "==> stage on-demand helper binaries"
     stage_binary "boss-rebuild-all"
 
+    # The operator CLI itself. boss-train.service and
+    # infra/train/conductor.sh exec /usr/local/bin/boss — and twice on
+    # the cadence-cutover night a stale real-file CLI (built Aug 7,
+    # missing `train`, then `cadence`) broke the conductor, because no
+    # roster ever staged or linked it. The generation owns it now:
+    # built by infra/build-release.sh with the rest, staged here, and
+    # linked through `current` by ensure_bin_links like every other
+    # managed binary.
+    stage_binary "boss"
+
     # boss-gateway + boss-brewery-sim aren't port-table *-api services and have
     # no DAEMONS entry, so no install list refreshed them — they rotted to
     # pre-migration builds the same way boss-rebuild-all did. Refresh +
@@ -1334,6 +1359,13 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
     done
 
     echo "==> install daemon units + stage their binaries"
+    # The install refreshes the unit FILE only. Per-host drop-ins
+    # (/etc/systemd/system/<stem>.service.d/*.conf) are deliberately
+    # never written or removed here — boss-train's forge + jobs-SoR
+    # env contract rides in exactly such drop-ins (see the unit's
+    # header), and a deploy that clobbered them would silently point
+    # the conductor at the wrong forge and the wrong jobs instance.
+    # Same removal-stays-manual policy as the gateway drop-ins above.
     for entry in "${DAEMONS[@]}"; do
         IFS=: read -r stem subdir <<<"$entry"
         src_dir="$REPO_ROOT/infra"
@@ -1436,13 +1468,34 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
     # Retire the train's timer pair wherever it survives: the schedule
     # lives in cadence_rules now, and an enabled timer would keep the
     # old wall-clock boarding firing beside the rules.
+    #
+    # Retiring is TWO acts, not one: the unit FILES go, and the LOADED
+    # units are stopped. On cutover night (2026-08-13) this sweep
+    # deleted the files and the loaded timers kept firing from systemd
+    # memory until a manual stop + daemon-reload — a unit file is only
+    # the recipe; the armed timer is the process. So: stop the loaded
+    # units unconditionally (never gated on the files existing —
+    # that gate is exactly what skipped the stop once the files were
+    # gone), remove the files, stop again for anything that fired in
+    # between, then daemon-reload. Every arm no-ops when the units
+    # are already gone, so the sweep is idempotent.
     for stem in "${RETIRED_TRAIN_TIMERS[@]}"; do
-        if [[ -f "/etc/systemd/system/${stem}.timer" ]]; then
-            systemctl disable --now "${stem}.timer" >/dev/null 2>&1 || true
+        for unit in "${stem}.timer" "${stem}.service"; do
+            # disable --now covers the enabled case; the fallback stop
+            # covers a unit already disabled but still loaded/running.
+            systemctl disable --now "$unit" >/dev/null 2>&1 \
+                || systemctl stop "$unit" >/dev/null 2>&1 \
+                || true
+        done
+        if [[ -f "/etc/systemd/system/${stem}.timer" \
+              || -f "/etc/systemd/system/${stem}.service" ]]; then
             rm -f "/etc/systemd/system/${stem}.timer" \
                   "/etc/systemd/system/${stem}.service"
-            echo "  retired ${stem}.timer (schedule moved to cadence_rules)"
+            echo "  retired ${stem} timer+service (schedule moved to cadence_rules)"
         fi
+        for unit in "${stem}.timer" "${stem}.service"; do
+            systemctl stop "$unit" >/dev/null 2>&1 || true
+        done
     done
     systemctl daemon-reload
 

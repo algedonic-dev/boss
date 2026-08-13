@@ -10,10 +10,14 @@ dispatching, I think we should have a clean architecture too."
 **Related**: [job-packet-network.md](./job-packet-network.md) ·
 [views-as-queue-lenses.md](./views-as-queue-lenses.md) ·
 [protocol-cadence.md](./protocol-cadence.md) ·
-[operating-system-view.md](./operating-system-view.md) — Q1/Q2/Q5
-resolved into this doc
+the retired operating-system view (pre-network framing, dropped
+2026-08-13 — its Q1/Q2/Q5 resolutions live in Decision history here)
 
 ---
+
+**Lineage:** the fork-era `docs/priority-queues` draft and the
+operating-system view both fold in here — **priority queues,
+stations, and network nodes are one concept** (David, 2026-08-13).
 
 ## The definition
 

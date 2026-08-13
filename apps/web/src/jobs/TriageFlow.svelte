@@ -260,10 +260,10 @@
 <style>
   .tf-msg {
     margin: 16px 0;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .tf-err {
-    color: var(--color-danger, #a33);
+    color: var(--err, #e2685c);
   }
   .tf-queue {
     margin-top: 18px;
@@ -277,7 +277,7 @@
   .tf-queue-n {
     font-size: 12px;
     font-weight: 400;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .tf-items {
     list-style: none;
@@ -295,23 +295,23 @@
     width: 100%;
     text-align: left;
     padding: 8px 12px;
-    border: 1px solid var(--color-border, #e3d9c4);
+    border: 1px solid var(--hairline, #2A3138);
     border-radius: 6px;
-    background: var(--color-surface, #fff);
+    background: var(--card, var(--ink, #12161C));
     cursor: pointer;
   }
   .tf-item.selected {
-    border-color: var(--color-accent, #7a3f1f);
+    border-color: var(--signal, #5FD4A8);
   }
   .tf-item-pri {
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .tf-item-pri[data-pri='urgent'],
   .tf-item-pri[data-pri='emergency'] {
-    color: var(--color-danger, #a33);
+    color: var(--err, #e2685c);
   }
   .tf-item-title {
     flex: 1;
@@ -319,20 +319,20 @@
   }
   .tf-item-age {
     font-size: 12px;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .tf-hint {
     margin-top: 10px;
     font-size: 13px;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .tf-route {
     margin-left: 6px;
     padding: 3px 10px;
-    border: 1px solid var(--color-accent, #7a3f1f);
+    border: 1px solid var(--signal, #5FD4A8);
     border-radius: 999px;
     background: transparent;
-    color: var(--color-accent, #7a3f1f);
+    color: var(--signal, #5FD4A8);
     font-size: 12px;
     font-weight: 600;
     cursor: pointer;

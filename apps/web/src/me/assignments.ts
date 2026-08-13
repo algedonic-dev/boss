@@ -7,6 +7,8 @@
 // unassigned). Rows where someone else is mid-flight on a
 // role-matched step are visible context, not claimable work.
 
+import type { PacketCardData } from '@boss/web-kit/ui/packet-card';
+
 export type AssignmentStep = Readonly<{
   id: string;
   job_id: string;
@@ -84,6 +86,31 @@ export async function fetchMyDay(
   if (!resp.ok) return null;
   const body = (await resp.json()) as { data?: AssignmentRow[] };
   return splitQueues(body.data ?? [], uid);
+}
+
+// My Day rows render as packet cards — the same card the train yard
+// uses (feedback d69033dd: one card grammar across the network). The
+// lens maps its rows into the card's shape: the workflow is the
+// protocol, the job title leads, and the actionable step rides the
+// mono provenance line. Priority, due date, and a blocked marker
+// travel as tag chips. The assignments endpoint carries no job tags
+// or metadata, so `sim` cannot be read here and stays false — a fact
+// this lens does not have, never an inference.
+export function assignmentPacket(row: AssignmentRow): PacketCardData {
+  const actionable = row.step.status === 'ready' || row.step.status === 'active';
+  return {
+    id: row.job_id,
+    kind: row.workflow,
+    branch: row.step.title,
+    title: row.job_title,
+    tags: [
+      ...(actionable ? [] : ['blocked']),
+      ...(row.priority !== 'standard' ? [row.priority] : []),
+      ...(row.due_on ? [`due ${row.due_on}`] : []),
+    ],
+    sim: false,
+    skipReason: null,
+  };
 }
 
 export type ClaimResult =

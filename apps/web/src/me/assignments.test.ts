@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { splitQueues, type AssignmentRow } from './assignments';
+import { assignmentPacket, splitQueues, type AssignmentRow } from './assignments';
 
 type RowOverrides = Omit<Partial<AssignmentRow>, 'step'> & {
   step?: Partial<AssignmentRow['step']>;
@@ -60,5 +60,29 @@ describe('splitQueues', () => {
       'me',
     );
     expect(q.mine[0]?.due_on).toBe('2026-08-13');
+  });
+});
+
+describe('assignmentPacket', () => {
+  test('maps a row onto the packet-card grammar', () => {
+    const p = assignmentPacket(row({}));
+    expect(p.id).toBe('j1');
+    expect(p.kind).toBe('field-service');
+    expect(p.title).toBe('Fix the kettle');
+    expect(p.branch).toBe('Do it');
+    expect(p.tags).toEqual([]);
+    expect(p.sim).toBe(false);
+    expect(p.skipReason).toBeNull();
+  });
+
+  test('non-standard priority and due date ride as tag chips', () => {
+    const p = assignmentPacket(row({ priority: 'urgent', due_on: '2026-08-13' }));
+    expect(p.tags).toEqual(['urgent', 'due 2026-08-13']);
+  });
+
+  test('a not-yet-actionable step is tagged blocked', () => {
+    const p = assignmentPacket(row({ step: { status: 'pending' } }));
+    expect(p.tags).toEqual(['blocked']);
+    expect(assignmentPacket(row({ step: { status: 'active' } })).tags).toEqual([]);
   });
 });

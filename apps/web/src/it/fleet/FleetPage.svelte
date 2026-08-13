@@ -371,18 +371,18 @@
     align-items: baseline;
     gap: 8px;
     font-size: 13px;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .fleet-scope {
     font-size: 12px;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .fleet-msg {
     margin: 24px 0;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .fleet-err {
-    color: var(--color-danger, #a33);
+    color: var(--err, #e2685c);
   }
   .fleet-table {
     margin-top: 16px;
@@ -393,11 +393,11 @@
   .fleet-table td {
     text-align: left;
     padding: 6px 14px 6px 0;
-    border-bottom: 1px solid var(--color-border, #e4dccb);
+    border-bottom: 1px solid var(--hairline, #2A3138);
   }
   .fleet-table th {
     font-weight: 600;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .fleet-node-items {
     margin-top: 14px;
@@ -411,7 +411,7 @@
   .fleet-node-n {
     font-size: 12px;
     font-weight: 400;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .fleet-items {
     list-style: none;
@@ -429,9 +429,9 @@
     width: 100%;
     text-align: left;
     padding: 7px 12px;
-    border: 1px solid var(--color-border, #e4dccb);
+    border: 1px solid var(--hairline, #2A3138);
     border-radius: 6px;
-    background: var(--color-surface, #fff);
+    background: var(--card, var(--ink, #12161C));
     cursor: pointer;
     font: inherit;
     color: inherit;
@@ -440,11 +440,11 @@
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .fleet-item-pri[data-pri='urgent'],
   .fleet-item-pri[data-pri='emergency'] {
-    color: var(--color-danger, #a33);
+    color: var(--err, #e2685c);
   }
   .fleet-item-title {
     flex: 1;
@@ -452,12 +452,12 @@
   }
   .fleet-item-age {
     font-size: 12px;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
   }
   .fleet-offmap {
     margin-left: 6px;
     font-size: 11px;
     font-weight: 600;
-    color: var(--color-accent, #7a3f1f);
+    color: var(--signal, #5FD4A8);
   }
 </style>

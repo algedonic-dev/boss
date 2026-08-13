@@ -37,10 +37,10 @@ CARGO_BIN="${CARGO_BIN:-$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu
 export PATH="$CARGO_BIN:$PATH"
 RELEASE_DIR="$REPO_ROOT/target/release"
 
-echo "==> [1/2] cargo build --release --workspace (libs + default-feature bins)"
+echo "==> [1/3] cargo build --release --workspace (libs + default-feature bins)"
 cargo build --release --workspace
 
-echo "==> [2/2] building every bin that declares required-features, with exactly those"
+echo "==> [2/3] building every bin that declares required-features, with exactly those"
 # cargo metadata is the single source of truth — read each workspace bin's
 # required-features straight from it, so this never drifts from the Cargo.tomls.
 mapfile -t GATED < <(
@@ -58,6 +58,20 @@ for row in "${GATED[@]}"; do
     echo "    $bin  (-p $crate --features $feats)"
     cargo build --release -p "$crate" --bin "$bin" --features "$feats"
 done
+
+echo "==> [3/3] boss CLI (-p boss-cli --bin boss)"
+# The CLI is a deploy-roster member, not a dev convenience:
+# boss-train.service and infra/train/conductor.sh exec
+# /usr/local/bin/boss on the box, and a roster that never NAMED it
+# left a stale Aug-7 CLI serving the cadence cutover (missing
+# `train`, then `cadence` — the conductor broke twice in one night).
+# The workspace build above compiles it today (no required-features);
+# this named invocation is the roster entry that keeps that true — if
+# the bin ever grows a feature gate or leaves default workspace
+# members, this line fails or fixes it loudly instead of silently
+# shipping whatever /usr/local/bin already had. deploy-services.sh
+# stages it into the generation and links it through `current`.
+cargo build --release -p boss-cli --bin boss
 
 if [[ "${1:-}" == "--verify" ]]; then
     echo "==> verifying gated bins are postgres-backed (link sqlx)"

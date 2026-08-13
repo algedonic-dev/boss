@@ -17,11 +17,11 @@
   import {
     fetchMyDay,
     claimStep,
+    assignmentPacket,
     type MyDayQueues,
     type AssignmentRow,
   } from './assignments';
-  import { navigate, href } from '../router';
-  import { entityHref } from '@boss/web-kit/ui/entity-href';
+  import PacketCard from '@boss/web-kit/ui/PacketCard.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
 
@@ -125,32 +125,12 @@
             Nothing in your personal queue right now.
           </div>
         {:else}
+          <!-- The same packet card the train yard deals — one card
+               grammar across the network (d69033dd). Double-click or
+               Enter opens the job detail. -->
           <div class="myday-jobs-list">
             {#each queues.mine as row (row.step.id)}
-              <!-- svelte-ignore a11y_click_events_have_key_events -->
-              <!-- svelte-ignore a11y_no_static_element_interactions -->
-              <div
-                class="myday-job-card"
-                onclick={() => navigate(entityHref('job', row.job_id))}
-              >
-                <div class="myday-job-header">
-                  <span
-                    class="myday-step"
-                    class:myday-step-ready={row.step.status === 'ready' ||
-                      row.step.status === 'active'}
-                    class:myday-step-blocked={row.step.status !== 'ready' &&
-                      row.step.status !== 'active'}>{row.step.title}</span
-                  >
-                  <span class="myday-workflow">{row.workflow}</span>
-                  <span class="myday-job-title">{row.job_title}</span>
-                  {#if row.priority !== 'standard'}
-                    <span class="chip chip-sm">{row.priority}</span>
-                  {/if}
-                </div>
-                {#if row.due_on}
-                  <div class="myday-job-due">Due {row.due_on}</div>
-                {/if}
-              </div>
+              <PacketCard card={assignmentPacket(row)} />
             {/each}
           </div>
         {/if}
@@ -167,18 +147,13 @@
         {:else}
           <div class="myday-jobs-list">
             {#each queues.upForGrabs as row (row.step.id)}
-              <div class="myday-job-card">
-                <div class="myday-job-header">
-                  <span class="myday-step myday-step-ready">{row.step.title}</span>
-                  <span class="myday-workflow">{row.workflow}</span>
-                  <span class="myday-job-title">{row.job_title}</span>
-                  {#if row.priority !== 'standard'}
-                    <span class="chip chip-sm">{row.priority}</span>
-                  {/if}
-                  <button class="myday-claim-btn" onclick={() => onClaim(row)}>
-                    Claim
-                  </button>
-                </div>
+              <!-- The claim hop stays a button beside the card: the
+                   card is the packet, the claim is queue mechanics. -->
+              <div class="myday-grab-row">
+                <PacketCard card={assignmentPacket(row)} />
+                <button class="myday-claim-btn" onclick={() => onClaim(row)}>
+                  Claim
+                </button>
               </div>
             {/each}
           </div>
@@ -203,23 +178,12 @@
 {/if}
 
 <style>
-  /* The step, not the Job, is what you act on — so it leads the card. */
-  .myday-step {
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    font-weight: 600;
-    padding: 1px 6px;
-    border-radius: 3px;
-    white-space: nowrap;
-  }
-  .myday-step-ready {
-    background: #ecfdf5;
-    color: #047857;
-  }
-  .myday-step-blocked {
-    background: var(--bg, #f5f5f4);
-    color: var(--text-dim, #78716c);
+  /* Packet card + claim button side by side; the card takes the row. */
+  .myday-grab-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+    align-items: center;
   }
 
   .myday-claim-btn {

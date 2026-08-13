@@ -126,7 +126,6 @@
         // The executor network — who moves work and where it goes.
         // Belongs with the other live instruments rather than under
         // Define: it shows the system RUNNING, not how it is authored.
-        ROUTE_CATALOG['system-os-map'],
       ],
     },
     {

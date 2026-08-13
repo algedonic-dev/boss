@@ -4,6 +4,31 @@ Documentation=file:/opt/boss/docs/design/protocol-cadence.md
 After=network-online.target postgresql.service boss-clock-api.service boss-jobs-api.service
 Wants=network-online.target
 
+# HOST ENV CONTRACT — this unit is not complete on its own. The env
+# VALUES (tokens, urls) are box-local and ride in drop-ins
+# (/etc/systemd/system/boss-train.service.d/*.conf, e.g. forge.conf +
+# jobs-sor.conf); the CONTRACT is documented here so a fresh host
+# cannot half-configure the conductor without noticing:
+#
+#   BOSS_TRAIN_FORGE=forgejo — which forge adapter drives PRs, merges
+#       and branch deletes. Unset, the conductor falls back to the
+#       `gh` GitHub adapter: on the 2026-08-13 cadence cutover that
+#       fallback pointed a whole window at GitHub instead of the
+#       forge until a drop-in patched it.
+#   BOSS_TRAIN_FORGE_URL / BOSS_TRAIN_FORGE_REPO /
+#   BOSS_TRAIN_FORGE_TOKEN_FILE — where the forge lives, which repo,
+#       and the repo-scoped token file (default
+#       /etc/boss-train/forge.token).
+#   BOSS_JOBS_URL — the jobs SYSTEM OF RECORD. Unset, the loop books
+#       trains on 127.0.0.1:7900, which on a cutover box is the
+#       legacy instance (split-brain incident c4b4a6b0).
+#   (BOSS_TRAIN_AUTO_MERGE=1, BOSS_TRAIN_DEPLOY_REMOTE, … ride the
+#   same drop-ins.)
+#
+# infra/deploy-services.sh installs THIS file only; it never writes
+# or removes anything under boss-train.service.d/, so host drop-ins
+# survive every deploy.
+
 [Service]
 # The scheduling knowledge that used to live in this directory's two
 # timers (06:00/18:00 boarding, 10-minute reconcile) is now rows in
@@ -22,12 +47,16 @@ User=david
 # /var/lib/boss-train — the conductor's own clone + lock live here,
 # never in the dev working tree.
 StateDirectory=boss-train
-WorkingDirectory=/opt/boss
+# Run IN the conductor's clone: the verb children (git, gates) act on
+# the cwd's repo, and on cutover night the unit ran at /opt/boss —
+# outside the clone — until a host drop-in re-pointed it. The `-`
+# tolerates the pre-first-boarding hole: the cadence loop itself is
+# cwd-independent and the boarding verb creates the clone; without
+# the dash a fresh host's unit would fail CHDIR forever and never
+# get the chance to create it.
+WorkingDirectory=-/var/lib/boss-train/repo
 ExecStart=/usr/local/bin/boss train cadence
 Environment=RUST_LOG=info
-# Box-local conductor env (BOSS_TRAIN_FORGE, BOSS_TRAIN_AUTO_MERGE,
-# BOSS_JOBS_URL overrides, …) rides in a drop-in, same as it did on
-# the timer units. Verb children inherit it.
 Restart=on-failure
 RestartSec=10
 

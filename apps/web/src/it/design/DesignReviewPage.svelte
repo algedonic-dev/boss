@@ -353,16 +353,16 @@
   .design-table td {
     text-align: left;
     padding: 8px 12px;
-    border-bottom: 1px solid var(--color-border, #e0e0e0);
+    border-bottom: 1px solid var(--hairline, #2A3138);
     vertical-align: top;
   }
   .design-path {
-    color: var(--color-fg-muted, #666);
+    color: var(--static, #7A838C);
     font-size: 12px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: var(--font-mono, ui-monospace, monospace);
   }
   .empty {
-    color: var(--color-fg-muted, #666);
+    color: var(--static, #7A838C);
     margin: 12px 0;
   }
 </style>

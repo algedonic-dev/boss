@@ -58,7 +58,6 @@
   import DispatcherRuleEditPage from './dispatcher/DispatcherRuleEditPage.svelte';
   import SubjectsClassesPage from './it/subjects/SubjectsClassesPage.svelte';
   import SystemModelPage from './it/system/SystemModelPage.svelte';
-  import OsMapPage from './it/osmap/OsMapPage.svelte';
   import FlowPage from './it/flow/FlowPage.svelte';
   import YardPage from './it/yard/YardPage.svelte';
   import FleetPage from './it/fleet/FleetPage.svelte';
@@ -318,8 +317,6 @@
       <StepPluginDetailPage pluginSlug={route.pluginSlug} />
     {:else if route.kind === 'systemDesign'}
       <DesignReviewPage />
-    {:else if route.kind === 'systemOsMap'}
-      <OsMapPage />
     {:else if route.kind === 'systemYard'}
       <YardPage />
     {:else if route.kind === 'systemFlow'}
