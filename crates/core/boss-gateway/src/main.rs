@@ -589,8 +589,21 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
         // demo session + persona flow apply (the service's own operator
         // gate refuses control writes for audit-readonly). These specific
         // routes win over the /{*rest} SPA fallback below.
+        //
+        // All THREE spellings are needed. `{*rest}` needs at least one
+        // segment, so `/simulator/` — what a browser sends for a
+        // trailing-slash link, a bookmark, or the SPA's own base URL —
+        // matched neither of the other two and fell through to the root
+        // SPA route, which answered a /simulator URL with the MAIN
+        // app's index.html. Same missing-bare-matcher shape as the
+        // `/api` catch-all below, and the reason this one is pinned by
+        // a test (`the_simulator_prefix_never_resolves_to_the_main_spa`).
         .route(
             "/simulator",
+            axum::routing::any(|s, r| proxy::handle_app(s, r, &proxy::SIMULATOR)),
+        )
+        .route(
+            "/simulator/",
             axum::routing::any(|s, r| proxy::handle_app(s, r, &proxy::SIMULATOR)),
         )
         .route(
@@ -977,5 +990,83 @@ mod routing_tests {
             !body.contains(MISS),
             "a page route must not be treated as an API miss: {body}"
         );
+    }
+
+    /// Same request a browser makes when someone clicks a link: GET
+    /// with an Accept that asks for HTML.
+    async fn navigate(app: axum::Router, path: &str) -> (StatusCode, String, String) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(axum::http::header::ACCEPT, "text/html,*/*;q=0.8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let location = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        (
+            status,
+            location,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
+    }
+
+    /// The simulator is a DIFFERENT app behind the same door, and
+    /// `/simulator/` — the spelling a browser produces from a trailing
+    /// slash, a redirect, or a relative link — matched neither
+    /// `/simulator` nor `/simulator/{*rest}`: matchit's `{*rest}` needs
+    /// at least one segment, exactly the shape that motivated the bare
+    /// `/api` matcher above. So it fell through to the root `/{*rest}`
+    /// SPA route and the visitor was served the MAIN app's index.html —
+    /// "Algedonic Ales", the dashboard shell — under a /simulator URL.
+    ///
+    /// That is worse than an error. boss-simulator's own "bundle not
+    /// installed" stub says what is wrong; another app's shell just
+    /// looks broken, and got reported as "the simulator didn't load"
+    /// (69a0421d) while the real fault was one missing route.
+    ///
+    /// The discriminator is which handler answers an unauthenticated
+    /// document navigation: the simulator proxy (`proxy::handle_app`)
+    /// sends a browser to `/login?next=…`, the root SPA handler
+    /// (`static_files::handle`) returns a bare 401. No upstream, no
+    /// session, no files on disk — so this pins routing and nothing
+    /// else.
+    #[tokio::test]
+    async fn the_simulator_prefix_never_resolves_to_the_main_spa() {
+        for path in [
+            "/simulator",
+            // The regression. Every other spelling already worked.
+            "/simulator/",
+            "/simulator/config",
+            "/simulator/api/status",
+        ] {
+            let (status, location, body) = navigate(app(), path).await;
+            assert_eq!(
+                status,
+                StatusCode::SEE_OTHER,
+                "`{path}` was not routed to boss-simulator — it fell through to the \
+                 root SPA handler, which serves the MAIN app's index.html to anyone \
+                 with a session. body: {body}"
+            );
+            assert_eq!(
+                location,
+                format!("/login?next={path}"),
+                "`{path}` should come back from the simulator proxy's login redirect"
+            );
+            assert!(
+                !body.to_lowercase().contains("<!doctype html"),
+                "a /simulator path must never be answered with another app's HTML \
+                 shell: {body}"
+            );
+        }
     }
 }

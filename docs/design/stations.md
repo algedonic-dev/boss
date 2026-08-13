@@ -49,6 +49,49 @@ Visual rollup — collapsing actor stations into team/department
 groupings — is a **view-level aggregation** for clutter control, not
 a data-model change; showing every station is acceptable for now.
 
+### Per-actor stations without per-actor rows
+
+"Every executor has an actor station" reads, naively, as one registry
+row per person — rows that must be minted at every hire and go stale
+at every departure. That is not a registry; that is a generator.
+
+The predicate shape carries a **self placeholder** instead: the
+literal `"@me"` in a value position (a `metadata_equals` value, or the
+step clause's `assignee_id`), which the evaluator binds to the
+**requesting actor** at read time, once, before any packet is
+compared. So an actor station is **one row every actor can query**,
+and its queue is derived per request like every other station's.
+
+Two rules keep it safe, and both fail closed:
+
+- An unbindable placeholder — a guest, nobody to bind to — yields no
+  predicate at all, and the read edge answers with an **empty** queue.
+  Failing to bind can never widen one.
+- An *unbound* predicate matches nothing, so a placeholder that
+  somehow reached the evaluator cannot compare `"@me"` against packet
+  data and hand one packet to everybody.
+
+The first row to use it is `my-watchlist` (117-watchlist-station.sql):
+the packets a person filed, which is where David's ask landed —
+"we should always notify the filer with the terminal state and it
+should show in their watchlist" (2026-08-13).
+
+### Departed packets: the terminal window
+
+Stations hold *in-flight* traffic, so a station's universe is packets
+that have not reached a terminal status. A watchlist inverts that: it
+is read by the person who filed the packet, and the terminal state is
+the information they came for — a list whose entries vanish at closure
+is empty at exactly the moment it matters.
+
+`terminal_window_days` on the station row keeps departed packets
+visible for N days after `closed_on`, then ages them out. It sits on
+the row beside `discipline` and `wip_limit`, not inside the predicate,
+because it is a **retention** rule rather than a membership one: the
+predicate says which packets are this station's, the window says how
+long a departed one lingers on the board. Keeping it off the predicate
+also keeps predicate evaluation clockless.
+
 ## What already conforms
 
 The claim CAS is "an actor takes a packet from a station" made safe.

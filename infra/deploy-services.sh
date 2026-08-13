@@ -711,9 +711,15 @@ emit_unit() {
         extra_env=$"${extra_env}"$'\nEnvironment=BOSS_EVENT_WEBHOOK_URL=http://127.0.0.1:7099/callback'
     elif [[ "$name" == "simulator" ]]; then
         # boss-simulator serves the apps/simulator bundle from this dir
-        # (installed by infra/deploy-simulator-web.sh); BOSS_SIM_BIND +
-        # the jobs/clock URLs fall back to boss_ports defaults.
-        extra_env="Environment=BOSS_SIM_STATIC_DIR=/var/lib/boss-simulator/dist"
+        # — IN the generation, like the gateway's web-dist, so a revert
+        # rolls the cockpit back with the code (deployment-as-network
+        # Q2). infra/deploy-web.sh builds and stages it. It used to
+        # point at a fixed /var/lib path that only a hand-run script
+        # ever wrote, so the playground had no bundle at all and the
+        # service served its "no SPA bundle found" stub.
+        # BOSS_SIM_BIND + the jobs/clock URLs fall back to boss_ports
+        # defaults.
+        extra_env="Environment=BOSS_SIM_STATIC_DIR=$BOSS_GEN_ROOT/current/simulator-dist"
     fi
 
     # Env-driven services don't take a --config flag. `search` and
@@ -1248,16 +1254,17 @@ else
         done
         echo "  seeded bin/ with $seeded binar(ies) from /usr/local/bin (first generation)"
     fi
-    # Q2: web dist + step-plugins live IN the generation, so a revert
-    # rolls the UI back with the code. Carry the currently served
-    # assets forward so the flip never serves an empty SPA;
-    # deploy-web.sh then overwrites them with the freshly built bundle.
-    for asset in web-dist step-plugins; do
-        if [[ "$asset" == "web-dist" ]]; then
-            legacy="/var/lib/boss-web/dist"
-        else
-            legacy="/var/lib/boss/step-plugins"
-        fi
+    # Q2: web dist + simulator dist + step-plugins live IN the
+    # generation, so a revert rolls the UI back with the code. Carry
+    # the currently served assets forward so the flip never serves an
+    # empty SPA; deploy-web.sh then overwrites them with the freshly
+    # built bundles.
+    for asset in web-dist simulator-dist step-plugins; do
+        case "$asset" in
+            web-dist)       legacy="/var/lib/boss-web/dist" ;;
+            simulator-dist) legacy="/var/lib/boss-simulator/dist" ;;
+            *)              legacy="/var/lib/boss/step-plugins" ;;
+        esac
         asset_src=""
         if [[ -d "$GEN_DIR/$asset" ]]; then
             asset_src="$GEN_DIR/$asset"            # restage of this sha

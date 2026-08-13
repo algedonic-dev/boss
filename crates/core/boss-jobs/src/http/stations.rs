@@ -74,9 +74,9 @@ pub(super) async fn list_stations<R: JobsRepository + 'static, B: EventBus + 'st
 }
 
 /// `GET /api/stations/{name}/queue` — the station's evaluated,
-/// ordered queue: derived membership (the predicate over the
-/// caller's policy-scoped open Jobs), data-declared discipline, and
-/// the advisory `over_limit` verdict in the envelope.
+/// ordered queue: derived membership (the predicate, bound to the
+/// caller, over their policy-scoped packets), data-declared
+/// discipline, and the advisory `over_limit` verdict in the envelope.
 pub(super) async fn station_queue<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,
@@ -86,9 +86,19 @@ pub(super) async fn station_queue<R: JobsRepository + 'static, B: EventBus + 'st
         Ok(r) => r,
         Err(r) => return r,
     };
-    let spec = match reg.get_active(&name).await {
+    let row = match reg.get_active(&name).await {
         Ok(s) => s,
         Err(e) => return station_err_response(e),
+    };
+    let today = boss_clock_client::now_from(&state.clock).await.date_naive();
+
+    // Bind the self placeholder ONCE, here, before any packet is
+    // compared — a per-actor station is one registry row whose queue
+    // depends on who is asking. A caller with no identity (guest) gets
+    // the station's own empty queue: the envelope still describes the
+    // station truthfully, it just holds nothing.
+    let Some(spec) = row.bind_self(self_id(&user)) else {
+        return Json(evaluate_station(&row, Vec::new(), today)).into_response();
     };
 
     // One policy path with /api/jobs: scope predicate → JobScope,
@@ -105,14 +115,24 @@ pub(super) async fn station_queue<R: JobsRepository + 'static, B: EventBus + 'st
     };
     let scope = job_scope_from_predicate(&user, &predicate);
 
-    // The evaluation universe: OPEN Jobs (stations hold in-flight
-    // traffic; a predicate naming another status narrows within the
-    // open set and simply matches nothing — closed packets have
-    // departed the network). Kind pushes down into SQL when the
-    // predicate declares one.
+    // The evaluation universe: in-flight packets, because stations
+    // hold in-flight traffic. A station declaring a terminal window
+    // also wants recently-departed packets, so its status filter opens
+    // up and the window narrows it back down in `evaluate_station` —
+    // the pure half, where the rule is testable without a database.
+    //
+    // Kind and the bound `metadata_equals` push down into SQL so the
+    // MAX_LIMIT page is drawn from the packets that can actually be
+    // members. Without the metadata push-down, a per-actor station on
+    // a busy install would page through the newest 1000 packets of the
+    // whole company and find few of the caller's own.
     let filter = JobFilter {
         kind: spec.predicate.kind.clone(),
-        status: Some(JobStatus::Open),
+        status: spec
+            .terminal_window_days
+            .is_none()
+            .then_some(JobStatus::Open),
+        metadata_contains: metadata_containment(&spec.predicate),
         scope,
         ..Default::default()
     };
@@ -133,5 +153,27 @@ pub(super) async fn station_queue<R: JobsRepository + 'static, B: EventBus + 'st
         packets.push((job, steps));
     }
 
-    Json(evaluate_station(&spec, packets)).into_response()
+    Json(evaluate_station(&spec, packets, today)).into_response()
+}
+
+/// The `metadata_equals` clause of an already-BOUND predicate as a
+/// containment document the adapter can push into SQL. `None` when the
+/// predicate declares none.
+///
+/// Only ever built from a bound predicate: pushing an unbound `"@me"`
+/// down would ask the database for packets that literally wrote the
+/// placeholder.
+fn metadata_containment(
+    predicate: &crate::station_queue::StationPredicate,
+) -> Option<serde_json::Value> {
+    if predicate.metadata_equals.is_empty() {
+        return None;
+    }
+    Some(serde_json::Value::Object(
+        predicate
+            .metadata_equals
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect(),
+    ))
 }

@@ -13,15 +13,18 @@
 //!   BEFORE the CAS; a claim without a station keeps today's
 //!   behavior.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use boss_core::job::{Job, JobStatus};
 use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
+use boss_jobs::JobsRepository;
 use boss_jobs::http::{JobsApiState, router};
 use boss_jobs::registry::{StepSpec, WorkflowSpec};
-use boss_jobs::station_queue::{StationPredicate, StepMatch};
+use boss_jobs::station_queue::{DisciplineKey, SELF, StationPredicate, StepMatch};
 use boss_jobs::step_registry::StepRegistry;
 use boss_jobs::{
     InMemoryJobs, InMemoryStations, InMemoryWorkflows, StationCapability, StationKind,
@@ -104,12 +107,33 @@ fn gated_station() -> StationSpec {
     s
 }
 
+/// The filer's watchlist: the platform's one per-actor station row
+/// (118-watchlist-station.sql). One row, every actor — `@me` binds to
+/// whoever is asking — and a terminal window so a packet's outcome is
+/// still there when the filer comes looking for it.
+fn watchlist_station() -> StationSpec {
+    let mut s = StationSpec::draft(
+        "my-watchlist",
+        "My watchlist — packets I filed",
+        StationKind::Actor,
+        StationPredicate {
+            metadata_equals: BTreeMap::from([("submitted_by".into(), SELF.to_string())]),
+            ..Default::default()
+        },
+    );
+    s.status = boss_jobs::registry::WorkflowStatus::Active;
+    s.discipline = vec![DisciplineKey::Recency];
+    s.terminal_window_days = Some(14);
+    s
+}
+
 fn app() -> (axum::Router, Arc<InMemoryJobs>) {
     let kinds = Arc::new(InMemoryWorkflows::new());
     kinds.seed(car_kind()).unwrap();
     let stations = Arc::new(InMemoryStations::new());
     stations.seed(dock_station()).unwrap();
     stations.seed(gated_station()).unwrap();
+    stations.seed(watchlist_station()).unwrap();
     let jobs = Arc::new(InMemoryJobs::new());
     let policy: Arc<dyn PolicyClient> = Arc::new(
         FakePolicyClient::builder()
@@ -118,6 +142,12 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>) {
             .allow("ceo", Action::Update, Resource::step(), Scope::All)
             .allow("head-brewer", Action::Read, Resource::job(), Scope::All)
             .allow("head-brewer", Action::Update, Resource::step(), Scope::All)
+            .allow("reporter", Action::Read, Resource::job(), Scope::All)
+            // A guest that policy would let read everything: the only
+            // thing standing between them and somebody's watchlist is
+            // the placeholder failing to bind, which is what the guest
+            // test below is actually asserting.
+            .allow("guest", Action::Read, Resource::job(), Scope::All)
             .build(),
     );
     let bus = RecordingEventBus::new();
@@ -207,21 +237,33 @@ async fn list_stations_returns_active_rows() {
     let (app, _jobs) = app();
     let (status, v) = get_json(&app, "/api/stations", "emp-ceo", "ceo").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(v["total"], 2);
+    assert_eq!(v["total"], 3);
     let names: Vec<&str> = v["data"]
         .as_array()
         .unwrap()
         .iter()
         .map(|s| s["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, vec!["brewer-gate", "test-dock"], "name-ordered");
-    // The rows carry the queue metadata a lens needs.
-    assert_eq!(v["data"][1]["kind"], "batch");
     assert_eq!(
-        v["data"][1]["discipline"],
+        names,
+        vec!["brewer-gate", "my-watchlist", "test-dock"],
+        "name-ordered"
+    );
+    // The rows carry the queue metadata a lens needs.
+    assert_eq!(v["data"][2]["kind"], "batch");
+    assert_eq!(
+        v["data"][2]["discipline"],
         serde_json::json!(["priority", "age"])
     );
-    assert_eq!(v["data"][1]["wip_limit"], 2);
+    assert_eq!(v["data"][2]["wip_limit"], 2);
+    // The per-actor row is a registry row like any other — the
+    // placeholder is visible in the listing, unbound.
+    assert_eq!(v["data"][1]["kind"], "actor");
+    assert_eq!(v["data"][1]["terminal_window_days"], 14);
+    assert_eq!(
+        v["data"][1]["predicate"]["metadata_equals"]["submitted_by"],
+        "@me"
+    );
 }
 
 #[tokio::test]
@@ -279,6 +321,170 @@ async fn queue_of_unknown_station_is_404_and_denied_caller_sees_empty() {
     let (status, v) = get_json(&app, "/api/stations/test-dock/queue", "emp-x", "intern").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["total"], 0, "policy-scoped universe: None sees nothing");
+}
+
+// ---------------------------------------------------------------------------
+// The filer's watchlist — the per-actor station read
+// ---------------------------------------------------------------------------
+
+/// A filed packet, seeded straight into the repository so the test can
+/// place it at an exact point in its life (open, or closed with an
+/// outcome N days ago) without driving a Workflow to get there.
+fn filed_packet(who: &str, title: &str, opened_days_ago: i64, closed: Option<(i64, &str)>) -> Job {
+    let today = chrono::Utc::now().date_naive();
+    let mut j = Job::new(
+        "user-feedback",
+        boss_core::job::Subject::new("custom", "/ux/jobs"),
+        title,
+        who,
+        boss_core::job::Priority::Standard,
+        today - chrono::Duration::days(opened_days_ago),
+    );
+    j.status = JobStatus::Open;
+    j.metadata = serde_json::json!({ "submitted_by": who, "message": "…" });
+    if let Some((days_ago, outcome)) = closed {
+        // What `close_job_on_terminal` leaves behind.
+        j.status = JobStatus::Closed;
+        j.closed_on = Some(today - chrono::Duration::days(days_ago));
+        j.metadata["outcome"] = serde_json::json!(outcome);
+    }
+    j
+}
+
+async fn get_json_anonymous(app: &axum::Router, path: &str) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .clone()
+        .oneshot(Request::get(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn a_watchlist_holds_my_open_and_recently_closed_packets() {
+    let (app, jobs) = app();
+    let mine_open = filed_packet("emp-r", "Column picker forgets my choice", 9, None);
+    let mine_closed = filed_packet("emp-r", "Dark mode contrast", 20, Some((1, "completed")));
+    let mine_stale = filed_packet("emp-r", "Ancient gripe", 90, Some((30, "declined")));
+    let theirs = filed_packet("emp-other", "Not mine", 1, None);
+    for j in [&mine_open, &mine_closed, &mine_stale, &theirs] {
+        jobs.create_job(j).await.unwrap();
+    }
+
+    let (status, v) = get_json(
+        &app,
+        "/api/stations/my-watchlist/queue",
+        "emp-r",
+        "reporter",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["station"], "my-watchlist");
+    assert_eq!(v["discipline"], serde_json::json!(["recency"]));
+    assert_eq!(
+        v["terminal_window_days"], 14,
+        "the envelope names the window, so a reader can see why a \
+         closed packet is in a queue"
+    );
+    assert_eq!(
+        v["total"], 2,
+        "mine, open and recently closed — not theirs, not the one that aged out"
+    );
+
+    // Newest activity first: the packet that closed yesterday leads the
+    // one opened nine days ago, even though both are standard priority
+    // and the closed one is the older Job.
+    let titles: Vec<&str> = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| j["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["Dark mode contrast", "Column picker forgets my choice"]
+    );
+
+    // The terminal state travels WITH the packet — it is the whole
+    // reason a closed entry is still on the list.
+    assert_eq!(v["data"][0]["status"], "closed");
+    assert_eq!(v["data"][0]["metadata"]["outcome"], "completed");
+}
+
+#[tokio::test]
+async fn one_row_serves_every_actor_and_no_actor_sees_another_s() {
+    let (app, jobs) = app();
+    jobs.create_job(&filed_packet("emp-r", "Mine", 1, None))
+        .await
+        .unwrap();
+    jobs.create_job(&filed_packet("emp-s", "Theirs", 1, None))
+        .await
+        .unwrap();
+
+    for (who, expected) in [("emp-r", "Mine"), ("emp-s", "Theirs")] {
+        let (status, v) = get_json(&app, "/api/stations/my-watchlist/queue", who, "reporter").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["total"], 1, "{who} sees exactly their own filing");
+        assert_eq!(v["data"][0]["title"], expected);
+    }
+}
+
+#[tokio::test]
+async fn a_guest_gets_an_empty_watchlist_not_everyone_s() {
+    let (app, jobs) = app();
+    jobs.create_job(&filed_packet("emp-r", "Mine", 1, None))
+        .await
+        .unwrap();
+    // A packet whose metadata literally holds the placeholder. If the
+    // self clause ever went unbound, this is what would leak.
+    jobs.create_job(&filed_packet("@me", "Literal placeholder", 1, None))
+        .await
+        .unwrap();
+
+    let (status, v) = get_json_anonymous(&app, "/api/stations/my-watchlist/queue").await;
+    assert_eq!(status, StatusCode::OK, "read-only and guest-safe: no 401");
+    assert_eq!(
+        v["station"], "my-watchlist",
+        "the station still describes itself"
+    );
+    assert_eq!(
+        v["total"], 0,
+        "nobody to bind @me to means an EMPTY queue, never a wide one"
+    );
+    assert_eq!(v["data"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn a_station_without_a_window_still_holds_only_in_flight_packets() {
+    // The regression guard on the widened universe: the dock is
+    // unchanged by any of this — closed packets have departed the
+    // network and a routing station has nothing to say about them.
+    let (app, jobs) = app();
+    let id = post_car(&app, "feat/a", "standard", "2026-08-01", false).await;
+    let (status, v) = get_json(&app, "/api/stations/test-dock/queue", "emp-ceo", "ceo").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["total"], 1);
+    assert_eq!(v["terminal_window_days"], serde_json::Value::Null);
+
+    let (all, _) = jobs
+        .list_jobs(&boss_jobs::port::JobFilter::default(), 100, 0)
+        .await
+        .unwrap();
+    let mut job = all
+        .into_iter()
+        .find(|j| j.id.to_string() == id)
+        .expect("job exists");
+    job.status = JobStatus::Closed;
+    job.closed_on = Some(chrono::Utc::now().date_naive());
+    jobs.update_job(&job).await.unwrap();
+
+    let (_, v) = get_json(&app, "/api/stations/test-dock/queue", "emp-ceo", "ceo").await;
+    assert_eq!(v["total"], 0, "the packet left the dock when it closed");
 }
 
 async fn claim(

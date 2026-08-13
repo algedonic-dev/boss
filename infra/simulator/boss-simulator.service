@@ -9,8 +9,11 @@ Type=simple
 Environment=RUST_LOG=info
 # Env-driven. Defaults if unset: BOSS_SIM_BIND=0.0.0.0:7010,
 # BOSS_JOBS_URL / BOSS_CLOCK_URL from boss_ports. The static dir holds
-# the apps/simulator bundle (installed by infra/deploy-simulator-web.sh).
-Environment=BOSS_SIM_STATIC_DIR=/var/lib/boss-simulator/dist
+# the apps/simulator bundle, built + staged by infra/deploy-web.sh —
+# from the live deploy generation (deployment-as-network Q1/Q2; layout
+# in infra/generation.sh), same as the gateway's web-dist, so one
+# `current` symlink flip rolls the cockpit with the binaries.
+Environment=BOSS_SIM_STATIC_DIR=/usr/local/boss/current/simulator-dist
 ExecStart=/usr/local/bin/boss-simulator
 Restart=on-failure
 RestartSec=5

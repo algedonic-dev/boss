@@ -328,6 +328,23 @@ pub(super) fn job_scope_from_predicate(
     }
 }
 
+/// The id a station predicate's [`crate::station_queue::SELF`]
+/// placeholder binds to for this request, or `None` when the caller is
+/// not an identified actor.
+///
+/// `ambient_actor()` is already the platform's answer to "is there
+/// somebody behind this request" — it returns `None` for an anonymous
+/// caller — so the guest case is settled by the existing identity rule
+/// rather than by a second hardcoded sentinel here. The id itself is
+/// `user.id`, because that is what a packet records when it names who
+/// filed it.
+///
+/// Shared by the station queue read and the claim gate: both ask a
+/// per-actor station the same question, so both must bind the same id.
+pub(super) fn self_id(user: &boss_policy_client::User) -> Option<&str> {
+    user.ambient_actor().is_some().then_some(user.id.as_str())
+}
+
 // ---------------------------------------------------------------------------
 // Shared id parsers
 // ---------------------------------------------------------------------------

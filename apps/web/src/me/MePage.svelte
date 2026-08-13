@@ -21,6 +21,11 @@
     type MyDayQueues,
     type AssignmentRow,
   } from './assignments';
+  import {
+    fetchWatchlist,
+    windowNote,
+    type WatchlistState,
+  } from './watchlist';
   import PacketCard from '@boss/web-kit/ui/PacketCard.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
@@ -55,6 +60,28 @@
         queues = q;
         loading = false;
       }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  // The watchlist: packets THIS person filed, and what became of them.
+  // A second station read, deliberately not folded into fetchMyDay —
+  // the two answer different questions (work assigned to me vs. work I
+  // reported) and one failing must not blank the other.
+  //
+  // Keyed on the user id only. The server binds `@me` from the session
+  // itself, so this call carries no identity of its own; the id is here
+  // to refetch when the signed-in person changes.
+  let watchlist = $state<WatchlistState>({ kind: 'loading' });
+
+  $effect(() => {
+    if (!userId) return;
+    let cancelled = false;
+    (async () => {
+      const w = await fetchWatchlist();
+      if (!cancelled) watchlist = w;
     })();
     return () => {
       cancelled = true;
@@ -165,6 +192,49 @@
         {/if}
       </Section>
 
+      <!-- Beneath the two work queues, because it is not work: it is
+           the receipt. Read-only by construction — the packets here
+           belong to whoever is handling them, and the only affordance
+           is the card's own double-click to open the job. -->
+      <Section title="My watchlist" wide>
+        {#if watchlist.kind === 'loading'}
+          <div class="myday-loading">Loading your watchlist…</div>
+        {:else if watchlist.kind === 'unavailable'}
+          <div class="myday-empty">
+            The watchlist station hasn't reached this deployment yet.
+          </div>
+        {:else if watchlist.kind === 'error'}
+          <div class="myday-empty">Couldn't load your watchlist.</div>
+        {:else if watchlist.entries.length === 0}
+          <div class="myday-empty">
+            You haven't filed anything. Feedback you send from the
+            Feedback button appears here, and stays until its outcome
+            has been visible for a while.
+          </div>
+        {:else}
+          {@const note = windowNote(watchlist.windowDays)}
+          {#if note}
+            <div class="watch-window">{note}</div>
+          {/if}
+          <div class="myday-jobs-list">
+            {#each watchlist.entries as entry (entry.card.id)}
+              <div class="watch-row">
+                <PacketCard card={entry.card} />
+                {#if entry.outcome}
+                  <!-- The terminal state IS the information this
+                       section exists for, so it sits beside the card
+                       rather than blending into the card's tag chips
+                       (all --static by design). -->
+                  <span class="watch-outcome watch-{entry.outcome.tone}">
+                    {entry.outcome.label}
+                  </span>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </Section>
+
       <Section title="At a glance">
         <div class="me-stats">
           <div class="me-stat-card">
@@ -213,5 +283,38 @@
     margin-top: 8px;
     font-size: 12px;
     color: var(--text-dim, #78716c);
+  }
+
+  /* Card + outcome side by side, the same shape the claim row uses. */
+  .watch-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+    align-items: center;
+  }
+  .watch-window {
+    font-size: 12px;
+    color: var(--static, #7a838c);
+    margin: 0 0 8px 0;
+  }
+  /* Mono + caps, matching the packet card's own chip treatment; only
+     the color changes, and only to a declared status token. */
+  .watch-outcome {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 10px;
+    letter-spacing: var(--ls-label, 0.1em);
+    text-transform: uppercase;
+    padding: 1px 6px;
+    border: 1px solid currentColor;
+    white-space: nowrap;
+  }
+  .watch-ok {
+    color: var(--ok, #4fb98a);
+  }
+  .watch-warn {
+    color: var(--warn, #d9a441);
+  }
+  .watch-static {
+    color: var(--static, #7a838c);
   }
 </style>

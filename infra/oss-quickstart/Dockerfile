@@ -1,5 +1,5 @@
 # OSS quickstart — single image carrying every BOSS service binary
-# + the built SPA. Ships from `docker compose up` in
+# + both built SPAs. Ships from `docker compose up` in
 # `infra/oss-quickstart/docker-compose.yml`.
 #
 # Multi-stage:
@@ -7,8 +7,9 @@
 #   2. planner     — cargo-chef recipe (the dependency build plan).
 #   3. rust-build  — cook the dep tree (a cacheable layer), then
 #                    compile the workspace in release mode.
-#   4. spa-build   — bun install + bun run build for apps/web.
-#   5. runtime     — debian:slim with the binaries + SPA copied in.
+#   4. spa-build   — bun install + bun run build for BOTH SPAs
+#                    (apps/web and apps/simulator).
+#   5. runtime     — debian:slim with the binaries + SPAs copied in.
 #
 # Image size: ~250 MB (binaries are stripped via `-C strip=symbols`
 # in the workspace Cargo.toml; SPA dist is gzipped by Caddy).
@@ -143,12 +144,13 @@ COPY apps/simulator/package.json ./apps/simulator/package.json
 COPY libs/web-kit/package.json ./libs/web-kit/package.json
 RUN bun install --frozen-lockfile
 
-# Source for the members the SPA build needs — apps/web + its
-# @boss/web-kit workspace dependency.
+# Source for the members the SPA build needs — apps/web, apps/simulator,
+# and the @boss/web-kit workspace dependency they share.
 COPY apps/web ./apps/web
+COPY apps/simulator ./apps/simulator
 COPY libs/web-kit ./libs/web-kit
 
-# `apps/web/src/build.ts` shells out to `boss-ports-list` for the
+# Both `src/build.ts` scripts shell out to `boss-ports-list` for the
 # canonical service-port table (single-source-of-truth shared with
 # the Rust binaries). The binary comes from stage 1; copy it onto
 # PATH so the SPA build resolves it. Bare-metal `quickstart.sh`
@@ -158,6 +160,16 @@ COPY libs/web-kit ./libs/web-kit
 # stage the binary explicitly.
 COPY --from=rust-build /out/boss-ports-list /usr/local/bin/boss-ports-list
 RUN cd apps/web && bun run build
+# The Simulator UX is a SECOND SPA — its own bundle, served by
+# boss-simulator (not the gateway) under /simulator. It was never
+# built here, so every image shipped without it: the service logged
+# "no SPA bundle found — serving stub page" and the visitor got
+# whatever the gateway's fallback handed back instead of the
+# simulator. Build it in the same stage; the runtime stage below
+# copies it to the dir the service reads.
+RUN cd apps/simulator && bun run build && \
+    test -f dist/index.html || \
+    (echo "FATAL: apps/simulator built no dist/index.html" >&2; exit 1)
 
 # ---------------------------------------------------------------------------
 # Stage 5 — runtime.
@@ -199,6 +211,17 @@ COPY --from=rust-build /out/ /usr/local/bin/
 # SPA static files — Caddy serves these directly. A separate Caddy
 # container in compose mounts /opt/boss/spa as a read-only volume.
 COPY --from=spa-build /spa/apps/web/dist /opt/boss/spa
+
+# Simulator UX bundle. Lands on boss-simulator's OWN default static
+# dir rather than under /opt/boss like the web SPA: nothing mounts or
+# re-serves this one, and the default is the only path the service
+# reads when BOSS_SIM_STATIC_DIR is unset — which it is here, since
+# services-launcher.sh execs the binary with the container's
+# environment and compose sets no override. Putting it anywhere else
+# would mean a second copy of the path in docker-compose.yml, free to
+# drift from the binary (CLAUDE.md §9a). Read-only for the service,
+# so root-owned is correct.
+COPY --from=spa-build /spa/apps/simulator/dist /var/lib/boss-simulator/dist
 
 # Brewery seeds + reference data — the `init.sh` first-run path
 # applies these against the freshly-bootstrapped DB.

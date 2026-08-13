@@ -43,6 +43,16 @@ pub struct JobFilter {
     /// prefix of it — the same resolution contract as
     /// `job_edge_resolves`. The clear-on-close handler's query.
     pub waiting_on: Option<String>,
+    /// Jobs whose `metadata` CONTAINS this document — the JSONB
+    /// containment shape (`metadata @> $1`), so a station predicate's
+    /// `metadata_equals` clause narrows in SQL instead of after the
+    /// page is drawn. A per-actor station is the case that needs it: a
+    /// watchlist filtered only in memory would page through the whole
+    /// company's newest packets to find one person's.
+    ///
+    /// Flat string-valued objects only — that is the whole of what
+    /// `metadata_equals` expresses.
+    pub metadata_contains: Option<serde_json::Value>,
     /// Row-level policy scope — translated from `boss_policy_client::Predicate`
     /// by the HTTP handler before calling the adapter. Pushing it down
     /// into SQL here means scoped roles get accurate `total` counts

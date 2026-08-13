@@ -847,7 +847,7 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
             )
                 .into_response();
         };
-        let spec = match reg.get_active(station_name).await {
+        let row = match reg.get_active(station_name).await {
             Ok(s) => s,
             Err(crate::stations::StationError::NotFound(msg)) => {
                 return (StatusCode::NOT_FOUND, msg).into_response();
@@ -856,15 +856,24 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
                 return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
             }
         };
+        // Same binding as the queue read: "is this packet at MY
+        // station" is the question a per-actor station asks, and an
+        // unbindable placeholder means the claimant has no queue here
+        // — so the packet is not at it.
+        let bound = row.bind_self(self_id(&user));
         let Some(job) = &parent_job else {
             return (StatusCode::NOT_FOUND, "job not found").into_response();
         };
-        let steps = if spec.predicate.needs_steps() {
+        let needs_steps = bound.as_ref().is_some_and(|s| s.predicate.needs_steps());
+        let steps = if needs_steps {
             state.jobs.list_steps(&job_id).await.unwrap_or_default()
         } else {
             Vec::new()
         };
-        if !spec.predicate.matches(job, &steps) {
+        if !bound
+            .as_ref()
+            .is_some_and(|s| s.predicate.matches(job, &steps))
+        {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -874,7 +883,7 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
             )
                 .into_response();
         }
-        if let Some(capability) = &spec.capability
+        if let Some(capability) = &row.capability
             && !capability.allows_role(&user.role)
         {
             return (

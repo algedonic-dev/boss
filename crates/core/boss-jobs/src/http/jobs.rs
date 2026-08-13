@@ -241,6 +241,7 @@ pub(super) async fn jobs_live<R: JobsRepository + 'static, B: EventBus + 'static
         owner_id: None,
         subject_id: None,
         waiting_on: None,
+        metadata_contains: None,
         scope: JobScope::All,
     };
     let jobs = match state.jobs.list_jobs(&filter, 12, 0).await {

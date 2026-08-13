@@ -109,6 +109,21 @@ pub struct StationSpec {
     /// `over_limit` when the queue exceeds it.
     #[serde(default)]
     pub wip_limit: Option<i32>,
+    /// How long a *terminal* packet stays in this station's queue,
+    /// counted from `closed_on`. `None` (the default, and every
+    /// holding/routing station) = in-flight packets only, since a
+    /// station that routes traffic has nothing to say about traffic
+    /// that already left.
+    ///
+    /// Declared per station rather than baked into the predicate
+    /// because it is a *retention* rule, not a membership rule: the
+    /// predicate says which packets are this station's, the window
+    /// says how long a departed one lingers on the board. Keeping it
+    /// off the predicate also keeps
+    /// [`StationPredicate::matches`](crate::station_queue::StationPredicate::matches)
+    /// clockless.
+    #[serde(default)]
+    pub terminal_window_days: Option<u32>,
     /// Optional capability gate at the claim CAS.
     #[serde(default)]
     pub capability: Option<StationCapability>,
@@ -136,10 +151,26 @@ impl StationSpec {
             predicate,
             discipline: default_discipline(),
             wip_limit: None,
+            terminal_window_days: None,
             capability: None,
             rollup_parent: None,
             created_at: Utc::now(),
         }
+    }
+
+    /// This row with its predicate bound to `actor` — the row a read
+    /// edge actually evaluates.
+    ///
+    /// `None` means the row declares a per-actor queue
+    /// ([`crate::station_queue::SELF`]) and this caller is not an
+    /// identified actor, so the station has no queue for them. The
+    /// caller renders an empty queue; it must never fall back to the
+    /// unbound row.
+    pub fn bind_self(&self, actor: Option<&str>) -> Option<StationSpec> {
+        Some(StationSpec {
+            predicate: self.predicate.bind_self(actor)?,
+            ..self.clone()
+        })
     }
 }
 
@@ -435,6 +466,7 @@ mod pg {
         predicate: serde_json::Value,
         discipline: serde_json::Value,
         wip_limit: Option<i32>,
+        terminal_window_days: Option<i32>,
         capability: Option<serde_json::Value>,
         rollup_parent: Option<String>,
         created_at: DateTime<Utc>,
@@ -467,6 +499,10 @@ mod pg {
             predicate,
             discipline,
             wip_limit: r.wip_limit,
+            // The column is INT (Postgres has no unsigned); a negative
+            // value would be a nonsense window, so it reads as "no
+            // window" rather than panicking a cast.
+            terminal_window_days: r.terminal_window_days.and_then(|d| u32::try_from(d).ok()),
             capability,
             rollup_parent: r.rollup_parent,
             created_at: r.created_at,
@@ -474,7 +510,8 @@ mod pg {
     }
 
     const SELECT: &str = "SELECT name, version, status, title, kind, predicate, discipline, \
-                          wip_limit, capability, rollup_parent, created_at \
+                          wip_limit, terminal_window_days, capability, rollup_parent, \
+                          created_at \
                           FROM stations";
 
     #[async_trait]
@@ -548,8 +585,9 @@ mod pg {
             sqlx::query(
                 "INSERT INTO stations
                     (name, version, status, title, kind, predicate, discipline,
-                     wip_limit, capability, rollup_parent, created_at)
-                 VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10)",
+                     wip_limit, terminal_window_days, capability, rollup_parent,
+                     created_at)
+                 VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             )
             .bind(&spec.name)
             .bind(spec.version)
@@ -558,6 +596,10 @@ mod pg {
             .bind(serde_json::to_value(&spec.predicate).unwrap_or_default())
             .bind(serde_json::to_value(&spec.discipline).unwrap_or_default())
             .bind(spec.wip_limit)
+            .bind(
+                spec.terminal_window_days
+                    .map(|d| i32::try_from(d).unwrap_or(i32::MAX)),
+            )
             .bind(
                 spec.capability
                     .as_ref()

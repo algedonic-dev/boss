@@ -505,6 +505,10 @@ impl JobsRepository for PgJobs {
                 OR (length(metadata->>'waiting_on') >= 8
                     AND $11 LIKE (metadata->>'waiting_on') || '%')
               )
+              -- $12 is a JSONB containment document (a station
+              -- predicate's bound `metadata_equals`): every key/value
+              -- in it must be present on the packet.
+              AND ($12::jsonb IS NULL OR metadata @> $12::jsonb)
             ORDER BY opened_on DESC
             LIMIT $5 OFFSET $6
         "#;
@@ -521,6 +525,7 @@ impl JobsRepository for PgJobs {
             .bind(scope_accounts.as_deref())
             .bind(filter.subject_id.as_deref())
             .bind(filter.waiting_on.as_deref())
+            .bind(filter.metadata_contains.as_ref())
             .fetch_all(&self.pool)
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -546,6 +551,7 @@ impl JobsRepository for PgJobs {
                 OR (length(metadata->>'waiting_on') >= 8
                     AND $9 LIKE (metadata->>'waiting_on') || '%')
               )
+              AND ($10::jsonb IS NULL OR metadata @> $10::jsonb)
             "#,
         )
         .bind(filter.kind.as_deref())
@@ -557,6 +563,7 @@ impl JobsRepository for PgJobs {
         .bind(scope_accounts.as_deref())
         .bind(filter.subject_id.as_deref())
         .bind(filter.waiting_on.as_deref())
+        .bind(filter.metadata_contains.as_ref())
         .fetch_one(&self.pool)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;

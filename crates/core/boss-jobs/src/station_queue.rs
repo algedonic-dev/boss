@@ -10,12 +10,35 @@
 //! (`http/stations.rs`) supplies the open-Job universe and renders
 //! the [`StationQueue`] envelope.
 
+use std::collections::BTreeMap;
+
 use boss_core::job::{Job, JobStatus, Priority, Step, StepStatus};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Predicate
 // ---------------------------------------------------------------------------
+
+/// The **self placeholder**: what a station row writes where the
+/// *requesting actor's* id belongs.
+///
+/// Station predicates are static registry data, but the taxonomy needs
+/// per-actor queues — "every executor has an actor station"
+/// (stations.md), and a filer's watchlist is one. Without a
+/// placeholder that is one row per person, generated whenever a person
+/// is hired and stale whenever they change. With it, `my-watchlist` is
+/// **one row every actor can query**, and the evaluator binds `@me` to
+/// whoever is asking.
+///
+/// Two rules keep it safe, both enforced by
+/// [`StationPredicate::bind_self`]:
+/// - Binding happens ONCE, at the read edge, before any packet is
+///   compared. `matches` never sees the placeholder.
+/// - An unbindable placeholder (no identified actor — a guest) yields
+///   NO predicate, and the caller must render an empty queue. Failing
+///   to bind can never widen a queue.
+pub const SELF: &str = "@me";
 
 /// The queue-membership predicate over packets: a CONJUNCTION of
 /// optional clauses (an omitted clause always matches). Deliberately
@@ -46,6 +69,17 @@ pub struct StationPredicate {
     /// Metadata keys that must be missing or null.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metadata_absent: Vec<String>,
+    /// Metadata keys whose value must equal exactly this string. Only
+    /// string values compare — the clause exists to match ids, and an
+    /// id is text; a number or object under the key is simply not a
+    /// match.
+    ///
+    /// A value of [`SELF`] is the self placeholder, bound to the
+    /// requesting actor by [`StationPredicate::bind_self`]. `BTreeMap`
+    /// (not `HashMap`) so the row round-trips through JSON in a stable
+    /// key order.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata_equals: BTreeMap<String, String>,
     /// Some step of the Job matches every given field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<StepMatch>,
@@ -97,7 +131,18 @@ impl StepMatch {
 impl StationPredicate {
     /// Whether `job` (with its `steps`) is a member of this station's
     /// queue. Pure; conjunction of every declared clause.
+    ///
+    /// An UNBOUND self predicate has no members. Binding is the read
+    /// edge's job ([`Self::bind_self`]); if it was ever skipped, the
+    /// placeholder must not be compared against packet data — a packet
+    /// whose metadata literally holds `"@me"` would otherwise land in
+    /// everyone's queue at once. Failing closed here means a missed
+    /// bind shows an empty queue, which is visible, instead of another
+    /// actor's packets, which is not.
     pub fn matches(&self, job: &Job, steps: &[Step]) -> bool {
+        if self.binds_self() {
+            return false;
+        }
         if let Some(kind) = &self.kind
             && &job.kind != kind
         {
@@ -121,6 +166,11 @@ impl StationPredicate {
                 return false;
             }
         }
+        for (key, want) in &self.metadata_equals {
+            if job.metadata.get(key).and_then(|v| v.as_str()) != Some(want.as_str()) {
+                return false;
+            }
+        }
         if let Some(step_match) = &self.step
             && !steps.iter().any(|s| step_match.matches(s))
         {
@@ -134,6 +184,50 @@ impl StationPredicate {
     /// step-less predicates.
     pub fn needs_steps(&self) -> bool {
         self.step.is_some()
+    }
+
+    /// Whether any clause names the [`SELF`] placeholder — i.e. this
+    /// is a per-actor station and the queue it serves depends on who
+    /// is asking.
+    pub fn binds_self(&self) -> bool {
+        self.metadata_equals.values().any(|v| v == SELF)
+            || self
+                .step
+                .as_ref()
+                .is_some_and(|s| s.assignee_id.as_deref() == Some(SELF))
+    }
+
+    /// Bind [`SELF`] to `actor`, yielding the concrete predicate to
+    /// evaluate. Pure.
+    ///
+    /// - A predicate with no placeholder binds to itself, actor or not.
+    /// - `None` means **this station has no queue for this caller**:
+    ///   the placeholder is present and there is no identified actor to
+    ///   bind it to. Callers render an empty queue; they must never
+    ///   fall back to the unbound predicate, which would compare the
+    ///   literal `"@me"` against packet data.
+    ///
+    /// Substitution is confined to the two positions where an actor id
+    /// can sensibly appear — a `metadata_equals` value and the step
+    /// clause's `assignee_id`. Everywhere else `@me` is just a string,
+    /// because everywhere else an actor id would be a category error.
+    pub fn bind_self(&self, actor: Option<&str>) -> Option<StationPredicate> {
+        if !self.binds_self() {
+            return Some(self.clone());
+        }
+        let actor = actor.filter(|a| !a.is_empty())?;
+        let mut bound = self.clone();
+        for value in bound.metadata_equals.values_mut() {
+            if value == SELF {
+                *value = actor.to_string();
+            }
+        }
+        if let Some(step) = &mut bound.step
+            && step.assignee_id.as_deref() == Some(SELF)
+        {
+            step.assignee_id = Some(actor.to_string());
+        }
+        Some(bound)
     }
 }
 
@@ -153,6 +247,19 @@ pub enum DisciplineKey {
     Age,
     /// Earliest `due_on` first; undated packets last.
     Due,
+    /// Newest activity first — the reverse of `Age`, and the only key
+    /// that reads a packet's *end* as well as its start: activity is
+    /// `closed_on` when the packet closed, `opened_on` while it is in
+    /// flight.
+    ///
+    /// Why a queue would want this: `priority, then age` answers "what
+    /// should I work on next", which is the question a worker asks of
+    /// a queue they pull from. A watchlist is not pulled from — it is
+    /// *read*, by someone asking "what became of my packets", and the
+    /// answer they came for is whatever moved most recently. Priority
+    /// ordering would bury a packet that just closed under an
+    /// emergency that has sat open for a week.
+    Recency,
 }
 
 /// The ratified default: `priority, then age`.
@@ -172,10 +279,18 @@ fn priority_rank(p: Priority) -> u8 {
     }
 }
 
+/// The date a packet last moved: its close date once it closed, its
+/// open date while it is in flight.
+fn last_activity(job: &Job) -> NaiveDate {
+    job.closed_on.unwrap_or(job.opened_on)
+}
+
 fn compare_by_key(key: DisciplineKey, a: &Job, b: &Job) -> std::cmp::Ordering {
     match key {
         DisciplineKey::Priority => priority_rank(a.priority).cmp(&priority_rank(b.priority)),
         DisciplineKey::Age => a.opened_on.cmp(&b.opened_on),
+        // Descending: newest first.
+        DisciplineKey::Recency => last_activity(b).cmp(&last_activity(a)),
         DisciplineKey::Due => match (a.due_on, b.due_on) {
             (Some(x), Some(y)) => x.cmp(&y),
             (Some(_), None) => std::cmp::Ordering::Less,
@@ -206,6 +321,41 @@ pub fn order_by_discipline(discipline: &[DisciplineKey], jobs: &mut [Job]) {
 }
 
 // ---------------------------------------------------------------------------
+// The terminal window
+// ---------------------------------------------------------------------------
+
+/// Whether a packet is inside the station's evaluation window, before
+/// the predicate gets a say. Pure — the clock arrives as `today`.
+///
+/// Stations hold in-flight traffic, so the default universe is packets
+/// that have not reached a terminal status. But a queue read by the
+/// person who *filed* the packet needs the opposite of vanishing at
+/// closure: the terminal state IS the information they came for. A
+/// station declaring `terminal_window_days` keeps departed packets
+/// visible for that many days after they closed, then lets them age
+/// out.
+///
+/// Three states, not two:
+/// - **Terminal** (`Closed` / `Cancelled`) — a member only inside a
+///   declared window, measured from `closed_on`. A terminal packet
+///   with no close date cannot be placed in the window, so it is out.
+/// - **Draft** — neither in flight nor terminal. An unadmitted packet
+///   has not entered the network, so it is never a queue member.
+/// - Everything else is in flight, and the predicate decides.
+pub fn in_window(job: &Job, today: NaiveDate, terminal_window_days: Option<u32>) -> bool {
+    match job.status {
+        JobStatus::Draft => false,
+        JobStatus::Closed | JobStatus::Cancelled => {
+            let (Some(days), Some(closed_on)) = (terminal_window_days, job.closed_on) else {
+                return false;
+            };
+            (today - closed_on).num_days() <= i64::from(days)
+        }
+        _ => true,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Envelope
 // ---------------------------------------------------------------------------
 
@@ -222,22 +372,36 @@ pub struct StationQueue {
     /// `wip_limit`. Never enforced here — lenses warn, telemetry
     /// reads it.
     pub over_limit: bool,
+    /// Echoed for the same reason `discipline` is: a reader who finds
+    /// a closed packet in a queue should be able to see, from the
+    /// envelope, that the station declared it would hold departed
+    /// packets this long.
+    pub terminal_window_days: Option<u32>,
     pub total: usize,
     pub data: Vec<Job>,
 }
 
-/// Evaluate a station over a packet universe: filter by the
-/// predicate, order by the discipline, wrap in the envelope. Pure.
+/// Evaluate a station over a packet universe: keep what is inside the
+/// window, filter by the predicate, order by the discipline, wrap in
+/// the envelope. Pure — the clock arrives as `today`.
 ///
 /// `packets` is `(job, steps)`; pass an empty step slice when the
 /// predicate doesn't need steps ([`StationPredicate::needs_steps`]).
+///
+/// `spec.predicate` must already be BOUND
+/// ([`StationPredicate::bind_self`]): this function has no notion of
+/// who is asking, and a station whose placeholder could not bind has
+/// an empty universe, not an unbound predicate.
 pub fn evaluate_station(
     spec: &crate::stations::StationSpec,
     packets: Vec<(Job, Vec<Step>)>,
+    today: NaiveDate,
 ) -> StationQueue {
     let mut members: Vec<Job> = packets
         .into_iter()
-        .filter(|(job, steps)| spec.predicate.matches(job, steps))
+        .filter(|(job, steps)| {
+            in_window(job, today, spec.terminal_window_days) && spec.predicate.matches(job, steps)
+        })
         .map(|(job, _)| job)
         .collect();
     order_by_discipline(&spec.discipline, &mut members);
@@ -254,6 +418,7 @@ pub fn evaluate_station(
         over_limit: spec
             .wip_limit
             .is_some_and(|limit| members.len() as i64 > i64::from(limit)),
+        terminal_window_days: spec.terminal_window_days,
         total: members.len(),
         data: members,
     }
@@ -284,6 +449,20 @@ mod tests {
             day(opened),
         );
         j.status = JobStatus::Open;
+        j
+    }
+
+    /// A packet that reached a terminal step: closed on `day(on)` with
+    /// `metadata.outcome` stamped, exactly as `close_job_on_terminal`
+    /// leaves it.
+    fn closed(mut j: Job, on: u32, outcome: &str) -> Job {
+        j.status = JobStatus::Closed;
+        j.closed_on = Some(day(on));
+        if let serde_json::Value::Object(map) = &mut j.metadata {
+            map.insert("outcome".into(), serde_json::json!(outcome));
+        } else {
+            j.metadata = serde_json::json!({ "outcome": outcome });
+        }
         j
     }
 
@@ -515,7 +694,7 @@ mod tests {
             (job("pr-train", Priority::Emergency, 1), vec![]),
             (job("ship-a-change", Priority::Urgent, 5), vec![]),
         ];
-        let q = evaluate_station(&spec, packets);
+        let q = evaluate_station(&spec, packets, day(20));
         assert_eq!(q.station, "loading-dock");
         assert_eq!(q.total, 2, "the pr-train packet is not a member");
         assert_eq!(q.data[0].priority, Priority::Urgent);
@@ -530,14 +709,271 @@ mod tests {
             (job("ship-a-change", Priority::Standard, 1), vec![]),
             (job("ship-a-change", Priority::Standard, 2), vec![]),
         ];
-        let q = evaluate_station(&spec, packets);
+        let q = evaluate_station(&spec, packets, day(20));
         assert_eq!(q.total, 2, "advisory: nothing is dropped");
         assert!(q.over_limit);
 
         let under = evaluate_station(
             &dock_spec(Some(5)),
             vec![(job("ship-a-change", Priority::Standard, 1), vec![])],
+            day(20),
         );
         assert!(!under.over_limit);
+    }
+
+    // ------------------------------------------------------------
+    // metadata_equals + the self placeholder
+    // ------------------------------------------------------------
+
+    fn filed_by(who: &str) -> Job {
+        job("user-feedback", Priority::Standard, 1)
+            .with_metadata(serde_json::json!({ "submitted_by": who }))
+    }
+
+    fn watchlist_predicate() -> StationPredicate {
+        StationPredicate {
+            metadata_equals: BTreeMap::from([("submitted_by".into(), SELF.to_string())]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn metadata_equals_compares_string_values() {
+        let p = StationPredicate {
+            metadata_equals: BTreeMap::from([("submitted_by".into(), "emp-7".to_string())]),
+            ..Default::default()
+        };
+        assert!(p.matches(&filed_by("emp-7"), &[]));
+        assert!(!p.matches(&filed_by("emp-9"), &[]));
+        // Key missing entirely.
+        assert!(!p.matches(&job("user-feedback", Priority::Standard, 1), &[]));
+        // A non-string value never equals a declared string — the
+        // clause compares ids, and an id is text.
+        let numeric = job("user-feedback", Priority::Standard, 1)
+            .with_metadata(serde_json::json!({ "submitted_by": 7 }));
+        assert!(!p.matches(&numeric, &[]));
+    }
+
+    #[test]
+    fn a_static_predicate_binds_to_itself() {
+        let p = StationPredicate {
+            kind: Some("ship-a-change".into()),
+            ..Default::default()
+        };
+        assert!(!p.binds_self());
+        // No placeholder: binding is the identity, with or without an
+        // actor. A station that names nobody serves everybody.
+        assert_eq!(p.bind_self(Some("emp-7")).as_ref(), Some(&p));
+        assert_eq!(p.bind_self(None).as_ref(), Some(&p));
+    }
+
+    #[test]
+    fn the_self_placeholder_binds_to_the_requesting_actor() {
+        let p = watchlist_predicate();
+        assert!(p.binds_self());
+        let bound = p.bind_self(Some("emp-7")).expect("an actor binds");
+        assert!(!bound.binds_self(), "the placeholder is gone once bound");
+        assert!(bound.matches(&filed_by("emp-7"), &[]));
+        assert!(!bound.matches(&filed_by("emp-9"), &[]));
+    }
+
+    #[test]
+    fn an_unbound_self_predicate_matches_nothing() {
+        // The guest case. Failing to bind must never widen the queue:
+        // an unbindable self predicate has NO members, and the literal
+        // "@me" must never be compared against packet data.
+        assert_eq!(watchlist_predicate().bind_self(None), None);
+        assert!(
+            !watchlist_predicate().matches(
+                &job("user-feedback", Priority::Standard, 1)
+                    .with_metadata(serde_json::json!({ "submitted_by": SELF })),
+                &[]
+            ),
+            "an UNBOUND predicate is never evaluated by the handler; if it \
+             ever is, it must not match a packet that literally wrote @me"
+        );
+        // An empty actor id is not an identity either.
+        assert_eq!(watchlist_predicate().bind_self(Some("")), None);
+    }
+
+    #[test]
+    fn the_self_placeholder_binds_the_step_assignee_position() {
+        // The other place an actor id belongs: the actor station every
+        // executor has (stations.md taxonomy) is one row, not one per
+        // person.
+        let p = StationPredicate {
+            step: Some(StepMatch {
+                assignee_id: Some(SELF.into()),
+                status_in: vec![StepStatus::Ready, StepStatus::Active],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(p.binds_self());
+        let bound = p.bind_self(Some("emp-7")).expect("an actor binds");
+        let mut mine = step("work", StepStatus::Active);
+        mine.assignee_id = Some("emp-7".into());
+        assert!(bound.matches(&job("k", Priority::Standard, 1), &[mine]));
+        let mut theirs = step("work", StepStatus::Active);
+        theirs.assignee_id = Some("emp-9".into());
+        assert!(!bound.matches(&job("k", Priority::Standard, 1), &[theirs]));
+    }
+
+    #[test]
+    fn metadata_equals_round_trips_on_the_wire() {
+        let json = serde_json::json!({"metadata_equals": {"submitted_by": "@me"}});
+        let p: StationPredicate = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(p, watchlist_predicate());
+        assert_eq!(serde_json::to_value(&p).unwrap(), json);
+    }
+
+    // ------------------------------------------------------------
+    // Recency discipline
+    // ------------------------------------------------------------
+
+    #[test]
+    fn recency_orders_newest_activity_first() {
+        // Activity is the close date when the packet closed, the open
+        // date while it is in flight — so a packet that just reached a
+        // terminal state sorts above one opened yesterday.
+        let old_open = job("k", Priority::Emergency, 2);
+        let new_open = job("k", Priority::Scheduled, 9);
+        let closed_yesterday = closed(job("k", Priority::Emergency, 1), 14, "completed");
+        let mut jobs = vec![old_open.clone(), new_open.clone(), closed_yesterday.clone()];
+        order_by_discipline(&[DisciplineKey::Recency], &mut jobs);
+        assert_eq!(
+            jobs.iter().map(|j| j.id).collect::<Vec<_>>(),
+            vec![closed_yesterday.id, new_open.id, old_open.id],
+            "priority is irrelevant here: newest activity leads"
+        );
+    }
+
+    // ------------------------------------------------------------
+    // The terminal window
+    // ------------------------------------------------------------
+
+    #[test]
+    fn without_a_window_only_in_flight_packets_are_members() {
+        let open = job("k", Priority::Standard, 1);
+        assert!(in_window(&open, day(20), None));
+        assert!(!in_window(
+            &closed(open.clone(), 20, "completed"),
+            day(20),
+            None
+        ));
+        let mut cancelled = open.clone();
+        cancelled.status = JobStatus::Cancelled;
+        cancelled.closed_on = Some(day(20));
+        assert!(!in_window(&cancelled, day(20), None));
+    }
+
+    #[test]
+    fn a_window_admits_recent_terminals_and_ages_them_out() {
+        let base = job("k", Priority::Standard, 1);
+        let window = Some(14);
+        // Closed today, and on the last day of the window: in.
+        assert!(in_window(
+            &closed(base.clone(), 20, "completed"),
+            day(20),
+            window
+        ));
+        assert!(in_window(
+            &closed(base.clone(), 6, "completed"),
+            day(20),
+            window
+        ));
+        // One day past the window: out. The entry does not vanish at
+        // closure, it ages out.
+        assert!(!in_window(
+            &closed(base.clone(), 5, "completed"),
+            day(20),
+            window
+        ));
+        // Cancelled is terminal too, and rides the same window.
+        let mut cancelled = closed(base.clone(), 19, "completed");
+        cancelled.status = JobStatus::Cancelled;
+        assert!(in_window(&cancelled, day(20), window));
+        // A terminal packet with no close date cannot be placed in the
+        // window, so it is out — never in on a guess.
+        let mut undated = closed(base.clone(), 19, "completed");
+        undated.closed_on = None;
+        assert!(!in_window(&undated, day(20), window));
+    }
+
+    #[test]
+    fn a_draft_packet_is_never_a_member() {
+        // Draft is neither in flight nor terminal: an unadmitted packet
+        // has not entered the network.
+        let mut draft = job("k", Priority::Standard, 1);
+        draft.status = JobStatus::Draft;
+        assert!(!in_window(&draft, day(20), None));
+        assert!(!in_window(&draft, day(20), Some(365)));
+    }
+
+    #[test]
+    fn a_watchlist_evaluates_open_and_recent_terminal_packets_together() {
+        let mut spec = StationSpec::draft(
+            "my-watchlist",
+            "Packets I filed",
+            StationKind::Actor,
+            watchlist_predicate(),
+        );
+        spec.discipline = vec![DisciplineKey::Recency];
+        spec.terminal_window_days = Some(14);
+        let spec = spec.bind_self(Some("emp-7")).expect("an actor binds");
+
+        let open_mine = filed_by("emp-7");
+        let closed_mine = closed(filed_by("emp-7"), 18, "duplicate");
+        let stale_mine = closed(filed_by("emp-7"), 2, "declined");
+        let closed_theirs = closed(filed_by("emp-9"), 18, "completed");
+        let q = evaluate_station(
+            &spec,
+            vec![
+                (open_mine.clone(), vec![]),
+                (closed_mine.clone(), vec![]),
+                (stale_mine, vec![]),
+                (closed_theirs, vec![]),
+            ],
+            day(20),
+        );
+
+        assert_eq!(q.total, 2, "mine, minus the one that aged out");
+        assert_eq!(
+            q.data.iter().map(|j| j.id).collect::<Vec<_>>(),
+            vec![closed_mine.id, open_mine.id],
+            "newest activity first: the packet that just closed leads"
+        );
+        assert_eq!(
+            q.terminal_window_days,
+            Some(14),
+            "the envelope names the window, like it names the discipline"
+        );
+        assert_eq!(q.data[0].metadata["outcome"], "duplicate");
+    }
+
+    #[test]
+    fn an_actor_only_ever_sees_their_own_filings() {
+        // The property that makes one station row safe for everybody:
+        // two actors, one spec, disjoint queues.
+        let mut spec = StationSpec::draft(
+            "my-watchlist",
+            "Packets I filed",
+            StationKind::Actor,
+            watchlist_predicate(),
+        );
+        spec.terminal_window_days = Some(14);
+        let packets = vec![
+            (filed_by("emp-7"), vec![]),
+            (filed_by("emp-9"), vec![]),
+            (closed(filed_by("emp-9"), 19, "completed"), vec![]),
+        ];
+        let seven = evaluate_station(
+            &spec.bind_self(Some("emp-7")).unwrap(),
+            packets.clone(),
+            day(20),
+        );
+        let nine = evaluate_station(&spec.bind_self(Some("emp-9")).unwrap(), packets, day(20));
+        assert_eq!(seven.total, 1);
+        assert_eq!(nine.total, 2);
     }
 }

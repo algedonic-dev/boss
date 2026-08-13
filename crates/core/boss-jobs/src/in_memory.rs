@@ -92,6 +92,15 @@ fn matches_filter(job: &Job, filter: &JobFilter) -> bool {
             return false;
         }
     }
+    if let Some(serde_json::Value::Object(wanted)) = &filter.metadata_contains {
+        // The in-memory stand-in for Postgres `metadata @> $1` over the
+        // flat string-valued documents this filter accepts.
+        for (key, value) in wanted {
+            if job.metadata.get(key) != Some(value) {
+                return false;
+            }
+        }
+    }
     match &filter.scope {
         JobScope::All => {}
         JobScope::None => return false,
