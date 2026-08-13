@@ -3,7 +3,7 @@
   "version": "0.8.0",
   "private": true,
   "type": "module",
-  "description": "Svelte 5 frontend for BOSS. Shipped 2026-04-23 via the 4-phase Svelte migration (see ADRs 0078-0084 + docs/design/svelte-migration.md).",
+  "description": "Svelte 5 frontend for BOSS. Shipped 2026-04-23 via the 4-phase Svelte migration (see ADRs 0078-0084).",
   "scripts": {
     "dev": "bun --hot src/dev-server.ts",
     "build": "bun run src/build.ts",

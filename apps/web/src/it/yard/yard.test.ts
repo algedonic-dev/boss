@@ -14,6 +14,7 @@ import {
   isSim,
   protocolHue,
   wipAdvisory,
+  dockUpstream,
   NO_MEDIANS,
   PROTOCOL_PALETTE,
   type JobLite,
@@ -172,6 +173,7 @@ describe('the dock from the station envelope', () => {
       wipLimit: 5,
       overLimit: true,
       total: 7,
+      upstream: null,
     });
   });
 
@@ -207,6 +209,74 @@ describe('the station header idiom', () => {
     expect(wipAdvisory(limitless.dockStation)).toBeNull();
     // The derived dock has no station facts to advertise.
     expect(wipAdvisory({ source: 'derived' })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The walk upstream (David, feedback 3ccb79f5): when a queue is not
+// filling as expected, the diagnosis is upstream. The station row
+// declares where that is; the lens renders a button for whatever the
+// row says and nothing at all when it says nothing.
+// ---------------------------------------------------------------------------
+
+describe('the upstream button', () => {
+  test('a declared upstream becomes a button labelled for the walk', () => {
+    const y = assembleYard(
+      [],
+      [],
+      envelope({ upstream: { label: 'FEEDBACK', href: '/system/feedback' } }),
+    );
+    const b = dockUpstream(y.dockStation);
+    expect(b).not.toBeNull();
+    expect(b!.label).toBe('↑ UPSTREAM: FEEDBACK');
+    expect(b!.href).toBe('/system/feedback');
+    // The tooltip says what the button does, not what it is.
+    expect(b!.title).toContain('feeds this station');
+  });
+
+  test('the label is the registry vocabulary, upper-cased — a station published tomorrow needs no code', () => {
+    const y = assembleYard(
+      [],
+      [],
+      envelope({ upstream: { label: 'design docs', href: '/system/design' } }),
+    );
+    expect(dockUpstream(y.dockStation)?.label).toBe('↑ UPSTREAM: DESIGN DOCS');
+  });
+
+  test('a station declaring no upstream renders nothing', () => {
+    expect(dockUpstream(assembleYard([], [], envelope()).dockStation)).toBeNull();
+  });
+
+  test('the derived dock has no station row, so no upstream', () => {
+    expect(dockUpstream({ source: 'derived' })).toBeNull();
+  });
+
+  test('a half-declared pointer is not a button — a dead link is worse than none', () => {
+    const noHref = assembleYard([], [], envelope({ upstream: { label: 'FEEDBACK', href: '' } }));
+    expect(dockUpstream(noHref.dockStation)).toBeNull();
+    const noLabel = assembleYard(
+      [],
+      [],
+      envelope({ upstream: { label: '', href: '/system/feedback' } }),
+    );
+    expect(dockUpstream(noLabel.dockStation)).toBeNull();
+  });
+
+  test('an older cluster whose envelope predates the field is simply upstream-less', () => {
+    // The key is absent, not null — the shape a station registry
+    // deployed before 119-station-upstream.sql serves.
+    const legacy = { ...envelope() } as Record<string, unknown>;
+    delete legacy.upstream;
+    const y = assembleYard([], [], legacy as unknown as StationQueueEnvelope);
+    expect(y.dockStation).toEqual({
+      source: 'station',
+      discipline: ['priority', 'age'],
+      wipLimit: null,
+      overLimit: false,
+      total: 0,
+      upstream: null,
+    });
+    expect(dockUpstream(y.dockStation)).toBeNull();
   });
 });
 

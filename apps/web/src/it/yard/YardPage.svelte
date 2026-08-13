@@ -7,6 +7,7 @@
   import { onMount } from 'svelte';
   import {
     disciplineLabel,
+    dockUpstream,
     fetchYard,
     wipAdvisory,
     type Eta,
@@ -21,6 +22,12 @@
 
   let yard = $state<YardState | null>(null);
   let loading = $state(true);
+
+  // The dock's walk upstream, when its registry row declares one.
+  // Nothing station-specific lives here: the row says where upstream
+  // is, so a station that names a different queue tomorrow moves this
+  // button with it, and one that names none renders nothing.
+  const upstream = $derived(yard ? dockUpstream(yard.dockStation) : null);
 
   onMount(() => {
     let cancelled = false;
@@ -138,8 +145,21 @@
          registry served, the header carries the station's own facts —
          the ordering discipline (Q2: never wonder why the queue is in
          this order) and the advisory WIP verdict (Q3: warn, don't
-         enforce). The derived fallback has no facts to show. -->
+         enforce). The derived fallback has no facts to show.
+
+         The walk upstream sits INSIDE this div, anchored left (David,
+         feedback 3ccb79f5) — a queue that isn't filling is diagnosed
+         upstream, and the affordance has to be where the operator is
+         already looking when they notice. It is navigation, not
+         content: the dock gains no row, no count, no state. -->
     <div class="yard-section">
+      {#if upstream}
+        <button
+          type="button"
+          class="yard-upstream"
+          title={upstream.title}
+          onclick={() => navigate(upstream.href)}>{upstream.label}</button>
+      {/if}
       02 — LOADING DOCK <span class="yard-n">{yard.dock.length}</span>
       {#if yard.dockStation.source === 'station'}
         <span class="yard-discipline" title="queue discipline"
@@ -229,6 +249,28 @@
   .yard-discipline { color: var(--static, #7A838C); letter-spacing: var(--ls-nav, 0.14em); }
   .yard-wip { color: var(--warn, #d9a441); border: 1px solid var(--warn, #d9a441);
     padding: 1px 7px; letter-spacing: 0.1em; }
+  /* The walk upstream: the chip grammar exactly (mono caps, hairline,
+     radius 0, --static), because it is an instrument on the header
+     rather than a call to action. It brightens to --signal on hover
+     and focus — the same "this is live" green the arrivals rows use —
+     so it reads as inert until you reach for it. */
+  .yard-upstream {
+    font: inherit;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--static, #7A838C);
+    background: transparent;
+    border: 1px solid var(--hairline, #2A3138);
+    border-radius: 0;
+    padding: 2px 8px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color 120ms ease, border-color 120ms ease;
+  }
+  .yard-upstream:hover, .yard-upstream:focus-visible {
+    color: var(--signal, #5FD4A8); border-color: var(--signal, #5FD4A8);
+  }
+  @media (prefers-reduced-motion: reduce) { .yard-upstream { transition: none; } }
   .yard-board { width: 100%; border-collapse: collapse; background: var(--card, var(--ink, #12161C));
     border: 1px solid var(--hairline, #2A3138); font-size: 14px; }
   .yard-board th { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px;

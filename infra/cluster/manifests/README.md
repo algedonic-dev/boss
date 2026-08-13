@@ -65,6 +65,50 @@ duplicate-cert limits).
 - Talos machine configs, kubeconfig, talosconfig — they embed
   cluster PKI and credentials; they stay in the operator's
   out-of-tree home (`~/talos-homelab/v2/`).
+
+  **But the addresses are not secret, and their absence cost two
+  hours on 2026-08-13.** When the jobs door went dark, nothing in
+  this repo could answer "where is the cluster?" — so the question
+  was answered from `~/talos-homelab/`, which holds TWO generations
+  with nothing marking which is live. The v1 configs (`192.168.1.x`)
+  were read as current, the nodes appeared dead, and a healthy
+  cluster was power-cycled while the actual fault — a crash-looping
+  init container — sat unexamined. The inventory below is the fix:
+  the facts you need at 2am, none of which are credentials.
+
+### Node inventory — the live cluster (v2)
+
+Verified against the running cluster 2026-08-13 (`kubectl get nodes`,
+`talosctl etcd members`), not copied from a config file.
+
+| node | address | role |
+|---|---|---|
+| cp-1 | `10.20.0.11` | control plane, etcd member |
+| cp-2 | `10.20.0.12` | control plane, etcd member |
+| cp-3 | `10.20.0.13` | control plane, etcd member |
+| — | `10.20.0.10` | control-plane VIP (shared, not a machine) |
+
+There are **three** machines, not four or five: `10.20.0.10` is a
+virtual IP. Workloads run on the control-plane nodes; there is no
+separate worker in the cluster today.
+
+Reaching them, with the v2 credentials and an explicit endpoint —
+`talosctl` takes its endpoint from the config context, so a stale
+`talosconfig` will dial the old addresses no matter what `-n` says:
+
+```
+talosctl --talosconfig ~/talos-homelab/v2/talosconfig -e 10.20.0.11 -n 10.20.0.11 version
+KUBECONFIG=~/talos-homelab/v2/kubeconfig kubectl get nodes -o wide
+```
+
+`~/talos-homelab/*.yaml` (no `v2/`) is the **retired v1 generation**
+on `192.168.1.x`. It is not the cluster. If you are reading addresses
+out of `final-cp-*.yaml` at the top level, you are reading the wrong
+cluster — that is exactly the trap that was fallen into.
+
+Talos has no SSH. There is no shell on these machines; `talosctl`
+over gRPC on `:50000` is the only interface, so "can we ssh in" is
+always no, healthy or not.
 - Non-BOSS cluster infrastructure (Kanidm, cert-manager installs,
   Longhorn, Cilium/MetalLB pools, the lego/Origin CA issuers) —
   owned by the cluster, not by BOSS.

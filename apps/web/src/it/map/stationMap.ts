@@ -10,7 +10,13 @@ import {
   protocolHue,
   type PacketCardData,
 } from '@boss/web-kit/ui/packet-card';
-import { isSim, type JobLite } from '../yard/yard';
+import {
+  isSim,
+  upstreamButton,
+  type JobLite,
+  type StationUpstream,
+  type UpstreamButton,
+} from '../yard/yard';
 
 // The registry row as `GET /api/stations` serializes it (StationSpec
 // in boss-jobs). `kind` stays an open string: the chip colors by
@@ -56,6 +62,12 @@ export type StationQueueView = Readonly<{
   overLimit: boolean;
   total: number;
   cards: readonly PacketCardData[];
+  /// The walk upstream, when the registry row declares one. Same
+  /// affordance the yard's dock renders, from the same envelope field
+  /// and the same mapper — a node that reads shallower than expected
+  /// is diagnosed one click upstream, and the map is where an operator
+  /// notices the depth.
+  upstream: UpstreamButton | null;
 }>;
 
 /// The ratified default discipline, phrased the way the doc phrases
@@ -123,6 +135,7 @@ export function queueViewFromBody(body: unknown): StationQueueView | null {
     discipline?: readonly string[];
     wip_limit?: number | null;
     over_limit?: unknown;
+    upstream?: StationUpstream | null;
     total?: unknown;
     data?: unknown;
   };
@@ -135,6 +148,7 @@ export function queueViewFromBody(body: unknown): StationQueueView | null {
     overLimit: e.over_limit === true,
     total: typeof e.total === 'number' ? e.total : jobs.length,
     cards: jobs.map(toQueueCard),
+    upstream: upstreamButton(e.upstream),
   };
 }
 

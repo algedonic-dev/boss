@@ -95,9 +95,19 @@ export type StationQueueEnvelope = Readonly<{
   discipline: readonly string[];
   wip_limit?: number | null;
   over_limit: boolean;
+  /** The station's declared upstream, when the row names one.
+   *  Optional on the wire: a cluster whose registry predates
+   *  119-station-upstream.sql omits the key entirely. */
+  upstream?: StationUpstream | null;
   total: number;
   data: readonly JobLite[];
 }>;
+
+// Where the queue that FEEDS a station is read, exactly as the
+// registry row declares it (`stations.upstream`; StationUpstream in
+// boss-jobs). One object, not two loose strings: a label with no href
+// is a dead button and an href with no label is an unlabelled one.
+export type StationUpstream = Readonly<{ label: string; href: string }>;
 
 // Where the dock's rows came from, plus the station's own facts when
 // the registry served them. `derived` is the fallback for a deployed
@@ -111,6 +121,7 @@ export type DockStation =
       wipLimit: number | null;
       overLimit: boolean;
       total: number;
+      upstream: StationUpstream | null;
     }>
   | Readonly<{ source: 'derived' }>;
 
@@ -128,6 +139,46 @@ export function wipAdvisory(station: DockStation): string | null {
   if (station.source !== 'station') return null;
   if (!station.overLimit || station.wipLimit === null) return null;
   return `WIP ${station.total}/${station.wipLimit}`;
+}
+
+// The walk upstream (David, feedback 3ccb79f5): "navigating to the
+// upstream queues when jobs aren't materializing as expected. That is
+// how our actual operators will diagnose the running system too."
+//
+// A lens that cannot walk upstream forces the operator out of the
+// system to guess. So the button is NAVIGATION, not content: it adds
+// no packet, no count, no state — it points at where this queue's
+// traffic comes from.
+//
+// Everything about it is the station row's business. The lens supplies
+// the "walk upstream" framing (the arrow, the word) and the row
+// supplies the destination, so any station that declares an upstream
+// gets the affordance with zero code here — and one that declares none
+// renders nothing rather than a guess.
+export type UpstreamButton = Readonly<{ label: string; href: string; title: string }>;
+
+/** The button for a declared upstream, or null when there is nothing
+ *  honest to point at. A half-declared pointer (label without href, or
+ *  the reverse) is treated as absent: a dead navigational aid is worse
+ *  than none, because it fails at exactly the moment it is trusted. */
+export function upstreamButton(up: StationUpstream | null | undefined): UpstreamButton | null {
+  if (!up) return null;
+  const label = up.label.trim();
+  const href = up.href.trim();
+  if (label === '' || href === '') return null;
+  const name = label.toUpperCase();
+  return {
+    label: `↑ UPSTREAM: ${name}`,
+    href,
+    title: `Walk upstream to ${name} — the queue that feeds this station`,
+  };
+}
+
+/** The dock's walk upstream. Same shape as `wipAdvisory`: a station
+ *  fact off the envelope, or null for the derived fallback — which has
+ *  no registry row and therefore nothing to say about upstream. */
+export function dockUpstream(station: DockStation): UpstreamButton | null {
+  return station.source === 'station' ? upstreamButton(station.upstream) : null;
 }
 
 export type YardState = Readonly<{
@@ -555,6 +606,7 @@ export function assembleYard(
           wipLimit: dockQueue.wip_limit ?? null,
           overLimit: dockQueue.over_limit,
           total: dockQueue.total,
+          upstream: dockQueue.upstream ?? null,
         }
       : { source: 'derived' },
     arrivals: arrived

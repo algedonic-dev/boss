@@ -71,7 +71,7 @@ pub fn apply_decisions(
     let after_open = lines[open_section.end_line..].to_vec();
 
     // Remove resolved questions from the open section body.
-    let (new_open_body, removed_titles, list_fully_drained) =
+    let (new_open_body, removed_titles, removed_bodies, list_fully_drained) =
         remove_decisions_from_open(&open_body, decisions)?;
 
     // If the list was entirely drained (no numbered items remain),
@@ -91,7 +91,8 @@ pub fn apply_decisions(
     // Rebuild the file with the new Open questions body, but we still
     // need to inject or extend the Decisions section inside
     // `after_open`.
-    let decisions_block = format_decisions_block(decisions, &removed_titles, today);
+    let decisions_block =
+        format_decisions_block(decisions, &removed_titles, &removed_bodies, today);
     let after_open_updated = merge_into_decisions(&after_open, &decisions_block)?;
 
     let mut out_lines = Vec::new();
@@ -161,8 +162,15 @@ fn is_open_question_heading(line: &str) -> bool {
 fn remove_decisions_from_open(
     body: &[String],
     decisions: &[FlushDecision],
-) -> Result<(Vec<String>, std::collections::HashMap<String, String>, bool)> {
+) -> Result<(
+    Vec<String>,
+    std::collections::HashMap<String, String>,
+    std::collections::HashMap<String, Vec<String>>,
+    bool,
+)> {
     let mut titles = std::collections::HashMap::new();
+    let mut bodies: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
 
     // Determine which anchors use the explicit ### Q<n>: format vs
     // the numbered-list fallback.
@@ -204,6 +212,15 @@ fn remove_decisions_from_open(
                     }
                     j += 1;
                 }
+                // Carry the question's body out before deleting it.
+                // Without this the flush destroys what was PROPOSED and
+                // keeps only what was answered, so a resolution reading
+                // "Agreed" becomes unrecoverable — job e9cc393f, found
+                // on event-kind-registry.md Q3/Q4, where the agreement
+                // had to be reconstructed from a shipped schema
+                // comment. The flush moves content; it does not consume
+                // it.
+                bodies.insert(anchor.clone(), body[i + 1..j].to_vec());
                 keep[i..j].fill(false);
                 found = true;
                 break;
@@ -269,7 +286,7 @@ fn remove_decisions_from_open(
         }
     }
 
-    Ok((filtered, titles, fallback_drained))
+    Ok((filtered, titles, bodies, fallback_drained))
 }
 
 /// Rewrite the `**Status**:` preamble line to include "approved"
@@ -599,6 +616,7 @@ fn first_sentence_outside_code(s: &str) -> String {
 fn format_decisions_block(
     decisions: &[FlushDecision],
     titles: &std::collections::HashMap<String, String>,
+    bodies: &std::collections::HashMap<String, Vec<String>>,
     today: NaiveDate,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -613,6 +631,35 @@ fn format_decisions_block(
         out.push(format!("### {}: {} (resolved)", d.anchor, title));
         out.push(String::new());
         out.push(format!("Resolved {} — {}.", today, d.kind.as_str()));
+        // The question as it stood, carried over rather than deleted.
+        // A resolution of "Agreed" is meaningless without the thing
+        // agreed to, and the Open questions section it used to live in
+        // is about to lose it (e9cc393f).
+        if let Some(body) = bodies.get(&d.anchor) {
+            let trimmed: Vec<&String> = body
+                .iter()
+                .skip_while(|l| l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .skip_while(|l| l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if !trimmed.is_empty() {
+                out.push(String::new());
+                out.push("**The question was:**".to_string());
+                out.push(String::new());
+                for l in trimmed {
+                    out.push(if l.trim().is_empty() {
+                        String::from(">")
+                    } else {
+                        format!("> {l}")
+                    });
+                }
+            }
+        }
         out.push(String::new());
         out.push(d.resolution.clone());
         if let Some(rationale) = &d.rationale {
@@ -745,6 +792,63 @@ mod tests {
             .map(|i| after_heading + i)
             .unwrap_or(md.len());
         &md[after_heading..next_h2]
+    }
+
+    #[test]
+    fn the_question_body_survives_a_terse_resolution() {
+        // Regression for e9cc393f. doc-flatten #1 found
+        // event-kind-registry.md Q3/Q4 resolved as bare "Agreed" and
+        // "Sounds good" with the question bodies already deleted, so
+        // what was agreed TO had to be reconstructed from a shipped
+        // schema comment. A flush must MOVE content, not consume it.
+        let md = r#"# Design: Foo
+
+**Status**: in-review.
+
+## Open questions
+
+### Q1: Where does X live?
+
+**Proposal**: a new crate named boss-x, because the alternative
+puts a domain concept in the substrate.
+
+### Q2: Untouched?
+
+Still open.
+
+## Next section
+
+Other content.
+"#;
+        let out = apply_decisions(
+            md,
+            &[FlushDecision {
+                anchor: "Q1".into(),
+                kind: DecisionKind::Accept,
+                resolution: "Agreed".into(),
+                rationale: None,
+            }],
+            NaiveDate::from_ymd_opt(2026, 8, 13).unwrap(),
+        )
+        .unwrap();
+
+        // The terse resolution is preserved...
+        assert!(out.contains("Agreed"), "resolution missing:\n{out}");
+        // ...and so is the proposal it was agreeing to. This is the
+        // assertion the original code could not satisfy.
+        assert!(
+            out.contains("a new crate named boss-x"),
+            "the question body was destroyed by the flush:\n{out}"
+        );
+        assert!(
+            out.contains("**The question was:**"),
+            "carried body is not labelled:\n{out}"
+        );
+        // The untouched question stays in Open questions.
+        assert!(
+            out.contains("### Q2: Untouched?"),
+            "unresolved question lost:\n{out}"
+        );
     }
 
     #[test]

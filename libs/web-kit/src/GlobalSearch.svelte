@@ -1,7 +1,8 @@
 <script lang="ts">
   // Global search — the chrome bar's third element.
   //
-  // Q4 in docs/design/global-search.md: a dropdown that prioritises the
+  // Q4, folded into docs/architecture-decisions.md §Search when the
+  // source doc was flattened away: a dropdown that prioritises the
   // app you are in, with a final link through to the full results
   // surface in Home. Not chrome-or-Home; chrome AND Home, because a
   // preview and a result set are different affordances and forcing one

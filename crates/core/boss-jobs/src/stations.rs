@@ -90,6 +90,30 @@ impl StationCapability {
     }
 }
 
+/// Where the queue that FEEDS this station is read — the operator's
+/// walk upstream when packets are not materializing as expected.
+///
+/// Registry data, never a code path: a station declares its own
+/// upstream and every lens renders the same affordance for whatever
+/// the row says, so a station published tomorrow gets the button with
+/// no frontend change.
+///
+/// One optional object rather than two optional scalars because it is
+/// one fact with two inseparable halves — a label with no href is a
+/// dead button, an href with no label is an unlabelled one. `Option`
+/// admits exactly the two states that mean something: declared, or
+/// not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StationUpstream {
+    /// What to call it, in the caller's own vocabulary — the lens
+    /// supplies the "walk upstream" framing around it, so this is
+    /// `FEEDBACK`, not `↑ UPSTREAM: FEEDBACK`.
+    pub label: String,
+    /// Where it goes. An app route (`/system/feedback`), handed to the
+    /// host's navigation helper.
+    pub href: String,
+}
+
 /// A full station row. Serializes directly to the `stations` columns
 /// with the same names.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -131,6 +155,12 @@ pub struct StationSpec {
     /// control, not a data-model claim.
     #[serde(default)]
     pub rollup_parent: Option<String>,
+    /// Optional pointer to the queue that feeds this one. Purely
+    /// navigational: it says nothing about membership or ordering,
+    /// which are the predicate's and the discipline's business. `None`
+    /// = no button renders.
+    #[serde(default)]
+    pub upstream: Option<StationUpstream>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -163,6 +193,7 @@ impl StationSpec {
             terminal_window_days: None,
             capability: None,
             rollup_parent: None,
+            upstream: None,
             created_at: now,
         }
     }
@@ -478,6 +509,7 @@ mod pg {
         terminal_window_days: Option<i32>,
         capability: Option<serde_json::Value>,
         rollup_parent: Option<String>,
+        upstream: Option<serde_json::Value>,
         created_at: DateTime<Utc>,
     }
 
@@ -499,6 +531,11 @@ mod pg {
             .map(serde_json::from_value)
             .transpose()
             .map_err(|e| StationError::Storage(format!("stations.capability: {e}")))?;
+        let upstream: Option<StationUpstream> = r
+            .upstream
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| StationError::Storage(format!("stations.upstream: {e}")))?;
         Ok(StationSpec {
             name: r.name,
             version: r.version,
@@ -514,13 +551,14 @@ mod pg {
             terminal_window_days: r.terminal_window_days.and_then(|d| u32::try_from(d).ok()),
             capability,
             rollup_parent: r.rollup_parent,
+            upstream,
             created_at: r.created_at,
         })
     }
 
     const SELECT: &str = "SELECT name, version, status, title, kind, predicate, discipline, \
                           wip_limit, terminal_window_days, capability, rollup_parent, \
-                          created_at \
+                          upstream, created_at \
                           FROM stations";
 
     #[async_trait]
@@ -595,8 +633,8 @@ mod pg {
                 "INSERT INTO stations
                     (name, version, status, title, kind, predicate, discipline,
                      wip_limit, terminal_window_days, capability, rollup_parent,
-                     created_at)
-                 VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                     upstream, created_at)
+                 VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             )
             .bind(&spec.name)
             .bind(spec.version)
@@ -615,6 +653,11 @@ mod pg {
                     .map(|c| serde_json::to_value(c).unwrap_or_default()),
             )
             .bind(&spec.rollup_parent)
+            .bind(
+                spec.upstream
+                    .as_ref()
+                    .map(|u| serde_json::to_value(u).unwrap_or_default()),
+            )
             .bind(spec.created_at)
             .execute(&mut *tx)
             .await
@@ -867,6 +910,60 @@ mod tests {
             names,
             vec!["a-station".to_string(), "b-station".to_string()]
         );
+    }
+
+    // -----------------------------------------------------------
+    // Upstream pointer — the navigation affordance as registry data.
+    // -----------------------------------------------------------
+
+    #[test]
+    fn a_station_declares_no_upstream_by_default() {
+        assert_eq!(sample("dock").upstream, None);
+    }
+
+    #[test]
+    fn upstream_round_trips_as_one_optional_object() {
+        let mut spec = sample("loading-dock");
+        spec.upstream = Some(StationUpstream {
+            label: "FEEDBACK".into(),
+            href: "/system/feedback".into(),
+        });
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["upstream"]["label"], "FEEDBACK");
+        assert_eq!(json["upstream"]["href"], "/system/feedback");
+        let back: StationSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(back.upstream, spec.upstream);
+    }
+
+    #[test]
+    fn a_row_written_before_the_column_existed_still_parses() {
+        // `upstream` is absent, not null: every station row stored
+        // before this field shipped must keep reading back.
+        let json = serde_json::json!({
+            "name": "old-station",
+            "version": 1,
+            "status": "active",
+            "title": "Older than the field",
+            "kind": "batch",
+            "predicate": {},
+            "created_at": "2026-08-01T00:00:00Z",
+        });
+        let spec: StationSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.upstream, None);
+    }
+
+    #[test]
+    fn binding_self_carries_the_upstream_through() {
+        // The read edge binds `@me` and then renders the envelope from
+        // the bound row — dropping `upstream` there would make the
+        // button vanish for exactly the per-actor stations.
+        let mut spec = sample("my-watchlist");
+        spec.upstream = Some(StationUpstream {
+            label: "FEEDBACK".into(),
+            href: "/system/feedback".into(),
+        });
+        let bound = spec.bind_self(Some("emp-r")).expect("binds");
+        assert_eq!(bound.upstream, spec.upstream);
     }
 
     #[tokio::test]

@@ -377,6 +377,11 @@ pub struct StationQueue {
     /// envelope, that the station declared it would hold departed
     /// packets this long.
     pub terminal_window_days: Option<u32>,
+    /// The station's declared upstream, echoed for the same reason
+    /// `discipline` is: a lens that already holds the queue can render
+    /// the walk-upstream affordance without a second call to the
+    /// registry. `None` = the row declares none, and no button renders.
+    pub upstream: Option<crate::stations::StationUpstream>,
     pub total: usize,
     pub data: Vec<Job>,
 }
@@ -419,6 +424,7 @@ pub fn evaluate_station(
             .wip_limit
             .is_some_and(|limit| members.len() as i64 > i64::from(limit)),
         terminal_window_days: spec.terminal_window_days,
+        upstream: spec.upstream.clone(),
         total: members.len(),
         data: members,
     }
@@ -720,6 +726,29 @@ mod tests {
             day(20),
         );
         assert!(!under.over_limit);
+    }
+
+    /// The envelope carries the station's upstream pointer for the
+    /// same reason it carries `discipline` and `wip_limit`: any lens
+    /// that already reads the queue can render the walk-upstream
+    /// affordance without a second call to the registry.
+    #[test]
+    fn the_envelope_carries_the_declared_upstream() {
+        let mut spec = dock_spec(None);
+        spec.upstream = Some(crate::stations::StationUpstream {
+            label: "FEEDBACK".into(),
+            href: "/system/feedback".into(),
+        });
+        let q = evaluate_station(&spec, vec![], day(20));
+        let up = q.upstream.expect("declared, so present");
+        assert_eq!(up.label, "FEEDBACK");
+        assert_eq!(up.href, "/system/feedback");
+    }
+
+    #[test]
+    fn a_station_with_no_upstream_says_so_rather_than_guessing() {
+        let q = evaluate_station(&dock_spec(None), vec![], day(20));
+        assert_eq!(q.upstream, None, "no pointer declared, no button");
     }
 
     // ------------------------------------------------------------

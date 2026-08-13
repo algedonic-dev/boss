@@ -10,7 +10,7 @@ import { mountPage } from '../smoke/_helpers';
 
 const DOCS = [
   {
-    path: 'docs/design/inventory-value-conservation.md',
+    path: 'docs/architecture-decisions.md',
     title: 'Inventory value conservation (costing PR 6)',
     status: 'in-review',
     open_questions: 3,
@@ -215,7 +215,7 @@ test.describe('Design review list', () => {
               title: 'Review: Inventory value conservation',
               status: 'open',
               opened_on: '2026-08-01',
-              subject: { id: 'docs/design/inventory-value-conservation.md' },
+              subject: { id: 'docs/architecture-decisions.md' },
               steps: [
                 { id: 'step-other', kind: 'sign-off' },
                 { id: 'step-rd', kind: 'review-design' },
@@ -245,7 +245,7 @@ test.describe('Design review list', () => {
               title: 'Review: Inventory value conservation',
               status: 'open',
               opened_on: '2026-08-01',
-              subject: { id: 'docs/design/inventory-value-conservation.md' },
+              subject: { id: 'docs/architecture-decisions.md' },
               steps: [],
             },
           ],

@@ -15,6 +15,7 @@
   import { onMount } from 'svelte';
   import PacketCard from '@boss/web-kit/ui/PacketCard.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import { navigate } from '@boss/web-kit/nav';
   import {
     fetchStations,
     fetchQueue,
@@ -27,6 +28,9 @@
   let selected = $state<string | null>(null);
   let queue = $state<StationQueueView | null>(null);
   let queueLoading = $state(false);
+
+  // The open queue's walk upstream, when its registry row declares one.
+  const upstream = $derived(queue?.upstream ?? null);
 
   // One poll updates every node's depth (and the open queue panel, so
   // the lens never goes stale while the tiles tick).
@@ -138,7 +142,20 @@
       </div>
 
       {#if selected !== null}
+        <!-- The walk upstream, anchored left in the queue's own
+             section (David, feedback 3ccb79f5): the map is where an
+             operator notices a node reading shallower than expected,
+             so it is where the "then look upstream" step has to be
+             one click away. Registry-driven — any station whose row
+             declares an upstream gets it. -->
         <div class="map-section">
+          {#if upstream}
+            <button
+              type="button"
+              class="map-upstream"
+              title={upstream.title}
+              onclick={() => navigate(upstream.href)}>{upstream.label}</button>
+          {/if}
           02 — QUEUE · {selected}
           {#if queue}
             <span class="map-n">{queue.total}</span>
@@ -217,6 +234,25 @@
     font-family: var(--font-mono, ui-monospace, monospace);
     font-size: 11px; color: var(--static, #7A838C);
   }
+  /* Same chip grammar as the yard's walk-upstream button: mono caps,
+     hairline, radius 0, --static until it is reached for. */
+  .map-upstream {
+    font: inherit;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--static, #7A838C);
+    background: transparent;
+    border: 1px solid var(--hairline, #2A3138);
+    border-radius: 0;
+    padding: 2px 8px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color 120ms ease, border-color 120ms ease;
+  }
+  .map-upstream:hover, .map-upstream:focus-visible {
+    color: var(--signal, #5FD4A8); border-color: var(--signal, #5FD4A8);
+  }
+  @media (prefers-reduced-motion: reduce) { .map-upstream { transition: none; } }
   .map-disc-chip {
     font-family: var(--font-mono, ui-monospace, monospace);
     font-size: 10px; letter-spacing: 0.1em; text-transform: none;

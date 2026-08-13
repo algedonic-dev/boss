@@ -80,6 +80,79 @@ async fn platform_seed_ships_the_sdlc_batch_stations() {
     assert_eq!(review.predicate.kind.as_deref(), Some("design-doc-review"));
 }
 
+/// The seeded upstream pointers survive the round trip through the
+/// `stations.upstream` column, and they point at routes that exist
+/// (119-station-upstream.sql).
+///
+/// A seed whose href is a typo is a dead button, and a dead
+/// navigational aid is worse than none — it sends the operator
+/// somewhere blank at exactly the moment they are diagnosing. The
+/// route strings are pinned here; `apps/web/src/shell/nav-catalog.ts`
+/// is where they resolve.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_seeded_upstream_pointers_round_trip() {
+    let db = TestDb::new().await;
+    let registry = PgStations::new(db.pool.clone());
+
+    // The dock holds parked ship-a-change cars; a car names its
+    // motivating user-feedback packet through the `backlog_item` edge,
+    // and the triage board is where those packets are worked.
+    let dock = registry.get_active("loading-dock").await.expect("dock row");
+    let up = dock.upstream.expect("the dock declares its upstream");
+    assert_eq!(up.label, "FEEDBACK");
+    assert_eq!(up.href, "/system/feedback");
+
+    // The review queue holds design-doc-review Jobs, spawned off
+    // `docs.design.indexed` from the design-doc corpus.
+    let review = registry
+        .get_active("design-review")
+        .await
+        .expect("review row");
+    let up = review.upstream.expect("the review queue declares one");
+    assert_eq!(up.label, "DESIGN DOCS");
+    assert_eq!(up.href, "/system/design");
+
+    // Not every station has an upstream, and one that doesn't must
+    // read back as "none declared" rather than as an empty pointer.
+    let watchlist = registry
+        .get_active("my-watchlist")
+        .await
+        .expect("watchlist row");
+    assert_eq!(watchlist.upstream, None);
+}
+
+/// An authored station carries its upstream through the write path
+/// too — the seed is data, and so is every row an operator publishes
+/// after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_authored_upstream_survives_draft_and_publish() {
+    let db = TestDb::new().await;
+    let registry = PgStations::new(db.pool.clone());
+    let now = chrono::Utc::now();
+
+    let mut authored = spec("night-dock");
+    authored.upstream = Some(boss_jobs::StationUpstream {
+        label: "FEEDBACK".into(),
+        href: "/system/feedback".into(),
+    });
+    registry
+        .create_draft(authored, &author(), now)
+        .await
+        .expect("draft");
+    let published = registry
+        .publish("night-dock", &author(), now)
+        .await
+        .expect("publish");
+
+    let expected = boss_jobs::StationUpstream {
+        label: "FEEDBACK".into(),
+        href: "/system/feedback".into(),
+    };
+    assert_eq!(published.upstream.as_ref(), Some(&expected));
+    let read_back = registry.get_active("night-dock").await.expect("active");
+    assert_eq!(read_back.upstream.as_ref(), Some(&expected));
+}
+
 /// The seeded watchlist row survives the round trip through the
 /// `stations` columns AND evaluates — the seed is only as good as the
 /// Rust shape's ability to read it back, and this row is the first to

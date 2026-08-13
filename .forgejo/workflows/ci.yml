@@ -89,7 +89,16 @@ jobs:
       # every DB-backed test dies on "Connection refused".
       BOSS_TEST_POSTGRES_ADMIN_URL: postgres://boss:boss@postgres:5432/postgres
     steps:
+      # fetch-depth: 0 because the gate's migrations-append-only check
+      # asks git whether this branch modified a migration that already
+      # exists on the trunk. checkout@v4 defaults to a depth-1 clone,
+      # where there is no trunk to compare against — and that check
+      # refuses to run rather than pass silently, so a shallow clone
+      # would red every train instead of quietly under-covering. The
+      # extra history is cheap; the repo's .git is ~20M.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Apply schema
         run: infra/postgres/migrate.sh -- psql "$DATABASE_URL"

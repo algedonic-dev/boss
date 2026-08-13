@@ -7,8 +7,8 @@
 #   sudo ./infra/postgres/bootstrap-scratch.sh        # drops + recreates
 #   sudo ./infra/postgres/bootstrap-scratch.sh --init # no-op if exists
 #
-# See docs/design/simulator-ui.md for the scratch-DB isolation
-# decision.
+# The scratch-DB isolation decision has no design doc. The reference
+# that stood here named a simulator-UI doc that was never written.
 
 set -euo pipefail
 

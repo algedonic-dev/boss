@@ -160,4 +160,22 @@ describe('queueViewFromBody', () => {
     expect(queueViewFromBody(null)).toBeNull();
     expect(queueViewFromBody({ nope: true })).toBeNull();
   });
+
+  // The walk upstream reaches every station lens, not just the yard's
+  // dock: the map's queue panel is where an operator lands when a node
+  // reads shallower than expected.
+  test('a declared upstream rides the envelope into the queue view', () => {
+    const v = queueViewFromBody({
+      ...envelope,
+      upstream: { label: 'FEEDBACK', href: '/system/feedback' },
+    });
+    expect(v!.upstream).toEqual({
+      label: '↑ UPSTREAM: FEEDBACK',
+      href: '/system/feedback',
+      title: 'Walk upstream to FEEDBACK — the queue that feeds this station',
+    });
+  });
+  test('a station with no declared upstream gets no button', () => {
+    expect(queueViewFromBody(envelope)!.upstream).toBeNull();
+  });
 });

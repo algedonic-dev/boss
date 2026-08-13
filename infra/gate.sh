@@ -76,6 +76,7 @@ check "outbox-migration-ratchet" infra/lint/outbox-migration-ratchet.sh
 check "idempotence-ratchet"      infra/lint/idempotence-ratchet.sh
 check "dispatcher-rules-ratchet" infra/lint/dispatcher-rules-ratchet.sh
 check "schema-converge"          infra/lint/schema-converge.sh
+check "migrations-append-only"   infra/lint/migrations-append-only.sh
 check "no-secrets"               infra/lint/no-secrets.sh
 check "invariant-register"       infra/lint/invariant-register.sh
 
