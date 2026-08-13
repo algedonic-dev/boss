@@ -7,7 +7,7 @@
 // unassigned). Rows where someone else is mid-flight on a
 // role-matched step are visible context, not claimable work.
 
-import type { PacketCardData } from '@boss/web-kit/ui/packet-card';
+import { isSim, type PacketCardData } from '@boss/web-kit/ui/packet-card';
 
 export type AssignmentStep = Readonly<{
   id: string;
@@ -28,6 +28,13 @@ export type AssignmentRow = Readonly<{
   subject_kind: string;
   subject_id: string;
   priority: string;
+  /** The Job's admission-fixed sim-vs-real flag, and its tags — the
+   *  packet facts the card needs, carried on the row so this lens
+   *  needs no second fetch. Optional so a response from a server that
+   *  predates them still parses (they then read as a real packet, the
+   *  same default the Job's own `serde(default)` takes). */
+  simulated?: boolean;
+  tags?: readonly string[];
   step: AssignmentStep;
 }>;
 
@@ -93,9 +100,11 @@ export async function fetchMyDay(
 // lens maps its rows into the card's shape: the workflow is the
 // protocol, the job title leads, and the actionable step rides the
 // mono provenance line. Priority, due date, and a blocked marker
-// travel as tag chips. The assignments endpoint carries no job tags
-// or metadata, so `sim` cannot be read here and stays false — a fact
-// this lens does not have, never an inference.
+// travel as tag chips. Sim comes off the row's own packet facts
+// through the shared predicate, so a simulated packet is as visibly
+// simulated in a personal queue as it is in the yard. The job's tags
+// feed that predicate but stay off the chips: in this lens the chips
+// are queue state (blocked / priority / due), not packet labels.
 export function assignmentPacket(row: AssignmentRow): PacketCardData {
   const actionable = row.step.status === 'ready' || row.step.status === 'active';
   return {
@@ -108,7 +117,7 @@ export function assignmentPacket(row: AssignmentRow): PacketCardData {
       ...(row.priority !== 'standard' ? [row.priority] : []),
       ...(row.due_on ? [`due ${row.due_on}`] : []),
     ],
-    sim: false,
+    sim: isSim({ simulated: row.simulated, tags: row.tags }),
     skipReason: null,
   };
 }

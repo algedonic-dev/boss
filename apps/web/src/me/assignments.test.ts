@@ -85,4 +85,13 @@ describe('assignmentPacket', () => {
     expect(p.tags).toEqual(['blocked']);
     expect(assignmentPacket(row({ step: { status: 'active' } })).tags).toEqual([]);
   });
+
+  test('a simulated packet is marked SIM in the personal queue too', () => {
+    expect(assignmentPacket(row({ simulated: true })).sim).toBe(true);
+    // Pre-column packets carry the tag instead — the same fallback the
+    // yard uses, so one packet cannot read sim in one lens and real in
+    // the other.
+    expect(assignmentPacket(row({ tags: ['sim'] })).sim).toBe(true);
+    expect(assignmentPacket(row({ simulated: false, tags: ['hotfix'] })).sim).toBe(false);
+  });
 });

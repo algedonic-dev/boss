@@ -111,6 +111,16 @@ pub struct AssignmentRow {
     pub subject_kind: String,
     pub subject_id: String,
     pub priority: Priority,
+    /// The Job's admission-fixed sim-vs-real flag, and its tags. A
+    /// projection, not the Job — but a queue lens renders a packet
+    /// card from the row alone, and a simulated packet has to look
+    /// simulated in a personal queue exactly as it does in the yard.
+    /// `tags` rides along for the same reason: the shared card
+    /// predicate falls back to a `sim` / `simulated` / `synthetic` tag
+    /// for packets that predate the column (there was no backfill), so
+    /// without it the two lenses would disagree on the same packet.
+    pub simulated: bool,
+    pub tags: Vec<String>,
     pub step: Step,
 }
 
@@ -296,6 +306,8 @@ pub trait JobsRepository: Send + Sync {
                             .to_string(),
                         subject_id: boss_core::primitives::Subject::id(&job.subject).to_string(),
                         priority: job.priority,
+                        simulated: job.simulated,
+                        tags: job.tags.clone(),
                         step,
                     });
                     if out.len() >= limit as usize {
@@ -347,6 +359,8 @@ pub trait JobsRepository: Send + Sync {
                     subject_kind: boss_core::primitives::Subject::kind(&job.subject).to_string(),
                     subject_id: boss_core::primitives::Subject::id(&job.subject).to_string(),
                     priority: job.priority,
+                    simulated: job.simulated,
+                    tags: job.tags.clone(),
                     step,
                 });
                 if out.len() >= limit as usize {

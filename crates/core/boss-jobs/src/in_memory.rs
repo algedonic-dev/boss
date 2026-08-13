@@ -766,6 +766,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assignment_rows_carry_the_jobs_sim_facts() {
+        // A simulated packet must read as simulated in every queue lens,
+        // My Day included — the row is the only thing that lens sees.
+        let repo = InMemoryJobs::new();
+        let mut sim = make_job("ingredient-restock");
+        sim.status = JobStatus::Open;
+        sim.simulated = true;
+        sim.tags = vec!["nightly".to_string()];
+        repo.create_job(&sim).await.unwrap();
+        let mut s = Step::new(sim.id, "procurement", "Place PO", 0).with_assignee("emp-1");
+        s.status = StepStatus::Ready;
+        repo.add_step(&s).await.unwrap();
+
+        let mut real = make_job("ingredient-restock");
+        real.status = JobStatus::Open;
+        repo.create_job(&real).await.unwrap();
+        let mut r = Step::new(real.id, "procurement", "Place real PO", 0).with_assignee("emp-1");
+        r.status = StepStatus::Ready;
+        repo.add_step(&r).await.unwrap();
+
+        let rows = repo
+            .list_assignments(Some("emp-1"), &[], 100)
+            .await
+            .unwrap();
+        let sim_row = rows.iter().find(|row| row.job_id == sim.id).unwrap();
+        assert!(sim_row.simulated, "simulated job's row reports it");
+        assert_eq!(sim_row.tags, vec!["nightly".to_string()]);
+        let real_row = rows.iter().find(|row| row.job_id == real.id).unwrap();
+        assert!(!real_row.simulated, "a real job's row stays real");
+        assert!(real_row.tags.is_empty());
+
+        // The sim workforce's bulk pull reads the same row shape.
+        let bulk = repo.list_assigned_workable(100).await.unwrap();
+        assert!(
+            bulk.iter()
+                .find(|row| row.job_id == sim.id)
+                .unwrap()
+                .simulated,
+            "bulk backlog rows carry the flag too"
+        );
+    }
+
+    #[tokio::test]
     async fn count_in_flight_steps_by_kind_only_counts_non_terminal() {
         let repo = InMemoryJobs::new();
         let job = make_job("refurb");

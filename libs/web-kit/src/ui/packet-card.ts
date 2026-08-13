@@ -17,6 +17,29 @@ export type PacketCardData = Readonly<{
   skipReason?: string | null;
 }>;
 
+// The facts a packet carries about being simulated. Every field is
+// optional: a lens passes whatever its rows hold (My Day's assignment
+// rows have no job metadata, only the flag and the tags).
+export type SimFacts = Readonly<{
+  simulated?: boolean;
+  tags?: readonly string[];
+  metadata?: Record<string, unknown> | null;
+}>;
+
+// Simulated is a fact on the packet, never an inference from where it
+// came from. The Job's own admission-fixed `simulated` field is the
+// source of truth; the tag / metadata conventions stay as fallback for
+// packets that predate the field. Lives here with the card so every
+// queue lens answers "is this real?" identically (CLAUDE.md §9a) —
+// yard.ts re-exports it, and My Day calls it on its assignment rows.
+export function isSim(j: SimFacts): boolean {
+  if (j.simulated === true) return true;
+  const tagged = (j.tags ?? []).some(t =>
+    ['sim', 'simulated', 'synthetic'].includes(t.toLowerCase()),
+  );
+  return tagged || (j.metadata as { simulated?: boolean } | null)?.simulated === true;
+}
+
 // Categorical hues for protocol chips, tuned to sit quietly on the
 // VOID/INK grounds. SIGNAL teal is deliberately absent — it stays the
 // one live accent — and ok/warn/err stay reserved for state.

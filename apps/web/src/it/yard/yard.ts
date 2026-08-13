@@ -55,23 +55,13 @@ export type CarRow = Readonly<{
   skipReason?: string | null;
 }>;
 
-// The protocol palette + kind → hue hash moved to web-kit with the
-// card itself (@boss/web-kit/ui/packet-card) so every queue surface
-// colors packets identically. Re-exported so the definitions live
-// exactly once (CLAUDE.md §9a) and yard consumers need no change.
-export { PROTOCOL_PALETTE, protocolHue } from '@boss/web-kit/ui/packet-card';
-
-// Simulated is a fact on the packet, never an inference from where it
-// came from. The Job's own admission-fixed `simulated` field is the
-// source of truth; the tag / metadata conventions stay as fallback for
-// packets that predate the field.
-export function isSim(j: Pick<JobLite, 'simulated' | 'tags' | 'metadata'>): boolean {
-  if (j.simulated === true) return true;
-  const tagged = (j.tags ?? []).some(t =>
-    ['sim', 'simulated', 'synthetic'].includes(t.toLowerCase()),
-  );
-  return tagged || (j.metadata as { simulated?: boolean } | null)?.simulated === true;
-}
+// The protocol palette + kind → hue hash + the sim predicate moved to
+// web-kit with the card itself (@boss/web-kit/ui/packet-card) so every
+// queue surface colors and marks packets identically. Re-exported so
+// the definitions live exactly once (CLAUDE.md §9a) and yard consumers
+// need no change.
+import { isSim } from '@boss/web-kit/ui/packet-card';
+export { isSim, PROTOCOL_PALETTE, protocolHue } from '@boss/web-kit/ui/packet-card';
 
 export type TrainStatus = 'BOARDING' | 'BOARDED' | 'DEPARTED' | 'ARRIVED';
 export type Lamp = 'green' | 'failing' | 'pending';
