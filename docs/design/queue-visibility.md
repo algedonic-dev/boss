@@ -1,6 +1,8 @@
 # Design: queue visibility — every actor's lens on the one queue
 
 **Status**: in-review — open questions tracked at `/system/design`.
+**Superseded in part** by [stations.md](./stations.md), which describes
+what shipped. Where the two disagree, stations.md wins.
 **Source**: feedback `207236cc` — raised by David in the audit-log Q6
 review (2026-08-08): "Every actor needs visibility into their
 personal queue and there are lots of abstract groups, like anyone
@@ -118,8 +120,24 @@ this the hard way.
 
 ## The shape of the answer
 
-**A queue is a lens — a WHERE clause over the one steps
-projection — never a reified structure.** Personal queue: the
+**A station is registry data; its *membership* is a predicate, not
+a stored roster.** The station row is real (name, discipline,
+capability gate, `wip_limit`); what is derived is who is in its
+queue right now — evaluated over packet state at read time, so
+there is no second source of truth to drift from `steps` and
+nothing to rebuild. A *view* over a station is a lens; the station
+itself is a node in the network.
+
+*(Amended 2026-08-13. This paragraph read "a queue is a lens …
+never a reified structure", written before the station registry
+shipped. `infra/postgres/schema/116-stations.sql` reified the node
+and `stations.md` Q1–Q4 ratified it, so the original sentence had
+become an argument against the substrate's own nodes. The
+distinction it was reaching for — no per-actor roster to drift —
+survives intact, one level down.)*
+
+The lenses over those stations are what each actor sees.
+Personal queue: the
 assignee branch. Group queue: the role branch. Agent queue: the
 same lens through the same API (agents are actors; the MCP
 `list_my_work` tool wraps this endpoint). Reified per-actor queues
@@ -146,9 +164,10 @@ engineering team is free to change what serves it.
 
 ## What this deliberately is not
 
-- **Not per-actor queue storage.** No queue tables, no broker
-  state per actor. Measurement says the derived lens stays cheap
-  far past any visible horizon.
+- **Not per-actor queue *storage* — a station row declares the
+  queue; membership is still derived.** No per-actor queue tables,
+  no broker state per actor. Measurement says the derived
+  membership stays cheap far past any visible horizon.
 - **Not a workload-balancing scheduler.** Assignment stays
   deterministic (replay depends on it). Whether it should weigh
   load or shift patterns is a separate decision for a separate

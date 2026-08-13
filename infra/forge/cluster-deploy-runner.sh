@@ -55,6 +55,37 @@ KM="sudo docker run --rm --network host -v $KUBECONFIG_PATH:/kc:ro -v $REPO/infr
 echo "cluster-deploy-runner: applying infra/cluster/manifests"
 $KM apply -f /manifests
 
+# StepPlugin bundles converge from the tree too (job d35aec77).
+# Code converges in the image, config in the manifests above, schema
+# in boss-init — but the `step-plugins` ConfigMap was built by a
+# kubectl command someone ran by hand, so it converged with nothing.
+# Adding a bundle to infra/step-plugins/ and landing a train delivered
+# NOTHING: the row at /system/step-plugins pointed at a file that was
+# never mounted, and the step rendered "No plugin registered" with no
+# error anywhere. That is how seven seeded plugins came to be active
+# with absent bundles, blocking eleven ready review-design steps.
+#
+# Regenerated from the directory every converge, so the mounted
+# bundles are whatever the tree says. --dry-run=client | apply keeps
+# it idempotent; README.md is excluded because it is documentation,
+# not a bundle. Deliberately NOT committed as a manifest: it is a
+# derived artifact whose sources are already in tree, and a committed
+# copy would be the second definition that drifts (§9a).
+KP="sudo docker run --rm --network host -v $KUBECONFIG_PATH:/kc:ro -v $REPO/infra/step-plugins:/plugins:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
+echo "cluster-deploy-runner: converging the step-plugins ConfigMap"
+PLUGIN_ARGS=""
+for f in "$REPO"/infra/step-plugins/*.js; do
+    [ -e "$f" ] || continue
+    PLUGIN_ARGS="$PLUGIN_ARGS --from-file=$(basename "$f")=/plugins/$(basename "$f")"
+done
+if [ -n "$PLUGIN_ARGS" ]; then
+    # shellcheck disable=SC2086
+    $KP create configmap step-plugins -n boss $PLUGIN_ARGS \
+        --dry-run=client -o yaml | $K apply -f -
+else
+    echo "cluster-deploy-runner: no bundles in infra/step-plugins — leaving the ConfigMap alone"
+fi
+
 $K set image -n boss deploy/boss "boss=$REGISTRY:$HEAD"
 $K patch deploy boss -n boss --type=json \
     -p "[{\"op\":\"replace\",\"path\":\"/spec/template/spec/initContainers/0/image\",\"value\":\"$REGISTRY:$HEAD\"}]"

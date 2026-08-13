@@ -4,7 +4,11 @@
 //! are humans and agents. Every other surface renders the *work*; this
 //! renders the *machine*: who the processors are and what moves
 //! between them. Design + decisions:
-//! `docs/design/operating-system-view.md`.
+//! `docs/architecture-decisions.md` (§the flow canvas), which also
+//! records this view's retirement as a PAGE while the LAG-pairing SQL
+//! below survives as the traffic layer, re-keyed from department to
+//! station. The pre-network `operating-system-view.md` it used to cite
+//! was dropped by the framing convergence.
 //!
 //! The shape here is what that review settled, and each choice is a
 //! decision rather than a default:

@@ -74,7 +74,7 @@ because that is the vocabulary the system was built with.
 
 ## Contradictory — fix first
 
-### 1. `docs/design/queue-visibility.md` — denies the substrate's nodes
+### 1. `docs/design/queue-visibility.md` — denies the substrate's nodes ✅ FIXED 2026-08-13
 
 The sharpest conflict in the corpus, and it is also the most
 factually stale doc (see §Factual errors).

@@ -345,7 +345,7 @@ mod tests {
             "step_id": "22222222-2222-2222-2222-222222222222",
             "kind": "review-design",
             "subject_kind": "custom",
-            "subject_id": "docs/design/operating-system-view.md",
+            "subject_id": "docs/design/the-three-layers.md",
             "metadata": { "authority_role": "platform-admin" }
         })
     }
@@ -453,7 +453,7 @@ mod tests {
             .expect("a message was sent");
         let subject = sent["subject"].as_str().unwrap_or_default();
         assert!(
-            subject.contains("docs/design/operating-system-view.md"),
+            subject.contains("docs/design/the-three-layers.md"),
             "subject must identify WHICH item: {subject}"
         );
         assert!(subject.contains("review-design"), "subject: {subject}");
