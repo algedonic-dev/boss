@@ -82,6 +82,7 @@ async fn smoke_tester_can_read_workflows_through_real_policy_api() {
 
     let state = JobsApiState {
         job_edges: None,
+        stations: None,
         jobs,
         bus,
         publisher,

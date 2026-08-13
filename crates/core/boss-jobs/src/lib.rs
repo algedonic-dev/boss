@@ -24,6 +24,8 @@ pub mod postgres;
 pub mod rebuild;
 pub mod registry;
 pub mod scheduling;
+pub mod station_queue;
+pub mod stations;
 pub mod workflow_lint;
 // Platform Workflows live in `registry::platform_workflows()` (currently
 // just `workflow-design`); tenant Workflows live in
@@ -46,6 +48,12 @@ pub use registry::PgWorkflows;
 pub use registry::{
     InMemoryWorkflows, StepSpec, Terminal, WorkflowError, WorkflowRegistry, WorkflowSpec,
     WorkflowStatus, materialize_steps, reevaluate,
+};
+pub use station_queue::{DisciplineKey, StationPredicate, StationQueue, evaluate_station};
+#[cfg(feature = "postgres")]
+pub use stations::PgStations;
+pub use stations::{
+    InMemoryStations, StationCapability, StationError, StationKind, StationRegistry, StationSpec,
 };
 #[cfg(feature = "postgres")]
 pub use step_plugins::PgStepPlugins;

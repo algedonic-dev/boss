@@ -5,7 +5,13 @@
   // the conductor writes; nothing here is new state. Reads are
   // audit-readonly-safe by construction.
   import { onMount } from 'svelte';
-  import { fetchYard, type YardState, type TrainRow } from './yard';
+  import {
+    disciplineLabel,
+    fetchYard,
+    wipAdvisory,
+    type YardState,
+    type TrainRow,
+  } from './yard';
   import PacketCard from '@boss/web-kit/ui/PacketCard.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
 
@@ -74,7 +80,22 @@
       {/each}
     {/if}
 
-    <div class="yard-section">02 — LOADING DOCK <span class="yard-n">{yard.dock.length}</span></div>
+    <!-- The dock is a station rendered (stations.md): when the
+         registry served, the header carries the station's own facts —
+         the ordering discipline (Q2: never wonder why the queue is in
+         this order) and the advisory WIP verdict (Q3: warn, don't
+         enforce). The derived fallback has no facts to show. -->
+    <div class="yard-section">
+      02 — LOADING DOCK <span class="yard-n">{yard.dock.length}</span>
+      {#if yard.dockStation.source === 'station'}
+        <span class="yard-discipline" title="queue discipline"
+          >{disciplineLabel(yard.dockStation.discipline)}</span>
+        {#if wipAdvisory(yard.dockStation)}
+          <span class="yard-wip" title="over the station's advisory WIP limit"
+            >{wipAdvisory(yard.dockStation)}</span>
+        {/if}
+      {/if}
+    </div>
     {#if yard.dock.length === 0}
       <div class="yard-empty">The dock is clear.</div>
     {:else}
@@ -110,6 +131,13 @@
   }
   .yard-section::after { content: ''; flex: 1; border-top: 1px solid var(--hairline, #2A3138); }
   .yard-n { color: var(--static, #7A838C); }
+  /* Station facts in the section header: discipline stays quiet
+     (static grey, same mono caps), the WIP advisory wears --warn —
+     the one state color in the header, present only when the queue
+     exceeds its declared bandwidth. */
+  .yard-discipline { color: var(--static, #7A838C); letter-spacing: var(--ls-nav, 0.14em); }
+  .yard-wip { color: var(--warn, #d9a441); border: 1px solid var(--warn, #d9a441);
+    padding: 1px 7px; letter-spacing: 0.1em; }
   .yard-board { width: 100%; border-collapse: collapse; background: var(--card, var(--ink, #12161C));
     border: 1px solid var(--hairline, #2A3138); font-size: 14px; }
   .yard-board th { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px;

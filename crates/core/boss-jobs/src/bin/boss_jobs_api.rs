@@ -189,6 +189,8 @@ async fn main() -> Result<()> {
                 std::sync::Arc::new(boss_jobs::job_edges::PgJobEdges::new(pool.clone()))
                     as std::sync::Arc<dyn boss_jobs::job_edges::JobEdgesRegistry>,
             ),
+            Some(Arc::new(boss_jobs::PgStations::new(pool.clone()))
+                as Arc<dyn boss_jobs::StationRegistry>),
             jobs,
             bus,
             publisher,
@@ -222,6 +224,7 @@ async fn main() -> Result<()> {
     run_server(
         Some(std::sync::Arc::new(boss_jobs::job_edges::InMemoryJobEdges)
             as std::sync::Arc<dyn boss_jobs::job_edges::JobEdgesRegistry>),
+        Some(Arc::new(boss_jobs::InMemoryStations::new()) as Arc<dyn boss_jobs::StationRegistry>),
         jobs,
         bus,
         publisher,
@@ -244,6 +247,7 @@ async fn main() -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn run_server<R: JobsRepository + 'static>(
     job_edges: Option<std::sync::Arc<dyn boss_jobs::job_edges::JobEdgesRegistry>>,
+    stations: Option<Arc<dyn boss_jobs::StationRegistry>>,
     jobs: Arc<R>,
     bus: Arc<NatsEventBus>,
     publisher: boss_core::publisher::DomainPublisher,
@@ -297,6 +301,7 @@ async fn run_server<R: JobsRepository + 'static>(
 
     let state = JobsApiState {
         job_edges,
+        stations,
         jobs,
         bus,
         publisher,

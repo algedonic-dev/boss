@@ -1,12 +1,16 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import {
   assembleYard,
+  disciplineLabel,
+  fetchYard,
   trainStatus,
   ciLamp,
   isSim,
   protocolHue,
+  wipAdvisory,
   PROTOCOL_PALETTE,
   type JobLite,
+  type StationQueueEnvelope,
 } from './yard';
 
 function train(over: Partial<JobLite>): JobLite {
@@ -74,6 +78,183 @@ describe('assembleYard', () => {
     expect(y.dock[0]?.kind).toBe('ship-a-change');
     expect(y.dock[0]?.sim).toBe(false);
     expect(y.inFlight[0]?.cars[0]?.kind).toBe('ship-a-change');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The dock as a registry-backed lens (stations.md): when the station
+// endpoint serves, the envelope is authoritative — membership AND
+// order come from the server, and the header shows the station's own
+// facts (discipline, advisory WIP verdict).
+// ---------------------------------------------------------------------------
+
+function envelope(over: Partial<StationQueueEnvelope> = {}): StationQueueEnvelope {
+  return {
+    station: 'loading-dock',
+    kind: 'batch',
+    discipline: ['priority', 'age'],
+    wip_limit: null,
+    over_limit: false,
+    total: 0,
+    data: [],
+    ...over,
+  };
+}
+
+const dockJob = (id: string, over: Partial<JobLite> = {}): JobLite => ({
+  id, kind: 'ship-a-change', title: `car ${id}`, status: 'open',
+  opened_on: '2026-08-10', metadata: { branch: `feat/${id}` }, ...over,
+});
+
+describe('the dock from the station envelope', () => {
+  test('envelope rows map to the same packet-card grammar as dockRows', () => {
+    const env = envelope({
+      total: 2,
+      data: [
+        dockJob('s1', {
+          tags: ['hotfix'],
+          metadata: { branch: 'feat/s1', skip_reason: 'CI red' },
+          simulated: true,
+        }),
+        dockJob('s2'),
+      ],
+    });
+    const y = assembleYard([], [], env);
+    expect(y.dock.map(c => c.id)).toEqual(['s1', 's2']);
+    expect(y.dock[0]).toEqual({
+      id: 's1', kind: 'ship-a-change', branch: 'feat/s1', title: 'car s1',
+      tags: ['hotfix'], sim: true, skipReason: 'CI red',
+    });
+    expect(y.dock[1]?.sim).toBe(false);
+    expect(y.dock[1]?.skipReason).toBeNull();
+  });
+
+  test('the envelope is authoritative: membership does not re-derive from ships', () => {
+    // A ship that dockRows would park, but the station did not serve.
+    const parked: JobLite = {
+      id: 'c1', kind: 'ship-a-change', title: 'A car', status: 'open',
+      opened_on: '2026-08-12', metadata: { branch: 'feat/a' },
+      steps: [s('review', 'ready')],
+    };
+    const y = assembleYard([], [parked], envelope({ total: 1, data: [dockJob('s9')] }));
+    expect(y.dock.map(c => c.id)).toEqual(['s9']);
+  });
+
+  test('server order is preserved — no client re-sort by age or anything else', () => {
+    // Deliberately NOT in age order: any client-side re-sort would flip it.
+    const env = envelope({
+      total: 3,
+      data: [
+        dockJob('newer', { opened_on: '2026-08-12' }),
+        dockJob('oldest', { opened_on: '2026-08-01' }),
+        dockJob('middle', { opened_on: '2026-08-07' }),
+      ],
+    });
+    const y = assembleYard([], [], env);
+    expect(y.dock.map(c => c.id)).toEqual(['newer', 'oldest', 'middle']);
+  });
+
+  test('the header facts come off the envelope', () => {
+    const y = assembleYard([], [], envelope({ wip_limit: 5, over_limit: true, total: 7 }));
+    expect(y.dockStation).toEqual({
+      source: 'station',
+      discipline: ['priority', 'age'],
+      wipLimit: 5,
+      overLimit: true,
+      total: 7,
+    });
+  });
+
+  test('without an envelope the dock falls back to the derived rows', () => {
+    const parked: JobLite = {
+      id: 'c1', kind: 'ship-a-change', title: 'A car', status: 'open',
+      opened_on: '2026-08-12', metadata: { branch: 'feat/a' },
+      steps: [s('review', 'ready')],
+    };
+    const y = assembleYard([], [parked], null);
+    expect(y.dock.map(c => c.id)).toEqual(['c1']);
+    expect(y.dockStation).toEqual({ source: 'derived' });
+    // The 2-arg call sites mean the same thing.
+    expect(assembleYard([], [parked]).dockStation).toEqual({ source: 'derived' });
+  });
+});
+
+describe('the station header idiom', () => {
+  test('discipline renders in the mono-caps idiom', () => {
+    expect(disciplineLabel(['priority', 'age'])).toBe('PRIORITY → AGE');
+    expect(disciplineLabel(['due'])).toBe('DUE');
+    // A key published tomorrow renders with zero code change.
+    expect(disciplineLabel(['shortest-job-first'])).toBe('SHORTEST-JOB-FIRST');
+  });
+
+  test('the WIP chip appears only on an over-limit station', () => {
+    const over = assembleYard([], [], envelope({ wip_limit: 5, over_limit: true, total: 7 }));
+    expect(wipAdvisory(over.dockStation)).toBe('WIP 7/5');
+    const under = assembleYard([], [], envelope({ wip_limit: 5, over_limit: false, total: 3 }));
+    expect(wipAdvisory(under.dockStation)).toBeNull();
+    // No declared limit -> never a chip, whatever the flag says.
+    const limitless = assembleYard([], [], envelope({ over_limit: true, total: 9 }));
+    expect(wipAdvisory(limitless.dockStation)).toBeNull();
+    // The derived dock has no station facts to advertise.
+    expect(wipAdvisory({ source: 'derived' })).toBeNull();
+  });
+});
+
+describe('fetchYard against the station endpoint', () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  const json = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), { status });
+
+  function stub(station: () => Response | Promise<Response>) {
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/stations/loading-dock/queue')) return station();
+      if (url.includes('kind=pr-train')) return json({ data: [] });
+      if (url.includes('kind=ship-a-change'))
+        return json({
+          data: [
+            {
+              id: 'c1', kind: 'ship-a-change', title: 'A car', status: 'open',
+              opened_on: '2026-08-12', metadata: { branch: 'feat/a' },
+              steps: [s('review', 'ready')],
+            },
+          ],
+        });
+      throw new Error(`unexpected fetch: ${url}`);
+    }) as typeof fetch;
+  }
+
+  test('when the endpoint serves, the dock reads its own station row', async () => {
+    stub(() => json(envelope({ total: 1, data: [dockJob('s1')] })));
+    const y = await fetchYard();
+    expect(y?.dock.map(c => c.id)).toEqual(['s1']);
+    expect(y?.dockStation.source).toBe('station');
+  });
+
+  test('a cluster that predates the registry still renders the yard whole', async () => {
+    // 404 (no station row), 503 (registry not configured), and a
+    // thrown network error all mean the same thing: derive locally.
+    for (const station of [
+      () => json('no such station', 404),
+      () => json('station registry not configured', 503),
+      () => Promise.reject(new Error('connection refused')),
+    ]) {
+      stub(station as () => Response | Promise<Response>);
+      const y = await fetchYard();
+      expect(y?.dock.map(c => c.id)).toEqual(['c1']);
+      expect(y?.dockStation).toEqual({ source: 'derived' });
+    }
+  });
+
+  test('a 200 that is not a queue envelope falls back too', async () => {
+    stub(() => json({ hello: 'not an envelope' }));
+    const y = await fetchYard();
+    expect(y?.dock.map(c => c.id)).toEqual(['c1']);
+    expect(y?.dockStation).toEqual({ source: 'derived' });
   });
 });
 

@@ -74,6 +74,7 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>) {
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let state = JobsApiState {
         job_edges: None,
+        stations: None,
         jobs: jobs.clone(),
         bus,
         publisher: DomainPublisher::new(bus_dyn, "jobs"),

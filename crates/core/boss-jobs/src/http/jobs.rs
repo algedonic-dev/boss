@@ -61,26 +61,10 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
     };
 
     // Translate the Predicate into a JobScope the adapter can push
-    // into SQL. `DepartmentIs` is the odd one out: Jobs don't carry
-    // a department column, so it's either "all" (caller's department
-    // matches) or "none" (it doesn't). The handler short-circuits
-    // before hitting the adapter in the mismatch case.
-    let scope = match &predicate {
-        boss_policy_client::Predicate::Unrestricted => JobScope::All,
-        boss_policy_client::Predicate::None => JobScope::None,
-        boss_policy_client::Predicate::OwnerIs { user_id } => JobScope::OwnerIs(user_id.clone()),
-        boss_policy_client::Predicate::OwnerIn { user_ids } => JobScope::OwnerIn(user_ids.clone()),
-        boss_policy_client::Predicate::AccountIn { account_ids } => {
-            JobScope::AccountIn(account_ids.clone())
-        }
-        boss_policy_client::Predicate::DepartmentIs { department } => {
-            if user.department.as_deref() == Some(department.as_str()) {
-                JobScope::All
-            } else {
-                JobScope::None
-            }
-        }
-    };
+    // into SQL — shared with the station queue lens
+    // (`job_scope_from_predicate`), so every packet read surface
+    // passes through one policy path.
+    let scope = job_scope_from_predicate(&user, &predicate);
 
     let filter = JobFilter {
         kind: q.kind,

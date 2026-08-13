@@ -764,10 +764,23 @@ pub(super) struct SignOffBody {
 /// the adapter: exactly one claimant wins; the loser gets 409 with
 /// the holder. Idempotent for the holder. The generic PUT keeps its
 /// PATCH semantics and never adjudicates claims.
+#[derive(Deserialize, Default)]
+pub(super) struct ClaimQuery {
+    /// The station the claimant is pulling FROM. A packet has no
+    /// single derivable station — membership is a predicate, and
+    /// several stations can hold the same packet — so the capability
+    /// gate (stations.md Q3: enforced at the claim CAS) applies to
+    /// the station the claim names, not to some inferred one. Claims
+    /// without a station keep today's behavior: the CAS plus the
+    /// policy check above, no station capability consulted.
+    station: Option<String>,
+}
+
 pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     Path((id, step_id_str)): Path<(String, String)>,
     CurrentUser(user): CurrentUser,
+    axum::extract::Query(q): axum::extract::Query<ClaimQuery>,
 ) -> Response {
     let job_id = match parse_job_id(&id) {
         Some(id) => id,
@@ -811,6 +824,64 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
     // admission-fixed `simulated` flag, and the assignment marker
     // reads its Subject identity.
     let parent_job = state.jobs.get_job(&job_id).await.ok().flatten();
+
+    // Station capability gate (stations.md Q3): when the claim names
+    // the station it pulls from, the packet must actually be a
+    // member of that station's queue, and the station's capability
+    // (Class-registry role vocabulary) must admit the claimant.
+    // Checked BEFORE the CAS so a gated claim never decides the
+    // race it wasn't allowed to enter.
+    if let Some(station_name) = q.station.as_deref() {
+        let Some(reg) = &state.stations else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "station registry not configured",
+            )
+                .into_response();
+        };
+        let spec = match reg.get_active(station_name).await {
+            Ok(s) => s,
+            Err(crate::stations::StationError::NotFound(msg)) => {
+                return (StatusCode::NOT_FOUND, msg).into_response();
+            }
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        };
+        let Some(job) = &parent_job else {
+            return (StatusCode::NOT_FOUND, "job not found").into_response();
+        };
+        let steps = if spec.predicate.needs_steps() {
+            state.jobs.list_steps(&job_id).await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !spec.predicate.matches(job, &steps) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "packet is not at this station",
+                    "station": station_name,
+                })),
+            )
+                .into_response();
+        }
+        if let Some(capability) = &spec.capability
+            && !capability.allows_role(&user.role)
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "role not admitted by station capability",
+                    "station": station_name,
+                    "role": user.role,
+                    "allowed_roles": capability.roles,
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let mut stamp = state.publisher.stamp_with_actor_at(actor, now).await;
     if let Some(j) = &parent_job {
         stamp = stamp.with_simulated(j.simulated);

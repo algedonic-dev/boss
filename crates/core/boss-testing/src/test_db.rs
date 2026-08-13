@@ -216,6 +216,10 @@ const SCHEMA_FILES: &[(&str, &str)] = &[
         "114-cadence-rules",
         include_str!("../../../../infra/postgres/schema/114-cadence-rules.sql"),
     ),
+    (
+        "116-stations",
+        include_str!("../../../../infra/postgres/schema/116-stations.sql"),
+    ),
 ];
 
 /// Concatenate the schema files in manifest order, omitting any whose name

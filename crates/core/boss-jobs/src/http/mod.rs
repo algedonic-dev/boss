@@ -31,12 +31,14 @@ mod jobs;
 mod kinds;
 mod plugins;
 mod sim_clock;
+mod stations;
 mod steps;
 
 use jobs::*;
 use kinds::*;
 use plugins::*;
 use sim_clock::*;
+use stations::*;
 use steps::*;
 
 const DEFAULT_LIMIT: i64 = 100;
@@ -65,6 +67,11 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// The job_edges registry (read-only; edges are declared in
     /// migrations). None → 503 on the read route.
     pub job_edges: Option<Arc<dyn crate::job_edges::JobEdgesRegistry>>,
+    /// Station registry (stations.md) — the data-defined priority
+    /// queues over packets. Same optionality semantics as
+    /// `kind_registry`: None → 503 on the /api/stations routes and
+    /// the claim path's station gate.
+    pub stations: Option<Arc<dyn crate::stations::StationRegistry>>,
     /// Cross-service client for the global calendar primitive
     /// (`docs/architecture-decisions.md` §Calendar). When set, scheduling
     /// steps that transition `ready → active` with full
@@ -139,6 +146,12 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         .route("/api/jobs/{id}", put(update_job::<R, B>))
         .route("/api/jobs/{id}/stream", get(job_stream::<R, B>))
         .route("/api/jobs/step-types", get(list_step_types::<R, B>))
+        // Station registry — data-defined priority queues over
+        // packets (docs/design/stations.md). Reads only; authoring
+        // ships as registry writes through the port (seed rows in
+        // 116-stations.sql today).
+        .route("/api/stations", get(list_stations::<R, B>))
+        .route("/api/stations/{name}/queue", get(station_queue::<R, B>))
         .route("/api/jobs/{id}/steps", get(list_steps::<R, B>))
         .route("/api/jobs/{id}/steps", post(add_step::<R, B>))
         .route("/api/jobs/{id}/steps/{step_id}", put(update_step::<R, B>))
@@ -281,6 +294,38 @@ pub(super) async fn validate_custom_subject<R: JobsRepository, B: EventBus>(
     subject: &boss_core::job::Subject,
 ) -> Result<(), Response> {
     check_custom_subject(state.subject_kinds.as_ref(), subject).await
+}
+
+// ---------------------------------------------------------------------------
+// Shared policy-scope translation
+// ---------------------------------------------------------------------------
+
+/// Translate the caller's read-scope `Predicate` into the `JobScope`
+/// the adapter can push into SQL. `DepartmentIs` is the odd one out:
+/// Jobs don't carry a department column, so it's either "all"
+/// (caller's department matches) or "none" (it doesn't). Shared by
+/// the /api/jobs list and the station queue lens so every packet
+/// read surface passes through ONE policy path.
+pub(super) fn job_scope_from_predicate(
+    user: &boss_policy_client::User,
+    predicate: &boss_policy_client::Predicate,
+) -> JobScope {
+    match predicate {
+        boss_policy_client::Predicate::Unrestricted => JobScope::All,
+        boss_policy_client::Predicate::None => JobScope::None,
+        boss_policy_client::Predicate::OwnerIs { user_id } => JobScope::OwnerIs(user_id.clone()),
+        boss_policy_client::Predicate::OwnerIn { user_ids } => JobScope::OwnerIn(user_ids.clone()),
+        boss_policy_client::Predicate::AccountIn { account_ids } => {
+            JobScope::AccountIn(account_ids.clone())
+        }
+        boss_policy_client::Predicate::DepartmentIs { department } => {
+            if user.department.as_deref() == Some(department.as_str()) {
+                JobScope::All
+            } else {
+                JobScope::None
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

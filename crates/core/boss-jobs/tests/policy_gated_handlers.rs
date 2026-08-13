@@ -60,6 +60,7 @@ fn build_app(policy: Arc<dyn PolicyClient>) -> (Router, Arc<InMemoryJobs>) {
     let step_registry = Arc::new(StepRegistry::v1());
     let state = JobsApiState {
         job_edges: None,
+        stations: None,
         jobs: jobs.clone(),
         bus,
         publisher,

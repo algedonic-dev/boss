@@ -241,16 +241,20 @@
   }
 </script>
 
-<PageHeader title="Design review" subtitle="Open questions, pending decisions, ADRs" />
+<PageHeader
+  eyebrow="System Model · Design review"
+  title="Design review"
+  subtitle="Open questions, pending decisions, ADRs"
+/>
 
 {#if loading}
   <p class="empty">Loading design docs…</p>
 {:else if error}
-  <p class="empty">Error: {error}</p>
+  <p class="design-error">Error: {error}</p>
 {:else}
   {#if rejections.length > 0}
     <Section title={`Not indexed (${rejections.length})`} wide>
-      <p class="empty reject-lede">
+      <p class="reject-lede">
         These files are in <code>docs/design/</code> but are <strong>not</strong>
         in the lists below — the reindexer refused them. Until each is
         fixed, this panel is showing an incomplete corpus.
@@ -312,10 +316,10 @@
             <strong>{doc.title}</strong>
             <div class="design-path">{doc.path}</div>
           </td>
-          <td>{doc.status}</td>
+          <td class="design-status">{doc.status}</td>
           <td>{doc.open_questions}</td>
           <td>{doc.pending_count}</td>
-          <td>{relTime(doc.last_modified)}</td>
+          <td class="design-when">{relTime(doc.last_modified)}</td>
           <td>
             {#if review}
               <Link to={reviewHref(review)}>
@@ -334,16 +338,25 @@
 {/snippet}
 
 <style>
+  /* Warning prose, not an empty-state: FOG at reading line-height. It was
+     STATIC via `.empty`, which buried the one paragraph explaining why the
+     corpus above is incomplete. */
   .reject-lede {
-    margin-bottom: 0.75rem;
+    color: var(--fog, #E8ECEF);
+    line-height: 1.6;
+    max-width: 720px;
+    margin: 0 0 12px;
   }
   .reject-age {
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
   }
+  /* Body prose in a cell. 0.85rem was 11.9px at the 14px root — below the
+     13px body floor — with cramped leading. */
   .reject-reason {
-    font-size: 0.85rem;
-    line-height: 1.4;
+    font-size: 13px;
+    line-height: 1.6;
+    max-width: 60ch;
   }
   .design-table {
     width: 100%;
@@ -355,14 +368,54 @@
     padding: 8px 12px;
     border-bottom: 1px solid var(--hairline, #2A3138);
     vertical-align: top;
+    font-variant-numeric: tabular-nums;
+  }
+  /* Column labels are instrument text: DM Mono caps in STATIC, not bold
+     browser-default headers competing with the rows. Yard-board idiom. */
+  .design-table th {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11px;
+    font-weight: 400;
+    letter-spacing: var(--ls-nav, 0.14em);
+    text-transform: uppercase;
+    color: var(--static, #7A838C);
+  }
+  .design-table tr:last-child td {
+    border-bottom: none;
+  }
+  .design-status {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11px;
+    letter-spacing: var(--ls-label, 0.1em);
+    text-transform: uppercase;
+    color: var(--static, #7A838C);
+    white-space: nowrap;
+  }
+  .design-when {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 12px;
+    color: var(--static, #7A838C);
+    white-space: nowrap;
   }
   .design-path {
     color: var(--static, #7A838C);
     font-size: 12px;
     font-family: var(--font-mono, ui-monospace, monospace);
+    margin-top: 2px;
+  }
+  /* Inline literals (paths, `### Qn:` markers) in the system mono, pinned
+     to 12px — bare <code> falls into the browser's monospace-shrink. */
+  code {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 12px;
   }
   .empty {
     color: var(--static, #7A838C);
+    margin: 12px 0;
+    line-height: 1.5;
+  }
+  .design-error {
+    color: var(--err, #e2685c);
     margin: 12px 0;
   }
 </style>

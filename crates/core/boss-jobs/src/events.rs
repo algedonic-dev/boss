@@ -43,6 +43,17 @@ pub const STEP_PLUGIN_PUBLISHED: &str = "jobs.step_plugin.published";
 /// The active StepPlugin version of a kind was retired with no
 /// successor. Payload is the retired `StepPluginSpec`.
 pub const STEP_PLUGIN_RETIRED: &str = "jobs.step_plugin.retired";
+/// A draft station row was appended to the registry (author saved,
+/// not live). Recorded by the registry adapter atomically with the
+/// stations row; payload is the full `StationSpec`.
+pub const STATION_DRAFT_SAVED: &str = "jobs.station.draft_saved";
+/// A `StationSpec` version went live: the latest draft flipped to
+/// active, retiring any prior active row. Payload is the promoted
+/// `StationSpec`.
+pub const STATION_PUBLISHED: &str = "jobs.station.published";
+/// The active station version of a name was retired with no
+/// successor. Payload is the retired `StationSpec`.
+pub const STATION_RETIRED: &str = "jobs.station.retired";
 
 // Marker events — informational only; rebuild ignores them.
 pub const JOB_STATUS_CHANGED: &str = "jobs.job.status_changed";
@@ -104,6 +115,22 @@ pub fn step_plugin_registry_event(
     actor: &boss_core::actor::ActorId,
     now: chrono::DateTime<chrono::Utc>,
     spec: &crate::step_plugins::StepPluginSpec,
+) -> boss_core::event::Event {
+    let payload =
+        boss_core::publisher::inject_actor(serde_json::to_value(spec).unwrap_or_default(), actor);
+    boss_core::event::Event::new("jobs", kind, payload, now)
+}
+
+/// A station registry event — same contract as
+/// [`workflow_registry_event`], for the `stations` table: built
+/// inside the adapter that owns the row transaction, payload is the
+/// serialized `StationSpec` with the actor riding as `_actor`
+/// exactly as EventStamp injects it.
+pub fn station_registry_event(
+    kind: &str,
+    actor: &boss_core::actor::ActorId,
+    now: chrono::DateTime<chrono::Utc>,
+    spec: &crate::stations::StationSpec,
 ) -> boss_core::event::Event {
     let payload =
         boss_core::publisher::inject_actor(serde_json::to_value(spec).unwrap_or_default(), actor);

@@ -72,6 +72,7 @@ fn build_app(registry: Arc<dyn WorkflowRegistry>) -> Router {
     );
     let state = JobsApiState {
         job_edges: None,
+        stations: None,
         jobs,
         bus,
         publisher,
@@ -318,6 +319,7 @@ async fn guest_cannot_publish_even_if_they_could_create() {
     );
     let state = JobsApiState {
         job_edges: None,
+        stations: None,
         jobs,
         bus,
         publisher,

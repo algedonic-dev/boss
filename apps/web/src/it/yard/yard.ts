@@ -2,6 +2,12 @@
 // (departure-board.md; pages-as-lenses). Every row derives from
 // pr-train and ship-a-change Jobs the conductor already writes;
 // audit-readonly reads only, so the guest landing renders whole.
+//
+// The loading dock is the first registry-backed lens (stations.md):
+// its rows come from `GET /api/stations/loading-dock/queue` — the
+// station's predicate and discipline evaluated server-side — with the
+// old hand-rolled derivation kept as fallback for clusters that
+// predate the registry.
 
 export type StepLite = Readonly<{
   spec_slug?: string | null;
@@ -72,9 +78,56 @@ export type TrainRow = Readonly<{
   live: boolean;
 }>;
 
+// The `GET /api/stations/{name}/queue` envelope (stations.md; the
+// StationQueue struct in boss-jobs/src/station_queue.rs). Discipline
+// keys and station kinds stay plain strings on this side: the lens
+// renders whatever vocabulary the registry declares — a key published
+// tomorrow needs zero code change here.
+export type StationQueueEnvelope = Readonly<{
+  station: string;
+  kind: string;
+  discipline: readonly string[];
+  wip_limit?: number | null;
+  over_limit: boolean;
+  total: number;
+  data: readonly JobLite[];
+}>;
+
+// Where the dock's rows came from, plus the station's own facts when
+// the registry served them. `derived` is the fallback for a deployed
+// cluster that predates the station registry — the yard renders
+// whole either way, it just can't show ordering rule or bandwidth
+// state it never received.
+export type DockStation =
+  | Readonly<{
+      source: 'station';
+      discipline: readonly string[];
+      wipLimit: number | null;
+      overLimit: boolean;
+      total: number;
+    }>
+  | Readonly<{ source: 'derived' }>;
+
+// Q2's resolution rendered: the ordering rule sits in the lens
+// header in the mono-caps idiom — an operator should never wonder
+// why the queue is in this order.
+export function disciplineLabel(discipline: readonly string[]): string {
+  return discipline.map(k => k.toUpperCase()).join(' → ');
+}
+
+// Q3's resolution rendered: `wip_limit` is advisory — a lens warning,
+// never enforcement. Chip text only when the station declared a limit
+// AND the server's verdict says the queue exceeds it.
+export function wipAdvisory(station: DockStation): string | null {
+  if (station.source !== 'station') return null;
+  if (!station.overLimit || station.wipLimit === null) return null;
+  return `WIP ${station.total}/${station.wipLimit}`;
+}
+
 export type YardState = Readonly<{
   inFlight: readonly TrainRow[];
   dock: readonly CarRow[];
+  dockStation: DockStation;
   arrivals: readonly TrainRow[];
 }>;
 
@@ -145,6 +198,26 @@ export function toTrainRow(
   };
 }
 
+// One packet → one card, whoever chose the packet. Both dock paths —
+// the station envelope and the local derivation — map through here,
+// so the card grammar cannot fork between them.
+function carRow(j: JobLite): CarRow {
+  const md = (j.metadata ?? {}) as { branch?: string; skip_reason?: string };
+  return {
+    id: j.id,
+    kind: j.kind,
+    branch: md.branch ?? '',
+    title: j.title,
+    tags: j.tags ?? [],
+    sim: isSim(j),
+    skipReason: md.skip_reason ?? null,
+  };
+}
+
+// The fallback derivation: the loading-dock predicate hand-rolled in
+// code, kept only for clusters that predate the station registry.
+// When `GET /api/stations/loading-dock/queue` serves, the registry
+// row (predicate + discipline) replaces all of this.
 export function dockRows(ships: readonly JobLite[]): CarRow[] {
   return ships
     .filter(j => {
@@ -153,21 +226,13 @@ export function dockRows(ships: readonly JobLite[]): CarRow[] {
       const review = step(j, 'review', 'Open for review');
       return !!review && (review.status === 'ready' || review.status === 'active');
     })
-    .map(j => ({
-      id: j.id,
-      kind: j.kind,
-      branch: ((j.metadata ?? {}) as { branch?: string }).branch ?? '',
-      title: j.title,
-      tags: j.tags ?? [],
-      sim: isSim(j),
-      skipReason:
-        ((j.metadata ?? {}) as { skip_reason?: string }).skip_reason ?? null,
-    }));
+    .map(carRow);
 }
 
 export function assembleYard(
   trains: readonly JobLite[],
   ships: readonly JobLite[],
+  dockQueue: StationQueueEnvelope | null = null,
 ): YardState {
   const shipById = new Map(ships.map(j => [j.id, j]));
   const open = trains.filter(t => t.status === 'open');
@@ -179,18 +244,49 @@ export function assembleYard(
   const liveId = open.find(t => trainStatus(t) !== 'ARRIVED')?.id;
   return {
     inFlight: open.map(t => toTrainRow(t, shipById, t.id === liveId)),
-    dock: dockRows(ships),
+    // The envelope is authoritative when it served: membership came
+    // from the registry predicate and order from the declared
+    // discipline — a client re-sort would silently overrule the
+    // station row, so the rows map 1:1 in server order.
+    dock: dockQueue ? dockQueue.data.map(carRow) : dockRows(ships),
+    dockStation: dockQueue
+      ? {
+          source: 'station',
+          discipline: dockQueue.discipline,
+          wipLimit: dockQueue.wip_limit ?? null,
+          overLimit: dockQueue.over_limit,
+          total: dockQueue.total,
+        }
+      : { source: 'derived' },
     arrivals: closed.map(t => toTrainRow(t, shipById, false)),
   };
 }
 
+// The dock's station row, or null when the cluster can't serve one —
+// 404 (no such station), 503 (registry not configured), a network
+// fault, or a 200 that isn't the envelope all mean the same thing:
+// fall back to deriving the dock locally. Never an error the yard
+// surfaces; the fallback costs nothing because the ships list is
+// fetched anyway for the consist join.
+async function fetchDockQueue(): Promise<StationQueueEnvelope | null> {
+  try {
+    const r = await fetch('/api/stations/loading-dock/queue');
+    if (!r.ok) return null;
+    const env = (await r.json()) as StationQueueEnvelope;
+    return Array.isArray(env?.data) && Array.isArray(env?.discipline) ? env : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function fetchYard(): Promise<YardState | null> {
-  const [tr, sr] = await Promise.all([
+  const [tr, sr, dockQueue] = await Promise.all([
     fetch('/api/jobs?kind=pr-train&limit=20'),
     fetch('/api/jobs?kind=ship-a-change&limit=200'),
+    fetchDockQueue(),
   ]);
   if (!tr.ok || !sr.ok) return null;
   const trains = ((await tr.json()) as { data?: JobLite[] }).data ?? [];
   const ships = ((await sr.json()) as { data?: JobLite[] }).data ?? [];
-  return assembleYard(trains, ships);
+  return assembleYard(trains, ships, dockQueue);
 }
