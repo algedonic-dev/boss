@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod cadence;
 mod deploy;
 mod docs;
 mod docs_flush;
@@ -169,10 +170,24 @@ enum TrainAction {
         #[arg(long)]
         dry_run: bool,
     },
-    /// The timer entry: reconcile open trains, then board this
-    /// window's train.
+    /// Reconcile open trains, then board this window's train (what
+    /// the retired timers used to enter; now fired by the
+    /// `train-window` cadence rule).
     Run {
         /// Say what would happen without writing anywhere
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// The cadence loop: evaluate the `cadence_rules` registry
+    /// against boss-clock time and fire the verbs the rules name,
+    /// recording every firing in `cadence_firings`. The supervised
+    /// entry (infra/train/boss-train.service) — the schedule itself
+    /// is protocol data (docs/design/protocol-cadence.md).
+    Cadence {
+        /// Evaluate one tick and exit (operator / test entry)
+        #[arg(long)]
+        once: bool,
+        /// Say what would fire without claiming or running anything
         #[arg(long)]
         dry_run: bool,
     },
@@ -474,16 +489,22 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Train { action } => {
+            // The cadence loop reads boss-clock time itself (via
+            // ClockClient) — it never takes a wallclock argument.
+            if let TrainAction::Cadence { once, dry_run } = action {
+                return cadence::run(once, dry_run).await;
+            }
             let (phase, dry) = match action {
                 TrainAction::Preflight { dry_run } => (train::Phase::Preflight, dry_run),
                 TrainAction::Reconcile { dry_run } => (train::Phase::Reconcile, dry_run),
                 TrainAction::Board { dry_run } => (train::Phase::Board, dry_run),
                 TrainAction::Run { dry_run } => (train::Phase::Run, dry_run),
+                TrainAction::Cadence { .. } => unreachable!("handled above"),
             };
             // Wall-clock at the CLI boundary: the train window IS the
-            // operator's now (the systemd timer cadence), and nothing
-            // here stamps audit_log directly — jobs-api does that on
-            // the far side of the HTTP calls.
+            // operator's now (the verb entry a person or the cadence
+            // loop fires), and nothing here stamps audit_log directly
+            // — jobs-api does that on the far side of the HTTP calls.
             train::run(phase, dry, chrono::Utc::now()).await
         }
         Commands::Queue { column } => queue::run(&column).await,

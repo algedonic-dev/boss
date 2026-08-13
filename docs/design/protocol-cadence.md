@@ -1,6 +1,6 @@
 # Design: protocol cadence — the clock coordinates, systemd supervises
 
-**Status:** draft — open questions tracked at `/system/design`
+**Status:** in-review — open questions tracked at `/system/design`
 **Origin:** David, 2026-08-12 (verbatim, `bacca14e`): "We should be
 using dispatcher to coordinate the conductor as well rather than
 systemd. We want every protocol internalized so we can measure,

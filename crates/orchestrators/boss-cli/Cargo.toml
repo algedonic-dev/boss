@@ -14,8 +14,9 @@ boss-ports = { path = "../../core/boss-ports" }
 boss-events = { path = "../../core/boss-events" }
 boss-nats = { path = "../../core/boss-nats" }
 boss-assets = { path = "../../modules/boss-assets", features = ["postgres"] }
+boss-clock-client = { path = "../../core/boss-clock-client" }
 boss-ledger = { path = "../../modules/boss-ledger", features = ["postgres"] }
-sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "json", "chrono"] }
 clap = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
@@ -28,6 +29,11 @@ dirs = "6"
 chrono = { workspace = true }
 uuid = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+[dev-dependencies]
+# DB-backed cadence tests (the firing claim's exactly-once contract
+# rides the cadence_firings primary key, which only Postgres can pin).
+boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
 
 [lints]
 workspace = true

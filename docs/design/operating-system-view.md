@@ -69,36 +69,6 @@ heuristic.
 
 ## Open questions
 
-### Q1: What is a node — an actor, a role, or a department?
-
-The measurement argues against individual actors: 200 nodes and 3,838
-edges is a hairball, and a named employee is rarely the interesting
-unit ("who does QA sign-off" beats "emp-aa-227 does"). Roles give 54
-human nodes plus 27 automation nodes, which is a readable graph and
-maps onto vocabulary the registry already owns.
-
-The cost is that roles hide load imbalance between people holding the
-same role, which is exactly the kind of thing an operator would want a
-map for. A defensible answer is role-level by default with expansion
-into individuals, but that is a real build rather than a default, so
-it should be chosen deliberately.
-
-### Q2: What is an edge — a handoff, a message, or both?
-
-Three candidates, and they are not the same network:
-
-- **Step handoff** — consecutive step completions on one Job by
-  different actors. This is the "Job moves through the org" reading,
-  and it is what the 58,650 number counts.
-- **Message** — `messages.message.sent` (54,543 events) is literally
-  actor-to-actor and needs no derivation.
-- **Dispatch** — a rule firing in response to another actor's event.
-  Already visualised at `/it/dispatcher` for rules alone.
-
-Drawing all three on one canvas without distinguishing them would make
-a picture that cannot be read. Drawing only one risks a map that
-contradicts what an operator sees elsewhere.
-
 ### Q3: Is this a live instrument or a historical map?
 
 A live view answers "what is my company doing right now" and makes the
@@ -122,16 +92,38 @@ become nodes in the existing graph — or the cascade becomes the
 drill-down for a single automation node on this map. Deciding late
 means building the second one twice.
 
-### Q5: Does the sim belong on the map?
-
-87% of the traffic is `_simulated`. On the public demo that IS the
-company and the map should show it. On a real deployment it would be
-noise, and worse, a map that silently blends simulated and real
-executors would misrepresent the organisation to someone making
-staffing decisions from it. A filter is the obvious answer; whether
-the default is "show" or "hide" is a judgement about who the surface
-is for.
-
 ## Decision history
 
-_None yet._
+**Q1 — What is a node? Resolved 2026-08-13 (David): a node is a
+station.** Verbatim: "Stations are the abstract priority queues we
+use to either route or hold job packet traffic until we have
+bandwidth or capability to handle the job packet in question. Actors
+will certainly have individual priority queues, but there are plenty
+of 'stations' that will be handled by groups of actors or be defined
+by constraints like having certain skills and authority. For example,
+at least each department needs a station queue, and we have the
+'stations' associated with the SDLC process that are queues where
+jobs can bundle up for periodic, higher-bandwidth or batch handling.
+These are all defined in data." Registered agents have stations too.
+Visual rollup of actor stations into team/department groupings is a
+view-level aggregation for clutter control — showing everyone is
+acceptable for now. Full definition: [stations.md](./stations.md).
+
+**Q2 — What is an edge? Resolved 2026-08-13 (David, by the same
+call): an edge is a route — packet motion between stations.**
+Queuing is separated from dispatching: stations hold, the dispatcher
+routes. Step handoffs are the default edge (that is the substrate's
+own motion); messages and dispatch firings render as distinct
+overlays, never silently blended into one graph.
+
+**Q5 — Does the sim belong on the map? Resolved 2026-08-13
+(David): real vs simulated is fixed on the packet at creation.**
+Verbatim: "jobs are the new packets, and we said a job is created as
+real or simulated, and all event/data/state information happens
+within a job, so we should have a much easier time discriminating
+between sim and real packets." Discrimination is a packet-attribute
+read, not an event-payload heuristic; surfaces show sim traffic
+visibly marked (the packet-card dashed/SIM grammar), never blended.
+Core follow-up: `simulated` becomes a first-class job field stamped
+at admission, inherited by the job's events — replacing tag-sniffing
+and `_simulated` payload inspection.

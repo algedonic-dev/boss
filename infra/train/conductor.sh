@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# conductor.sh — entry point for the pr-train conductor. The logic
-# lives in `boss train` (crates/orchestrators/boss-cli/src/train.rs)
-# since directive 26d61c97 retired python from the BOSS system; this
-# shim survives so the systemd units, a terminal, and a dry run all
-# invoke it the same way — with the flags they always passed.
+# conductor.sh — terminal entry point for the pr-train conductor. The
+# logic lives in `boss train` (crates/orchestrators/boss-cli/src/
+# train.rs) since directive 26d61c97 retired python from the BOSS
+# system. The systemd timers that used to enter here are gone
+# (protocol-cadence): the schedule is rows in the cadence_rules
+# registry, executed by the supervised `boss train cadence` loop
+# (boss-train.service). This shim survives for humans — a terminal
+# and a dry run keep the flags they always passed.
 #
 #   ./infra/train/conductor.sh                  # reconcile + board
 #   ./infra/train/conductor.sh --reconcile-only # advance open trains only
@@ -11,7 +14,7 @@
 set -euo pipefail
 
 # build-release.sh resolves cargo from CARGO_BIN or $HOME — under the
-# timer HOME is the service user's, which is where the toolchain lives.
+# cadence service HOME is the service user's, where the toolchain lives.
 
 # Translate the historical flags to `boss train` verbs. --preflight
 # wins over --reconcile-only, same as the python argv scan (preflight

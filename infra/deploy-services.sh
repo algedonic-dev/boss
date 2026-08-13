@@ -218,17 +218,9 @@ TIMERS=(
     # boss-rebuild-all nothing refreshed it. Measured stale at 0.5% job
     # coverage on a live box: search could not find 99% of the corpus.
     "boss-search-reindex:."
-    # The twice-daily PR train: batches ready branches into one PR and
-    # records CI/merge/deploy evidence on the pr-train Job. The
-    # conductor is `boss train` (crates/orchestrators/boss-cli), entered
-    # through infra/train/conductor.sh.
-    "boss-pr-train:train"
-    # Reconcile-only sibling on a 10-minute cadence: records CI/merge
-    # evidence and lands merged trains near the event instead of at
-    # the next boarding window — the stage-duration measurements and
-    # the notify_on_done alerts are only as honest as this cadence.
-    # Never boards, so the 2/day PR budget is untouched.
-    "boss-pr-train-reconcile:train"
+    # The PR train's timers are gone (protocol-cadence): the schedule
+    # is rows in the cadence_rules registry (114-cadence-rules.sql),
+    # executed by the boss-train daemon below. See RETIRED_TRAIN_TIMERS.
     # boss-backup: previously deferred over destination + retention
     # review — but the UNIT is live on this box regardless, and the
     # maintenance family (internal-forge Q6) needs deploy to own the
@@ -262,6 +254,23 @@ TIMERS=(
 # service-outside-the-deploy-list rot class (cybernetics, 2026-07-13).
 DAEMONS=(
     "boss-event-relay:events"
+    # The train conductor's cadence loop (`boss train cadence`,
+    # docs/design/protocol-cadence.md): evaluates the cadence_rules
+    # registry against boss-clock time and fires the train verbs the
+    # rows name, recording every firing in cadence_firings. This unit
+    # replaces the boss-pr-train / boss-pr-train-reconcile timer pair
+    # — systemd keeps the process alive, the rules own the schedule.
+    "boss-train:train"
+)
+
+# Units whose scheduling knowledge moved into the cadence_rules
+# registry (protocol-cadence). Left enabled they would keep firing the
+# 06:00/18:00 boarding beside the rules, so the deploy retires them
+# from boxes that still carry them. The flock made the overlap safe;
+# the double schedule is what must not survive.
+RETIRED_TRAIN_TIMERS=(
+    boss-pr-train
+    boss-pr-train-reconcile
 )
 
 port_of() {
@@ -1354,8 +1363,8 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
         install -m 0644 "$tmr_src" "/etc/systemd/system/${stem}.timer"
         # Stage the timer's binary if it's been built. The unit stem
         # matches the binary name (e.g. boss-ledger-recognize); pure-
-        # script timers (boss-pr-train, boss-deploy-confirm) have no
-        # binary and SKIP here, which is fine.
+        # script timers (boss-deploy-confirm) have no binary and SKIP
+        # here, which is fine.
         stage_binary "$stem"
         echo "  installed $stem unit + timer"
     done
@@ -1423,6 +1432,19 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
             echo "  enabled ${stem}.timer"
         fi
     done
+
+    # Retire the train's timer pair wherever it survives: the schedule
+    # lives in cadence_rules now, and an enabled timer would keep the
+    # old wall-clock boarding firing beside the rules.
+    for stem in "${RETIRED_TRAIN_TIMERS[@]}"; do
+        if [[ -f "/etc/systemd/system/${stem}.timer" ]]; then
+            systemctl disable --now "${stem}.timer" >/dev/null 2>&1 || true
+            rm -f "/etc/systemd/system/${stem}.timer" \
+                  "/etc/systemd/system/${stem}.service"
+            echo "  retired ${stem}.timer (schedule moved to cadence_rules)"
+        fi
+    done
+    systemctl daemon-reload
 
     # Q4: arm the dead-man switch — a SEPARATE unit, never in-process
     # waiting here (a dead-man that dies with the deployer reverts

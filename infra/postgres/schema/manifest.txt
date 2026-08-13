@@ -39,3 +39,4 @@
 111-gateway-audit-events.sql
 112-event-kinds-workflow-registry.sql
 113-event-kinds-step-plugins.sql
+114-cadence-rules.sql

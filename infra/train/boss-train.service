@@ -1,0 +1,35 @@
+[Unit]
+Description=BOSS train conductor — cadence loop (rules fire the verbs; systemd keeps the process alive)
+Documentation=file:/opt/boss/docs/design/protocol-cadence.md
+After=network-online.target postgresql.service boss-clock-api.service boss-jobs-api.service
+Wants=network-online.target
+
+[Service]
+# The scheduling knowledge that used to live in this directory's two
+# timers (06:00/18:00 boarding, 10-minute reconcile) is now rows in
+# the cadence_rules registry (infra/postgres/schema/114-cadence-rules.sql):
+# each rule names the `boss train` verb it fires, its basis
+# (wall | clock | queue-depth) and parameters. This unit is what
+# remains for the OS to do — keep the executor alive. Changing the
+# train's cadence is a registry edit, not a unit-file edit.
+#
+# The loop evaluates rules against boss-clock time, claims a
+# deterministic firing row per window (exactly-once across restarts
+# and instances), and runs the verb as a child of the same binary —
+# so the conductor's flock, journal lines, and exit codes behave
+# exactly as they did under the timers.
+User=david
+# /var/lib/boss-train — the conductor's own clone + lock live here,
+# never in the dev working tree.
+StateDirectory=boss-train
+WorkingDirectory=/opt/boss
+ExecStart=/usr/local/bin/boss train cadence
+Environment=RUST_LOG=info
+# Box-local conductor env (BOSS_TRAIN_FORGE, BOSS_TRAIN_AUTO_MERGE,
+# BOSS_JOBS_URL overrides, …) rides in a drop-in, same as it did on
+# the timer units. Verb children inherit it.
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,6 @@
 # Design: protocol experiments — variants as data, verdicts from the log
 
-**Status:** draft — open questions tracked at `/system/design`
+**Status:** in-review — open questions tracked at `/system/design`
 **Origin:** David, 2026-08-12 (verbatim): "We can definitely take
 empirical data from our train deployment protocol and use that to
 propose changes. We haven't really exercised our capabilities for

@@ -52,7 +52,7 @@ use serde_json::{Map, Value, json};
 
 const ACTOR: &str = "automation:train-conductor";
 
-fn boss_user() -> String {
+pub(crate) fn boss_user() -> String {
     json!({
         "id": ACTOR, "role": "platform-admin", "access_tier": "operator",
         "territory_account_ids": [], "direct_report_ids": [], "department": "platform",
@@ -70,7 +70,7 @@ pub enum Phase {
     Run,
 }
 
-fn env_or(key: &str, default: &str) -> String {
+pub(crate) fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
@@ -264,7 +264,7 @@ fn preflight(cfg: &Config) -> Result<Vec<String>> {
 
 /// The list body, whether or not the endpoint wrapped it in
 /// `{"data": [...]}`.
-fn rows(resp: Option<Value>) -> Result<Vec<Value>> {
+pub(crate) fn rows(resp: Option<Value>) -> Result<Vec<Value>> {
     let resp = resp.ok_or_else(|| anyhow!("empty response for a list call"))?;
     let list = match resp {
         Value::Object(mut o) if o.contains_key("data") => o.remove("data").unwrap_or(Value::Null),
@@ -332,6 +332,28 @@ fn metadata_map(v: &Value) -> Map<String, Value> {
         Some(Value::Object(m)) => m.clone(),
         _ => Map::new(),
     }
+}
+
+/// Is this ship-a-change Job a parked ready car — at review with a
+/// branch declared and not already on a train? ONE definition, shared
+/// by the boarding collector below and the cadence loop's dock-depth
+/// probe (`boss train cadence`, the queue-depth basis): the count that
+/// fires a boarding must be the same predicate boarding itself uses.
+/// (The fork-branch existence check stays in `candidates` — it needs
+/// the clone, and a car whose branch was never pushed still occupies
+/// the dock from the author's point of view.)
+pub(crate) fn parked_ready(job: &Value) -> bool {
+    let md = job.get("metadata").cloned().unwrap_or(Value::Null);
+    let branch = md.get("branch").and_then(Value::as_str).unwrap_or_default();
+    if branch.is_empty() || truthy(md.get("train")) || branch.starts_with("train/") {
+        return false;
+    }
+    let review = find_step(job, "review", "Open for review");
+    let review_status = review
+        .and_then(|s| s.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    review_status == "ready" || review_status == "active"
 }
 
 // The DRY log lines mirror the python conductor's dict/list reprs —
@@ -1015,23 +1037,15 @@ impl Conductor {
         for j0 in listed {
             let jid = job_id(&j0)?.to_string();
             let j = self.get_job(&jid).await?;
-            let md = j.get("metadata").cloned().unwrap_or(Value::Null);
-            let branch = md
-                .get("branch")
+            if !parked_ready(&j) {
+                continue;
+            }
+            let branch = j
+                .get("metadata")
+                .and_then(|m| m.get("branch"))
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            if branch.is_empty() || truthy(md.get("train")) || branch.starts_with("train/") {
-                continue;
-            }
-            let review = find_step(&j, "review", "Open for review");
-            let review_status = review
-                .and_then(|s| s.get("status"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if !(review_status == "ready" || review_status == "active") {
-                continue;
-            }
             let ok = sh_unchecked(&[
                 "git",
                 "-C",
@@ -1394,4 +1408,61 @@ pub async fn run(phase: Phase, dry: bool, now: DateTime<Utc>) -> Result<()> {
         conductor.board(now).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parked_ready;
+    use serde_json::json;
+
+    /// A car parked at review, branch pushed, not on a train.
+    fn ready_car() -> serde_json::Value {
+        json!({
+            "id": "car-1",
+            "metadata": {"branch": "feat/x"},
+            "steps": [
+                {"spec_slug": "review", "title": "Open for review", "status": "ready"}
+            ],
+        })
+    }
+
+    #[test]
+    fn a_car_at_review_with_a_branch_is_parked_ready() {
+        assert!(parked_ready(&ready_car()));
+        let mut active = ready_car();
+        active["steps"][0]["status"] = json!("active");
+        assert!(parked_ready(&active));
+    }
+
+    #[test]
+    fn a_car_without_a_branch_is_not_ready() {
+        let mut j = ready_car();
+        j["metadata"] = json!({});
+        assert!(!parked_ready(&j));
+        j["metadata"] = json!({"branch": ""});
+        assert!(!parked_ready(&j));
+    }
+
+    #[test]
+    fn a_car_already_on_a_train_is_not_ready() {
+        let mut j = ready_car();
+        j["metadata"]["train"] = json!("train-job-id");
+        assert!(!parked_ready(&j));
+        // A train's own branch is never a car either.
+        let mut t = ready_car();
+        t["metadata"]["branch"] = json!("train/20260812-0600");
+        assert!(!parked_ready(&t));
+    }
+
+    #[test]
+    fn a_car_not_yet_at_review_is_not_ready() {
+        let mut j = ready_car();
+        j["steps"][0]["status"] = json!("pending");
+        assert!(!parked_ready(&j));
+        j["steps"][0]["status"] = json!("completed");
+        assert!(!parked_ready(&j));
+        // No review step at all.
+        j["steps"] = json!([]);
+        assert!(!parked_ready(&j));
+    }
 }
