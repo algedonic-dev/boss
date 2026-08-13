@@ -5,8 +5,8 @@
 to see job packets moving more dynamically across the network as we
 work them. We are still missing good visuals for the IT department
 to watch our information trains."
-**Related**: [it-activity-network.md](./it-activity-network.md) — the
-canvas this board sits beside; trains are consists of packets ·
+**Related**: [stations.md](./stations.md) — the nodes this board
+sits beside; trains are consists of packets ·
 [job-packet-network.md](./job-packet-network.md) — cars couple via
 `job_edges`; the board is a queue lens ·
 [queue-visibility.md](./queue-visibility.md) ·

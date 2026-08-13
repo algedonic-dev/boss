@@ -8,7 +8,8 @@ trains, deployed periodically … I think we also have maintenance
 missing here."
 **Related**: [dev-cluster.md](./dev-cluster.md) (declared this as
 the after-runners direction) · [idm-kanidm.md](./idm-kanidm.md) ·
-[it-activity-network.md](./it-activity-network.md)
+[stations.md](./stations.md) — the forge and its runners become
+instrumented stations
 
 ## What internalizing buys
 

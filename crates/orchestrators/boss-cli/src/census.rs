@@ -1180,7 +1180,16 @@ mod tests {
     }
 
     fn station(name: &str, predicate: StationPredicate) -> StationSpec {
-        let mut s = StationSpec::draft(name, name, StationKind::Batch, predicate);
+        // `now` is threaded in explicitly since the no-wallclock lint
+        // moved the clock out of the constructor; a test fixture is the
+        // one place a literal Utc::now() is honest.
+        let mut s = StationSpec::draft(
+            name,
+            name,
+            StationKind::Batch,
+            predicate,
+            chrono::Utc::now(),
+        );
         s.status = WorkflowStatus::Active;
         s
     }

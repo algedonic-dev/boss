@@ -88,23 +88,50 @@ All three converge: the company *is* its event log + its current state
 + the rules connecting them. Design choices that respect that
 convergence land cleanly; ones that don't accumulate fragility.
 
-### Reading frame: BOSS is a human-powered state machine
+### Reading frame: the three layers
 
-BOSS is the software layer of a state machine whose executors are humans
-(and, increasingly, agents). The software does not *run* the business;
-it *describes* it as a state machine and gives the executors
-instrumentation to run it safely. Concretely: the event log + projections
-are the machine's memory; the StepType registry is the alphabet of legal
-transitions; Workflow is the program written in that alphabet; a Step's
-`status` is the program counter; Messages + My Day are the work-routing
-surface (not to be confused with the `boss-dispatcher` core service,
-which runs step side-effect rules off `step.done.<kind>` topics);
-policy is the privilege model on CPUs. Agents are additional CPUs in
-the same machine, not a separate system. This framing is load-bearing
-for design review — if you're about to add a new workflow, a new page,
-or a new abstraction, read it against the invariants in
-[docs/design/human-powered-state-machine.md](docs/design/human-powered-state-machine.md)
-first.
+**The network is the substrate. The fat protocols dictate the current
+operating model. The actors run it.** (David, 2026-08-13.) Three layers,
+each replaceable without disturbing the others — which is what lets a
+company change how it works without rebuilding what it works *on*:
+
+- **The network is the substrate.** Packets (a Job is an immutable
+  envelope + a protocol set fixed at admission), stations (data-defined
+  priority queues that route or hold packets until there is bandwidth or
+  capability), routes, the log, and the one admission edge. This layer is
+  physics — it has no opinion about what the work *means*.
+- **The fat protocols dictate the current operating model.** Workflows
+  are protocols, and the meaning lives in the protocol row, not in the
+  endpoints: steps, the predicates that order them, the evidence each
+  requires, the terminals, the obligations. That is why protocols are
+  **registry data** — versioned, append-only, in-flight packets pinned to
+  the version they were admitted under. "The **current** operating model"
+  is load-bearing: a protocol that cannot be replaced without a deploy
+  has leaked into the substrate, and that leak is the defect to hunt.
+- **The actors run it.** Humans and registered agents are the CPUs —
+  nothing moves without an actor claiming a step and doing it. Capability
+  is enforced at the claim; bandwidth is finite, which is why stations
+  hold rather than drop. Actors are not users of the system; they are the
+  part of it that executes.
+
+Canonical statement:
+[docs/design/the-three-layers.md](docs/design/the-three-layers.md).
+
+**The "human-powered state machine" reading is the execution lens over
+this, not the foundation.** It answers "how does one packet get
+executed": the event log + projections are the machine's memory; the
+StepType registry is the alphabet of legal transitions; Workflow is the
+program written in that alphabet; a Step's `status` is the program
+counter; My Day / assignments is an actor's station rendered (not to be
+confused with the `boss-dispatcher` core service, which runs step
+side-effect rules off `step.done.<kind>` topics); policy is the privilege
+model on CPUs. Its invariants still hold — human and agent executors are
+CPUs in the same machine, not a separate system, and new work types are
+registry rows, never bespoke core code paths. Read a new workflow, page,
+or abstraction against both frames; when they disagree, **the network
+framing wins**, because it is the one that survives changing the
+operating model. The lens and its invariants:
+[docs/design/human-powered-state-machine.md](docs/design/human-powered-state-machine.md).
 
 The five-property correctness protocol (provenance, conservation,
 closure, idempotence, determinism) named in §Founding ideas above is

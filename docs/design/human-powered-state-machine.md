@@ -1,13 +1,29 @@
-# Design: BOSS as a Human-Powered State Machine
+# Design: the human-powered state machine — the execution lens
 
 **Status**: approved — framing doc; no implementation work.
-**Related**: [architecture-diagram.md](../architecture-diagram.md) ·
+**This is a lens, not the foundation.** The primary frame is
+[the-three-layers.md](./the-three-layers.md): *the network is the
+substrate, the fat protocols dictate the current operating model, the
+actors run it.* This doc is the **execution lens** over those three
+layers — it answers "how does a single packet get executed", and it is
+a good frame for that: the log as memory, the StepType registry as the
+instruction alphabet, a step's `status` as a program counter, policy as
+the privilege model. It is not the substrate; the network is. **When
+the two framings disagree in a design argument, the network framing
+wins**, because it is the one that survives changing the operating
+model. Read everything below with that pointer in mind: where this
+doc says "the machine", the three-layer frame says "the substrate plus
+the protocol a packet is pinned to"; where it says "CPU", that is an
+**actor** (layer 3), unchanged.
+**Related**: [the-three-layers.md](./the-three-layers.md) — the primary
+frame this is a lens over ·
+[architecture-diagram.md](../architecture-diagram.md) ·
 [CLAUDE.md](../../CLAUDE.md) ·
 [extending-boss.md](./extending-boss.md)
 
 ---
 
-## The framing
+## The framing (as a lens)
 
 **BOSS is the software layer of a state machine whose executors are
 humans (and, increasingly, agents).** The software does not *run* the

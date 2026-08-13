@@ -43,6 +43,19 @@ fn rust_job() -> String {
     rest[..end].to_string()
 }
 
+/// The `test`-job slice of the Forgejo workflow — the job that carries
+/// the Postgres service, and so the only one that can run the gate's
+/// DB-backed test phase. `test` is the last job in the file, so the
+/// slice runs to the end; a job appended after it would be swept in,
+/// which only ever makes the no-second-definition check stricter.
+fn forge_test_job() -> String {
+    let ci = read(".forgejo/workflows/ci.yml");
+    let start = ci
+        .find("\n  test:")
+        .expect(".forgejo/workflows/ci.yml has a test job");
+    ci[start + 1..].to_string()
+}
+
 #[test]
 fn ci_rust_job_invokes_the_gate_script() {
     let job = rust_job();
@@ -71,6 +84,49 @@ fn ci_rust_job_has_no_inline_second_definition() {
             "ci.yml's rust job inlines `{needle}` beside infra/gate.sh — \
              the gate now has two definitions again; move the check into \
              the script"
+        );
+    }
+}
+
+/// The forge workflow is the one that actually gates a train — since
+/// the 2026-08-12 cutover, `.github/workflows/ci.yml` runs on the
+/// public mirror while every car lands through Forgejo. It ran
+/// locomotive + fmt + clippy + migrate + build + test and NOT the
+/// script, so the whole lint roster was unenforced in production for a
+/// day and thirteen trains landed green over a real `no-wallclock`
+/// violation. The pin above only ever knew about the GitHub file,
+/// which is why nothing caught it. It knows about both now.
+#[test]
+fn forge_test_job_invokes_the_gate_script() {
+    let job = forge_test_job();
+    assert!(
+        job.contains("infra/gate.sh"),
+        ".forgejo/workflows/ci.yml's test job does not invoke \
+         infra/gate.sh — the workflow that gates every train has \
+         forked away from the gate's definition"
+    );
+}
+
+#[test]
+fn forge_test_job_has_no_inline_second_definition() {
+    let job = forge_test_job();
+    // Same rule as the GitHub job: environment setup (services, schema
+    // apply) stays in the workflow, checks live in the script. The
+    // `fast` job's fmt + clippy are deliberately outside this slice —
+    // they are a duplicated fast-signal loop, not a second definition.
+    let inline_checks = [
+        "run: cargo clippy",
+        "run: cargo test",
+        "run: cargo build",
+        "run: cargo fmt",
+        "run: infra/lint/",
+    ];
+    for needle in inline_checks {
+        assert!(
+            !job.contains(needle),
+            ".forgejo/workflows/ci.yml's test job inlines `{needle}` \
+             beside infra/gate.sh — the gate now has two definitions \
+             again; move the check into the script"
         );
     }
 }

@@ -136,11 +136,20 @@ pub struct StationSpec {
 
 impl StationSpec {
     /// Convenience constructor for tests + seeds.
+    ///
+    /// `now` is the caller's clock reading, taken as a parameter for
+    /// the same reason every write method on [`StationRegistry`] takes
+    /// one: only the clock service reads wall time, so a row's
+    /// `created_at` is stamped with whatever `now` the caller was
+    /// handed — sim-time under a sim deploy, wall time otherwise. A
+    /// constructor that called `Utc::now()` itself would stamp wall
+    /// time regardless of clock-api mode (`infra/lint/no-wallclock.sh`).
     pub fn draft(
         name: impl Into<String>,
         title: impl Into<String>,
         kind: StationKind,
         predicate: StationPredicate,
+        now: DateTime<Utc>,
     ) -> Self {
         Self {
             name: name.into(),
@@ -154,7 +163,7 @@ impl StationSpec {
             terminal_window_days: None,
             capability: None,
             rollup_parent: None,
-            created_at: Utc::now(),
+            created_at: now,
         }
     }
 
@@ -771,6 +780,7 @@ mod tests {
                 kind: Some("ship-a-change".into()),
                 ..Default::default()
             },
+            Utc::now(),
         )
     }
 

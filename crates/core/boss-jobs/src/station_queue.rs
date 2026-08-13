@@ -433,7 +433,7 @@ mod tests {
     use super::*;
     use crate::stations::{StationKind, StationSpec};
     use boss_core::job::{JobId, Subject};
-    use chrono::NaiveDate;
+    use chrono::{NaiveDate, Utc};
 
     fn day(d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 8, d).unwrap()
@@ -681,6 +681,7 @@ mod tests {
                 kind: Some("ship-a-change".into()),
                 ..Default::default()
             },
+            Utc::now(),
         );
         s.wip_limit = wip_limit;
         s
@@ -917,6 +918,7 @@ mod tests {
             "Packets I filed",
             StationKind::Actor,
             watchlist_predicate(),
+            Utc::now(),
         );
         spec.discipline = vec![DisciplineKey::Recency];
         spec.terminal_window_days = Some(14);
@@ -960,6 +962,7 @@ mod tests {
             "Packets I filed",
             StationKind::Actor,
             watchlist_predicate(),
+            Utc::now(),
         );
         spec.terminal_window_days = Some(14);
         let packets = vec![

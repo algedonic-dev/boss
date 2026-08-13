@@ -1,0 +1,409 @@
+# docs/invariants.toml — the invariant register.
+#
+# Every load-bearing invariant declares how it is held
+# (docs/design/design-conformance.md, "The mechanism"). A claim with
+# no enforcement is indistinguishable, at a glance, from one with
+# enforcement; this file is what makes the difference visible.
+#
+# FIELDS (all seven keys are required on every entry;
+# infra/lint/invariant-register.sh checks the shape, never the claim):
+#
+#   id             stable slug, unique across the file. Never recycled:
+#                  a conformance finding cites an id, so an id that
+#                  changes meaning silently rewrites history.
+#   claim          one sentence, quotable, in the design's own words.
+#   source         the doc or file that states it.
+#   enforcement    enforced | checked | unenforced
+#                    enforced   — a lint, a test, or a type makes
+#                                 violation impossible or loud.
+#                    checked    — verified periodically by inspection
+#                                 or by a protocol that produces
+#                                 findings.
+#                    unenforced — nothing holds it. This is not a sin;
+#                                 it is debt, and writing it down is
+#                                 what makes it visible.
+#   mechanism      enforced   → the lint/test path (must exist on disk)
+#                  checked    → the verification method
+#                  unenforced → empty
+#   last_verified  YYYY-MM-DD. Required for `checked`.
+#   note           why unenforced, or what would enforce it. Required
+#                  for `unenforced`.
+#
+# The lint enforces the DECLARATION, not the strength. An author may
+# write `unenforced`, and that honesty is the point — anything else
+# turns the rule into pressure to fake enforcement (design-conformance
+# Q2).
+#
+# Seeded 2026-08-13 by audit, not by transcription: every `enforced`
+# entry below was opened and read to confirm the mechanism actually
+# checks the claim. Three claims that read as enforced did not survive
+# that reading and are recorded `unenforced` — see
+# `dispatcher-rules-only-shrink`, `gate-roster-is-complete`, and
+# `spa-lists-are-generated`.
+
+
+# =====================================================================
+# Tiering and dependency direction
+# =====================================================================
+
+[[invariant]]
+id = "tier-1-does-not-depend-on-tier-2"
+claim = "Tier-1 (core) library crates must NOT depend on Tier-2 (modules) or Tier-3 (tenants) crates."
+source = "infra/lint/tier-import-audit.sh; CLAUDE.md §Rust Conventions/Structure; docs/architecture-decisions.md"
+enforcement = "enforced"
+mechanism = "infra/lint/tier-import-audit.sh"
+last_verified = ""
+note = "The same script carries the DB analogue: a core schema file (00-09) must not hard-FK a table owned by a Tier-2 module file (10-40). Orchestrators are explicitly exempt — fanning out across tiers is their purpose."
+
+[[invariant]]
+id = "sim-speaks-only-the-public-api"
+claim = "Code that runs OUTSIDE the system (the simulator, tenant engine drivers, seed loaders) must interact with the system only through its public HTTP API."
+source = "infra/lint/sim-boundary-audit.sh"
+enforcement = "enforced"
+mechanism = "infra/lint/sim-boundary-audit.sh"
+last_verified = ""
+note = "Allowlist grandfathers the six violators found at the v1.0.10 audit; migrating each off the allowlist is the open work. The lint fails on any NEW path dep from a sim-side crate onto a module implementation crate. CAVEAT — it is enforced in CI only: the dep-extraction awk uses `\\s`, a GNU extension, so on BSD awk (macOS) it matches nothing and the run reports '0 dep declarations scanned' while still exiting 0. A local infra/gate.sh on a Mac gets no coverage from this lint."
+
+
+# =====================================================================
+# Registries over code paths
+# =====================================================================
+
+[[invariant]]
+id = "step-kind-names-are-data"
+claim = "No core code may match on a step-kind name — code dispatches on properties and mechanism enums; kind names are data (registry rows + rule topics + seeds)."
+source = "infra/lint/no-step-kind-match.sh; docs/architecture-decisions.md §Step types are property bundles"
+enforcement = "enforced"
+mechanism = "infra/lint/no-step-kind-match.sh"
+last_verified = ""
+note = "The kind vocabulary is read live from crates/core/boss-jobs/seeds/step_types.toml, so the lint tracks the catalog without a second hand-maintained list. Allow-list is a ratchet holding two permanent platform pins. Requires bash 4 (associative arrays) — it cannot run on macOS's bash 3.2."
+
+[[invariant]]
+id = "workflow-rows-not-code"
+claim = "Adding a new workflow means adding a Workflow row, not touching core code."
+source = "CLAUDE.md §Primitives/Jobs"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "Nothing checks that a new work type landed as data rather than as Rust. `no-step-kind-match` catches the most common SHAPE of the violation (a match on a kind name) but a new bespoke code path that dispatches on any other property passes it. Enforcing this needs a census of workflow-shaped branches, not a grep."
+
+
+# =====================================================================
+# The event log
+# =====================================================================
+
+[[invariant]]
+id = "audit-log-is-append-only"
+claim = "audit_log is append-only: UPDATE, DELETE and TRUNCATE are rejected."
+source = "infra/postgres/schema/02-events.sql; docs/design/transactional-audit-log.md"
+enforcement = "enforced"
+mechanism = "infra/postgres/schema/02-events.sql"
+last_verified = ""
+note = "Two independent layers: BEFORE UPDATE OR DELETE and BEFORE TRUNCATE triggers that RAISE, plus REVOKE UPDATE, DELETE, TRUNCATE ON audit_log FROM PUBLIC. Layer 3 is the per-row sha256 chain (row_hash = sha256(prev_hash || canonical))."
+
+[[invariant]]
+id = "events-record-on-the-outbox-not-post-commit"
+claim = "NO crate may call the post-commit publish APIs; domain writes record their event on the transactional outbox, inside the same transaction as the state."
+source = "infra/lint/outbox-migration-ratchet.sh; docs/design/transactional-audit-log.md"
+enforcement = "enforced"
+mechanism = "infra/lint/outbox-migration-ratchet.sh"
+last_verified = ""
+note = "A flat ban since the migration completed 2026-07-28, not a ratchet — a brand-new crate that starts publishing post-commit fails CI immediately. Closes the swallowed-write class behind the 2026-07-13 replay-divergence incident."
+
+[[invariant]]
+id = "job-edges-resolve"
+claim = "Every Job-metadata key declared in the job_edges registry must reference a resolvable Job."
+source = "infra/postgres/schema/104-job-edges.sql"
+enforcement = "enforced"
+mechanism = "infra/postgres/schema/104-job-edges.sql"
+last_verified = ""
+note = "BEFORE INSERT OR UPDATE OF metadata trigger `jobs_check_job_edges_trg` on `jobs`, reading the edge set as data. Violation behaviour is dialled per-edge by `on_missing`; 105-job-edges-abort.sql moved the seeded edges to 'abort' and 110-waiting-on-edge.sql added a wildcard ('*') edge so a per-kind roster cannot drift."
+
+
+# =====================================================================
+# The clock
+# =====================================================================
+
+[[invariant]]
+id = "nothing-reads-the-wall-clock-but-the-clock"
+claim = "Every other \"now\" in BOSS must route through `state.clock.now().await.now` so the receiving service stamps audit_log via clock-api (sim or wall depending on deploy mode)."
+source = "infra/lint/no-wallclock.sh"
+enforcement = "enforced"
+mechanism = "infra/lint/no-wallclock.sh"
+last_verified = ""
+note = "Two passes: `Utc::now` on a word boundary in Rust, and SQL CURRENT_DATE / CURRENT_TIMESTAMP / NOW() inside Rust string literals. Closed the leak class that mis-stamped 116k audit rows in regen 18. The allow-list is large (~45 path prefixes) but each entry carries a written justification and the bar is stated: 'this path's Utc::now() never stamps an audit_log row.'"
+
+
+# =====================================================================
+# Deploy, schema, and secrets
+# =====================================================================
+
+[[invariant]]
+id = "every-deploy-converges-the-schema"
+claim = "Code, config and schema converge from the tree on every deploy."
+source = "infra/lint/schema-converge.sh"
+enforcement = "enforced"
+mechanism = "infra/lint/schema-converge.sh"
+last_verified = ""
+note = "Checks two things: every deploy entry point in the roster invokes infra/postgres/migrate.sh, and the init container's converge does not sit behind an early exit. The 2026-08-13 gap was exactly one `exit 0` above that line, and it let four migrations accumulate unapplied while every other layer rolled forward."
+
+[[invariant]]
+id = "schema-list-has-one-definition"
+claim = "The schema list has one definition."
+source = "CLAUDE.md §9a; crates/core/boss-testing/build.rs"
+enforcement = "enforced"
+mechanism = "crates/core/boss-testing/build.rs"
+last_verified = ""
+note = "Collapsed, not pinned: build.rs generates SCHEMA_FILES from infra/postgres/schema/manifest.txt, parsing it the same way migrate.sh does, and asserts by name that every manifest entry exists on disk. `generated_list_matches_the_manifest` in test_db.rs is the backstop against a stale OUT_DIR artifact."
+
+[[invariant]]
+id = "migrations-are-append-only"
+claim = "A schema change is a new file appended to the manifest, never an edit to an already-applied one; nothing is rolled back — roll-forward only."
+source = "docs/design/schema-migrations.md §The convention: applied migrations are history"
+enforcement = "enforced"
+mechanism = "infra/postgres/migrate.sh"
+last_verified = ""
+note = "The runner records a sha256 per applied entry and refuses the whole run BY NAME if a recorded file changed on disk: 'applied migrations are history; put the change in a new migration file'. Also holds the sibling claim that schema reaches a database only through migrate.sh — see `every-deploy-converges-the-schema`. Contract pinned by crates/core/boss-testing/tests/migrate_sh.rs."
+
+[[invariant]]
+id = "credentials-never-enter-the-tree"
+claim = "Manifests reference their secrets by name only; the Secret objects are created out-of-band."
+source = "infra/lint/no-secrets.sh; infra/cluster/manifests/README.md"
+enforcement = "enforced"
+mechanism = "infra/lint/no-secrets.sh"
+last_verified = ""
+note = "Seven credential-shaped patterns over every tracked file. The lint self-tests on every run — one planted fixture per pattern, each asserted caught — because a credential scanner nobody has proved is a credential scanner nobody should trust. Findings are redacted so the lint does not copy the secret into a CI log."
+
+[[invariant]]
+id = "deploy-fallback-matches-the-port-registry"
+claim = "The deploy-services.sh fallback arrays must stand alone when the binary is unbuilt, and must not drift from boss-ports."
+source = "CLAUDE.md §9a; crates/core/boss-ports/src/lib.rs"
+enforcement = "enforced"
+mechanism = "crates/core/boss-ports/src/lib.rs"
+last_verified = ""
+note = "An equality-test pin, not a collapse: `mod deploy_fallback_agreement` include_str!s infra/deploy-services.sh and asserts SOLO_SERVICES and PAIRED_SERVICES match the registry, naming the drifted entry. CLAUDE.md is explicit that a pin is a holding action, not a destination — the drift it caught left two services silently absent from a deploy."
+
+
+# =====================================================================
+# Data provenance at the write boundary
+# =====================================================================
+
+[[invariant]]
+id = "seeds-set-initial-conditions-only"
+claim = "Seed files set initial conditions only, never downstream artifacts that should emerge from a Job step.done."
+source = "docs/design/seed-vs-emergent-state.md; infra/lint/seed-bypass-smell.sh"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "THE MECHANISM SCANS ZERO FILES TODAY. seed-bypass-smell.sh globs examples/<tenant>/seeds/sql/*.sql, and no such file exists anywhere in the tree — the playground_*.sql bundles were retired for `--audit-log-seed` + boss-rebuild-all, and the run prints 'no seed sql files under examples/*/seeds/sql/' and exits 0. What the seeds ARE today is TOML and JSON (accounts.toml, products.toml, workflows.toml, classes.json, employees.json ...), and nothing scans those for downstream artifacts. The lint survives as a useful forward guard against reintroduced SQL seeds — its allowlist is deliberately empty so a new one trips on first commit — but a forward guard against a retired file format is not enforcement of the claim above. What would enforce it: teach the lint the TOML/JSON seed shapes, or assert the seed loader only ever calls public API endpoints."
+
+[[invariant]]
+id = "data-is-written-through-the-api"
+claim = "Domain + seed data is written by a SERVICE (behind its port adapter) reacting to a public-API call — never poured straight into the DB by a script or a seed binary."
+source = "infra/lint/api-path-bypass-smell.sh; docs/design/seed-vs-emergent-state.md"
+enforcement = "enforced"
+mechanism = "infra/lint/api-path-bypass-smell.sh"
+last_verified = ""
+note = "A direct-DB data write skips policy, validation, and the audit/event path the rest of the system is built on. Pg port adapters, rebuilders, DDL and reads are never flagged."
+
+[[invariant]]
+id = "dispatcher-calls-carry-the-rule-actor"
+claim = "Every downstream call a dispatcher handler makes must carry the rule-as-actor `x-boss-user` header."
+source = "infra/lint/dispatcher-actor-stamp.sh"
+enforcement = "enforced"
+mechanism = "infra/lint/dispatcher-actor-stamp.sh"
+last_verified = ""
+note = "Structural rather than a test, because an unauthenticated internal call is a latent outage that fires when somebody else adds a gate, possibly months later — handler tests mock the downstream service and pass whether or not the call is authenticated."
+
+
+# =====================================================================
+# Protocols can finish
+# =====================================================================
+
+[[invariant]]
+id = "a-protocol-must-be-able-to-finish"
+claim = "A spec may occupy the ACTIVE slot only if it is viable — every step reachable from a trigger, every step able to reach a terminal, the graph acyclic, and every fork point covering all values of its discriminating enum."
+source = "docs/design/correctness-protocol.md §Enforcement.1; crates/core/boss-jobs/src/workflow_lint.rs"
+enforcement = "enforced"
+mechanism = "crates/core/boss-jobs/src/workflow_lint.rs"
+last_verified = ""
+note = "`gate_active` is the publish gate, called from publish, publish_authored and bootstrap_reconcile in both adapters; a draft may still be SAVED unviable. Pinned end-to-end by crates/core/boss-jobs/tests/workflow_publish_gate.rs, whose assertion is that an unviable spec is refused at publish, not at the next pod roll. Provenance: the 2026-08-13 protocol-retro incident. A third layer runs at boot — crates/core/boss-jobs/src/workflow_quarantine.rs refuses to start against a broken registry, and refuses to strand open Jobs pinned to the offending row."
+
+
+# =====================================================================
+# The gate itself
+# =====================================================================
+
+[[invariant]]
+id = "the-gate-has-one-definition"
+claim = "The rust gate has ONE definition: infra/gate.sh."
+source = "infra/gate.sh; CLAUDE.md §9a; crates/core/boss-testing/tests/gate_sh.rs"
+enforcement = "enforced"
+mechanism = "crates/core/boss-testing/tests/gate_sh.rs"
+last_verified = ""
+note = "Two of the three tests hold this half: ci.yml's rust job must invoke the script, and must not grow a second inline definition (`run: cargo clippy` / `run: cargo test` / `run: cargo fmt` / `run: infra/lint/`) beside it. The roster-coverage half is a separate entry — see `gate-roster-is-complete`."
+
+[[invariant]]
+id = "gate-roster-is-complete"
+claim = "The script must keep covering the checks the gate exists to run — a trimmed roster is exactly the under-covering gate that let both #226 failures through."
+source = "crates/core/boss-testing/tests/gate_sh.rs"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "STATED AS ENFORCED, BUT THE MECHANISM DOES NOT CHECK IT. `gate_script_covers_the_checks` asserts a hardcoded 10-entry lint roster, while infra/gate.sh runs 13. dispatcher-rules-ratchet.sh, schema-converge.sh and no-secrets.sh are unpinned: deleting any of the three from gate.sh leaves the test green. Enforcing it means adding the three names to the roster array in that test (deliberately out of scope for the car that seeded this register)."
+
+[[invariant]]
+id = "boarded-head-sweep-deletes-only-what-it-carried"
+claim = "The sweep now deletes only what it can prove it carried: the head recorded at ASSEMBLY time must still be the branch's head."
+source = "crates/orchestrators/boss-cli/src/train.rs"
+enforcement = "enforced"
+mechanism = "crates/orchestrators/boss-cli/src/train.rs"
+last_verified = ""
+note = "`sweep_guard` is a pure decision function over (recorded, current) heads, so the four outcomes (Delete / Moved / NoRecord / Gone) are each unit-tested. Asking the forge FIRST is part of the invariant: record-first conflated 'we cannot vouch for this branch' with 'there is no such branch'. Provenance: car 23923b40 lost unmerged commits pushed after boarding."
+
+
+# =====================================================================
+# The five-property correctness protocol
+# docs/design/correctness-protocol.md — "Every Workflow, projection,
+# and adapter must satisfy all five."
+# =====================================================================
+
+[[invariant]]
+id = "correctness-provenance"
+claim = "Every recorded fact traces to a real event — no orphan rows, no manual INSERT stand-ins."
+source = "docs/design/correctness-protocol.md §The five properties.1"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "THE ONE NAMED MECHANISM IS VACUOUS TODAY. correctness-protocol.md §Enforcement.3 points at conservation-invariants.sh invariant E, but E filters `WHERE f.source_table = 'steps'` and no financial_facts row is steps-sourced — both the script (line 188: 'this is a future-state guard — passes trivially when no source_table=steps rows exist') and seed-vs-emergent-state.md §Enforcement.1 ('a forward guard today: it passes trivially') say so outright. The source_table values that ARE in use (invoices, payroll_runs, tax_filings, bank_settlements, revenue_schedules, brewery_seed_opening_balance) get no orphan check at all, and the doc's further claim that state tables like inventory_items inherit the same chain is checked nowhere. What would enforce it: widen E to every source_table in rebuild_facts.rs rather than waiting for steps-sourced facts to exist."
+
+[[invariant]]
+id = "correctness-conservation"
+claim = "For every conserved quantity, `in − out = stock` to the unit."
+source = "docs/design/correctness-protocol.md §The five properties.2"
+enforcement = "checked"
+mechanism = "infra/lint/conservation-invariants.sh — 22 SQL invariants (trial balance, inventory non-negative, GL control accounts 1300/1320/cash, accrual >= remittance for sales tax / payroll / deferred revenue, FG GL balance identical to sum of value_cents, period close reflects net P&L), run hourly in prod and inside infra/postgres/validate-brewery-sim.sh"
+last_verified = "2026-08-13"
+note = "The best-held of the five, and still `checked` rather than `enforced`: it needs a live populated DB and settles only over a full regen, so it cannot gate a PR. Scope is the brewery tenant's chart of accounts — the invariants are written against specific account numbers, so a second tenant inherits no coverage."
+
+[[invariant]]
+id = "correctness-closure"
+claim = "Every Job that opens reaches a terminal state."
+source = "docs/design/correctness-protocol.md §The five properties.3"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "The doc says stranded mid-flight Jobs 'are loose ends, and a periodic sweep surfaces them as Bulletins on Operations'. That sweep does not exist: no timer, script or handler looks for open Jobs that can no longer progress, and conservation-invariants.sh's C/D/F check only that ALREADY-closed jobs and paid invoices carry their closed_on / paid_on. The viability lint proves a protocol CAN finish, which is strictly weaker than every Job DOES. What would enforce it: a sweep over open Jobs with no ready step and no live assignee, emitting Bulletins — the conservation sweep's own header still carries the 'TODO: bulletin emission once the bus is wired' that blocks it."
+
+[[invariant]]
+id = "correctness-idempotence"
+claim = "Replaying the audit log into a fresh DB lands at the live state byte-for-byte."
+source = "docs/design/correctness-protocol.md §The five properties.4"
+enforcement = "checked"
+mechanism = "infra/verify-replay.sh diffs rebuilt against live state; infra/postgres/validate-brewery-sim.sh drives a 365-day regen through the live API then asserts 0 net drift across all 15 rebuilders; boss-ledger-replay-check.timer re-derives financial_facts and the journal nightly in prod (--deep)"
+last_verified = "2026-08-13"
+note = "Verified on demand and before a release cut, never in CI — the byte-for-byte claim is only actually exercised for the brewery tenant, and the nightly timer covers the ledger domain alone. infra/lint/idempotence-ratchet.sh is the one STATIC guard, and it holds a narrower claim than this one: it ratchets accumulating arithmetic (SET x = x + $n), which is the shape that double-applies on JetStream redelivery."
+
+[[invariant]]
+id = "correctness-determinism"
+claim = "Same inputs produce same outputs across runs — no wall-clock-derived random numbers in side effects, no nondeterministic ordering of within-step writes."
+source = "docs/design/correctness-protocol.md §The five properties.5"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "Half the claim has a mechanism and half has none. no-wallclock.sh holds the wall-clock clause statically. NOTHING checks the ordering clause: no lint, test or sweep asserts that within-step writes land in a deterministic order, and the nightly ledger replay would only surface it after the fact, in one domain, as an unexplained divergence. Recorded here as unenforced rather than enforced-by-no-wallclock because a register entry that cites a mechanism for half a claim is the exact ambiguity this file exists to remove."
+
+[[invariant]]
+id = "accumulating-mutations-are-a-ratchet"
+claim = "The event bus is at-least-once, so every handler must be safe to run twice on the same event; an ACCUMULATING mutation is not."
+source = "infra/lint/idempotence-ratchet.sh"
+enforcement = "enforced"
+mechanism = "infra/lint/idempotence-ratchet.sh"
+last_verified = ""
+note = "A ratchet, not a ban — accumulating arithmetic under a row lock is sometimes the right shape. Closes the 2026-06-16 class where non-idempotent on_hand mutations double-applied on redelivery and decoupled GL 1300/1320 from physical inventory, producing no error anywhere, just numbers that stopped reconciling."
+
+
+# =====================================================================
+# KNOWN DRIFTED — the five claims the design-conformance audit found
+# stated in authoritative docs and contradicted by the tree. Each is
+# entered with the state the CODE is actually in, not the state the
+# doc asserts. Repairing drift is a judgement call (is the doc wrong,
+# or the code?), so these escalate rather than self-resolve.
+# =====================================================================
+
+[[invariant]]
+id = "drift-every-executor-has-an-actor-station"
+claim = "Every executor has an `actor` station; `group` stations are served by a set of actors; `constraint` stations gate membership by capability predicates."
+source = "docs/design/stations.md; restated in infra/postgres/schema/116-stations.sql"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "DOES NOT HOLD TODAY. The stations table ships exactly two seeded rows, both kind='batch' (loading-dock, design-review). There are no actor, group or constraint rows anywhere in the tree, and no authoring API to create them — crates/core/boss-jobs/src/http/mod.rs routes only GET /api/stations and GET /api/stations/{name}/queue, so the registry is read-only in both adapters. The schema comment defends the gap ('actor and group stations are TENANT data'), but no tenant seed creates one either. Judgement call pending: ship the authoring surface, or narrow the doc to the batch stations that exist."
+
+[[invariant]]
+id = "drift-a-queue-is-a-lens-not-a-structure"
+claim = "A queue is a lens … never a reified structure."
+source = "docs/design/queue-visibility.md; docs/design/views-as-queue-lenses.md"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "DOES NOT HOLD TODAY. The station registry ships as rows: infra/postgres/schema/116-stations.sql creates a `stations` table with a primary key, a versioning discipline and a partial unique index. The lens half survives inside each row — membership is derived by evaluating `predicate` over open Jobs at read time, with no mutable current-station field on the packet — so the accurate statement is that queue MEMBERSHIP is a lens while the queue's IDENTITY is reified. Judgement call pending: the doc's absolute is what drifted, not the schema."
+
+[[invariant]]
+id = "drift-group-role-mapping-is-a-registry"
+claim = "Group→role mapping is a registry, not gateway code."
+source = "docs/design/idm-kanidm.md"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "DOES NOT HOLD TODAY, AND DELIBERATELY SO. crates/core/boss-gateway/src/oidc.rs has no such registry and says why at the top of the file: 'an IdP-group→role mapping would be a second source of role truth, so it is deliberately absent (phase 2 may revisit)'. Roles come off the employee row, the same as local login. This is the case where the CODE is right and the doc owes the edit."
+
+[[invariant]]
+id = "drift-systemd-demoted-to-supervision"
+claim = "systemd is demoted to supervision — cadence moves out of timers."
+source = "implied by the cadence work; docs/design/protocol-cadence.md"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "PARTIAL AT BEST. The TRAIN's timers retired; 12 systemd timers remain in the tree (boss-views-catchup, boss-search-reindex, boss-deploy-confirm, boss-backup, boss-audit-integrity-check, boss-messages-events-purge, boss-ledger-recognize, boss-ledger-replay-check, boss-files-gc, boss-conservation-invariants, boss-ml-inference-batch, cluster-deploy-runner). Several are load-bearing for OTHER entries in this register — the conservation sweep and the ledger replay check are the mechanisms behind three of the five correctness properties — so demoting them is not a free move. What would enforce it: a ratchet on the .timer file count, once a target number is agreed."
+
+[[invariant]]
+id = "drift-crate-roster-counts"
+claim = "The core state-machine OS lives under crates/core/ (27 crates) … the modules tier (16 crates) … cross-tier orchestrators (5) … tenants (2)."
+source = "CLAUDE.md §10 and §Rust Conventions/Structure (stated twice)"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "WRONG IN THE TREE AS OF 2026-08-13: the real counts are 29 core, 18 modules, 6 orchestrators, 2 tenants. docs/design/testing-strategy.md repeats '0 violations across 27 core crates' and inherits the error. A hand-counted roster in prose is the drift class CLAUDE.md §9a exists to name, and it has now drifted in three files at once. What would enforce it: count the directories under each tier and compare, or stop stating the number in prose."
+
+
+# =====================================================================
+# Mechanisms that exist but hold less than they appear to
+# =====================================================================
+
+[[invariant]]
+id = "dispatcher-rules-only-shrink"
+claim = "The roster is a ratchet: the count may fall, and any rise fails CI."
+source = "infra/lint/dispatcher-rules-ratchet.sh; docs/design/protocol-policy-publish.md"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "STATED AS A RATCHET, IMPLEMENTED AS A STATIC CEILING. The lint compares the rule count against a hardcoded BASELINE=38 and fails only above it; falling below is advisory and prints a reminder to lower BASELINE by hand. So once a migration removes rules, nothing stops the same number being re-added silently — a true ratchet cannot be un-clicked by inaction. Count and baseline are both 38 today, so the ceiling binds at the moment; the gap opens the first time a migration lands without the follow-up edit. What would enforce it: have the lint write the observed count back, or fail on any drift from BASELINE in either direction."
+
+[[invariant]]
+id = "spa-lists-are-generated"
+claim = "The SPA's service/port map is generated from boss-ports, never a hand-maintained array of facts that silently drifts from its real source of truth."
+source = "infra/lint/no-snapshot-arrays.sh"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "THE LINT EXISTS AND NOTHING RUNS IT. infra/lint/no-snapshot-arrays.sh is complete and would catch the drift, but it appears in neither infra/gate.sh's roster nor .github/workflows/ci.yml nor any systemd unit, so it fires only if a human invokes it. The same is true of infra/lint/audit-ordering.sh (causal-ordering sweep over audit-log-derived projections). What would enforce it: one `check` line in infra/gate.sh — deliberately out of scope for the car that seeded this register, which adds only its own lint."
+
+[[invariant]]
+id = "conservation-sweep-covers-three-properties-not-five"
+claim = "infra/lint/conservation-invariants.sh proves the five-property correctness protocol — provenance, conservation, closure, idempotence, determinism — across every projection vs. the audit_log it derives from."
+source = "README.md; restated in docs/design/testing-strategy.md §Layer 6"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "THE CLAIM OVERSTATES THE MECHANISM. The script's 22 invariants cover conservation (A, B, G-R, V, W), closure-of-already-closed-records (C, D, F) and provenance (E). The words 'idempotence' and 'determinism' do not appear in it, and no query in it replays anything or compares two runs. Recorded here so the overstatement is visible next to `correctness-idempotence` and `correctness-determinism`, which are the entries that actually carry those two properties. What would enforce it: correct the two sentences — the script is fine, the description is not."

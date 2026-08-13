@@ -84,6 +84,7 @@ fn dock_station() -> StationSpec {
             }),
             ..Default::default()
         },
+        chrono::Utc::now(),
     );
     s.status = boss_jobs::registry::WorkflowStatus::Active;
     s.wip_limit = Some(2);
@@ -99,6 +100,7 @@ fn gated_station() -> StationSpec {
             kind: Some("car-kind".into()),
             ..Default::default()
         },
+        chrono::Utc::now(),
     );
     s.status = boss_jobs::registry::WorkflowStatus::Active;
     s.capability = Some(StationCapability {
@@ -120,6 +122,7 @@ fn watchlist_station() -> StationSpec {
             metadata_equals: BTreeMap::from([("submitted_by".into(), SELF.to_string())]),
             ..Default::default()
         },
+        chrono::Utc::now(),
     );
     s.status = boss_jobs::registry::WorkflowStatus::Active;
     s.discipline = vec![DisciplineKey::Recency];

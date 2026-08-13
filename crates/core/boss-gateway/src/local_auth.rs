@@ -358,7 +358,8 @@ pub struct LocalAuthState {
     pub store: CredentialStore,
     pub session_key: Vec<u8>,
     pub http: reqwest::Client,
-    /// Auth events for the edge (gateway-audit-events.md). Always
+    /// Auth events for the edge (docs/architecture-decisions.md
+    /// §Policy & auth). Always
     /// present; a deployment without the staging pool carries the
     /// disabled emitter, whose record is the structured warn line.
     pub audit: crate::audit::AuthAudit,
@@ -413,7 +414,7 @@ pub async fn login(
     Json(req): Json<LoginRequest>,
 ) -> Response {
     if let Err(e) = state.store.verify(&req.email, &req.password) {
-        // The decision record (gateway-audit-events Q2): before the
+        // The decision record (§Policy & auth): before the
         // denied event, a bad password left no trace at all.
         state.audit.login_denied(
             Some(&req.email.to_lowercase()),
@@ -469,8 +470,8 @@ pub async fn login(
     sess.territory_account_ids = scope.territory_account_ids;
     sess.direct_report_ids = scope.direct_report_ids;
 
-    // The mint moment IS the succeeded event (gateway-audit-events
-    // Q2); `method` is how the passkey path joins without a schema
+    // The mint moment IS the succeeded event (§Policy & auth);
+    // `method` is how the passkey path joins without a schema
     // change.
     state.audit.login_succeeded(
         &email,
@@ -555,7 +556,7 @@ pub async fn guest(State(state): State<Arc<LocalAuthState>>) -> Response {
     let mut sess = Session::new(GUEST_EMAIL, session::DEFAULT_TTL_SECONDS);
     sess.role = Some(boss_core::roles::AUDIT_READONLY_ROLE.to_string());
 
-    // Counted, deliberately (gateway-audit-events Q2): an
+    // Counted, deliberately (§Policy & auth): an
     // unauthenticated endpoint that mints real read access gets a
     // record per mint. Constant identity — no PII rides along.
     state.audit.guest_session(GUEST_EMAIL);
@@ -964,7 +965,7 @@ mod tests {
         (td, st)
     }
 
-    /// gateway-audit-events Q2: a bad local password is an
+    /// Architecture decisions, §Policy & auth: a bad local password is an
     /// authentication decision, and today it leaves no record at
     /// all. The denied event is the fix; `bad_credentials` is its
     /// closed reason.

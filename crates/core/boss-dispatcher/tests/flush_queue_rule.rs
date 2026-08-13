@@ -20,7 +20,7 @@ handler = "docs.flush_queue"
 fn every_decision_event_queues_a_flush() {
     let reg = Registry::from_toml(RULE).expect("rule parses");
     let payload = serde_json::json!({
-        "doc_path": "docs/design/event-kind-registry.md",
+        "doc_path": "docs/design/stations.md",
         "anchor": "Q1",
         "kind": "override",
         "resolution": "Table is good",

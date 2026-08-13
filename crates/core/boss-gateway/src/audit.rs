@@ -1,5 +1,6 @@
 //! The gateway joins the log — auth events for the edge
-//! (gateway-audit-events.md, Q1+Q2 resolved 2026-08-11).
+//! (Q1+Q2 resolved 2026-08-11; folded into
+//! docs/architecture-decisions.md §Policy & auth).
 //!
 //! Q1: the gateway stages events on the transactional outbox through
 //! its own small pool (recipe 3 of transactional-audit-log.md — the

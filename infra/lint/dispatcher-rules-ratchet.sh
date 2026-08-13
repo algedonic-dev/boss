@@ -31,7 +31,18 @@
 
 set -euo pipefail
 
-BASELINE=38
+# 38 -> 40 (2026-08-13). Train #20 landed the two feedback-obligation
+# reactors — `complete-feedback-branch-on-car-merged` and
+# `notify-filer-on-feedback-terminal` — without raising this line,
+# which nothing caught because forge CI did not yet run the gate. Both
+# qualify under the cross-protocol-reactor exemption above and both
+# carry their "why" in rules.toml: one advances a `user-feedback` job
+# from a `ship-a-change` close, the other notifies the filer on ANY
+# terminal. Neither can be declared as a consequence inside a single
+# Workflow definition, because each spans two protocols by
+# construction. Raised here rather than on that train because the
+# violation only became visible when the gate was wired in.
+BASELINE=40
 RULES_FILE="infra/dispatcher/rules.toml"
 
 count=$(grep -c '^\[\[rule\]\]' "$RULES_FILE")

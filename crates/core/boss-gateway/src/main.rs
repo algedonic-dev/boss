@@ -49,7 +49,8 @@ pub(crate) struct AppState {
     pub perf: Arc<PerfCollector>,
 }
 
-/// Auth-event staging (gateway-audit-events.md Q1). The URL is its
+/// Auth-event staging (docs/architecture-decisions.md §Policy &
+/// auth). The URL is its
 /// own variable — not BOSS_POSTGRES_URL — because it is expected to
 /// carry the INSERT-only `boss_gateway_audit` role
 /// (111-gateway-audit-events.sql), not the service superuser. Absent

@@ -10,7 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 boss-core = { path = "../boss-core" }
-# The auth-event staging path (gateway-audit-events.md Q1): the
+# The auth-event staging path (docs/architecture-decisions.md
+# §Policy & auth): the
 # gateway's one database dependency, scoped to PgOutboxRecorder +
 # a 2-connection lazy pool. Pool only — no macros, no migrations.
 boss-clock-client = { path = "../boss-clock-client" }

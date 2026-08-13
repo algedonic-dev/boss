@@ -10,7 +10,7 @@ the actors that meet the requirements and can manifest the queue payload
 availability to them somehow. At worst, we should be able to surface
 queues that aren't being drained for someone to make a decision about
 how to handle."
-**Related**: [it-activity-network.md](./it-activity-network.md) ·
+**Related**: [stations.md](./stations.md) — the network's nodes ·
 [human-powered-state-machine.md](./human-powered-state-machine.md) ·
 [class-registry.md](./class-registry.md) ·
 [correctness-protocol.md](./correctness-protocol.md)

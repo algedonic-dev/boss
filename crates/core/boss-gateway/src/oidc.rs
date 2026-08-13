@@ -16,8 +16,8 @@
 //! pattern): `/api/auth/oidc/available` says so, login/callback 404.
 //!
 //! Denials and mints land registered audit events via the gateway's
-//! outbox staging path (`crate::audit`, gateway-audit-events.md Q1+Q2
-//! resolved 2026-08-11) — the follow-up the earlier warn-line-only
+//! outbox staging path (`crate::audit`; docs/architecture-decisions.md
+//! §Policy & auth) — the follow-up the earlier warn-line-only
 //! record tracked. The warn lines remain as the local echo and the
 //! backstop when staging is unavailable.
 //!
@@ -264,7 +264,7 @@ pub async fn callback(
         // (reason `idp_denied`, no claimed email: the refusal
         // happened before any identity reached us). Every other
         // error value is transport/config trouble and stays a warn
-        // line only (gateway-audit-events Q2).
+        // line only (§Policy & auth).
         if err == "access_denied" {
             state.audit.login_denied(
                 None,
@@ -629,7 +629,7 @@ mod tests {
             "state cookie cleared: {cookies:?}"
         );
 
-        // gateway-audit-events Q2: the mint moment is the succeeded
+        // Architecture decisions, §Policy & auth: the mint moment is the succeeded
         // event, and it names its method so the passkey path lands
         // as a value, not a schema change.
         let events = crate::audit::testing::drain(&cap, 1).await;
@@ -707,7 +707,7 @@ mod tests {
             "fail closed mints nothing"
         );
 
-        // gateway-audit-events Q2: the fail-closed denial lands a
+        // Architecture decisions, §Policy & auth: the fail-closed denial lands a
         // registered event — no longer only a warn line — naming the
         // claimed email and the IdP, asserting no employee.
         let events = crate::audit::testing::drain(&cap, 1).await;

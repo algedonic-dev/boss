@@ -12,10 +12,10 @@
 #
 # Deliberately split into two jobs. `fast` is fmt + clippy and returns in
 # under a minute on the Ryzen — that is the feedback loop you actually
-# live in. `test` carries the Postgres service and the full suite, and is
-# allowed to take as long as it takes. Reporting them separately means a
-# formatting slip is not hidden behind a ten-minute test run, and the
-# bottleneck is visible rather than averaged away.
+# live in. `test` carries the Postgres service and runs `infra/gate.sh`,
+# and is allowed to take as long as it takes. Reporting them separately
+# means a formatting slip is not hidden behind a ten-minute test run, and
+# the bottleneck is visible rather than averaged away.
 name: CI
 
 on:
@@ -94,8 +94,20 @@ jobs:
       - name: Apply schema
         run: infra/postgres/migrate.sh -- psql "$DATABASE_URL"
 
-      - name: Build
-        run: cargo build --workspace
-
-      - name: Test
-        run: cargo test --all-features
+      - name: Gate
+        # ONE definition of the rust gate — the same script an agent runs
+        # before pushing a car (`infra/gate.sh -p <crate>`) and the same
+        # one .github/workflows/ci.yml's rust job runs, so CI and the
+        # local gate cannot drift (CLAUDE.md §9a). The check roster, each
+        # check's flags, and the provenance comments for both live IN the
+        # script; environment setup (image, services, schema) stays here.
+        # boss-testing/tests/gate_sh.rs pins this step and the roster.
+        #
+        # This replaces the `cargo build --workspace` + `cargo test
+        # --all-features` steps that stood here: gate.sh runs both, plus
+        # clippy, fmt, and the 13-lint roster. Between the forge cutover
+        # (2026-08-12) and this change the forge workflow ran neither the
+        # roster nor a default-feature build, so the lints — including
+        # no-wallclock, tier-import-audit, no-secrets, schema-converge —
+        # were unenforced on the branch that actually gates every train.
+        run: infra/gate.sh

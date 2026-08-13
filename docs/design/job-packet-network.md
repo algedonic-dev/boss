@@ -18,8 +18,8 @@ understand where this is going" (`955ba4e5`).
 **Related**: [requirements-based-addressing.md](./requirements-based-addressing.md) —
 the addressing half of this model: queues as predicates, pools as
 their actor face ·
-[it-activity-network.md](./it-activity-network.md) — the rendering:
-stations/rails/traffic/packets ·
+[stations.md](./stations.md) — the network's nodes, and the
+registry contract for them ·
 [queue-visibility.md](./queue-visibility.md) ·
 [transactional-audit-log.md](./transactional-audit-log.md) ·
 [human-powered-state-machine.md](./human-powered-state-machine.md)
@@ -148,7 +148,7 @@ The system diagram redraws on the network stack (`955ba4e5`): the
 audit log is the wire; projections are interface counters; services
 are hosts; the dispatcher is a router running data-defined rules;
 workflows are the protocol suite; queues are ports; policy is the
-firewall; the canvas (it-activity-network) is the NOC wall. One
+firewall; the activity canvas is the NOC wall. One
 picture, one vocabulary, from architecture doc to UI labels — the
 presentation payoff item `75a66b01` asks for: a protocol has a name, a
 version, a page, and usage stats, the way a workflow today has only a

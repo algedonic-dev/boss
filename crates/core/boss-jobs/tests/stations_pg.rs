@@ -33,6 +33,7 @@ fn spec(name: &str) -> StationSpec {
             kind: Some("ship-a-change".into()),
             ..Default::default()
         },
+        chrono::Utc::now(),
     )
 }
 

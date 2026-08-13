@@ -1,6 +1,7 @@
 <script lang="ts">
   // /system/map — the network's stations as a live map, v1
-  // (docs/design/stations.md · it-activity-network.md). Every node is
+  // (docs/design/stations.md; the canvas decisions are folded into
+  // docs/architecture-decisions.md §Step UX & frontend). Every node is
   // an active registry row; depth is the station's evaluated queue,
   // polled; clicking a node opens that queue in the yard's packet-card
   // grammar. Reads only — guest-safe by construction.

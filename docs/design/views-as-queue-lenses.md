@@ -67,9 +67,10 @@ exact move StepPlugins made for step UX.
 
 Each conversion deletes bespoke fetch/filter code and registers a
 lens row; the renderer and the flow strip are built once. The
-canvas stays the one wall (it-activity-network Q4); every lens is a
-scoped region of the same picture, which is what makes the company
-recursion (Q5's scope parameter) hold for views too.
+canvas stays the one wall (`../architecture-decisions.md` §Step UX &
+frontend); every lens is a scoped region of the same picture, which
+is what makes the company recursion — the scope parameter every layer
+endpoint carries from its first version — hold for views too.
 
 ## Open questions
 
@@ -79,7 +80,7 @@ Proposed: `lenses(id, title, queue_predicates jsonb, presentation,
 flow_window, scope, owner_role)` — predicates in the same `boss-expr`
 surface the admission edge evaluates (PPP's one-evaluator rule),
 presentation naming a registered renderer the way `step_plugins`
-rows name bundles, scope per it-activity-network Q5. Append-only,
+rows name bundles, scope as the canvas layers carry it. Append-only,
 versioned, seeded from the table above.
 
 ### Q2: Are presentations code or data?

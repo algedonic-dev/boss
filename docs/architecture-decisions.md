@@ -236,6 +236,106 @@ authoring a work-type is operational leadership's call, not the deploy
 operator's alone (core policy grants it to `platform-admin`; tenants
 grant it to their leaders; `design-doc-review` stays `platform-admin`).
 
+## The network substrate — packets, stations, routes
+
+The reading frame is `docs/design/the-three-layers.md`: *"The network
+is the substrate, the fat protocols dictate the current operating
+model, the actors run it."* That doc is the one place the statement
+is made; this section is what it resolves to in the running system.
+
+**A Job is a packet.** The envelope is the Job row — identity,
+subject, headers, protocol set; the payload is the accretion of
+writes the log holds for that job_id. The projection rows mutate;
+the log accretes. Two columns were asked to justify themselves and
+both survived. **`owner_id` stays** as the accountable human of
+record but stops pretending to be routing: stage 1 is that demotion,
+stage 2 re-keys the `Self_`/`Team` policy scopes onto queue-derived
+ownership and leaves `owner_id` a derived accountability lens ("who
+owns the queue this sits in" plus "who has written to this packet").
+The 2026-07-15 rule that a Job with no resolvable human owner is
+refused is **relocated, not repealed** — the protocol names an
+accountable requirement owner. **`Job.status` stays** as a
+materialized cache of what `compute_job_status(steps)` derives,
+recomputed on every step write; the manual status PUT dies except
+for `released` and `cancelled`, the two imperative states that
+resist derivation and become explicit packet writes.
+
+**The protocol set is fixed at creation.** A packet declares a set
+of compatible protocols composed exactly once, at admission —
+requirements conjoin, obligations union, the viability lint runs
+over the composed set — and the envelope never mutates after;
+layering was rejected for v1. A packet needing different governance
+mid-life is **translated**: a new packet under the new set, admitted
+through the same edge, carrying a `translated_from` edge back and
+leaving a `translated` terminal on the source. Translation is also
+how a packet crosses fabrics (instances) — one mechanism, not two.
+
+**Headers are declared data; undeclared metadata stays payload.**
+`job_edges` is the shipped half: which metadata field of which Job
+kind references another Job, enforced on the write path with
+`subject_edges`' `on_missing` dial and prefix-aware resolution for
+the folklore it inherited — seeded `warn` while the values were
+dirty, turned to `abort` once the three real edges (`backlog_item`,
+`train`, `boarded_jobs`) were cleaned and the machine writers
+audited; `spec`, `branch` and `merge_ref` point outside the Job
+graph and are deliberately out of scope. It generalizes into a
+**header registry** carrying name, value shape, edge-ness
+(resolution + `on_missing`), and which protocol reads the header;
+`authority_role`'s triple duty gets named and split as it lands.
+
+**Stations are the network's nodes, and everything about one is
+registry data** (living reference: `docs/design/stations.md`). A
+station is an abstract priority queue that routes or holds packet
+traffic until there is bandwidth or capability to handle it —
+**queuing separated from dispatching**: a station holds and orders,
+the router moves. The registry lives in `boss-jobs` beside the
+workflow registry, same append-only versioned posture, one active
+row per name. Four kinds share one row shape: **actor** (every
+executor has one), **group** (departments and teams), **constraint**
+(membership by capability predicate, not an enumerated roster), and
+**batch** (the bundling points — loading dock, review queue, board
+windows — where packets accumulate for periodic, higher-bandwidth
+handling). **Membership is derived and motion is evented**: the row
+carries a predicate evaluated over open packets at read time, so no
+mutable current-station field exists to drift from `steps`, and the
+router emits arrival/departure markers so the map and flow metrics
+read motion without one. Per-actor stations need no per-actor rows —
+the predicate carries a literal `"@me"` that the evaluator binds to
+the requesting actor once, before any packet is compared, and both
+failure modes fail closed (an unbindable placeholder answers with an
+empty queue; an unbound one matches nothing, so it can never hand
+one packet to everybody). **Ordering is data**: a `discipline` array
+on the row, default `priority, then age`, ties broken on job id, and
+shown in the lens header so an operator never wonders why a queue is
+in this order. **Capability gates at the claim** — checked against
+the station the claim *names*, before the compare-and-set decides
+anything — and **`wip_limit` is advisory first**: a lens warning and
+telemetry, enforcing later only if the data says it matters.
+`terminal_window_days` sits on the row rather than inside the
+predicate because it is retention, not membership (and keeps
+predicate evaluation clockless): a watchlist read by the person who
+filed the packet is empty at exactly the moment it matters if
+departed packets vanish at closure. Stations ship read-only and
+barely seeded — two platform `batch` rows, no authoring API — so
+"every executor has one" is the design, not today's data.
+
+**Priority becomes Class-registry data.** The `CHECK` constraint,
+the closed Rust enum and the TS union retire together in favour of
+Classes of `job`-kind Subjects — §Registries-over-code one level
+down — and only then can a station's discipline reference priority
+meaningfully. Escalation stays a hop between stations, never a
+discipline.
+
+**A protocol gets a page.** Each workflow kind grows the network
+vocabulary — name, version, purpose, demands, and usage read from
+the `jobs_kind_version` index — so a protocol is presented as a
+protocol rather than only as a DAG, and the canvas's route ghost
+becomes a per-protocol tint. The system diagram redraws on the same
+vocabulary and becomes the one diagram the README and the canvas
+legend both cite (resolved 2026-08-12; the redraw itself is not yet
+executed). The envelope model and the target shape of the parts not
+yet built are carried by `docs/design/job-packet-network.md`.
+
 ## Step types are property bundles; the alphabet is the mechanisms
 
 A step *type* enforces rules, and each rule is an orthogonal,
@@ -346,6 +446,47 @@ serves real actors, the simulator, and side-effect handlers
 identically; the simulator presents as the role-matched humans it
 assigns, with no exemptions anywhere in policy or validation.
 
+**The forward direction inverts this contract: reaction becomes
+admission.** The network gets one admission edge — **Protocol**
+evaluates the write against the packet's pinned protocol set,
+**Policy** checks the actor may perform it, **Publish** stages the
+consequences in the same transaction as the write — and reaction
+survives only where admission cannot see: wall-clock timers,
+external ingress, and cross-protocol reactors. Two-thirds already
+exist (the `PolicyClient` gate, `ready_when` evaluated inside the
+write transaction, the transactional outbox); the missing third is
+**protocol-declared consequences**, which live in the WorkflowSpec
+as `on` blocks per step transition — notify / spawn / assign /
+obligation rows with an optional `when` — versioned with the
+workflow and proven resolvable at authoring time by
+`workflow_lint`. `on_complete_create` is the shipped precedent. The
+edge is **promoted in place**, not extracted to a service: a
+`boss-admission` crate boundary inside `boss-jobs`, because a
+network hop inside the write transaction buys nothing until a real
+second writer exists. Consequences are **decided synchronously and
+delivered asynchronously** — jobs-internal ones apply in the same
+transaction (exactly-once by construction, replacing the JetStream
+consumer's at-least-once), cross-domain ones become **obligation
+events** that the existing handler machinery drains instead of
+interpreting rules, keeping the decision in the log beside its cause
+while delivery stays at-least-once behind the handlers' own
+idempotency guards. The queue-placement half publishes what already
+exists: admission resolves the next station, records
+requirement-addressed pools as events so replay can reproduce who
+could have taken the work, and emits the ready/assigned markers —
+no new placement state. The census of 2026-08-12 classed 38 rules as
+7 jobs-internal consequences, ~22 domain effects, and 9 external-glue
+reactions that never migrate; `infra/lint/dispatcher-rules-ratchet.sh`
+makes the roster **shrink-only** from that baseline, and every
+surviving rule owes a sentence naming why it cannot be a protocol
+consequence. Scope is **packet admission only** in v1 — other domains
+keep their write paths, with no quiet annexation of other front
+doors. Landing the workflow registry's own draft/publish/bootstrap
+writes on the outbox is a prerequisite: under this model a protocol
+edit *is* a network configuration change, and a protocol the log
+cannot witness is not yet data. The build plan is
+`docs/design/protocol-policy-publish.md`.
+
 ## Correctness protocol & the audit log
 
 The five-property protocol — **provenance, conservation, closure,
@@ -401,6 +542,54 @@ spellings (`ActorId` type, `actor` publisher param, `_actor`
 payload key, `actor_id` boundary field) are documented in
 `boss-core::actor` and must not be flattened. Origin markers on
 registry rows use `owning_team = 'platform'`, not 'system'.
+
+**Event kinds are the last vocabulary to become a registry.** The
+log's own semantic layer was folklore — 120 distinct kinds across 15
+sources on the live box against roughly 19 declared as constants —
+while every other vocabulary in the system was already
+registry-shaped. `event_kinds` is a **table, not a generated
+manifest**, and it is compositional because the kind space is:
+static kinds are plain rows, and a **dynamic family** is one pattern
+row whose `suffix_domain` names the registry that already owns its
+suffixes (`step.done.*` ranges over the StepType registry), so
+declaring the family once covers every future step kind without a
+migration per step type. A declaration carries a **flat field
+inventory** (`payload_fields`), starting empty and filled as
+consumers need it — the per-field sensitivity classification the
+payload-encryption work wants becomes a column on a row that now
+exists. Enforcement is deliberately **warn plus a drift guard**
+rather than a write-path abort: an emitted kind no pattern matches
+is loud in `boss-audit-integrity-check` and in CI, and the log stays
+available under drift, because a registry that could refuse an event
+would make the system of record refusable. The seed was **harvested
+from the live log** rather than hand-authored, which is why it
+matched reality on day one; new kinds are born declared in the same
+change that emits them.
+
+**The end state for the bus is the log itself.** The dispatcher's
+two durable consumers move off JetStream onto a cursor over
+`audit_log` — both already consume `(kind, event_id, payload)`,
+which are the log's exact columns, and the cursor pattern ships
+twice already. The swap deletes the duplicate durable log, retires
+the delivery machinery behind two real incident classes (the
+ack_wait/backoff double-fire; the redelivery state-leak that
+receive-dedup compensates for), makes the silent-zero-deliveries
+filter trap structurally impossible, and removes a stateful service
+from the correctness path. Everything else on the bus either wants
+at-most-once (the SSE fan-outs) or is not event-log traffic (the
+cybernetics message plane), and stays on NATS. Costs accepted with
+the decision: side effects trail the write by relay lag plus a poll
+interval (human-timescale irrelevant), the retry/dead-letter budget
+and the concurrency fan-out must be rebuilt on a cursor, and epoch
+trim re-anchors cursors the way it purges the stream today.
+Sequenced `dispatcher-rules` first (its `Settle` outcome is already
+transport-agnostic), then `dispatcher-steps`, then the stream
+shrinks to fan-out-only retention — **staged with the cluster work,
+not standalone**. This and the insert-time chaining above were
+settled as one decision, because one writer inserting in sequence is
+what makes id order ≡ commit order, which is exactly what log-tailing
+needs to never miss a row; if sustained demand ever approaches
+~1K/sec, both reopen together.
 
 ## Finance & ledger
 
@@ -470,10 +659,68 @@ load-bearing and deliberately not flattened). Sign-off authority
 is policy: stamping authorizes against `step-signoff:<role>`
 resources, uniformly — simulator included. The policy client
 **fails closed**; a 60s TTL cache floors correctness with NATS
-invalidation as the convenience overlay. SPA auth is file-backed
+invalidation as the convenience overlay. (The packet model's
+stage-2 re-key of `Self_`/`Team` onto queue-derived ownership —
+§The network substrate — is the one decision that would move this
+predicate; it is resolved but unscheduled, and until it lands the
+owner-keyed compilation above is the truth.) SPA auth is file-backed
 credentials managed by the gateway's admin CLI; SSH is
 bring-your-own-keys with the SSH-CA flow parked as an opt-in
 blueprint.
+
+**The front door for real people is Kanidm** (living contract:
+`docs/design/idm-kanidm.md`), on the GCP box rather than in the
+cluster — stable public IP, and rebuilding the cluster must not lose
+the company's logins. Two invariants make it BOSS-shaped rather than
+bolted on. **Kanidm authenticates; it never provisions**: a login
+maps to an *existing* employee Subject, joined on email, or it
+**fails closed with an audit event** — people enter the company
+through the People domain, where hiring is a Workflow with a trail,
+never as a side effect of first login (a pending-access Job is a
+later nicety, not v1). And **the policy engine never learns Kanidm
+exists**: OIDC is another way to authenticate an email, and
+everything after the email is the pipeline local login already uses
+— roles are read from the employee row, exactly as they are for a
+local session. (The design doc proposed an `idp_group_roles`
+registry so Kanidm could own membership; the shipped runtime
+deliberately does *not* have one, on the ground that it would be a
+second source of role truth. The two statements disagree and the
+code is the current truth here — see §Open findings.) The
+**gateway holds the session**
+— OIDC at login only, every downstream service untouched; per-service
+bearer validation waits for service-to-service auth to actually need
+it. Agents get Kanidm service accounts in **phase 2**: humans first,
+agents while the forged-claim header path still works, then that path
+dies. Kanidm's own state is the second member of the
+outside-git-and-Postgres class (with `credentials.toml`) and its
+online backup rides the existing `backup.sh` timer. It terminates its
+own TLS at `id.algedonic.dev`, DNS-only, with the gateway's OIDC
+callback staying behind the existing front. **Local auth survives as
+break-glass** — an IdP outage must not lock operators out of the
+system that runs the company.
+
+**The gateway joins the log.** Auth denials were structured warn
+lines; with a real front door they are security telemetry, and "who
+tried the door" is a company fact. The gateway therefore gains **one
+small Postgres pool used only for audit staging**, on the existing
+`EventRecorder`/`PgOutboxRecorder` recipe, connecting as a dedicated
+role with INSERT-only rights on `event_outbox` — least privilege for
+the one internet-facing service. The alternative, an authenticated
+ingest endpoint on events-api, was **rejected**: it either reopens
+the measured single-writer decision or reintroduces the retired
+post-commit-publish shape over an HTTP hop, spending a new
+credential class for strictly worse durability. The `tracing::warn`
+line stays as the backstop when the bounded queue is full or the
+pool is down — **degrade to today's behavior, never to silence, and
+never block a login**. Three kinds ship, registered in `event_kinds`
+with `source = 'gateway'`: `auth.login.denied` (a closed reason enum,
+and deliberately **no subject reference** — no employee matched, and
+a reference is exactly what the ref-check trigger would rightly
+refuse), `auth.login.succeeded` (carrying `method`), and
+`auth.session.guest`. IdP transport failures — discovery, token
+exchange, userinfo — stay warn lines: plumbing facts, not
+who-tried-the-door facts. **No per-request events**, ratified as a
+standing constraint rather than a deferral.
 
 ## Calendar
 
@@ -598,6 +845,33 @@ domain APIs. The ports table (`boss-ports`) is the single source
 of truth for service names/ports — the SPA's generated copy is
 lint-checked against the Rust registry.
 
+**The activity surface draws the network, not the route map.** A
+workflow DAG is a route map, and stacking N kinds as N sections
+could never show that two packet classes share the same operator —
+so the **canvas is `/system/flow`'s hero**, per-kind decorated DAGs
+demote to the route ghost and the Fleet inspector, and `/system/os-map`
+retires as a page while its LAG-pairing SQL survives as the traffic
+layer, re-keyed from department to station. **Rails are merged** into
+one faint overlay of all declared routes with per-kind tint on
+hover: stations serve many kinds by construction, and per-kind rails
+would re-partition exactly what stations-as-queues unified.
+**Packets move on the marker topics** — `step.ready`,
+`step.assigned`, `step.done`, plus `jobs.job.closed` as the
+departure — while `jobs.step.updated` metadata chatter stays
+ticker-only; transport is hybrid per the SSE policy, dots riding the
+existing push stream and depth piles and edge thickness riding the
+polled aggregate. **Personal-queue stations materialize when
+non-empty or recently active** (the os-map's nodes-from-edges rule
+restated for queues, honest at the measured occupancy), the claim
+hop renders in the one transfer grammar with the push-vs-self-claim
+split as a tint rather than a second gesture, and the claim
+compare-and-set was a hard prerequisite — without it the canvas
+could animate two actors winning the same packet. **No company-level
+canvas in v1**, but every layer endpoint takes a scope parameter
+from its first version so the recursion is a query change rather
+than a rewrite, pinned by a test that a department-filtered canvas
+is self-consistent. Simulated traffic is always counted separately.
+
 **The personal unit is a View, not a gadget.** A View is a saved
 composition — a query plus a layout — holding no authoritative state
 of its own; it is a pure function of the log, so it rebuilds, cannot
@@ -644,3 +918,141 @@ answer is a Workflow (`docs/design/seed-vs-emergent-state.md`,
 enforced by `seed-bypass-smell.sh`); the canonical demo world is
 **built live, not migrated**: the install starts the sim and it
 generates 365 simulated days of events against the live API.
+
+## Deployment, the forge, and the cluster
+
+**Deployment is modeled on how networks patch** (living reference:
+`docs/design/deployment-as-network.md`, which the deploy scripts and
+unit files cite by question number), which means distinguishing what
+kind of thing is changing. **Traffic** —
+requests in flight, Jobs mid-step, the log — is never rolled back; a
+delivered response is history. **Derived state** — binaries,
+projections, the served SPA — is *reconverged*, not restored:
+rebuilt from intent, freely replaceable, no snapshot nostalgia.
+**Intent** — the repo at a commit plus the registries and config —
+is the only versioned layer, and "rollback" exists there only as
+rolling *forward* to a prior intent. Two prerequisites were already
+policy, which is why the rest is plumbing: expand/contract
+migrations are exactly the N-1 compatibility that lets a reverted
+binary run on today's schema, and the SPA's content-hashed dist is
+make-before-break natively.
+
+**Generations make installs make-before-break.** A release lands in
+`releases/<sha>/` carrying `bin/`, `web-dist/`, `step-plugins/` and
+the source-fingerprint stamp, with `current` and `previous`
+symlinks that unit `ExecStart` lines go through; deploy is install
+beside, flip, restart, and revert is re-point and restart — seconds,
+not a rebuild. Three generations are kept, with an explicit prune
+step that prints sizes, because this box has had its disk-full day.
+The web dist joins the generation, so `rsync --delete` retires
+cleanly and the SPA's content-hashed naming finally has a revert
+path.
+
+**The flip is commit-confirmed — a dead-man switch.** After a flip
+the deploy is UNCONFIRMED, and the confirm is every deployed unit's
+health probe returning 200 (reusing the deploy roster itself, so the
+confirm cannot drift from the deploy list), plus dispatcher readiness,
+plus one write round-trip through the HTTP API. It is read at **+2
+and +8 minutes** — the delayed second reading is what catches the
+dispatcher silent-death class — and an unconfirmed deploy
+auto-reverts at +10. The evaluator is its **own systemd unit armed
+at flip**, never an in-process wait inside the deployer: a 45-minute
+build timeout once killed the deployer mid-run, and a dead-man
+switch that dies with the process it guards reverts nothing.
+Auto-revert covers binaries, web dist and step plugins; **schema,
+registries, the log and the data stay** — roll-forward only. Two
+riders follow from that: emitted config bodies snapshot into the
+generation and restore with it, and events written during the
+unconfirmed window stay in the log forever, so projections and
+rebuilders must tolerate unknown event kinds — closure doing
+revert-safety work. The conductor completes the train Job's
+deploy step only on the confirm marker, and an auto-revert reopens
+it.
+
+**Scratch is wave 1, named honestly.** Per-environment `current`
+symlinks are what make a wave seam possible at all; scratch's
+confirm covers only the paired services it runs, so it reduces
+prod's exposure and never replaces prod's own confirm and dead-man.
+Real per-node waves and true drain-patch-undrain arrive with the
+cluster; on one box, restart order plus health gates approximate
+them, and the approximation is named so nobody mistakes it for the
+thing.
+
+**Git and CI come inside, on Forgejo.** Internalizing is what turns
+the merge wall into policy — the ship-a-change `review` step gains a
+required operator sign-off, and the conductor, on seeing a
+signed-off review, calls the forge adapter's merge verb and stamps
+the merged marker exactly as before: the observe-then-mark shape
+survives, the observer becomes the executor. CI is **Forgejo
+Actions**, chosen de facto once GitHub-Actions compatibility held
+with two container-job deltas, with the CI image's Dockerfile in the
+repo and the gate script pinned on both sides so a second gate
+definition cannot drift into the workflow file. The GitHub mirror
+becomes a **push-mirror on every main update** — superseding the
+earlier daily cadence, because a disaster-recovery copy of the
+system of record that is a day stale is a day of lost commits, and
+the GitHub-native checks only audit what the mirror shows them.
+Inbound stays deliberate-pull through GitHub PRs, keeping external
+code off internal runners. **Forge events land on the outbox** via a
+small ingress that validates the webhook secret and stages with
+`record_event_in_tx` — never post-commit publish — with
+`forge.push`, `forge.check.completed` and `forge.merge` born
+declared in the event-kind registry.
+
+**Maintenance stops being invisible work.** The department's
+recurring labor — backup, audit integrity, ledger replay checks,
+views catchup, GC, purges — ran as systemd timers outside the Job
+model, in a system whose thesis is that work is visible. Each chore
+is now a **maintenance Workflow kind**: success completes the run
+step, failure completes nothing and leaves the Job open and loud,
+and recovery closes the standing Job, so a failed backup is an
+algedonic signal instead of a quiet journal line. The spawner is
+deliberately the **systemd timer's wrapper on wall-clock time**, not
+the dispatcher's schedule runner — an amendment to the original
+proposal, ratified: sim-day rules fire every couple of wall-minutes
+at warp, and maintenance is wall-clock work. The cadence loop
+retired the *train's* timers, not systemd itself; the remaining
+timers are a rollout list, not a claim.
+
+**The cluster reaches the hub over bare WireGuard.** The GCP box is
+the hub — stable public IP, overlay `10.99.0.0/24` — and cluster
+nodes are spokes that dial *out*, so no inbound hole is opened in
+the home router and a keepalive holds the NAT mapping; node-to-node
+traffic inside the cluster stays on its own mesh. Kanidm and the
+log-copy migration both ride that wire. The cluster is a *client* of
+identity and a consumer of intent, never the host of either: moving
+the company is copying its log and its rules, and everything else
+regenerates.
+
+## Open findings — where two live decisions disagree
+
+Flattening surfaced three places where a settled decision conflicts
+with another that is also still in force. None is resolved here; a
+fold is not the place to pick a winner. Each names what the code
+does today, because that is what this record is obliged to state.
+
+- **Group→role mapping for the IdP.** `docs/design/idm-kanidm.md`
+  carries it as an invariant — Kanidm owns membership, the join to
+  BOSS roles is registry data. The shipped OIDC runtime deliberately
+  has no such registry and reads roles from the employee row,
+  reasoning that a mapping table would be a second source of role
+  truth. Both are defensible; only one can be the design. **Today
+  the employee row wins**, and the doc's invariant is stale as
+  written.
+- **A queue: lens or node?** `docs/design/queue-visibility.md`
+  states that a queue is a `WHERE` clause and *never* a reified
+  structure, with "no queue tables" as an explicit non-goal. The
+  station registry shipped as rows. The distinction it was reaching
+  for survives one level down — the station row is real, its
+  membership is a predicate — but the doc as written argues against
+  the substrate's own nodes, and two of its five open questions have
+  been answered by shipped code (the claim primitive, the
+  assignments lens) while still presenting as live.
+- **What `Self_` and `Team` compile to.** §Policy & auth records
+  the owner-keyed scope predicates as load-bearing and deliberately
+  not flattened; the packet model's stage 2 re-keys them onto
+  queue-derived ownership. This one is a **scheduled** divergence
+  rather than a disagreement — stage 2 is resolved and unscheduled —
+  but until it lands, two sections of this document describe
+  different futures for the same predicate, and that should be
+  closed by a decision rather than by drift.

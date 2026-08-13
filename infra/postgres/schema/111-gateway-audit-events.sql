@@ -1,5 +1,6 @@
 -- 111-gateway-audit-events.sql — the gateway joins the log
--- (gateway-audit-events.md, Q1+Q2 resolved 2026-08-11).
+-- (Q1+Q2 resolved 2026-08-11; folded into
+-- docs/architecture-decisions.md §Policy & auth).
 --
 -- Q2: the three auth kinds enter the event-kinds registry as the
 -- registry's first `gateway` source. `auth.login.denied` carries a

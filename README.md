@@ -30,8 +30,10 @@ enterprise stack.** Beer Open Source Software for System
 Modeling, named in tribute to **Stafford Beer**, the British
 cybernetician whose work on the Viable System Model and Project
 Cybersyn shaped how I thought about modeling organizations while
-designing BOSS. Event-sourced, state-machine-shaped, built around
-describing real-world organizations directly.
+designing BOSS. Event-sourced and network-shaped: **the network is
+the substrate, the fat protocols dictate the current operating
+model, the actors run it** — built around describing real-world
+organizations directly.
 
 **The thesis: a reasonably-sized business — a brewery, a
 device-refurb shop, a dental practice, a 200-tech field-service
@@ -78,10 +80,16 @@ tools, buys three things the patchwork can't:
 Underneath, the model is event-sourced and third-party-verifiable
 (above) — replay rebuilds every projection from t=0 — so
 durability, auditability, and a one-policy-gate security posture
-come from the foundation, not from operator discipline. The
-executor model is humans plus agents: agents execute Steps inside
-the same schema and sign-off rules as humans, never in the
-request path.
+come from the foundation, not from operator discipline. It reads
+in three layers, each replaceable without disturbing the others:
+the **network** is the substrate — packets, the queues that hold
+them, routes, the log, one admission edge — and has no opinion
+about what the work means; the **protocols** are fat and carry the
+meaning, which is why changing how the company works is publishing
+a versioned registry row rather than shipping code; and the
+**actors** — humans plus agents — are the CPUs that run it,
+executing Steps inside the same schema, policy gate, and sign-off
+rules, never in the request path.
 
 The codebase is structured to be conducive to rapid customization
 with AI coding agents — with a bit of care to preserve the audit-
