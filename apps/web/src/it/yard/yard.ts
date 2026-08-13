@@ -17,16 +17,65 @@ export type JobLite = Readonly<{
   title: string;
   status: string;
   opened_on: string;
+  tags?: readonly string[];
   metadata?: Record<string, unknown> | null;
   steps?: readonly StepLite[];
 }>;
 
+// A car in the yard is a job packet, and it renders as a card (David's
+// call, 2026-08-12): protocol names the color, tags ride along, and a
+// simulated packet is visibly not a real one. The same card grammar is
+// meant to travel to every queue lens, so everything here derives from
+// packet data — no per-kind code paths.
 export type CarRow = Readonly<{
   id: string;
+  kind: string;
   branch: string;
   title: string;
+  tags: readonly string[];
+  sim: boolean;
   skipReason?: string | null;
 }>;
+
+// Categorical hues for protocol chips, tuned to sit quietly on the
+// VOID/INK grounds. SIGNAL teal is deliberately absent — it stays the
+// one live accent — and ok/warn/err stay reserved for state.
+export const PROTOCOL_PALETTE: readonly string[] = [
+  '#7FB4D8', // slate blue
+  '#C9A96B', // brass
+  '#A98FD1', // lilac
+  '#6BBFB4', // sea
+  '#D18F9E', // rose
+  '#9DBF6B', // moss
+  '#8FA1D1', // periwinkle
+  '#B4B48C', // sage
+];
+
+// Deterministic kind → hue. A hash, not a lookup table, so a workflow
+// published tomorrow gets its color with zero code change (registries
+// over hardcoded paths — the palette is the only fixed data).
+export function protocolHue(kind: string): string {
+  // FNV-1a with an avalanche finish — a plain multiplicative roll
+  // mod 8 sent ship-a-change and pr-train to the same slot.
+  let h = 2166136261;
+  for (let i = 0; i < kind.length; i++) {
+    h ^= kind.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  h ^= h >>> 15;
+  h = Math.imul(h, 2246822519) >>> 0;
+  h ^= h >>> 13;
+  return PROTOCOL_PALETTE[(h >>> 0) % PROTOCOL_PALETTE.length] ?? PROTOCOL_PALETTE[0]!;
+}
+
+// Simulated is a fact on the packet (tag or metadata flag), never an
+// inference from where it came from.
+export function isSim(j: Pick<JobLite, 'tags' | 'metadata'>): boolean {
+  const tagged = (j.tags ?? []).some(t =>
+    ['sim', 'simulated', 'synthetic'].includes(t.toLowerCase()),
+  );
+  return tagged || (j.metadata as { simulated?: boolean } | null)?.simulated === true;
+}
 
 export type TrainStatus = 'BOARDING' | 'BOARDED' | 'DEPARTED' | 'ARRIVED';
 export type Lamp = 'green' | 'failing' | 'pending';
@@ -95,8 +144,11 @@ export function toTrainRow(
     };
     return {
       id,
+      kind: car?.kind ?? 'ship-a-change',
       branch: cmd.branch ?? id.slice(0, 8),
       title: car?.title ?? '(car not in window)',
+      tags: car?.tags ?? [],
+      sim: car ? isSim(car) : false,
       skipReason: cmd.skip_reason ?? null,
     };
   });
@@ -123,8 +175,11 @@ export function dockRows(ships: readonly JobLite[]): CarRow[] {
     })
     .map(j => ({
       id: j.id,
+      kind: j.kind,
       branch: ((j.metadata ?? {}) as { branch?: string }).branch ?? '',
       title: j.title,
+      tags: j.tags ?? [],
+      sim: isSim(j),
       skipReason:
         ((j.metadata ?? {}) as { skip_reason?: string }).skip_reason ?? null,
     }));

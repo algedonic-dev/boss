@@ -668,14 +668,10 @@ bs_response=$(curl -sS --fail -H "x-boss-user: $LEDGER_READER" "$LEDGER_BASE/api
     violations=$((violations + 1))
 }
 if [[ -n "$bs_response" ]]; then
-    imbalance=$(echo "$bs_response" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-A = d.get('total_assets_cents', 0)
-L = d.get('total_liabilities_cents', 0)
-E = d.get('total_equity_cents', 0)
-print(A - (L + E))
-" 2>/dev/null)
+    imbalance=$(echo "$bs_response" | jq -r '
+        (.total_assets_cents // 0)
+        - ((.total_liabilities_cents // 0) + (.total_equity_cents // 0))
+    ' 2>/dev/null)
     if [[ -z "$imbalance" ]]; then
         echo "[ERROR] S. Balance-sheet endpoint — response not JSON-parseable"
         violations=$((violations + 1))

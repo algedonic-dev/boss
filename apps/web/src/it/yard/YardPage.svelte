@@ -6,6 +6,7 @@
   // audit-readonly-safe by construction.
   import { onMount } from 'svelte';
   import { fetchYard, type YardState, type TrainRow } from './yard';
+  import PacketCard from './PacketCard.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
 
   let yard = $state<YardState | null>(null);
@@ -49,48 +50,39 @@
     {#if yard.inFlight.length === 0}
       <div class="yard-empty">No departures — nothing ready to board.</div>
     {:else}
-      <table class="yard-board">
-        <thead><tr><th>Train</th><th>Consist</th><th>Signal</th><th>Status</th></tr></thead>
-        <tbody>
-          {#each yard.inFlight as t (t.id)}
-            <tr class="yard-train">
-              <td>
-                {#if t.live}<span class="yard-dot" title="in motion"></span>{/if}
-                {t.title}
-              </td>
-              <td>{t.cars.length} car{t.cars.length === 1 ? '' : 's'}</td>
-              <td>
-                <span class="yard-lamp" class:ok={t.lamp === 'green'} class:err={t.lamp === 'failing'} class:run={t.lamp === 'pending'}>
-                  {t.lamp === 'green' ? 'CI ✓' : t.lamp === 'failing' ? 'CI ✗' : 'CI …'}
-                </span>
-              </td>
-              <td><span class="yard-chip">{t.status}</span> <span class="yard-stamp">{stampOf(t)}</span></td>
-            </tr>
-            {#each t.cars as c (c.id)}
-              <tr class="yard-car">
-                <td colspan="4">
-                  <span class="yard-branch">{c.branch}</span> — {c.title}
-                  {#if c.skipReason}<span class="yard-skip">LEFT BEHIND — {c.skipReason}</span>{/if}
-                </td>
-              </tr>
-            {/each}
-          {/each}
-        </tbody>
-      </table>
+      {#each yard.inFlight as t (t.id)}
+        <div class="yard-trainblock">
+          <div class="yard-trainhead">
+            {#if t.live}<span class="yard-dot" title="in motion"></span>{/if}
+            <span class="yard-trainname">{t.title}</span>
+            <span class="yard-lamp" class:ok={t.lamp === 'green'} class:err={t.lamp === 'failing'} class:run={t.lamp === 'pending'}>
+              {t.lamp === 'green' ? 'CI ✓' : t.lamp === 'failing' ? 'CI ✗' : 'CI …'}
+            </span>
+            <span class="yard-chip">{t.status}</span>
+            <span class="yard-stamp">{stampOf(t)}</span>
+          </div>
+          <div class="yard-consist">
+            {#if t.cars.length === 0}
+              <span class="yard-empty">consist forming…</span>
+            {:else}
+              {#each t.cars as c (c.id)}
+                <PacketCard card={c} size="consist" />
+              {/each}
+            {/if}
+          </div>
+        </div>
+      {/each}
     {/if}
 
     <div class="yard-section">02 — LOADING DOCK <span class="yard-n">{yard.dock.length}</span></div>
     {#if yard.dock.length === 0}
       <div class="yard-empty">The dock is clear.</div>
     {:else}
-      <table class="yard-board">
-        <thead><tr><th>Car</th><th>Change</th></tr></thead>
-        <tbody>
-          {#each yard.dock as c (c.id)}
-            <tr><td class="yard-branch">{c.branch}</td><td>{c.title}</td></tr>
-          {/each}
-        </tbody>
-      </table>
+      <div class="yard-dock">
+        {#each yard.dock as c (c.id)}
+          <PacketCard card={c} size="dock" />
+        {/each}
+      </div>
     {/if}
 
     <div class="yard-section">03 — RECENT ARRIVALS</div>
@@ -126,9 +118,18 @@
     border-bottom: 1px solid var(--hairline, #2A3138); }
   .yard-board td { padding: 7px 12px; border-bottom: 1px solid var(--hairline, #2A3138); }
   .yard-board tr:last-child td { border-bottom: none; }
-  .yard-car td { color: var(--static, #7A838C); font-size: 13px; padding: 4px 12px 4px 34px;
+  .yard-trainblock { border: 1px solid var(--hairline, #2A3138);
+    background: var(--card, var(--ink, #12161C)); margin-bottom: 12px; }
+  .yard-trainhead { display: flex; align-items: center; gap: 12px; padding: 9px 12px;
+    border-bottom: 1px solid var(--hairline, #2A3138); font-size: 14px; }
+  .yard-trainname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+  /* The flatbed: consist cards sit on VOID so the packets read as
+     cargo loaded onto the train, the same cards that wait in the dock. */
+  .yard-consist { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 12px;
     background: var(--bg, var(--void, #0D1014)); }
-  .yard-branch { font-family: var(--font-mono, ui-monospace, monospace); font-size: 12.5px; }
+  .yard-dock { display: grid; gap: 10px;
+    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); }
   .yard-chip { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px;
     letter-spacing: 0.1em; border: 1px solid var(--hairline, #2A3138); padding: 2px 8px; }
   .yard-lamp { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px;
@@ -141,8 +142,6 @@
     animation: yard-pulse 1.4s ease-in-out infinite; }
   @keyframes yard-pulse { 50% { opacity: 0.35; } }
   @media (prefers-reduced-motion: reduce) { .yard-dot { animation: none; } }
-  .yard-skip { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px;
-    color: var(--warn, #d9a441); margin-left: 10px; letter-spacing: 0.05em; }
   .yard-stamp { font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px;
     color: var(--static, #7A838C); }
   .yard-empty { color: var(--static, #78716c); padding: 12px 0; font-size: 14px; }

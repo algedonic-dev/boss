@@ -1,5 +1,13 @@
 import { describe, expect, test } from 'bun:test';
-import { assembleYard, trainStatus, ciLamp, type JobLite } from './yard';
+import {
+  assembleYard,
+  trainStatus,
+  ciLamp,
+  isSim,
+  protocolHue,
+  PROTOCOL_PALETTE,
+  type JobLite,
+} from './yard';
 
 function train(over: Partial<JobLite>): JobLite {
   return {
@@ -57,5 +65,32 @@ describe('assembleYard', () => {
     const y = assembleYard([train({ id: 't9', status: 'closed' })], []);
     expect(y.arrivals.length).toBe(1);
     expect(y.arrivals[0]?.live).toBe(false);
+  });
+  test('packet cards carry protocol, tags, and sim through both queues', () => {
+    const y = assembleYard(
+      [train({ metadata: { boarded_jobs: ['c2'] }, steps: [s('pr', 'completed')] })],
+      ships,
+    );
+    expect(y.dock[0]?.kind).toBe('ship-a-change');
+    expect(y.dock[0]?.sim).toBe(false);
+    expect(y.inFlight[0]?.cars[0]?.kind).toBe('ship-a-change');
+  });
+});
+
+describe('the packet-card grammar', () => {
+  test('a simulated packet is named by its data, not a code path', () => {
+    const base = { id: 'x', kind: 'ship-a-change', title: 't', status: 'open',
+      opened_on: '2026-08-12' } as const;
+    expect(isSim({ ...base, tags: ['sim'] })).toBe(true);
+    expect(isSim({ ...base, tags: ['Simulated'] })).toBe(true);
+    expect(isSim({ ...base, metadata: { simulated: true } })).toBe(true);
+    expect(isSim({ ...base, tags: ['fix'], metadata: {} })).toBe(false);
+  });
+  test('protocol hue is stable, palette-bound, and distinguishes the yard kinds', () => {
+    expect(protocolHue('ship-a-change')).toBe(protocolHue('ship-a-change'));
+    expect(PROTOCOL_PALETTE).toContain(protocolHue('ship-a-change'));
+    expect(PROTOCOL_PALETTE).toContain(protocolHue('some-future-kind'));
+    expect(protocolHue('ship-a-change')).not.toBe(protocolHue('pr-train'));
+    expect(new Set(PROTOCOL_PALETTE).size).toBe(PROTOCOL_PALETTE.length);
   });
 });

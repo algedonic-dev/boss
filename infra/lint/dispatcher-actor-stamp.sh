@@ -28,67 +28,79 @@ HANDLERS=crates/orchestrators/boss-dispatcher-handlers/src/handlers
 # writes landed on simulated Jobs marked real.
 ASSIGNMENT=crates/core/boss-dispatcher/src
 
-python3 - "$HANDLERS" "$ASSIGNMENT" <<'PY'
-import pathlib, re, sys
-
-handlers = pathlib.Path(sys.argv[1])
-assignment = pathlib.Path(sys.argv[2])
-
 # Files whose calls legitimately carry no actor. Keep this empty
 # unless there is a recorded reason — a public webhook to a third
 # party has no BOSS actor to present, for example.
-ALLOW = {
-    # Outbound to a counterparty's URL, not a BOSS service: there is
-    # no internal identity to stamp.
-    "webhook_notify.rs",
-}
+#
+#   webhook_notify.rs — outbound to a counterparty's URL, not a BOSS
+#   service: there is no internal identity to stamp.
+ALLOW="webhook_notify.rs"
 
-# `.post(&url)` / `.get(&url)` — a request aimed at a URL variable.
-CALL = re.compile(r"\.(post|get)\(\s*&?(url|[a-z_]*url)\b")
+failures=""
 
-failures = []
-# rglob, not glob. The assignment path was added here after it leaked
-# sim-origin, and `glob("*.rs")` reads the top of `boss-dispatcher/src`
-# only — so `src/rules/jobs_spawn.rs` stayed invisible and leaked the
-# same header for the same reason, on 55 events across three kinds.
-# A check that covers one directory of a tree reports "ok" for the
+# Walk BOTH trees recursively, never one directory of them. The
+# assignment path was added here after it leaked sim-origin, and a
+# non-recursive glob read the top of `boss-dispatcher/src` only — so
+# `src/rules/jobs_spawn.rs` stayed invisible and leaked the same
+# header for the same reason, on 55 events across three kinds. A
+# check that covers one directory of a tree reports "ok" for the
 # rest of it.
-for path in sorted(handlers.rglob("*.rs")) + sorted(assignment.rglob("*.rs")):
-    if path.name in ALLOW:
-        continue
-    src = path.read_text()
-    # Drop the test module: mocks are not the production call path.
-    cut = src.find("#[cfg(test)]")
-    if cut != -1:
-        src = src[:cut]
-    lines = src.splitlines()
-    for i, line in enumerate(lines):
-        if not CALL.search(line):
-            continue
-        # The builder chain runs until `.send()`; the header must
-        # appear somewhere in it.
-        window = []
-        for j in range(i, min(i + 20, len(lines))):
-            window.append(lines[j])
-            if ".send()" in lines[j]:
-                break
-        chunk = "\n".join(window)
-        # Identity may ride on the client's default headers (the
-        # assignment dispatcher does that), but sim-ness cannot: it
-        # belongs to the event being handled, not to the client.
-        if "x-sim-origin" not in chunk:
-            failures.append(f"{path}:{i + 1}: no x-sim-origin — {line.strip()}")
-        elif "x-boss-user" not in chunk and "default_headers" not in path.read_text():
-            failures.append(f"{path}:{i + 1}: no actor — {line.strip()}")
+while IFS= read -r path; do
+    skip=0
+    for allowed in $ALLOW; do
+        if [ "$(basename "$path")" = "$allowed" ]; then skip=1; fi
+    done
+    if [ "$skip" -eq 1 ]; then continue; fi
 
-if failures:
-    print("FAIL — dispatcher calls missing an actor or sim-origin header:")
-    for f in failures:
-        print(f"  {f}")
-    print()
-    print("Stamp it: .header(\"x-boss-user\", dispatcher_actor_header(rule_name))")
-    print("or use common::post_json, which does it for you.")
-    raise SystemExit(1)
+    # `.post(&url)` / `.get(&url)` — a request aimed at a URL variable.
+    # The builder chain runs until `.send()`; the headers must appear
+    # somewhere in it (windowed to 20 lines, like the chains are).
+    # The test module is dropped first: mocks are not the production
+    # call path. Identity may ride on the client's default headers
+    # (the assignment dispatcher does that), but sim-ness cannot: it
+    # belongs to the event being handled, not to the client.
+    out=$(awk -v FILE="$path" '
+        {
+            line[NR] = $0
+            if (index($0, "default_headers") > 0) has_default_headers = 1
+        }
+        END {
+            cut = NR
+            for (i = 1; i <= NR; i++)
+                if (index(line[i], "#[cfg(test)]") > 0) { cut = i - 1; break }
+            for (i = 1; i <= cut; i++) {
+                if (line[i] !~ /\.(post|get)\([[:space:]]*&?[a-z_]*url([^a-zA-Z0-9_]|$)/)
+                    continue
+                chunk = ""
+                end = i + 19
+                if (end > cut) end = cut
+                for (j = i; j <= end; j++) {
+                    chunk = chunk line[j] "\n"
+                    if (index(line[j], ".send()") > 0) break
+                }
+                stripped = line[i]
+                gsub(/^[[:space:]]+/, "", stripped)
+                gsub(/[[:space:]]+$/, "", stripped)
+                if (index(chunk, "x-sim-origin") == 0)
+                    printf "%s:%d: no x-sim-origin — %s\n", FILE, i, stripped
+                else if (index(chunk, "x-boss-user") == 0 && !has_default_headers)
+                    printf "%s:%d: no actor — %s\n", FILE, i, stripped
+            }
+        }' "$path")
+    if [ -n "$out" ]; then
+        failures="${failures}${out}
+"
+    fi
+done < <({ find "$HANDLERS" -name '*.rs' | LC_ALL=C sort
+           find "$ASSIGNMENT" -name '*.rs' | LC_ALL=C sort; })
 
-print("ok: every dispatcher downstream call stamps its actor and its origin")
-PY
+if [ -n "$failures" ]; then
+    echo "FAIL — dispatcher calls missing an actor or sim-origin header:"
+    printf '%s' "$failures" | sed 's/^/  /'
+    echo
+    echo 'Stamp it: .header("x-boss-user", dispatcher_actor_header(rule_name))'
+    echo "or use common::post_json, which does it for you."
+    exit 1
+fi
+
+echo "ok: every dispatcher downstream call stamps its actor and its origin"

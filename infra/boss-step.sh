@@ -37,10 +37,10 @@
 # feedback-queue.sh: the gateway is the browser edge and strips
 # inbound `x-boss-*`, so terminal tooling cannot present itself there.
 #
-# The python runs via `-c "$PYCODE"` with the payload on stdin rather
-# than embedded in a double-quoted string. feedback-queue.sh was
-# written the other way and a literal double quote silently truncated
-# the program.
+# All JSON parsing is jq with the payload on stdin and caller values
+# passed via --arg, never spliced into the program text.
+# feedback-queue.sh once embedded its parser in a double-quoted
+# string and a literal double quote silently truncated the program.
 set -euo pipefail
 
 if [ $# -lt 2 ]; then
@@ -64,74 +64,66 @@ if ! jobs_json=$(curl -fsS -H "x-boss-user: $BOSS_USER" \
     exit 1
 fi
 
-PYCODE=$(cat <<'PY'
-import json, subprocess, sys
+# The reply may be enveloped ({"data": [...]}) or a bare array; keep
+# only the open rows either way.
+open_jobs=$(printf '%s' "$jobs_json" | jq '
+    (if type == "object" and has("data") then .data else . end)
+    | map(select(.status == "open"))')
+open_count=$(printf '%s' "$open_jobs" | jq 'length')
 
-workflow, step_title, base, boss_user = sys.argv[1:5]
-pairs = sys.argv[5:]
+if [ "$open_count" -eq 0 ]; then
+    echo "boss-step: no open $WORKFLOW Job — nothing to record" >&2
+    exit 0
+fi
+if [ "$open_count" -gt 1 ]; then
+    ids=$(printf '%s' "$open_jobs" | jq -r '[.[].id[:8]] | join(", ")')
+    echo "boss-step: $open_count open $WORKFLOW Jobs ($ids) — refusing to guess" >&2
+    exit 1
+fi
 
-body = json.load(sys.stdin)
-rows = body["data"] if isinstance(body, dict) and "data" in body else body
-rows = [j for j in rows if j.get("status") == "open"]
+job=$(printf '%s' "$open_jobs" | jq '.[0]')
+job_id=$(printf '%s' "$job" | jq -r '.id')
 
-if not rows:
-    print("boss-step: no open %s Job — nothing to record" % workflow, file=sys.stderr)
-    sys.exit(0)
-if len(rows) > 1:
-    ids = ", ".join(j["id"][:8] for j in rows)
-    print("boss-step: %d open %s Jobs (%s) — refusing to guess"
-          % (len(rows), workflow, ids), file=sys.stderr)
-    sys.exit(1)
-
-job = rows[0]
 # Slug first (the stable identifier), title as fallback for steps
 # materialized before spec_slug existed. Never both vocabularies in
 # one pass — an exact slug match must not lose to a title elsewhere.
-step = None
-for s in job.get("steps", []):
-    if s.get("spec_slug") == step_title:
-        step = s
-        break
-if step is None:
-    for s in job.get("steps", []):
-        if s.get("title") == step_title:
-            step = s
-            break
-if step is None:
-    have = ", ".join(
-        "%s (%s)" % (s.get("spec_slug") or "?", s.get("title", "?"))
-        for s in job.get("steps", [])
-    )
-    print("boss-step: no step %r on %s (has slug (title): %s)"
-          % (step_title, job["id"][:8], have), file=sys.stderr)
-    sys.exit(1)
+step=$(printf '%s' "$job" | jq --arg t "$STEP_TITLE" '
+    ((.steps // []) | map(select(.spec_slug == $t)) | .[0])
+    // ((.steps // []) | map(select(.title == $t)) | .[0])')
 
-if step.get("status") in ("completed", "skipped"):
-    print("boss-step: %s already %s — no-op" % (step_title, step["status"]),
-          file=sys.stderr)
-    sys.exit(0)
+if [ "$step" = "null" ]; then
+    have=$(printf '%s' "$job" | jq -r '
+        [(.steps // [])[] | "\(.spec_slug // "?") (\(.title // "?"))"]
+        | join(", ")')
+    echo "boss-step: no step '$STEP_TITLE' on ${job_id:0:8} (has slug (title): $have)" >&2
+    exit 1
+fi
 
-merged = dict(step.get("metadata") or {})
-for p in pairs:
-    if "=" not in p:
-        print("boss-step: %r is not key=value" % p, file=sys.stderr)
-        sys.exit(2)
-    k, v = p.split("=", 1)
-    merged[k] = v
+step_status=$(printf '%s' "$step" | jq -r '.status // ""')
+if [ "$step_status" = "completed" ] || [ "$step_status" = "skipped" ]; then
+    echo "boss-step: $STEP_TITLE already $step_status — no-op" >&2
+    exit 0
+fi
 
-payload = json.dumps({"status": "completed", "metadata": merged})
-url = "%s/api/jobs/%s/steps/%s" % (base, job["id"], step["id"])
-r = subprocess.run(
-    ["curl", "-fsS", "-X", "PUT", "-H", "content-type: application/json",
-     "-H", "x-boss-user: " + boss_user, "-d", payload, url],
-    capture_output=True, text=True,
-)
-if r.returncode != 0:
-    print("boss-step: PUT failed — %s" % r.stderr.strip(), file=sys.stderr)
-    sys.exit(1)
-print("boss-step: closed %s/%s on %s" % (workflow, step_title, job["id"][:8]))
-PY
-)
+merged=$(printf '%s' "$step" | jq '.metadata // {}')
+for pair in "$@"; do
+    case "$pair" in
+        *=*) ;;
+        *)
+            echo "boss-step: '$pair' is not key=value" >&2
+            exit 2
+            ;;
+    esac
+    merged=$(printf '%s' "$merged" \
+        | jq --arg k "${pair%%=*}" --arg v "${pair#*=}" '. + {($k): $v}')
+done
 
-printf '%s' "$jobs_json" | python3 -c "$PYCODE" \
-    "$WORKFLOW" "$STEP_TITLE" "$BASE" "$BOSS_USER" "$@"
+payload=$(printf '%s' "$merged" | jq -c '{status: "completed", metadata: .}')
+step_id=$(printf '%s' "$step" | jq -r '.id')
+url="$BASE/api/jobs/$job_id/steps/$step_id"
+if ! put_err=$(curl -fsS -X PUT -H "content-type: application/json" \
+        -H "x-boss-user: $BOSS_USER" -d "$payload" "$url" 2>&1 >/dev/null); then
+    echo "boss-step: PUT failed — $put_err" >&2
+    exit 1
+fi
+echo "boss-step: closed $WORKFLOW/$STEP_TITLE on ${job_id:0:8}"

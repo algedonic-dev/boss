@@ -29,9 +29,12 @@ LABEL="${2:?chore label required}"
 BASE="${BOSS_JOBS_URL:-http://127.0.0.1:7900}"
 BOSS_USER='{"id":"automation:maintenance-timer","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
 
+# `.data` missing from the reply means the jobs API changed shape —
+# error out (aborting the timer run) rather than reading it as zero
+# open Jobs and spawning a duplicate.
 open_count=$(curl -fsS -H "x-boss-user: $BOSS_USER" \
     "$BASE/api/jobs?kind=$KIND&status=open&limit=2" \
-    | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']))")
+    | jq '.data | if . == null then error("jobs reply has no .data") else length end')
 
 if [ "$open_count" != "0" ]; then
     echo "boss-maintenance-wrap: open $KIND Job exists — this run will complete it (recovery)"
@@ -40,19 +43,14 @@ fi
 
 curl -fsS -X POST "$BASE/api/jobs" \
     -H "x-boss-user: $BOSS_USER" -H "content-type: application/json" \
-    -d "$(python3 - "$KIND" "$LABEL" <<'PY'
-import json, sys, datetime
-kind, label = sys.argv[1], sys.argv[2]
-print(json.dumps({
-    "kind": kind,
-    "subject": {"subject_kind": "custom", "id": f"infra/{kind}"},
-    "title": f"{label} — {datetime.date.today().isoformat()}",
-    "owner_id": "emp-bootstrap-admin",
-    "priority": "standard",
-    "status": "open",
-    "metadata": {"chore": kind},
-    "tags": ["maintenance"],
-}))
-PY
-)" >/dev/null
+    -d "$(jq -n --arg kind "$KIND" --arg label "$LABEL" --arg today "$(date +%F)" '{
+        kind: $kind,
+        subject: {subject_kind: "custom", id: ("infra/" + $kind)},
+        title: ($label + " — " + $today),
+        owner_id: "emp-bootstrap-admin",
+        priority: "standard",
+        status: "open",
+        metadata: {chore: $kind},
+        tags: ["maintenance"]
+    }')" >/dev/null
 echo "boss-maintenance-wrap: spawned today's $KIND Job"

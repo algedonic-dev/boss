@@ -49,8 +49,10 @@ else
     # Compare the SET of service names. Order + scratch ports are
     # checked in boss-ports-list's own unit tests; this lint just
     # asserts that the two sources agree on which services exist.
+    # jq's sort (codepoint order) so the comparison doesn't depend
+    # on the caller's locale collation.
     expected_names="$("$PORTS_BIN" --json |
-        python3 -c 'import sys,json; print("\n".join(sorted(s["name"] for s in json.load(sys.stdin))))')"
+        jq -r '[.[].name] | sort | .[]')"
     actual_names="$(grep -oE '"name":\s*"[a-z-]+"' "$PORTS_TS" |
         sed -E 's/.*"name":\s*"([a-z-]+)".*/\1/' | sort -u)"
     if [[ "$expected_names" == "$actual_names" ]]; then

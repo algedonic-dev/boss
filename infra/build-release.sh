@@ -44,14 +44,13 @@ echo "==> [2/2] building every bin that declares required-features, with exactly
 # cargo metadata is the single source of truth — read each workspace bin's
 # required-features straight from it, so this never drifts from the Cargo.tomls.
 mapfile -t GATED < <(
-  cargo metadata --format-version 1 --no-deps | python3 -c '
-import json, sys
-md = json.load(sys.stdin)
-for p in md["packages"]:
-    for t in p["targets"]:
-        if "bin" in t["kind"] and t.get("required-features"):
-            print("{}\t{}\t{}".format(p["name"], t["name"], ",".join(t["required-features"])))
-'
+  cargo metadata --format-version 1 --no-deps | jq -r '
+    .packages[]
+    | .name as $crate
+    | .targets[]
+    | select((.kind | index("bin")) != null and ((."required-features" // []) | length) > 0)
+    | [$crate, .name, (."required-features" | join(","))]
+    | @tsv'
 )
 
 for row in "${GATED[@]}"; do

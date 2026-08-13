@@ -2,7 +2,7 @@
 # Snapshot lines-of-code across the BOSS repo, grouped by the
 # five-tier crate organization and by language surface.
 #
-# Run from repo root. No deps beyond bash + find + wc + python3.
+# Run from repo root. No deps beyond bash + find + wc + awk.
 #
 # Used to regenerate the "By the numbers" block in README.md
 # whenever the proportions shift meaningfully. Treat the README
