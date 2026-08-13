@@ -9,9 +9,13 @@
 //! the declarations and resolve a Job's fields against them.
 
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// `Deserialize` as well as `Serialize`: `GET /api/jobs/job-edges`
+/// serves these, and the census reader (`boss packet census`) parses
+/// them back into the same type rather than keeping a second copy of
+/// the edge shape (CLAUDE.md §9a).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobEdgeSpec {
     pub source_kind: String,
     pub field_path: String,

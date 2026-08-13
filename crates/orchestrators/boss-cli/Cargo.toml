@@ -13,6 +13,11 @@ boss-core = { path = "../../core/boss-core" }
 boss-ports = { path = "../../core/boss-ports" }
 boss-events = { path = "../../core/boss-events" }
 boss-nats = { path = "../../core/boss-nats" }
+# The station registry + its predicate evaluator. `boss packet
+# census` answers "which stations would present this packet?" by
+# calling the SAME `StationPredicate::matches` the /queue endpoint
+# calls — a census that disagrees with the queue is worse than none.
+boss-jobs = { path = "../../core/boss-jobs" }
 boss-assets = { path = "../../modules/boss-assets", features = ["postgres"] }
 boss-clock-client = { path = "../../core/boss-clock-client" }
 boss-ledger = { path = "../../modules/boss-ledger", features = ["postgres"] }

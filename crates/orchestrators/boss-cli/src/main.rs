@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod cadence;
+mod census;
 mod deploy;
 mod docs;
 mod docs_flush;
@@ -127,6 +128,11 @@ enum Commands {
         #[arg(default_value = "all")]
         column: String,
     },
+    /// Job-packet network diagnostics (docs/design/packet-loss.md).
+    Packet {
+        #[command(subcommand)]
+        action: PacketAction,
+    },
     /// Query the audit log for domain events
     Audit {
         /// Filter by event kind prefix (e.g., "catalog.model")
@@ -205,6 +211,43 @@ enum TrainAction {
         /// Say what would fire without claiming or running anything
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PacketAction {
+    /// Measure packet conservation across the whole instance and
+    /// print what it found: open vs terminal counts by kind, the age
+    /// and stall profile of open packets, how many stations would
+    /// present each one (zero = ORPHANED — structurally unworkable),
+    /// and whether declared `job_edges` still point at Jobs that
+    /// exist.
+    ///
+    /// Read-only and non-raising by design: it files no job, sends no
+    /// message, repairs nothing, and exits 0 whatever it finds —
+    /// packet-loss.md Q2 defers raising until the base rate this
+    /// measures is known.
+    Census {
+        /// Days without step motion before a packet counts stalled.
+        #[arg(long, default_value = "7", value_parser = clap::value_parser!(i64).range(1..))]
+        stale_days: i64,
+        /// Output as JSON (for jq / a cadence rule recording a series).
+        #[arg(long)]
+        json: bool,
+        /// Cap on open packets evaluated. The default covers today's
+        /// volume with room to spare; a truncating run says so in the
+        /// output rather than sampling silently.
+        #[arg(long, default_value = "2000")]
+        max_open: usize,
+        /// Cap on Jobs read when resolving edge references that are id
+        /// PREFIXES (those need the full id universe — see the module
+        /// docs). 0 skips the scan and reports those refs unknown.
+        #[arg(long, default_value = "20000")]
+        max_scan: usize,
+        /// Override the jobs-api URL. Defaults to BOSS_JOBS_URL or
+        /// http://127.0.0.1:7900.
+        #[arg(long)]
+        jobs_url: Option<String>,
     },
 }
 
@@ -534,6 +577,30 @@ async fn main() -> Result<()> {
             train::run(phase, dry, chrono::Utc::now()).await
         }
         Commands::Queue { column } => queue::run(&column).await,
+        Commands::Packet { action } => match action {
+            PacketAction::Census {
+                stale_days,
+                json,
+                max_open,
+                max_scan,
+                jobs_url,
+            } => {
+                // Wall-clock at the CLI boundary: the census's `now`
+                // IS the operator's now, and it stamps nothing — every
+                // call it makes is a GET.
+                census::run(
+                    census::Options {
+                        stale_days,
+                        json,
+                        max_open,
+                        max_scan,
+                        jobs_url,
+                    },
+                    chrono::Utc::now(),
+                )
+                .await
+            }
+        },
         Commands::Audit {
             kind,
             source,
