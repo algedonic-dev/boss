@@ -720,10 +720,10 @@ pub(crate) enum SweepGuard {
     /// Commits arrived after boarding — the train never carried them,
     /// and they live nowhere else.
     Moved { recorded: String, current: String },
-    /// No head on the record (a car that boarded before the conductor
-    /// recorded one). An unknown head is not evidence: the cost of
-    /// keeping a stale branch is a stale branch; the cost of deleting
-    /// a moved one is lost work.
+    /// The branch EXISTS and no head is on the record (a car that
+    /// boarded before the conductor recorded one). An unknown head is
+    /// not evidence: the cost of keeping a stale branch is a stale
+    /// branch; the cost of deleting a moved one is lost work.
     NoRecord,
     /// The branch is not on the forge — nothing left to sweep.
     Gone,
@@ -732,17 +732,59 @@ pub(crate) enum SweepGuard {
 /// The head-guard decision, pure. Both shas are full 40-char heads —
 /// the assembly records what `git rev-parse` merged, the guard reads
 /// what the forge names now — so equality is the whole test.
+///
+/// The forge's answer is read FIRST, and an absent branch settles the
+/// question whatever the record says. Ordering the record first
+/// conflates "we cannot vouch for this branch" with "there is no such
+/// branch", and the second is not a finding: nothing to delete,
+/// nothing to rescue, nothing an operator can do. Job 1bd1fb3d is the
+/// bill — every car that boarded before this guard existed has
+/// neither a recorded head nor a surviving branch, so the record-first
+/// order made each one a `NoRecord` line on every reconcile, forever.
+///
+/// The reorder is free: `branch_head` was already called
+/// unconditionally for every deletable branch, so the sweep asks the
+/// forge exactly as often as it did before.
 pub(crate) fn sweep_guard(recorded: Option<&str>, current: Option<&str>) -> SweepGuard {
     let recorded = recorded.filter(|s| !s.is_empty());
     let current = current.filter(|s| !s.is_empty());
     match (recorded, current) {
-        (None, _) => SweepGuard::NoRecord,
-        (Some(_), None) => SweepGuard::Gone,
+        (_, None) => SweepGuard::Gone,
+        (None, Some(_)) => SweepGuard::NoRecord,
         (Some(r), Some(c)) if r == c => SweepGuard::Delete,
         (Some(r), Some(c)) => SweepGuard::Moved {
             recorded: r.to_string(),
             current: c.to_string(),
         },
+    }
+}
+
+/// The journal line a guard verdict earns — `None` when it earns
+/// none. Pure, so "what does the operator hear" is a decision with a
+/// test rather than a shape buried in the sweep loop.
+///
+/// The sweep's journal is an operator surface, and a line belongs
+/// there only when a human could act on it. `Gone` is not that: the
+/// branch is not on the forge, so there is nothing to delete and
+/// nothing to rescue. Job 1bd1fb3d is the cost of getting this wrong
+/// — every car that boarded before the head guard existed has no
+/// recorded head and no surviving branch, and narrating that pair put
+/// dozens of lines in every reconcile, forever, about branches swept
+/// by hand hours earlier.
+///
+/// `Delete` is silent here too, but for the opposite reason: the
+/// caller does the deleting and is the only one who knows whether it
+/// was a dry run, a deletion, or a race lost to something faster.
+pub(crate) fn sweep_note(guard: &SweepGuard, branch: &str, car: &str) -> Option<String> {
+    match guard {
+        SweepGuard::Gone | SweepGuard::Delete => None,
+        SweepGuard::NoRecord => Some(format!(
+            "branch {branch} has no boarded head on record — not deleting (car {} landed)",
+            id8(car)
+        )),
+        SweepGuard::Moved { recorded, current } => {
+            Some(branch_moved_line(branch, recorded, current))
+        }
     }
 }
 
@@ -1907,9 +1949,16 @@ impl Conductor {
     /// The job record can: once a train has closed (arrived) and a
     /// boarded car closed with the merged outcome, that branch's
     /// work is on main and the conductor deletes it. A 404 is a fine
-    /// answer — something got there first. A train whose cars have
-    /// all reached a terminal is stamped `branches_swept`, so the
-    /// steady state costs one list call and no per-car fetches.
+    /// answer — something got there first, and the sweep says nothing
+    /// about it (see `sweep_note`). A train whose cars have all
+    /// reached a terminal is stamped `branches_swept`, so the steady
+    /// state costs one list call and no per-car fetches.
+    ///
+    /// Forge cost, unchanged by the quieting: one list call, plus per
+    /// UNSWEPT train one fetch per boarded car and one `branch_head`
+    /// per deletable branch. The `branches_swept` stamp is what bounds
+    /// it — coverage is never capped, so no landed branch goes
+    /// uninspected.
     async fn sweep_landed_branches(&self) -> Result<()> {
         let arrived = rows(
             self.api(
@@ -1962,36 +2011,31 @@ impl Conductor {
                     .and_then(boarded_head)
                     .map(str::to_string);
                 let current = self.forge.branch_head(&branch).await?;
-                match sweep_guard(recorded.as_deref(), current.as_deref()) {
-                    SweepGuard::Moved { recorded, current } => {
-                        log(branch_moved_line(&branch, &recorded, &current));
-                    }
-                    SweepGuard::NoRecord => log(format!(
-                        "branch {branch} has no boarded head on record — not deleting \
-                         (car {} landed)",
-                        id8(&car)
-                    )),
-                    SweepGuard::Gone => log(format!(
-                        "branch {branch} already gone (car {} landed)",
-                        id8(&car)
-                    )),
-                    SweepGuard::Delete => {
-                        if self.cfg.dry {
-                            log(format!(
-                                "DRY: would delete branch {branch} (car {} landed)",
-                                id8(&car)
-                            ));
-                        } else if self.forge.delete_branch(&branch).await? {
-                            log(format!(
-                                "deleted branch {branch} (car {} landed)",
-                                id8(&car)
-                            ));
-                        } else {
-                            log(format!(
-                                "branch {branch} already gone (car {} landed)",
-                                id8(&car)
-                            ));
-                        }
+                let guard = sweep_guard(recorded.as_deref(), current.as_deref());
+                // Verdicts that keep a branch narrate themselves, and
+                // a branch already off the forge narrates nothing.
+                if let Some(note) = sweep_note(&guard, &branch, &car) {
+                    log(note);
+                }
+                if guard == SweepGuard::Delete {
+                    if self.cfg.dry {
+                        log(format!(
+                            "DRY: would delete branch {branch} (car {} landed)",
+                            id8(&car)
+                        ));
+                    } else if self.forge.delete_branch(&branch).await? {
+                        log(format!(
+                            "deleted branch {branch} (car {} landed)",
+                            id8(&car)
+                        ));
+                    } else {
+                        // It existed a moment ago — something else
+                        // swept it between the two calls. Rare, and
+                        // worth saying so it is not read as our doing.
+                        log(format!(
+                            "branch {branch} already gone (car {} landed)",
+                            id8(&car)
+                        ));
                     }
                 }
             }
@@ -2675,7 +2719,8 @@ mod tests {
         arrival_summary, boarded_head, branch_moved_line, classify_transport, deletable_branches,
         deploy_needed, local_jobs_problem, overlay_metadata, parked_ready, releasable_cars,
         repo_path, resolve_train, retryable, retrying, short_cause, skip_reason_branch_missing,
-        skip_reason_conflict, stall_age_hours, sweep_guard, sweep_settled, train_branch_to_delete,
+        skip_reason_conflict, stall_age_hours, sweep_guard, sweep_note, sweep_settled,
+        train_branch_to_delete,
     };
     use anyhow::{Result, anyhow};
     use chrono::{DateTime, Utc};
@@ -3320,9 +3365,9 @@ mod tests {
         // An unknown head is not evidence. A car that boarded before
         // the conductor recorded heads keeps its branch: the cost of
         // keeping one is a stale branch, the cost of deleting one is
-        // lost work.
+        // lost work. The branch has to EXIST for the question to mean
+        // anything — see the Gone test for the other half.
         assert_eq!(sweep_guard(None, Some(BOARDED)), SweepGuard::NoRecord);
-        assert_eq!(sweep_guard(None, None), SweepGuard::NoRecord);
         // An empty stamp is no stamp.
         assert_eq!(sweep_guard(Some(""), Some(BOARDED)), SweepGuard::NoRecord);
     }
@@ -3331,6 +3376,49 @@ mod tests {
     fn a_branch_already_off_the_forge_is_nothing_to_sweep() {
         assert_eq!(sweep_guard(Some(BOARDED), None), SweepGuard::Gone);
         assert_eq!(sweep_guard(Some(BOARDED), Some("")), SweepGuard::Gone);
+        // The forge's answer is asked FIRST, so an absent branch reads
+        // Gone whatever the record says. Job 1bd1fb3d: every pre-guard
+        // historical car has no recorded head AND no branch left, and
+        // ordering the record first made each one a NoRecord line on
+        // every reconcile, forever, about a branch swept by hand hours
+        // earlier.
+        assert_eq!(sweep_guard(None, None), SweepGuard::Gone);
+        assert_eq!(sweep_guard(None, Some("")), SweepGuard::Gone);
+        assert_eq!(sweep_guard(Some(""), None), SweepGuard::Gone);
+    }
+
+    #[test]
+    fn only_a_branch_that_still_exists_is_worth_narrating() {
+        // The sweep's journal is an operator surface: a line earns its
+        // place by naming something a human can act on. A branch that
+        // is not on the forge is not that — nothing to delete, nothing
+        // to rescue, no action available.
+        assert_eq!(sweep_note(&SweepGuard::Gone, "fix/x", "car-1"), None);
+        // Delete narrates at the call site, which knows whether it was
+        // a dry run, a deletion, or a race.
+        assert_eq!(sweep_note(&SweepGuard::Delete, "fix/x", "car-1"), None);
+        // The two keep-and-tell cases: the branch exists and the sweep
+        // declined it, which is exactly what an operator must hear.
+        let no_record = sweep_note(&SweepGuard::NoRecord, "fix/x", "car-1")
+            .expect("a surviving branch with no record is worth a line");
+        assert!(no_record.contains("fix/x"), "{no_record}");
+        assert!(
+            no_record.contains("no boarded head on record"),
+            "{no_record}"
+        );
+        let moved = sweep_note(
+            &SweepGuard::Moved {
+                recorded: BOARDED.to_string(),
+                current: MOVED.to_string(),
+            },
+            "fix/conductor-hardening",
+            "car-1",
+        )
+        .expect("a branch that outgrew its boarding is worth a line");
+        assert_eq!(
+            moved,
+            branch_moved_line("fix/conductor-hardening", BOARDED, MOVED)
+        );
     }
 
     #[test]
