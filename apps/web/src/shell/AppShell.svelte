@@ -126,6 +126,12 @@
         // The executor network — who moves work and where it goes.
         // Belongs with the other live instruments rather than under
         // Define: it shows the system RUNNING, not how it is authored.
+        // The yard is one batch station rendered deep (the pipeline's
+        // queues); the map is every registry station rendered wide.
+        // The yard row was missing since its car landed — repaired
+        // here alongside the map's addition.
+        ROUTE_CATALOG['system-yard'],
+        ROUTE_CATALOG['system-map'],
       ],
     },
     {

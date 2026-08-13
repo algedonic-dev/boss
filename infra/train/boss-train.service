@@ -21,7 +21,11 @@ Wants=network-online.target
 #       /etc/boss-train/forge.token).
 #   BOSS_JOBS_URL — the jobs SYSTEM OF RECORD. Unset, the loop books
 #       trains on 127.0.0.1:7900, which on a cutover box is the
-#       legacy instance (split-brain incident c4b4a6b0).
+#       legacy instance (split-brain incident c4b4a6b0). Preflight
+#       now goes red on any loopback jobs URL unless
+#       BOSS_TRAIN_ALLOW_LOCAL_JOBS=1 is set — the deliberate
+#       test/demo-box escape hatch; never set it on a box whose
+#       system of record lives elsewhere.
 #   (BOSS_TRAIN_AUTO_MERGE=1, BOSS_TRAIN_DEPLOY_REMOTE, … ride the
 #   same drop-ins.)
 #

@@ -184,6 +184,43 @@ pub(crate) fn due_window(
     Some(window)
 }
 
+/// The soonest scheduled window strictly after `now` across the
+/// rules — the heartbeat's "next due". Wall rules promise their next
+/// grid bucket; clock rules today's next time-of-day or tomorrow's
+/// first; queue-depth rules fire on dock state, not on time, and
+/// promise nothing. None when no rule carries a schedule.
+pub(crate) fn next_due(rules: &[CadenceRule], now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    rules
+        .iter()
+        .filter_map(|rule| match &rule.basis {
+            Basis::Wall { every_minutes } => {
+                let every = i64::from(*every_minutes);
+                if every == 0 {
+                    return None;
+                }
+                let midnight = now.date_naive().and_hms_opt(0, 0, 0)?.and_utc();
+                let elapsed_min = (now - midnight).num_minutes();
+                Some(midnight + Duration::minutes((elapsed_min / every + 1) * every))
+            }
+            Basis::Clock { at } => {
+                let today = now.date_naive();
+                let tomorrow = today.succ_opt()?;
+                at.iter()
+                    .map(|t| {
+                        let w = today.and_time(*t).and_utc();
+                        if w > now {
+                            w
+                        } else {
+                            tomorrow.and_time(*t).and_utc()
+                        }
+                    })
+                    .min()
+            }
+            Basis::QueueDepth { .. } => None,
+        })
+        .min()
+}
+
 /// Parse the registry's `at_times` JSONB (`["06:00","18:00"]`) into
 /// times-of-day. Rejects empty lists and non-"HH:MM" entries loudly —
 /// a rule that cannot be read must be skipped visibly, not fire never
@@ -401,7 +438,13 @@ fn run_verb(verb: &str) -> Result<i32> {
     Ok(status.code().unwrap_or(-1))
 }
 
-async fn tick(pool: &PgPool, clock: &dyn ClockClient, dry: bool) -> Result<()> {
+/// What a tick saw — fodder for the heartbeat line.
+struct TickSummary {
+    rules: usize,
+    next_due: Option<DateTime<Utc>>,
+}
+
+async fn tick(pool: &PgPool, clock: &dyn ClockClient, dry: bool) -> Result<TickSummary> {
     // Boss-clock time is the only "now" in this loop (clock-as-service;
     // the no-wallclock invariant). In the wall-mode production deploy
     // it IS wall time — served by the one authoritative clock.
@@ -454,7 +497,10 @@ async fn tick(pool: &PgPool, clock: &dyn ClockClient, dry: bool) -> Result<()> {
             rule.name, rule.verb
         ));
     }
-    Ok(())
+    Ok(TickSummary {
+        rules: rules.len(),
+        next_due: next_due(&rules, now),
+    })
 }
 
 /// The `boss train cadence` entry: the supervised loop
@@ -472,20 +518,43 @@ pub async fn run(once: bool, dry: bool) -> Result<()> {
     let tick_secs: u64 = train::env_or("BOSS_TRAIN_CADENCE_TICK_SECONDS", "60")
         .parse()
         .context("parsing BOSS_TRAIN_CADENCE_TICK_SECONDS")?;
+    // The heartbeat cadence: one "alive" line every N ticks (~30 min
+    // at the 60s default). Silence must be diagnosable — a hung loop
+    // and a quiet loop cannot be allowed to look identical in the
+    // journal; this makes "is it hung?" a one-line grep.
+    let heartbeat_ticks = train::env_or("BOSS_TRAIN_HEARTBEAT_TICKS", "30")
+        .parse::<u64>()
+        .ok()
+        .filter(|&n| n > 0)
+        .unwrap_or(30);
     log(format!(
         "loop starting — rules from cadence_rules, clock at {clock_url}, tick {tick_secs}s{}",
         if dry { ", DRY" } else { "" }
     ));
+    let mut tick_n: u64 = 0;
     loop {
+        tick_n += 1;
         let outcome = tick(&pool, clock.as_ref(), dry).await;
         if once {
-            return outcome;
+            return outcome.map(|_| ());
         }
-        if let Err(e) = outcome {
-            // The loop survives a bad tick — supervision is systemd's
-            // job, coordination is this loop's; a transient jobs-api
-            // or Postgres outage must not kill the schedule.
-            log(format!("tick failed: {e:#}"));
+        match outcome {
+            Err(e) => {
+                // The loop survives a bad tick — supervision is systemd's
+                // job, coordination is this loop's; a transient jobs-api
+                // or Postgres outage must not kill the schedule.
+                log(format!("tick failed: {e:#}"));
+            }
+            Ok(summary) if tick_n.is_multiple_of(heartbeat_ticks) => {
+                let due = summary
+                    .next_due
+                    .map_or_else(|| "?".to_string(), window_stamp);
+                log(format!(
+                    "alive (tick {tick_n}, {} rules, next due {due})",
+                    summary.rules
+                ));
+            }
+            Ok(_) => {}
         }
         tokio::time::sleep(std::time::Duration::from_secs(tick_secs)).await;
     }
@@ -715,6 +784,43 @@ mod tests {
         ] {
             assert!(parse_at_times(&bad).is_err(), "accepted {bad}");
         }
+    }
+
+    // -- the heartbeat's next-due -----------------------------------------
+    //
+    // One journal line every N ticks says the loop is alive and what
+    // it is waiting for — a hung loop and a quiet loop must not look
+    // identical. `next_due` is the schedule half of that line.
+
+    #[test]
+    fn next_due_is_the_soonest_scheduled_window() {
+        let rules = vec![wall_rule(10), clock_rule()];
+        // 06:07: the wall grid's next bucket (06:10) beats 18:00.
+        assert_eq!(
+            next_due(&rules, utc(2026, 8, 12, 6, 7, 30)),
+            Some(utc(2026, 8, 12, 6, 10, 0))
+        );
+    }
+
+    #[test]
+    fn next_due_rolls_a_clock_rule_to_tomorrow() {
+        // 19:00 — both of today's windows (06:00, 18:00) are behind;
+        // the promise is tomorrow 06:00.
+        assert_eq!(
+            next_due(&[clock_rule()], utc(2026, 8, 12, 19, 0, 0)),
+            Some(utc(2026, 8, 13, 6, 0, 0))
+        );
+    }
+
+    #[test]
+    fn queue_depth_rules_promise_no_window() {
+        // Depth rules fire on dock state, not on time — a registry of
+        // only depth rules gives the heartbeat nothing to promise.
+        assert_eq!(
+            next_due(&[depth_rule(3, 120)], utc(2026, 8, 12, 6, 0, 0)),
+            None
+        );
+        assert_eq!(next_due(&[], utc(2026, 8, 12, 6, 0, 0)), None);
     }
 
     // -- firing ids -------------------------------------------------------

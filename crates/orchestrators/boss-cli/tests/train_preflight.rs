@@ -106,9 +106,9 @@ impl Fixture {
         }
     }
 
-    fn preflight(&self) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_boss"))
-            .args(["train", "preflight"])
+    fn preflight_cmd(&self) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_boss"));
+        cmd.args(["train", "preflight"])
             .env("BOSS_TRAIN_HOME", &self.home)
             .env("BOSS_TRAIN_UPSTREAM_URL", &self.upstream)
             .env("BOSS_TRAIN_FORK_URL", &self.fork)
@@ -121,6 +121,15 @@ impl Fixture {
             // accidental API call fail the test instead of touching
             // a real jobs-api.
             .env("BOSS_JOBS_URL", "http://127.0.0.1:1")
+            // That URL is loopback ON PURPOSE, so the drift sentinel
+            // (split-brain incident c4b4a6b0) needs the deliberate
+            // allowance here — exactly what a test/demo box sets.
+            .env("BOSS_TRAIN_ALLOW_LOCAL_JOBS", "1");
+        cmd
+    }
+
+    fn preflight(&self) -> Output {
+        self.preflight_cmd()
             .output()
             .expect("boss train preflight runs")
     }
@@ -170,6 +179,32 @@ fn unreachable_fork_remote_fails_loudly_with_exit_3() {
     assert!(
         text.contains("fork"),
         "the failure names the remote that broke: {text}"
+    );
+}
+
+#[test]
+fn loopback_jobs_url_without_the_allowance_goes_red() {
+    // The drift sentinel (split-brain incident c4b4a6b0): a defaulted
+    // BOSS_JOBS_URL once sent a whole window's bookkeeping to
+    // localhost instead of the system of record. An otherwise healthy
+    // locomotive must still refuse to pull.
+    let fx = Fixture::new("split-brain");
+    let mut cmd = fx.preflight_cmd();
+    cmd.env_remove("BOSS_TRAIN_ALLOW_LOCAL_JOBS");
+    let out = cmd.output().expect("boss train preflight runs");
+    let text = combined(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a loopback jobs URL without the allowance exits 3: {text}"
+    );
+    assert!(
+        text.contains("BOSS_JOBS_URL"),
+        "the failure names the env var that drifted: {text}"
+    );
+    assert!(
+        text.contains("BOSS_TRAIN_ALLOW_LOCAL_JOBS"),
+        "the failure names the deliberate override: {text}"
     );
 }
 

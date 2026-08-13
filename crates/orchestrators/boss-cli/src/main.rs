@@ -178,6 +178,21 @@ enum TrainAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Cancel an open train that will not arrive: close its PR
+    /// unmerged, release the boarded cars back to the dock (each one
+    /// re-enters the next boarding, with the reason on its record),
+    /// complete the train's `cancelled` terminal, and delete the
+    /// train's own branch — never a car's.
+    Cancel {
+        /// The train's Job id (or a unique prefix), or its PR url
+        train: String,
+        /// Why — recorded on the cancelled step and every released car
+        #[arg(long)]
+        reason: String,
+        /// Say what would happen without writing anywhere
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// The cadence loop: evaluate the `cadence_rules` registry
     /// against boss-clock time and fire the verbs the rules name,
     /// recording every firing in `cadence_firings`. The supervised
@@ -499,6 +514,17 @@ async fn main() -> Result<()> {
                 TrainAction::Reconcile { dry_run } => (train::Phase::Reconcile, dry_run),
                 TrainAction::Board { dry_run } => (train::Phase::Board, dry_run),
                 TrainAction::Run { dry_run } => (train::Phase::Run, dry_run),
+                TrainAction::Cancel {
+                    train,
+                    reason,
+                    dry_run,
+                } => (
+                    train::Phase::Cancel {
+                        handle: train,
+                        reason,
+                    },
+                    dry_run,
+                ),
                 TrainAction::Cadence { .. } => unreachable!("handled above"),
             };
             // Wall-clock at the CLI boundary: the train window IS the

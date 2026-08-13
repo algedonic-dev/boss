@@ -81,6 +81,14 @@ describe('nav catalog — app assignment', () => {
     // Beside Flow deliberately: Flow is throughput, Fleet is where
     // the work is piling up (queue-visibility Q4's depth signal).
     'system-fleet',
+    // The train yard — the departure board over the pipeline's queues
+    // and the IT app's guest-visible landing (departure-board.md Q1).
+    // Its car landed without this line; added when the map arrived.
+    'system-yard',
+    // The network map — every registry station as a node
+    // (stations.md: priority queues, stations, and network nodes are
+    // one concept). No edges until motion is evented.
+    'system-map',
   ];
 
   it('the IT app contains the System Model set plus what we added deliberately', () => {

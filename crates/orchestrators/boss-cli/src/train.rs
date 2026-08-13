@@ -66,11 +66,14 @@ pub(crate) fn boss_user() -> String {
 /// Which slice of the conductor to run. `Run` is the timer entry
 /// (reconcile + board); the others are the standalone verbs the
 /// python argv flags (`--preflight`, `--reconcile-only`) selected.
+/// `Cancel` is the operator's judgment call on a train that will not
+/// arrive — close the PR unmerged, release the cars, record why.
 pub enum Phase {
     Preflight,
     Reconcile,
     Board,
     Run,
+    Cancel { handle: String, reason: String },
 }
 
 pub(crate) fn env_or(key: &str, default: &str) -> String {
@@ -92,6 +95,16 @@ struct Config {
     /// this protocol is the car review at parking, not a mechanical
     /// click at landing.
     auto_merge: bool,
+    /// The drift sentinel's deliberate escape hatch
+    /// (BOSS_TRAIN_ALLOW_LOCAL_JOBS=1): accept a loopback jobs URL.
+    /// Test harnesses and demo boxes only — on a real box the jobs
+    /// system of record lives elsewhere (incident c4b4a6b0).
+    allow_local_jobs: bool,
+    /// Hours without a step completion before an open train counts
+    /// stalled (BOSS_TRAIN_STALL_HOURS, default 6). An env knob for
+    /// now — this threshold belongs in the cadence_rules registry as
+    /// protocol data; follow-up, not this change.
+    stall_hours: i64,
     dry: bool,
 }
 
@@ -113,6 +126,8 @@ impl Config {
             clone: format!("{home}/repo"),
             deploy_tree: env_or("BOSS_TRAIN_DEPLOY_TREE", "/opt/boss"),
             auto_merge: std::env::var("BOSS_TRAIN_AUTO_MERGE").as_deref() == Ok("1"),
+            allow_local_jobs: std::env::var("BOSS_TRAIN_ALLOW_LOCAL_JOBS").as_deref() == Ok("1"),
+            stall_hours: env_or("BOSS_TRAIN_STALL_HOURS", "6").parse().unwrap_or(6),
             gh_repo,
             home,
             dry,
@@ -203,9 +218,51 @@ fn walk_foreign(dir: &Path, me: u32, foreign: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Host of an http(s) URL — scheme, userinfo, port, and path all
+/// stripped. Enough to ask "is this loopback?" without a URL crate.
+fn url_host(url: &str) -> &str {
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host.split(':').next().unwrap_or_default(),
+    }
+}
+
+/// The drift sentinel (split-brain incident c4b4a6b0): BOSS_JOBS_URL
+/// defaulted to localhost on a cutover box and the conductor silently
+/// booked a whole window's trains on the wrong instance. A loopback
+/// jobs URL is a preflight problem unless the box declares that a
+/// local jobs-api is the point — BOSS_TRAIN_ALLOW_LOCAL_JOBS=1, set
+/// deliberately by test harnesses and demo boxes.
+pub(crate) fn local_jobs_problem(jobs_url: &str, allow_local: bool) -> Option<String> {
+    if allow_local {
+        return None;
+    }
+    let host = url_host(jobs_url);
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    loopback.then(|| {
+        format!(
+            "BOSS_JOBS_URL resolves to loopback ({jobs_url}) — bookkeeping must target \
+             the jobs system of record, not this box (split-brain incident c4b4a6b0); \
+             set BOSS_TRAIN_ALLOW_LOCAL_JOBS=1 only where a local jobs-api is the point"
+        )
+    })
+}
+
 /// Return the list of problems; empty means the locomotive is fit.
 fn preflight(cfg: &Config) -> Result<Vec<String>> {
     let mut problems = Vec::new();
+    // The drift sentinel runs first, clone or no clone: a conductor
+    // whose bookkeeping would land on this box instead of the system
+    // of record must not pull at all.
+    if let Some(p) = local_jobs_problem(&cfg.jobs, cfg.allow_local_jobs) {
+        problems.push(p);
+    }
     // The invariant is OWNERSHIP, not uid zero: the conductor must run
     // as the clone's owner. The original flat refuse-root check said
     // the same thing only on the box where the service user is not
@@ -337,6 +394,62 @@ fn metadata_map(v: &Value) -> Map<String, Value> {
     }
 }
 
+/// The overlay half of `merge_job_metadata`, pure: jobs-api's PATCH
+/// semantics stop at the top level — a PUT replaces `metadata`
+/// wholesale — so every update must carry the record's existing keys
+/// forward. A `Value::Null` value REMOVES the key: how a boarding car
+/// sheds a stale `skip_reason` instead of carrying "" forever.
+pub(crate) fn overlay_metadata(container: &Value, kv: Vec<(&str, Value)>) -> Map<String, Value> {
+    let mut md = metadata_map(container);
+    for (k, v) in kv {
+        match v {
+            Value::Null => {
+                md.remove(k);
+            }
+            v => {
+                md.insert(k.to_string(), v);
+            }
+        }
+    }
+    md
+}
+
+/// Character budget for the file list in a conflict skip reason. The
+/// reason lands on the car Job's `metadata.skip_reason`, which the
+/// yard's PacketCard renders as a chip ("LEFT BEHIND — <reason>") —
+/// past this budget the list truncates to a count.
+const SKIP_REASON_FILE_BUDGET: usize = 96;
+
+/// The skip reason for a car whose branch would not merge onto this
+/// window's train: names the conflicted files, truncated to stay
+/// chip-sized. At least one file always shows.
+pub(crate) fn skip_reason_conflict(conflicted: &[String]) -> String {
+    if conflicted.is_empty() {
+        return "conflict: unresolved (merge died before conflict markers)".to_string();
+    }
+    let mut shown = 0usize;
+    let mut len = 0usize;
+    for f in conflicted {
+        let add = f.len() + if shown == 0 { 0 } else { 2 };
+        if shown > 0 && len + add > SKIP_REASON_FILE_BUDGET {
+            break;
+        }
+        shown += 1;
+        len += add;
+    }
+    let files = conflicted[..shown].join(", ");
+    match conflicted.len() - shown {
+        0 => format!("conflict: {files}"),
+        hidden => format!("conflict: {files} +{hidden} more"),
+    }
+}
+
+/// The skip reason for a car parked at review whose branch was never
+/// pushed to the fork.
+pub(crate) fn skip_reason_branch_missing(branch: &str) -> String {
+    format!("branch {branch} not on fork")
+}
+
 /// Is this ship-a-change Job a parked ready car — at review with a
 /// branch declared and not already on a train? ONE definition, shared
 /// by the boarding collector below and the cadence loop's dock-depth
@@ -415,6 +528,240 @@ pub(crate) fn sweep_settled(boarded_cars: &[Value]) -> bool {
     })
 }
 
+/// A step's `completed_at` evidence stamp, raw as stored. The
+/// conductor stamps this on every step IT completes; steps closed by
+/// other hands (the dispatcher's terminals) may not carry one.
+fn step_stamp<'a>(train: &'a Value, slug: &str, title: &str) -> Option<&'a str> {
+    find_step(train, slug, title)
+        .and_then(|s| s.get("metadata"))
+        .and_then(|m| m.get("completed_at"))
+        .and_then(Value::as_str)
+}
+
+fn parse_stamp(s: Option<&str>) -> Option<DateTime<chrono::FixedOffset>> {
+    s.and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+}
+
+fn secs_between(
+    a: Option<DateTime<chrono::FixedOffset>>,
+    b: Option<DateTime<chrono::FixedOffset>>,
+) -> Value {
+    match (a, b) {
+        (Some(a), Some(b)) => json!((b - a).num_seconds()),
+        _ => Value::Null,
+    }
+}
+
+/// The deployed sha out of the deploy step's summary evidence
+/// (`main@<sha>; ...`). None when the summary is absent or shaped
+/// differently — the report never guesses.
+fn deployed_generation(summary: &str) -> Option<&str> {
+    summary
+        .strip_prefix("main@")
+        .and_then(|rest| rest.split([';', ' ']).next())
+        .filter(|sha| !sha.is_empty())
+}
+
+/// The arrival report — the landing's final structured entry, filed
+/// on the `arrived` step when the sweep visits an arrived train.
+/// Everything derives from evidence the job record already holds:
+/// the boarded cars (consist), the board-time skips the train
+/// recorded (left_behind), the deployed generation, and the timings
+/// the conductor's own `completed_at` stamps make derivable. Missing
+/// evidence reads as null, never a guess — `arrived_at` stays null
+/// until whatever completes the outcome step stamps a time, and no
+/// CI round count appears because the record does not carry one.
+pub(crate) fn arrival_report(train: &Value, boarded_cars: &[Value]) -> Value {
+    let consist: Vec<Value> = boarded_cars
+        .iter()
+        .map(|c| {
+            json!({
+                "car_id_short": id8(c.get("id").and_then(Value::as_str).unwrap_or("?")),
+                "title": c.get("title").and_then(Value::as_str).unwrap_or_default(),
+                "branch": c
+                    .get("metadata")
+                    .and_then(|m| m.get("branch"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            })
+        })
+        .collect();
+    let left_behind = train
+        .get("metadata")
+        .and_then(|m| m.get("left_behind"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let generation = find_step(train, "deployed", "Deployed to the playground")
+        .and_then(|s| s.get("metadata"))
+        .and_then(|m| m.get("deployed"))
+        .and_then(Value::as_str)
+        .and_then(deployed_generation);
+    let merged_sha = find_step(train, "merged", "Merged into main")
+        .and_then(|s| s.get("metadata"))
+        .and_then(|m| m.get("merge_ref"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let boarded = step_stamp(train, "collect", "Collect what is ready to board");
+    let merged = step_stamp(train, "merged", "Merged into main");
+    let deployed = step_stamp(train, "deployed", "Deployed to the playground");
+    let arrived = step_stamp(train, "arrived", "Train arrived");
+    let mut report = json!({
+        "consist": consist,
+        "left_behind": left_behind,
+        "generation": generation,
+        "timings": {
+            "boarded_at": boarded,
+            "merged_at": merged,
+            "deployed_at": deployed,
+            "arrived_at": arrived,
+            "board_to_merge_s": secs_between(parse_stamp(boarded), parse_stamp(merged)),
+            "merge_to_deploy_s": secs_between(parse_stamp(merged), parse_stamp(deployed)),
+            "total_s": secs_between(parse_stamp(boarded), parse_stamp(arrived)),
+        },
+    });
+    // The merged sha is the generation seen from the other end — a
+    // short deploy sha prefixing the full merge sha is the SAME
+    // commit, and repeating it would imply a divergence that is not
+    // there. It appears only when genuinely distinct (or when the
+    // deploy evidence is missing and it is the only sha on record).
+    if let Some(m) =
+        merged_sha.filter(|m| generation.is_none_or(|g| !(g.starts_with(m) || m.starts_with(g))))
+    {
+        report["merged_sha"] = json!(m);
+    }
+    report
+}
+
+/// The one-line form of the report — filed beside it as `summary`,
+/// and the shape of the journal line. Reads the report, not the
+/// world: unknowns print as "unknown" / "?", never as guesses.
+pub(crate) fn arrival_summary(report: &Value) -> String {
+    let n = report
+        .get("consist")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let generation = report
+        .get("generation")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let total = report
+        .get("timings")
+        .and_then(|t| t.get("total_s"))
+        .and_then(Value::as_i64)
+        .map_or_else(|| "?".to_string(), |s| s.to_string());
+    format!("{n} cars; generation {generation}; total {total}s")
+}
+
+/// Is a deploy actually needed? `current_key` is the generation
+/// store's live key — the 8-char short-sha release dirname
+/// (infra/generation.sh); `remote_main` is the FULL 40-char sha
+/// `git ls-remote` answers. Same generation iff the full sha starts
+/// with the short key — exactly that direction (the live incident:
+/// this pair failing the comparison re-ran a full no-op deploy every
+/// 10-minute reconcile). Missing evidence on either side deploys —
+/// the deploy path surfaces its own errors, and a skip must never
+/// rest on absence.
+pub(crate) fn deploy_needed(current_key: &str, remote_main: &str) -> bool {
+    current_key.is_empty() || remote_main.is_empty() || !remote_main.starts_with(current_key)
+}
+
+/// The live generation's key — the basename of the store's `current`
+/// symlink. The store layout is owned by infra/generation.sh (the
+/// one definition); this reads the same BOSS_GEN_ROOT contract.
+/// Empty when the box has no generation store yet.
+fn current_generation_key() -> String {
+    let root = env_or("BOSS_GEN_ROOT", "/usr/local/boss");
+    fs::read_link(Path::new(&root).join("current"))
+        .ok()
+        .and_then(|t| t.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default()
+}
+
+/// The newest `completed_at` stamp across a train's steps — when
+/// progress last provably happened. None when no step carries a
+/// parseable stamp.
+fn newest_completion(train: &Value) -> Option<&str> {
+    train
+        .get("steps")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|s| {
+            let raw = s
+                .get("metadata")
+                .and_then(|m| m.get("completed_at"))
+                .and_then(Value::as_str)?;
+            Some((DateTime::parse_from_rfc3339(raw).ok()?, raw))
+        })
+        .max_by_key(|(t, _)| *t)
+        .map(|(_, raw)| raw)
+}
+
+/// The stall sentinel's decision, pure: an open train counts stalled
+/// when its newest step completion is at least `threshold_hours` old,
+/// and the age in whole hours comes back for the journal line. No
+/// completion evidence means no basis — None, never a guess.
+pub(crate) fn stall_age_hours(
+    train: &Value,
+    now: DateTime<Utc>,
+    threshold_hours: i64,
+) -> Option<i64> {
+    let newest = DateTime::parse_from_rfc3339(newest_completion(train)?).ok()?;
+    let age = (now.signed_duration_since(newest)).num_hours();
+    (age >= threshold_hours).then_some(age)
+}
+
+/// Which boarded cars a cancelled train releases back to the dock:
+/// the still-open ones. A closed or cancelled car's record is history
+/// — merged or abandoned, either way not the cancel path's to touch.
+pub(crate) fn releasable_cars(cars: &[Value]) -> Vec<&Value> {
+    cars.iter()
+        .filter(|c| c.get("status").and_then(Value::as_str) == Some("open"))
+        .collect()
+}
+
+/// The ONE branch a cancelled train may delete: its own `train/*`
+/// assembly branch (the Job's subject id). Car branches hold the
+/// cars' unmerged work and are never the cancel path's to touch —
+/// this filter is the pin.
+pub(crate) fn train_branch_to_delete(train: &Value) -> Option<String> {
+    train
+        .get("subject")
+        .and_then(|s| s.get("id"))
+        .and_then(Value::as_str)
+        .filter(|b| b.starts_with("train/"))
+        .map(str::to_string)
+}
+
+/// Resolve the operator's handle — a Job id, an id prefix, or the
+/// train's PR url — against the open trains. Exactly one match or an
+/// error saying what went wrong; an ambiguous prefix refuses rather
+/// than guessing which train to cancel.
+pub(crate) fn resolve_train<'a>(trains: &'a [Value], handle: &str) -> Result<&'a Value> {
+    let matches: Vec<&Value> = trains
+        .iter()
+        .filter(|t| {
+            let id = t.get("id").and_then(Value::as_str).unwrap_or_default();
+            let pr_url = find_step(t, "pr", "Open the batched PR")
+                .and_then(|s| s.get("metadata"))
+                .and_then(|m| m.get("pr_url"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            id == handle || (!handle.is_empty() && id.starts_with(handle)) || pr_url == handle
+        })
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(one),
+        [] => bail!("no open train matches {handle:?}"),
+        many => bail!(
+            "{handle:?} is ambiguous — matches trains {}",
+            many.iter()
+                .map(|t| id8(t.get("id").and_then(Value::as_str).unwrap_or("?")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 // The DRY log lines mirror the python conductor's dict/list reprs —
 // the journal is operator surface, and the port keeps its lines.
 
@@ -473,6 +820,9 @@ trait Forge: Send + Sync {
         body: &str,
     ) -> Result<String>;
     async fn merge(&self, url: &str) -> Result<()>;
+    /// Close a PR WITHOUT merging — a cancelled train's PR must not
+    /// sit open inviting a merge.
+    async fn close_pr(&self, url: &str) -> Result<()>;
     /// Delete `branch` from the repo car branches are pushed to.
     /// Ok(true) = deleted; Ok(false) = already gone (404) — an
     /// expected state, the repo auto-deletes merged `train/*` PR
@@ -531,6 +881,11 @@ impl Forge for GitHubForge {
 
     async fn merge(&self, url: &str) -> Result<()> {
         sh(&["gh", "pr", "merge", url, "--squash"])?;
+        Ok(())
+    }
+
+    async fn close_pr(&self, url: &str) -> Result<()> {
+        sh(&["gh", "pr", "close", url])?;
         Ok(())
     }
 
@@ -724,6 +1079,17 @@ impl Forge for ForgejoForge {
         Ok(())
     }
 
+    async fn close_pr(&self, url: &str) -> Result<()> {
+        let idx = Self::index(url);
+        self.api(
+            Method::PATCH,
+            &format!("/repos/{}/pulls/{idx}", self.repo),
+            Some(json!({"state": "closed"})),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// DELETE /repos/{owner}/{repo}/branches/{branch}. Not through
     /// `api()` — a 404 here is an answer (already gone), not an
     /// error, and `api()` bails on every non-2xx.
@@ -885,6 +1251,13 @@ impl Conductor {
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("step without an id on job {jid}"))?;
+        // WHEN is evidence too: steps carry only a completion DATE,
+        // so the conductor stamps the instant itself — the arrival
+        // report's timings derive from these.
+        md.insert(
+            "completed_at".to_string(),
+            json!(Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        );
         self.api(
             Method::PUT,
             &format!("/api/jobs/{jid}/steps/{sid}"),
@@ -896,13 +1269,14 @@ impl Conductor {
     }
 
     /// update_job takes a whole Job; fetch, merge metadata, put back.
+    /// The overlay itself is `overlay_metadata` — pure, and pinned by
+    /// tests: PUT replaces metadata wholesale, so clobbering here
+    /// would silently eat another writer's keys. A `Value::Null`
+    /// value removes the key.
     async fn merge_job_metadata(&self, jid: &str, kv: Vec<(&str, Value)>) -> Result<Value> {
         let mut job = self.get_job(jid).await?;
         let keys: Vec<&str> = kv.iter().map(|(k, _)| *k).collect();
-        let mut md = metadata_map(&job);
-        for (k, v) in kv {
-            md.insert(k.to_string(), v);
-        }
+        let md = overlay_metadata(&job, kv);
         job["metadata"] = Value::Object(md);
         if self.cfg.dry {
             log(format!(
@@ -926,6 +1300,38 @@ impl Conductor {
     async fn deploy(&self, train: &Value, deployed_step: &Value) -> Result<()> {
         let tree = self.cfg.deploy_tree.clone();
         let tree_path = Path::new(&tree);
+        // Deploy only when needed. The skip decision comes before the
+        // busy check — a no-op deploy has no business caring about
+        // the tree — and reads two facts: the generation store's live
+        // key and what `main` is on the remote. Matching pair: record
+        // the evidence on the step and journal the skip; the services
+        // stay unbounced.
+        let pull_remote = env_or("BOSS_TRAIN_DEPLOY_REMOTE", "origin");
+        let remote_out = sh_unchecked(&["git", "-C", &tree, "ls-remote", &pull_remote, "main"])?;
+        let remote_main = stdout_str(&remote_out)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let current = current_generation_key();
+        if !deploy_needed(&current, &remote_main) {
+            let short: String = remote_main.chars().take(12).collect();
+            log(format!(
+                "deploy skipped — generation {current} already serves main@{short}"
+            ));
+            self.complete_step(
+                train,
+                Some(deployed_step),
+                &[(
+                    "deployed",
+                    Some(format!(
+                        "already live: generation {current} serves main@{short}; no deploy run"
+                    )),
+                )],
+            )
+            .await?;
+            return Ok(());
+        }
         let dirty_out = sh_unchecked(&["git", "-C", &tree, "status", "--porcelain"])?;
         let dirty = !stdout_str(&dirty_out).trim().is_empty();
         let branch_out = sh(&["git", "-C", &tree, "rev-parse", "--abbrev-ref", "HEAD"])?;
@@ -961,7 +1367,6 @@ impl Conductor {
         }
         // Under the forge protocol the playground converges on forge
         // main; GitHub is the mirror, never the source (27ab7680).
-        let pull_remote = env_or("BOSS_TRAIN_DEPLOY_REMOTE", "origin");
         sh(&["git", "-C", &tree, "pull", &pull_remote, "main"])?;
         let main_ref_out = sh(&["git", "-C", &tree, "rev-parse", "--short", "HEAD"])?;
         let main_ref = stdout_str(&main_ref_out).trim().to_string();
@@ -1007,7 +1412,7 @@ impl Conductor {
         Ok(())
     }
 
-    async fn reconcile(&self) -> Result<()> {
+    async fn reconcile(&self, now: DateTime<Utc>) -> Result<()> {
         let trains = rows(
             self.api(
                 Method::GET,
@@ -1019,6 +1424,10 @@ impl Conductor {
         for t0 in trains {
             let tid = job_id(&t0)?.to_string();
             let mut t = self.get_job(&tid).await?;
+            // The stall sentinel first — a train stuck BEFORE its PR
+            // (assembly died, push hung) would slip past the
+            // pr-step early-continues below and stall invisibly.
+            self.note_stall(&t, now).await?;
             let pr_step = find_step(&t, "pr", "Open the batched PR");
             if !step_done(pr_step) {
                 continue; // this window's board phase, or a stalled assembly
@@ -1105,6 +1514,38 @@ impl Conductor {
         Ok(())
     }
 
+    /// The stall sentinel: stamp `stalled_since` (once) when an open
+    /// train's newest step completion ages past the threshold; clear
+    /// the stamp when the train advances. Raising is protocol,
+    /// cancelling is judgment — nothing here auto-cancels; the
+    /// operator's verb for that is `boss train cancel`.
+    async fn note_stall(&self, t: &Value, now: DateTime<Utc>) -> Result<()> {
+        let tid = job_id(t)?;
+        let stamped = truthy(t.get("metadata").and_then(|m| m.get("stalled_since")));
+        match stall_age_hours(t, now, self.cfg.stall_hours) {
+            Some(age) if !stamped => {
+                log(format!(
+                    "train {} stalled ({age}h, threshold {}h)",
+                    id8(tid),
+                    self.cfg.stall_hours
+                ));
+                // Since WHEN: the newest completion — the moment
+                // progress provably stopped, not the moment the
+                // sentinel happened to look.
+                let since = newest_completion(t).unwrap_or_default().to_string();
+                self.merge_job_metadata(tid, vec![("stalled_since", json!(since))])
+                    .await?;
+            }
+            None if stamped => {
+                log(format!("train {} advanced — stall stamp cleared", id8(tid)));
+                self.merge_job_metadata(tid, vec![("stalled_since", Value::Null)])
+                    .await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Reconcile's arrival sweep: delete landed cars' branches from
     /// the forge (protocol decision, David). The repo auto-deletes
     /// merged `train/*` PR heads, but each CAR branch survives its
@@ -1157,6 +1598,7 @@ impl Conductor {
             for cid in &boarded {
                 cars.push(self.get_job(cid).await?);
             }
+            self.file_arrival_report(tid, &cars).await?;
             for (branch, car) in deletable_branches(&cars, &open_branches) {
                 if self.cfg.dry {
                     log(format!(
@@ -1180,6 +1622,68 @@ impl Conductor {
                     .await?;
             }
         }
+        Ok(())
+    }
+
+    /// File the arrival report — the landing's final structured entry
+    /// — on an arrived train's `arrived` step, once. The sweep is the
+    /// conductor's visit to every arrived train, so the report is
+    /// composed here from the full job record plus the boarded cars
+    /// the sweep already fetched. The step PUT merges metadata (the
+    /// same rule `overlay_metadata` pins): the outcome step's own
+    /// keys survive the filing.
+    async fn file_arrival_report(&self, tid: &str, cars: &[Value]) -> Result<()> {
+        let train = self.get_job(tid).await?;
+        let Some(step) = find_step(&train, "arrived", "Train arrived") else {
+            return Ok(());
+        };
+        let filed = step
+            .get("metadata")
+            .and_then(|m| m.get("arrival_report"))
+            .is_some();
+        // Strictly `completed` — never `skipped`: a cancelled train
+        // closes with its arrived step SKIPPED, and a landing report
+        // on a train that never landed would be fiction.
+        let arrived = step.get("status").and_then(Value::as_str) == Some("completed");
+        if !arrived || filed {
+            return Ok(());
+        }
+        let report = arrival_report(&train, cars);
+        let summary = arrival_summary(&report);
+        let n = report
+            .get("consist")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let total = report
+            .get("timings")
+            .and_then(|t| t.get("total_s"))
+            .and_then(Value::as_i64)
+            .map_or_else(|| "?".to_string(), |s| s.to_string());
+        if self.cfg.dry {
+            log(format!(
+                "DRY: would file the arrival report on {}",
+                id8(tid)
+            ));
+            return Ok(());
+        }
+        let sid = step
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("arrived step without an id on job {tid}"))?;
+        let md = overlay_metadata(
+            step,
+            vec![("arrival_report", report), ("summary", json!(summary))],
+        );
+        self.api(
+            Method::PUT,
+            &format!("/api/jobs/{tid}/steps/{sid}"),
+            Some(json!({"metadata": md})),
+        )
+        .await?;
+        log(format!(
+            "arrival report on {} ({n} cars, total {total}s)",
+            id8(tid)
+        ));
         Ok(())
     }
 
@@ -1251,8 +1755,13 @@ impl Conductor {
         Ok(())
     }
 
-    async fn candidates(&self) -> Result<Vec<(Value, String)>> {
+    /// The parked-ready cars whose branch is actually on the fork,
+    /// plus the left-behind record for the ones whose branch is not
+    /// — each of those gets its `skip_reason` stamped (the yard's
+    /// "LEFT BEHIND" chip) and an entry for the train's own books.
+    async fn candidates(&self) -> Result<(Vec<(Value, String)>, Vec<Value>)> {
         let mut out = Vec::new();
+        let mut left_behind = Vec::new();
         let listed = rows(
             self.api(
                 Method::GET,
@@ -1283,30 +1792,20 @@ impl Conductor {
                 &format!("fork/{branch}"),
             ])?;
             if !ok.status.success() {
-                log(format!(
-                    "{}: branch {branch} not on fork — leaving behind",
-                    id8(&jid)
-                ));
+                let reason = skip_reason_branch_missing(&branch);
+                log(format!("{}: {reason} — leaving behind", id8(&jid)));
+                left_behind.push(json!({"car_id_short": id8(&jid), "reason": reason.as_str()}));
                 if !self.cfg.dry {
                     // Loud on the Job, not just in the journal: the author
                     // parked this at review believing it would board.
-                    self.merge_job_metadata(
-                        &jid,
-                        vec![(
-                            "skip_reason",
-                            json!(format!(
-                                "branch {branch} not found on the fork — push it, then \
-                                 the next train boards it"
-                            )),
-                        )],
-                    )
-                    .await?;
+                    self.merge_job_metadata(&jid, vec![("skip_reason", json!(reason))])
+                        .await?;
                 }
                 continue;
             }
             out.push((j, branch));
         }
-        Ok(out)
+        Ok((out, left_behind))
     }
 
     async fn open_train_job(&self, train_branch: &str, window: &str) -> Result<Option<Value>> {
@@ -1355,7 +1854,7 @@ impl Conductor {
 
     async fn board(&self, now: DateTime<Utc>) -> Result<()> {
         self.ensure_clone()?;
-        let cands = self.candidates().await?;
+        let (cands, mut left_behind) = self.candidates().await?;
         let window = format!(
             "{}{}",
             now.format("%Y-%m-%d "),
@@ -1419,25 +1918,17 @@ impl Conductor {
                     .map(str::to_string)
                     .collect();
                 sh_unchecked(&["git", "-C", clone, "merge", "--abort"])?;
-                let files = if conflicted.is_empty() {
-                    "unresolved (merge died before conflict markers)".to_string()
-                } else {
-                    conflicted.join(", ")
-                };
-                self.merge_job_metadata(
-                    job_id(&j)?,
-                    vec![(
-                        "skip_reason",
-                        json!(format!(
-                            "merge conflict with this window's train in: {files} — rebase \
-                             onto main and repark at review"
-                        )),
-                    )],
-                )
-                .await?;
-                log(format!(
-                    "conflict merging {branch} ({files}) — left for the next train"
-                ));
+                // ONE reason string, journal and Job alike — the chip
+                // the yard renders and the line the operator greps
+                // must never tell different stories.
+                let reason = skip_reason_conflict(&conflicted);
+                log(format!("{branch}: {reason} — left for the next train"));
+                left_behind.push(json!({
+                    "car_id_short": id8(job_id(&j)?),
+                    "reason": reason.as_str(),
+                }));
+                self.merge_job_metadata(job_id(&j)?, vec![("skip_reason", json!(reason))])
+                    .await?;
                 skipped.push((j, branch));
             }
         }
@@ -1511,6 +2002,11 @@ impl Conductor {
             vec![
                 ("boarded_jobs", json!(boarded_ids)),
                 ("skipped_branches", json!(skipped_branches)),
+                // The train's own record of who it left behind and
+                // why — the arrival report reads THIS, because a
+                // car's skip_reason clears the moment a later train
+                // boards it.
+                ("left_behind", json!(left_behind)),
             ],
         )
         .await?;
@@ -1568,13 +2064,15 @@ impl Conductor {
                 ],
             )
             .await?;
-            // skip_reason cleared on boarding: an earlier window's skip note
-            // must not outlive the skip.
+            // skip_reason cleared on boarding, in the same update that
+            // stamps the train: an earlier window's skip note must not
+            // outlive the skip — the key is REMOVED (Null), not left
+            // behind as "".
             self.merge_job_metadata(
                 job_id(j)?,
                 vec![
                     ("train", json!(train_id.as_str())),
-                    ("skip_reason", json!("")),
+                    ("skip_reason", Value::Null),
                 ],
             )
             .await?;
@@ -1584,6 +2082,139 @@ impl Conductor {
             id8(&train_id),
             boarded.len()
         ));
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Cancel — the operator's judgment on a train that will not arrive
+    // -----------------------------------------------------------------------
+
+    /// Cancel an open train (David's ask: trains that don't arrive
+    /// were cleaned up by hand, and cancellation orphaned the cars).
+    /// Car-release comes FIRST, so a crash mid-cancel leaves cars
+    /// free rather than orphaned:
+    ///   1. release every still-open boarded car back to the dock —
+    ///      review step back to `ready` (the dock predicate requires
+    ///      it; clearing metadata alone re-boards nothing),
+    ///      `metadata.train` removed, `skip_reason` saying why;
+    ///   2. close the PR unmerged;
+    ///   3. complete the `cancelled` terminal with the reason —
+    ///      jobs-api then closes the Job with outcome=cancelled and
+    ///      skips the remaining steps;
+    ///   4. delete the train's OWN `train/*` branch — never a car's:
+    ///      the cars keep their branches (train_branch_to_delete is
+    ///      the pin, and it is tested).
+    async fn cancel(&self, handle: &str, reason: &str) -> Result<()> {
+        let listed = rows(
+            self.api(
+                Method::GET,
+                "/api/jobs?kind=pr-train&status=open&limit=50",
+                None,
+            )
+            .await?,
+        )?;
+        let mut trains = Vec::with_capacity(listed.len());
+        for t0 in &listed {
+            trains.push(self.get_job(job_id(t0)?).await?);
+        }
+        let train = resolve_train(&trains, handle)?;
+        let tid = job_id(train)?;
+
+        let boarded: Vec<String> = train
+            .get("metadata")
+            .and_then(|m| m.get("boarded_jobs"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut cars = Vec::with_capacity(boarded.len());
+        for cid in &boarded {
+            cars.push(self.get_job(cid).await?);
+        }
+        for car in releasable_cars(&cars) {
+            let cid = job_id(car)?;
+            let review = find_step(car, "review", "Open for review");
+            if let Some(review) = review.filter(|s| step_done(Some(s))) {
+                if self.cfg.dry {
+                    log(format!("DRY: would reopen review on {}", id8(cid)));
+                } else {
+                    let sid = review
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow!("review step without an id on job {cid}"))?;
+                    self.api(
+                        Method::PUT,
+                        &format!("/api/jobs/{cid}/steps/{sid}"),
+                        Some(json!({"status": "ready"})),
+                    )
+                    .await?;
+                }
+            }
+            self.merge_job_metadata(
+                cid,
+                vec![
+                    ("train", Value::Null),
+                    (
+                        "skip_reason",
+                        json!(format!("returned to dock: train cancelled ({reason})")),
+                    ),
+                ],
+            )
+            .await?;
+            log(format!("released car {} back to the dock", id8(cid)));
+        }
+
+        let pr_url = find_step(train, "pr", "Open the batched PR")
+            .and_then(|s| s.get("metadata"))
+            .and_then(|m| m.get("pr_url"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !pr_url.is_empty() {
+            if self.cfg.dry {
+                log(format!("DRY: would close {pr_url} unmerged"));
+            } else {
+                self.forge.close_pr(pr_url).await?;
+                log(format!("closed {pr_url} unmerged"));
+            }
+        }
+
+        // The cancelled terminal is gated (blocked_by) on collect; a
+        // train that died mid-assembly never completed it. Close that
+        // gate honestly first — nothing boarded on the record.
+        let collect = find_step(train, "collect", "Collect what is ready to board");
+        if !step_done(collect) {
+            self.complete_step(
+                train,
+                collect,
+                &[(
+                    "boarded",
+                    Some("nothing — train cancelled before boarding completed".to_string()),
+                )],
+            )
+            .await?;
+        }
+        self.complete_step(
+            train,
+            find_step(train, "cancelled", "Cancelled — nothing to board"),
+            &[("reason", Some(reason.to_string()))],
+        )
+        .await?;
+
+        if let Some(branch) = train_branch_to_delete(train) {
+            if self.cfg.dry {
+                log(format!(
+                    "DRY: would delete branch {branch} (train cancelled)"
+                ));
+            } else if self.forge.delete_branch(&branch).await? {
+                log(format!("deleted branch {branch} (train cancelled)"));
+            } else {
+                log(format!("branch {branch} already gone (train cancelled)"));
+            }
+        }
+        log(format!("train {} cancelled: {reason}", id8(tid)));
         Ok(())
     }
 }
@@ -1628,19 +2259,29 @@ pub async fn run(phase: Phase, dry: bool, now: DateTime<Utc>) -> Result<()> {
         return Ok(());
     }
     let conductor = Conductor::new(cfg, forge)?;
-    if !matches!(phase, Phase::Board) {
-        conductor.reconcile().await?;
-    }
-    if !matches!(phase, Phase::Reconcile) {
-        conductor.board(now).await?;
+    match phase {
+        Phase::Preflight => {} // returned above; the arm keeps the match total
+        Phase::Reconcile => conductor.reconcile(now).await?,
+        Phase::Board => conductor.board(now).await?,
+        Phase::Run => {
+            conductor.reconcile(now).await?;
+            conductor.board(now).await?;
+        }
+        Phase::Cancel { handle, reason } => conductor.cancel(&handle, &reason).await?,
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{deletable_branches, parked_ready, repo_path, sweep_settled};
-    use serde_json::json;
+    use super::{
+        arrival_report, arrival_summary, deletable_branches, deploy_needed, local_jobs_problem,
+        overlay_metadata, parked_ready, releasable_cars, repo_path, resolve_train,
+        skip_reason_branch_missing, skip_reason_conflict, stall_age_hours, sweep_settled,
+        train_branch_to_delete,
+    };
+    use chrono::{DateTime, Utc};
+    use serde_json::{Value, json};
     use std::collections::BTreeSet;
 
     /// A car parked at review, branch pushed, not on a train.
@@ -1795,6 +2436,435 @@ mod tests {
         assert!(!sweep_settled(&[landed, still_open]));
         // Nothing boarded is trivially settled.
         assert!(sweep_settled(&[]));
+    }
+
+    // -- the skip reason on the car job ------------------------------------
+    //
+    // Train #8 conflict-skipped three cars; the journal said "left for
+    // the next train" but the car Jobs carried nothing, so the yard's
+    // dock showed them unexplained. The PacketCard chip renders
+    // `metadata.skip_reason` ("LEFT BEHIND — <reason>"), so the string
+    // stays short: a truncated file list, or the missing branch.
+
+    #[test]
+    fn a_conflict_skip_reason_names_the_files() {
+        let files = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+        assert_eq!(skip_reason_conflict(&files), "conflict: src/a.rs, src/b.rs");
+    }
+
+    #[test]
+    fn a_long_conflict_list_truncates_with_a_count() {
+        let files: Vec<String> = (0..20)
+            .map(|i| format!("crates/core/boss-jobs/src/file_{i:02}.rs"))
+            .collect();
+        let reason = skip_reason_conflict(&files);
+        assert!(
+            reason.starts_with("conflict: crates/core/boss-jobs/src/file_00.rs"),
+            "leads with the first file: {reason}"
+        );
+        assert!(reason.ends_with("+18 more"), "counts what it hid: {reason}");
+        assert!(
+            reason.len() <= 120,
+            "stays chip-sized ({} chars): {reason}",
+            reason.len()
+        );
+    }
+
+    #[test]
+    fn one_huge_conflict_file_is_still_named() {
+        // Truncation drops files, never the whole answer: at least one
+        // file always shows.
+        let long = format!("crates/{}.rs", "x".repeat(150));
+        let reason = skip_reason_conflict(std::slice::from_ref(&long));
+        assert_eq!(reason, format!("conflict: {long}"));
+    }
+
+    #[test]
+    fn a_merge_that_died_before_markers_says_so() {
+        assert_eq!(
+            skip_reason_conflict(&[]),
+            "conflict: unresolved (merge died before conflict markers)"
+        );
+    }
+
+    #[test]
+    fn a_missing_branch_skip_reason_names_the_branch() {
+        assert_eq!(
+            skip_reason_branch_missing("feat/x"),
+            "branch feat/x not on fork"
+        );
+    }
+
+    // -- metadata overlays merge, never clobber ----------------------------
+    //
+    // jobs-api PUT replaces top-level `metadata` wholesale; every
+    // update must carry the existing keys forward, and clearing a key
+    // means removing it, not writing "".
+
+    #[test]
+    fn a_metadata_overlay_preserves_existing_keys() {
+        let job = json!({"metadata": {"branch": "feat/x", "queue": "q-1"}});
+        let md = overlay_metadata(&job, vec![("skip_reason", json!("conflict: a.rs"))]);
+        assert_eq!(md.get("branch"), Some(&json!("feat/x")));
+        assert_eq!(md.get("queue"), Some(&json!("q-1")));
+        assert_eq!(md.get("skip_reason"), Some(&json!("conflict: a.rs")));
+    }
+
+    #[test]
+    fn a_null_overlay_removes_the_key() {
+        // Boarding stamps `train` and sheds the stale skip note in one
+        // update; the key goes away rather than lingering as "".
+        let job = json!({"metadata": {"branch": "feat/x", "skip_reason": "conflict: a.rs"}});
+        let md = overlay_metadata(
+            &job,
+            vec![("train", json!("t-1")), ("skip_reason", Value::Null)],
+        );
+        assert!(!md.contains_key("skip_reason"));
+        assert_eq!(md.get("train"), Some(&json!("t-1")));
+        assert_eq!(md.get("branch"), Some(&json!("feat/x")));
+    }
+
+    #[test]
+    fn an_overlay_on_a_bare_job_starts_fresh() {
+        let job = json!({"id": "j-1"});
+        let md = overlay_metadata(&job, vec![("skip_reason", json!("x"))]);
+        assert_eq!(md.len(), 1);
+        // Removing a key that was never there is a quiet no-op.
+        let md = overlay_metadata(&job, vec![("skip_reason", Value::Null)]);
+        assert!(md.is_empty());
+    }
+
+    // -- the drift sentinel (split-brain incident c4b4a6b0) ----------------
+    //
+    // BOSS_JOBS_URL defaulted to localhost and the conductor silently
+    // booked a whole window on the wrong instance. Preflight goes red
+    // on a loopback jobs URL unless the box says it means it.
+
+    #[test]
+    fn a_loopback_jobs_url_is_a_preflight_problem() {
+        for url in [
+            "http://127.0.0.1:7900",
+            "http://localhost:7900",
+            "http://LOCALHOST:7900",
+            "http://[::1]:7900",
+            "http://127.9.9.9/api",
+        ] {
+            let p = local_jobs_problem(url, false)
+                .unwrap_or_else(|| panic!("{url} must trip the sentinel"));
+            assert!(p.contains("BOSS_JOBS_URL"), "names the env var: {p}");
+            assert!(
+                p.contains("BOSS_TRAIN_ALLOW_LOCAL_JOBS"),
+                "names the override: {p}"
+            );
+            assert!(
+                p.contains("system of record"),
+                "names the incident class: {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_allowance_and_remote_jobs_urls_pass_the_sentinel() {
+        // The allowance is the deliberate test/demo-box escape hatch.
+        assert!(local_jobs_problem("http://127.0.0.1:7900", true).is_none());
+        assert!(local_jobs_problem("http://10.20.0.15:7900", false).is_none());
+        assert!(local_jobs_problem("https://jobs.boss.internal/api", false).is_none());
+    }
+
+    // -- the arrival report ------------------------------------------------
+    //
+    // The landing's final structured entry: when the sweep visits an
+    // arrived train, it composes what the record proves — the consist,
+    // who got left behind, the generation, and the timings the
+    // conductor's own `completed_at` stamps make derivable — and files
+    // it on the `arrived` step. Missing evidence reads as null, never
+    // a guess.
+
+    fn arrived_train() -> serde_json::Value {
+        json!({
+            "id": "train-77",
+            "status": "closed",
+            "metadata": {
+                "boarded_jobs": ["car-1", "car-2"],
+                "left_behind": [
+                    {"car_id_short": "car-3-id", "reason": "conflict: src/a.rs"}
+                ],
+            },
+            "steps": [
+                {"spec_slug": "collect", "title": "Collect what is ready to board",
+                 "status": "completed",
+                 "metadata": {"completed_at": "2026-08-13T06:00:00Z"}},
+                {"spec_slug": "merged", "title": "Merged into main",
+                 "status": "completed",
+                 "metadata": {"completed_at": "2026-08-13T06:05:00Z",
+                              "merge_ref": "abc1234def56"}},
+                {"spec_slug": "deployed", "title": "Deployed to the playground",
+                 "status": "completed",
+                 "metadata": {"completed_at": "2026-08-13T06:12:00Z",
+                              "deployed": "main@abc1234; 0 applied; services: prod; web: deployed"}},
+                {"spec_slug": "arrived", "title": "Train arrived",
+                 "status": "completed",
+                 "metadata": {"completed_at": "2026-08-13T06:20:00Z"}},
+            ],
+        })
+    }
+
+    fn boarded_cars() -> Vec<serde_json::Value> {
+        vec![
+            json!({"id": "car-1-uuid-long", "title": "Fix the thing",
+                   "metadata": {"branch": "feat/x"}}),
+            json!({"id": "car-2-uuid-long", "title": "Add the widget",
+                   "metadata": {"branch": "feat/y"}}),
+        ]
+    }
+
+    #[test]
+    fn the_arrival_report_carries_consist_left_behind_and_timings() {
+        let report = arrival_report(&arrived_train(), &boarded_cars());
+        assert_eq!(
+            report["consist"],
+            json!([
+                {"car_id_short": "car-1-uu", "title": "Fix the thing", "branch": "feat/x"},
+                {"car_id_short": "car-2-uu", "title": "Add the widget", "branch": "feat/y"},
+            ])
+        );
+        assert_eq!(
+            report["left_behind"],
+            json!([{"car_id_short": "car-3-id", "reason": "conflict: src/a.rs"}])
+        );
+        assert_eq!(report["generation"], json!("abc1234"));
+        // merge_ref abc1234def56 IS the deployed generation (short sha
+        // prefix) — not distinct, so no merged_sha key.
+        assert!(report.get("merged_sha").is_none(), "same commit: {report}");
+        assert_eq!(
+            report["timings"]["boarded_at"],
+            json!("2026-08-13T06:00:00Z")
+        );
+        assert_eq!(
+            report["timings"]["merged_at"],
+            json!("2026-08-13T06:05:00Z")
+        );
+        assert_eq!(
+            report["timings"]["deployed_at"],
+            json!("2026-08-13T06:12:00Z")
+        );
+        assert_eq!(
+            report["timings"]["arrived_at"],
+            json!("2026-08-13T06:20:00Z")
+        );
+        assert_eq!(report["timings"]["board_to_merge_s"], json!(300));
+        assert_eq!(report["timings"]["merge_to_deploy_s"], json!(420));
+        assert_eq!(report["timings"]["total_s"], json!(1200));
+    }
+
+    #[test]
+    fn a_distinct_merge_sha_is_reported() {
+        let mut train = arrived_train();
+        train["steps"][2]["metadata"]["deployed"] =
+            json!("main@999aaaa; 0 applied; services: prod; web: deployed");
+        let report = arrival_report(&train, &boarded_cars());
+        assert_eq!(report["generation"], json!("999aaaa"));
+        assert_eq!(report["merged_sha"], json!("abc1234def56"));
+    }
+
+    #[test]
+    fn missing_evidence_reads_as_null_never_a_guess() {
+        // A train whose steps carry no completed_at stamps (they
+        // predate the stamping, or the dispatcher closed `arrived`)
+        // and whose deploy summary is absent.
+        let train = json!({
+            "id": "train-78",
+            "status": "closed",
+            "metadata": {"boarded_jobs": ["car-1"]},
+            "steps": [
+                {"spec_slug": "collect", "title": "Collect what is ready to board",
+                 "status": "completed", "metadata": {}},
+                {"spec_slug": "merged", "title": "Merged into main",
+                 "status": "completed", "metadata": {}},
+                {"spec_slug": "arrived", "title": "Train arrived",
+                 "status": "completed", "metadata": {}},
+            ],
+        });
+        let report = arrival_report(&train, &boarded_cars());
+        assert_eq!(report["left_behind"], json!([]));
+        assert_eq!(report["generation"], Value::Null);
+        // No deployed sha to compare against — the merge evidence is
+        // absent too, so no merged_sha key appears.
+        assert!(report.get("merged_sha").is_none());
+        assert_eq!(report["timings"]["boarded_at"], Value::Null);
+        assert_eq!(report["timings"]["arrived_at"], Value::Null);
+        assert_eq!(report["timings"]["board_to_merge_s"], Value::Null);
+        assert_eq!(report["timings"]["merge_to_deploy_s"], Value::Null);
+        assert_eq!(report["timings"]["total_s"], Value::Null);
+    }
+
+    #[test]
+    fn the_summary_reads_the_report_not_the_world() {
+        let full = arrival_report(&arrived_train(), &boarded_cars());
+        assert_eq!(
+            arrival_summary(&full),
+            "2 cars; generation abc1234; total 1200s"
+        );
+        let bare = arrival_report(&json!({"id": "t", "metadata": {}, "steps": []}), &[]);
+        assert_eq!(
+            arrival_summary(&bare),
+            "0 cars; generation unknown; total ?s"
+        );
+    }
+
+    // -- the stall sentinel ------------------------------------------------
+    //
+    // A train counts stalled when open and its newest step completion
+    // is older than the threshold. Raising is protocol, cancelling is
+    // judgment — the sentinel only makes the stall visible.
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    fn train_with_stamps(stamps: &[&str]) -> serde_json::Value {
+        let steps: Vec<serde_json::Value> = stamps
+            .iter()
+            .map(|t| json!({"status": "completed", "metadata": {"completed_at": t}}))
+            .collect();
+        json!({"id": "t-1", "status": "open", "metadata": {}, "steps": steps})
+    }
+
+    #[test]
+    fn a_train_past_the_threshold_counts_stalled() {
+        let t = train_with_stamps(&["2026-08-13T00:00:00Z"]);
+        assert_eq!(stall_age_hours(&t, ts("2026-08-13T08:30:00Z"), 6), Some(8));
+        // The boundary counts: exactly at the threshold is stalled.
+        assert_eq!(stall_age_hours(&t, ts("2026-08-13T06:00:00Z"), 6), Some(6));
+    }
+
+    #[test]
+    fn a_train_inside_the_threshold_is_not_stalled() {
+        let t = train_with_stamps(&["2026-08-13T00:00:00Z"]);
+        assert_eq!(stall_age_hours(&t, ts("2026-08-13T05:59:00Z"), 6), None);
+    }
+
+    #[test]
+    fn the_newest_completion_is_the_stall_basis() {
+        // Unordered stamps: the NEWEST one anchors the age (3h ago),
+        // not the oldest (30h ago).
+        let t = train_with_stamps(&["2026-08-12T00:00:00Z", "2026-08-13T03:00:00Z"]);
+        assert_eq!(stall_age_hours(&t, ts("2026-08-13T06:00:00Z"), 6), None);
+        assert_eq!(stall_age_hours(&t, ts("2026-08-13T09:00:00Z"), 6), Some(6));
+    }
+
+    #[test]
+    fn a_train_without_stamps_never_counts_stalled() {
+        // No completion evidence, no basis — the sentinel never
+        // guesses an age.
+        let t = train_with_stamps(&[]);
+        assert_eq!(stall_age_hours(&t, ts("2026-08-13T06:00:00Z"), 6), None);
+    }
+
+    // -- cancelling a train ------------------------------------------------
+
+    #[test]
+    fn cancel_releases_only_the_still_open_cars() {
+        let open = json!({"id": "car-1", "status": "open",
+                          "metadata": {"train": "t-1", "branch": "feat/x"}});
+        let landed = landed_car("car-2", "feat/y");
+        let mut cancelled = landed_car("car-3", "feat/z");
+        cancelled["status"] = json!("cancelled");
+        let cars = vec![open, landed, cancelled];
+        let released: Vec<&str> = releasable_cars(&cars)
+            .iter()
+            .map(|c| c.get("id").and_then(Value::as_str).unwrap())
+            .collect();
+        // Closed cars are history — merged or abandoned, not ours to
+        // touch. Only the open car returns to the dock.
+        assert_eq!(released, vec!["car-1"]);
+    }
+
+    #[test]
+    fn cancel_deletes_only_the_trains_own_branch_never_a_cars() {
+        let train = json!({
+            "id": "t-1",
+            "subject": {"subject_kind": "custom", "id": "train/20260813-0600"},
+        });
+        assert_eq!(
+            train_branch_to_delete(&train),
+            Some("train/20260813-0600".to_string())
+        );
+        // A subject that is not a train/* branch — whatever went
+        // wrong upstream, the cancel path deletes NO car branch.
+        let odd = json!({
+            "id": "t-2",
+            "subject": {"subject_kind": "custom", "id": "feat/x"},
+        });
+        assert_eq!(train_branch_to_delete(&odd), None);
+        assert_eq!(train_branch_to_delete(&json!({"id": "t-3"})), None);
+    }
+
+    #[test]
+    fn a_cancel_handle_resolves_by_id_prefix_or_pr_url() {
+        let a = json!({
+            "id": "aaaa1111-2222-3333-4444-555566667777",
+            "steps": [{"spec_slug": "pr", "title": "Open the batched PR",
+                       "status": "completed",
+                       "metadata": {"pr_url": "http://forge/repo/pulls/9"}}],
+        });
+        let b = json!({"id": "bbbb1111-0000-0000-0000-000000000000", "steps": []});
+        let trains = vec![a, b];
+        assert_eq!(
+            resolve_train(&trains, "aaaa1111-2222-3333-4444-555566667777")
+                .unwrap()
+                .get("id"),
+            trains[0].get("id")
+        );
+        assert_eq!(
+            resolve_train(&trains, "bbbb1111").unwrap().get("id"),
+            trains[1].get("id")
+        );
+        assert_eq!(
+            resolve_train(&trains, "http://forge/repo/pulls/9")
+                .unwrap()
+                .get("id"),
+            trains[0].get("id")
+        );
+        assert!(resolve_train(&trains, "cccc0000").is_err(), "no match");
+        // An ambiguous prefix refuses rather than guessing a train.
+        let twins = vec![
+            json!({"id": "aaaa1111-x", "steps": []}),
+            json!({"id": "aaaa1111-y", "steps": []}),
+        ];
+        assert!(resolve_train(&twins, "aaaa1111").is_err(), "ambiguous");
+    }
+
+    // -- the deploy-needed decision ----------------------------------------
+    //
+    // Live incident: every 10-minute reconcile re-ran a full no-op
+    // deploy — generation unchanged, services bounced anyway. The
+    // store's `current` key is the 8-char release dirname; ls-remote
+    // answers the FULL 40-char sha. full.starts_with(short) is the
+    // match — that exact direction, pinned here with the real shapes.
+
+    #[test]
+    fn a_generation_already_serving_remote_main_skips_the_deploy() {
+        let full = "c0020201aa5f3d9e8b7c6d5e4f3a2b1c0d9e8f7a";
+        assert!(
+            !deploy_needed("c0020201", full),
+            "8-char store key vs 40-char remote sha must read as up to date"
+        );
+    }
+
+    #[test]
+    fn every_other_pair_deploys() {
+        let full = "deadbeefaa5f3d9e8b7c6d5e4f3a2b1c0d9e8f7a";
+        assert!(deploy_needed("c0020201", full), "different generations");
+        // The reversed half-match must never read as up to date.
+        assert!(deploy_needed(
+            "c0020201aa5f3d9e8b7c6d5e4f3a2b1c0d9e8f7a",
+            "c0020201"
+        ));
+        // Missing evidence on either side deploys — the deploy path
+        // surfaces its own errors; a skip must never rest on absence.
+        assert!(deploy_needed("", full));
+        assert!(deploy_needed("c0020201", ""));
     }
 
     #[test]

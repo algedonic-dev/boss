@@ -89,6 +89,11 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
   // (departure-board.md Q1, David's call: the yard is the front
   // door, guest-visible).
   'system-yard':              { id: 'system-yard',              label: 'Train Yard',          path: '/system/yard',         permKey: 'system-yard',             app: 'it' },
+  // The network map — every registry station as a node (stations.md:
+  // priority queues, stations, and network nodes are one concept).
+  // After the yard: the yard is one batch station rendered deep, the
+  // map is every station rendered wide.
+  'system-map':               { id: 'system-map',               label: 'Network map',         path: '/system/map',          permKey: 'system-map',              app: 'it' },
   'system-monitoring':       { id: 'system-monitoring',       label: 'Monitoring',          path: '/system/monitoring',   permKey: 'system-monitoring',       app: 'it' },
   policy:                    { id: 'policy',                  label: 'Policy',              path: '/system/policy',       permKey: 'policy',                  app: 'it' },
   'system-step-plugins':     { id: 'system-step-plugins',     label: 'Step plugins',        path: '/system/step-plugins', permKey: 'system-step-plugins',     app: 'it' },

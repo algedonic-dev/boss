@@ -925,8 +925,25 @@ restart_prod_daemons() {
         IFS=: read -r stem _ <<<"$entry"
         if [[ -f "/etc/systemd/system/${stem}.service" ]]; then
             systemctl enable "${stem}.service" >/dev/null 2>&1 || true
-            systemctl restart "${stem}.service"
-            echo "  restarted ${stem}.service"
+            if [[ "${stem}" == "boss-train" ]]; then
+                # Never restart the conductor synchronously: this deploy
+                # is routinely a CHILD of boss-train's own reconcile verb,
+                # and a synchronous restart kills the deploy mid-run (the
+                # PR-7 stall / suicide-deploy incident, 2026-08-13). The
+                # bounce fires from its own transient unit, outside the
+                # conductor's cgroup, after this script exits. An
+                # already-scheduled bounce covers this run.
+                if systemd-run --collect --on-active=15s \
+                    --unit=boss-train-restart \
+                    systemctl restart boss-train.service >/dev/null 2>&1; then
+                    echo "  boss-train.service restart scheduled (+15s, detached)"
+                else
+                    echo "  boss-train.service restart already scheduled"
+                fi
+            else
+                systemctl restart "${stem}.service"
+                echo "  restarted ${stem}.service"
+            fi
         fi
     done
 }

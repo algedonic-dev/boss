@@ -41,6 +41,10 @@ const ROUTES: ReadonlyArray<string> = [
   // drift test at the bottom of this file for why that can no longer
   // happen quietly.
   '/system/feedback', '/system/flow', '/system/yard',
+  // The network map under the mock's `[]` catch-all: an array where
+  // the {data} envelope should be reads as zero stations — chrome +
+  // empty state, no crash.
+  '/system/map',
   // Fleet renders its no-Workflows empty state under the mock's
   // empty /api/workflows — a real crawl of the page chrome + picker.
   '/system/fleet',
@@ -161,7 +165,8 @@ test.describe('the crawl covers every registered surface', () => {
     ['/ux/finance', 'statements .reduce needs object-shaped fixtures'],
     ['/ux/warehouse', 'summary.below_reorder_count needs a faithful fixture'],
     ['/ux/exec', '.find/.length over object-shaped summaries'],
-    ['/system/os-map', 'graph view: the generic [] catch-all cannot fake an OsMap object'],
+    // '/system/os-map' deferral dropped: the page retired with the
+    // pre-network framing and its catalog entry is gone.
   ]);
 
   test('no deferral names a route that does not exist', async () => {

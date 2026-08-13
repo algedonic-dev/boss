@@ -32,6 +32,8 @@ export type RouteName =
   // Sits beside the dispatcher cascade: same IT audience, different
   // question (job traffic, not rule wiring).
   | 'system-yard'
+  // The network map — every registry station as a node (stations.md).
+  | 'system-map'
   | 'system-flow'
   // The fleet overlay — every in-flight Job of a kind on its
   // Workflow's DAG; per-step depth is the queue-visibility signal.
@@ -57,7 +59,7 @@ const ALL: ReadonlyArray<RouteName> = [
   'shipping', 'vendors', 'marketing-assets', 'calendar',
   'schedule', 'jobs',
   'policy', 'workflows', 'system-step-plugins', 'system-dispatcher',
-  'system-dispatcher-rules', 'system-dispatcher-rule', 'system-design', 'system-yard', 'system-flow', 'system-fleet', 'system-subjects', 'system-model', 'system-kb', 'auth-admin',
+  'system-dispatcher-rules', 'system-dispatcher-rule', 'system-design', 'system-yard', 'system-map', 'system-flow', 'system-fleet', 'system-subjects', 'system-model', 'system-kb', 'auth-admin',
   'system-experiments',
   'workflows',
 ];

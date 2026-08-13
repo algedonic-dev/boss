@@ -83,6 +83,8 @@ export type Route =
   | { kind: 'systemStepPluginDetail'; pluginSlug: string }
   | { kind: 'systemDesign' }
   | { kind: 'systemYard' }
+  /// The network map — every registry station as a node (stations.md).
+  | { kind: 'systemMap' }
   | { kind: 'systemFlow' }
   | { kind: 'systemFleet' }
   | { kind: 'systemSubjects' }
@@ -125,6 +127,7 @@ export function parseRoute(pathname: string): Route {
     if (p === '/kb') return { kind: 'systemKb' };
     if (p === '/design') return { kind: 'systemDesign' };
     if (p === '/yard') return { kind: 'systemYard' };
+    if (p === '/map') return { kind: 'systemMap' };
     if (p === '/flow') return { kind: 'systemFlow' };
     if (p === '/fleet') return { kind: 'systemFleet' };
     if (p === '/feedback') return { kind: 'systemFeedback' };
