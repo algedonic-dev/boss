@@ -18,7 +18,8 @@
 //!     open, visibly. Once a train has arrived, the sweep deletes each
 //!     landed car's branch from the forge — on the job record's
 //!     evidence, because squash-merged trains leave no git ancestry to
-//!     prove a landing (see `deletable_branches`).
+//!     prove a landing (see `deletable_branches`), and only while the
+//!     branch still points at the head that boarded (`sweep_guard`).
 //!
 //!  2. BOARD — open this window's train Job, collect the ship-a-change
 //!     Jobs that are ready (review step ready/active, a branch pushed to
@@ -319,6 +320,181 @@ fn preflight(cfg: &Config) -> Result<Vec<String>> {
 }
 
 // ---------------------------------------------------------------------------
+// The jobs-API blip guard
+//
+// The cluster is the system of record, and it rolls. Twice on
+// 2026-08-13 a reconcile hit `Connection refused` to the jobs API
+// mid-converge and returned rc=1 for the whole verb — right to refuse
+// to act blind, needlessly brittle about an outage that lasted
+// seconds (the cadence loop's dock probe held the queue-depth rules
+// for that tick on the same blip). A bounded retry covers the roll.
+//
+// Two rules keep it from papering over anything real: a 4xx is an
+// ANSWER and is never retried, and every retry journals one line, so
+// blips stay measurable instead of invisible.
+// ---------------------------------------------------------------------------
+
+/// What a failed jobs-API attempt was. The classifier reads this and
+/// nothing else — pure, and pinned by tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Failure {
+    /// The connection never established — refused, DNS, TLS. Proof
+    /// that the request did not reach the system of record.
+    Connect,
+    /// A timeout, or a response that died mid-body: nothing usable
+    /// came back, and whether the write happened is UNKNOWN.
+    Ambiguous,
+    /// The jobs API answered, with this status.
+    Http(u16),
+    /// The answer arrived and was unusable — an unparseable body.
+    Malformed,
+}
+
+/// Retry, or surface? Two rules, and the second is the one that keeps
+/// the retry honest:
+///
+///   - a 4xx is an ANSWER (a 422 is the SoR saying no, and asking the
+///     same question three times does not change it); only transport
+///     failures and 5xx are blips;
+///   - a blip that leaves the write AMBIGUOUS may only be re-sent when
+///     the call is idempotent. Re-POSTing an ambiguous create is how
+///     one blip becomes two train Jobs. A refused connection is not
+///     ambiguous — nothing was received — so anything may go again,
+///     which is exactly the production case this exists for.
+pub(crate) fn retryable(method: &Method, failure: &Failure) -> bool {
+    let idempotent = matches!(
+        *method,
+        Method::GET | Method::PUT | Method::DELETE | Method::HEAD
+    );
+    match failure {
+        Failure::Connect => true,
+        Failure::Ambiguous => idempotent,
+        Failure::Http(status) => idempotent && (500..600).contains(status),
+        Failure::Malformed => false,
+    }
+}
+
+/// A reqwest error, classified. Connect / timeout / mid-flight body
+/// failures are the blips a rolling SoR produces; a builder or
+/// redirect error is a misconfiguration, and retrying one just burns
+/// the window three times over.
+fn classify_transport(e: &reqwest::Error) -> Failure {
+    if e.is_connect() {
+        Failure::Connect
+    } else if e.is_timeout() || e.is_request() || e.is_body() {
+        Failure::Ambiguous
+    } else {
+        Failure::Malformed
+    }
+}
+
+/// A jobs-API call that did not succeed: what it was (for the
+/// classifier) and the error to surface once the retries run out.
+pub(crate) struct ApiFailure {
+    pub(crate) kind: Failure,
+    pub(crate) cause: anyhow::Error,
+}
+
+impl ApiFailure {
+    /// A reqwest failure — classified by what reqwest says went wrong.
+    pub(crate) fn transport(e: reqwest::Error, context: String) -> Self {
+        ApiFailure {
+            kind: classify_transport(&e),
+            cause: anyhow::Error::new(e).context(context),
+        }
+    }
+}
+
+/// The bounded retry: how many attempts in total, and the first wait
+/// between them (each further wait doubles).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RetryPolicy {
+    pub(crate) attempts: u32,
+    pub(crate) base: Duration,
+}
+
+/// The jobs-API policy: 3 attempts, 2s then 4s. A pod roll is over
+/// inside that budget, and a jobs API still refusing after it is an
+/// outage the verb should surface rather than paper over.
+pub(crate) const JOBS_API_RETRY: RetryPolicy = RetryPolicy {
+    attempts: 3,
+    base: Duration::from_secs(2),
+};
+
+impl RetryPolicy {
+    /// The wait before attempt `n + 1`, doubling from `base`.
+    pub(crate) fn backoff(&self, attempt: u32) -> Duration {
+        self.base * 2u32.pow(attempt.saturating_sub(1).min(16))
+    }
+
+    /// The same decisions with no waiting — the tests' policy, so the
+    /// retry semantics get pinned without spending the backoff.
+    #[cfg(test)]
+    pub(crate) const fn immediate(attempts: u32) -> Self {
+        RetryPolicy {
+            attempts,
+            base: Duration::ZERO,
+        }
+    }
+}
+
+/// Character budget for a blip's cause in the journal.
+const BLIP_CAUSE_BUDGET: usize = 80;
+
+/// The one-line cause of a blip: the INNERMOST error, which is where
+/// the fact lives ("Connection refused (os error 61)") — the layers
+/// above it just repeat the url the journal line already implies.
+pub(crate) fn short_cause(err: &anyhow::Error) -> String {
+    let innermost = err
+        .chain()
+        .last()
+        .map(|c| c.to_string())
+        .unwrap_or_default();
+    let line = innermost.lines().next().unwrap_or_default().trim();
+    if line.chars().count() <= BLIP_CAUSE_BUDGET {
+        return line.to_string();
+    }
+    format!(
+        "{}…",
+        line.chars().take(BLIP_CAUSE_BUDGET).collect::<String>()
+    )
+}
+
+/// Run `op` until it succeeds, its failure turns out to be an answer
+/// rather than a blip, or the attempt budget runs out. Every retry
+/// journals one line through `journal` — the caller's idiom, so the
+/// conductor's blips read `conductor: ` and the cadence loop's read
+/// `cadence: `.
+pub(crate) async fn retrying<T, F, Fut>(
+    policy: &RetryPolicy,
+    method: &Method,
+    journal: &dyn Fn(&str),
+    mut op: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, ApiFailure>>,
+{
+    let mut attempt = 1u32;
+    loop {
+        let failure = match op().await {
+            Ok(v) => return Ok(v),
+            Err(f) => f,
+        };
+        if attempt >= policy.attempts || !retryable(method, &failure.kind) {
+            return Err(failure.cause);
+        }
+        journal(&format!(
+            "jobs API blip ({attempt}/{}): {}",
+            policy.attempts,
+            short_cause(&failure.cause)
+        ));
+        tokio::time::sleep(policy.backoff(attempt)).await;
+        attempt += 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // jobs-api helpers
 // ---------------------------------------------------------------------------
 
@@ -512,6 +688,73 @@ pub(crate) fn deletable_branches(
         out.push((branch.to_string(), cid.to_string()));
     }
     out
+}
+
+/// The branch head recorded when this car boarded — stamped by the
+/// assembly onto the car Job in the same update that stamps `train`
+/// (see `board`). Absent or empty reads as no stamp at all.
+pub(crate) fn boarded_head(car: &Value) -> Option<&str> {
+    car.get("metadata")?
+        .get("boarded_head")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+}
+
+/// The sweep's second question, and the answers to it.
+///
+/// `deletable_branches` asks whether the job record proves the car's
+/// CONTENT landed. It does not — it cannot — prove the branch still
+/// holds only that content. Car 23923b40's known_gap is what the gap
+/// costs: `fix/conductor-hardening` boarded at fc55e4d, two more
+/// commits were pushed to the branch AFTER boarding, the train landed
+/// carrying only the boarded ones, and the sweep deleted the branch
+/// on a job record that was entirely correct. The unmerged commits
+/// went with it.
+///
+/// So the sweep now deletes only what it can prove it carried: the
+/// head recorded at ASSEMBLY time must still be the branch's head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SweepGuard {
+    /// The branch still points at exactly what boarded.
+    Delete,
+    /// Commits arrived after boarding — the train never carried them,
+    /// and they live nowhere else.
+    Moved { recorded: String, current: String },
+    /// No head on the record (a car that boarded before the conductor
+    /// recorded one). An unknown head is not evidence: the cost of
+    /// keeping a stale branch is a stale branch; the cost of deleting
+    /// a moved one is lost work.
+    NoRecord,
+    /// The branch is not on the forge — nothing left to sweep.
+    Gone,
+}
+
+/// The head-guard decision, pure. Both shas are full 40-char heads —
+/// the assembly records what `git rev-parse` merged, the guard reads
+/// what the forge names now — so equality is the whole test.
+pub(crate) fn sweep_guard(recorded: Option<&str>, current: Option<&str>) -> SweepGuard {
+    let recorded = recorded.filter(|s| !s.is_empty());
+    let current = current.filter(|s| !s.is_empty());
+    match (recorded, current) {
+        (None, _) => SweepGuard::NoRecord,
+        (Some(_), None) => SweepGuard::Gone,
+        (Some(r), Some(c)) if r == c => SweepGuard::Delete,
+        (Some(r), Some(c)) => SweepGuard::Moved {
+            recorded: r.to_string(),
+            current: c.to_string(),
+        },
+    }
+}
+
+/// The line the sweep journals when a branch outgrew its boarding —
+/// operator surface, and the only notice that unmerged commits are
+/// sitting on a branch the train did not carry.
+pub(crate) fn branch_moved_line(branch: &str, recorded: &str, current: &str) -> String {
+    format!(
+        "branch {branch} moved since boarding ({} -> {}) — not deleting",
+        id8(recorded),
+        id8(current)
+    )
 }
 
 /// A train's sweep is settled once every boarded car has reached a
@@ -806,7 +1049,7 @@ fn py_pairs(cands: &[(Value, String)]) -> String {
 // exactly as before; behavior is unchanged by this refactor.
 // ---------------------------------------------------------------------------
 
-/// The code host as the conductor sees it: four verbs.
+/// The code host as the conductor sees it: five verbs.
 #[async_trait]
 trait Forge: Send + Sync {
     /// -> {state, mergeCommit, statusCheckRollup} for a PR url.
@@ -828,6 +1071,11 @@ trait Forge: Send + Sync {
     /// expected state, the repo auto-deletes merged `train/*` PR
     /// heads and hand sweeps happen. Anything else is an error.
     async fn delete_branch(&self, branch: &str) -> Result<bool>;
+    /// The branch's head sha right now, or Ok(None) when the branch is
+    /// not there (404). The sweep's head guard reads this: a landed
+    /// car's branch is only deletable while it still points at what
+    /// boarded.
+    async fn branch_head(&self, branch: &str) -> Result<Option<String>>;
 }
 
 /// `owner/name` from a clone url — https or ssh, with or without
@@ -901,9 +1149,32 @@ impl Forge for GitHubForge {
         }
         bail!("gh api DELETE {path}: {}", stderr.trim());
     }
+
+    /// `git/ref/heads/<branch>` — the singular form, which answers
+    /// with the ONE ref; the plural `git/refs/...` answers with every
+    /// ref sharing the prefix, and `feat/x` would happily return
+    /// `feat/x-followup`.
+    async fn branch_head(&self, branch: &str) -> Result<Option<String>> {
+        let path = format!("repos/{}/git/ref/heads/{branch}", self.fork_repo);
+        let r = sh_unchecked(&["gh", "api", &path])?;
+        if !r.status.success() {
+            let stderr = String::from_utf8_lossy(&r.stderr);
+            if stderr.contains("HTTP 404") || stderr.contains("Not Found") {
+                return Ok(None);
+            }
+            bail!("gh api {path}: {}", stderr.trim());
+        }
+        let v: Value =
+            serde_json::from_str(&stdout_str(&r)).context("parsing gh api git/ref output")?;
+        Ok(v.get("object")
+            .and_then(|o| o.get("sha"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string))
+    }
 }
 
-/// The same four verbs against the internal forge's API. PRs are
+/// The same five verbs against the internal forge's API. PRs are
 /// same-repo (no fork dance): the train branch pushes to the one
 /// repo, the PR head is the bare branch name, and car branches get
 /// deleted from that same repo at arrival.
@@ -1109,6 +1380,16 @@ impl Forge for ForgejoForge {
             return Ok(false);
         }
         let body = resp.text().await?;
+        // Forgejo answers a DELETE of an absent branch with 500 and
+        // `object does not exist [id: refs/heads/<b>]`, not 404 —
+        // observed 2026-08-13 against branches removed out of band,
+        // where it failed every reconcile AFTER the merge and deploy
+        // had already succeeded, so the run reported rc=1 and re-filed
+        // its arrival report each tick. Already-gone is the sweep's
+        // success condition whatever status dresses it up.
+        if !status.is_success() && body.contains("object does not exist") {
+            return Ok(false);
+        }
         if !status.is_success() {
             bail!(
                 "forge DELETE /repos/{}/branches/{branch}: HTTP {status}: {}",
@@ -1117,6 +1398,41 @@ impl Forge for ForgejoForge {
             );
         }
         Ok(true)
+    }
+
+    /// GET /repos/{owner}/{repo}/branches/{branch} — `commit.id` is
+    /// the head. Not through `api()` for the same reason as the delete
+    /// above: a 404 here is an answer (no such branch), not an error.
+    async fn branch_head(&self, branch: &str) -> Result<Option<String>> {
+        let resp = self
+            .http
+            .request(
+                Method::GET,
+                format!("{}/api/v1/repos/{}/branches/{branch}", self.base, self.repo),
+            )
+            .header("Authorization", format!("token {}", self.token))
+            .send()
+            .await
+            .with_context(|| format!("forge GET branches/{branch}"))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let body = resp.text().await?;
+        if !status.is_success() {
+            bail!(
+                "forge GET /repos/{}/branches/{branch}: HTTP {status}: {}",
+                self.repo,
+                body.trim()
+            );
+        }
+        let v: Value = serde_json::from_str(&body)
+            .with_context(|| format!("parsing forge branches/{branch} response"))?;
+        Ok(v.get("commit")
+            .and_then(|c| c.get("id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string))
     }
 }
 
@@ -1181,12 +1497,31 @@ impl Conductor {
         Ok(Conductor { cfg, http, forge })
     }
 
+    /// Every jobs-API call the conductor makes, under the blip guard:
+    /// a rolling system of record must not fail a whole verb.
     async fn api(
         &self,
         method: Method,
         path: &str,
         payload: Option<Value>,
     ) -> Result<Option<Value>> {
+        retrying(&JOBS_API_RETRY, &method, &|m| log(m), || {
+            let method = method.clone();
+            let payload = payload.clone();
+            async move { self.api_once(method, path, payload).await }
+        })
+        .await
+    }
+
+    /// One attempt. Every way it can fail is classified on the way
+    /// out, so the caller above decides retry-or-surface on evidence
+    /// rather than on a string match over an error message.
+    async fn api_once(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<Value>,
+    ) -> std::result::Result<Option<Value>, ApiFailure> {
         let mut req = self
             .http
             .request(method.clone(), format!("{}{path}", self.cfg.jobs))
@@ -1198,19 +1533,27 @@ impl Conductor {
         let resp = req
             .send()
             .await
-            .with_context(|| format!("{method} {path}"))?;
+            .map_err(|e| ApiFailure::transport(e, format!("{method} {path}")))?;
         let status = resp.status();
-        let body = resp.text().await?;
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| ApiFailure::transport(e, format!("reading {method} {path} response")))?;
         if !status.is_success() {
-            bail!("{method} {path}: HTTP {status}: {}", body.trim());
+            return Err(ApiFailure {
+                kind: Failure::Http(status.as_u16()),
+                cause: anyhow!("{method} {path}: HTTP {status}: {}", body.trim()),
+            });
         }
         if body.trim().is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(serde_json::from_str(&body).with_context(|| {
-                format!("parsing {method} {path} response")
-            })?))
+            return Ok(None);
         }
+        serde_json::from_str(&body)
+            .map(Some)
+            .map_err(|e| ApiFailure {
+                kind: Failure::Malformed,
+                cause: anyhow::Error::new(e).context(format!("parsing {method} {path} response")),
+            })
     }
 
     async fn get_job(&self, id: &str) -> Result<Value> {
@@ -1510,7 +1853,17 @@ impl Conductor {
                 self.deploy(&t, deployed_step).await?;
             }
         }
-        self.sweep_landed_branches().await?;
+        // Housekeeping must not fail a run whose real work succeeded.
+        // The sweep runs last, after merges, deploys and evidence are
+        // recorded; on 2026-08-13 a single un-deletable branch made
+        // every reconcile report rc=1 and re-file its arrival report,
+        // which reads as "the conductor is broken" when the trains had
+        // in fact landed. Journal the failure, keep the verb green.
+        if let Err(e) = self.sweep_landed_branches().await {
+            log(format!(
+                "branch sweep failed (housekeeping, run stands): {e}"
+            ));
+        }
         Ok(())
     }
 
@@ -1600,21 +1953,46 @@ impl Conductor {
             }
             self.file_arrival_report(tid, &cars).await?;
             for (branch, car) in deletable_branches(&cars, &open_branches) {
-                if self.cfg.dry {
-                    log(format!(
-                        "DRY: would delete branch {branch} (car {} landed)",
+                // The job record proved the CONTENT landed; the head
+                // guard proves the branch still holds only that
+                // content. Both, or the branch stays (car 23923b40).
+                let recorded = cars
+                    .iter()
+                    .find(|c| c.get("id").and_then(Value::as_str) == Some(car.as_str()))
+                    .and_then(boarded_head)
+                    .map(str::to_string);
+                let current = self.forge.branch_head(&branch).await?;
+                match sweep_guard(recorded.as_deref(), current.as_deref()) {
+                    SweepGuard::Moved { recorded, current } => {
+                        log(branch_moved_line(&branch, &recorded, &current));
+                    }
+                    SweepGuard::NoRecord => log(format!(
+                        "branch {branch} has no boarded head on record — not deleting \
+                         (car {} landed)",
                         id8(&car)
-                    ));
-                } else if self.forge.delete_branch(&branch).await? {
-                    log(format!(
-                        "deleted branch {branch} (car {} landed)",
-                        id8(&car)
-                    ));
-                } else {
-                    log(format!(
+                    )),
+                    SweepGuard::Gone => log(format!(
                         "branch {branch} already gone (car {} landed)",
                         id8(&car)
-                    ));
+                    )),
+                    SweepGuard::Delete => {
+                        if self.cfg.dry {
+                            log(format!(
+                                "DRY: would delete branch {branch} (car {} landed)",
+                                id8(&car)
+                            ));
+                        } else if self.forge.delete_branch(&branch).await? {
+                            log(format!(
+                                "deleted branch {branch} (car {} landed)",
+                                id8(&car)
+                            ));
+                        } else {
+                            log(format!(
+                                "branch {branch} already gone (car {} landed)",
+                                id8(&car)
+                            ));
+                        }
+                    }
                 }
             }
             if sweep_settled(&cars) {
@@ -1895,9 +2273,15 @@ impl Conductor {
             &train_branch,
             "origin/main",
         ])?;
-        let mut boarded: Vec<(Value, String)> = Vec::new();
+        // (car, branch, boarded head) — the head is WHAT boarded, and
+        // the sweep's licence to delete the branch later depends on it
+        // (car 23923b40). Read from the fetched `fork/<branch>` ref,
+        // which is precisely the commit the merge below carries.
+        let mut boarded: Vec<(Value, String, String)> = Vec::new();
         let mut skipped: Vec<(Value, String)> = Vec::new();
         for (j, branch) in cands {
+            let head_out = sh(&["git", "-C", clone, "rev-parse", &format!("fork/{branch}")])?;
+            let head = stdout_str(&head_out).trim().to_string();
             let r = sh_unchecked(&[
                 "git",
                 "-C",
@@ -1909,7 +2293,7 @@ impl Conductor {
                 &format!("fork/{branch}"),
             ])?;
             if r.status.success() {
-                boarded.push((j, branch));
+                boarded.push((j, branch, head));
             } else {
                 let diff =
                     sh_unchecked(&["git", "-C", clone, "diff", "--name-only", "--diff-filter=U"])?;
@@ -1962,7 +2346,7 @@ impl Conductor {
 
         let mut lines: Vec<String> = boarded
             .iter()
-            .map(|(j, b)| {
+            .map(|(j, b, _)| {
                 format!(
                     "- `{b}` — {} (Job `{}`)",
                     j.get("title").and_then(Value::as_str).unwrap_or_default(),
@@ -1994,7 +2378,7 @@ impl Conductor {
 
         let boarded_ids: Vec<String> = boarded
             .iter()
-            .map(|(j, _)| job_id(j).map(str::to_string))
+            .map(|(j, _, _)| job_id(j).map(str::to_string))
             .collect::<Result<_>>()?;
         let skipped_branches: Vec<String> = skipped.iter().map(|(_, b)| b.clone()).collect();
         self.merge_job_metadata(
@@ -2013,7 +2397,7 @@ impl Conductor {
         let train = self.get_job(&train_id).await?;
         let boarded_note = boarded
             .iter()
-            .map(|(j, b)| {
+            .map(|(j, b, _)| {
                 format!(
                     "{b} ({})",
                     id8(j.get("id").and_then(Value::as_str).unwrap_or("?"))
@@ -2050,7 +2434,7 @@ impl Conductor {
         )
         .await?;
 
-        for (j, _branch) in &boarded {
+        for (j, _branch, head) in &boarded {
             let review = find_step(j, "review", "Open for review");
             self.complete_step(
                 j,
@@ -2068,10 +2452,18 @@ impl Conductor {
             // stamps the train: an earlier window's skip note must not
             // outlive the skip — the key is REMOVED (Null), not left
             // behind as "".
+            //
+            // `boarded_head` rides here too, and lives on the CAR
+            // rather than in a second list on the train: the sweep
+            // already fetches every boarded car, so the fact stays in
+            // one place (guideline 9a) and costs no extra call. It is
+            // rewritten on every boarding, so a car that rides a later
+            // train carries that train's head, not the first one's.
             self.merge_job_metadata(
                 job_id(j)?,
                 vec![
                     ("train", json!(train_id.as_str())),
+                    ("boarded_head", json!(head.as_str())),
                     ("skip_reason", Value::Null),
                 ],
             )
@@ -2153,10 +2545,14 @@ impl Conductor {
                     .await?;
                 }
             }
+            // The boarded head goes with the train stamp: this car
+            // boarded nothing now, and a stale head is not evidence
+            // about whatever it boards next.
             self.merge_job_metadata(
                 cid,
                 vec![
                     ("train", Value::Null),
+                    ("boarded_head", Value::Null),
                     (
                         "skip_reason",
                         json!(format!("returned to dock: train cancelled ({reason})")),
@@ -2275,14 +2671,19 @@ pub async fn run(phase: Phase, dry: bool, now: DateTime<Utc>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        arrival_report, arrival_summary, deletable_branches, deploy_needed, local_jobs_problem,
-        overlay_metadata, parked_ready, releasable_cars, repo_path, resolve_train,
-        skip_reason_branch_missing, skip_reason_conflict, stall_age_hours, sweep_settled,
-        train_branch_to_delete,
+        ApiFailure, Failure, JOBS_API_RETRY, RetryPolicy, SweepGuard, arrival_report,
+        arrival_summary, boarded_head, branch_moved_line, classify_transport, deletable_branches,
+        deploy_needed, local_jobs_problem, overlay_metadata, parked_ready, releasable_cars,
+        repo_path, resolve_train, retryable, retrying, short_cause, skip_reason_branch_missing,
+        skip_reason_conflict, stall_age_hours, sweep_guard, sweep_settled, train_branch_to_delete,
     };
+    use anyhow::{Result, anyhow};
     use chrono::{DateTime, Utc};
+    use reqwest::Method;
     use serde_json::{Value, json};
+    use std::cell::Cell;
     use std::collections::BTreeSet;
+    use std::time::Duration;
 
     /// A car parked at review, branch pushed, not on a train.
     fn ready_car() -> serde_json::Value {
@@ -2877,5 +3278,281 @@ mod tests {
             repo_path("git@github.com:dauld/boss-fork"),
             "dauld/boss-fork"
         );
+    }
+
+    // -- the sweep's head guard (car 23923b40's known_gap) -----------------
+    //
+    // `fix/conductor-hardening` boarded at fc55e4d; two more commits
+    // (705230b) were pushed to the branch AFTER boarding; the train
+    // landed carrying only the boarded ones; the sweep read the job
+    // record ("closed, outcome=merged" — true) and deleted the branch,
+    // taking the unmerged commits with it. The job record proves the
+    // CONTENT landed, never that the branch still holds only that
+    // content. These pin the second question the sweep must now ask.
+
+    const BOARDED: &str = "fc55e4d1a2b3c4d5e6f708192a3b4c5d6e7f8091";
+    const MOVED: &str = "705230b9f8e7d6c5b4a39281706f5e4d3c2b1a09";
+
+    #[test]
+    fn a_branch_still_at_its_boarded_head_is_deleted() {
+        assert_eq!(
+            sweep_guard(Some(BOARDED), Some(BOARDED)),
+            SweepGuard::Delete
+        );
+    }
+
+    #[test]
+    fn a_branch_that_moved_since_boarding_is_kept() {
+        // The incident, exactly: the recorded head is not the branch's
+        // head any more, so the delete would take work the train never
+        // carried.
+        assert_eq!(
+            sweep_guard(Some(BOARDED), Some(MOVED)),
+            SweepGuard::Moved {
+                recorded: BOARDED.to_string(),
+                current: MOVED.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_car_with_no_recorded_head_keeps_its_branch() {
+        // An unknown head is not evidence. A car that boarded before
+        // the conductor recorded heads keeps its branch: the cost of
+        // keeping one is a stale branch, the cost of deleting one is
+        // lost work.
+        assert_eq!(sweep_guard(None, Some(BOARDED)), SweepGuard::NoRecord);
+        assert_eq!(sweep_guard(None, None), SweepGuard::NoRecord);
+        // An empty stamp is no stamp.
+        assert_eq!(sweep_guard(Some(""), Some(BOARDED)), SweepGuard::NoRecord);
+    }
+
+    #[test]
+    fn a_branch_already_off_the_forge_is_nothing_to_sweep() {
+        assert_eq!(sweep_guard(Some(BOARDED), None), SweepGuard::Gone);
+        assert_eq!(sweep_guard(Some(BOARDED), Some("")), SweepGuard::Gone);
+    }
+
+    #[test]
+    fn the_boarded_head_is_read_off_the_car_job() {
+        let mut car = landed_car("car-1", "feat/x");
+        car["metadata"]["boarded_head"] = json!(BOARDED);
+        assert_eq!(boarded_head(&car), Some(BOARDED));
+        // Absent, empty, or non-string reads as no stamp at all.
+        assert_eq!(boarded_head(&landed_car("car-2", "feat/y")), None);
+        let mut blank = landed_car("car-3", "feat/z");
+        blank["metadata"]["boarded_head"] = json!("");
+        assert_eq!(boarded_head(&blank), None);
+        assert_eq!(boarded_head(&json!({"id": "car-4"})), None);
+    }
+
+    #[test]
+    fn the_moved_branch_line_names_both_heads() {
+        // Operator surface: the only notice that unmerged commits are
+        // sitting on a branch the train did not carry.
+        assert_eq!(
+            branch_moved_line("fix/conductor-hardening", BOARDED, MOVED),
+            "branch fix/conductor-hardening moved since boarding \
+             (fc55e4d1 -> 705230b9) — not deleting"
+        );
+    }
+
+    // -- the jobs-API retry classifier -------------------------------------
+    //
+    // The cluster is the system of record and it rolls. Twice on
+    // 2026-08-13 a reconcile hit `Connection refused` to the jobs API
+    // mid-converge and failed the whole verb; the blip lasted seconds.
+    // A bounded retry covers the roll — but only for failures that are
+    // blips, and only where re-sending is safe.
+
+    #[test]
+    fn a_refused_connection_is_a_blip_under_any_method() {
+        // Nothing was received, so nothing was done: even a create may
+        // go again.
+        assert!(retryable(&Method::GET, &Failure::Connect));
+        assert!(retryable(&Method::PUT, &Failure::Connect));
+        assert!(retryable(&Method::POST, &Failure::Connect));
+    }
+
+    #[test]
+    fn an_ambiguous_blip_only_retries_an_idempotent_call() {
+        // A timeout leaves the write UNKNOWN — re-POSTing an ambiguous
+        // create is how one blip becomes two train Jobs.
+        assert!(retryable(&Method::GET, &Failure::Ambiguous));
+        assert!(retryable(&Method::PUT, &Failure::Ambiguous));
+        assert!(!retryable(&Method::POST, &Failure::Ambiguous));
+    }
+
+    #[test]
+    fn a_5xx_is_a_blip_and_a_4xx_is_an_answer() {
+        for status in [500, 502, 503, 504] {
+            assert!(
+                retryable(&Method::GET, &Failure::Http(status)),
+                "{status} is the SoR failing to answer"
+            );
+            assert!(
+                !retryable(&Method::POST, &Failure::Http(status)),
+                "{status} leaves a create ambiguous"
+            );
+        }
+        // A 422 is the jobs API telling the conductor no. Retrying an
+        // answer just asks the same question three times — including
+        // 429, which is an answer about rate, not a transport blip.
+        for status in [400, 404, 409, 422, 429] {
+            assert!(!retryable(&Method::GET, &Failure::Http(status)), "{status}");
+            assert!(!retryable(&Method::PUT, &Failure::Http(status)), "{status}");
+        }
+        // 2xx/3xx never reach the classifier, and are not blips either.
+        assert!(!retryable(&Method::GET, &Failure::Http(200)));
+        assert!(!retryable(&Method::GET, &Failure::Http(301)));
+    }
+
+    #[test]
+    fn an_unusable_answer_is_never_a_blip() {
+        // The SoR answered; the body was garbage. Retrying re-reads
+        // the same garbage.
+        assert!(!retryable(&Method::GET, &Failure::Malformed));
+        assert!(!retryable(&Method::POST, &Failure::Malformed));
+    }
+
+    #[test]
+    fn the_backoff_doubles_from_the_base() {
+        assert_eq!(JOBS_API_RETRY.attempts, 3);
+        assert_eq!(JOBS_API_RETRY.backoff(1), Duration::from_secs(2));
+        assert_eq!(JOBS_API_RETRY.backoff(2), Duration::from_secs(4));
+        // The tests' policy makes the same decisions and never waits.
+        assert_eq!(RetryPolicy::immediate(3).backoff(1), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_blip_cause_reads_the_innermost_error() {
+        // "GET /api/jobs: error sending request: ... : Connection
+        // refused" — the fact is at the bottom; the url is already
+        // implied by the line around it.
+        let e = anyhow!("Connection refused (os error 61)")
+            .context("error sending request for url (http://10.20.0.34:7900/api/jobs)")
+            .context("GET /api/jobs?kind=pr-train");
+        assert_eq!(short_cause(&e), "Connection refused (os error 61)");
+        // A bare error is its own innermost cause.
+        assert_eq!(short_cause(&anyhow!("HTTP 503")), "HTTP 503");
+        // And it stays journal-sized.
+        let long = short_cause(&anyhow!("{}", "x".repeat(500)));
+        assert!(long.chars().count() <= 81, "{} chars", long.chars().count());
+        assert!(long.ends_with('…'), "says it truncated: {long}");
+    }
+
+    #[test]
+    fn a_real_refused_connection_classifies_as_a_blip() {
+        // The production failure end to end: reqwest's own error for a
+        // refused connect must land on a retryable Failure, or the
+        // classifier above is pinning a shape the wire never produces.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt.block_on(async {
+            reqwest::Client::builder()
+                .timeout(Duration::from_millis(250))
+                .build()
+                .unwrap()
+                // Port 1 refuses; a filtered port times out. Both are
+                // blips, and neither is an answer.
+                .get("http://127.0.0.1:1/api/jobs")
+                .send()
+                .await
+                .expect_err("nothing serves port 1")
+        });
+        let kind = classify_transport(&err);
+        assert!(
+            matches!(kind, Failure::Connect | Failure::Ambiguous),
+            "a refused/timed-out connect must be a transport failure, got {kind:?}"
+        );
+        assert!(retryable(&Method::GET, &kind));
+    }
+
+    // -- the retry driver --------------------------------------------------
+
+    fn blip(kind: Failure) -> ApiFailure {
+        ApiFailure {
+            kind,
+            cause: anyhow!("Connection refused (os error 61)"),
+        }
+    }
+
+    /// A journal that counts its lines instead of printing them.
+    fn counting_journal(lines: &Cell<u32>) -> impl Fn(&str) {
+        move |_| lines.set(lines.get() + 1)
+    }
+
+    #[tokio::test]
+    async fn a_blip_retries_to_the_attempt_budget_then_surfaces() {
+        let mut calls = 0u32;
+        let lines = Cell::new(0u32);
+        let out: Result<()> = retrying(
+            &RetryPolicy::immediate(3),
+            &Method::GET,
+            &counting_journal(&lines),
+            || {
+                calls += 1;
+                async { Err(blip(Failure::Connect)) }
+            },
+        )
+        .await;
+        assert!(out.is_err(), "the verb still surfaces a real outage");
+        assert_eq!(calls, 3, "three attempts, not more");
+        assert_eq!(lines.get(), 2, "one line per retry — blips stay countable");
+    }
+
+    #[tokio::test]
+    async fn a_recovered_blip_costs_nothing_but_a_line() {
+        let mut calls = 0u32;
+        let lines = Cell::new(0u32);
+        let out: Result<u8> = retrying(
+            &RetryPolicy::immediate(3),
+            &Method::PUT,
+            &counting_journal(&lines),
+            || {
+                calls += 1;
+                let attempt = calls;
+                async move {
+                    if attempt == 1 {
+                        Err(blip(Failure::Ambiguous))
+                    } else {
+                        Ok(7)
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(out.unwrap(), 7);
+        assert_eq!(calls, 2, "stops the moment the SoR answers");
+        assert_eq!(lines.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_surfaced_on_the_first_attempt() {
+        let mut calls = 0u32;
+        let lines = Cell::new(0u32);
+        let out: Result<()> = retrying(
+            &RetryPolicy::immediate(3),
+            &Method::PUT,
+            &counting_journal(&lines),
+            || {
+                calls += 1;
+                async {
+                    Err(ApiFailure {
+                        kind: Failure::Http(422),
+                        cause: anyhow!("PUT /api/jobs/x: HTTP 422: metadata_schema"),
+                    })
+                }
+            },
+        )
+        .await;
+        assert!(
+            out.unwrap_err().to_string().contains("422"),
+            "the answer reaches the operator unchanged"
+        );
+        assert_eq!(calls, 1, "a 422 is an answer — asked once");
+        assert_eq!(lines.get(), 0, "an answer is not a blip and journals none");
     }
 }

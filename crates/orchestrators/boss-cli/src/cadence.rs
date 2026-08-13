@@ -368,26 +368,52 @@ async fn record_outcome(pool: &PgPool, id: &str, rc: i32, runtime_secs: u64) -> 
 // the same predicate boarding itself collects by (train::parked_ready).
 // ---------------------------------------------------------------------------
 
+/// The probe reads the same system of record the conductor does, and
+/// the same pod roll hits it: on 2026-08-13 a `Connection refused`
+/// here held the queue-depth rules for a tick. Same blip guard, same
+/// classifier — journalled in this loop's idiom (`cadence: `).
 async fn get_json(http: &reqwest::Client, base: &str, path: &str) -> Result<Option<Value>> {
+    train::retrying(
+        &train::JOBS_API_RETRY,
+        &reqwest::Method::GET,
+        &|m| log(m),
+        || get_json_once(http, base, path),
+    )
+    .await
+}
+
+async fn get_json_once(
+    http: &reqwest::Client,
+    base: &str,
+    path: &str,
+) -> std::result::Result<Option<Value>, train::ApiFailure> {
     let resp = http
         .get(format!("{base}{path}"))
         .header("content-type", "application/json")
         .header("x-boss-user", train::boss_user())
         .send()
         .await
-        .with_context(|| format!("GET {path}"))?;
+        .map_err(|e| train::ApiFailure::transport(e, format!("GET {path}")))?;
     let status = resp.status();
-    let body = resp.text().await?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| train::ApiFailure::transport(e, format!("reading GET {path} response")))?;
     if !status.is_success() {
-        bail!("GET {path}: HTTP {status}: {}", body.trim());
+        return Err(train::ApiFailure {
+            kind: train::Failure::Http(status.as_u16()),
+            cause: anyhow!("GET {path}: HTTP {status}: {}", body.trim()),
+        });
     }
     if body.trim().is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(
-            serde_json::from_str(&body).with_context(|| format!("parsing GET {path} response"))?,
-        ))
+        return Ok(None);
     }
+    serde_json::from_str(&body)
+        .map(Some)
+        .map_err(|e| train::ApiFailure {
+            kind: train::Failure::Malformed,
+            cause: anyhow::Error::new(e).context(format!("parsing GET {path} response")),
+        })
 }
 
 async fn probe_dock_depth() -> Result<u32> {

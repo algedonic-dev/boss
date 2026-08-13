@@ -27,8 +27,13 @@ up-to-date database is a no-op.
   containers (no args).
 
 `boss_testing::TestDb` loads the same manifest, compiled in as
-`SCHEMA_FILES`; the `manifest_agreement` test pins the two lists to
-each other (CLAUDE.md §9a).
+`SCHEMA_FILES` — generated from `manifest.txt` by
+`crates/core/boss-testing/build.rs`, because `include_str!` needs
+literal paths at compile time and so cannot read the manifest itself.
+The manifest is the single definition; adding a migration edits it and
+nothing else. (This pair was formerly two hand-maintained lists pinned
+to each other by a test — see CLAUDE.md §9a for why the pin was
+retired in favour of the collapse.)
 
 ## The convention: applied migrations are history
 

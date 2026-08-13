@@ -48,8 +48,7 @@ async fn dispatcher_rules_seed_matches_toml() {
          trips on every live database). A rule added or changed after the \
          migration runner landed gets its OWN manifest entry: a new \
          NNN-dispatcher-rule-*.sql with an ON CONFLICT-safe INSERT (see \
-         101-dispatcher-rule-step-assigned.sql), appended to manifest.txt \
-         and SCHEMA_FILES."
+         101-dispatcher-rule-step-assigned.sql), appended to manifest.txt."
     );
 }
 

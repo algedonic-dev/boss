@@ -180,16 +180,27 @@ next person to keep two lists in sync is not a mechanism.
 This is not theoretical. Three such pairs drifted and each caused a
 real failure:
 
-| pair | what broke |
-|---|---|
-| `boss-ports` ↔ `deploy-services.sh` fallback arrays | two services silently absent from a deploy |
-| `manifest.txt` ↔ `boss-testing::SCHEMA_FILES` | every DB-backed test ran without two tables |
-| `MODEL_ROUTES` ↔ `MODEL_KINDS` | pages rendered under the wrong tab, silently |
+| pair | what broke | now |
+|---|---|---|
+| `boss-ports` ↔ `deploy-services.sh` fallback arrays | two services silently absent from a deploy | pinned by a test — the fallback must stand alone when the binary is unbuilt |
+| `manifest.txt` ↔ `boss-testing::SCHEMA_FILES` | every DB-backed test ran without two tables | **collapsed** — `boss-testing/build.rs` generates the list from the manifest |
+| `MODEL_ROUTES` ↔ `MODEL_KINDS` | pages rendered under the wrong tab, silently | **collapsed** — one `nav-catalog.ts` answers both questions |
 
-All three now either collapsed to one definition or pinned by a test
-that names the offending entry when it drifts. Prefer collapsing:
+All three are now either collapsed to one definition or pinned by a
+test that names the offending entry when it drifts. Prefer collapsing:
 `VENDOR_COUNT` was two hardcoded `13`s under a sync comment and is now
 one `pub const`, because one constant cannot drift from itself.
+
+**A pin is a holding action, not a destination.** The equality test is
+what you write when you cannot collapse *today*; it stops the drift
+but keeps the duplication, and duplication has a running cost the test
+does not pay off. `manifest.txt` ↔ `SCHEMA_FILES` is the worked
+example: the pin held for months, then every new migration had to edit
+the tail line of both files, and on 2026-08-13 four cars in one day
+collided there — each collision costing a re-rail. That is the signal
+to go back and collapse. A generated list cannot drift *and* cannot
+conflict; `include_str!` needing compile-time literals is what a build
+script is for.
 
 ### 10. Core vs. Example Tenant
 The core state-machine OS lives under `crates/core/` (27 crates —
