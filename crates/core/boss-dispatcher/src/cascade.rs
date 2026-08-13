@@ -87,9 +87,19 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // same write, aa9980c8).
         ("jobs.clear_waiting", vec!["jobs.job.updated"]),
         ("jobs.subjob_resolve", vec!["jobs.step.completed"]),
+        // Completes the open branch on the Job a declared edge names
+        // (a merged car answering its feedback packet). The completion
+        // is what closes the loop: jobs.step.completed → step.done.* →
+        // the packet's own `closed` terminal → jobs.job.closed, which
+        // re-enters the rule set at notify-filer-on-feedback-terminal.
+        ("jobs.complete_linked_step", vec!["jobs.step.completed"]),
         ("gate.resolve", vec!["jobs.step.completed"]),
         ("packaging.allocate", vec!["jobs.step.completed"]),
         ("messages.notify", vec![]),
+        // Tells the filer how their packet ended. A sink, like every
+        // other notifier — the message is the end of the cascade, not
+        // a new branch of it.
+        ("messages.notify_job_terminal", vec![]),
         // Queues a docs flush job (rule 109) — a docs-api write, no
         // event emitted back into the cascade (the flush WORKER's
         // eventual commit is outside the dispatcher's loop).

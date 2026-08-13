@@ -510,7 +510,12 @@ fn ship_a_change_spec() -> WorkflowSpec {
          question. The `scope` step is the point of the kind: it asks a person what the \
          change contains and what it deliberately excludes BEFORE the work, which is the \
          only moment that decision keeps a PR small. Counted on /system/flow, so a cadence \
-         target needs no second mechanism."
+         target needs no second mechanism. Name the feedback packet this change answers in \
+         `metadata.backlog_item` — a declared job edge, ref-checked at the write, and the \
+         link the dispatcher follows on merge to complete that packet's open branch and \
+         tell its filer. Use `metadata.backlog_text` only when the referent is not a Job \
+         on this instance (legacy, or a request that arrived as prose); it is free text \
+         and nothing follows it."
             .to_string(),
     );
     spec
@@ -1383,6 +1388,46 @@ fn user_feedback_spec() -> WorkflowSpec {
             .to_string(),
     );
     spec
+}
+
+/// Which `user-feedback` step a triage disposition opens, and whether
+/// reaching it ends the Job on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedbackBranch {
+    /// The step's `spec_slug` — the stable machine-facing identifier
+    /// (`investigate`, `design-review`, …), which is what a caller
+    /// addressing the step across the HTTP surface matches on.
+    pub slug: String,
+    /// `true` for `duplicate` / `declined`: the branch IS a declared
+    /// terminal, so triage closes the Job outright and there is no
+    /// open step for anything downstream to complete.
+    pub terminal: bool,
+}
+
+/// Which branch step the `user-feedback` triage disposition
+/// `disposition` opened — the fork's routing table, answered from the
+/// shipped spec rather than from a second list.
+///
+/// Every branch's eligibility is `steps.triage.done AND
+/// steps.triage.metadata.disposition = "<value>"`, so the mapping
+/// disposition → step already exists in the Workflow; this reads it
+/// back out instead of restating it. A branch renamed in
+/// `user_feedback_spec` moves this answer with it, which is the point
+/// (CLAUDE.md §9a — the fact stays in one place instead of drifting
+/// against a hardcoded table).
+///
+/// `None` for a disposition no branch claims — an unknown value, or
+/// one the viability lint has yet to catch.
+pub fn feedback_branch_for_disposition(disposition: &str) -> Option<FeedbackBranch> {
+    let needle = format!("steps.triage.metadata.disposition = \"{disposition}\"");
+    user_feedback_spec()
+        .steps
+        .into_iter()
+        .find(|s| s.ready_when.contains(&needle))
+        .map(|s| FeedbackBranch {
+            slug: s.title,
+            terminal: s.terminal.is_some(),
+        })
 }
 
 /// Build the canonical `design-doc-review` WorkflowSpec.
@@ -3783,6 +3828,68 @@ mod tests {
             "the feedback flow has exactly one field an operator fills in; anything \
              else here is a step no surface can complete"
         );
+    }
+
+    /// The routing table triage actually implements. A shipped change
+    /// answers a feedback packet by completing the step its
+    /// disposition opened, so "which step did `build` open" has to be
+    /// an answerable question rather than something a caller guesses
+    /// from the label.
+    #[test]
+    fn each_disposition_names_the_branch_it_opened() {
+        for (disposition, slug, terminal) in [
+            ("reproduce", "investigate", false),
+            ("design", "design-review", false),
+            ("build", "build", false),
+            ("needs-info", "needs-info", false),
+            ("duplicate", "duplicate", true),
+            ("decline", "declined", true),
+        ] {
+            let branch = feedback_branch_for_disposition(disposition)
+                .unwrap_or_else(|| panic!("`{disposition}` opens no branch"));
+            assert_eq!(
+                branch.slug, slug,
+                "`{disposition}` routed to the wrong step"
+            );
+            assert_eq!(
+                branch.terminal, terminal,
+                "`{disposition}` disagrees about whether its branch ends the Job"
+            );
+        }
+    }
+
+    /// EVERY value of the disposition enum resolves — the same
+    /// property the viability lint proves about successors, asserted
+    /// against the lookup callers use. A disposition with no branch
+    /// here is an item that routes nowhere.
+    #[test]
+    fn every_declared_disposition_resolves_to_a_branch() {
+        let spec = user_feedback_spec();
+        let triage = spec
+            .steps
+            .iter()
+            .find(|s| s.title == "triage")
+            .expect("triage step present");
+        let field = triage
+            .fields
+            .iter()
+            .find(|f| f.name == "disposition")
+            .expect("triage collects a disposition");
+        for value in field.field_type.split('|') {
+            assert!(
+                feedback_branch_for_disposition(value).is_some(),
+                "disposition `{value}` is offered to triagers but opens no branch"
+            );
+        }
+    }
+
+    /// An unknown disposition is `None`, not a wrong answer. A caller
+    /// completing "whatever branch this opened" must be able to tell
+    /// "nothing" from "something".
+    #[test]
+    fn an_unknown_disposition_opens_no_branch() {
+        assert_eq!(feedback_branch_for_disposition("wontfix"), None);
+        assert_eq!(feedback_branch_for_disposition(""), None);
     }
 
     #[test]

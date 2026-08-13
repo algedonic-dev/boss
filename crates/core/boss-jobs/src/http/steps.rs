@@ -740,6 +740,20 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                     serde_json::json!({
                         "id": job.id.to_string(),
                         "closed_on": job.closed_on,
+                        // ALWAYS present, on all three emit sites,
+                        // defaulting null — the dispatcher's expr
+                        // binder makes an ABSENT identifier a
+                        // PredicateFailed → Retry → dead-letter storm
+                        // rather than a quiet false, so a rule gating
+                        // on `kind` / `outcome` needs the keys on every
+                        // close, not just the ones that have an answer.
+                        // (The `notify_on_done` field on step.done,
+                        // migration 106, is the same contract.) A
+                        // catch-all close carries no declared outcome,
+                        // so `outcome` is null here unless a terminal
+                        // already stamped one.
+                        "kind": job.kind,
+                        "outcome": job.metadata.get("outcome"),
                         // D7: same delegate-subjob back-link as the
                         // terminal-close path, so a child Job that
                         // closes via the all-steps-terminal catch-all
@@ -1150,6 +1164,12 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
                 "id": job.id.to_string(),
                 "closed_on": job.closed_on,
                 "outcome": outcome,
+                // Which protocol closed. Present on all three emit
+                // sites so a rule can select the Workflow it cares
+                // about as data: the close marker otherwise names no
+                // kind, and every consumer had to fetch the Job to
+                // find out whether the event was even about them.
+                "kind": job.kind,
                 // D7: surface the delegate-subjob back-link (if any) on
                 // the close marker so the jobs.subjob_resolve rule can
                 // gate `when` on it without fetching the Job. Null for

@@ -1,0 +1,643 @@
+//! `jobs.complete_linked_step` — a closing Job completes the open step
+//! it was authorized by, on the Job its declared edge names.
+//!
+//! The gap this closes: `ship-a-change` declares a `backlog_item` job
+//! edge at the Job's metadata (migration 104, dialed to `abort` by
+//! 105), pointing at the `user-feedback` packet the change answers.
+//! Nothing read it. So a change could be scoped, built, gated,
+//! reviewed, merged, deployed and observed working while the feedback
+//! packet that asked for it sat at `submitted` — sixteen of them, on
+//! 2026-08-11. The loop closed only when a person remembered.
+//!
+//! David ratified the rule this implements: "Once the user feedback
+//! results in either a shipped change or some other terminal state, it
+//! can be closed without the filer approving." So the system completes
+//! the branch step triage opened, and the Workflow's own `ready_when`
+//! does the rest — `closed` fires off `steps.investigate.done OR
+//! steps.design-review.done OR steps.build.done OR
+//! steps.needs-info.done`. Nothing here knows the feedback Job closes;
+//! it completes a step, and the state machine draws the conclusion.
+//!
+//! ## Why this is a handler and not feedback-specific code
+//!
+//! Every noun is a rule arg. The handler knows "follow the edge named
+//! by `link`, complete whichever of the steps named by `steps` is open
+//! on the far end, stamp the evidence under `evidence_key`" — which is
+//! a shape, not a policy. Which edge, which steps, and which Workflows
+//! it applies to are the rule row's business (migration 117). Point it
+//! at a different edge and it answers a different obligation.
+//!
+//! Rule shape:
+//! ```toml
+//! [[rule]]
+//! on_event = "jobs.job.closed"
+//! when = "kind = \"ship-a-change\" AND outcome = \"merged\""
+//! [[rule.do]]
+//! handler = "jobs.complete_linked_step"
+//! args = { link = "\"backlog_item\"", steps = "\"investigate,design-review,build\"" }
+//! ```
+//!
+//! ## Idempotence
+//!
+//! JetStream is at-least-once and the close marker is emitted from
+//! three sites, so this WILL run more than once for one merge. Three
+//! guards, cheapest first:
+//!
+//! 1. The linked Job is already closed → nothing open to complete.
+//! 2. No step named by `steps` is `ready`/`active` → the branch was
+//!    already completed (by us on the first delivery, or by a person).
+//!    A completed step is never re-completed, so no second
+//!    `step.done.*` marker fires and no second re-evaluation runs.
+//! 3. The step already carries this car's id under `evidence_key` →
+//!    belt to (2)'s braces, and the stamp that makes the write
+//!    self-describing about which delivery wrote it.
+
+use super::common::{dispatcher_actor_header, dispatcher_reader_header, sim_origin_value};
+use async_trait::async_trait;
+use boss_dispatcher::rules::expr::Value;
+use boss_dispatcher::rules::handler::{Handler, HandlerError, InvocationContext, arg, arg_string};
+use serde_json::json;
+use std::sync::Arc;
+
+/// Default metadata key the arrival evidence lands under on the
+/// completed step. Overridable per rule via the `evidence_key` arg.
+const DEFAULT_EVIDENCE_KEY: &str = "arrived_from";
+
+/// Step statuses that mean "open" — the branch triage actually opened
+/// is `ready` (nobody claimed it) or `active` (someone did). A
+/// `pending` branch is one the disposition did NOT open, and
+/// completing it would fabricate work that was never routed.
+const OPEN_STATUSES: [&str; 2] = ["ready", "active"];
+
+pub struct JobsCompleteLinkedStep {
+    client: reqwest::Client,
+    jobs_base: String,
+}
+
+impl JobsCompleteLinkedStep {
+    pub fn new(jobs_base: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            client: reqwest::Client::new(),
+            jobs_base: jobs_base.into(),
+        })
+    }
+
+    /// Construct with a custom reqwest client (tests point it at a
+    /// local stand-in for jobs-api).
+    pub fn with_client(client: reqwest::Client, jobs_base: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            client,
+            jobs_base: jobs_base.into(),
+        })
+    }
+
+    async fn get_job(&self, job_id: &str, rule: &str) -> Result<serde_json::Value, HandlerError> {
+        let url = format!(
+            "{}/api/jobs/{}",
+            self.jobs_base.trim_end_matches('/'),
+            job_id
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .header("x-boss-user", dispatcher_reader_header())
+            .header("x-sim-origin", sim_origin_value())
+            .send()
+            .await
+            .map_err(|e| HandlerError::Downstream(format!("GET {url} (rule {rule}): {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(HandlerError::Downstream(format!(
+                "GET {url} returned {status}: {body}"
+            )));
+        }
+        resp.json()
+            .await
+            .map_err(|e| HandlerError::Downstream(format!("GET {url} response not JSON: {e}")))
+    }
+}
+
+/// The generation a train carried, out of its `deployed` step's
+/// evidence (`main@<sha>; …`). `None` when the summary is absent or
+/// shaped differently — evidence never guesses.
+///
+/// The `main@<sha>` shape is the conductor's, and `boss-cli`'s
+/// arrival report parses it the same way. Two readers of one written
+/// format that cannot be collapsed today (the other lives in a binary
+/// crate's private fn), so it is pinned by a test here instead
+/// (CLAUDE.md §9a).
+fn deployed_generation(summary: &str) -> Option<&str> {
+    summary
+        .strip_prefix("main@")
+        .and_then(|rest| rest.split([';', ' ']).next())
+        .filter(|sha| !sha.is_empty())
+}
+
+/// Find a Job's step by `spec_slug` — the stable machine-facing
+/// identifier, distinct from the rendered `title`.
+fn step_by_slug<'a>(job: &'a serde_json::Value, slug: &str) -> Option<&'a serde_json::Value> {
+    job.get("steps")?
+        .as_array()?
+        .iter()
+        .find(|s| s.get("spec_slug").and_then(|v| v.as_str()) == Some(slug))
+}
+
+#[async_trait]
+impl Handler for JobsCompleteLinkedStep {
+    fn name(&self) -> &'static str {
+        "jobs.complete_linked_step"
+    }
+
+    async fn invoke(
+        &self,
+        args: &[(String, Value)],
+        ctx: &InvocationContext,
+    ) -> Result<(), HandlerError> {
+        let link = arg_string(args, "link")?;
+        let allowed: Vec<&str> = arg_string(args, "steps")?
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if allowed.is_empty() {
+            return Err(HandlerError::MissingArg("steps".to_string()));
+        }
+        let evidence_key = match arg(args, "evidence_key") {
+            Some(Value::String(s)) if !s.is_empty() => s.as_str(),
+            _ => DEFAULT_EVIDENCE_KEY,
+        };
+
+        // The `jobs.job.closed` payload carries the closing Job's id.
+        // A malformed marker is not something a redelivery can fix, so
+        // it is a no-op rather than an error that retries forever.
+        let Some(closing_id) = ctx.event_payload.get("id").and_then(|v| v.as_str()) else {
+            return Ok(());
+        };
+
+        let closing = self.get_job(closing_id, &ctx.rule_name).await?;
+        let closing_meta = closing.get("metadata").cloned().unwrap_or(json!({}));
+
+        // No declared edge → no obligation. This is the legacy /
+        // free-text case: a car whose motivating item is named only in
+        // `backlog_text` prose, or one filed against nothing at all.
+        // Both ship exactly as before.
+        let Some(target_id) = closing_meta
+            .get(link)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(());
+        };
+
+        let target = self.get_job(target_id, &ctx.rule_name).await?;
+
+        // GUARD 1 — a packet that already reached a terminal is
+        // untouched. Its filer got their answer from whatever closed
+        // it; re-opening that decision is not this handler's business.
+        let target_status = target.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if matches!(target_status, "closed" | "cancelled") {
+            return Ok(());
+        }
+
+        // GUARD 2 — the open branch, or nothing. Exactly one of the
+        // named steps is open on a live packet (the fork's `ready_when`
+        // guarantees it: each branch gates on a different disposition
+        // value). A re-delivery finds the branch already `completed`
+        // and falls out here.
+        let Some(step) = allowed
+            .iter()
+            .filter_map(|slug| step_by_slug(&target, slug))
+            .find(|s| {
+                s.get("status")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|st| OPEN_STATUSES.contains(&st))
+            })
+        else {
+            return Ok(());
+        };
+        let Some(step_id) = step.get("id").and_then(|v| v.as_str()) else {
+            return Ok(());
+        };
+
+        // PATCH-on-PUT replaces top-level `metadata` wholesale, so the
+        // write merges into the step's existing keys — `authority_role`
+        // lives there and is what keeps the step gated.
+        let mut merged = match step.get("metadata").cloned() {
+            Some(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+
+        // GUARD 3 — already stamped by this same car. Cheap, and it
+        // makes the write self-describing about which delivery wrote
+        // it.
+        if merged
+            .get(evidence_key)
+            .and_then(|e| e.get("car"))
+            .and_then(|v| v.as_str())
+            == Some(closing_id)
+        {
+            return Ok(());
+        }
+
+        // The evidence. "The work you asked for shipped" is only worth
+        // saying if it names WHAT shipped — an id and a title a reader
+        // can go look at, plus the train that carried it and the
+        // generation that generation landed in when those are
+        // reachable. Absent facts are null, never invented.
+        let train_id = closing_meta
+            .get("train")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        // Best-effort: a train we cannot read costs us the generation,
+        // not the obligation. The packet still gets completed.
+        let generation = match train_id {
+            Some(t) => self
+                .get_job(t, &ctx.rule_name)
+                .await
+                .ok()
+                .as_ref()
+                .and_then(|train| step_by_slug(train, "deployed"))
+                .and_then(|s| s.get("metadata"))
+                .and_then(|m| m.get("deployed"))
+                .and_then(|v| v.as_str())
+                .and_then(deployed_generation)
+                .map(str::to_string),
+            None => None,
+        };
+        merged.insert(
+            evidence_key.to_string(),
+            json!({
+                "car": closing_id,
+                "title": closing.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                "branch": closing
+                    .get("subject")
+                    .and_then(|s| s.get("id"))
+                    .and_then(|v| v.as_str()),
+                "outcome": ctx.event_payload.get("outcome").and_then(|v| v.as_str()),
+                "closed_on": ctx.event_payload.get("closed_on").cloned(),
+                "train": train_id,
+                "generation": generation,
+                "by_rule": ctx.rule_name,
+            }),
+        );
+
+        let step_url = format!(
+            "{}/api/jobs/{}/steps/{}",
+            self.jobs_base.trim_end_matches('/'),
+            target_id,
+            step_id,
+        );
+        let body = json!({
+            "status": "completed",
+            "metadata": serde_json::Value::Object(merged),
+        });
+        let resp = self
+            .client
+            .put(&step_url)
+            .header("content-type", "application/json")
+            .header("x-boss-user", dispatcher_actor_header(&ctx.rule_name))
+            .header("x-sim-origin", sim_origin_value())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| HandlerError::Downstream(format!("PUT {step_url}: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(HandlerError::Downstream(format!(
+                "PUT {step_url} returned {status}: {text}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Json, Router, extract::Path, routing::get};
+    use std::sync::Mutex;
+
+    fn ctx(payload: serde_json::Value) -> InvocationContext {
+        InvocationContext {
+            rule_name: "complete-feedback-branch-on-car-merged".into(),
+            triggering_event_id: "evt-close-1".into(),
+            triggering_topic: "jobs.job.closed".into(),
+            event_payload: payload,
+        }
+    }
+
+    fn args() -> Vec<(String, Value)> {
+        vec![
+            ("link".to_string(), Value::String("backlog_item".into())),
+            (
+                "steps".to_string(),
+                Value::String("investigate,design-review,build".into()),
+            ),
+        ]
+    }
+
+    const CAR: &str = "11111111-1111-1111-1111-111111111111";
+    const PACKET: &str = "22222222-2222-2222-2222-222222222222";
+    const TRAIN: &str = "33333333-3333-3333-3333-333333333333";
+    const BRANCH_STEP: &str = "44444444-4444-4444-4444-444444444444";
+
+    fn car(metadata: serde_json::Value) -> serde_json::Value {
+        json!({
+            "id": CAR,
+            "kind": "ship-a-change",
+            "title": "Close the feedback loop",
+            "status": "closed",
+            "subject": { "subject_kind": "custom", "id": "feat/feedback-obligation" },
+            "metadata": metadata,
+            "steps": [],
+        })
+    }
+
+    /// A live feedback packet whose triage routed to `build`, so the
+    /// `build` branch is ready and the others stayed pending.
+    fn packet(build_status: &str) -> serde_json::Value {
+        json!({
+            "id": PACKET,
+            "kind": "user-feedback",
+            "title": "Feedback on /system/flow",
+            "status": if build_status == "completed" { "closed" } else { "open" },
+            "metadata": { "submitted_by": "emp-bootstrap-admin" },
+            "steps": [
+                { "id": "s-triage", "spec_slug": "triage", "status": "completed",
+                  "metadata": { "disposition": "build" } },
+                { "id": "s-investigate", "spec_slug": "investigate", "status": "pending",
+                  "metadata": {} },
+                { "id": BRANCH_STEP, "spec_slug": "build", "status": build_status,
+                  "metadata": { "authority_role": "platform-admin" } },
+            ],
+        })
+    }
+
+    fn train() -> serde_json::Value {
+        json!({
+            "id": TRAIN,
+            "kind": "pr-train",
+            "title": "train/2026-08-13-pm",
+            "status": "closed",
+            "steps": [
+                { "id": "t-deployed", "spec_slug": "deployed", "status": "completed",
+                  "metadata": { "deployed": "main@abc1234; playground" } },
+            ],
+        })
+    }
+
+    type Puts = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+
+    /// Stand-in for jobs-api: serves the three Jobs by id and records
+    /// every step PUT so a test can assert what an operator would see.
+    async fn mock_jobs(jobs: Vec<serde_json::Value>) -> (String, Puts) {
+        let puts: Puts = Arc::new(Mutex::new(Vec::new()));
+        let by_id: std::collections::HashMap<String, serde_json::Value> = jobs
+            .into_iter()
+            .map(|j| (j["id"].as_str().unwrap_or_default().to_string(), j))
+            .collect();
+
+        let get_puts = puts.clone();
+        let app = Router::new()
+            .route(
+                "/api/jobs/{id}",
+                get(move |Path(id): Path<String>| {
+                    let by_id = by_id.clone();
+                    async move {
+                        by_id
+                            .get(&id)
+                            .cloned()
+                            .map(Json)
+                            .ok_or(axum::http::StatusCode::NOT_FOUND)
+                    }
+                }),
+            )
+            .route(
+                "/api/jobs/{id}/steps/{step_id}",
+                axum::routing::put(
+                    move |Path((_id, step_id)): Path<(String, String)>,
+                          Json(body): Json<serde_json::Value>| {
+                        let puts = get_puts.clone();
+                        async move {
+                            puts.lock().unwrap().push((step_id, body));
+                            Json(json!({ "ok": true }))
+                        }
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), puts)
+    }
+
+    fn close_marker() -> serde_json::Value {
+        json!({
+            "id": CAR,
+            "kind": "ship-a-change",
+            "outcome": "merged",
+            "closed_on": "2026-08-13",
+            "parent_step_id": null,
+        })
+    }
+
+    /// The obligation itself: a merged car completes the branch its
+    /// packet's triage opened, carrying evidence that names the car.
+    #[tokio::test]
+    async fn a_merged_car_completes_the_open_branch_with_its_evidence() {
+        let (base, puts) = mock_jobs(vec![
+            car(json!({ "backlog_item": PACKET, "train": TRAIN })),
+            packet("ready"),
+            train(),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
+
+        let calls = puts.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "exactly one step completed: {calls:?}");
+        let (step_id, body) = &calls[0];
+        assert_eq!(step_id, BRANCH_STEP, "the `build` branch is the open one");
+        assert_eq!(body["status"], "completed");
+
+        let evidence = &body["metadata"]["arrived_from"];
+        assert_eq!(evidence["car"], CAR, "evidence must name the car");
+        assert_eq!(
+            evidence["title"], "Close the feedback loop",
+            "evidence must carry a title a reader can act on"
+        );
+        assert_eq!(evidence["train"], TRAIN);
+        assert_eq!(
+            evidence["generation"], "abc1234",
+            "the generation the train carried is reachable: {evidence:#}"
+        );
+        // The step's own metadata survives the write — PATCH-on-PUT
+        // replaces `metadata` wholesale, and `authority_role` living
+        // there is what keeps the step gated.
+        assert_eq!(body["metadata"]["authority_role"], "platform-admin");
+    }
+
+    /// A car with no linked feedback is a no-op — the legacy /
+    /// free-text case (`backlog_text` prose, or nothing at all) ships
+    /// exactly as it did before.
+    #[tokio::test]
+    async fn a_merged_car_with_no_linked_packet_is_a_no_op() {
+        let (base, puts) = mock_jobs(vec![
+            car(json!({ "backlog_text": "David asked for this in chat" })),
+            packet("ready"),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "nothing to complete without a declared edge"
+        );
+    }
+
+    /// A packet that already reached a terminal is untouched. Its
+    /// filer got their answer from whatever closed it.
+    #[tokio::test]
+    async fn an_already_terminal_packet_is_untouched() {
+        let mut closed = packet("ready");
+        closed["status"] = json!("closed");
+        let (base, puts) = mock_jobs(vec![car(json!({ "backlog_item": PACKET })), closed]).await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
+        assert!(puts.lock().unwrap().is_empty(), "a closed packet is done");
+    }
+
+    /// Redelivery is at-least-once and the close marker has three emit
+    /// sites, so this WILL run twice. The second run finds the branch
+    /// already completed and writes nothing — no second `step.done`
+    /// marker, no second re-evaluation.
+    #[tokio::test]
+    async fn a_rerun_against_a_completed_branch_writes_nothing() {
+        let (base, puts) = mock_jobs(vec![
+            car(json!({ "backlog_item": PACKET })),
+            packet("completed"),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "a completed branch is never re-completed"
+        );
+    }
+
+    /// The evidence stamp is the second guard: a branch still showing
+    /// open but already carrying THIS car's stamp (a redelivery that
+    /// raced the projection) writes nothing either.
+    #[tokio::test]
+    async fn a_branch_already_stamped_by_this_car_writes_nothing() {
+        let mut stamped = packet("ready");
+        stamped["steps"][2]["metadata"]["arrived_from"] = json!({ "car": CAR });
+        let (base, puts) = mock_jobs(vec![car(json!({ "backlog_item": PACKET })), stamped]).await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
+        assert!(puts.lock().unwrap().is_empty(), "already stamped by us");
+    }
+
+    /// Only the branch triage OPENED gets completed. A `pending`
+    /// branch is one the disposition did not route to, and completing
+    /// it would fabricate work that was never assigned.
+    #[tokio::test]
+    async fn a_pending_branch_is_never_completed() {
+        let mut nothing_open = packet("pending");
+        nothing_open["status"] = json!("open");
+        let (base, puts) =
+            mock_jobs(vec![car(json!({ "backlog_item": PACKET })), nothing_open]).await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
+        assert!(
+            puts.lock().unwrap().is_empty(),
+            "no branch is open; nothing was routed here"
+        );
+    }
+
+    /// An unreachable train costs the generation, never the
+    /// obligation. The packet still gets its answer.
+    #[tokio::test]
+    async fn an_unreachable_train_still_completes_the_branch() {
+        // The train Job is simply absent from the mock's roster.
+        let (base, puts) = mock_jobs(vec![
+            car(json!({ "backlog_item": PACKET, "train": TRAIN })),
+            packet("ready"),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        h.invoke(&args(), &ctx(close_marker())).await.expect("runs");
+
+        let calls = puts.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "the branch still completes");
+        assert!(
+            calls[0].1["metadata"]["arrived_from"]["generation"].is_null(),
+            "an unreadable generation is null, never guessed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rule_missing_its_link_arg_is_a_permanent_error() {
+        let h = JobsCompleteLinkedStep::new("http://127.0.0.1:1");
+        let res = h
+            .invoke(
+                &[("steps".to_string(), Value::String("build".into()))],
+                &ctx(close_marker()),
+            )
+            .await;
+        assert!(matches!(res, Err(HandlerError::MissingArg(_))));
+    }
+
+    #[tokio::test]
+    async fn a_rule_with_an_empty_steps_arg_is_a_permanent_error() {
+        let h = JobsCompleteLinkedStep::new("http://127.0.0.1:1");
+        let res = h
+            .invoke(
+                &[
+                    ("link".to_string(), Value::String("backlog_item".into())),
+                    ("steps".to_string(), Value::String(" , ".into())),
+                ],
+                &ctx(close_marker()),
+            )
+            .await;
+        assert!(matches!(res, Err(HandlerError::MissingArg(_))));
+    }
+
+    #[tokio::test]
+    async fn a_close_marker_with_no_id_is_a_no_op() {
+        let h = JobsCompleteLinkedStep::new("http://127.0.0.1:1");
+        // Unreachable base URL: a no-op is the only outcome that
+        // cannot error here, which is what proves nothing was fetched.
+        let res = h
+            .invoke(&args(), &ctx(json!({ "closed_on": "2026-08-13" })))
+            .await;
+        assert!(
+            res.is_ok(),
+            "a malformed marker retries into nothing: {res:?}"
+        );
+    }
+
+    /// The `main@<sha>` shape is the conductor's; `boss-cli`'s arrival
+    /// report reads the same written format. Two readers of one fact
+    /// that cannot be collapsed today, so the parse is pinned
+    /// (CLAUDE.md §9a).
+    #[test]
+    fn the_generation_parse_matches_the_conductors_written_shape() {
+        assert_eq!(
+            deployed_generation("main@abc1234; playground"),
+            Some("abc1234")
+        );
+        assert_eq!(deployed_generation("main@abc1234"), Some("abc1234"));
+        assert_eq!(
+            deployed_generation("main@abc1234 playground"),
+            Some("abc1234")
+        );
+        assert_eq!(deployed_generation("deployed by hand"), None);
+        assert_eq!(deployed_generation("main@"), None);
+    }
+}

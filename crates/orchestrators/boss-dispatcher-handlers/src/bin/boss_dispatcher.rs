@@ -25,10 +25,11 @@ use boss_dispatcher_handlers::handlers::{
     inventory_overhead_absorb::InventoryOverheadAbsorb,
     inventory_parts_consume::InventoryPartsConsume, inventory_parts_produce::InventoryPartsProduce,
     inventory_po_place::InventoryPoPlace, inventory_receive::InventoryReceive,
-    jobs_clear_waiting::JobsClearWaiting, jobs_complete_step::JobsCompleteStep,
-    jobs_subjob_resolve::JobsSubjobResolve, ledger_bill_approve::LedgerBillApprove,
-    ledger_payroll_run_submit::LedgerPayrollRunSubmit, ledger_tax_accrue::LedgerTaxAccrue,
-    ledger_tax_remit::LedgerTaxRemit, messages_notify::MessagesNotify,
+    jobs_clear_waiting::JobsClearWaiting, jobs_complete_linked_step::JobsCompleteLinkedStep,
+    jobs_complete_step::JobsCompleteStep, jobs_subjob_resolve::JobsSubjobResolve,
+    ledger_bill_approve::LedgerBillApprove, ledger_payroll_run_submit::LedgerPayrollRunSubmit,
+    ledger_tax_accrue::LedgerTaxAccrue, ledger_tax_remit::LedgerTaxRemit,
+    messages_notify::MessagesNotify, messages_notify_job_terminal::MessagesNotifyJobTerminal,
     packaging_allocate::PackagingAllocate, people_hire::PeopleHire,
     people_terminate::PeopleTerminate, products_consume::ProductsConsume,
     products_consume_from_invoice::ProductsConsumeFromInvoice, products_produce::ProductsProduce,
@@ -134,6 +135,11 @@ async fn main() -> Result<()> {
             // A closed Job wakes its waiters: clears metadata.waiting_on
             // (the '*' job edge) so blocked steps re-evaluate (e9291570).
             handlers.register(JobsClearWaiting::new(cfg.jobs_api_url.clone()));
+            // A closing Job completes the open step it was authorized
+            // by, on the Job its declared edge names — the merged car
+            // → feedback-packet obligation (2c4ae549). Generic: which
+            // edge and which steps ride the rule row.
+            handlers.register(JobsCompleteLinkedStep::new(cfg.jobs_api_url.clone()));
             // System-completes zero-duration, no-role markers
             // (trigger / outcome / milestone) the moment they go
             // Ready, so a Job flows past its structural checkpoints
@@ -236,6 +242,15 @@ async fn main() -> Result<()> {
             handlers.register(DocsFlushQueue::new(cfg.docs_api_url.clone()));
             handlers.register(MessagesNotify::new(
                 cfg.people_api_url.clone(),
+                cfg.messages_api_url.clone(),
+            ));
+            // The filer hears how their packet ended, on ANY terminal
+            // (David, 2026-08-11: the system may close feedback
+            // without the filer approving, but must always tell them
+            // the terminal state). Same messages surface, so the
+            // deterministic id dedupes on redelivery.
+            handlers.register(MessagesNotifyJobTerminal::new(
+                cfg.jobs_api_url.clone(),
                 cfg.messages_api_url.clone(),
             ));
             let helpers = Arc::new(InventoryHelpers::new(

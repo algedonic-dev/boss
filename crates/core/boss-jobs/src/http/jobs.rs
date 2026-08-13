@@ -399,9 +399,40 @@ fn default_materialize_steps() -> bool {
 fn persist_error_response(e: impl std::fmt::Display) -> Response {
     let msg = e.to_string();
     if msg.contains("job edge") && msg.contains("unresolvable") {
-        (StatusCode::BAD_REQUEST, msg).into_response()
+        (StatusCode::BAD_REQUEST, edge_guidance(msg)).into_response()
     } else {
         (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+    }
+}
+
+/// A rejected edge tells the author WHAT was refused; this adds what
+/// to do instead.
+///
+/// `backlog_item` is the declared, ref-checked link from a change to
+/// the feedback packet it answers, and the dispatcher's
+/// `complete-feedback-branch-on-car-merged` rule follows it to close
+/// that packet when the change merges. So it is worth preferring, and
+/// worth refusing when it does not resolve — a link to nothing closes
+/// nothing.
+///
+/// But not every motivating item IS a Job on this instance. Some
+/// predate the packet model, some arrived as a sentence in chat. The
+/// free-text field `backlog_text` carries those: it is not a declared
+/// edge, so nothing ref-checks it and nothing follows it. Without
+/// this sentence an author who hit the guard had two moves and no way
+/// to tell which was intended — the observed response was to drop the
+/// reference entirely, which is how sixteen packets ended up
+/// unlinked.
+fn edge_guidance(msg: String) -> String {
+    if msg.contains("backlog_item") {
+        format!(
+            "{msg} — `backlog_item` is a declared job edge and must name a Job on this \
+             instance (it is what closes that packet when this change merges). For a \
+             legacy or free-text referent, put it in `backlog_text` instead, which is \
+             prose and is not ref-checked."
+        )
+    } else {
+        msg
     }
 }
 
@@ -912,11 +943,24 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
             }),
         ));
         if job.status == JobStatus::Closed {
+            // Same four keys as the two step-driven close paths
+            // (`close_job_on_terminal` and the all-steps-terminal
+            // catch-all, both in http/steps.rs). The close marker is
+            // ONE contract with three emit sites, and a rule's `when`
+            // binds identifiers off whichever one fired: an absent key
+            // is a PredicateFailed → Retry → dead-letter, not a quiet
+            // false. This site used to carry only `id` / `closed_on`,
+            // so a Job closed by a direct status PUT dead-lettered the
+            // `parent_step_id != null` subjob rule instead of skipping
+            // it.
             job_events.push(stamp.event(
                 events::JOB_CLOSED,
                 serde_json::json!({
                     "id": job.id.to_string(),
                     "closed_on": job.closed_on,
+                    "kind": job.kind,
+                    "outcome": job.metadata.get("outcome"),
+                    "parent_step_id": job.metadata.get("parent_step_id"),
                 }),
             ));
         }
@@ -938,4 +982,43 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
     }
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::edge_guidance;
+
+    /// The guard's own text is the valuable part and must survive
+    /// verbatim — an author reads WHICH edge and WHICH id was refused
+    /// off this string.
+    #[test]
+    fn edge_guidance_keeps_the_guards_message_first() {
+        let raw = "job edge ship-a-change.backlog_item references unresolvable Job 2c4ae549";
+        let out = edge_guidance(raw.to_string());
+        assert!(
+            out.starts_with(raw),
+            "the guard's own text must lead: {out}"
+        );
+    }
+
+    /// …and a refused `backlog_item` names the free-text escape
+    /// hatch. Without it the observed move was to drop the reference
+    /// entirely, which is how packets ended up unlinked.
+    #[test]
+    fn a_refused_backlog_item_names_backlog_text_as_the_alternative() {
+        let out = edge_guidance(
+            "job edge ship-a-change.backlog_item references unresolvable Job 2c4ae549".to_string(),
+        );
+        assert!(
+            out.contains("backlog_text"),
+            "an author who hit the guard needs the alternative named: {out}"
+        );
+    }
+
+    /// Other edges get no feedback-specific advice bolted on.
+    #[test]
+    fn an_unrelated_edge_failure_is_passed_through_untouched() {
+        let raw = "job edge pr-train.boarded_jobs references unresolvable Job abc";
+        assert_eq!(edge_guidance(raw.to_string()), raw);
+    }
 }

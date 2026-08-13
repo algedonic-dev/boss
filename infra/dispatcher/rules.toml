@@ -453,3 +453,53 @@ name = "jobs-clear-waiting-on"
 on_event = "jobs.job.closed"
 [[rule.do]]
 handler = "jobs.clear_waiting"
+
+# A shipped change answers the packet that authorized it (job
+# 2c4ae549). `ship-a-change` has declared a `backlog_item` job edge at
+# its Job metadata since migration 104 — dialed to `abort` by 105, so
+# an unresolvable referent is refused at the write — and until now
+# nothing READ it. Measured 2026-08-11: sixteen feedback packets sat at
+# `submitted` while the work they authorized was shipped, tested and
+# live; the loop closed only because an agent remembered.
+#
+# David ratified the rule: "Once the user feedback results in either a
+# shipped change or some other terminal state, it can be closed without
+# the filer approving." So the merge completes the branch step triage
+# opened, and the `user-feedback` Workflow's own `ready_when` fires its
+# `closed` terminal — nothing here knows the packet closes.
+#
+# `steps` lists the branches a SHIPPED change satisfies. `needs-info`
+# is deliberately absent: a change landing does not answer a question
+# asked of the reporter. The list is pinned against the live Workflow
+# by boss-dispatcher's tests/feedback_obligation_rules.rs, so renaming
+# a branch fails CI instead of silently completing nothing.
+#
+# `when` binds `kind` / `outcome` off the close marker — both present
+# on every emit site, null when unanswered (the same always-present
+# contract `notify_on_done` has on step.done: an ABSENT identifier is a
+# PredicateFailed → Retry → dead-letter, not a quiet false). Seeded
+# live by 117-feedback-obligation.sql.
+[[rule]]
+name = "complete-feedback-branch-on-car-merged"
+on_event = "jobs.job.closed"
+when = "kind = \"ship-a-change\" AND outcome = \"merged\""
+[[rule.do]]
+handler = "jobs.complete_linked_step"
+args = { link = "\"backlog_item\"", steps = "\"investigate,design-review,build\"" }
+
+# …and the filer always hears how it ended (same ratification: "But, we
+# should always notify the filer with the terminal state"). ANY
+# terminal, not only the shipped one — `duplicate` and `declined` are
+# answers a filer is owed for the same reason. The message names the
+# packet, the terminal, and what satisfied it, and goes through
+# boss-messages with a deterministic id so a redelivered close
+# collapses on that surface's existing ON CONFLICT (id) insert rather
+# than stacking an inbox row. Seeded live by
+# 117-feedback-obligation.sql.
+[[rule]]
+name = "notify-filer-on-feedback-terminal"
+on_event = "jobs.job.closed"
+when = "kind = \"user-feedback\""
+[[rule.do]]
+handler = "messages.notify_job_terminal"
+args = { recipient_key = "\"submitted_by\"" }
