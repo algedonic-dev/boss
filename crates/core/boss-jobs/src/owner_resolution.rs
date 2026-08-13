@@ -38,13 +38,17 @@ pub trait RosterLookup: Send + Sync {
     async fn is_active_employee(&self, id: &str) -> Result<bool, String>;
 }
 
-/// True when the id names an automation-shaped actor rather than a
+/// True when the id names a machine-shaped actor rather than a
 /// person: the `ActorId` union's non-human arms plus the historical
 /// pseudo-owners the audit catalogued.
+///
+/// Every colon-bearing id is a machine: a named automation
+/// (`automation:<slug>`, `rule:<name>`) or an agent session
+/// (`<mode>:<model>`, e.g. `claude:opus-5`). No employee id carries a
+/// colon — that is the same invariant `ActorId::from_str` parses on.
 pub fn is_automation_shaped(owner: &str) -> bool {
     owner.is_empty()
-        || owner.starts_with("automation:")
-        || owner.starts_with("rule:")
+        || owner.contains(':')
         || owner.starts_with("system")
         || owner == "direct-shop"
         || owner == "bootstrap"
@@ -278,6 +282,24 @@ mod tests {
 
         let err = resolve_owner(&roster, "automation:seed", "j", Some("bookkeeper"), None).await;
         assert!(err.is_err(), "no holder for the role and no fallback");
+    }
+
+    /// Q7 says every Job names a responsible HUMAN owner. An agent is
+    /// a CPU, not a person, so an agent-shaped owner must resolve away
+    /// to a role holder exactly like an automation does — including
+    /// when the roster is unreachable, where a human-shaped id is kept
+    /// on faith and a machine-shaped one has no claim to keep.
+    #[tokio::test]
+    async fn an_agent_owner_is_machine_shaped_and_resolves_to_a_human() {
+        assert!(is_automation_shaped("claude:opus-5"));
+        assert!(is_automation_shaped("claude:fable"));
+        assert!(!is_automation_shaped("emp-brew-1"));
+
+        let roster = InMemoryRoster::new().with_holder("brewer", "emp-brew-1");
+        let owner = resolve_owner(&roster, "claude:fable", "j", Some("brewer"), None)
+            .await
+            .unwrap();
+        assert_eq!(owner, "emp-brew-1");
     }
 
     #[tokio::test]

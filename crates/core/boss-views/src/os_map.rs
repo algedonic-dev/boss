@@ -47,6 +47,11 @@ pub enum NodeKind {
     /// one per rule; `/it/dispatcher` is the drill-down for what is
     /// inside it.
     Dispatcher,
+    /// Agent sessions — the LLM CPUs (`ActorId::Agent`, wire form
+    /// `<mode>:<model>`). One node, like the dispatcher: the map is
+    /// about traffic between executor classes, and `claude:opus-5` vs
+    /// `claude:fable` is a drill-down, not a node.
+    Agent,
     /// An actor we could not resolve to either. Rendered rather than
     /// dropped, because a silently missing executor is how a map
     /// starts lying.
@@ -136,11 +141,13 @@ pub fn nodes_from_edges(
         .collect()
 }
 
-/// Label + kind for a node id. `dispatcher` is the one reserved id;
-/// everything else is a department code the tenant owns.
+/// Label + kind for a node id. `dispatcher`, `agent` and `unresolved`
+/// are the reserved ids; everything else is a department code the
+/// tenant owns.
 pub fn classify(id: &str) -> (String, NodeKind) {
     match id {
         "dispatcher" => ("Dispatcher".to_string(), NodeKind::Dispatcher),
+        "agent" => ("Agent".to_string(), NodeKind::Agent),
         "unresolved" => ("Unresolved".to_string(), NodeKind::Unresolved),
         other => {
             let mut label = String::with_capacity(other.len());
@@ -234,6 +241,21 @@ mod tests {
         assert_eq!(label("it"), "IT");
         // Reserved ids have no Class row and still resolve.
         assert_eq!(label("dispatcher"), "Dispatcher");
+    }
+
+    /// Agents are the third class of CPU (see `boss_core::actor`), and
+    /// the map claims to render "who the processors are". Folding them
+    /// into `dispatcher` would make the `/it/dispatcher` drill-down
+    /// lie; leaving them in `unresolved` is the silently-missing
+    /// executor this module's docs call out.
+    #[test]
+    fn agents_are_their_own_kind_not_the_dispatcher_and_not_unresolved() {
+        let nodes = nodes_from_edges(&[edge("agent", "qa", 7, 0)], classify);
+        let a = nodes.iter().find(|n| n.id == "agent").unwrap();
+        assert_eq!(a.kind, NodeKind::Agent);
+        assert_eq!(a.label, "Agent");
+        assert_ne!(a.kind, NodeKind::Dispatcher);
+        assert_ne!(a.kind, NodeKind::Unresolved);
     }
 
     #[test]

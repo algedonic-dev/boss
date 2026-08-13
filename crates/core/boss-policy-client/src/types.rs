@@ -324,6 +324,13 @@ impl User {
     /// emit then falls back to the emitting service's own automation
     /// identity. There is no `"system"` actor — every automated id maps
     /// to a named `Automation`.
+    ///
+    /// The legacy automation spellings below are checked BEFORE
+    /// delegating to `ActorId::from_str`, because they are
+    /// colon-bearing ids that predate the agent wire form:
+    /// `rule:bill-approve` is a firing dispatch rule, not a `rule`-mode
+    /// agent. Everything left over goes through the type's own parse,
+    /// which sorts `<mode>:<model>` agents from bare employee ids.
     pub fn ambient_actor(&self) -> Option<boss_core::actor::ActorId> {
         use boss_core::actor::ActorId;
         let id = self.id.as_str();
@@ -349,7 +356,8 @@ impl User {
             let slug = if slug == "system" { "platform" } else { slug };
             return Some(ActorId::Automation(slug.to_string()));
         }
-        Some(ActorId::Human(id.to_string()))
+        // `<mode>:<model>` → Agent; anything else → Human. Infallible.
+        id.parse().ok()
     }
 }
 
@@ -519,5 +527,63 @@ mod owner_allow_list_tests {
             .owner_allow_list(&u),
             Some(vec![])
         );
+    }
+}
+
+#[cfg(test)]
+mod ambient_actor_tests {
+    use super::*;
+    use boss_core::actor::ActorId;
+
+    fn user(id: &str) -> User {
+        User {
+            id: id.to_string(),
+            role: "r".to_string(),
+            access_tier: AccessTier::User,
+            territory_account_ids: vec![],
+            direct_report_ids: vec![],
+            department: None,
+        }
+    }
+
+    /// An agent session authenticates as `<mode>:<model>`. It must
+    /// land on the Agent arm — not Human, which is what made 104 step
+    /// assignments read as an unknown employee.
+    #[test]
+    fn an_agent_session_is_an_agent_not_a_human() {
+        for id in ["claude:fable", "claude:opus-5"] {
+            let a = user(id).ambient_actor().unwrap();
+            assert_eq!(a.to_string(), id);
+            assert!(a.is_agent(), "{id} should be an agent");
+            assert!(!a.is_human(), "{id} must not count as staff");
+        }
+    }
+
+    /// The pre-existing automation shapes keep winning over the agent
+    /// colon-split — `rule:<name>` is a firing rule, not a `rule`-mode
+    /// agent, and this ordering is the reason it stays that way.
+    #[test]
+    fn automation_shapes_still_beat_the_agent_split() {
+        let cases = [
+            ("automation:dispatcher", "automation:dispatcher"),
+            ("rule:bill-approve", "automation:rule:bill-approve"),
+            ("system:dispatcher", "automation:dispatcher"),
+            ("system", "automation:platform"),
+            ("brewery-sim", "automation:brewery-sim"),
+        ];
+        for (id, want) in cases {
+            let a = user(id).ambient_actor().unwrap();
+            assert_eq!(a.to_string(), want, "for x-boss-user id {id}");
+            assert!(!a.is_agent(), "{id} is an automation, not an agent");
+        }
+    }
+
+    #[test]
+    fn a_plain_employee_id_is_still_human_and_anonymous_is_still_none() {
+        assert_eq!(
+            user("emp-032").ambient_actor(),
+            Some(ActorId::human("emp-032"))
+        );
+        assert_eq!(user("anonymous").ambient_actor(), None);
     }
 }

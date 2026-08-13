@@ -15,7 +15,17 @@ export type StepLite = Readonly<{
   status: string;
   metadata?: Record<string, unknown> | null;
   completed_on?: string | null;
+  /** RFC3339 instant, when the conductor stamped one. The steps table
+   *  carries only the day-granular `completed_on` column, so today the
+   *  instant arrives in the step's metadata; read both so the lens
+   *  needs no change when it becomes a column. */
+  completed_at?: string | null;
 }>;
+
+/** Anything carrying a step list — a yard JobLite or a jobs/types Job.
+ *  The step readers below take this so the job-detail page can reuse
+ *  them without importing the yard's own Job shape. */
+export type WithSteps = Readonly<{ steps?: readonly StepLite[] | null }>;
 
 export type JobLite = Readonly<{
   id: string;
@@ -76,6 +86,12 @@ export type TrainRow = Readonly<{
   deployed?: string | null;
   cars: readonly CarRow[];
   live: boolean;
+  /** Why the train closed — `unknown` for one still in flight. */
+  outcome: TrainOutcome;
+  /** The best evidence of when it arrived, and what that evidence was. */
+  arrivedAt: ArrivalStamp;
+  /** An estimate, or the phase alone when there is nothing honest to say. */
+  eta: Eta;
 }>;
 
 // The `GET /api/stations/{name}/queue` envelope (stations.md; the
@@ -129,9 +145,12 @@ export type YardState = Readonly<{
   dock: readonly CarRow[];
   dockStation: DockStation;
   arrivals: readonly TrainRow[];
+  /** Closed without arriving. Kept visible — a train that cancelled is
+   *  a fact about the day, it just isn't an arrival. */
+  cancelled: readonly TrainRow[];
 }>;
 
-function step(j: JobLite, slug: string, titleFallback: string): StepLite | null {
+function step(j: WithSteps, slug: string, titleFallback: string): StepLite | null {
   return (
     j.steps?.find(
       s => (s.spec_slug ?? '') === slug || s.title === titleFallback,
@@ -141,6 +160,281 @@ function step(j: JobLite, slug: string, titleFallback: string): StepLite | null 
 
 const done = (s: StepLite | null) =>
   !!s && (s.status === 'completed' || s.status === 'skipped');
+
+// A terminal reads STRICTLY completed. `done` counts `skipped` — right
+// for progress (a skipped step is settled) and wrong here: the
+// terminal close marks every step it did NOT fire as skipped, so a
+// cancelled train carries a skipped `arrived` step. Reading that as
+// done is how an empty train reached the top of the arrivals board.
+const completed = (s: StepLite | null) => !!s && s.status === 'completed';
+
+// ---------------------------------------------------------------------------
+// Arrivals — which trains arrived, and when.
+//
+// `close_job_on_terminal` (boss-jobs/src/http/steps.rs) stamps
+// `job.metadata.outcome` from the Workflow's terminal step, so the
+// pr-train spec's two terminals surface as `arrived` / `cancelled`.
+// Trains that closed before the terminals existed carry neither; the
+// completed `deployed` step is the same evidence the `arrived`
+// terminal is gated on (`steps.deployed.done AND steps.ci.done`), so
+// it stands in.
+// ---------------------------------------------------------------------------
+
+export type TrainOutcome = 'arrived' | 'cancelled' | 'unknown';
+
+export function trainOutcome(j: JobLite): TrainOutcome {
+  const stamped = (j.metadata as { outcome?: unknown } | null)?.outcome;
+  if (stamped === 'arrived') return 'arrived';
+  if (stamped === 'cancelled') return 'cancelled';
+  if (completed(step(j, 'arrived', 'Train arrived'))) return 'arrived';
+  if (completed(step(j, 'cancelled', 'Cancelled — nothing to board'))) return 'cancelled';
+  if (completed(step(j, 'deployed', 'Deployed to the playground'))) return 'arrived';
+  return 'unknown';
+}
+
+/** The conductor's RFC3339 stamp on a step, column or metadata. */
+function stampAt(s: StepLite | null): string | null {
+  if (!s) return null;
+  if (typeof s.completed_at === 'string' && s.completed_at !== '') return s.completed_at;
+  const md = (s.metadata as { completed_at?: unknown } | null)?.completed_at;
+  return typeof md === 'string' && md !== '' ? md : null;
+}
+
+export type ArrivalBasis = 'completed_at' | 'completed_on' | 'opened_on';
+export type ArrivalStamp = Readonly<{ ms: number; at: string; basis: ArrivalBasis }>;
+
+// Order the board by the best available arrival instant. `opened_on`
+// is day-granular, so ordering by it ties every train opened on the
+// same day — which is how a ported train from March outranked this
+// morning's arrival on an arbitrary tie-break.
+export function arrivalStamp(j: JobLite): ArrivalStamp {
+  const arrived = step(j, 'arrived', 'Train arrived');
+  const deployed = step(j, 'deployed', 'Deployed to the playground');
+  const candidates: ReadonlyArray<readonly [string | null | undefined, ArrivalBasis]> = [
+    [stampAt(arrived), 'completed_at'],
+    [stampAt(deployed), 'completed_at'],
+    [arrived?.completed_on, 'completed_on'],
+    [deployed?.completed_on, 'completed_on'],
+    [j.opened_on, 'opened_on'],
+  ];
+  for (const [at, basis] of candidates) {
+    if (typeof at !== 'string' || at === '') continue;
+    const ms = Date.parse(at);
+    if (Number.isNaN(ms)) continue;
+    return { ms, at, basis };
+  }
+  return { ms: 0, at: '', basis: 'opened_on' };
+}
+
+// ---------------------------------------------------------------------------
+// The landing report the conductor writes into the arrived step's
+// metadata. Every field may be null and nothing here fills one in: a
+// report with no `merged_sha` renders without a merged_sha.
+// ---------------------------------------------------------------------------
+
+export type ArrivalCar = Readonly<{
+  car_id_short: string | null;
+  title: string | null;
+  branch: string | null;
+}>;
+export type ArrivalSkip = Readonly<{ car_id_short: string | null; reason: string | null }>;
+export type ArrivalTimings = Readonly<{
+  boarded_at: string | null;
+  merged_at: string | null;
+  deployed_at: string | null;
+  arrived_at: string | null;
+  board_to_merge_s: number | null;
+  merge_to_deploy_s: number | null;
+  total_s: number | null;
+}>;
+export type ArrivalReport = Readonly<{
+  consist: readonly ArrivalCar[];
+  left_behind: readonly ArrivalSkip[];
+  generation: string | null;
+  merged_sha: string | null;
+  timings: ArrivalTimings | null;
+}>;
+
+const asObject = (v: unknown): Record<string, unknown> | null =>
+  typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+const asText = (v: unknown): string | null =>
+  typeof v === 'string' && v !== ''
+    ? v
+    : typeof v === 'number' && Number.isFinite(v)
+      ? String(v)
+      : null;
+const asNumber = (v: unknown): number | null =>
+  typeof v === 'number' && Number.isFinite(v) ? v : null;
+
+function timings(v: unknown): ArrivalTimings | null {
+  const t = asObject(v);
+  if (!t) return null;
+  return {
+    boarded_at: asText(t.boarded_at),
+    merged_at: asText(t.merged_at),
+    deployed_at: asText(t.deployed_at),
+    arrived_at: asText(t.arrived_at),
+    board_to_merge_s: asNumber(t.board_to_merge_s),
+    merge_to_deploy_s: asNumber(t.merge_to_deploy_s),
+    total_s: asNumber(t.total_s),
+  };
+}
+
+/** The train's landing report, or null for a train that has none —
+ *  every train that arrived before the conductor started writing one. */
+export function arrivalReport(j: WithSteps): ArrivalReport | null {
+  const steps = j.steps ?? [];
+  const arrived = step(j, 'arrived', 'Train arrived');
+  const raw = [arrived, ...steps]
+    .map(s => asObject((s?.metadata as { arrival_report?: unknown } | null)?.arrival_report))
+    .find(o => o !== null);
+  if (!raw) return null;
+  return {
+    consist: (Array.isArray(raw.consist) ? raw.consist : []).map(c => {
+      const o = asObject(c) ?? {};
+      return {
+        car_id_short: asText(o.car_id_short),
+        title: asText(o.title),
+        branch: asText(o.branch),
+      };
+    }),
+    left_behind: (Array.isArray(raw.left_behind) ? raw.left_behind : []).map(c => {
+      const o = asObject(c) ?? {};
+      return { car_id_short: asText(o.car_id_short), reason: asText(o.reason) };
+    }),
+    generation: asText(raw.generation),
+    merged_sha: asText(raw.merged_sha),
+    timings: timings(raw.timings),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// ETAs. The batching the train does is exactly the coordination cost an
+// ETA answers — but an estimate that looks like a promise is worse than
+// none. So: the numbers come from what recent trains ACTUALLY did
+// (median board→merge, median merge→deploy), a train with no started-at
+// evidence gets its phase and no time, and the chip always wears `~`.
+// ---------------------------------------------------------------------------
+
+export type ArrivalMedians = Readonly<{
+  boardToMergeS: number | null;
+  mergeToDeployS: number | null;
+  /** How many arrivals contributed a usable leg — the estimate's basis. */
+  samples: number;
+}>;
+
+export const NO_MEDIANS: ArrivalMedians = {
+  boardToMergeS: null,
+  mergeToDeployS: null,
+  samples: 0,
+};
+
+/** How many recent arrivals the medians are taken over. */
+export const ARRIVAL_SAMPLE_WINDOW = 5;
+
+function legSeconds(from: string | null, to: string | null): number | null {
+  if (from === null || to === null) return null;
+  const a = Date.parse(from);
+  const b = Date.parse(to);
+  if (Number.isNaN(a) || Number.isNaN(b) || b < a) return null;
+  return (b - a) / 1000;
+}
+
+function median(xs: readonly number[]): number | null {
+  // One sample is an anecdote, not a median.
+  if (xs.length < 2) return null;
+  const sorted = [...xs].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
+}
+
+/** Medians over the most recent arrivals (newest first, as the board
+ *  orders them). The conductor's own measured timings win when it
+ *  reported them; otherwise the legs are re-derived from step stamps. */
+export function arrivalMedians(
+  arrived: readonly JobLite[],
+  window: number = ARRIVAL_SAMPLE_WINDOW,
+): ArrivalMedians {
+  const boardToMerge: number[] = [];
+  const mergeToDeploy: number[] = [];
+  let samples = 0;
+  for (const j of arrived.slice(0, window)) {
+    const t = arrivalReport(j)?.timings ?? null;
+    const bm =
+      t?.board_to_merge_s ??
+      legSeconds(
+        stampAt(step(j, 'pr', 'Open the batched PR')),
+        stampAt(step(j, 'merged', 'Merged into main')),
+      );
+    const md =
+      t?.merge_to_deploy_s ??
+      legSeconds(
+        stampAt(step(j, 'merged', 'Merged into main')),
+        stampAt(step(j, 'deployed', 'Deployed to the playground')),
+      );
+    if (bm !== null) boardToMerge.push(bm);
+    if (md !== null) mergeToDeploy.push(md);
+    if (bm !== null || md !== null) samples += 1;
+  }
+  return {
+    boardToMergeS: median(boardToMerge),
+    mergeToDeployS: median(mergeToDeploy),
+    samples,
+  };
+}
+
+export type EtaPhase = 'boarding' | 'ci' | 'merging' | 'deploying' | 'blocked' | 'arrived';
+
+export function etaPhase(status: TrainStatus, lamp: Lamp): EtaPhase {
+  switch (status) {
+    case 'ARRIVED':
+      return 'arrived';
+    case 'DEPARTED':
+      return 'deploying';
+    case 'BOARDED':
+      // Red CI is not a slow leg, it's a stopped one.
+      return lamp === 'failing' ? 'blocked' : lamp === 'green' ? 'merging' : 'ci';
+    case 'BOARDING':
+      return 'boarding';
+  }
+}
+
+export type Eta =
+  | Readonly<{ kind: 'phase'; phase: EtaPhase }>
+  | Readonly<{ kind: 'eta'; phase: EtaPhase; atMs: number; basis: string }>;
+
+export function trainEta(j: JobLite, medians: ArrivalMedians, nowMs: number): Eta {
+  const phase = etaPhase(trainStatus(j), ciLamp(j));
+  const phaseOnly: Eta = { kind: 'phase', phase };
+  const basis = `median of last ${medians.samples} arrivals`;
+  const { boardToMergeS, mergeToDeployS } = medians;
+
+  // Remaining seconds on the leg under way, plus whatever legs follow.
+  // `startedAt` is the evidence requirement: no stamp, no estimate —
+  // an invented CI duration is exactly the kind of number that reads
+  // as a promise.
+  const project = (startedAt: string | null, legS: number, restS: number): Eta => {
+    if (startedAt === null) return phaseOnly;
+    const from = Date.parse(startedAt);
+    if (Number.isNaN(from)) return phaseOnly;
+    const left = Math.max(legS - (nowMs - from) / 1000, 0) + restS;
+    return { kind: 'eta', phase, atMs: nowMs + Math.round(left * 1000), basis };
+  };
+
+  if (phase === 'ci' || phase === 'merging') {
+    if (boardToMergeS === null || mergeToDeployS === null) return phaseOnly;
+    return project(
+      stampAt(step(j, 'pr', 'Open the batched PR')),
+      boardToMergeS,
+      mergeToDeployS,
+    );
+  }
+  if (phase === 'deploying') {
+    if (mergeToDeployS === null) return phaseOnly;
+    return project(stampAt(step(j, 'merged', 'Merged into main')), mergeToDeployS, 0);
+  }
+  return phaseOnly;
+}
 
 export function trainStatus(j: JobLite): TrainStatus {
   if (done(step(j, 'deployed', 'Deployed to the playground')) || j.status === 'closed')
@@ -162,6 +456,8 @@ export function toTrainRow(
   j: JobLite,
   shipById: ReadonlyMap<string, JobLite>,
   live: boolean,
+  medians: ArrivalMedians = NO_MEDIANS,
+  nowMs: number = Date.now(),
 ): TrainRow {
   const md = (j.metadata ?? {}) as {
     boarded_jobs?: string[];
@@ -195,6 +491,9 @@ export function toTrainRow(
     deployed: ((deployed?.metadata ?? {}) as { deployed?: string }).deployed ?? null,
     cars,
     live,
+    outcome: trainOutcome(j),
+    arrivedAt: arrivalStamp(j),
+    eta: trainEta(j, medians, nowMs),
   };
 }
 
@@ -229,21 +528,31 @@ export function dockRows(ships: readonly JobLite[]): CarRow[] {
     .map(carRow);
 }
 
+/** How many arrivals the board shows, and how many cancellations. */
+const ARRIVALS_SHOWN = 5;
+const CANCELLED_SHOWN = 3;
+
 export function assembleYard(
   trains: readonly JobLite[],
   ships: readonly JobLite[],
   dockQueue: StationQueueEnvelope | null = null,
+  nowMs: number = Date.now(),
 ): YardState {
   const shipById = new Map(ships.map(j => [j.id, j]));
   const open = trains.filter(t => t.status === 'open');
+  // Arrivals are trains that ARRIVED, newest first by the best instant
+  // each one carries. Everything else that closed is kept aside rather
+  // than dropped — a cancelled train is a fact about the day.
   const closed = trains
     .filter(t => t.status === 'closed')
-    .sort((a, b) => b.opened_on.localeCompare(a.opened_on))
-    .slice(0, 5);
+    .map(t => ({ t, outcome: trainOutcome(t), stamp: arrivalStamp(t) }))
+    .sort((a, b) => b.stamp.ms - a.stamp.ms);
+  const arrived = closed.filter(c => c.outcome === 'arrived').map(c => c.t);
+  const medians = arrivalMedians(arrived);
   // The one signal-green element: the oldest still-moving train.
   const liveId = open.find(t => trainStatus(t) !== 'ARRIVED')?.id;
   return {
-    inFlight: open.map(t => toTrainRow(t, shipById, t.id === liveId)),
+    inFlight: open.map(t => toTrainRow(t, shipById, t.id === liveId, medians, nowMs)),
     // The envelope is authoritative when it served: membership came
     // from the registry predicate and order from the declared
     // discipline — a client re-sort would silently overrule the
@@ -258,7 +567,13 @@ export function assembleYard(
           total: dockQueue.total,
         }
       : { source: 'derived' },
-    arrivals: closed.map(t => toTrainRow(t, shipById, false)),
+    arrivals: arrived
+      .slice(0, ARRIVALS_SHOWN)
+      .map(t => toTrainRow(t, shipById, false, medians, nowMs)),
+    cancelled: closed
+      .filter(c => c.outcome !== 'arrived')
+      .slice(0, CANCELLED_SHOWN)
+      .map(c => toTrainRow(c.t, shipById, false, medians, nowMs)),
   };
 }
 
@@ -281,7 +596,11 @@ async function fetchDockQueue(): Promise<StationQueueEnvelope | null> {
 
 export async function fetchYard(): Promise<YardState | null> {
   const [tr, sr, dockQueue] = await Promise.all([
-    fetch('/api/jobs?kind=pr-train&limit=20'),
+    // 40, not 20: the window has to hold the open trains, the five
+    // arrivals the board shows, AND the arrivals the ETA medians are
+    // taken over — cancelled trains sit in the same list and would
+    // otherwise crowd the samples out.
+    fetch('/api/jobs?kind=pr-train&limit=40'),
     fetch('/api/jobs?kind=ship-a-change&limit=200'),
     fetchDockQueue(),
   ]);

@@ -21,13 +21,17 @@
 #   2. Writes /etc/systemd/system/boss-<name>-api[-scratch].service
 #   3. systemctl daemon-reload
 #   4. Stages binaries (+ carried web-dist / step-plugins) into a
-#      generation at /usr/local/boss/releases/<sha>/, then atomically
-#      flips the `current` symlink (previous generation stays on disk
-#      as the revert target — see infra/generation.sh for the layout)
-#   5. systemctl enable + restart each unit (units exec through the
+#      generation at /usr/local/boss/releases/<sha>/
+#   5. Converges the schema on the target database(s) —
+#      infra/postgres/migrate.sh, manifest order, idempotent. Runs
+#      before the flip, so a migration error aborts the deploy with
+#      nothing activated and nothing restarted.
+#   6. Atomically flips the `current` symlink (previous generation stays
+#      on disk as the revert target — see infra/generation.sh)
+#   7. systemctl enable + restart each unit (units exec through the
 #      `current` symlink), arms boss-deploy-confirm, prunes to the 3
 #      newest generations (logging what was pruned, with sizes)
-#   6. Probes /api/<name>/health and reports the status code
+#   8. Probes /api/<name>/health and reports the status code
 #
 # Idempotent — safe to re-run. Re-deploying the sha that is already
 # live re-activates the standing generation (stage is skipped when the
@@ -1418,6 +1422,57 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
         echo "  installed $stem unit + timer"
     done
     systemctl daemon-reload
+fi
+
+# ---------------------------------------------------------------------
+# Converge the schema — after staging, BEFORE anything is activated or
+# restarted.
+#
+# Code, config and schema all converge from the tree on every deploy.
+# The train's deploy verb (boss-cli, `train.rs`) already runs migrate.sh
+# before calling this script, so on that path this is a no-op that says
+# so; a deploy driven by hand (`sudo ./infra/deploy-services.sh prod`,
+# bootstrap-vm.sh step 8) had no schema step at all, and would happily
+# restart new code against an old database. The cluster had exactly that
+# gap on 2026-08-13 and shipped a 500 (`relation "stations" does not
+# exist`) off a deploy that reported success.
+#
+# Placed before the generation flip on purpose: a migration failure then
+# leaves the box completely untouched — old code still serving the
+# database it was built for — which is the correct state after a failed
+# deploy, the same property the fingerprint pre-flight above protects.
+#
+# migrate.sh is idempotent by ledger (only manifest entries missing from
+# schema_migrations apply, each atomically with its bookkeeping row) and
+# it prints what it applied plus an `applied N, already recorded M, of K
+# manifest entries` summary. Failures are NOT swallowed: a half-migrated
+# database that keeps serving is worse than a visible failure.
+# ---------------------------------------------------------------------
+converge_schema() {
+    local label="$1" db_url="$2"
+    echo "==> converge schema ($label)"
+    if ! "$REPO_ROOT/infra/postgres/migrate.sh" -- psql "$db_url"; then
+        {
+            echo
+            echo "!! DEPLOY ABORTED — schema converge failed on the $label database."
+            echo
+            echo "   Nothing was activated and nothing was restarted: the box is"
+            echo "   still serving the previous generation against the database it"
+            echo "   was built for. migrate.sh named the failing entry above (its"
+            echo "   transaction rolled back, nothing from it was kept)."
+            echo
+            echo "   A database that predates the migration runner is refused until"
+            echo "   adopted once, by hand:"
+            echo "     ./infra/postgres/migrate.sh --baseline -- psql \"$db_url\""
+        } >&2
+        exit 1
+    fi
+}
+if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
+    converge_schema prod "$PROD_DB_URL"
+fi
+if [[ "$TARGET" == "scratch" || "$TARGET" == "both" ]]; then
+    converge_schema scratch "$SCRATCH_DB_URL"
 fi
 
 # ---------------------------------------------------------------------

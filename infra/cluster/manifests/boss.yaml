@@ -183,8 +183,13 @@ spec:
           configMap:
             name: step-plugins
       initContainers:
-        # Applies schema, loads the brewery seed, seeds bootstrap-admin.
-        # Skips the expensive seed when the DB is already bootstrapped.
+        # Converges the schema (infra/postgres/migrate.sh, manifest order)
+        # on EVERY start — an existing database gets the migrations it is
+        # missing, which is what stops the tree and the cluster drifting
+        # apart. A migration error fails this container and the rollout.
+        # The once-per-database steps (bootstrap-admin credential, sim
+        # clock prime) and the expensive brewery seed still run only when
+        # the database is empty.
         - name: boss-init
           image: 10.20.0.15:3000/david/boss:b2814ef
           command: ["/usr/bin/tini", "--", "/usr/local/bin/boss-init"]

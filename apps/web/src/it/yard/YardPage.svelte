@@ -9,11 +9,15 @@
     disciplineLabel,
     fetchYard,
     wipAdvisory,
+    type Eta,
+    type EtaPhase,
     type YardState,
     type TrainRow,
   } from './yard';
   import PacketCard from '@boss/web-kit/ui/PacketCard.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
+  import { navigate } from '@boss/web-kit/nav';
 
   let yard = $state<YardState | null>(null);
   let loading = $state(true);
@@ -38,6 +42,51 @@
     if (t.status === 'DEPARTED' && t.mergeRef) return `merged ${t.mergeRef}`;
     return '';
   }
+
+  const clock = (ms: number) =>
+    new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+  // What the train is waiting on, when there is no honest time to give.
+  const PHASE_LABEL: Record<EtaPhase, string> = {
+    boarding: 'boarding',
+    ci: 'CI running',
+    merging: 'awaiting merge',
+    deploying: 'deploying',
+    blocked: 'CI red',
+    arrived: 'arrived',
+  };
+
+  // Always `~`: this is a median of what recent trains did, not a
+  // promise about this one.
+  const etaText = (e: Eta) =>
+    e.kind === 'eta' ? `ETA ~${clock(e.atMs)}` : PHASE_LABEL[e.phase];
+  const etaTitle = (e: Eta) =>
+    e.kind === 'eta'
+      ? `estimate — ${e.basis}`
+      : 'no estimate yet — not enough recent arrivals with usable timestamps';
+
+  // The arrival instant, shown at the granularity of its evidence: a
+  // train whose only stamp is a date gets a date, never an invented
+  // clock time.
+  function arrivalText(t: TrainRow): string {
+    const a = t.arrivedAt;
+    if (a.at === '') return '—';
+    if (a.basis !== 'completed_at') return a.at;
+    return new Date(a.ms).toLocaleString([], {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  }
+  const arrivalTitle = (t: TrainRow) =>
+    t.arrivedAt.at === '' ? 'no arrival stamp' : `${t.arrivedAt.at} · ${t.arrivedAt.basis}`;
+
+  // Same affordance PacketCard carries: double-click, or Enter on the
+  // row's link. The row leads to the train's Job — where the landing
+  // report is.
+  const trainHref = (t: TrainRow) => entityHref('job', t.id);
+  const openTrain = (t: TrainRow) => navigate(trainHref(t));
 </script>
 
 <div class="theme-exec yard-root">
@@ -65,6 +114,11 @@
               {t.lamp === 'green' ? 'CI ✓' : t.lamp === 'failing' ? 'CI ✗' : 'CI …'}
             </span>
             <span class="yard-chip">{t.status}</span>
+            {#if t.eta.phase !== 'arrived'}
+              <span class="yard-eta" class:est={t.eta.kind === 'eta'} title={etaTitle(t.eta)}>
+                {etaText(t.eta)}
+              </span>
+            {/if}
             <span class="yard-stamp">{stampOf(t)}</span>
           </div>
           <div class="yard-consist">
@@ -106,16 +160,53 @@
       </div>
     {/if}
 
+    <!-- Arrivals are trains that ARRIVED — a cancelled train never
+         did, and it keeps its own muted line below rather than
+         disappearing. Ordered by the best arrival instant each train
+         carries (the column's tooltip names the evidence), because
+         `opened_on` is day-granular and tied every train opened on the
+         same day. Each row opens the train's Job, where the landing
+         report is. -->
     <div class="yard-section">03 — RECENT ARRIVALS</div>
     <table class="yard-board">
       <thead><tr><th>Train</th><th>Consist</th><th>Arrival</th></tr></thead>
       <tbody>
         {#each yard.arrivals as t (t.id)}
-          <tr><td>{t.title}</td><td>{t.cars.length} cars</td>
-              <td class="yard-stamp">{t.deployed ?? (t.mergeRef ? `merged ${t.mergeRef}` : '—')}</td></tr>
+          <tr class="yard-arrival" ondblclick={() => openTrain(t)}>
+            <td>
+              <a
+                href={trainHref(t)}
+                title="{t.title} — open the train's landing report"
+                onclick={e => {
+                  e.preventDefault();
+                  openTrain(t);
+                }}>{t.title}</a>
+            </td>
+            <td>{t.cars.length} cars</td>
+            <td class="yard-stamp" title={arrivalTitle(t)}>{arrivalText(t)}</td>
+          </tr>
         {/each}
+        {#if yard.arrivals.length === 0}
+          <tr><td colspan="3" class="yard-empty">No train has arrived yet.</td></tr>
+        {/if}
       </tbody>
     </table>
+
+    {#if yard.cancelled.length > 0}
+      <div class="yard-cancelled">
+        {#each yard.cancelled as t (t.id)}
+          <div>
+            <a
+              href={trainHref(t)}
+              onclick={e => {
+                e.preventDefault();
+                openTrain(t);
+              }}>{t.title}</a>
+            — {t.outcome === 'cancelled' ? 'cancelled, nothing to board' : 'closed, never arrived'}
+          </div>
+        {/each}
+      </div>
+    {/if}
 
     <div class="yard-flow">PARKED → BOARDED → <em>DEPARTED</em> → ARRIVED</div>
   {/if}
@@ -171,7 +262,26 @@
   @keyframes yard-pulse { 50% { opacity: 0.35; } }
   @media (prefers-reduced-motion: reduce) { .yard-dot { animation: none; } }
   .yard-stamp { font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px;
-    color: var(--static, #7A838C); }
+    color: var(--static, #7A838C); font-variant-numeric: tabular-nums; }
+  /* The ETA chip. An estimate reads brighter than the phase-only
+     state, and never brighter than the live dot — it is a median of
+     what recent trains did, not a promise about this one. */
+  .yard-eta { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px;
+    letter-spacing: 0.1em; color: var(--static, #7A838C); padding: 2px 8px;
+    border: 1px solid var(--hairline, #2A3138); font-variant-numeric: tabular-nums;
+    white-space: nowrap; }
+  .yard-eta.est { color: var(--text, #C7CED6); }
+  /* The arrivals row is a link to the train's landing report. */
+  .yard-arrival { cursor: pointer; }
+  .yard-arrival:hover { background: var(--bg, var(--void, #0D1014)); }
+  .yard-board a { color: inherit; text-decoration: none; }
+  .yard-board a:hover, .yard-board a:focus-visible { color: var(--signal, #5FD4A8); }
+  /* Cancelled trains: kept in the world, kept out of the arrivals
+     board. One muted line each. */
+  .yard-cancelled { margin-top: 10px; font-size: 12.5px; color: var(--static, #7A838C);
+    display: flex; flex-direction: column; gap: 4px; }
+  .yard-cancelled a { color: inherit; text-decoration: none; }
+  .yard-cancelled a:hover, .yard-cancelled a:focus-visible { color: var(--signal, #5FD4A8); }
   .yard-empty { color: var(--static, #78716c); padding: 12px 0; font-size: 14px; }
   .yard-flow { font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px;
     letter-spacing: var(--ls-nav, 0.14em); color: var(--static, #7A838C);

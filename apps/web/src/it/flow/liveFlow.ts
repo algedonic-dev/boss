@@ -11,6 +11,8 @@
 // — never a crash (the route-smoke crawl runs this page against an
 // adversarial mock).
 
+import { isHumanActor } from '../../data/actor';
+
 export type FlowHit = Readonly<{
   jobKind: string;
   jobId: string;
@@ -18,11 +20,29 @@ export type FlowHit = Readonly<{
   slug: string;
   phase: 'ready' | 'done' | 'assigned';
   stepKind: string;
-  /** `rule:*` / `automation:*` actors are the machine at work. */
+  /** True when a non-human CPU did it — see {@link isMachineActor}. */
   actor: string;
   machine: boolean;
   at: number;
 }>;
+
+/**
+ * Is this actor the machine at work rather than a person?
+ *
+ * True for both non-human arms of `ActorId`: named automations
+ * (`automation:*`, and the legacy bare `rule:*` spelling) and agent
+ * sessions (`<mode>:<model>`, e.g. `claude:opus-5`). An agent is a CPU
+ * but not staff, so it animates as machine traffic — counting it as a
+ * person would overstate how much of the flow humans are driving.
+ *
+ * The human/machine rule itself lives once, in `isHumanActor`. An
+ * absent actor stays *unattributed* rather than becoming machine
+ * traffic: this feed animates whatever the stream hands it, and a
+ * malformed frame must not colour itself in.
+ */
+export function isMachineActor(actor: string): boolean {
+  return actor.length > 0 && !isHumanActor(actor);
+}
 
 type JobLite = Readonly<{
   kind: string;
@@ -85,7 +105,7 @@ export function connectLiveFlow(onHit: (hit: FlowHit) => void): () => void {
       phase: m[1] as FlowHit['phase'],
       stepKind: kind.slice(m[0].length),
       actor,
-      machine: actor.startsWith('rule:') || actor.startsWith('automation:'),
+      machine: isMachineActor(actor),
       at: Date.now(),
     });
   }

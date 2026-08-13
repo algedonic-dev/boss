@@ -603,6 +603,21 @@ mod inject_tests {
         assert_eq!(out["foo"], "bar");
     }
 
+    /// An agent's `_actor` survives the payload round trip as the
+    /// typed Agent, so a rebuilder replaying the log gets the same CPU
+    /// class back — and the model is recoverable from `_actor` alone,
+    /// with no `_model` key alongside it.
+    #[test]
+    fn agent_actor_roundtrips_through_an_event_payload() {
+        let p = serde_json::json!({"job_id": "job-1"});
+        let out = inject_actor(p, &ActorId::agent("claude", "opus-5"));
+        assert_eq!(out["_actor"], "claude:opus-5");
+        assert!(out.get("_model").is_none());
+        let back: ActorId = serde_json::from_value(out["_actor"].clone()).unwrap();
+        assert_eq!(back, ActorId::agent("claude", "opus-5"));
+        assert!(!back.is_human());
+    }
+
     #[test]
     fn preserves_explicit_actor_on_replay() {
         let p = serde_json::json!({"foo": "bar", "_actor": "emp-5"});

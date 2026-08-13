@@ -336,6 +336,22 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
             "/api/jobs/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::JOBS)),
         )
+        // Stations — the network's nodes (stations.md). Registry rows
+        // and their evaluated queues live on the jobs upstream beside
+        // workflows, so they proxy there. Auth-gated like `/api/jobs`:
+        // the handlers apply the same job-read policy scope inside, so
+        // a guest session reads the yard's dock through here. Without
+        // these two lines the endpoints exist on the service and 404 at
+        // the human door — which is how they shipped in train #10, with
+        // the yard silently falling back to its derived dock.
+        .route(
+            "/api/stations",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
+        .route(
+            "/api/stations/{*rest}",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
         // Scheduling routes live alongside jobs on the same upstream.
         // Auth-gated like the rest of /api/*.
         .route(
@@ -901,6 +917,10 @@ mod routing_tests {
             "/api/events/tail",
             "/api/design/docs",
             "/api/it/health",
+            // Shipped on the service in train #10 and unreachable at
+            // the door until train #12 — the reason this list exists.
+            "/api/stations",
+            "/api/stations/loading-dock/queue",
         ];
         for path in REAL {
             let (_, body) = get(app(), path).await;

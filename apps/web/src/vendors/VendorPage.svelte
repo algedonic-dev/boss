@@ -15,6 +15,7 @@
   import ProvenanceBadge from '@boss/web-kit/ui/ProvenanceBadge.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import { formatMoney } from '@boss/web-kit/ui/money';
+  import { formatActor } from '../data/actor';
   import {
     loadVendorAccountTeam,
     loadVendorContacts,
@@ -397,7 +398,7 @@
                   </span>
                   <span style="color:#78716c">{dateOf(i.occurred_at)}</span>
                   <span style="color:#44403c">
-                    by {empNames.get(i.actor_id) ?? i.actor_id}
+                    by {formatActor(i.actor_id, empNames)}
                   </span>
                   {#if contactName}<span style="color:#44403c">with {contactName}</span>{/if}
                 </div>

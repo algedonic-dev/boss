@@ -17,6 +17,9 @@
   import StepSurface from '../steps/StepSurface.svelte';
   import StepGraph from './StepGraph.svelte';
   import FileAttachments from '../content/FileAttachments.svelte';
+  // Renders only when a step carries an `arrival_report` — a train's
+  // landing report. Every other Job renders exactly as before.
+  import ArrivalReport from '../it/yard/ArrivalReport.svelte';
 
   let { jobId } = $props<{ jobId: string }>();
 
@@ -166,6 +169,7 @@
     />
 
     <div class="tab-grid">
+      <ArrivalReport job={j} />
       {#if jobLinks.length > 0}
         <Section title="Linked Jobs">
           {#each jobLinks as link (link.label)}

@@ -23,6 +23,27 @@ cluster config, and it converges the same way code does:
   `boss-tls`); the Secret objects themselves are created out-of-band
   and stay out-of-tree.
 
+**Code, config and schema all converge from the tree, every deploy**
+
+Config converges here, code converges in the image — and the database
+schema converges the same way. The `boss-init` initContainer runs
+`infra/postgres/migrate.sh` in manifest order on *every* pod start,
+against a fresh database and an existing one alike; the runner applies
+only manifest entries missing from `schema_migrations`, prints each file
+it applied plus an `applied N, already recorded M, of K manifest
+entries` summary, and fails the container — and so the rollout — if any
+migration errors. It used to skip a database that already had a schema,
+which is how four migrations (112, 113, 114, 116) accumulated unapplied
+on 2026-08-13 while the image and the manifests rolled forward: the
+station registry shipped, the deploy reported success, and
+`GET /api/stations` answered 500 `relation "stations" does not exist`.
+**Hand-applied schema is drift**, exactly like a hand-applied manifest —
+it stabilises the box for an hour and hides the fact that the tree and
+the cluster disagree. A schema change is a new file appended to
+`infra/postgres/schema/manifest.txt`, shipped through the train, never
+an edit to a file that has already been applied (the runner refuses
+those by name).
+
 **What's here**
 
 | file | what it is |

@@ -75,8 +75,15 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
     // Employee taking on the work; we honor that as the audit actor
     // so step.created rows attribute to a person, not a process.
     // Otherwise the actor is the session's own identity — a human
-    // operator, or the named automation (`automation:<authority>`);
-    // never anonymous.
+    // operator, a named automation (`automation:<authority>`), or an
+    // agent session (`<mode>:<model>`); never anonymous.
+    //
+    // Agents deliberately do NOT belong in `is_automation`. This flag
+    // means "the caller is a proxy standing in for a person, so honor
+    // the person it names" — the sim's whole purpose. An agent is not
+    // a proxy: it IS the CPU that did the work, and redirecting its
+    // attribution to `assignee_id` would erase exactly the agent
+    // attribution the `<mode>:<model>` actor id exists to record.
     let is_automation = user.id == "anonymous"
         || user.id.starts_with("automation:")
         || user.id.starts_with("rule:")
@@ -467,7 +474,10 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // field in the body that names the real Employee whose work the
     // step represents; we honor that override when the calling
     // identity is an automation slug so the audit_log row attributes
-    // work to a person, not a process. Computed BEFORE the
+    // work to a person, not a process. Agent sessions
+    // (`<mode>:<model>`) are excluded from that override on purpose —
+    // see the note on the same flag in `create_step`: an agent is the
+    // CPU, not a stand-in for one. Computed BEFORE the
     // workflow-publish dispatch below — the registry write records
     // its event under this same actor + now.
     let body_completed_by = body
