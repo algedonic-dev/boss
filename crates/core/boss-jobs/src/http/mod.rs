@@ -169,10 +169,10 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
             "/api/workflows",
             get(list_kinds::<R, B>).post(create_kind::<R, B>),
         )
-        // Author-time dry run: lint a draft spec without persisting, so
-        // the editor surfaces the same validate_all the publish path
-        // enforces (live, on the graph). See architecture-decisions.md
-        // §Jobs, Workflows, Steps.
+        // Author-time dry run: lint a draft spec without persisting,
+        // so the editor surfaces the same `workflow_lint::gate_active`
+        // the publish path enforces (live, on the graph). See
+        // architecture-decisions.md §Jobs, Workflows, Steps.
         .route("/api/workflows/_validate", post(validate_kind::<R, B>))
         .route(
             "/api/workflows/{kind}",

@@ -4,7 +4,7 @@
 //! When a step of kind `workflow-publish` flips to Done via PUT
 //! /api/jobs/{id}/steps/{step_id}, the handler must:
 //! 1. Pull `workflow_spec` from the step metadata.
-//! 2. Validate it via `validate_all`.
+//! 2. Hand it to the registry, which gates it on viability.
 //! 3. Call `WorkflowRegistry::publish_authored(spec, job_id, actor, now)`
 //!    — the registry records `jobs.kind.published` (full published
 //!    spec) atomically with the workflows row; the step path no
@@ -128,8 +128,8 @@ async fn seed_publish_step(
 }
 
 fn valid_spec(kind: &str) -> WorkflowSpec {
-    // Must pass validate_all (the dispatch path lints before
-    // publishing): a viable trigger → terminal pair.
+    // Must pass the viability gate `publish_authored` enforces:
+    // a viable trigger → terminal pair.
     WorkflowSpec::platform_seed(
         kind,
         "Morning Brew",
@@ -299,6 +299,36 @@ async fn malformed_workflow_spec_returns_400() {
     assert!(kinds.recorded_events().is_empty());
     let events = jobs.recorded_events();
     assert!(events.iter().all(|e| e.kind != WORKFLOW_PUBLISHED));
+}
+
+#[tokio::test]
+async fn unviable_workflow_spec_returns_422_and_publishes_nothing() {
+    // The Step dispatch path sets a registry row ACTIVE without a
+    // draft ever existing, so it answers to the publish gate too
+    // (2026-08-13). The refusal is 422 with the lint problems, and
+    // the step must NOT flip to done behind a failed registry write.
+    let kinds = Arc::new(InMemoryWorkflows::new());
+    let (app, jobs, _bus) = build_app(kinds.clone());
+
+    // Viable shape minus the outcome — the incident's exact defect.
+    let mut spec = valid_spec("morning-brew");
+    spec.steps[1].terminal = None;
+    let metadata = json!({ "workflow_spec": serde_json::to_value(&spec).unwrap() });
+    let (job_id, step_id) = seed_publish_step(jobs.as_ref(), metadata).await;
+
+    let resp = put_step_done(&app, job_id, step_id, &user_header(&cto())).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    assert!(
+        kinds.get_active("morning-brew").await.is_err(),
+        "an unviable spec must not reach the active slot by any path"
+    );
+    assert!(kinds.recorded_events().is_empty());
+    assert!(
+        jobs.recorded_events()
+            .iter()
+            .all(|e| e.kind != WORKFLOW_PUBLISHED)
+    );
 }
 
 #[tokio::test]

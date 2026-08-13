@@ -172,7 +172,7 @@ async fn main() -> Result<()> {
         ));
         let kind_registry: Arc<dyn boss_jobs::WorkflowRegistry> =
             Arc::new(boss_jobs::PgWorkflows::new(pool.clone()));
-        reconcile_platform_workflows(kind_registry.as_ref(), &clock).await;
+        reconcile_platform_workflows(kind_registry.as_ref(), jobs.as_ref(), &clock).await;
         let plugin_registry: Arc<dyn boss_jobs::StepPluginRegistry> =
             Arc::new(boss_jobs::PgStepPlugins::new(pool.clone()));
         let scheduling: Arc<dyn boss_jobs::scheduling::SchedulingRepository> =
@@ -216,7 +216,7 @@ async fn main() -> Result<()> {
         Arc::new(boss_jobs::InMemoryWorkflows::new());
     let plugin_registry: Arc<dyn boss_jobs::StepPluginRegistry> =
         Arc::new(boss_jobs::InMemoryStepPlugins::new());
-    reconcile_platform_workflows(kind_registry.as_ref(), &clock).await;
+    reconcile_platform_workflows(kind_registry.as_ref(), jobs.as_ref(), &clock).await;
     // No subjects table without Postgres — the in-memory spike path
     // skips the existence gate, same as before.
     let subject_existence: Option<Arc<dyn boss_jobs::subject_existence::SubjectExistenceCheck>> =
@@ -380,8 +380,9 @@ async fn run_server<R: JobsRepository + 'static>(
 /// with the row (registry-events invariant), attributed to the
 /// named `bootstrap-reconciler` automation at a clock-routed
 /// "now" — a boot-time reconcile in sim mode stamps sim time.
-async fn reconcile_platform_workflows(
+async fn reconcile_platform_workflows<R: JobsRepository>(
     registry: &dyn boss_jobs::WorkflowRegistry,
+    jobs: &R,
     clock: &Arc<dyn boss_clock_client::ClockClient>,
 ) {
     use boss_jobs::registry::platform_workflows;
@@ -395,43 +396,68 @@ async fn reconcile_platform_workflows(
                 republished = stats.republished,
                 preserved = stats.preserved,
                 unchanged = stats.unchanged,
+                rejected = stats.rejected,
                 total = defaults.len(),
                 "reconciled platform Workflows"
             );
+            if stats.rejected > 0 {
+                // A shipped default that fails the viability lint is
+                // a code bug, not an operational one — the reconcile
+                // already refused to seed it and named it at ERROR.
+                tracing::error!(
+                    rejected = stats.rejected,
+                    "platform Workflow default(s) failed the viability lint and were NOT seeded"
+                );
+            }
         }
         Err(e) => {
             tracing::warn!(error = %e, "platform Workflow reconcile failed");
         }
     }
-    verify_registry_viability(registry).await;
+    verify_registry_viability(registry, jobs, clock).await;
 }
 
 /// Boot-time viability re-verification: every active Workflow in the
 /// registry must still pass the viability lint. A previously-valid
 /// spec can become invalid if an upstream StepType's enum domain
-/// changes; refuse to start rather than dispatch against a broken
-/// graph (the audit_log is the system of record — we don't open for
-/// writes we can't reason about).
-async fn verify_registry_viability(registry: &dyn boss_jobs::WorkflowRegistry) {
-    use boss_jobs::step_registry::StepRegistry;
-    use boss_jobs::workflow_lint::validate_all;
-    let kinds = match registry.list_active(None).await {
-        Ok(k) => k,
+/// changes.
+///
+/// This used to `exit(1)` on the first bad row, which made one
+/// registry row a whole-service outage (2026-08-13). It now
+/// quarantines — see `boss_jobs::workflow_quarantine` for the
+/// semantics and the one case that still refuses to start.
+async fn verify_registry_viability<R: JobsRepository>(
+    registry: &dyn boss_jobs::WorkflowRegistry,
+    jobs: &R,
+    clock: &Arc<dyn boss_clock_client::ClockClient>,
+) {
+    let actor = boss_core::actor::ActorId::Automation(
+        boss_jobs::workflow_quarantine::QUARANTINE_ACTOR.into(),
+    );
+    let now = boss_clock_client::now_from(clock).await;
+    let report = match boss_jobs::workflow_quarantine::quarantine_unviable_active_workflows(
+        registry, jobs, &actor, now,
+    )
+    .await
+    {
+        Ok(r) => r,
         Err(e) => {
-            tracing::error!(error = %e, "boot viability check: could not list active Workflows");
+            // The pass itself failed, so we can't tell whether the
+            // registry is sound. Same rule as before: don't open for
+            // writes we can't reason about.
+            tracing::error!(error = %e, "refusing to start: boot viability check could not complete");
             std::process::exit(1);
         }
     };
-    let errs = validate_all(&kinds, &StepRegistry::v1());
-    if !errs.is_empty() {
-        for e in &errs {
-            tracing::error!("boot viability check: {e}");
-        }
-        tracing::error!(
-            count = errs.len(),
-            "refusing to start: active Workflow(s) fail the viability lint"
-        );
+    if let Some(msg) = report.refusal_message() {
+        tracing::error!("{msg}");
         std::process::exit(1);
     }
-    info!(active = kinds.len(), "boot viability check passed");
+    if !report.quarantined.is_empty() {
+        tracing::error!(
+            quarantined = report.quarantined.len(),
+            active = report.checked,
+            "started with quarantined Workflow(s) — retired and marked, service is up"
+        );
+    }
 }

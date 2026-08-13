@@ -27,6 +27,7 @@ pub mod scheduling;
 pub mod station_queue;
 pub mod stations;
 pub mod workflow_lint;
+pub mod workflow_quarantine;
 // Platform Workflows live in `registry::platform_workflows()` (currently
 // just `workflow-design`); tenant Workflows live in
 // `examples/<tenant>/seeds/workflows.toml` and load via `seed_loader`.

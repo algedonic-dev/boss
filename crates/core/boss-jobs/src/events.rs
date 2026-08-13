@@ -65,6 +65,13 @@ pub const STEP_SIGNED_OFF: &str = "jobs.step.signed_off";
 /// named roles must re-sign before the step can complete.
 pub const STEP_STAMPS_INVALIDATED: &str = "jobs.step.stamps_invalidated";
 pub const JOB_CLOSED: &str = "jobs.job.closed";
+/// Boot found an ACTIVE Workflow that fails the viability lint and
+/// retired it so the service could start (`workflow_quarantine`).
+/// The sibling state event is the registry's own
+/// `jobs.kind.retired`; this marker is the loud one — it carries the
+/// problems that condemned the row, so the log answers "why is this
+/// kind gone?" without a re-lint. Rebuild ignores it.
+pub const WORKFLOW_QUARANTINED: &str = "jobs.kind.quarantined";
 
 /// The state-event payload for a Step: the serialized struct plus a
 /// top-level `step_id` — the same key every marker event uses.
@@ -103,6 +110,30 @@ pub fn workflow_registry_event(
     let payload =
         boss_core::publisher::inject_actor(serde_json::to_value(spec).unwrap_or_default(), actor);
     boss_core::event::Event::new("jobs", kind, payload, now)
+}
+
+/// The `jobs.kind.quarantined` marker: which Workflow row boot
+/// retired, and the lint problems that condemned it. Payload keys
+/// mirror the registry events (`kind`, `version`, `label`) plus a
+/// `problems` list in the same `{step, reason, message}` wire shape
+/// `POST /api/workflows/_validate` returns, so one reader parses
+/// both. Actor rides as `_actor` exactly as EventStamp injects it.
+pub fn workflow_quarantined_event(
+    actor: &boss_core::actor::ActorId,
+    now: chrono::DateTime<chrono::Utc>,
+    spec: &crate::registry::WorkflowSpec,
+    problems: &[crate::workflow_lint::WorkflowLintError],
+) -> boss_core::event::Event {
+    let payload = boss_core::publisher::inject_actor(
+        serde_json::json!({
+            "kind": spec.kind,
+            "version": spec.version,
+            "label": spec.label,
+            "problems": crate::workflow_lint::problems_json(problems),
+        }),
+        actor,
+    );
+    boss_core::event::Event::new("jobs", WORKFLOW_QUARANTINED, payload, now)
 }
 
 /// A step-plugin registry event — same contract as

@@ -40,4 +40,5 @@
 112-event-kinds-workflow-registry.sql
 113-event-kinds-step-plugins.sql
 114-cadence-rules.sql
+115-event-kinds-workflow-quarantine.sql
 116-stations.sql

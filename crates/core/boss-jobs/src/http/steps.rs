@@ -131,10 +131,12 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
 /// registry adapter records `jobs.kind.published` atomically with
 /// the workflows row — the step path no longer emits its own copy.
 ///
-/// Validation = `boss_jobs::workflow_lint::validate_all` —
-/// catches required-field mismatches, unknown step kinds, and the
-/// other static guarantees a published spec needs. The lint
-/// failure is surfaced as 400 so the SPA can render the offender.
+/// Viability is NOT re-linted here: `publish_authored` runs
+/// `workflow_lint::gate_active` itself, because it is one of the
+/// paths that can set a row ACTIVE and every such path must refuse
+/// on its own (a pre-check in one caller protects only that caller).
+/// A refusal arrives as `WorkflowError::Unviable` and leaves as 422
+/// with the problem list, matching `POST /api/workflows/{kind}/publish`.
 async fn dispatch_workflow_publish(
     registry: &dyn crate::registry::WorkflowRegistry,
     step: &boss_core::job::Step,
@@ -142,8 +144,6 @@ async fn dispatch_workflow_publish(
     actor: &boss_core::actor::ActorId,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<crate::registry::WorkflowSpec, (StatusCode, String)> {
-    use crate::workflow_lint::validate_all;
-
     let spec_value = step.metadata.get("workflow_spec").ok_or((
         StatusCode::BAD_REQUEST,
         "workflow-publish step missing required metadata field `workflow_spec`".to_string(),
@@ -157,24 +157,21 @@ async fn dispatch_workflow_publish(
             )
         })?;
 
-    let registry_v1 = crate::step_registry::StepRegistry::v1();
-    let lint_errs = validate_all(std::slice::from_ref(&spec), &registry_v1);
-    if !lint_errs.is_empty() {
-        let mut msg = String::from("workflow-publish: spec failed validate_all:");
-        for e in &lint_errs {
-            msg.push_str(&format!("\n  {e}"));
-        }
-        return Err((StatusCode::BAD_REQUEST, msg));
-    }
-
     registry
         .publish_authored(spec, job_id, actor, now)
         .await
-        .map_err(|e| {
-            (
+        .map_err(|e| match e {
+            crate::registry::WorkflowError::Unviable(problems) => {
+                let mut msg = String::from("workflow-publish: spec is not viable:");
+                for p in &problems {
+                    msg.push_str(&format!("\n  {p}"));
+                }
+                (StatusCode::UNPROCESSABLE_ENTITY, msg)
+            }
+            other => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("publish_authored failed: {e}"),
-            )
+                format!("publish_authored failed: {other}"),
+            ),
         })
 }
 
@@ -501,9 +498,10 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
 
     // In-process dispatch for the `workflow-publish` StepType. When a
     // step of this kind flips to Done, read `workflow_spec` from
-    // metadata, lint it via `validate_all`, and call
-    // `WorkflowRegistry::publish_authored` so the meta-Job's authoring
-    // closes by writing a real registry row.
+    // metadata and call `WorkflowRegistry::publish_authored` so the
+    // meta-Job's authoring closes by writing a real registry row.
+    // `publish_authored` runs the viability gate itself — an unviable
+    // spec comes back as 422 and the step does not flip.
     //
     // Registry-write-first: if publish_authored fails, `update_step_at`
     // is never called and no STEP_UPDATED accumulates in audit_log for

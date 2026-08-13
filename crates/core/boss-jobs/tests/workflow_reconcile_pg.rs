@@ -9,13 +9,40 @@
 
 use boss_core::job::JobId;
 use boss_jobs::registry::{
-    KindReconcileStats, PgWorkflows, WorkflowRegistry, WorkflowSpec, WorkflowStatus,
+    KindReconcileStats, PgWorkflows, StepSpec, Terminal, WorkflowRegistry, WorkflowSpec,
+    WorkflowStatus,
 };
 use boss_testing::TestDb;
 use sqlx::Row;
 
+/// A minimal VIABLE spec — trigger → terminal. Reconcile sets rows
+/// active, so it runs the same viability gate publish does; a
+/// step-less fixture would be refused (and would never have run in
+/// production either).
 fn spec(kind: &str, label: &str) -> WorkflowSpec {
-    WorkflowSpec::platform_seed(kind, label, "platform", vec!["account".into()], Vec::new())
+    WorkflowSpec::platform_seed(
+        kind,
+        label,
+        "platform",
+        vec!["account".into()],
+        vec![
+            StepSpec {
+                title: "start".into(),
+                kind: "task".into(),
+                ready_when: "true".into(),
+                ..Default::default()
+            },
+            StepSpec {
+                title: "finish".into(),
+                kind: "task".into(),
+                ready_when: "steps.start.done".into(),
+                terminal: Some(Terminal {
+                    outcome: "done".into(),
+                }),
+                ..Default::default()
+            },
+        ],
+    )
 }
 
 /// Shared write-path actor + now: every registry write records an
@@ -54,6 +81,7 @@ async fn pg_inserts_missing_kinds_as_bootstrap_owned() {
             republished: 0,
             preserved: 0,
             unchanged: 0,
+            rejected: 0,
         }
     );
 

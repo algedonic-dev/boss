@@ -948,6 +948,25 @@ impl JobsRepository for PgJobs {
         Ok(n)
     }
 
+    async fn count_open_jobs_for_workflow(
+        &self,
+        kind: &str,
+        version: i32,
+    ) -> Result<i64, JobsError> {
+        // Served by the `jobs_kind_version` index (03-jobs.sql).
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM jobs \
+             WHERE kind = $1 AND workflow_version = $2 \
+               AND status NOT IN ('closed', 'cancelled')",
+        )
+        .bind(kind)
+        .bind(version)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        Ok(n)
+    }
+
     async fn count_jobs_by_kind(
         &self,
         status: Option<JobStatus>,

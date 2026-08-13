@@ -19,9 +19,13 @@
 //!   discriminating enum is handled by some successor, or a wildcard
 //!   fallback covers the open-ended case.
 //!
-//! Runs at author time (`/system/workflows`), publish time (the
-//! `workflow-publish` dispatch path), and boot time (boss-jobs-api
-//! refuses to start against a broken registry).
+//! Runs at author time (`POST /api/workflows/_validate`), publish
+//! time (every registry path that can set a row ACTIVE — see
+//! [`gate_active`]), and boot time (`workflow_quarantine`).
+//! One definition, four call sites: the author-time dry run and the
+//! publish gate cannot disagree about what "viable" means, which is
+//! exactly how the 2026-08-13 outage happened — `_validate` could
+//! name the problem the whole time, and publish never asked it.
 
 use crate::registry::{StepSpec, WorkflowSpec, predicate_step_refs};
 use crate::step_registry::StepRegistry;
@@ -73,6 +77,50 @@ pub fn validate_all(specs: &[WorkflowSpec], registry: &StepRegistry) -> Vec<Work
         errs.extend(validate_workflow(spec, registry));
     }
     errs
+}
+
+/// **The publish gate.** A spec may occupy the ACTIVE slot only if
+/// it is viable; `Err` carries every problem, in the order the lint
+/// found them.
+///
+/// Runs against the process-resident StepType registry — the same
+/// one `POST /api/workflows/_validate` uses — so an editor showing
+/// "no problems" publishes cleanly, and a spec that publishes
+/// cleanly boots cleanly.
+///
+/// Called by every registry write that can set `status = active`
+/// (`publish`, `publish_authored`, `bootstrap_reconcile`) in BOTH
+/// adapters. Draft writes deliberately do NOT call it: a draft is
+/// work in progress and may be saved in any state.
+pub fn gate_active(spec: &WorkflowSpec) -> Result<(), Vec<WorkflowLintError>> {
+    gate_active_with(spec, &StepRegistry::v1())
+}
+
+/// [`gate_active`] against a caller-supplied registry — for the
+/// batch paths that would otherwise rebuild the StepType registry
+/// once per spec.
+pub fn gate_active_with(
+    spec: &WorkflowSpec,
+    registry: &StepRegistry,
+) -> Result<(), Vec<WorkflowLintError>> {
+    let errs = validate_workflow(spec, registry);
+    if errs.is_empty() { Ok(()) } else { Err(errs) }
+}
+
+/// The wire shape for a list of lint problems: `[{step, reason,
+/// message}]`. One definition so the author-time dry run
+/// (`_validate`, 200 + `ok:false`) and the publish refusal (422)
+/// hand the editor the same JSON to render.
+pub fn problems_json(errs: &[WorkflowLintError]) -> Vec<Value> {
+    errs.iter()
+        .map(|e| {
+            serde_json::json!({
+                "step": e.step,
+                "reason": e.reason,
+                "message": e.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn err(spec: &WorkflowSpec, step: &str, reason: impl Into<String>) -> WorkflowLintError {

@@ -45,8 +45,28 @@ pub(super) fn kind_err_response(err: WorkflowError) -> Response {
         WorkflowError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
         WorkflowError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
         WorkflowError::Invalid(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+        // 422, not 400: the spec parsed and is well-formed JSON — it
+        // just describes work no Job could finish. Body is the same
+        // `{ok, problems}` shape `_validate` returns so the editor
+        // renders a refused publish exactly like a failed dry run.
+        WorkflowError::Unviable(problems) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(lint_result_json(&problems)),
+        )
+            .into_response(),
         WorkflowError::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
     }
+}
+
+/// The lint result body — `{ok, problems}`. One definition shared by
+/// the author-time dry run (200) and the publish refusal (422).
+pub(super) fn lint_result_json(
+    problems: &[crate::workflow_lint::WorkflowLintError],
+) -> serde_json::Value {
+    serde_json::json!({
+        "ok": problems.is_empty(),
+        "problems": crate::workflow_lint::problems_json(problems),
+    })
 }
 
 pub(super) async fn policy_check<R: JobsRepository, B: EventBus>(
@@ -173,12 +193,12 @@ pub(super) struct DraftLintRequest {
 }
 
 /// Author-time dry run — lint a draft's steps WITHOUT persisting.
-/// Runs the same `validate_workflow` the publish path enforces, against
-/// the same process-resident StepType registry, so an editor showing
-/// "no problems" will publish cleanly. Always returns 200 with a
-/// structured result; lint failures are data, not an HTTP error — the
-/// editor renders them on the graph. See architecture-decisions.md
-/// §Jobs, Workflows, Steps.
+/// Calls `workflow_lint::gate_active`, the same function the publish
+/// path enforces, so an editor showing "no problems" will publish
+/// cleanly and a refused publish shows the same problem list.
+/// Always returns 200 with a structured result; lint failures are
+/// data, not an HTTP error — the editor renders them on the graph.
+/// See architecture-decisions.md §Jobs, Workflows, Steps.
 pub(super) async fn validate_kind<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,
@@ -194,23 +214,11 @@ pub(super) async fn validate_kind<R: JobsRepository + 'static, B: EventBus + 'st
         req.kind.as_str()
     };
     let spec = WorkflowSpec::platform_seed(kind, "draft", "draft", Vec::new(), req.steps);
-    let registry = crate::step_registry::StepRegistry::v1();
-    let errs = crate::workflow_lint::validate_workflow(&spec, &registry);
-    let problems: Vec<serde_json::Value> = errs
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "step": e.step,
-                "reason": e.reason,
-                "message": e.to_string(),
-            })
-        })
-        .collect();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "ok": errs.is_empty(), "problems": problems })),
-    )
-        .into_response()
+    let errs = match crate::workflow_lint::gate_active(&spec) {
+        Ok(()) => Vec::new(),
+        Err(problems) => problems,
+    };
+    (StatusCode::OK, Json(lint_result_json(&errs))).into_response()
 }
 
 pub(super) async fn update_kind<R: JobsRepository + 'static, B: EventBus + 'static>(
@@ -235,6 +243,15 @@ pub(super) async fn update_kind<R: JobsRepository + 'static, B: EventBus + 'stat
     }
 }
 
+/// Promote the latest draft of `kind` to ACTIVE.
+///
+/// The viability gate runs inside `WorkflowRegistry::publish`,
+/// against the draft row the transaction actually promotes — not
+/// against a copy re-read here, which could race a concurrent
+/// author. An unviable draft comes back as `WorkflowError::Unviable`
+/// and leaves as 422 + the problem list (2026-08-13: publish used to
+/// accept anything, and the bad row surfaced as a dead API on the
+/// next pod roll).
 pub(super) async fn publish_kind<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     CurrentUser(user): CurrentUser,

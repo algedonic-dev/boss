@@ -362,6 +362,21 @@ pub trait JobsRepository: Send + Sync {
     /// UX plugin retire path to surface a blast-radius preview.
     async fn count_in_flight_steps_by_kind(&self, step_kind: &str) -> Result<i64, JobsError>;
 
+    /// Count Jobs pinned to one Workflow ROW — `(kind, version)`,
+    /// the pair a Job records at open — whose status is still
+    /// non-terminal (anything but closed / cancelled).
+    ///
+    /// A Job stays pinned to the version it opened under, so this is
+    /// the live-work blast radius of retiring that exact row. Boot's
+    /// quarantine pass asks before it auto-retires an unviable
+    /// Workflow: retiring a row with open Jobs on it would strand
+    /// them.
+    async fn count_open_jobs_for_workflow(
+        &self,
+        kind: &str,
+        version: i32,
+    ) -> Result<i64, JobsError>;
+
     /// Group Jobs by kind and return `(kind, count)` pairs, optionally
     /// scoped to a specific status. Used by the operating-model view
     /// to drive the per-phase live counts without pulling the whole

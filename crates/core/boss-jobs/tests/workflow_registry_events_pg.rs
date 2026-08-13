@@ -9,11 +9,35 @@
 
 use boss_core::actor::ActorId;
 use boss_jobs::events::{WORKFLOW_DRAFT_SAVED, WORKFLOW_PUBLISHED, WORKFLOW_RETIRED};
-use boss_jobs::registry::{PgWorkflows, WorkflowRegistry, WorkflowSpec};
+use boss_jobs::registry::{PgWorkflows, StepSpec, Terminal, WorkflowRegistry, WorkflowSpec};
 use boss_testing::TestDb;
 
+/// Minimal VIABLE spec — publish runs the viability gate, so a
+/// step-less fixture would be refused before any event was staged.
 fn spec(kind: &str, label: &str) -> WorkflowSpec {
-    WorkflowSpec::platform_seed(kind, label, "platform", vec!["account".into()], Vec::new())
+    WorkflowSpec::platform_seed(
+        kind,
+        label,
+        "platform",
+        vec!["account".into()],
+        vec![
+            StepSpec {
+                title: "start".into(),
+                kind: "task".into(),
+                ready_when: "true".into(),
+                ..Default::default()
+            },
+            StepSpec {
+                title: "finish".into(),
+                kind: "task".into(),
+                ready_when: "steps.start.done".into(),
+                terminal: Some(Terminal {
+                    outcome: "done".into(),
+                }),
+                ..Default::default()
+            },
+        ],
+    )
 }
 
 fn author() -> ActorId {

@@ -345,6 +345,23 @@ impl JobsRepository for InMemoryJobs {
         Ok(n as i64)
     }
 
+    async fn count_open_jobs_for_workflow(
+        &self,
+        kind: &str,
+        version: i32,
+    ) -> Result<i64, JobsError> {
+        let state = self.inner.lock().expect("poisoned");
+        let n = state
+            .jobs
+            .values()
+            .filter(|j| j.kind == kind && j.workflow_version == version)
+            // Same predicate as the Pg adapter's
+            // `status NOT IN ('closed','cancelled')`.
+            .filter(|j| !matches!(j.status, JobStatus::Closed | JobStatus::Cancelled))
+            .count();
+        Ok(n as i64)
+    }
+
     async fn count_jobs_by_kind(
         &self,
         status: Option<JobStatus>,

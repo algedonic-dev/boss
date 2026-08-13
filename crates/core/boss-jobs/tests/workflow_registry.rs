@@ -45,13 +45,17 @@ fn user_header(u: &User) -> String {
     serde_json::to_string(u).unwrap()
 }
 
+/// A minimal VIABLE draft — trigger → terminal. Publishing runs the
+/// viability gate, so a step-less fixture would be refused with 422
+/// (see `workflow_publish_gate.rs`); tests about versioning and
+/// policy shouldn't have to think about that.
 fn draft_spec(kind: &str) -> WorkflowSpec {
     WorkflowSpec::platform_seed(
         kind,
         format!("Test {kind}"),
         "test",
         vec!["system".into()],
-        Vec::new(),
+        vec![trigger_step(), terminal_step()],
     )
 }
 

@@ -2003,6 +2003,14 @@ pub enum WorkflowError {
     Conflict(String),
     #[error("invalid spec: {0}")]
     Invalid(String),
+    /// The spec failed the viability lint and so may not occupy the
+    /// ACTIVE slot. Carries every problem so the HTTP surface can
+    /// hand the editor the same `{step, reason, message}` list
+    /// `POST /api/workflows/_validate` returns. Distinct from
+    /// `Invalid` because it maps to 422 (semantically well-formed,
+    /// operationally unrunnable), not 400.
+    #[error("workflow is not viable: {}", .0.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "))]
+    Unviable(Vec<crate::workflow_lint::WorkflowLintError>),
     #[error("storage error: {0}")]
     Storage(String),
 }
@@ -2179,6 +2187,12 @@ pub struct KindReconcileStats {
     /// Bootstrap-owned rows already matching the default — no
     /// write.
     pub unchanged: usize,
+    /// Defaults refused by the viability lint — never written, never
+    /// activated. A shipped seed landing here is a code bug (the
+    /// `every_shipped_platform_seed_is_viable` test exists to keep
+    /// this at zero); the reconcile still completes for the rest so
+    /// one bad default can't strand the whole platform set.
+    pub rejected: usize,
 }
 
 /// Helper: returns true iff every body field that bootstrap
@@ -2356,6 +2370,9 @@ impl WorkflowRegistry for InMemoryWorkflows {
                 WorkflowError::NotFound(format!("no draft to publish for kind: {kind}"))
             })?;
 
+        // The publish gate — refuse before any row flips.
+        crate::workflow_lint::gate_active(&latest_draft).map_err(WorkflowError::Unviable)?;
+
         // Demote any currently-active row for this kind.
         for ((k, _), row) in rows.iter_mut() {
             if k == kind && row.status == WorkflowStatus::Active {
@@ -2418,6 +2435,10 @@ impl WorkflowRegistry for InMemoryWorkflows {
         actor: &boss_core::actor::ActorId,
         now: DateTime<Utc>,
     ) -> Result<WorkflowSpec, WorkflowError> {
+        // Same gate as `publish` — this path writes an active row
+        // with no draft ever existing, so it needs its own check.
+        crate::workflow_lint::gate_active(&spec).map_err(WorkflowError::Unviable)?;
+
         let next = self.max_version(&spec.kind).unwrap_or(0) + 1;
         spec.version = next;
         spec.status = WorkflowStatus::Active;
@@ -2463,10 +2484,23 @@ impl WorkflowRegistry for InMemoryWorkflows {
         // nothing. Collected here and pushed after the row locks
         // drop.
         let mut events: Vec<boss_core::event::Event> = Vec::new();
+        let step_types = crate::step_registry::StepRegistry::v1();
         let mut rows = self.rows.lock().unwrap();
         let mut owned = self.bootstrap_owned.lock().unwrap();
 
         for default in defaults {
+            // Platform seeding sets rows ACTIVE, so it answers to the
+            // publish gate too. An unviable default is refused here
+            // rather than seeded and quarantined at the next boot.
+            if let Err(problems) = crate::workflow_lint::gate_active_with(default, &step_types) {
+                tracing::error!(
+                    kind = %default.kind,
+                    problems = %problems.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("; "),
+                    "platform Workflow default fails the viability lint — refusing to seed it"
+                );
+                stats.rejected += 1;
+                continue;
+            }
             // Find the active row for this kind, if any.
             let active_key: Option<(String, i32)> = rows
                 .iter()
@@ -2824,6 +2858,11 @@ mod pg {
                 .transpose()?
                 .ok_or_else(|| WorkflowError::NotFound(format!("no draft to publish: {kind}")))?;
 
+            // The publish gate, inside the transaction and against
+            // the row we are about to promote — not against whatever
+            // a caller happened to hand us.
+            crate::workflow_lint::gate_active(&promoted).map_err(WorkflowError::Unviable)?;
+
             // Retire any currently-active row.
             sqlx::query(
                 "UPDATE workflows SET status = 'retired'
@@ -2930,6 +2969,11 @@ mod pg {
             actor: &boss_core::actor::ActorId,
             now: DateTime<Utc>,
         ) -> Result<WorkflowSpec, WorkflowError> {
+            // Same gate as `publish` — refuse before opening the
+            // transaction, since nothing here can rescue an unviable
+            // spec.
+            crate::workflow_lint::gate_active(&spec).map_err(WorkflowError::Unviable)?;
+
             let mut tx = self
                 .pool
                 .begin()
@@ -3051,8 +3095,24 @@ mod pg {
             }
 
             let mut stats = KindReconcileStats::default();
+            let step_types = crate::step_registry::StepRegistry::v1();
 
             for default in defaults {
+                // Platform seeding sets rows ACTIVE, so it answers to
+                // the publish gate too. An unviable default is refused
+                // here rather than seeded and quarantined at the next
+                // boot.
+                if let Err(problems) = crate::workflow_lint::gate_active_with(default, &step_types)
+                {
+                    tracing::error!(
+                        kind = %default.kind,
+                        problems = %problems.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("; "),
+                        "platform Workflow default fails the viability lint — refusing to seed it"
+                    );
+                    stats.rejected += 1;
+                    continue;
+                }
+
                 let row: Option<ReconcileRow> = sqlx::query_as(
                     "SELECT kind, version, status, label, description, category,
                             subject_kinds, steps, metadata_schema, entitlements, metadata,
@@ -3414,13 +3474,33 @@ mod tests {
         assert_eq!(trigger.subject_source, "same");
     }
 
+    /// A minimal VIABLE spec — one trigger flowing into one terminal.
+    /// Every write path that sets a row ACTIVE runs the viability
+    /// gate, so a step-less fixture would be refused (and described
+    /// work no Job could ever finish, which is why the gate exists).
     fn seed_spec(kind: &str) -> WorkflowSpec {
         WorkflowSpec::platform_seed(
             kind,
             format!("Test {kind}"),
             "test",
             vec!["asset".into()],
-            Vec::new(),
+            vec![
+                StepSpec {
+                    title: "start".into(),
+                    kind: "task".into(),
+                    ready_when: "true".into(),
+                    ..Default::default()
+                },
+                StepSpec {
+                    title: "finish".into(),
+                    kind: "task".into(),
+                    ready_when: "steps.start.done".into(),
+                    terminal: Some(Terminal {
+                        outcome: "done".into(),
+                    }),
+                    ..Default::default()
+                },
+            ],
         )
     }
 
@@ -4172,8 +4252,14 @@ mod tests {
     // bootstrap_reconcile — InMemoryWorkflows
     // -----------------------------------------------------------
 
+    /// Viable by construction — reconcile activates rows, so it runs
+    /// the same gate publish does.
     fn reconcile_spec(kind: &str, label: &str) -> WorkflowSpec {
-        WorkflowSpec::platform_seed(kind, label, "platform", vec!["account".into()], Vec::new())
+        let mut spec = seed_spec(kind);
+        spec.label = label.to_string();
+        spec.category = "platform".into();
+        spec.subject_kinds = vec!["account".into()];
+        spec
     }
 
     #[tokio::test]

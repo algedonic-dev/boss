@@ -217,6 +217,10 @@ const SCHEMA_FILES: &[(&str, &str)] = &[
         include_str!("../../../../infra/postgres/schema/114-cadence-rules.sql"),
     ),
     (
+        "115-event-kinds-workflow-quarantine",
+        include_str!("../../../../infra/postgres/schema/115-event-kinds-workflow-quarantine.sql"),
+    ),
+    (
         "116-stations",
         include_str!("../../../../infra/postgres/schema/116-stations.sql"),
     ),
