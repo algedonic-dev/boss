@@ -448,6 +448,15 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
         }
     };
 
+    // Admission decides sim-vs-real ONCE, here, and the flag never
+    // moves again (03-jobs.sql: the epoch trim leans on a Job's rows
+    // all sharing one fate). Two admissible sources, OR-ed: an
+    // explicit `simulated: true` on the body (demo seeding, tests),
+    // or the request arriving on a sim chain (`x-sim-origin` — how
+    // every sim-engine create presents). The OR means a sim chain can
+    // never mint real work, even with a body that claims otherwise.
+    job.simulated = job.simulated || boss_core::sim_origin::is_in_sim_chain();
+
     // Validate the kind against the Workflow registry. When no registry
     // is plumbed (older tests) we accept any kind string. We capture
     // the active spec here so the step-materialization pass below
@@ -562,7 +571,14 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
     let actor = user
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-    let job_stamp = state.publisher.stamp_with_actor_at(actor, now).await;
+    // Every event about the Job inherits its admission-fixed flag as
+    // the `_simulated` marker — the packet, not the transport context
+    // of the write, is the source of truth for sim-vs-real.
+    let job_stamp = state
+        .publisher
+        .stamp_with_actor_at(actor, now)
+        .await
+        .with_simulated(job.simulated);
     let job_event = job_stamp.event(
         events::JOB_CREATED,
         serde_json::to_value(&job).unwrap_or_default(),
@@ -616,7 +632,11 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
             let step_actor = user
                 .ambient_actor()
                 .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-            let step_stamp = state.publisher.stamp_with_actor_at(step_actor, now).await;
+            let step_stamp = state
+                .publisher
+                .stamp_with_actor_at(step_actor, now)
+                .await
+                .with_simulated(job.simulated);
             let step_event =
                 step_stamp.event(events::STEP_CREATED, events::step_state_payload(step));
             if let Err(e) = state.jobs.add_step_at(step, now, &[step_event]).await {
@@ -831,6 +851,17 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
     };
     let old_status = existing.status;
 
+    // `simulated` is IMMUTABLE after admission. Ignore-not-reject,
+    // matching how the other server-owned field on this route is
+    // treated (the path-authoritative `id` above): the stored value
+    // wins over anything on the wire, so a client round-tripping a
+    // full Job body never has to strip the field, and a client trying
+    // to flip it simply doesn't. The Pg adapter's UPDATE never
+    // touches the column; carrying the stored value forward here
+    // keeps the JOB_UPDATED event payload (and the in-memory
+    // adapter) agreeing with the row.
+    job.simulated = existing.simulated;
+
     // Pick the right policy action: transitioning to Closed is a Close
     // action (more restricted than Update); everything else is Update.
     let action = if job.status == JobStatus::Closed && old_status != JobStatus::Closed {
@@ -877,7 +908,11 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
     let actor = user
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-    let stamp = state.publisher.stamp_with_actor_at(actor, now).await;
+    let stamp = state
+        .publisher
+        .stamp_with_actor_at(actor, now)
+        .await
+        .with_simulated(job.simulated);
     let mut job_events = vec![stamp.event(
         events::JOB_UPDATED,
         serde_json::to_value(&job).unwrap_or_default(),

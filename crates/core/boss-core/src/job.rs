@@ -164,6 +164,19 @@ pub struct Job {
     pub closed_on: Option<NaiveDate>,
     pub metadata: serde_json::Value,
     pub tags: Vec<String>,
+    /// Whether this Job belongs to the simulated company. Decided ONCE
+    /// at admission (`POST /api/jobs`) — from an explicit body flag or
+    /// the sim-chain origin of the creating request — and immutable
+    /// thereafter: a real operator can click around a simulated Job
+    /// all day without making it real. Every event about the Job (job
+    /// + step state events and markers) inherits this flag as its
+    /// `_simulated` payload marker, so the flag on the packet — not
+    /// the transport context of any later write — is the source of
+    /// truth for sim-vs-real. `#[serde(default)]` keeps pre-flag
+    /// payloads (old audit_log events, old clients) deserializing as
+    /// real.
+    #[serde(default)]
+    pub simulated: bool,
 }
 
 impl Job {
@@ -189,6 +202,7 @@ impl Job {
             closed_on: None,
             metadata: serde_json::Value::Object(serde_json::Map::new()),
             tags: Vec::new(),
+            simulated: false,
         }
     }
 
@@ -224,6 +238,14 @@ impl Job {
 
     pub fn with_tags(mut self, tags: Vec<String>) -> Self {
         self.tags = tags;
+        self
+    }
+
+    /// Mark the Job as belonging to the simulated company. Sim
+    /// engines set this at construction so admission fixes the flag
+    /// from the packet itself, not from per-event stamping.
+    pub fn with_simulated(mut self, simulated: bool) -> Self {
+        self.simulated = simulated;
         self
     }
 }
@@ -478,6 +500,29 @@ mod tests {
         let json = serde_json::to_string(&job).unwrap();
         let back: Job = serde_json::from_str(&json).unwrap();
         assert_eq!(job, back);
+    }
+
+    #[test]
+    fn job_simulated_defaults_false_for_pre_flag_payloads() {
+        // Old audit_log payloads (and old clients) predate the
+        // `simulated` field. serde(default) must admit them as real
+        // Jobs — a rebuild over a pre-flag slice must not fail, and
+        // must not invent a simulated company.
+        let job = Job::new(
+            "test-kind",
+            Subject::new("asset", "sys-001"),
+            "Test job",
+            "emp-42",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 4, 16).unwrap(),
+        );
+        let mut v = serde_json::to_value(&job).unwrap();
+        v.as_object_mut().unwrap().remove("simulated");
+        let back: Job = serde_json::from_value(v).unwrap();
+        assert!(!back.simulated);
+
+        // And the builder fixes it at construction for sim engines.
+        assert!(job.with_simulated(true).simulated);
     }
 
     #[test]

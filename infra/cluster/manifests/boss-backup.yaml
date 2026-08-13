@@ -1,0 +1,87 @@
+# Nightly pg_dump of the cluster BOSS database — the system of
+# record gets backups on day one (David, 2026-08-12).
+#
+# Dump to a Longhorn PVC (14-day retention), then ship the fresh
+# dump offsite to the playground box via the kanidm backup-shipper
+# pattern: a deposit-only forced-command SSH key (secret
+# boss-backup-key) whose entire blast radius is 'can write files
+# into /var/backups/boss-cluster-pg on boss-gcp'. The receiver
+# (boss-cluster-pg-recv.sh there) stamps names server-side and
+# keeps the most recent 21. A failed ship fails the Job loudly —
+# an offsite copy that silently stops is worse than none.
+#
+# The dump is plain SQL of the whole database. audit_log is the
+# system of record inside the system of record — a restore is
+# schema + audit_log + boss-rebuild-all, same as dev-refresh.sh —
+# but a full dump keeps the restore path dumb, which is what you
+# want at 03:00.
+#
+# Pins: no LAN door of its own; ships offsite to boss-gcp
+# (david@34.45.110.40, the playground box) with the deposit-only key
+# in secret boss-backup-key. Secrets are referenced by name only —
+# they are created out-of-band and never live in this tree.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: boss-backups
+  namespace: boss
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: boss-pg-backup
+  namespace: boss
+spec:
+  schedule: "10 9 * * *"   # 09:10 UTC — after the household's day starts, before the US one
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: dump
+              image: postgres:16-alpine
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -e
+                  STAMP=$(date -u +%Y%m%d-%H%M%S)
+                  OUT=/backup/boss-${STAMP}.sql.gz
+                  pg_dump "$DATABASE_URL" | gzip > "$OUT"
+                  SIZE=$(du -h "$OUT" | cut -f1)
+                  echo "dumped $OUT ($SIZE)"
+                  # Retention: 14 days. Prune loudly, never silently.
+                  find /backup -name 'boss-*.sql.gz' -mtime +14 -print -delete
+                  # Offsite: ship tonight's dump to the playground box.
+                  # The key is deposit-only (forced command + restrict);
+                  # the receiver stamps the name and prunes its own set.
+                  apk add --no-cache openssh-client >/dev/null 2>&1
+                  install -m 600 /keys/id_ed25519 /tmp/k
+                  cat "$OUT" | ssh -i /tmp/k \
+                    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                    -o ConnectTimeout=20 david@34.45.110.40
+                  echo "backups on volume:"; ls -lh /backup | tail -8
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: boss-secrets
+                      key: database-url
+              volumeMounts:
+                - {name: backups, mountPath: /backup}
+                - {name: ship-key, mountPath: /keys, readOnly: true}
+          volumes:
+            - name: backups
+              persistentVolumeClaim: {claimName: boss-backups}
+            - name: ship-key
+              secret: {secretName: boss-backup-key, defaultMode: 0o256}

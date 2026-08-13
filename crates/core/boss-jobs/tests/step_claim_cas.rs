@@ -28,6 +28,7 @@ async fn seeded_step(status: StepStatus, assignee: Option<&str>) -> (InMemoryJob
         closed_on: None,
         metadata: serde_json::Value::Null,
         tags: vec![],
+        simulated: false,
     };
     let mut step = Step::new(job_id, "task", "Do the work", 0);
     step.spec_slug = Some("work".into());

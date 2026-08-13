@@ -505,6 +505,7 @@ mod tests {
             closed_on: None,
             metadata: serde_json::Value::Object(Default::default()),
             tags: Vec::new(),
+            simulated: false,
         }
     }
 
@@ -752,6 +753,7 @@ mod tests {
                 closed_on: None,
                 metadata: serde_json::Value::Object(Default::default()),
                 tags: vec![],
+                simulated: false,
             };
             let steps: Vec<Step> = ci
                 .step_titles
@@ -775,6 +777,7 @@ mod tests {
             closed_on: None,
             metadata: serde_json::Value::Object(Default::default()),
             tags: vec![],
+            simulated: false,
         };
         let parent_steps: Vec<Step> = parent_input
             .step_titles

@@ -386,6 +386,18 @@ impl EventStamp {
         }
     }
 
+    /// Override the `_simulated` marker for every event this stamp
+    /// builds. The job/step write paths use this to make the Job's
+    /// admission-fixed `simulated` flag — not the transport context
+    /// of the current request — the source of the marker: a write to
+    /// a simulated packet is simulated even when a human clicks it,
+    /// and a sim-chain write to a real packet stays real. Events not
+    /// scoped to a Job keep the task-local sim-chain default.
+    pub fn with_simulated(mut self, simulated: bool) -> Self {
+        self.simulated = Some(simulated);
+        self
+    }
+
     /// Build the enriched `Event` for `kind` + `payload` — the in-tx
     /// analogue of `emit_with_actor_at`'s construction.
     pub fn event(&self, kind: &str, payload: serde_json::Value) -> Event {
@@ -637,5 +649,35 @@ mod inject_tests {
         let out = inject_simulated(p, true);
         assert_eq!(out["_simulated"], true);
         assert_eq!(out["value"], serde_json::json!(["a", "b"]));
+    }
+
+    #[test]
+    fn stamp_with_simulated_overrides_the_chain_default() {
+        // A stamp built outside any sim chain carries no _simulated;
+        // the job write paths override it from the packet's
+        // admission-fixed flag, in both directions.
+        let stamp = EventStamp::new(
+            "jobs",
+            ActorId::Human("emp-1".into()),
+            chrono::DateTime::parse_from_rfc3339("2026-08-12T00:00:00Z")
+                .unwrap()
+                .to_utc(),
+        );
+        let bare = stamp
+            .clone()
+            .event("jobs.job.updated", serde_json::json!({}));
+        assert!(
+            bare.payload.get("_simulated").is_none(),
+            "outside a sim chain the default stamp leaves the key off"
+        );
+        let sim = stamp
+            .clone()
+            .with_simulated(true)
+            .event("jobs.job.updated", serde_json::json!({}));
+        assert_eq!(sim.payload["_simulated"], true);
+        let real = stamp
+            .with_simulated(false)
+            .event("jobs.job.updated", serde_json::json!({}));
+        assert_eq!(real.payload["_simulated"], false);
     }
 }

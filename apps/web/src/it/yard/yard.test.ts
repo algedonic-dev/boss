@@ -81,10 +81,17 @@ describe('the packet-card grammar', () => {
   test('a simulated packet is named by its data, not a code path', () => {
     const base = { id: 'x', kind: 'ship-a-change', title: 't', status: 'open',
       opened_on: '2026-08-12' } as const;
+    // The Job's admission-fixed field is the source of truth …
+    expect(isSim({ ...base, simulated: true })).toBe(true);
+    expect(isSim({ ...base, simulated: true, tags: [], metadata: {} })).toBe(true);
+    // … and the tag / metadata conventions survive as fallback for
+    // packets that predate it.
     expect(isSim({ ...base, tags: ['sim'] })).toBe(true);
     expect(isSim({ ...base, tags: ['Simulated'] })).toBe(true);
     expect(isSim({ ...base, metadata: { simulated: true } })).toBe(true);
+    expect(isSim({ ...base, simulated: false, tags: ['sim'] })).toBe(true);
     expect(isSim({ ...base, tags: ['fix'], metadata: {} })).toBe(false);
+    expect(isSim({ ...base, simulated: false })).toBe(false);
   });
   test('protocol hue is stable, palette-bound, and distinguishes the yard kinds', () => {
     expect(protocolHue('ship-a-change')).toBe(protocolHue('ship-a-change'));

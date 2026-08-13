@@ -66,6 +66,7 @@ struct JobRow {
     closed_on: Option<chrono::NaiveDate>,
     metadata: serde_json::Value,
     tags: Vec<String>,
+    simulated: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -124,6 +125,7 @@ fn row_to_job(r: JobRow) -> Job {
         closed_on: r.closed_on,
         metadata: r.metadata,
         tags: r.tags,
+        simulated: r.simulated,
     }
 }
 
@@ -337,11 +339,14 @@ impl JobsRepository for PgJobs {
         .bind(&job.tags)
         .bind(job.workflow_version)
         .bind(now)
-        // Decided once, here, from the origin of the request that
-        // opened the Job — and never revisited. Everything downstream
-        // (steps, side effects, an operator poking at it later) is
-        // simulated iff the Job is.
-        .bind(boss_core::sim_origin::is_in_sim_chain())
+        // Decided once, at ADMISSION (create_job in http/jobs.rs:
+        // explicit body flag OR sim-chain origin) — and never
+        // revisited. The adapter persists the Job it was handed so
+        // the row can never disagree with the JOB_CREATED payload
+        // recorded beside it; everything downstream (steps, side
+        // effects, an operator poking at it later) is simulated iff
+        // the Job is.
+        .bind(job.simulated)
         .execute(&mut *tx)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -364,7 +369,7 @@ impl JobsRepository for PgJobs {
 
     async fn get_job(&self, id: &JobId) -> Result<Option<Job>, JobsError> {
         let row = sqlx::query_as::<_, JobRow>(
-            "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, due_on, closed_on, metadata, tags FROM jobs WHERE id = $1",
+            "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, due_on, closed_on, metadata, tags, simulated FROM jobs WHERE id = $1",
         )
         .bind(*id.inner().as_uuid())
         .fetch_optional(&self.pool)
@@ -385,6 +390,10 @@ impl JobsRepository for PgJobs {
             .begin()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // `simulated` is deliberately absent from the SET list: a
+        // Job's origin is decided at admission and never revisited.
+        // The storage enforces the immutability rather than trusting
+        // every caller to (same rule as rebuild.rs's upsert).
         let result = sqlx::query(
             r#"
             UPDATE jobs SET kind = $2, subject_kind = $3, subject_id = $4,
@@ -471,7 +480,7 @@ impl JobsRepository for PgJobs {
         // /api/jobs?account_id=foo looked empty on every detail page.
         let list_sql = r#"
             SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status,
-                   priority, opened_on, due_on, closed_on, metadata, tags
+                   priority, opened_on, due_on, closed_on, metadata, tags, simulated
             FROM jobs
             WHERE ($1::text IS NULL OR kind = $1)
               AND ($2::text IS NULL OR status = $2)

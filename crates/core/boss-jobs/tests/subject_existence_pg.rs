@@ -61,6 +61,7 @@ fn job_about(id: &str, kind: &str, subject: Subject) -> Job {
         closed_on: None,
         metadata: serde_json::Value::Null,
         tags: vec![],
+        simulated: false,
     }
 }
 

@@ -1,0 +1,304 @@
+# BOSS — single-pod topology on the cluster.
+#
+# Translation of infra/oss-quickstart/docker-compose.yml. Deliberately
+# single-pod for the first deployment: every boss-* binary runs under
+# boss-launch on loopback inside one container, so only the gateway's
+# :4443 is reachable. That satisfies BOSS's trust model structurally
+# (SECURITY.md §Deployment trust model — the gateway must be the only
+# thing that can reach backend ports) without needing NetworkPolicy.
+#
+# The compose file runs boss-init as a separate one-shot sharing a
+# volume with the services container. Here it is an initContainer in the
+# same pod, which is the natural Kubernetes shape: same lifecycle, same
+# emptyDir for the credentials file, and it re-runs idempotently (the
+# marker in the Postgres volume makes a seeded DB skip the 5-minute
+# brewery load).
+#
+# Pins: LB IP 10.20.0.30 (boss-gateway Service, Cilium LB-IPAM) — the
+# plain-HTTP upstream that Caddy on boss-gcp proxies for the human
+# door, https://playground.algedonic.dev.
+#
+# The image tag committed below is a placeholder from the day this
+# file entered the tree: cluster-deploy-runner.sh applies this file
+# FIRST, then rolls deploy/boss (and the init container) to the tag it
+# just built from forge main, so the fresh tag always wins.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: boss
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: boss
+spec:
+  clusterIP: None
+  selector: {app: postgres}
+  ports: [{port: 5432, name: pg}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: boss
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector: {matchLabels: {app: postgres}}
+  template:
+    metadata:
+      labels: {app: postgres}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          # ~24 API services each hold an sqlx pool (default max 10), which
+          # blows past PG's default max_connections=100 and makes services
+          # fail-closed mid-startup. 400 matches infra/deploy-services.sh.
+          args: ["postgres", "-c", "max_connections=400"]
+          env:
+            - {name: POSTGRES_USER, value: boss}
+            - {name: POSTGRES_DB, value: boss}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: boss-secrets, key: postgres-password}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports: [{containerPort: 5432}]
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "boss"]}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests: {cpu: "500m", memory: 1Gi}
+          volumeMounts:
+            - {name: pgdata, mountPath: /var/lib/postgresql/data}
+  volumeClaimTemplates:
+    - metadata: {name: pgdata}
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: longhorn
+        resources: {requests: {storage: 20Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  namespace: boss
+spec:
+  selector: {app: nats}
+  ports:
+    - {port: 4222, name: client}
+    - {port: 8222, name: monitor}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nats
+  namespace: boss
+spec:
+  serviceName: nats
+  replicas: 1
+  selector: {matchLabels: {app: nats}}
+  template:
+    metadata:
+      labels: {app: nats}
+    spec:
+      containers:
+        - name: nats
+          image: nats:2.10-alpine
+          # -js: JetStream, required for audit-log replay.
+          args: ["-js", "-sd", "/data", "-m", "8222"]
+          ports:
+            - {containerPort: 4222}
+            - {containerPort: 8222}
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8222}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: {cpu: "100m", memory: 256Mi}
+          volumeMounts:
+            - {name: jsdata, mountPath: /data}
+  volumeClaimTemplates:
+    - metadata: {name: jsdata}
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: longhorn
+        resources: {requests: {storage: 10Gi}}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: boss-auth
+  namespace: boss
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: boss
+  namespace: boss
+spec:
+  replicas: 1
+  # Single pod owning one Postgres; never run two.
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: boss}}
+  template:
+    metadata:
+      labels: {app: boss}
+    spec:
+      # The image runs as uid/gid 1500 (boss), but a freshly provisioned
+      # Longhorn volume mounts root:root 0755 — so the credential store
+      # was unwritable and boss-auth failed on the temp file. fsGroup
+      # makes the kubelet chgrp the volume and set setgid on it.
+      securityContext:
+        fsGroup: 1500
+      imagePullSecrets:
+        - {name: forgejo-registry}
+      volumes:
+        # NOT emptyDir. boss-init skips provisioning once the schema
+        # exists (ours came from the GCP migration), so credentials.toml
+        # is written at most once — on an emptyDir it is empty on every
+        # restart, which makes the documented break-glass path a fiction.
+        # idm-kanidm.md keeps local auth precisely so an IdP outage
+        # cannot lock operators out; that requires it to persist.
+        - name: boss-auth
+          persistentVolumeClaim:
+            claimName: boss-auth
+        # StepPlugin JS bundles (step-plugins.yaml). The `step_plugins`
+        # rows were seeded but the bundles they point at were never
+        # deployed, so every plugin-backed step rendered "No plugin
+        # registered" — including the eleven ready `review-design` steps
+        # gating the design-doc review workflow. Read-only: the gateway
+        # serves these, nothing writes them.
+        - name: step-plugins
+          configMap:
+            name: step-plugins
+      initContainers:
+        # Applies schema, loads the brewery seed, seeds bootstrap-admin.
+        # Skips the expensive seed when the DB is already bootstrapped.
+        - name: boss-init
+          image: 10.20.0.15:3000/david/boss:b2814ef
+          command: ["/usr/bin/tini", "--", "/usr/local/bin/boss-init"]
+          env:
+            - {name: PGHOST, value: postgres}
+            - {name: PGUSER, value: boss}
+            - {name: PGDATABASE, value: boss}
+            - name: PGPASSWORD
+              valueFrom: {secretKeyRef: {name: boss-secrets, key: postgres-password}}
+            - name: DATABASE_URL
+              valueFrom: {secretKeyRef: {name: boss-secrets, key: database-url}}
+            - name: BOSS_POSTGRES_URL
+              valueFrom: {secretKeyRef: {name: boss-secrets, key: database-url}}
+            - {name: BOSS_BOOTSTRAP_ADMIN_EMAIL, value: david@algedonic.dev}
+            - name: BOSS_BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom: {secretKeyRef: {name: boss-secrets, key: admin-password}}
+            - {name: BOSS_AUTH_FILE, value: /var/lib/boss/auth/credentials.toml}
+          volumeMounts:
+            - {name: boss-auth, mountPath: /var/lib/boss/auth}
+      containers:
+        - name: boss
+          image: 10.20.0.15:3000/david/boss:b2814ef
+          env:
+            - name: DATABASE_URL
+              valueFrom: {secretKeyRef: {name: boss-secrets, key: database-url}}
+            - name: BOSS_POSTGRES_URL
+              valueFrom: {secretKeyRef: {name: boss-secrets, key: database-url}}
+            - {name: BOSS_NATS_URL, value: "nats://nats:4222"}
+            # Wall clock — the prod default. This is no longer a pure
+            # simulation: the IT department is real people and agents, and
+            # only the rest of the company is simulated, so events must be
+            # stamped when they actually happen.
+            #
+            # It also repairs a real defect. boss-init re-primes the sim
+            # epoch to 2025-03-31 on every start, but the migrated log from
+            # the GCP instance carries 2026 timestamps — so post-migration
+            # events were being written 17 months in the past, leaving
+            # 33,042 entries stamped before their predecessor.
+            - {name: BOSS_CLOCK_MODE, value: wall}
+            - {name: BOSS_DEFAULT_USER_EMAIL, value: david@algedonic.dev}
+            - {name: BOSS_BOOTSTRAP_ADMIN_EMAIL, value: david@algedonic.dev}
+            - {name: BOSS_STATIC_DIR, value: /opt/boss/spa}
+            - {name: BOSS_AUTH_FILE, value: /var/lib/boss/auth/credentials.toml}
+            - {name: BOSS_AUTH_PROVIDER, value: local-auth}
+            # Deliberate: this is a public demonstration. Anonymous
+            # visitors get a synthetic audit-readonly session — read every
+            # projection, write nothing — so the brewery renders without a
+            # login, and the write path is what's under scrutiny.
+            - {name: BOSS_GUEST_ACCESS, value: "1"}
+            - {name: BOSS_TENANT_MANIFEST_TOML, value: /opt/boss/examples/brewery/seeds/tenant.toml}
+            - name: BOSS_SESSION_KEY
+              valueFrom: {secretKeyRef: {name: boss-secrets, key: session-key}}
+            # Collections loop: dispatcher pushes step.done.<kind> to the
+            # sim's webhook on the same loopback host:port. Both must agree
+            # or zero collections fire and AR balloons.
+            - {name: BOSS_EVENT_WEBHOOK_URL, value: "http://127.0.0.1:7099/callback"}
+            - {name: BOSS_SIM_CALLBACK_BIND, value: "127.0.0.1:7099"}
+            - {name: BOSS_DISPATCH_STRATEGY, value: spread}
+            - {name: BOSS_DISPATCHER_RULES, value: /opt/boss/infra/dispatcher/rules.toml}
+            # Bind all interfaces so the Service can reach the gateway;
+            # the default 127.0.0.1 is right for systemd+Caddy, wrong here.
+            - {name: BOSS_LISTEN, value: "0.0.0.0:4443"}
+            - {name: BOSS_PUBLIC_URL, value: "https://playground.algedonic.dev"}
+            # OIDC against Kanidm (idm-kanidm.md). The gateway is an OIDC
+            # client and issues its own session after login (Q1), mapping the
+            # id_token email to an EXISTING employee Subject — a login with no
+            # match fails closed (Q2). Kanidm authenticates; it never provisions.
+            - {name: BOSS_OIDC_ISSUER, value: "https://id.algedonic.dev/oauth2/openid/boss"}
+            - {name: BOSS_OIDC_CLIENT_ID, value: "boss"}
+            - name: BOSS_OIDC_CLIENT_SECRET
+              valueFrom: {secretKeyRef: {name: boss-oidc, key: client-secret}}
+            # Auth mail (queue item: "Email relay: pick a sender and turn on
+            # auth mail"). mail.rs posts {from,to[],subject,text} with bearer
+            # auth — Resend's exact shape, so this is credentials, not code.
+            #
+            # FROM is on send.algedonic.dev, not the root the Job named:
+            # Resend is verified for the subdomain, and verifying the root
+            # would mean editing the live SPF record that carries Proton mail.
+            - {name: BOSS_MAIL_API_URL, value: "https://api.resend.com/emails"}
+            - {name: BOSS_AUTH_MAIL_FROM, value: "auth@send.algedonic.dev"}
+            - name: BOSS_MAIL_API_TOKEN
+              valueFrom: {secretKeyRef: {name: resend, key: api-key}}
+            - {name: RUST_LOG, value: info}
+          ports:
+            - {containerPort: 4443, name: gateway}
+          readinessProbe:
+            # `/` is unauthenticated (the SPA index); /healthz requires a
+            # session by design, so it is the wrong probe target.
+            httpGet: {path: /, port: 4443}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 30
+          resources:
+            requests: {cpu: "2", memory: 4Gi}
+            limits: {memory: 12Gi}
+          volumeMounts:
+            # Writable, not :ro as the compose file has it. boss-auth
+            # ships in this image and is the sanctioned way to rotate the
+            # break-glass credential; read-only means the only way to
+            # provision one is a scale-down dance during an outage —
+            # exactly when you cannot afford it.
+            - {name: boss-auth, mountPath: /var/lib/boss/auth}
+            - {name: step-plugins, mountPath: /var/lib/boss/step-plugins, readOnly: true}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: boss-gateway
+  namespace: boss
+  annotations:
+    # Pinned so Caddy on GCP has a stable target across redeploys.
+    io.cilium/lb-ipam-ips: "10.20.0.30"
+spec:
+  type: LoadBalancer
+  selector: {app: boss}
+  ports:
+    - {port: 80, targetPort: 4443, name: http}

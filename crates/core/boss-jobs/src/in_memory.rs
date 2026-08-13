@@ -160,10 +160,16 @@ impl JobsRepository for InMemoryJobs {
         {
             let mut state = self.inner.lock().expect("poisoned");
             let key = job_key(&job.id);
-            if !state.jobs.contains_key(&key) {
+            let Some(existing) = state.jobs.get(&key) else {
                 return Err(JobsError::NotFound(job.id));
-            }
-            state.jobs.insert(key, job.clone());
+            };
+            // Mirror the Pg adapter: `simulated` is decided at
+            // admission and immutable — an update carries no
+            // authority over it. The storage enforces this rather
+            // than trusting every caller to.
+            let mut next = job.clone();
+            next.simulated = existing.simulated;
+            state.jobs.insert(key, next);
         }
         self.record_all(events);
         Ok(())

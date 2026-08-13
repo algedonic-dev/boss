@@ -1,0 +1,21 @@
+# Machine door for the BOSS jobs API — the system of record's write
+# path for off-cluster machinery (the train conductor on boss-gcp,
+# operator tooling over WireGuard). Same posture as the forge and
+# registry on this LAN: infrastructure door, never a human door;
+# humans stay behind the gateway at playground.algedonic.dev.
+# Born 2026-08-12 fixing the split-brain where the conductor wrote
+# its train bookkeeping to boss-gcp's legacy instance because the
+# SoR had no reachable jobs port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: boss-jobs-internal
+  namespace: boss
+  annotations:
+    metallb.universe.tf/loadBalancerIPs: "10.20.0.34"
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 10.20.0.34
+  selector: {app: boss}
+  ports:
+    - {port: 7900, targetPort: 7900, name: jobs}

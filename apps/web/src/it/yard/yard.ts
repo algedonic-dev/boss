@@ -20,6 +20,8 @@ export type JobLite = Readonly<{
   tags?: readonly string[];
   metadata?: Record<string, unknown> | null;
   steps?: readonly StepLite[];
+  /** Admission-fixed sim-vs-real flag on the Job row itself. */
+  simulated?: boolean;
 }>;
 
 // A car in the yard is a job packet, and it renders as a card (David's
@@ -68,9 +70,12 @@ export function protocolHue(kind: string): string {
   return PROTOCOL_PALETTE[(h >>> 0) % PROTOCOL_PALETTE.length] ?? PROTOCOL_PALETTE[0]!;
 }
 
-// Simulated is a fact on the packet (tag or metadata flag), never an
-// inference from where it came from.
-export function isSim(j: Pick<JobLite, 'tags' | 'metadata'>): boolean {
+// Simulated is a fact on the packet, never an inference from where it
+// came from. The Job's own admission-fixed `simulated` field is the
+// source of truth; the tag / metadata conventions stay as fallback for
+// packets that predate the field.
+export function isSim(j: Pick<JobLite, 'simulated' | 'tags' | 'metadata'>): boolean {
+  if (j.simulated === true) return true;
   const tagged = (j.tags ?? []).some(t =>
     ['sim', 'simulated', 'synthetic'].includes(t.toLowerCase()),
   );

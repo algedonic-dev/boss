@@ -5,10 +5,13 @@
 # The deployment half of the forge shipping protocol (directive
 # 27ab7680): the conductor merges CI-green trains into forge main;
 # this runner, on the forge host, notices main moved, builds the
-# all-in-one image, pushes it to the forge registry, and rolls the
+# all-in-one image, pushes it to the forge registry, applies the
+# tree's cluster manifests (infra/cluster/manifests/), and rolls the
 # cluster deployment. Derived state reconverging on intent
 # (deployment-as-network) — no ssh from the conductor, no shared
-# credentials: each side touches only what it owns.
+# credentials: each side touches only what it owns. Cluster config
+# converges on forge main exactly like code does; hand-applied
+# changes are drift (see infra/cluster/manifests/README.md).
 #
 # Install (forge host):
 #   sudo cp infra/forge/cluster-deploy-runner.{service,timer} /etc/systemd/system/
@@ -41,6 +44,17 @@ docker build -q -f infra/oss-quickstart/Dockerfile -t "$REGISTRY:$HEAD" .
 docker push "$REGISTRY:$HEAD"
 
 K="sudo docker run --rm --network host -v $KUBECONFIG_PATH:/kc:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
+
+# Cluster config converges with the code: apply the tree's manifests
+# idempotently (secrets are referenced by name and stay out-of-tree).
+# Apply comes BEFORE the image roll so the tag built above — not the
+# placeholder tag committed in boss.yaml — is what the cluster ends
+# on. A failed apply aborts here (set -e): no stamp is written, the
+# next timer run retries.
+KM="sudo docker run --rm --network host -v $KUBECONFIG_PATH:/kc:ro -v $REPO/infra/cluster/manifests:/manifests:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
+echo "cluster-deploy-runner: applying infra/cluster/manifests"
+$KM apply -f /manifests
+
 $K set image -n boss deploy/boss "boss=$REGISTRY:$HEAD"
 $K patch deploy boss -n boss --type=json \
     -p "[{\"op\":\"replace\",\"path\":\"/spec/template/spec/initContainers/0/image\",\"value\":\"$REGISTRY:$HEAD\"}]"

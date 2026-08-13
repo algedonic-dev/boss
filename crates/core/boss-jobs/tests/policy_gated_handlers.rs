@@ -48,6 +48,7 @@ fn job_owned_by(id: &str, owner: &str) -> Job {
         closed_on: None,
         metadata: serde_json::Value::Null,
         tags: vec![],
+        simulated: false,
     }
 }
 
