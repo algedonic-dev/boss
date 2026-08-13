@@ -47,6 +47,17 @@ Wants=network-online.target
 # and instances), and runs the verb as a child of the same binary —
 # so the conductor's flock, journal lines, and exit codes behave
 # exactly as they did under the timers.
+#
+# A verb runs BESIDE the loop, not inside it: a reconcile that
+# deploys can take 30+ minutes, and awaiting it inline used to stop
+# every other rule AND the heartbeat for that whole window (job
+# 9c5871fa). Ticks now keep evaluating while a verb runs, with one
+# in-flight run per rule; overlap between different rules is settled
+# by the conductor's own flock, which is what it was always for.
+# On stop, the loop waits BOSS_TRAIN_CADENCE_DRAIN_SECONDS (default
+# 30, comfortably inside systemd's 90s TimeoutStopSec) for in-flight
+# verbs and journals any that outlast it — a cut-short run is a
+# claimed firing row with no rc.
 User=david
 # /var/lib/boss-train — the conductor's own clone + lock live here,
 # never in the dev working tree.

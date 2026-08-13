@@ -23,11 +23,29 @@
 //! downtime fires at most the single most-recent missed window per
 //! rule — a deliberate no-thundering-backfill choice matching the
 //! conductor's one-window-at-a-time cadence (protocol-cadence Q3).
-//! An in-flight verb cannot be double-fired: the loop runs verbs to
-//! completion before the next tick, and a manually-started conductor
-//! holds the flock, which makes the child exit clean.
+//!
+//! **A verb runs beside the loop, never inside it.** Job 9c5871fa
+//! (2026-08-13 10:00–10:20Z): a reconcile that deployed took 30+
+//! minutes — a core-crate change forces a full workspace rebuild —
+//! and because the tick awaited it inline, nothing else fired for
+//! that whole window: no later reconcile, no queue-depth evaluation,
+//! and no heartbeat. The scheduler went deaf exactly when an operator
+//! most wanted to know it was alive. So a firing now spawns its verb
+//! as a tracked task (`Runs`) and the tick returns; the task waits on
+//! the child, journals the completion line, and merges rc + runtime
+//! into the row it already claimed.
+//!
+//! What replaces the old "one verb at a time" serialization is a
+//! guard scoped to what actually needs it: **one in-flight run per
+//! rule**. A rule whose previous firing is still going skips its next
+//! window loudly (`<rule> still running (<n>s) — not re-firing`) and
+//! claims nothing. DIFFERENT rules may overlap on purpose — the
+//! conductor's flock is the arbiter of whether two verbs can really
+//! proceed, and its "another conductor run holds the lock — leaving"
+//! is the correct, already-designed outcome for the loser. A second
+//! lock in this loop would only re-implement it worse.
 
-use std::process::Command;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -37,6 +55,7 @@ use chrono::{DateTime, Duration, NaiveTime, Timelike, Utc};
 use serde_json::{Value, json};
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
+use tokio::task::JoinHandle;
 
 use crate::train;
 
@@ -182,6 +201,102 @@ pub(crate) fn due_window(
         return None;
     }
     Some(window)
+}
+
+/// One run this loop spawned and has not yet reaped: which rule it
+/// belongs to, and how long it has been going. Plain data because
+/// both readers — the per-rule guard and the heartbeat — are pure
+/// functions of it, testable without a child process or a clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunSnapshot {
+    pub rule: String,
+    pub elapsed: std::time::Duration,
+}
+
+/// What a tick decided about one rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Decision {
+    /// Not due this tick.
+    Hold,
+    /// Due for this window: claim it, then spawn the verb.
+    Fire(DateTime<Utc>),
+    /// Due, but this rule's previous firing is still running. One
+    /// in-flight run per rule — skip the window, claim nothing, say
+    /// so in the journal. The elapsed time is the run's, not the
+    /// window's: it is the number an operator wants.
+    StillRunning(std::time::Duration),
+}
+
+/// The whole per-tick scheduling decision for one rule, as a pure
+/// function of (rule, boss-clock now, last firing, dock depth,
+/// what this loop already has in flight).
+pub(crate) fn decide(
+    rule: &CadenceRule,
+    now: DateTime<Utc>,
+    last: Option<&LastFiring>,
+    dock_depth: Option<u32>,
+    running: &[RunSnapshot],
+) -> Decision {
+    let Some(window) = due_window(rule, now, last, dock_depth) else {
+        return Decision::Hold;
+    };
+    // Per rule, deliberately: a long reconcile must not gag the
+    // boarding window or the queue-depth board. Overlap between
+    // rules is the conductor's flock to arbitrate, not this loop's.
+    match running.iter().find(|r| r.rule == rule.name) {
+        Some(run) => Decision::StillRunning(run.elapsed),
+        None => Decision::Fire(window),
+    }
+}
+
+/// Whole elapsed seconds — the one conversion the completion line,
+/// the still-running line, the heartbeat, and the firing row's
+/// `runtime_secs` all read, so none of them can disagree.
+pub(crate) fn runtime_secs(elapsed: std::time::Duration) -> u64 {
+    elapsed.as_secs()
+}
+
+/// `<rule> verb=<verb> rc=<n> in <t>s` — a firing's obituary,
+/// journalled by the spawned task with its true elapsed time.
+pub(crate) fn completion_line(rule: &str, verb: &str, rc: i32, runtime_secs: u64) -> String {
+    format!("{rule} verb={verb} rc={rc} in {runtime_secs}s")
+}
+
+/// The skipped-window line. A window that does not fire must say why;
+/// silence here would look exactly like the deafness this fixes.
+pub(crate) fn still_running_line(rule: &str, elapsed: std::time::Duration) -> String {
+    format!(
+        "{rule} still running ({}s) — not re-firing",
+        runtime_secs(elapsed)
+    )
+}
+
+/// `<rule> <n>s, ...` — in-flight work, named and aged.
+fn running_list(running: &[RunSnapshot]) -> String {
+    running
+        .iter()
+        .map(|r| format!("{} {}s", r.rule, runtime_secs(r.elapsed)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The heartbeat: one line every N ticks saying the loop is alive,
+/// what it is waiting for, and — the point of this fix — what it is
+/// currently running. A 30-minute deploy now prints heartbeats
+/// throughout instead of 30 minutes of silence.
+pub(crate) fn heartbeat_line(
+    tick_n: u64,
+    rules: usize,
+    next_due: Option<DateTime<Utc>>,
+    running: &[RunSnapshot],
+) -> String {
+    let due = next_due.map_or_else(|| "?".to_string(), window_stamp);
+    let work = if running.is_empty() {
+        String::new()
+    } else {
+        format!(", running: {}", running_list(running))
+    };
+    format!("alive (tick {tick_n}, {rules} rules, next due {due}{work})")
 }
 
 /// The soonest scheduled window strictly after `now` across the
@@ -452,30 +567,133 @@ async fn probe_dock_depth() -> Result<u32> {
 /// return its exit code. The conductor's own flock makes an overlap
 /// with a manually-started run exit clean, and a preflight exit 3
 /// lands here as data instead of killing the loop.
-fn run_verb(verb: &str) -> Result<i32> {
+async fn run_verb(verb: &str) -> Result<i32> {
     if !VERBS.contains(&verb) {
         bail!("refusing to run unknown verb {verb:?}");
     }
     let exe = std::env::current_exe().context("resolving the boss binary path")?;
-    let status = Command::new(exe)
+    let status = tokio::process::Command::new(exe)
         .args(["train", verb])
         .status()
+        .await
         .with_context(|| format!("spawning boss train {verb}"))?;
     Ok(status.code().unwrap_or(-1))
 }
 
+/// A spawned verb the loop is still tracking.
+struct Run {
+    started: Instant,
+    handle: JoinHandle<()>,
+}
+
+/// The verbs this loop has in flight, at most one per rule. A
+/// `BTreeMap` and not a `HashMap` so the heartbeat's "running: ..."
+/// reads the same way every time — a journal line that shuffles its
+/// own fields is a line operators stop trusting.
+#[derive(Default)]
+struct Runs {
+    inner: BTreeMap<String, Run>,
+}
+
+impl Runs {
+    /// Adopt a spawned task under `rule`'s guard. `started` comes
+    /// from the caller so the heartbeat's elapsed and the firing
+    /// row's `runtime_secs` measure from one instant, not two.
+    fn track(&mut self, rule: &str, started: Instant, handle: JoinHandle<()>) {
+        self.inner.insert(rule.to_string(), Run { started, handle });
+    }
+
+    /// Release the guards of runs that have finished. Called at the
+    /// top of every tick: a run that ended since the last tick must
+    /// not cost its rule an extra window.
+    fn reap(&mut self) {
+        self.inner.retain(|_, run| !run.handle.is_finished());
+    }
+
+    fn snapshot(&self) -> Vec<RunSnapshot> {
+        self.inner
+            .iter()
+            .map(|(rule, run)| RunSnapshot {
+                rule: rule.clone(),
+                elapsed: run.started.elapsed(),
+            })
+            .collect()
+    }
+
+    /// Wait for the in-flight runs to finish, up to `budget`
+    /// (`None` = as long as it takes). Returns whatever is still
+    /// running when the budget expires — the loop reports those
+    /// rather than pretending they ended.
+    async fn drain(&mut self, budget: Option<std::time::Duration>) -> Vec<RunSnapshot> {
+        let waiting_since = Instant::now();
+        loop {
+            self.reap();
+            if self.inner.is_empty() {
+                return Vec::new();
+            }
+            if budget.is_some_and(|b| waiting_since.elapsed() >= b) {
+                return self.snapshot();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Spawn a claimed firing's verb beside the loop. The task owns
+    /// the whole tail of the firing — waiting on the child, merging
+    /// rc + runtime into the claimed row, and journalling the
+    /// completion line — so none of it depends on the loop being
+    /// free, and the loop is free immediately.
+    fn spawn_verb(&mut self, pool: &PgPool, rule: &CadenceRule, firing_id: String) {
+        let pool = pool.clone();
+        let name = rule.name.clone();
+        let verb = rule.verb.clone();
+        let started = Instant::now();
+        let handle = tokio::spawn(async move {
+            let rc = match run_verb(&verb).await {
+                Ok(rc) => rc,
+                Err(e) => {
+                    // The verb never started. Say so, then record it
+                    // like any other failure: an unfinished claim with
+                    // no rc would look like a loop that lost the run.
+                    log(format!("{name} verb={verb} could not start: {e:#}"));
+                    -1
+                }
+            };
+            let secs = runtime_secs(started.elapsed());
+            if let Err(e) = record_outcome(&pool, &firing_id, rc, secs).await {
+                log(format!(
+                    "{name}: recording the firing outcome failed: {e:#}"
+                ));
+            }
+            log(completion_line(&name, &verb, rc, secs));
+        });
+        self.track(&rule.name, started, handle);
+    }
+}
+
 /// What a tick saw — fodder for the heartbeat line.
+#[derive(Default)]
 struct TickSummary {
     rules: usize,
     next_due: Option<DateTime<Utc>>,
 }
 
-async fn tick(pool: &PgPool, clock: &dyn ClockClient, dry: bool) -> Result<TickSummary> {
+async fn tick(
+    pool: &PgPool,
+    clock: &dyn ClockClient,
+    dry: bool,
+    runs: &mut Runs,
+) -> Result<TickSummary> {
     // Boss-clock time is the only "now" in this loop (clock-as-service;
     // the no-wallclock invariant). In the wall-mode production deploy
     // it IS wall time — served by the one authoritative clock.
     let now = clock.now().await.now;
     let rules = load_rules(pool).await?;
+    // Release the guards of runs that finished since the last tick,
+    // then read the survivors once — every rule this tick is judged
+    // against the same picture of what is in flight.
+    runs.reap();
+    let running = runs.snapshot();
     // One dock probe per tick, and only when a queue-depth rule is
     // active. A failed probe holds those rules; it never fires blind.
     let mut dock_depth: Option<u32> = None;
@@ -490,8 +708,13 @@ async fn tick(pool: &PgPool, clock: &dyn ClockClient, dry: bool) -> Result<TickS
     }
     for rule in &rules {
         let last = last_firing(pool, &rule.name).await?;
-        let Some(window) = due_window(rule, now, last.as_ref(), dock_depth) else {
-            continue;
+        let window = match decide(rule, now, last.as_ref(), dock_depth, &running) {
+            Decision::Hold => continue,
+            Decision::StillRunning(elapsed) => {
+                log(still_running_line(&rule.name, elapsed));
+                continue;
+            }
+            Decision::Fire(window) => window,
         };
         let id = firing_id(&rule.name, window);
         if dry {
@@ -514,19 +737,44 @@ async fn tick(pool: &PgPool, clock: &dyn ClockClient, dry: bool) -> Result<TickS
             rule.verb,
             rule.basis.as_str()
         ));
-        let started = Instant::now();
-        let rc = run_verb(&rule.verb)?;
-        let runtime_secs = started.elapsed().as_secs();
-        record_outcome(pool, &id, rc, runtime_secs).await?;
-        log(format!(
-            "{} verb={} rc={rc} in {runtime_secs}s",
-            rule.name, rule.verb
-        ));
+        // Spawn and move on. The tick that fires a 30-minute deploy
+        // ends in milliseconds like any other.
+        runs.spawn_verb(pool, rule, id);
     }
     Ok(TickSummary {
         rules: rules.len(),
         next_due: next_due(&rules, now),
     })
+}
+
+/// Stop evaluating and settle up with whatever is in flight. A
+/// running verb is a real child process doing real work (a merge, a
+/// deploy); the loop owes the journal an honest account of it either
+/// way. Wait up to `budget` for it to finish — the common case, since
+/// systemd's default `KillMode=control-group` SIGTERMs the child too
+/// and it exits promptly — and name whatever outlasts the budget.
+async fn shut_down(runs: &mut Runs, signal: &str, budget: std::time::Duration) {
+    runs.reap();
+    let in_flight = runs.snapshot();
+    if in_flight.is_empty() {
+        log(format!("{signal} — nothing in flight, leaving"));
+        return;
+    }
+    log(format!(
+        "{signal} — waiting up to {}s for {}",
+        budget.as_secs(),
+        running_list(&in_flight)
+    ));
+    for left in runs.drain(Some(budget)).await {
+        // Its claim stands with no rc: the window is not re-fired,
+        // and the missing outcome IS the record that the run was cut
+        // short rather than completed.
+        log(format!(
+            "{signal} — {} still running ({}s), leaving it without an outcome",
+            left.rule,
+            runtime_secs(left.elapsed)
+        ));
+    }
 }
 
 /// The `boss train cadence` entry: the supervised loop
@@ -535,7 +783,10 @@ async fn tick(pool: &PgPool, clock: &dyn ClockClient, dry: bool) -> Result<TickS
 pub async fn run(once: bool, dry: bool) -> Result<()> {
     let pg_url = train::env_or("BOSS_POSTGRES_URL", "postgres://boss:boss@127.0.0.1/boss");
     let pool = PgPoolOptions::new()
-        .max_connections(2)
+        // The loop's own queries plus a connection for each spawned
+        // verb's closing `record_outcome` — with verbs beside the
+        // loop rather than inside it, those can now coincide.
+        .max_connections(4)
         .connect(&pg_url)
         .await
         .context("connecting to Postgres for cadence_rules")?;
@@ -553,36 +804,72 @@ pub async fn run(once: bool, dry: bool) -> Result<()> {
         .ok()
         .filter(|&n| n > 0)
         .unwrap_or(30);
+    // How long a SIGTERM waits for an in-flight verb before naming it
+    // and leaving. Long enough for a child that got the same SIGTERM
+    // to wind down; far short of a full deploy, which no restart
+    // should be made to sit through.
+    let drain = std::time::Duration::from_secs(
+        train::env_or("BOSS_TRAIN_CADENCE_DRAIN_SECONDS", "30")
+            .parse::<u64>()
+            .unwrap_or(30),
+    );
     log(format!(
         "loop starting — rules from cadence_rules, clock at {clock_url}, tick {tick_secs}s{}",
         if dry { ", DRY" } else { "" }
     ));
+    let mut runs = Runs::default();
+    if once {
+        // One evaluated tick — but an operator (or a test) asking for
+        // it wants the verb's result, and a detached child would die
+        // with this process. Wait it out; only the supervised loop
+        // gets to move on while a verb runs.
+        let outcome = tick(&pool, clock.as_ref(), dry, &mut runs).await;
+        runs.drain(None).await;
+        return outcome.map(|_| ());
+    }
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing the SIGTERM handler")?;
+    let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("installing the SIGINT handler")?;
     let mut tick_n: u64 = 0;
+    // The last tick that got as far as reading the registry. A failed
+    // tick must not cost the heartbeat its content — "alive" with a
+    // stale rule count still beats silence.
+    let mut seen = TickSummary::default();
     loop {
         tick_n += 1;
-        let outcome = tick(&pool, clock.as_ref(), dry).await;
-        if once {
-            return outcome.map(|_| ());
+        match tick(&pool, clock.as_ref(), dry, &mut runs).await {
+            // The loop survives a bad tick — supervision is systemd's
+            // job, coordination is this loop's; a transient jobs-api
+            // or Postgres outage must not kill the schedule.
+            Err(e) => log(format!("tick failed: {e:#}")),
+            Ok(summary) => seen = summary,
         }
-        match outcome {
-            Err(e) => {
-                // The loop survives a bad tick — supervision is systemd's
-                // job, coordination is this loop's; a transient jobs-api
-                // or Postgres outage must not kill the schedule.
-                log(format!("tick failed: {e:#}"));
-            }
-            Ok(summary) if tick_n.is_multiple_of(heartbeat_ticks) => {
-                let due = summary
-                    .next_due
-                    .map_or_else(|| "?".to_string(), window_stamp);
-                log(format!(
-                    "alive (tick {tick_n}, {} rules, next due {due})",
-                    summary.rules
-                ));
-            }
-            Ok(_) => {}
+        if tick_n.is_multiple_of(heartbeat_ticks) {
+            // Unconditional: the heartbeat is the aliveness signal,
+            // so neither a long verb nor a failing tick may suppress
+            // it. That silence is the whole bug being fixed.
+            log(heartbeat_line(
+                tick_n,
+                seen.rules,
+                seen.next_due,
+                &runs.snapshot(),
+            ));
         }
-        tokio::time::sleep(std::time::Duration::from_secs(tick_secs)).await;
+        // The signal handlers are installed once, above, so a signal
+        // that arrives mid-tick is still waiting here when the tick
+        // ends — it is never dropped for landing at a busy moment.
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(tick_secs)) => {}
+            _ = term.recv() => {
+                shut_down(&mut runs, "SIGTERM", drain).await;
+                return Ok(());
+            }
+            _ = int.recv() => {
+                shut_down(&mut runs, "SIGINT", drain).await;
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -864,6 +1151,207 @@ mod tests {
             firing_id("r", utc(2026, 8, 12, 6, 0, 59)),
             firing_id("r", utc(2026, 8, 12, 6, 0, 1))
         );
+    }
+
+    // -- the per-rule in-flight guard --------------------------------------
+    //
+    // Job 9c5871fa, 2026-08-13 10:00–10:20Z: a reconcile that deployed
+    // ran 30+ minutes INSIDE the tick, and for that whole window no
+    // rule fired and no heartbeat printed — the scheduler went deaf
+    // exactly when an operator wanted to know it was alive. Verbs now
+    // spawn; these pin what the loop may decide while one is running.
+
+    fn running(rule: &str, secs: u64) -> RunSnapshot {
+        RunSnapshot {
+            rule: rule.into(),
+            elapsed: std::time::Duration::from_secs(secs),
+        }
+    }
+
+    #[test]
+    fn a_due_rule_with_nothing_in_flight_fires() {
+        let rule = wall_rule(10);
+        let last = fired(&rule, utc(2026, 8, 13, 10, 0, 0));
+        assert_eq!(
+            decide(&rule, utc(2026, 8, 13, 10, 10, 0), Some(&last), None, &[]),
+            Decision::Fire(utc(2026, 8, 13, 10, 10, 0))
+        );
+    }
+
+    #[test]
+    fn the_same_rule_still_running_does_not_re_fire() {
+        let rule = wall_rule(10);
+        // 10:00 fired and is still deploying at 10:10. The next bucket
+        // is due, but this rule already holds a verb — skip the window
+        // and claim nothing, so the firing row stays honest.
+        let last = fired(&rule, utc(2026, 8, 13, 10, 0, 0));
+        assert_eq!(
+            decide(
+                &rule,
+                utc(2026, 8, 13, 10, 10, 0),
+                Some(&last),
+                None,
+                &[running("train-reconcile", 612)],
+            ),
+            Decision::StillRunning(std::time::Duration::from_secs(612))
+        );
+    }
+
+    #[test]
+    fn a_different_rules_run_does_not_block_this_one() {
+        // The guard is per rule, never global: the conductor's flock
+        // arbitrates whether two verbs may actually proceed, and its
+        // "another conductor run holds the lock — leaving" is the
+        // right outcome for the loser. This loop adds no second lock.
+        let rule = clock_rule(); // train-window
+        let now = utc(2026, 8, 13, 18, 0, 0);
+        assert_eq!(
+            decide(&rule, now, None, None, &[running("train-reconcile", 1_800)]),
+            Decision::Fire(now)
+        );
+    }
+
+    #[test]
+    fn a_rule_that_is_not_due_holds_whatever_else_runs() {
+        let rule = wall_rule(10);
+        let last = fired(&rule, utc(2026, 8, 13, 10, 0, 0));
+        let mid_bucket = utc(2026, 8, 13, 10, 5, 0);
+        for r in [
+            Vec::new(),
+            vec![running("train-reconcile", 300)],
+            vec![running("train-window", 300)],
+        ] {
+            assert_eq!(
+                decide(&rule, mid_bucket, Some(&last), None, &r),
+                Decision::Hold
+            );
+        }
+    }
+
+    #[test]
+    fn the_still_running_line_names_the_rule_and_its_elapsed() {
+        assert_eq!(
+            still_running_line("train-reconcile", std::time::Duration::from_secs(612)),
+            "train-reconcile still running (612s) — not re-firing"
+        );
+    }
+
+    // -- the heartbeat under load ------------------------------------------
+
+    #[test]
+    fn the_heartbeat_reports_in_flight_work() {
+        assert_eq!(
+            heartbeat_line(
+                30,
+                3,
+                Some(utc(2026, 8, 13, 10, 10, 0)),
+                &[running("train-reconcile", 412)],
+            ),
+            "alive (tick 30, 3 rules, next due 2026-08-13T10:10Z, \
+             running: train-reconcile 412s)"
+        );
+    }
+
+    #[test]
+    fn the_heartbeat_with_nothing_running_is_the_line_it_always_was() {
+        assert_eq!(
+            heartbeat_line(30, 3, Some(utc(2026, 8, 13, 10, 10, 0)), &[]),
+            "alive (tick 30, 3 rules, next due 2026-08-13T10:10Z)"
+        );
+        // No rule carries a schedule (or the last tick failed): the
+        // loop still says it is alive, with an honest "?".
+        assert_eq!(
+            heartbeat_line(60, 1, None, &[]),
+            "alive (tick 60, 1 rules, next due ?)"
+        );
+    }
+
+    #[test]
+    fn the_heartbeat_lists_every_in_flight_run_in_a_stable_order() {
+        assert_eq!(
+            heartbeat_line(
+                90,
+                3,
+                None,
+                &[running("train-reconcile", 412), running("train-window", 7)],
+            ),
+            "alive (tick 90, 3 rules, next due ?, running: train-reconcile 412s, train-window 7s)"
+        );
+    }
+
+    // -- elapsed-time accounting -------------------------------------------
+
+    #[test]
+    fn elapsed_truncates_to_whole_seconds_everywhere() {
+        // The journal line and the firing row's runtime_secs are the
+        // same number by construction — one conversion, read twice.
+        let e = std::time::Duration::from_millis(412_900);
+        assert_eq!(runtime_secs(e), 412);
+        assert_eq!(
+            completion_line("train-reconcile", "reconcile", 0, runtime_secs(e)),
+            "train-reconcile verb=reconcile rc=0 in 412s"
+        );
+        assert_eq!(
+            still_running_line("train-reconcile", e),
+            "train-reconcile still running (412s) — not re-firing"
+        );
+    }
+
+    #[test]
+    fn a_long_deploy_reports_its_true_elapsed_time() {
+        // The 9c5871fa shape: a core-crate change forces a full
+        // workspace rebuild. Spawning must not cost the true runtime.
+        let e = std::time::Duration::from_secs(31 * 60 + 7);
+        assert_eq!(
+            completion_line("train-reconcile", "reconcile", 0, runtime_secs(e)),
+            "train-reconcile verb=reconcile rc=0 in 1867s"
+        );
+    }
+
+    // -- the tracked-run registry ------------------------------------------
+
+    #[tokio::test]
+    async fn a_finished_run_stops_holding_its_rules_guard() {
+        let mut runs = Runs::default();
+        let (done, wait) = tokio::sync::oneshot::channel::<()>();
+        runs.track(
+            "train-reconcile",
+            Instant::now(),
+            tokio::spawn(async move {
+                let _ = wait.await;
+            }),
+        );
+        assert_eq!(runs.snapshot().len(), 1);
+        runs.reap();
+        assert_eq!(
+            runs.snapshot().len(),
+            1,
+            "an unfinished run keeps its guard"
+        );
+        done.send(()).unwrap();
+        assert!(runs.drain(None).await.is_empty());
+        assert!(
+            runs.snapshot().is_empty(),
+            "a finished run releases its guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_reports_what_is_still_running_when_the_budget_expires() {
+        // Shutdown semantics: the loop never claims a verb finished
+        // that did not. Budget zero = report immediately, no wait.
+        let mut runs = Runs::default();
+        let (_hold, wait) = tokio::sync::oneshot::channel::<()>();
+        runs.track(
+            "train-reconcile",
+            Instant::now(),
+            tokio::spawn(async move {
+                let _ = wait.await;
+            }),
+        );
+        let left = runs.drain(Some(std::time::Duration::ZERO)).await;
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].rule, "train-reconcile");
     }
 }
 
