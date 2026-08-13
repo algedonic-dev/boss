@@ -100,6 +100,25 @@ support or certbot — verify against current Kanidm docs at install
 time. The gateway's OIDC callback stays behind the existing
 Cloudflare front.
 
+**Amended 2026-08-13 — the host moved, and this is the ratification.**
+What shipped on 2026-08-11 is not what the paragraph above proposes.
+Kanidm runs **in-cluster** as a StatefulSet at `10.20.0.31`, with an
+online-backup sidecar shipping to GCP hourly over a forced-command
+SSH key, reached from outside through the WireGuard hub. The
+TLS reasoning is unchanged and still correct — Kanidm terminates its
+own TLS, so nothing strips it — only the box it runs on changed.
+
+Ratified rather than reverted, on David's stated preference at the
+time ("I don't mind where Kanidm is. Wherever is most secure /
+useful"), because in-cluster is the more secure of the two: it keeps
+the identity provider inside the isolated VLAN alongside the only
+things it serves, and off a shared multi-purpose host that also
+carries the train conductor, the backups, and the public front door.
+A compromise of `boss-gcp` no longer reaches the IdP.
+
+Verified before writing this: `10.20.0.31:443` answers, and
+`/var/backups/kanidm` on boss-gcp is receiving the sidecar's shipments.
+
 ## Decision history
 
 Resolved 2026-08-10 through the in-app review flow — the

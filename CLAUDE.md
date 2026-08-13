@@ -230,8 +230,8 @@ conflict; `include_str!` needing compile-time literals is what a build
 script is for.
 
 ### 10. Core vs. Example Tenant
-The core state-machine OS lives under `crates/core/` (27 crates —
-`boss-core`, `boss-events`, `boss-jobs`, `boss-policy`,
+The core state-machine OS lives under `crates/core/` (
+among them `boss-core`, `boss-events`, `boss-jobs`, `boss-policy`,
 `boss-gateway`, `boss-observability`, `boss-cybernetics`,
 `boss-docs`, `boss-ml`, `boss-content`, `boss-testing`,
 `boss-dispatcher`, `boss-clock`, `boss-expr`, `boss-locations`, the
@@ -310,7 +310,7 @@ Four tier directories, each with a hard rule about what the tier
 can depend on. **Every PR is judged against the audit bar of
 the tier it touches.**
 
-- **`crates/core/` — Tier 1: Core state-machine OS** (27 crates).
+- **`crates/core/` — Tier 1: Core state-machine OS**.
   The generic state-machine modeling toolkit. Every BOSS
   deployment ships these regardless of what the tenant models.
   A non-company tenant (research lab, robot fleet, city
@@ -325,8 +325,8 @@ the tier it touches.**
   `boss-testing`, `boss-ports`, `boss-docs`, plus matching
   `*-client` crates.
 
-- **`crates/modules/` — Tier 2: Company-modeling layer**
-  (16 crates). Useful for modeling a company on top of the
+- **`crates/modules/` — Tier 2: Company-modeling layer**.
+  Useful for modeling a company on top of the
   core. A non-company tenant can deploy without these. Same
   hexagonal shape as Tier 1 (domain types + port + HTTP surface
   + projection rebuilder) but the *concepts* are business-shaped,
@@ -338,7 +338,7 @@ the tier it touches.**
   `boss-assets`, plus matching `*-client` HTTP-contract crates and
   `boss-ml-plugins`.
 
-- **`crates/orchestrators/` — Cross-tier orchestrators** (5).
+- **`crates/orchestrators/` — Cross-tier orchestrators**.
   Binaries that fan out across both tiers by design. The
   Tier-1-must-not-depend-on-Tier-2 rule applies to **libraries**,
   not orchestrators. An orchestrator's purpose IS to wire core
@@ -354,7 +354,7 @@ the tier it touches.**
   owned by the core `boss-dispatcher` crate, which subscribes to
   `step.done.<kind>` topics and runs data-driven rules.
 
-- **`crates/tenants/` — Tier 3: Tenants** (2). Tenant-specific
+- **`crates/tenants/` — Tier 3: Tenants**. Tenant-specific
   binaries. Crates: `boss-brewery-engine` (Algedonic Ales public
   demo) and `boss-used-device-shop-engine` (used-device-shop).
   Data-side seeds + Workflows for the brewery tenant live under

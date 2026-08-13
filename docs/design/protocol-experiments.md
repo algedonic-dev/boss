@@ -49,6 +49,45 @@ Three protocol changes fall straight out of that data:
    cadence trigger — `basis: queue-depth` joins wall|clock in
    protocol-cadence.md's row.)
 
+## The second experiment: consist size, 4 → 8
+
+Ran before this doc could describe it, which is itself a finding.
+
+**The arm.** `cadence_rules` row `train-board-on-dock-depth` v1
+(`min_dock_depth: 4`) retired, v2 (`min_dock_depth: 8`) published
+active — a registry edit, no deploy, which is the fat-protocol claim
+working exactly as advertised. Motivation was David's: CI is the
+bottleneck, so a deeper dock amortises a 20–40 minute `test` job over
+more cars.
+
+**The verdict.** David, 2026-08-13: *"Let's keep at 8 cars for now,
+until we get evidence that our repair rate is rising."* So 8 stands,
+with a named stopping condition rather than a fixed review date — the
+right shape for a protocol arm.
+
+**The problem with that stopping condition.** Repair rate is not
+measurable today. Cars get `ship-a-change` packets; the commits that
+repair a red train get none, and the `pr-train` Workflow has no field
+that can represent a repair round — train #21's `ci` step read
+`completed` through two failed CI runs. The two attribution timings
+this experiment has produced (~2 min for a semantic conflict on round
+1, ~2 min for a test failure on round 2) were written onto the train
+Job by hand. So the arm has a verdict and no instrument for its own
+exit condition. Filed as `bb86d687`; until it lands, "repair rate is
+rising" is a judgement someone makes from memory, which is the state
+this whole doc exists to end.
+
+**What the two rounds suggest so far** — anecdote, explicitly not
+data. The 8-vs-4 worry was that a bigger consist makes attribution
+hard. Both failures so far attributed in about two minutes, including
+the test failure where the compiler cannot point, because the
+assertion printed both strings and `git log -S` named the responsible
+car in one query. If that holds, the thing that governs attribution
+cost is how well a check reports itself, not how many cars are in the
+consist — which would make assertion quality, not consist size, the
+variable worth tuning. Two rounds cannot support that claim; they can
+only motivate measuring it.
+
 ## The capability
 
 Everything an experiment needs already exists as data; what is

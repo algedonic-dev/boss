@@ -274,7 +274,8 @@ else
   echo
   echo "Fix: replace with \`state.clock.now().await.now\` (in async handlers)"
   echo "or pass a DateTime<Utc> argument from a clock-routed caller."
-  echo "See docs/design/clock-as-service.md (or v1.0.5 commit 1a862d9a for context)."
+  echo "Why, and the full allowlist: the header of this script."
+  echo "History: v1.0.5 commit 1a862d9a, and #68 (116k mis-stamped rows)."
 fi
 
 # ============================================================

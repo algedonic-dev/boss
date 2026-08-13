@@ -10,7 +10,8 @@ revises its "timers never migrate" boundary ·
 [internal-forge.md](./internal-forge.md) — supersedes half of Q6's
 resolution, with its objection answered ·
 [job-packet-network.md](./job-packet-network.md) ·
-[clock-as-service (docs/design/clock-as-service.md)]
+the clock-as-service rule, documented in the header of
+`infra/lint/no-wallclock.sh` (no doc was ever written for it)
 
 ## The claim
 

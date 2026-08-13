@@ -34,7 +34,13 @@ fail() { printf "  %sFAIL%s %s\n" "$RED" "$RESET" "$1"; failures=$((failures + 1
 ok()   { printf "  %sok%s   %s\n" "$GREEN" "$RESET" "$1"; }
 
 PORTS_TS="apps/web/src/_generated/ports.ts"
+# Release first, then debug, then PATH. The debug fallback is what
+# makes this runnable straight after `infra/gate.sh`, whose build phase
+# is `cargo build --workspace` (debug) — without it the check could only
+# ever say "not found" on a machine that had just built everything,
+# which is a large part of why it never joined the gate roster.
 PORTS_BIN="${PORTS_BIN:-target/release/boss-ports-list}"
+[[ -x "$PORTS_BIN" ]] || PORTS_BIN="target/debug/boss-ports-list"
 [[ -x "$PORTS_BIN" ]] || PORTS_BIN="$(command -v boss-ports-list 2>/dev/null)"
 
 # --- 1. ports.ts matches the Rust source -------------------------------
@@ -53,10 +59,17 @@ else
     # on the caller's locale collation.
     expected_names="$("$PORTS_BIN" --json |
         jq -r '[.[].name] | sort | .[]')"
-    actual_names="$(grep -oE '"name":\s*"[a-z-]+"' "$PORTS_TS" |
-        sed -E 's/.*"name":\s*"([a-z-]+)".*/\1/' | sort -u)"
+    # `[[:space:]]`, never `\s`: BSD sed does not understand `\s`, so
+    # on macOS the substitution silently no-opped and every name came
+    # through as the raw `"name": "accounts"` match. The set compared
+    # equal on Linux and diverged on every Mac — which is how this file
+    # got recorded as "stale generated ports.ts" when it was in sync all
+    # along, and why the check sat outside the gate. Same portability
+    # rule no-secrets.sh states for its patterns.
+    actual_names="$(grep -oE '"name":[[:space:]]*"[a-z-]+"' "$PORTS_TS" |
+        sed -E 's/.*"name":[[:space:]]*"([a-z-]+)".*/\1/' | sort -u)"
     if [[ "$expected_names" == "$actual_names" ]]; then
-        ok "$PORTS_TS lists the same $(echo "$expected_names" | wc -l) services as boss-ports-list"
+        ok "$PORTS_TS lists the same $(echo "$expected_names" | wc -l | tr -d '[:space:]') services as boss-ports-list"
     else
         fail "service-name set diverges:"
         diff <(echo "$expected_names") <(echo "$actual_names") |

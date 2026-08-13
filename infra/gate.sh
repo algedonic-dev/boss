@@ -70,6 +70,7 @@ check "api-path-bypass-smell"    infra/lint/api-path-bypass-smell.sh
 check "dispatcher-actor-stamp"   infra/lint/dispatcher-actor-stamp.sh
 check "sim-boundary-audit"       infra/lint/sim-boundary-audit.sh
 check "tier-import-audit"        infra/lint/tier-import-audit.sh
+check "layer-order-audit"        infra/lint/layer-order-audit.sh
 check "no-wallclock"             infra/lint/no-wallclock.sh
 check "outbox-migration-ratchet" infra/lint/outbox-migration-ratchet.sh
 check "idempotence-ratchet"      infra/lint/idempotence-ratchet.sh

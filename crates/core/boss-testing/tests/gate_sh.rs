@@ -143,28 +143,64 @@ fn gate_script_covers_the_checks() {
         "--all-features",
         "cargo fmt -- --check",
     ];
-    // The lint roster. Listed HERE (not globbed from infra/lint/)
-    // because the directory legitimately holds non-gate scripts —
-    // nightly prod invariants, their systemd units. Trimming an entry
-    // from gate.sh without removing it here is the under-covering
-    // gate that shipped two red runs on PR #226.
-    let lints = [
-        "seed-bypass-smell.sh",
-        "no-todo-citation.sh",
-        "no-step-kind-match.sh",
-        "api-path-bypass-smell.sh",
-        "dispatcher-actor-stamp.sh",
-        "sim-boundary-audit.sh",
-        "tier-import-audit.sh",
-        "no-wallclock.sh",
-        "outbox-migration-ratchet.sh",
-        "idempotence-ratchet.sh",
-    ];
-    for needle in cargo_phases.iter().chain(lints.iter()) {
+    for needle in cargo_phases.iter() {
         assert!(
             gate.contains(needle),
             "infra/gate.sh no longer runs `{needle}` — the gate \
              under-covers what it existed to cover"
         );
     }
+
+    // The lint roster used to be hand-listed here, and by 2026-08-13 it
+    // had drifted to a strict subset: dispatcher-rules-ratchet,
+    // schema-converge and no-secrets all ran in gate.sh while this test
+    // said nothing about them, so any of the three — including the
+    // secret scanner — could have been deleted from the gate silently.
+    // That is the same under-covering shape PR #226 shipped twice, just
+    // one level up, so the roster is derived instead of restated
+    // (CLAUDE.md §9a).
+    //
+    // Every executable check in infra/lint/ must appear in gate.sh
+    // unless it is listed below with a reason. The directory does hold
+    // legitimate non-gate scripts — that was the original objection to
+    // globbing — but "which ones and why" is a decision that should be
+    // written down once, here, rather than expressed as absence.
+    let not_gated: &[(&str, &str)] = &[
+        (
+            "conservation-invariants.sh",
+            "live-DB sweep on a systemd timer, not a static check",
+        ),
+        (
+            "audit-ordering.sh",
+            "live-DB sweep; needs a populated audit_log to say anything",
+        ),
+        (
+            "no-snapshot-arrays.sh",
+            "needs a built workspace (boss-ports-list) — gating it is \
+             proposed separately; it is the check that would have caught \
+             the stale _generated/ports.ts",
+        ),
+    ];
+
+    let mut missing = Vec::new();
+    for entry in std::fs::read_dir(repo_root().join("infra/lint")).expect("read infra/lint") {
+        let path = entry.expect("dir entry").path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) if n.ends_with(".sh") => n.to_string(),
+            _ => continue,
+        };
+        if not_gated.iter().any(|(n, _)| *n == name) {
+            continue;
+        }
+        if !gate.contains(&name) {
+            missing.push(name);
+        }
+    }
+    missing.sort();
+    assert!(
+        missing.is_empty(),
+        "infra/lint/ holds check(s) that infra/gate.sh does not run: {missing:?}. \
+         Either add them to the gate, or add them to `not_gated` in this test \
+         with the reason they are exempt."
+    );
 }
