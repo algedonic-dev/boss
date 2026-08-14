@@ -80,6 +80,11 @@ check "migrations-append-only"   infra/lint/migrations-append-only.sh
 check "no-secrets"               infra/lint/no-secrets.sh
 check "invariant-register"       infra/lint/invariant-register.sh
 
+# The frontend type gate. Last, because it is the only check that
+# installs anything, and a Rust-only car should learn about its Rust
+# failures before waiting on a package install.
+check "svelte-check"             infra/lint/svelte-check.sh
+
 if [ "${#FAILED[@]}" -gt 0 ]; then
     echo "" >&2
     echo "gate: ${#FAILED[@]} check(s) failed: ${FAILED[*]}" >&2

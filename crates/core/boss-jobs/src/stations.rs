@@ -226,6 +226,13 @@ pub enum StationError {
     Conflict(String),
     #[error("invalid spec: {0}")]
     Invalid(String),
+    /// The spec parsed and is well-formed — it just describes a queue
+    /// that cannot behave as declared. Distinct from `Invalid` because
+    /// the caller gets a problem *list* to render, not a message, and
+    /// because it leaves as 422 rather than 400. See
+    /// [`crate::station_lint`].
+    #[error("station is not viable: {} problem(s)", .0.len())]
+    Unviable(Vec<crate::station_lint::StationLintError>),
     #[error("storage error: {0}")]
     Storage(String),
 }
@@ -423,6 +430,12 @@ impl StationRegistry for InMemoryStations {
             .ok_or_else(|| {
                 StationError::NotFound(format!("no draft to publish for station: {name}"))
             })?;
+
+        // The viability gate, against the row this call actually
+        // promotes — not a copy re-read by the caller, which could
+        // race a concurrent author. Same placement as the Workflow
+        // registry's, for the same reason.
+        crate::station_lint::gate_active(&latest_draft).map_err(StationError::Unviable)?;
 
         for ((n, _), row) in rows.iter_mut() {
             if n == name && row.status == WorkflowStatus::Active {
@@ -708,6 +721,12 @@ mod pg {
                 .map(row_to_spec)
                 .transpose()?
                 .ok_or_else(|| StationError::NotFound(format!("no draft to publish: {name}")))?;
+
+            // The viability gate, inside the transaction, against the
+            // row the flip below actually promotes. `?` here rolls the
+            // tx back untouched — an unviable draft never occupies the
+            // ACTIVE slot even for the length of a transaction.
+            crate::station_lint::gate_active(&promoted).map_err(StationError::Unviable)?;
 
             sqlx::query(
                 "UPDATE stations SET status = 'retired'

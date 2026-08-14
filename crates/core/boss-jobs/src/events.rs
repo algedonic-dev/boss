@@ -72,6 +72,13 @@ pub const JOB_CLOSED: &str = "jobs.job.closed";
 /// problems that condemned the row, so the log answers "why is this
 /// kind gone?" without a re-lint. Rebuild ignores it.
 pub const WORKFLOW_QUARANTINED: &str = "jobs.kind.quarantined";
+/// Boot found an ACTIVE station that fails the viability lint
+/// (`station_quarantine`) and retired it. Same contract as
+/// [`WORKFLOW_QUARANTINED`]: the sibling state event is the
+/// registry's own `jobs.station.retired`, and this marker is the loud
+/// one carrying the problems that condemned the row. Rebuild ignores
+/// it.
+pub const STATION_QUARANTINED: &str = "jobs.station.quarantined";
 
 /// The state-event payload for a Step: the serialized struct plus a
 /// top-level `step_id` — the same key every marker event uses.
@@ -134,6 +141,27 @@ pub fn workflow_quarantined_event(
         actor,
     );
     boss_core::event::Event::new("jobs", WORKFLOW_QUARANTINED, payload, now)
+}
+
+/// The loud marker for a station retired by the boot viability pass.
+/// Carries the problems that condemned the row so the log answers
+/// "why did this queue disappear?" without a re-lint.
+pub fn station_quarantined_event(
+    actor: &boss_core::actor::ActorId,
+    now: chrono::DateTime<chrono::Utc>,
+    spec: &crate::stations::StationSpec,
+    problems: &[crate::station_lint::StationLintError],
+) -> boss_core::event::Event {
+    let payload = boss_core::publisher::inject_actor(
+        serde_json::json!({
+            "name": spec.name,
+            "version": spec.version,
+            "title": spec.title,
+            "problems": crate::station_lint::problems_json(problems),
+        }),
+        actor,
+    );
+    boss_core::event::Event::new("jobs", STATION_QUARANTINED, payload, now)
 }
 
 /// A step-plugin registry event — same contract as

@@ -147,11 +147,32 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         .route("/api/jobs/{id}/stream", get(job_stream::<R, B>))
         .route("/api/jobs/step-types", get(list_step_types::<R, B>))
         // Station registry — data-defined priority queues over
-        // packets (docs/design/stations.md). Reads only; authoring
-        // ships as registry writes through the port (seed rows in
-        // 116-stations.sql today).
-        .route("/api/stations", get(list_stations::<R, B>))
+        // packets (docs/design/stations.md). Append-only and
+        // versioned like the Workflow registry, and editable at run
+        // time: a queue is redrawn by publishing a new version, never
+        // by a deploy.
+        .route(
+            "/api/stations",
+            get(list_stations::<R, B>).post(create_station::<R, B>),
+        )
+        // Author-time dry run: lint a spec without persisting, so the
+        // editor surfaces the same `station_lint::gate_active` the
+        // publish path enforces.
+        .route("/api/stations/_validate", post(validate_station::<R, B>))
         .route("/api/stations/{name}/queue", get(station_queue::<R, B>))
+        .route(
+            "/api/stations/{name}/versions",
+            get(list_station_versions::<R, B>),
+        )
+        .route(
+            "/api/stations/{name}/versions/{version}",
+            get(get_station_version::<R, B>),
+        )
+        .route(
+            "/api/stations/{name}/publish",
+            post(publish_station::<R, B>),
+        )
+        .route("/api/stations/{name}/retire", post(retire_station::<R, B>))
         .route("/api/jobs/{id}/steps", get(list_steps::<R, B>))
         .route("/api/jobs/{id}/steps", post(add_step::<R, B>))
         .route("/api/jobs/{id}/steps/{step_id}", put(update_step::<R, B>))

@@ -33,7 +33,19 @@ failures=0
 fail() { printf "  %sFAIL%s %s\n" "$RED" "$RESET" "$1"; failures=$((failures + 1)); }
 ok()   { printf "  %sok%s   %s\n" "$GREEN" "$RESET" "$1"; }
 
-PORTS_TS="apps/web/src/_generated/ports.ts"
+# BOTH generated copies. The fact lives three times — boss-ports (the
+# Rust source of truth) and one _generated/ports.ts per SPA — and this
+# check used to pin only the web copy. On 2026-08-13 the simulator copy
+# was found 20 lines short, missing `search`, `views` and `campaigns`
+# entirely, while the web copy was correct: the guarded copy stayed in
+# sync and the unguarded one silently rotted. A guard that covers one of
+# two duplicates is not a guard on the duplication, which is the whole
+# point of CLAUDE.md §9a. Collapsing to a single shared module is the
+# real fix; pinning both is the holding action until then.
+PORTS_TS_FILES=(
+    "apps/web/src/_generated/ports.ts"
+    "apps/simulator/src/_generated/ports.ts"
+)
 # Release first, then debug, then PATH. The debug fallback is what
 # makes this runnable straight after `infra/gate.sh`, whose build phase
 # is `cargo build --workspace` (debug) — without it the check could only
@@ -47,9 +59,7 @@ PORTS_BIN="${PORTS_BIN:-target/release/boss-ports-list}"
 
 printf '\n%s\n' "[1/2] _generated/ports.ts ↔ boss-ports::lib"
 
-if [[ ! -f "$PORTS_TS" ]]; then
-    fail "$PORTS_TS missing — run \`bun run build\` in apps/web/"
-elif [[ -z "$PORTS_BIN" || ! -x "$PORTS_BIN" ]]; then
+if [[ -z "$PORTS_BIN" || ! -x "$PORTS_BIN" ]]; then
     fail "boss-ports-list not found (set PORTS_BIN= or build the workspace)"
 else
     # Compare the SET of service names. Order + scratch ports are
@@ -59,23 +69,30 @@ else
     # on the caller's locale collation.
     expected_names="$("$PORTS_BIN" --json |
         jq -r '[.[].name] | sort | .[]')"
-    # `[[:space:]]`, never `\s`: BSD sed does not understand `\s`, so
-    # on macOS the substitution silently no-opped and every name came
-    # through as the raw `"name": "accounts"` match. The set compared
-    # equal on Linux and diverged on every Mac — which is how this file
-    # got recorded as "stale generated ports.ts" when it was in sync all
-    # along, and why the check sat outside the gate. Same portability
-    # rule no-secrets.sh states for its patterns.
-    actual_names="$(grep -oE '"name":[[:space:]]*"[a-z-]+"' "$PORTS_TS" |
-        sed -E 's/.*"name":[[:space:]]*"([a-z-]+)".*/\1/' | sort -u)"
-    if [[ "$expected_names" == "$actual_names" ]]; then
-        ok "$PORTS_TS lists the same $(echo "$expected_names" | wc -l | tr -d '[:space:]') services as boss-ports-list"
-    else
-        fail "service-name set diverges:"
-        diff <(echo "$expected_names") <(echo "$actual_names") |
-            sed 's/^/         /'
-        echo "       Fix: \`cd apps/web && bun run build\` regenerates from boss-ports-list."
-    fi
+    for PORTS_TS in "${PORTS_TS_FILES[@]}"; do
+        app="${PORTS_TS#apps/}"; app="${app%%/*}"
+        if [[ ! -f "$PORTS_TS" ]]; then
+            fail "$PORTS_TS missing — run \`bun run build\` in apps/$app/"
+            continue
+        fi
+        # `[[:space:]]`, never `\s`: BSD sed does not understand `\s`, so
+        # on macOS the substitution silently no-opped and every name came
+        # through as the raw `"name": "accounts"` match. The set compared
+        # equal on Linux and diverged on every Mac — which is how this file
+        # got recorded as "stale generated ports.ts" when it was in sync all
+        # along, and why the check sat outside the gate. Same portability
+        # rule no-secrets.sh states for its patterns.
+        actual_names="$(grep -oE '"name":[[:space:]]*"[a-z-]+"' "$PORTS_TS" |
+            sed -E 's/.*"name":[[:space:]]*"([a-z-]+)".*/\1/' | sort -u)"
+        if [[ "$expected_names" == "$actual_names" ]]; then
+            ok "$PORTS_TS lists the same $(echo "$expected_names" | wc -l | tr -d '[:space:]') services as boss-ports-list"
+        else
+            fail "service-name set diverges in $PORTS_TS:"
+            diff <(echo "$expected_names") <(echo "$actual_names") |
+                sed 's/^/         /'
+            echo "       Fix: \`cd apps/$app && bun run build\` regenerates from boss-ports-list."
+        fi
+    done
 fi
 
 # --- 2. dev-server.ts + MonitoringPage.svelte import from _generated ---

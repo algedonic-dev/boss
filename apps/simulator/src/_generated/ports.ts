@@ -53,6 +53,16 @@ export const PORTS: ReadonlyArray<PortRow> = [
     "scratch": 8900
   },
   {
+    "name": "search",
+    "prod": 7960,
+    "scratch": null
+  },
+  {
+    "name": "views",
+    "prod": 7961,
+    "scratch": null
+  },
+  {
     "name": "simulator",
     "prod": 7010,
     "scratch": null
@@ -110,6 +120,16 @@ export const PORTS: ReadonlyArray<PortRow> = [
   {
     "name": "products",
     "prod": 7840,
+    "scratch": null
+  },
+  {
+    "name": "campaigns",
+    "prod": 7845,
+    "scratch": null
+  },
+  {
+    "name": "customers",
+    "prod": 7855,
     "scratch": null
   },
   {

@@ -35,7 +35,46 @@ fn station_err_response(err: StationError) -> Response {
         StationError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
         StationError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
         StationError::Invalid(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+        // 422, not 400: the spec parsed and is well-formed JSON — it
+        // just describes a queue that cannot behave as declared. Body
+        // is the same `{ok, problems}` shape `_validate` returns, so
+        // the editor renders a refused publish exactly like a failed
+        // dry run.
+        StationError::Unviable(problems) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(lint_result_json(&problems)),
+        )
+            .into_response(),
         StationError::Storage(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    }
+}
+
+/// The lint result body — `{ok, problems}`. One definition shared by
+/// the author-time dry run (200) and the publish refusal (422).
+fn lint_result_json(problems: &[crate::station_lint::StationLintError]) -> serde_json::Value {
+    serde_json::json!({
+        "ok": problems.is_empty(),
+        "problems": crate::station_lint::problems_json(problems),
+    })
+}
+
+/// Station authoring is a network-configuration change, so it is
+/// gated on the `workflow` resource — the same privilege that governs
+/// the other registries a protocol is assembled from. A reader who
+/// may see queues still cannot redraw them.
+async fn station_policy_check<R: JobsRepository, B: EventBus>(
+    state: &JobsApiState<R, B>,
+    user: &boss_policy_client::User,
+    action: Action,
+) -> Result<(), Response> {
+    match state.policy.check(user, action, Resource::workflow()).await {
+        Ok(Decision::Allow { .. }) => Ok(()),
+        Ok(Decision::Deny { reason }) => Err((StatusCode::FORBIDDEN, reason).into_response()),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("policy check failed: {e}"),
+        )
+            .into_response()),
     }
 }
 
@@ -154,6 +193,152 @@ pub(super) async fn station_queue<R: JobsRepository + 'static, B: EventBus + 'st
     }
 
     Json(evaluate_station(&spec, packets, today)).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Authoring — the runtime write path
+// ---------------------------------------------------------------------------
+//
+// Stations are the substrate's routing table, and David's ratified
+// answer (2026-08-13) was that they must be editable at run time:
+// "stations need to be editable at run time. They should be data in a
+// registry." The registry and the port already existed; without these
+// routes the only way to redraw a queue was a SQL seed and a deploy,
+// which is precisely the leak the three-layer reading calls out — a
+// protocol that cannot be replaced without a deploy has leaked into
+// the substrate.
+
+/// `POST /api/stations` — append a draft version. Version numbering
+/// is the registry's business (max+1); a draft is work in progress and
+/// is deliberately NOT linted, matching the Workflow registry.
+pub(super) async fn create_station<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+    Json(spec): Json<crate::stations::StationSpec>,
+) -> Response {
+    let reg = match stations_or_503(&state) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    if let Err(r) = station_policy_check(&state, &user, Action::Create).await {
+        return r;
+    }
+    let (actor, now) = super::kinds::write_stamp(&state, &user).await;
+    match reg.create_draft(spec, &actor, now).await {
+        Ok(stored) => (StatusCode::CREATED, Json(stored)).into_response(),
+        Err(e) => station_err_response(e),
+    }
+}
+
+/// `POST /api/stations/_validate` — author-time dry run. Lints a spec
+/// WITHOUT persisting, calling the same `station_lint::gate_active`
+/// the publish path enforces, so an editor showing "no problems"
+/// publishes cleanly and a refused publish shows the same list.
+///
+/// Always 200: lint failures are data, not an HTTP error. The 422 on
+/// publish and this 200 carry the same body.
+pub(super) async fn validate_station<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+    Json(spec): Json<crate::stations::StationSpec>,
+) -> Response {
+    // Gated like create — the dry run is an authoring affordance.
+    if let Err(r) = station_policy_check(&state, &user, Action::Create).await {
+        return r;
+    }
+    let problems = match crate::station_lint::gate_active(&spec) {
+        Ok(()) => Vec::new(),
+        Err(p) => p,
+    };
+    (StatusCode::OK, Json(lint_result_json(&problems))).into_response()
+}
+
+/// `GET /api/stations/{name}/versions` — every version of one name,
+/// oldest first, drafts and retired included. The audit view: what
+/// this queue used to be, and what is staged to replace it.
+pub(super) async fn list_station_versions<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+    Path(name): Path<String>,
+) -> Response {
+    let reg = match stations_or_503(&state) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    if let Err(r) = station_policy_check(&state, &user, Action::Read).await {
+        return r;
+    }
+    match reg.list_versions(&name).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => station_err_response(e),
+    }
+}
+
+/// `GET /api/stations/{name}/versions/{version}` — one historical row.
+pub(super) async fn get_station_version<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+    Path((name, version)): Path<(String, i32)>,
+) -> Response {
+    let reg = match stations_or_503(&state) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    if let Err(r) = station_policy_check(&state, &user, Action::Read).await {
+        return r;
+    }
+    match reg.get_version(&name, version).await {
+        Ok(row) => Json(row).into_response(),
+        Err(e) => station_err_response(e),
+    }
+}
+
+/// `POST /api/stations/{name}/publish` — promote the latest draft to
+/// ACTIVE, retiring the incumbent.
+///
+/// The viability gate runs inside `StationRegistry::publish`, against
+/// the draft row the transaction actually promotes — not against a
+/// copy re-read here, which could race a concurrent author. An
+/// unviable draft comes back as `StationError::Unviable` and leaves as
+/// 422 + the problem list.
+pub(super) async fn publish_station<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+    Path(name): Path<String>,
+) -> Response {
+    let reg = match stations_or_503(&state) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    if let Err(r) = station_policy_check(&state, &user, Action::Update).await {
+        return r;
+    }
+    let (actor, now) = super::kinds::write_stamp(&state, &user).await;
+    match reg.publish(&name, &actor, now).await {
+        Ok(spec) => Json(spec).into_response(),
+        Err(e) => station_err_response(e),
+    }
+}
+
+/// `POST /api/stations/{name}/retire` — close the station. Idempotent:
+/// retiring an already-retired name is a 204 that records nothing.
+pub(super) async fn retire_station<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+    Path(name): Path<String>,
+) -> Response {
+    let reg = match stations_or_503(&state) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    if let Err(r) = station_policy_check(&state, &user, Action::Update).await {
+        return r;
+    }
+    let (actor, now) = super::kinds::write_stamp(&state, &user).await;
+    match reg.retire(&name, &actor, now).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => station_err_response(e),
+    }
 }
 
 /// The `metadata_equals` clause of an already-BOUND predicate as a

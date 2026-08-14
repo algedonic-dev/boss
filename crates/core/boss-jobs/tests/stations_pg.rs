@@ -8,13 +8,18 @@
 //! - every registry write stages its event in `event_outbox` in the
 //!   SAME transaction as the stations row (the workflow-registry
 //!   posture; the InMemory contract is pinned in `stations::tests`);
-//! - the three `jobs.station.*` kinds are registered in
-//!   `event_kinds` so the audit trigger admits them.
+//! - every `jobs.station.*` kind is registered in `event_kinds` so the
+//!   audit trigger admits it. Deliberately an exact-set assertion
+//!   rather than a contains-check: a marker emitted but never
+//!   registered is rejected by the trigger at run time, which is the
+//!   expensive place to find out.
 
 #![cfg(feature = "postgres")]
 
 use boss_core::actor::ActorId;
-use boss_jobs::events::{STATION_DRAFT_SAVED, STATION_PUBLISHED, STATION_RETIRED};
+use boss_jobs::events::{
+    STATION_DRAFT_SAVED, STATION_PUBLISHED, STATION_QUARANTINED, STATION_RETIRED,
+};
 use boss_jobs::registry::WorkflowStatus;
 use boss_jobs::station_queue::StationPredicate;
 use boss_jobs::{PgStations, StationKind, StationRegistry, StationSpec};
@@ -299,9 +304,19 @@ async fn station_event_kinds_are_registered() {
     .expect("read event_kinds");
     assert_eq!(
         kinds,
+        // Alphabetical, because the query is ORDER BY kind_pattern —
+        // `quarantined` sorts between `published` and `retired`.
+        //
+        // This list is the second home of a fact that lives in the
+        // event_kinds INSERTs of migrations 116 and 120 (§9a's equality
+        // test), and it did exactly its job: adding
+        // `jobs.station.quarantined` in 120 reddened here, which is how
+        // an unregistered marker gets caught before it reaches
+        // production rather than after.
         vec![
             STATION_DRAFT_SAVED.to_string(),
             STATION_PUBLISHED.to_string(),
+            STATION_QUARANTINED.to_string(),
             STATION_RETIRED.to_string(),
         ]
     );

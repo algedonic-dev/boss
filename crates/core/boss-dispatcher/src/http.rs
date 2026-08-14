@@ -107,6 +107,10 @@ fn authoring_err(e: AuthoringError) -> Response {
     let code = match &e {
         AuthoringError::NotFound(_) => StatusCode::NOT_FOUND,
         AuthoringError::Invalid(_) => StatusCode::BAD_REQUEST,
+        // 422, not 400: the stored row is well-formed — it just would not
+        // load as a Rule. Same posture as the Workflow and station
+        // registries' publish refusals.
+        AuthoringError::Unviable(_) => StatusCode::UNPROCESSABLE_ENTITY,
         AuthoringError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (code, e.to_string()).into_response()

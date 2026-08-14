@@ -83,6 +83,25 @@ pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Respons
     // Try to read the file. If it doesn't exist, serve index.html (SPA fallback).
     let (content, serving_path) = match tokio::fs::read(&full_path).await {
         Ok(bytes) => (bytes, full_path),
+        // A request that NAMES A FILE and misses is a 404, not the SPA.
+        //
+        // The fallback exists so `/system/yard` reaches the client-side
+        // router. It must not swallow `/dashboard/chunk-abc123.js`. When
+        // it did, a browser holding a chunk hash from before a deploy
+        // asked for that chunk, got `200 text/html`, and tried to execute
+        // `<!doctype html>` as JavaScript — the app never mounted, so the
+        // page rendered with no styling, no nav, and no pages, while every
+        // layer reported success. A missing stylesheet was worse: browsers
+        // drop a text/html stylesheet without a word.
+        //
+        // 2026-08-13: reported as "did we just have a huge regression /
+        // where is the Train Yard / the new styling is all gone". Nothing
+        // had regressed — the deploy was current and correct. The only
+        // defect was this fallback answering 200 to a question whose
+        // honest answer was 404, which is the same silent-loss shape as a
+        // JSON endpoint falling through to index.html (see main.rs, where
+        // the missing bare matcher was fixed for exactly this reason).
+        Err(_) if is_static_asset => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => {
             // SPA fallback: serve index.html for any non-file path.
             let index = PathBuf::from(base).join("index.html");
@@ -229,5 +248,57 @@ mod tests {
             guess_content_type(Path::new("data.bin")),
             "application/octet-stream"
         );
+    }
+}
+
+#[cfg(test)]
+mod asset_fallback_tests {
+    use super::has_file_extension;
+
+    /// The predicate the fallback branches on. A path naming a file is
+    /// an ASSET request and must 404 when it misses; a path naming a
+    /// route is an SPA request and must reach index.html.
+    #[test]
+    fn asset_paths_and_route_paths_are_told_apart() {
+        // Assets — a miss here must be a 404, or the browser executes
+        // HTML as JavaScript and the app dies silently.
+        for asset in [
+            "/dashboard/chunk-f2m8gpyh.js",
+            "/dashboard/chunk-50737a54.css",
+            "/dashboard/chunk-abc.js.map",
+            "/favicon.ico",
+            "/kb-assets/01-primitives.svg",
+        ] {
+            assert!(
+                has_file_extension(asset),
+                "{asset} must be read as an asset"
+            );
+        }
+
+        // Routes — these MUST still fall through to the SPA, which is
+        // the whole reason the fallback exists. `/system/yard` reaching
+        // index.html is what makes a deep link work at all.
+        for route in [
+            "/",
+            "/system/yard",
+            "/it/yard",
+            "/system/design",
+            "/jobs/6fde677f-b3f1-468b-ae54-47c8b44d0823",
+            "/dashboard",
+        ] {
+            assert!(
+                !has_file_extension(route),
+                "{route} must still reach the SPA fallback"
+            );
+        }
+    }
+
+    /// A job id carries no dot, but a Subject id or a doc path could.
+    /// Pinning the boundary: the check looks at the LAST segment only,
+    /// so a dot earlier in the path does not turn a route into an asset.
+    #[test]
+    fn a_dot_earlier_in_the_path_does_not_make_a_route_an_asset() {
+        assert!(!has_file_extension("/docs/design/the-three-layers.md/view"));
+        assert!(has_file_extension("/docs/design/the-three-layers.md"));
     }
 }

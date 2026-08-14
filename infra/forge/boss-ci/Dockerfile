@@ -18,12 +18,25 @@
 # Build + push (forge host):
 #   docker build -t 10.20.0.15:3000/david/boss-ci:rust1.96 infra/forge/boss-ci
 #   docker push 10.20.0.15:3000/david/boss-ci:rust1.96
+# bun is the workspace's package manager and script runner (root
+# bun.lock, `bun run typecheck` in apps/web). The gate runs
+# svelte-check, and without bun in the image there is no way to install
+# the workspace's node_modules or invoke the script that drives it — so
+# the web app's types went unchecked by CI entirely while every Rust
+# lint was enforced. Copied from the official image rather than curl'd
+# into a shell: a pinned tag is reproducible and reviewable, and the
+# installer script wants unzip and writes to $HOME, neither of which
+# this image should acquire for one binary.
+FROM oven/bun:1.3-slim AS bun
+
 FROM rust:1.96-slim-bookworm
 
 RUN apt-get update -qq \
  && apt-get install -y --no-install-recommends \
       nodejs git ca-certificates postgresql-client pkg-config libssl-dev curl \
  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 
 RUN rustup component add rustfmt clippy
 

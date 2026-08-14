@@ -184,13 +184,15 @@ async fn main() -> Result<()> {
             boss_jobs::owner_resolution::ReqwestRosterLookup::new(people_url.clone()),
         ));
         info!(%people_url, "human job-owner resolution wired (Q7)");
+        let stations: Arc<dyn boss_jobs::StationRegistry> =
+            Arc::new(boss_jobs::PgStations::new(pool.clone()));
+        verify_station_viability(stations.as_ref(), jobs.as_ref(), &clock).await;
         return run_server(
             Some(
                 std::sync::Arc::new(boss_jobs::job_edges::PgJobEdges::new(pool.clone()))
                     as std::sync::Arc<dyn boss_jobs::job_edges::JobEdgesRegistry>,
             ),
-            Some(Arc::new(boss_jobs::PgStations::new(pool.clone()))
-                as Arc<dyn boss_jobs::StationRegistry>),
+            Some(stations),
             jobs,
             bus,
             publisher,
@@ -415,6 +417,47 @@ async fn reconcile_platform_workflows<R: JobsRepository>(
         }
     }
     verify_registry_viability(registry, jobs, clock).await;
+}
+
+/// Boot-time viability check over the station registry — the sibling
+/// of [`verify_registry_viability`], for the queues rather than the
+/// protocols.
+///
+/// Never exits. A Workflow quarantine can be forced to refuse (open
+/// Jobs pinned to the bad row would be stranded by an auto-retire);
+/// station membership is derived from the predicate at read time and
+/// nothing is ever pinned to a station version, so retiring one
+/// strands nothing and there is no case that warrants refusing to
+/// start. A failure of the PASS itself is logged and start continues:
+/// the station registry is a read surface over packets, and losing the
+/// check is not a reason to take the jobs API down.
+async fn verify_station_viability<R: JobsRepository>(
+    stations: &dyn boss_jobs::StationRegistry,
+    jobs: &R,
+    clock: &Arc<dyn boss_clock_client::ClockClient>,
+) {
+    let actor = boss_core::actor::ActorId::Automation(
+        boss_jobs::station_quarantine::QUARANTINE_ACTOR.into(),
+    );
+    let now = boss_clock_client::now_from(clock).await;
+    match boss_jobs::station_quarantine::quarantine_unviable_active_stations(
+        stations, jobs, &actor, now,
+    )
+    .await
+    {
+        Ok(report) if !report.quarantined.is_empty() => {
+            tracing::error!(
+                quarantined = report.quarantined.len(),
+                active = report.checked,
+                "retired station(s) that failed the viability lint — those queues are \
+                 gone until a viable version is published; service is up"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "boot station viability check could not complete");
+        }
+    }
 }
 
 /// Boot-time viability re-verification: every active Workflow in the
