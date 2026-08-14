@@ -382,6 +382,17 @@ pub(crate) struct MatchRow {
 pub(crate) struct StationDepth {
     pub station: String,
     pub packets: usize,
+    /// A station whose predicate binds `@me` has no global depth. Its
+    /// membership is per-actor by construction, and `matches()`
+    /// deliberately fails closed when the placeholder is unbound — so
+    /// the census, which evaluates without an actor, sees zero and
+    /// would otherwise report "0" where the truth is "not applicable".
+    ///
+    /// This mattered: the first census run called `my-watchlist` empty
+    /// and counted every packet whose only home was someone's
+    /// watchlist as orphaned, overstating the orphan share by 46
+    /// packets (158 reported vs 112 genuinely unreachable).
+    pub personal: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -791,6 +802,11 @@ async fn collect(opts: Options, now: DateTime<Utc>) -> Result<Census> {
             station_depth: depth
                 .into_iter()
                 .map(|(station, packets)| StationDepth {
+                    personal: stations
+                        .iter()
+                        .find(|s| s.name == station)
+                        .map(|s| s.predicate.binds_self())
+                        .unwrap_or(false),
                     station: station.to_string(),
                     packets,
                 })
@@ -1045,7 +1061,29 @@ fn render(c: &Census) -> String {
     ));
     o.push("  per-station depth (compare GET /api/stations/<name>/queue .total)".into());
     for d in &s.station_depth {
-        o.push(format!("    {:<32}{:>6}", trunc(&d.station, 31), d.packets));
+        if d.personal {
+            // Not a number, because there isn't one. A per-actor
+            // station has as many depths as there are actors, and the
+            // census has no actor to bind.
+            o.push(format!(
+                "    {:<32}{:>6}  per-actor — ask GET /api/stations/{}/queue as someone",
+                trunc(&d.station, 31),
+                "n/a",
+                d.station
+            ));
+        } else {
+            o.push(format!("    {:<32}{:>6}", trunc(&d.station, 31), d.packets));
+        }
+    }
+    if s.station_depth.iter().any(|d| d.personal) {
+        o.push(String::new());
+        o.push(
+            "  NOTE: orphan counts below are 'matched no SHARED station'. A packet
+  listed there may still be visible to its owner through a per-actor
+  station — the census cannot see those, so it must not claim they are
+  invisible to everyone."
+                .into(),
+        );
     }
     o.push(String::new());
     if s.orphans.is_empty() {
@@ -1687,6 +1725,49 @@ mod tests {
     // The report an operator actually reads
     // -----------------------------------------------------------
 
+    #[test]
+    fn a_personal_station_is_reported_as_per_actor_not_as_zero() {
+        // Regression for the first live census run, which printed
+        // `my-watchlist  0` and folded every packet whose only home was
+        // someone's watchlist into the orphan list — overstating the
+        // orphan share by 46 packets (158 reported, 112 genuinely
+        // unreachable). `matches()` fails closed on an unbound `@me` by
+        // design, so the census sees zero; the report must say "not
+        // applicable" rather than "empty".
+        let mut c = sample_census();
+        c.conservation_over_space.station_depth = vec![
+            StationDepth {
+                station: "loading-dock".into(),
+                packets: 3,
+                personal: false,
+            },
+            StationDepth {
+                station: "my-watchlist".into(),
+                packets: 0,
+                personal: true,
+            },
+        ];
+        let out = render(&c);
+
+        assert!(
+            out.contains("my-watchlist") && out.contains("per-actor"),
+            "a personal station must be labelled per-actor:\n{out}"
+        );
+        assert!(
+            !out.contains("my-watchlist                        0"),
+            "a personal station must not be rendered as a depth of 0:\n{out}"
+        );
+        assert!(
+            out.contains("matched no SHARED station"),
+            "the orphan caveat must appear when a personal station exists:\n{out}"
+        );
+        // A shared station still reports a real number.
+        assert!(
+            out.contains("loading-dock") && out.contains("3"),
+            "shared station depth regressed:\n{out}"
+        );
+    }
+
     fn sample_census() -> Census {
         Census {
             generated_at: at(13, 18),
@@ -1745,6 +1826,7 @@ mod tests {
                 station_depth: vec![StationDepth {
                     station: "loading-dock".into(),
                     packets: 1,
+                    personal: false,
                 }],
                 orphans: vec![OrphanRow {
                     id: "9f3a1c2e-1111-2222-3333-444444444444".into(),

@@ -489,20 +489,43 @@ impl DocsRepository for PgDocsRepo {
         .await
         .map_err(storage)?;
 
-        // Delete pending rows AFTER inserting the job so they're
-        // captured in the payload snapshot.
-        sqlx::query("DELETE FROM design_pending_decisions WHERE doc_path = $1")
-            .bind(&payload.doc_path)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
+        // Delete ONLY the rows this payload actually snapshotted.
+        //
+        // This used to delete every pending row for the doc, while the
+        // snapshot came from the caller's payload and the check above
+        // only verified that SOME rows existed. A decision recorded
+        // between the caller building its payload and this transaction
+        // running was therefore deleted having never been captured
+        // anywhere — silently, with the flush job looking complete and
+        // internally consistent (feedback 1dd28e4c, defect 2).
+        //
+        // Deleting by anchor makes the race harmless instead: a
+        // decision that arrived late is not in the payload, so it is
+        // not deleted, and it is still pending for the next flush.
+        let anchors: Vec<String> = payload.decisions.iter().map(|d| d.anchor.clone()).collect();
+        sqlx::query(
+            "DELETE FROM design_pending_decisions
+             WHERE doc_path = $1 AND anchor = ANY($2)",
+        )
+        .bind(&payload.doc_path)
+        .bind(&anchors)
+        .execute(&mut *tx)
+        .await
+        .map_err(storage)?;
 
-        // Reset pending_count on the doc.
-        sqlx::query("UPDATE design_docs SET pending_count = 0 WHERE path = $1")
-            .bind(&payload.doc_path)
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
+        // pending_count reflects what SURVIVES, not zero. With the
+        // delete now scoped to the snapshot, a late-arriving decision
+        // is still pending and the badge has to say so — otherwise the
+        // row lives on with a count of 0 and nobody flushes it.
+        sqlx::query(
+            "UPDATE design_docs SET pending_count = (
+                 SELECT COUNT(*) FROM design_pending_decisions WHERE doc_path = $1
+             ) WHERE path = $1",
+        )
+        .bind(&payload.doc_path)
+        .execute(&mut *tx)
+        .await
+        .map_err(storage)?;
 
         let row = sqlx::query("SELECT * FROM design_flush_jobs WHERE id = $1")
             .bind(&id)
@@ -739,6 +762,85 @@ mod tests {
         assert_eq!(pending[0].kind, DecisionKind::Override);
         let doc = repo.doc_by_path("docs/design/a.md").await.unwrap().unwrap();
         assert_eq!(doc.pending_count, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_decision_recorded_after_the_payload_survives_the_flush() {
+        // Regression for feedback 1dd28e4c defect 2. The delete used to
+        // take every pending row for the doc while the snapshot came
+        // from the caller's payload, so a decision recorded in the gap
+        // between payload-build and flush-create was destroyed without
+        // ever being captured — silently, with the flush job looking
+        // complete. Deleting by anchor makes that race harmless.
+        let db = TestDb::new().await;
+        let repo = PgDocsRepo::new(db.pool.clone());
+        repo.upsert_doc(&sample_doc("docs/design/a.md"), &[])
+            .await
+            .unwrap();
+        for i in 0..2 {
+            repo.upsert_pending_decision(
+                &PendingDecisionInput {
+                    doc_path: "docs/design/a.md".to_string(),
+                    anchor: format!("Q{i}"),
+                    kind: DecisionKind::Accept,
+                    resolution: format!("answer {i}"),
+                    rationale: None,
+                },
+                "alice",
+            )
+            .await
+            .unwrap();
+        }
+
+        // The caller snapshots Q0 and Q1...
+        let payload = FlushJobPayload {
+            doc_path: "docs/design/a.md".to_string(),
+            base_commit_sha: "abc123".to_string(),
+            decisions: (0..2)
+                .map(|i| FlushDecision {
+                    anchor: format!("Q{i}"),
+                    kind: DecisionKind::Accept,
+                    resolution: format!("answer {i}"),
+                    rationale: None,
+                })
+                .collect(),
+        };
+
+        // ...and Q2 lands before the flush job is created.
+        repo.upsert_pending_decision(
+            &PendingDecisionInput {
+                doc_path: "docs/design/a.md".to_string(),
+                anchor: "Q2".to_string(),
+                kind: DecisionKind::Accept,
+                resolution: "the late one".to_string(),
+                rationale: None,
+            },
+            "bob",
+        )
+        .await
+        .unwrap();
+
+        repo.create_flush_job(&payload, "alice").await.unwrap();
+
+        // Q2 was never snapshotted, so it must still be pending.
+        let pending = repo
+            .pending_decisions_for_doc("docs/design/a.md")
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the un-snapshotted decision was destroyed by the flush: {pending:?}"
+        );
+        assert_eq!(pending[0].anchor, "Q2");
+        assert_eq!(pending[0].resolution, "the late one");
+
+        // And the badge must say there is still one to flush.
+        let doc = repo.doc_by_path("docs/design/a.md").await.unwrap().unwrap();
+        assert_eq!(
+            doc.pending_count, 1,
+            "pending_count was zeroed while a decision was still pending"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

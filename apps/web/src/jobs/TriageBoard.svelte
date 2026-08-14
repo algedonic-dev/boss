@@ -33,6 +33,7 @@
   // The fork rule lives in one module — it drifted once between this
   // board and the terminal queue reader. See jobs/fork.ts.
   import { type Fork, forkStep as forkStepOf, gatedStep, readFork } from './fork';
+  import { formatActor } from '../data/actor';
 
   type Props = Readonly<{
     /// Which queue this board shows. One Workflow today because that is
@@ -91,6 +92,13 @@
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   });
+  // Employee id -> name, so a card says "David Hauld" rather than
+  // `emp-bootstrap-admin` (feedback 19896c17). formatActor already
+  // knows how to spell every actor kind — machines, agents, humans —
+  // and falls back to the raw id when the roster has not arrived or
+  // does not contain the id, so a slow or failed fetch degrades to
+  // exactly the old behaviour rather than to a blank.
+  let empNames = $state<Map<string, string>>(new Map());
   let loading = $state(true);
   let error = $state<string | null>(null);
   let busy = $state<Record<string, boolean>>({});
@@ -357,7 +365,25 @@
     if (j) void route(j, col);
   }
 
+  // The roster is decoration, not data the board depends on: it is
+  // fetched alongside `load` rather than inside it, and a failure is
+  // swallowed. formatActor falls back to the raw id, so the worst
+  // case is the ids we were already showing — a board that refuses to
+  // render because /api/people is down would be a strictly worse
+  // trade than a card that says `emp-bootstrap-admin`.
+  async function loadRoster() {
+    try {
+      const r = await fetch('/api/people');
+      if (!r.ok) return;
+      const roster = (await r.json()) as ReadonlyArray<{ id: string; name?: string }>;
+      empNames = new Map(roster.map((e) => [e.id, e.name ?? '']));
+    } catch {
+      /* names stay ids */
+    }
+  }
+
   onMount(load);
+  onMount(loadRoster);
 </script>
 
 <PageHeader {title} {subtitle} />
@@ -412,7 +438,7 @@
             {/if}
 
             <div class="tb-card-meta">
-              <span class="tb-by">{j.owner_id || 'unassigned'}</span>
+              <span class="tb-by">{j.owner_id ? formatActor(j.owner_id, empNames) : 'unassigned'}</span>
             </div>
 
             <!-- The finding renders on EVERY card, routed or not. A
@@ -561,7 +587,7 @@
         <dt>Subject</dt>
         <dd class="tb-mono">{detail.subject.subject_kind} / {detail.subject.id}</dd>
         <dt>Owner</dt>
-        <dd>{detail.owner_id || 'unassigned'}</dd>
+        <dd>{detail.owner_id ? formatActor(detail.owner_id, empNames) : 'unassigned'}</dd>
         {#if detail.tags.length}
           <dt>Tags</dt>
           <dd>{detail.tags.join(', ')}</dd>
@@ -578,7 +604,7 @@
             <li class="tb-modal-step">
               <span class="tb-modal-step-status tb-modal-step-{s.status}">{s.status}</span>
               <span class="tb-modal-step-title">{s.title}</span>
-              {#if s.assignee_id}<span class="tb-modal-step-who">{s.assignee_id}</span>{/if}
+              {#if s.assignee_id}<span class="tb-modal-step-who">{formatActor(s.assignee_id, empNames)}</span>{/if}
             </li>
           {/each}
         </ol>
