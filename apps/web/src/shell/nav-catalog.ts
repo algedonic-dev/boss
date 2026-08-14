@@ -88,34 +88,34 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
   // First IT surface in catalog order = the IT app's landing
   // (departure-board.md Q1, David's call: the yard is the front
   // door, guest-visible).
-  'system-yard':              { id: 'system-yard',              label: 'Train Yard',          path: '/system/yard',         permKey: 'system-yard',             app: 'it' },
+  'system-yard':              { id: 'system-yard',              label: 'Train Yard',          path: '/it/yard',         permKey: 'system-yard',             app: 'it' },
   // The network map — every registry station as a node (stations.md:
   // priority queues, stations, and network nodes are one concept).
   // After the yard: the yard is one batch station rendered deep, the
   // map is every station rendered wide.
-  'system-map':               { id: 'system-map',               label: 'Network map',         path: '/system/map',          permKey: 'system-map',              app: 'it' },
-  'system-monitoring':       { id: 'system-monitoring',       label: 'Monitoring',          path: '/system/monitoring',   permKey: 'system-monitoring',       app: 'it' },
-  policy:                    { id: 'policy',                  label: 'Policy',              path: '/system/policy',       permKey: 'policy',                  app: 'it' },
-  'system-step-plugins':     { id: 'system-step-plugins',     label: 'Step plugins',        path: '/system/step-plugins', permKey: 'system-step-plugins',     app: 'it' },
-  'system-dispatcher':       { id: 'system-dispatcher',       label: 'Dispatcher rules',    path: '/system/dispatcher',   permKey: 'system-dispatcher',       app: 'it' },
-  'system-model':            { id: 'system-model',            label: 'System Model',        path: '/system',              permKey: 'system-model',            app: 'it' },
-  'system-subjects':         { id: 'system-subjects',         label: 'Subjects & Classes',  path: '/system/subjects',     permKey: 'system-subjects',         app: 'it' },
+  'system-map':               { id: 'system-map',               label: 'Network map',         path: '/it/map',          permKey: 'system-map',              app: 'it' },
+  'system-monitoring':       { id: 'system-monitoring',       label: 'Monitoring',          path: '/it/monitoring',   permKey: 'system-monitoring',       app: 'it' },
+  policy:                    { id: 'policy',                  label: 'Policy',              path: '/it/policy',       permKey: 'policy',                  app: 'it' },
+  'system-step-plugins':     { id: 'system-step-plugins',     label: 'Step plugins',        path: '/it/step-plugins', permKey: 'system-step-plugins',     app: 'it' },
+  'system-dispatcher':       { id: 'system-dispatcher',       label: 'Dispatcher rules',    path: '/it/dispatcher',   permKey: 'system-dispatcher',       app: 'it' },
+  'system-model':            { id: 'system-model',            label: 'System Model',        path: '/it',              permKey: 'system-model',            app: 'it' },
+  'system-subjects':         { id: 'system-subjects',         label: 'Subjects & Classes',  path: '/it/subjects',     permKey: 'system-subjects',         app: 'it' },
   // The rule-authoring list + editor are reached via a link FROM the
   // cascade viz (the system-dispatcher Surface entry), not their own
   // sidebar rows — so these catalog entries exist to satisfy the
   // Record<RouteName,…> type but are intentionally absent from
   // SURFACE_ORDER (no sidebar item ⇒ no sidebar-consistency entry).
-  'system-dispatcher-rules': { id: 'system-dispatcher-rules', label: 'Dispatcher rules — authoring', path: '/system/dispatcher/rules', permKey: 'system-dispatcher-rules', app: 'it' },
-  'system-dispatcher-rule':  { id: 'system-dispatcher-rule',  label: 'Dispatcher rule — editor',     path: '/system/dispatcher/rules', permKey: 'system-dispatcher-rule',  app: 'it' },
-  'system-design':           { id: 'system-design',           label: 'Design review',       path: '/system/design',       permKey: 'system-design',           app: 'it' },
-  'system-flow':             { id: 'system-flow',             label: 'Flow',                path: '/system/flow',         permKey: 'system-flow',             app: 'it' },
-  'system-fleet':            { id: 'system-fleet',            label: 'Bottlenecks',               path: '/system/fleet',        permKey: 'system-fleet',            app: 'it' },
-  'system-feedback':         { id: 'system-feedback',         label: 'Feedback triage',     path: '/system/feedback',     permKey: 'system-feedback',         app: 'it' },
+  'system-dispatcher-rules': { id: 'system-dispatcher-rules', label: 'Dispatcher rules — authoring', path: '/it/dispatcher/rules', permKey: 'system-dispatcher-rules', app: 'it' },
+  'system-dispatcher-rule':  { id: 'system-dispatcher-rule',  label: 'Dispatcher rule — editor',     path: '/it/dispatcher/rules', permKey: 'system-dispatcher-rule',  app: 'it' },
+  'system-design':           { id: 'system-design',           label: 'Design review',       path: '/it/design',       permKey: 'system-design',           app: 'it' },
+  'system-flow':             { id: 'system-flow',             label: 'Flow',                path: '/it/flow',         permKey: 'system-flow',             app: 'it' },
+  'system-fleet':            { id: 'system-fleet',            label: 'Bottlenecks',               path: '/it/fleet',        permKey: 'system-fleet',            app: 'it' },
+  'system-feedback':         { id: 'system-feedback',         label: 'Feedback triage',     path: '/it/feedback',     permKey: 'system-feedback',         app: 'it' },
   // The "Evolve" surface — controlled, sandboxed model modifications
   // (placeholder for now; visible to every role via canSeeRoute).
-  'system-experiments':      { id: 'system-experiments',      label: 'Experiments',         path: '/system/experiments',  permKey: 'system-experiments',      app: 'it' },
-  'system-kb':               { id: 'system-kb',               label: 'Knowledge Base',      path: '/system/kb',           permKey: 'system-kb',               app: 'it' },
-  'auth-admin':              { id: 'auth-admin',              label: 'Auth admin',          path: '/system/auth-admin',   permKey: 'auth-admin',              app: 'it' },
+  'system-experiments':      { id: 'system-experiments',      label: 'Experiments',         path: '/it/experiments',  permKey: 'system-experiments',      app: 'it' },
+  'system-kb':               { id: 'system-kb',               label: 'Knowledge Base',      path: '/it/kb',           permKey: 'system-kb',               app: 'it' },
+  'auth-admin':              { id: 'auth-admin',              label: 'Auth admin',          path: '/it/auth-admin',   permKey: 'auth-admin',              app: 'it' },
   // The single Workflow surface. There were two entries before the
   // rename — a 'Job kinds' authoring row and a 'Workflows' catalog
   // row — pointing at the same path; the authoring row had already
@@ -124,7 +124,7 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
   // KB view of every active Workflow — read-only catalog, visible to
   // every role via canSeeRoute() short-circuit. Editing lives at
   // /system/workflows, reached FROM Workflows.
-  workflows:                 { id: 'workflows',               label: 'Workflows',           path: '/system/workflows',    permKey: 'workflows',               app: 'it' },
+  workflows:                 { id: 'workflows',               label: 'Workflows',           path: '/it/workflows',    permKey: 'workflows',               app: 'it' },
 };
 
 /// The apps this host offers: Home, Simulator, and one per department

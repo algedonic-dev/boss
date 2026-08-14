@@ -113,8 +113,25 @@ export type Route =
   | { kind: 'shopProduct'; sku: string };
 
 export function parseRoute(pathname: string): Route {
-  const raw = pathname.replace(/^\/dashboard/, '').replace(/\/$/, '') || '/';
+  let raw = pathname.replace(/^\/dashboard/, '').replace(/\/$/, '') || '/';
   if (raw === '/login') return { kind: 'login' };
+
+  // IT surfaces answer on /it/* as well as /system/*.
+  //
+  // Feedback 0fc8b216: "We should not be under /system route because I
+  // am working on a Job in the context of the IT department. So I
+  // should be in the /it route IT app." He is right — nav-catalog
+  // already assigns every one of these to `app: 'it'`, so the URL was
+  // the last place still calling them System surfaces.
+  //
+  // /system/* is kept, permanently and deliberately. Those paths are in
+  // bookmarks, in the station registry's `upstream` hrefs, and in docs;
+  // an alias costs one line and a redirect that breaks a saved link
+  // costs an operator their place. Canonical moves, old paths keep
+  // answering.
+  if (raw === '/it' || raw.startsWith('/it/')) {
+    raw = `/system${raw.slice('/it'.length)}`;
+  }
 
   // ===== System Model perspective — /system/* =====
   if (raw === '/system' || raw.startsWith('/system/')) {

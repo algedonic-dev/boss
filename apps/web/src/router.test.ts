@@ -66,6 +66,13 @@ describe('parseRoute — every specific path matches its specific case', () => {
     ['/system', { kind: 'systemModel' }],
     ['/system/subjects', { kind: 'systemSubjects' }],
     ['/system/design', { kind: 'systemDesign' }],
+    // /it/* is the canonical spelling for IT surfaces (0fc8b216); the
+    // /system/* rows above stay because bookmarks, the station
+    // registry's upstream hrefs and the docs all still use them.
+    ['/it/design', { kind: 'systemDesign' }],
+    ['/it/yard', { kind: 'systemYard' }],
+    ['/it/monitoring/events', { kind: 'systemMonitoringEvents' }],
+    ['/it', { kind: 'systemModel' }],
     ['/system/step-plugins', { kind: 'systemStepPlugins' }],
     ['/system/step-plugins/pour-quality-check', { kind: 'systemStepPluginDetail', pluginSlug: 'pour-quality-check' }],
     ['/system/dispatcher', { kind: 'dispatcherRules' }],

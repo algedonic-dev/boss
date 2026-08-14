@@ -72,6 +72,21 @@ $KM apply -f /manifests
 # derived artifact whose sources are already in tree, and a committed
 # copy would be the second definition that drifts (§9a).
 KP="sudo docker run --rm --network host -v $KUBECONFIG_PATH:/kc:ro -v $REPO/infra/step-plugins:/plugins:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
+# `-i`, and that single flag is the whole bug this replaces. The first
+# version piped the generated ConfigMap into `$K apply -f -`, but $K is
+# `docker run --rm` with no `-i`, so the container never attached
+# stdin: apply read an empty document, said "error: no objects passed
+# to apply", and the generator died with "write /dev/stdout: broken
+# pipe". The runner has failed on every tick since — silently, because
+# a failed systemd oneshot notifies nobody — leaving the cluster on the
+# placeholder tag committed in boss.yaml while forge main moved on.
+#
+# The lesson is the one from the zsh/bash mixup earlier the same day:
+# a command validated in a different environment than the one that
+# runs it has not been validated. I checked the kubectl invocation
+# against my own kubectl and never against the docker wrapper it
+# actually runs through.
+KAPPLY="sudo docker run --rm -i --network host -v $KUBECONFIG_PATH:/kc:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"
 echo "cluster-deploy-runner: converging the step-plugins ConfigMap"
 PLUGIN_ARGS=""
 for f in "$REPO"/infra/step-plugins/*.js; do
@@ -81,7 +96,7 @@ done
 if [ -n "$PLUGIN_ARGS" ]; then
     # shellcheck disable=SC2086
     $KP create configmap step-plugins -n boss $PLUGIN_ARGS \
-        --dry-run=client -o yaml | $K apply -f -
+        --dry-run=client -o yaml | $KAPPLY apply -f -
 else
     echo "cluster-deploy-runner: no bundles in infra/step-plugins — leaving the ConfigMap alone"
 fi
