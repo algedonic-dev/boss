@@ -22,6 +22,36 @@
 # $KUBECONFIG_PATH; kubectl via the alpine/k8s container.
 set -euo pipefail
 
+# Run from a SNAPSHOT, never from the file this script is about to
+# rewrite.
+#
+# This script lives inside $REPO, and a few lines below it runs
+# `git checkout "$HEAD"` on that same repo. Bash does not read a script
+# into memory; it reads incrementally and remembers a BYTE OFFSET. So
+# when git replaces the file underneath a running invocation, bash
+# carries on reading the new contents from the old offset — resuming
+# mid-token, skipping a command, or executing a fragment of a line that
+# happens to be syntactically valid. The failure is silent, unrepeatable
+# and shaped by how much the diff moved the bytes, which makes it close
+# to undiagnosable from the outcome alone.
+#
+# It has not bitten yet only because the file changed rarely and the
+# offsets happened to survive. That is luck, not a property.
+#
+# `exec` into a copy makes the executing file structurally incapable of
+# being rewritten: git can do whatever it likes to $REPO afterwards,
+# because the bytes bash is reading are no longer reachable from there.
+# The env var is the recursion guard and also carries the path so the
+# snapshot can clean itself up on the way out — the trap belongs in the
+# snapshot's own process, since `exec` replaces this one and would never
+# run a trap set here.
+if [ -z "${BOSS_RUNNER_SNAPSHOT:-}" ]; then
+    snap="$(mktemp -t cluster-deploy-runner.XXXXXX)"
+    cat "$0" > "$snap"
+    BOSS_RUNNER_SNAPSHOT="$snap" exec bash "$snap" "$@"
+fi
+trap 'rm -f "$BOSS_RUNNER_SNAPSHOT"' EXIT
+
 REPO="${BOSS_FORGE_REPO_DIR:-$HOME/boss}"
 REGISTRY="${BOSS_FORGE_REGISTRY:-10.20.0.15:3000/david/boss}"
 KUBECONFIG_PATH="${BOSS_FORGE_KUBECONFIG:-$HOME/kc.yaml}"

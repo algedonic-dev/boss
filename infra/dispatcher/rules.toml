@@ -503,3 +503,46 @@ when = "kind = \"user-feedback\""
 [[rule.do]]
 handler = "messages.notify_job_terminal"
 args = { recipient_key = "\"submitted_by\"" }
+
+# ---------------------------------------------------------------------
+# The maintenance protocol (migration 121). David, 2026-08-14: "We
+# probably need protocol around maintenance of the IT systems."
+#
+# These two are the dispatcher's SANCTIONED shape under its narrowed
+# charter — initiate on a schedule, and initiate on threshold. Neither
+# routes anything: routing belongs in the protocol row.
+# ---------------------------------------------------------------------
+
+# 1. ADMISSION, on the clock. The first clock-triggered rule in the
+# system — the schedule machinery existed and had never been used.
+# Daily per maintenance AREA; more areas are more rows, and intraday is
+# a `schedule` edit rather than a deploy. Starting with disk headroom,
+# which has already cost real time twice wearing two disguises on train
+# #22 (once as `ld terminated with signal 7 [Bus error]`, because the
+# linker mmaps its output and ENOSPC surfaces as a bus error, not as
+# "disk full") and put three machines at 100% on 2026-08-13.
+[[rule]]
+name = "maintenance-sweep-disk-daily"
+schedule = { cadence = "daily", anchor_date = "2026-08-14" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"maintenance-sweep\"", subject_kind = "\"custom\"", subject = "\"disk-headroom\"", title = "\"Disk headroom sweep\"", "metadata.target" = "\"disk-headroom\"", "metadata.area" = "\"infra\"" }
+
+# 2. WHAT A SWEEP PRODUCES. A sweep that concluded it needed work spawns
+# a ship-a-change car carrying a `backlog_item` edge back to the sweep,
+# so the car closes its own sweep on merge through the existing
+# feedback-obligation machinery. That is what makes the dock
+# self-filling rather than hand-loaded.
+#
+# Fires on the sweep's TERMINAL OUTCOME, not on the `remediate` step
+# completing: the step-done topic is `step.done.<step kind>` and
+# `remediate` is a plain `task`, so subscribing there would wake this on
+# every task step in every workflow and lean on a `when` to discard
+# almost all of them. The outcome is the more honest trigger anyway.
+[[rule]]
+name = "spawn-car-on-sweep-remediated"
+on_event = "jobs.job.closed"
+when = "kind = \"maintenance-sweep\" AND outcome = \"remediated\""
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"ship-a-change\"", subject_kind = "\"custom\"", subject = "id", title = "title", "metadata.backlog_item" = "id" }

@@ -42,7 +42,7 @@ set -euo pipefail
 # Workflow definition, because each spans two protocols by
 # construction. Raised here rather than on that train because the
 # violation only became visible when the gate was wired in.
-BASELINE=40
+BASELINE=42
 RULES_FILE="infra/dispatcher/rules.toml"
 
 count=$(grep -c '^\[\[rule\]\]' "$RULES_FILE")
