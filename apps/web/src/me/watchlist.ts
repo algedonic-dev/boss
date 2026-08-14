@@ -30,7 +30,7 @@
 //     closed packet with nothing recorded says "closed", because that
 //     is the whole of what is known.
 
-import type { PacketCardData } from '@boss/web-kit/ui/packet-card';
+import { isSim, type PacketCardData } from '@boss/web-kit/ui/packet-card';
 
 /// A packet as the station-queue envelope serializes it (bare Jobs,
 /// no steps). Only the fields this lens reads.
@@ -75,16 +75,6 @@ export function outcomeOf(job: WatchlistJob): Outcome | null {
   const recorded = (job.metadata ?? {})['outcome'];
   const label = typeof recorded === 'string' && recorded.length > 0 ? recorded : 'closed';
   return { label, tone: OUTCOME_TONES[label] ?? 'static' };
-}
-
-/// Same sim test the yard uses — a simulated packet can never pass for
-/// real work, wherever it renders.
-function isSim(job: WatchlistJob): boolean {
-  if (job.simulated === true) return true;
-  const tagged = (job.tags ?? []).some(t =>
-    ['sim', 'simulated', 'synthetic'].includes(t.toLowerCase()),
-  );
-  return tagged || (job.metadata as { simulated?: boolean } | null)?.simulated === true;
 }
 
 /// A packet in the shared card grammar. The mono provenance line is

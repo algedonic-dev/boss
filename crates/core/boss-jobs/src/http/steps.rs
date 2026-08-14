@@ -5,6 +5,20 @@ use super::*;
 
 use axum::extract::Path;
 
+/// The wire spelling of a step status, for messages the caller reads.
+/// Local rather than borrowed from the postgres adapter: an HTTP error
+/// string has no business depending on the storage layer, and the two
+/// are free to diverge without either noticing.
+fn status_word(s: StepStatus) -> &'static str {
+    match s {
+        StepStatus::Pending => "pending",
+        StepStatus::Ready => "ready",
+        StepStatus::Active => "active",
+        StepStatus::Completed => "completed",
+        StepStatus::Skipped => "skipped",
+    }
+}
+
 pub(super) async fn list_steps<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     Path(id): Path<String>,
@@ -642,6 +656,40 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                 "required_roles": step.sign_offs_required,
             }),
         ));
+    }
+
+    // Refuse, out loud, what the row would silently drop.
+    //
+    // `update_step_at`'s UPDATE freezes status, completed_on and
+    // metadata on a terminal step — deliberately, so a write computed
+    // against a pre-completion fetch (dispatcher assign retries,
+    // JetStream redeliveries, any racing read-modify-write) cannot
+    // demote it. That invariant is right and stays.
+    //
+    // What was wrong is that the caller was never told. The handler
+    // returned 204 and the columns simply did not move, so an actor
+    // that believed it had recorded something had not. Job 903e6b90
+    // found it by probe; the same silence ate a correction to a car's
+    // build step earlier the same day, and nobody noticed until the
+    // record was read back.
+    //
+    // Idempotent re-sends still pass: this compares VALUES, so a
+    // redelivery that re-completes an already-completed step with the
+    // same status is unchanged and proceeds. Only a real conflict —
+    // a different status against a terminal row — is refused.
+    if matches!(old.status, StepStatus::Completed | StepStatus::Skipped)
+        && step.status != old.status
+    {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "step is {} and does not move backwards: refusing to set it to {}. \
+                 Terminal steps are immutable; add a new step or record the change elsewhere.",
+                status_word(old.status),
+                status_word(step.status)
+            ),
+        )
+            .into_response();
     }
 
     if let Err(e) = state.jobs.update_step_at(&step, now, &step_events).await {
