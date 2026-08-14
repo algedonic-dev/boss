@@ -151,3 +151,45 @@ export async function claimStep(
   }
   return { kind: 'error', message: `HTTP ${resp.status}` };
 }
+
+// ---------------------------------------------------------------------
+// Protocol filtering (David, 2026-08-14: "protocol-based My Queue
+// filtering ... will make it much easier to see the specific jobs I
+// want").
+//
+// Purely a lens over rows already fetched — `workflow` rides on every
+// AssignmentRow, so this needs no second call and no server change.
+// The counts come from the SAME rows the chips filter, so a chip can
+// never advertise a number the list then contradicts.
+// ---------------------------------------------------------------------
+
+/** Every protocol present across the queues, with how many rows each
+ *  holds, most-work-first then alphabetical. Counting all three queues
+ *  together is deliberate: the question a chip answers is "how much
+ *  approval work is in front of me", not "how much of it is already
+ *  mine". */
+export function protocolCounts(
+  queues: MyDayQueues | null,
+): ReadonlyArray<{ workflow: string; count: number }> {
+  if (!queues) return [];
+  const all = [...queues.mine, ...queues.upForGrabs, ...queues.inFlightElsewhere];
+  const tally = new Map<string, number>();
+  for (const r of all) {
+    if (!r.workflow) continue;
+    tally.set(r.workflow, (tally.get(r.workflow) ?? 0) + 1);
+  }
+  return [...tally.entries()]
+    .map(([workflow, count]) => ({ workflow, count }))
+    .sort((a, b) => (b.count - a.count) || a.workflow.localeCompare(b.workflow));
+}
+
+/** `null` means no filter — every row. An unknown protocol yields an
+ *  empty list rather than everything, so a stale chip selection reads
+ *  as "nothing here" instead of silently widening the queue. */
+export function filterByProtocol(
+  rows: readonly AssignmentRow[],
+  workflow: string | null,
+): readonly AssignmentRow[] {
+  if (workflow === null) return rows;
+  return rows.filter((r) => r.workflow === workflow);
+}

@@ -63,9 +63,24 @@
 }
 .step-review-design .srd-meter.is-complete > i { background: #16a34a; }
 
-/* Two panes: the document to read, the decisions to record. */
+/* Two panes: the document to read, the decisions to record.
+
+   The rail may grow to half (David, 6d4fa80a: "give the question bar
+   up to half if it doesn't require scrolling the doc panel
+   horizontally"). It was capped at 420px while the doc took every
+   remaining pixel — but the doc CANNOT use them: .srd-doc-inner is
+   capped at 68ch, so past that width the left pane was growing its
+   own margins while the rail, which holds the textareas you actually
+   type in, stayed narrow.
+
+   Both columns are 1fr, so on a wide viewport they split evenly. The
+   left floor is what honours "without scrolling the doc panel": 46ch
+   is narrower than the 68ch measure but still comfortably wider than
+   the point at which prose starts to break up, and the elements that
+   genuinely cannot reflow — pre blocks and tables — already scroll
+   inside their own box rather than widening the panel. */
 .step-review-design .srd-panes {
-  display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, 420px);
+  display: grid; grid-template-columns: minmax(46ch, 1fr) minmax(320px, 1fr);
   gap: var(--srd-gap); align-items: start;
 }
 @media (max-width: 1100px) {

@@ -1,5 +1,11 @@
 import { describe, expect, test } from 'bun:test';
-import { assignmentPacket, splitQueues, type AssignmentRow } from './assignments';
+import {
+  assignmentPacket,
+  filterByProtocol,
+  protocolCounts,
+  splitQueues,
+  type AssignmentRow,
+} from './assignments';
 
 type RowOverrides = Omit<Partial<AssignmentRow>, 'step'> & {
   step?: Partial<AssignmentRow['step']>;
@@ -93,5 +99,37 @@ describe('assignmentPacket', () => {
     // the other.
     expect(assignmentPacket(row({ tags: ['sim'] })).sim).toBe(true);
     expect(assignmentPacket(row({ simulated: false, tags: ['hotfix'] })).sim).toBe(false);
+  });
+});
+
+describe('protocol filtering', () => {
+  const queues = {
+    mine: [row({ workflow: 'approval' }), row({ workflow: 'ship-a-change' })],
+    upForGrabs: [row({ workflow: 'approval' })],
+    inFlightElsewhere: [row({ workflow: 'user-feedback' })],
+  };
+
+  test('counts every protocol across all three queues, busiest first', () => {
+    expect(protocolCounts(queues)).toEqual([
+      { workflow: 'approval', count: 2 },
+      { workflow: 'ship-a-change', count: 1 },
+      { workflow: 'user-feedback', count: 1 },
+    ]);
+  });
+
+  test('no queues means no chips, rather than a crash', () => {
+    expect(protocolCounts(null)).toEqual([]);
+  });
+
+  test('null filter is every row; a protocol keeps only its own', () => {
+    expect(filterByProtocol(queues.mine, null)).toHaveLength(2);
+    expect(filterByProtocol(queues.mine, 'approval')).toHaveLength(1);
+  });
+
+  test('a stale chip selection empties the list instead of widening it', () => {
+    // The chip for a protocol that has since drained must not read as
+    // "no filter" — that would silently show everything at the moment
+    // the operator believes they are looking at one protocol.
+    expect(filterByProtocol(queues.mine, 'retired-protocol')).toHaveLength(0);
   });
 });

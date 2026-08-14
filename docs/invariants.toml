@@ -407,3 +407,35 @@ enforcement = "unenforced"
 mechanism = ""
 last_verified = ""
 note = "THE CLAIM OVERSTATES THE MECHANISM. The script's 22 invariants cover conservation (A, B, G-R, V, W), closure-of-already-closed-records (C, D, F) and provenance (E). The words 'idempotence' and 'determinism' do not appear in it, and no query in it replays anything or compares two runs. Recorded here so the overstatement is visible next to `correctness-idempotence` and `correctness-determinism`, which are the entries that actually carry those two properties. What would enforce it: correct the two sentences — the script is fine, the description is not."
+
+# =====================================================================
+# Learnings from 2026-08-14. Each of these cost real time once; none of
+# them was held by anything until it was written down here.
+# =====================================================================
+
+[[invariant]]
+id = "protocol-data-agrees-between-record-and-runtime"
+claim = "The registry an operator can read is the registry the runtime obeys: protocol rows in the system of record and the rows the executing process evaluates are the same rows."
+source = "docs/design/protocol-cadence.md; packet c7775816; infra/postgres/schema/123-cadence-registry-reconcile.sql"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "VIOLATED TODAY, AND THE VIOLATION IS STILL LIVE. The cadence loop reads `cadence_rules` from boss-gcp's local Postgres while the packets it schedules live on the cluster: on 2026-08-14 the cluster said the boarding threshold was 4 and the running rule was 8, and cadence_firings held 0 rows on the cluster against 244 locally. The cost is not abstract — an agent read the system of record, concluded a four-car dock would board, and reported that to David. It did not. This is the sharpest possible version of the failure, because the whole architecture bets on protocols being editable registry data, and an edit made where the operator can reach had NO effect on the runtime. Migration 123 reconciles the rows so the record stops lying; it does not close this. What would enforce it: a BOSS_POSTGRES_URL drop-in pointing boss-train at the cluster (David's call, must land after 123 or it silently halves the threshold), and then a check that the two agree — the same shape as the schema-converge gate, one registry over."
+
+[[invariant]]
+id = "single-pod-deploy-requires-recreate"
+claim = "The `boss` Deployment's strategy stays `Recreate` for as long as `boss-auth` is a ReadWriteOnce volume and infra/postgres/migrate.sh takes no advisory lock."
+source = "infra/cluster/manifests/boss.yaml; packet b392d199"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "Nothing stops the obvious fix, and the obvious fix is worse than the bug. Every deploy takes the system of record dark for the length of a pod roll, so `RollingUpdate` with maxSurge=1/maxUnavailable=0 is the natural reach — and it DEADLOCKS this Deployment: boss-auth is a ReadWriteOnce Longhorn PVC (verified against the live cluster), so the surge pod blocks in ContainerCreating on multi-attach while maxUnavailable=0 forbids retiring the pod holding the volume. A stuck rollout beats a two-minute outage only in that it lasts longer. Recorded because the reasoning lives in a manifest comment, and CLAUDE.md 9a is explicit that a comment is not a mechanism. Not a gate: duplicate dispatch — boss-dispatcher binds durable PULL consumers, which compete rather than duplicate. What would enforce it: move boss-auth off RWO (a Secret, or RWX) and give migrate.sh an advisory lock, at which point this entry is retired rather than enforced."
+
+[[invariant]]
+id = "a-registry-seed-and-its-roster-test-change-together"
+claim = "A migration that seeds or edits registry rows lands with the roster test that asserts those rows, in the same change."
+source = "crates/core/boss-jobs/tests/stations_pg.rs; crates/orchestrators/boss-cli/src/cadence.rs (db_tests)"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "This bit twice in one afternoon, in both directions. The stations roster test caught migration 124 adding a repair station and forced the assertion to be updated deliberately — the mechanism working. An hour earlier migration 123 changed a cadence row and the boss-cli seed test was NOT updated, which reddened a train carrying eight cars and cost a repair round; the author had run the neighbouring crate's DB tests (boss-dispatcher, for migration 122) and not the crate whose data actually changed. The general rule is the cheap one: run the tests of the crate whose DATA you changed, not a related one. What would enforce it: nothing generic exists — a lint cannot know which roster belongs to which seed. The tractable version is narrower, a check that every table written by a migration under infra/postgres/schema/ is named in at least one test, which would have caught 123 and is a grep over sqlx queries rather than a proof."

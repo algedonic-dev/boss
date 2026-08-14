@@ -18,9 +18,12 @@
     fetchMyDay,
     claimStep,
     assignmentPacket,
+    filterByProtocol,
+    protocolCounts,
     type MyDayQueues,
     type AssignmentRow,
   } from './assignments';
+  import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
   import {
     fetchWatchlist,
     windowNote,
@@ -65,6 +68,27 @@
       cancelled = true;
     };
   });
+
+  // Protocol filter (David, 2026-08-14). One chip per protocol present,
+  // counted across all three queues, applied to all three — the
+  // question is "show me the approvals", and an approval up for grabs
+  // is still an approval.
+  //
+  // The selection is deliberately NOT reset when the queues refetch: a
+  // 10s poll that cleared the filter would fight whoever set it.
+  // `protocolCounts` drops a drained protocol from the chips, and
+  // `filterByProtocol` then renders an empty queue rather than
+  // silently widening back to everything.
+  let protocol = $state<string | null>(null);
+  const protocols = $derived(protocolCounts(queues));
+  const shown = $derived({
+    mine: filterByProtocol(queues?.mine ?? [], protocol),
+    upForGrabs: filterByProtocol(queues?.upForGrabs ?? [], protocol),
+    inFlightElsewhere: filterByProtocol(queues?.inFlightElsewhere ?? [], protocol),
+  });
+  const totalShown = $derived(
+    shown.mine.length + shown.upForGrabs.length + shown.inFlightElsewhere.length,
+  );
 
   // The watchlist: packets THIS person filed, and what became of them.
   // A second station read, deliberately not folded into fetchMyDay —
@@ -143,11 +167,35 @@
       motif="glass"
     />
 
+    <!-- Only worth showing when there is a choice to make: one
+         protocol means the chips would just restate the queue. -->
+    {#if protocols.length > 1}
+      <div class="myday-protocols" role="group" aria-label="Filter by protocol">
+        <FilterButton active={protocol === null} onclick={() => (protocol = null)}>
+          All ({protocols.reduce((n, p) => n + p.count, 0)})
+        </FilterButton>
+        {#each protocols as p (p.workflow)}
+          <FilterButton
+            active={protocol === p.workflow}
+            onclick={() => (protocol = protocol === p.workflow ? null : p.workflow)}
+          >
+            {p.workflow} ({p.count})
+          </FilterButton>
+        {/each}
+      </div>
+      {#if protocol !== null && totalShown === 0}
+        <div class="myday-empty">
+          Nothing left under <strong>{protocol}</strong> — it may have drained
+          since you filtered. Pick All to see the rest.
+        </div>
+      {/if}
+    {/if}
+
     <div class="me-grid">
       <Section title="My queue" wide>
         {#if loading}
           <div class="myday-loading">Loading your queue…</div>
-        {:else if !queues || queues.mine.length === 0}
+        {:else if shown.mine.length === 0}
           <div class="myday-empty">
             Nothing in your personal queue right now.
           </div>
@@ -156,7 +204,7 @@
                grammar across the network (d69033dd). Double-click or
                Enter opens the job detail. -->
           <div class="myday-jobs-list">
-            {#each queues.mine as row (row.step.id)}
+            {#each shown.mine as row (row.step.id)}
               <PacketCard card={assignmentPacket(row)} />
             {/each}
           </div>
@@ -167,13 +215,13 @@
         {#if claimNote}
           <div class="myday-claim-note" role="status">{claimNote}</div>
         {/if}
-        {#if !queues || queues.upForGrabs.length === 0}
+        {#if shown.upForGrabs.length === 0}
           <div class="myday-empty">
             Nothing waiting on your role's queue.
           </div>
         {:else}
           <div class="myday-jobs-list">
-            {#each queues.upForGrabs as row (row.step.id)}
+            {#each shown.upForGrabs as row (row.step.id)}
               <!-- The claim hop stays a button beside the card: the
                    card is the packet, the claim is queue mechanics. -->
               <div class="myday-grab-row">
@@ -184,9 +232,9 @@
               </div>
             {/each}
           </div>
-          {#if queues.inFlightElsewhere.length > 0}
+          {#if shown.inFlightElsewhere.length > 0}
             <div class="myday-inflight-note">
-              {queues.inFlightElsewhere.length} role-matched step{queues.inFlightElsewhere.length === 1 ? '' : 's'} in flight with teammates
+              {shown.inFlightElsewhere.length} role-matched step{shown.inFlightElsewhere.length === 1 ? '' : 's'} in flight with teammates
             </div>
           {/if}
         {/if}
@@ -248,6 +296,17 @@
 {/if}
 
 <style>
+  /* Protocol chips sit above the queues, not inside one, because they
+     filter all three. Wraps rather than scrolls — the count grows with
+     the number of protocols in flight, and a hidden chip is a filter
+     nobody knows they have. */
+  .myday-protocols {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 4px 0 18px;
+  }
+
   /* Packet card + claim button side by side; the card takes the row. */
   .myday-grab-row {
     display: grid;

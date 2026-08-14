@@ -1835,3 +1835,38 @@ required_roles = ["platform-admin"]
   required = false
   description = "Per-question resolutions [{anchor, decision}]; plugin enforces all-filled before done"
 
+
+[[step_type]]
+kind = "answer-question"
+label = "Answer a question"
+category = "coordination"
+ux = "expanded"
+version = 1
+description = """
+Custom Step UX for the `approval` Workflow's decide step. Renders the
+asker's question, the context they supplied as markdown, and their
+proposed answer with a control that copies it into the answer box —
+the same populate-but-you-click contract the design review uses
+(David, 2026-08-14).
+
+The context panel is the point. An approval asked without evidence is
+a request to guess: the answerer is being asked "does this meet your
+bar?" with no way to see the thing. The asker writes markdown into
+`job.metadata.context_md` and it renders beside the question, which
+also makes this the canvas for the artifact under review.
+"""
+typical_duration_hours = 0.5
+typical_duration_jitter = 0.5
+required_roles = []
+
+  [[step_type.fields]]
+  name = "verdict"
+  field_type = "string"
+  required = true
+  description = "approved | declined | answered — the fork the outcome steps read"
+
+  [[step_type.fields]]
+  name = "answer"
+  field_type = "string"
+  required = true
+  description = "The substance: what was decided and why. Required, so an answer cannot evaporate into a completed step."

@@ -49,3 +49,4 @@
 121-maintenance-sweep-rules.sql
 122-maintenance-sweep-areas.sql
 123-cadence-registry-reconcile.sql
+126-answer-question-plugin.sql
