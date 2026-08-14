@@ -19,8 +19,6 @@
 //!    full id or a >= 8-char prefix of it — the clear-on-close
 //!    handler's query, so a prefix-writing waiter still wakes.
 
-#![cfg(feature = "postgres")]
-
 use boss_core::job::{Job, JobId, JobStatus, Priority, Subject};
 use boss_jobs::port::{JobFilter, JobScope, JobsRepository};
 use boss_testing::TestDb;

@@ -5,8 +5,6 @@
 //! rebuild from `audit_log`, assert match. This is the REAL delivery
 //! path — no hand-emitted events.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use boss_commerce::PgCommerce;

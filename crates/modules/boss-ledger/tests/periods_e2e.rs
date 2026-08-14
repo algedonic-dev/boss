@@ -2,8 +2,6 @@
 //! locked period fails loudly, and the DB trigger catches it even if the
 //! application-level check is bypassed.
 
-#![cfg(feature = "postgres")]
-
 use boss_ledger::periods::{list_periods, lock_period, unlock_period};
 use boss_ledger::{FactRef, LedgerError, post_fact_in_tx};
 use boss_testing::TestDb;

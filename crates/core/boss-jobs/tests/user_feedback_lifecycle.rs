@@ -28,8 +28,6 @@
 //! the one flow where the answer is "nothing", which is exactly why
 //! it is the one that broke.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use async_trait::async_trait;

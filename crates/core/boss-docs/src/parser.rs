@@ -557,19 +557,62 @@ fn events_to_markdown(events: &[Event]) -> String {
     out
 }
 
-/// Look for a `**Proposal**: ...` line in the question body and
-/// return its text. Multi-sentence proposals collapse onto one line.
+/// The proposed answer a question carries, if it states one.
+///
+/// This is what the review surface pre-fills its resolution box from,
+/// so the reviewer accepts or edits a draft instead of retyping the
+/// answer already written a few lines above it (David, 2026-08-14:
+/// "give you the ability to populate the resolution but I have to
+/// still click the button ... basically just authorizing you to copy
+/// and paste on my behalf").
+///
+/// TWO SPELLINGS, and the unbolded one is the one that matters.
+/// This function originally recognised only `**Proposal**:`, which
+/// appears in ZERO docs in the corpus; `Proposed:` — what every doc
+/// actually writes — appears 34 times across 10 of them. So the field
+/// was parsed on every question and populated on none, the review
+/// plugin recorded a comment concluding "there's no parsed proposal
+/// being accepted", and every decision was filed as an override. A
+/// miss returns None, which is indistinguishable from a question that
+/// genuinely proposes nothing: silent, like the SPA fallback and the
+/// cfg-gated suite.
+///
+/// `Proposed:` must OPEN a line. Bolded `**Proposal**` / `**Proposed**`
+/// may sit mid-prose, because the bold markers are themselves the
+/// label. Without the line-start rule, "nobody has proposed: anything"
+/// would parse as a proposal.
 fn extract_proposal(body: &str) -> Option<String> {
-    // Scan for a bolded "Proposal" anywhere — the common shapes are
-    // `**Proposal**: foo.`, or prose like `... **Proposal**: foo.`.
-    let needle = "**Proposal**";
-    let idx = body.find(needle)?;
-    let after = &body[idx + needle.len()..];
-    let after = after.trim_start_matches(':').trim_start();
-    // Grab up to the next double-newline or end.
+    let after = bolded_label(body).or_else(|| line_leading_label(body))?;
+    // Up to the paragraph break; the rest of the body is discussion.
     let end = after.find("\n\n").unwrap_or(after.len());
     let text = after[..end].replace('\n', " ").trim().to_string();
     if text.is_empty() { None } else { Some(text) }
+}
+
+/// `**Proposal**: ...` / `**Proposed**: ...`, anywhere in the body.
+fn bolded_label(body: &str) -> Option<&str> {
+    for needle in ["**Proposal**", "**Proposed**"] {
+        if let Some(idx) = body.find(needle) {
+            return Some(
+                body[idx + needle.len()..]
+                    .trim_start_matches(':')
+                    .trim_start(),
+            );
+        }
+    }
+    None
+}
+
+/// `Proposed: ...` opening a line — the corpus convention.
+fn line_leading_label(body: &str) -> Option<&str> {
+    const NEEDLE: &str = "Proposed:";
+    for (idx, _) in body.match_indices(NEEDLE) {
+        let opens_line = idx == 0 || body[..idx].ends_with('\n');
+        if opens_line {
+            return Some(body[idx + NEEDLE.len()..].trim_start());
+        }
+    }
+    None
 }
 
 /// Title extractor for numbered-list open questions. Handles two
@@ -1024,5 +1067,66 @@ All 7 services or subset?
         assert!(!parsed.used_fallback_anchors);
         assert_eq!(parsed.questions[0].anchor, "Q1");
         assert_eq!(parsed.questions[0].proposal.as_deref(), Some("new crate."));
+    }
+
+    /// The shape the corpus actually writes. `**Proposal**:` — the only
+    /// form the extractor knew — appears in ZERO docs; `Proposed:` appears
+    /// 34 times across 10 of them, so every parsed question carried
+    /// `proposal: None` and the review plugin concluded, in a comment,
+    /// that "there's no parsed proposal being accepted" and recorded every
+    /// decision as an override. The extractor returned None rather than
+    /// erroring, so nothing ever said so.
+    #[test]
+    fn extracts_the_proposed_convention_the_corpus_uses() {
+        assert_eq!(
+            extract_proposal("Proposed: all 7 services.").as_deref(),
+            Some("all 7 services."),
+        );
+    }
+
+    /// Real body from packet-loss.md Q1: the proposal leads with bold and
+    /// runs across several lines before the paragraph break. Bold is kept
+    /// — a resolution is flushed back into the doc as markdown.
+    #[test]
+    fn extracts_a_multiline_proposed_and_keeps_its_markdown() {
+        let body = "Proposed: **every admitted packet reaches a terminal, and every\nnon-terminal packet is visible at ≥1 station.** The first half is\nconservation over time.\n\nA later paragraph.";
+        assert_eq!(
+            extract_proposal(body).as_deref(),
+            Some(
+                "**every admitted packet reaches a terminal, and every non-terminal packet is visible at ≥1 station.** The first half is conservation over time."
+            ),
+        );
+    }
+
+    /// The bolded spelling stays supported — the fixture above is not the
+    /// corpus, but a doc may still use it.
+    #[test]
+    fn still_extracts_the_bolded_proposal_spelling() {
+        assert_eq!(
+            extract_proposal("**Proposal**: new crate.").as_deref(),
+            Some("new crate."),
+        );
+        assert_eq!(
+            extract_proposal("**Proposed**: new crate.").as_deref(),
+            Some("new crate."),
+        );
+    }
+
+    /// A question with no proposal must stay None: pre-filling the review
+    /// surface from an empty match would put words in the reviewer's mouth.
+    #[test]
+    fn no_proposal_stays_none() {
+        assert_eq!(extract_proposal("Just a question, no answer."), None);
+        assert_eq!(extract_proposal("Proposed:   \n\n"), None);
+    }
+
+    /// "Proposed" inside a sentence is prose, not a labelled proposal.
+    /// Only a line that OPENS with the label counts, or the bolded form.
+    #[test]
+    fn prose_mentioning_proposed_is_not_a_proposal() {
+        assert_eq!(
+            extract_proposal("Nobody has proposed: anything here yet."),
+            None,
+        );
     }
 }

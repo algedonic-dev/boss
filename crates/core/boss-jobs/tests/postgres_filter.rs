@@ -14,8 +14,6 @@
 //! `InMemoryJobs`) wouldn't catch a Postgres-only gap. This file runs
 //! the same shape against `PgJobs`.
 
-#![cfg(feature = "postgres")]
-
 use boss_core::job::{Job, JobId, JobStatus, Priority, Subject};
 use boss_jobs::port::{JobFilter, JobScope, JobsRepository};
 use boss_testing::TestDb;

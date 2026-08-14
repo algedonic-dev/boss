@@ -3,8 +3,6 @@
 //! relay drain moves them to audit_log), snapshot asset_models + key
 //! satellites, drop, rebuild from `audit_log`, assert match.
 
-#![cfg(feature = "postgres")]
-
 mod common;
 
 use std::sync::Arc;

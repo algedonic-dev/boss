@@ -5,8 +5,6 @@
 //! drift, the bootstrap loop in boss-jobs-api would silently apply
 //! one branch in dev tests and a different branch in production.
 
-#![cfg(feature = "postgres")]
-
 use boss_core::job::JobId;
 use boss_jobs::registry::{
     KindReconcileStats, PgWorkflows, StepSpec, Terminal, WorkflowRegistry, WorkflowSpec,

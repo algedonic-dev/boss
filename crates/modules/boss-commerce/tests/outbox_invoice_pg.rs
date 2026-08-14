@@ -11,8 +11,6 @@
 //!    closed at the source — the post-commit audit trigger could only
 //!    punch provenance holes; this can refuse the state itself.
 
-#![cfg(feature = "postgres")]
-
 use boss_commerce::PgCommerce;
 use boss_commerce::port::CommerceRepository;
 use boss_commerce::types::*;

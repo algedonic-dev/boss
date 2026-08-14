@@ -15,8 +15,6 @@
 //!
 //! Postgres-only: the in-memory adapter has no sim_clock table.
 
-#![cfg(feature = "postgres")]
-
 use boss_jobs::{JobsRepository, PgJobs};
 use boss_testing::TestDb;
 

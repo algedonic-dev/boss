@@ -11,8 +11,6 @@
 //! SQL. It catches schema/code drift (missing columns, wrong types,
 //! etc.) that pure in-memory tests can't see.
 
-#![cfg(feature = "postgres")]
-
 mod common;
 
 use boss_people::PeopleRepository;

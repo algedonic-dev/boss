@@ -4,8 +4,6 @@
 //! Covers: authz (operator tier + ceo/cto role allow, plain user
 //! denies), source/kind filtering, limit clamping, descending order.
 
-#![cfg(feature = "postgres")]
-
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};

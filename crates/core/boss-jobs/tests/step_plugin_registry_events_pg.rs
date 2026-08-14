@@ -6,8 +6,6 @@
 //! file proves the Pg adapter actually stages the rows in
 //! `event_outbox`.
 
-#![cfg(feature = "postgres")]
-
 use boss_core::actor::ActorId;
 use boss_jobs::events::{STEP_PLUGIN_DRAFT_SAVED, STEP_PLUGIN_PUBLISHED, STEP_PLUGIN_RETIRED};
 use boss_jobs::{PgStepPlugins, StepPluginRegistry, StepPluginSpec};

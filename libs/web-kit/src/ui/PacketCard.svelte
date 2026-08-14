@@ -6,13 +6,25 @@
   // for real work. Promoted here from the train yard so every queue
   // lens draws the same card. Pure presentation plus one affordance —
   // every fact comes off the card data, and double-click (or Enter
-  // when focused) opens the packet's job detail.
+  // when focused) opens the packet. What "opens" means belongs to the
+  // surface: a lens that renders PacketModal passes `onOpen` and gets
+  // the condensed panel without losing the queue it was reading
+  // (David, fc67bed2); a lens that does not keeps navigating to the
+  // job page.
   import { navigate } from '../nav';
   import { entityHref } from './entity-href';
   import { protocolHue, type PacketCardData } from './packet-card';
 
-  type Props = Readonly<{ card: PacketCardData; size?: 'dock' | 'consist' }>;
-  let { card, size = 'dock' }: Props = $props();
+  type Props = Readonly<{
+    card: PacketCardData;
+    size?: 'dock' | 'consist';
+    /** What opening the packet means on this surface. A lens that can
+     *  show the condensed panel (PacketModal) passes it here; without
+     *  one the card keeps navigating to the job page, so surfaces that
+     *  have not adopted the modal behave exactly as before. */
+    onOpen?: (id: string) => void;
+  }>;
+  let { card, size = 'dock', onOpen }: Props = $props();
 
   const hue = $derived(protocolHue(card.kind));
   const shownTags = $derived(
@@ -20,6 +32,10 @@
   );
 
   function open(): void {
+    if (onOpen) {
+      onOpen(card.id);
+      return;
+    }
     navigate(entityHref('job', card.id));
   }
   function onKeydown(e: KeyboardEvent): void {
@@ -38,7 +54,7 @@
   class:compact={size === 'consist'}
   class:sim={card.sim}
   style="--pk: {hue}"
-  title="{card.title} — double-click to open the job"
+  title={onOpen ? `${card.title} — double-click for the packet` : `${card.title} — double-click to open the job`}
   role="link"
   tabindex="0"
   ondblclick={open}

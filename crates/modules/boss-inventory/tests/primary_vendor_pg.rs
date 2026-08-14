@@ -5,8 +5,6 @@
 //! `vendor_category`. The match is fully generic — no SKU knowledge in
 //! code; the mapping is data on the item (from the tenant's parts.toml).
 
-#![cfg(feature = "postgres")]
-
 use boss_inventory::PgInventory;
 use boss_inventory::port::InventoryRepository;
 use boss_inventory::types::InventoryItem;

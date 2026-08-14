@@ -5,8 +5,6 @@
 //! drain; zero on_hand forces zero value. The 2026-07-06 365d regen
 //! measured the old averaged scheme leaking +$6,597.77/yr here.
 
-#![cfg(feature = "postgres")]
-
 use boss_products::PgProducts;
 use boss_products::port::ProductsRepository;
 use boss_testing::TestDb;

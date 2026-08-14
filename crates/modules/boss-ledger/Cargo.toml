@@ -67,3 +67,67 @@ sqlx = { version = "0.8", default-features = false, features = ["macros", "runti
 
 [lints]
 workspace = true
+
+[[test]]
+name = "asc606_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "control_plane_audit_trail"
+required-features = ["postgres"]
+
+[[test]]
+name = "from_paid_invoice_shapes_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "gl_account_daily_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "http_api"
+required-features = ["postgres"]
+
+[[test]]
+name = "period_ownership_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "periods_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "posting_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "rebuild_bank_settlements_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "rebuild_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "rebuild_facts_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "rebuild_payroll_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "rebuild_tax_filings_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "replay_check_audit_log_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "replay_check_lock_free_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "supersede_e2e"
+required-features = ["postgres"]

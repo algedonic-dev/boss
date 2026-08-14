@@ -15,8 +15,6 @@
 //!   - DELETE /api/catalog/models/{sku} → 404 for unknown SKU (guard returns 0, then repo reports NotFound)
 //!   - The guard fires BEFORE the SQL delete: verify the row is still present on 409.
 
-#![cfg(feature = "postgres")]
-
 mod common;
 
 use std::sync::Arc;

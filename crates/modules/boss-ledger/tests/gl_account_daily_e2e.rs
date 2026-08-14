@@ -7,8 +7,6 @@
 //!      the SAME rollup as the rebuild's full TRUNCATE + re-aggregate, and
 //!   2. that rollup equals a direct aggregation of the journal.
 
-#![cfg(feature = "postgres")]
-
 use std::collections::BTreeMap;
 
 use boss_ledger::{FactRef, post_fact_in_tx, rebuild};

@@ -1,7 +1,5 @@
 //! End-to-end tests against the products HTTP API + Postgres adapter.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::body::Body;

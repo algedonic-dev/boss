@@ -1,8 +1,6 @@
 //! End-to-end test for the Marketing Asset KB. Round-trips create /
 //! list / update / supersede / retire through a real Postgres DB.
 
-#![cfg(feature = "postgres")]
-
 use axum::http::StatusCode;
 use boss_catalog::marketing_assets::http::{MarketingAssetsApiState, router};
 use boss_testing::{TestDb, TestRequest};

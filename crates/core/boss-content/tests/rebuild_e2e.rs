@@ -2,8 +2,6 @@
 //! PgAuditWriter, snapshot bulletins + bulletin_dismissals, drop,
 //! rebuild from `audit_log`, assert match.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 fn test_stamp(now: chrono::DateTime<Utc>) -> boss_core::publisher::EventStamp {

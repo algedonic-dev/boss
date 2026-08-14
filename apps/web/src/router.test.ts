@@ -180,6 +180,39 @@ describe('full-page step route', () => {
     expect((r as { stepId: string }).stepId).toBe('step-456');
   });
 
+  test('carries the lens Back target through, with its label', () => {
+    // David, 40fe7291: Back from a design review landed on the job
+    // page instead of the queue he came from. Only the lens knows
+    // where back is, so it says so on the URL.
+    (globalThis as { window?: { location: { search: string } } }).window = {
+      location: { search: '?from=%2Fsystem%2Fdesign&from_label=Design%20Review' },
+    };
+    const r = parseRoute('/ux/jobs/job-123/steps/step-456');
+    expect(r.kind).toBe('stepFocus');
+    expect((r as { from?: string }).from).toBe('/system/design');
+    expect((r as { fromLabel?: string }).fromLabel).toBe('Design Review');
+    (globalThis as { window: { location: { search: string } } }).window = {
+      location: { search: '' },
+    };
+  });
+
+  test('refuses a Back target that leaves the app', () => {
+    // A `from` naming another origin would turn the Back button into
+    // an open redirect. Protocol-relative `//host` is the one that
+    // looks in-app at a glance, which is why it is tested by name.
+    for (const hostile of ['//evil.example', 'https://evil.example', 'evil']) {
+      (globalThis as { window?: { location: { search: string } } }).window = {
+        location: { search: `?from=${encodeURIComponent(hostile)}` },
+      };
+      const r = parseRoute('/ux/jobs/job-123/steps/step-456');
+      expect(r.kind).toBe('stepFocus');
+      expect((r as { from?: string }).from).toBeUndefined();
+    }
+    (globalThis as { window: { location: { search: string } } }).window = {
+      location: { search: '' },
+    };
+  });
+
   test('does not steal the plain job-detail route', () => {
     // The greedy /jobs/(.+) branch sits right after this one; if the
     // step pattern were looser (or ordered later) one of these two

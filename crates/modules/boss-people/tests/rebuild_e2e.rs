@@ -2,8 +2,6 @@
 //! PgAuditWriter, snapshot all three projections, drop, rebuild
 //! from `audit_log`, assert exact match.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::Router;

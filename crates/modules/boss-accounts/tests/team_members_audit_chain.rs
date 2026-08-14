@@ -12,8 +12,6 @@
 //! handlers, drops the projection, and asserts every team-member
 //! row reappears from `audit_log` alone.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 /// Drain the outbox through the relay pipeline into audit_log.

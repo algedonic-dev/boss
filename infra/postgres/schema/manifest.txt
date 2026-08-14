@@ -47,3 +47,5 @@
 119-station-upstream.sql
 120-event-kinds-station-quarantine.sql
 121-maintenance-sweep-rules.sql
+122-maintenance-sweep-areas.sql
+123-cadence-registry-reconcile.sql

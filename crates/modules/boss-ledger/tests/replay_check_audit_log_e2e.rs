@@ -6,8 +6,6 @@
 //! replay-check inside an aborted transaction and asserts no
 //! divergences. Live state is unchanged after the check completes.
 
-#![cfg(feature = "postgres")]
-
 use boss_ledger::{rebuild, rebuild_facts, replay_check_from_audit_log};
 use boss_testing::TestDb;
 use chrono::{DateTime, Utc};

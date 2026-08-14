@@ -1,7 +1,5 @@
 //! End-to-end test for the assets → audit_log chain.
 
-#![cfg(feature = "postgres")]
-
 mod common;
 
 use axum::http::StatusCode;

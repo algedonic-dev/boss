@@ -4,8 +4,6 @@
 //! moves it to audit_log. Deliberately NO direct audit writer — this
 //! test only passes through the real outbox → relay → audit_log path.
 
-#![cfg(feature = "postgres")]
-
 mod common;
 
 use std::sync::Arc;

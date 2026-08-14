@@ -1366,7 +1366,16 @@ mod db_tests {
     use chrono::TimeZone;
 
     /// The 114 seed loads through the same reader the loop uses: the
-    /// two retired timers as data, plus the queue-depth rule.
+    /// two retired timers as data, plus the queue-depth rule — as
+    /// reconciled by 123 to the row the conductor actually evaluates.
+    ///
+    /// This test is the reason 123 exists, from the other side. The
+    /// boarding threshold was raised 4 -> 8 live on the running
+    /// instance on 2026-08-13 and never migrated, so the seed said 4
+    /// while production ran 8, and reading the system of record gave a
+    /// confident wrong answer about why a train had not boarded. The
+    /// assertion below is now the same number in both places, and it
+    /// fails if they diverge again.
     #[tokio::test(flavor = "multi_thread")]
     async fn seeded_rules_load_and_parse() {
         let db = boss_testing::TestDb::new().await;
@@ -1396,7 +1405,7 @@ mod db_tests {
         assert_eq!(
             depth.basis,
             Basis::QueueDepth {
-                min_depth: 4,
+                min_depth: 8,
                 cooldown_minutes: 120,
             }
         );

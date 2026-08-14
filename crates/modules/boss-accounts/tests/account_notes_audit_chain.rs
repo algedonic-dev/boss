@@ -11,8 +11,6 @@
 //! `rebuild_accounts` from `audit_log` alone. Soft-delete
 //! survival is covered separately.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 /// Drain the outbox through the relay pipeline into audit_log.

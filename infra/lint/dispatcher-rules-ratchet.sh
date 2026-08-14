@@ -42,7 +42,27 @@ set -euo pipefail
 # Workflow definition, because each spans two protocols by
 # construction. Raised here rather than on that train because the
 # violation only became visible when the gate was wired in.
-BASELINE=42
+#
+# 42 -> 45 (2026-08-14, migration 122). Three more maintenance areas:
+# `maintenance-sweep-build-caches-daily`,
+# `maintenance-sweep-image-freshness-daily`,
+# `maintenance-sweep-converge-lag-daily`.
+#
+# All three are CLOCK rules, which is the first of the dispatcher's
+# three sanctioned roles under its narrowed charter (David, 2026-08-14:
+# the dispatcher "is essentially the queue watcher for us now" — clock,
+# threshold, matchmaking, and nothing else). They qualify under the
+# timer exemption above for the reason that exemption exists: there is
+# no Workflow whose definition could declare them, because nothing has
+# happened yet. A sweep's whole point is to run when NO event fired.
+#
+# Note this ratchet counts in the right direction for once. It exists to
+# stop routing leaking into the dispatcher, and these rules add none:
+# every one of them only admits a packet, and what happens next is
+# `maintenance-sweep`'s own protocol row. The number to watch is not
+# this total but the 22 `step.done.*` rules underneath it, which ARE
+# routing and are owed back to the protocol.
+BASELINE=45
 RULES_FILE="infra/dispatcher/rules.toml"
 
 count=$(grep -c '^\[\[rule\]\]' "$RULES_FILE")

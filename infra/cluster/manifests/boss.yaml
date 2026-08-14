@@ -149,6 +149,35 @@ metadata:
 spec:
   replicas: 1
   # Single pod owning one Postgres; never run two.
+  #
+  # `Recreate` means the old pod is TERMINATED before the new one is
+  # created, so every deploy is a full outage of the system of record —
+  # jobs door, gateway, dispatcher and docs all go dark for the length
+  # of a pod roll (observed 2026-08-13: ~2m, most of it boss-init
+  # running migrations, and it was misdiagnosed as an incident because
+  # nothing announced it).
+  #
+  # The obvious fix is wrong and would be worse. `RollingUpdate` with
+  # maxSurge=1/maxUnavailable=0 DEADLOCKS this Deployment: `boss-auth`
+  # below is a ReadWriteOnce Longhorn PVC, so the surge pod blocks in
+  # ContainerCreating on multi-attach while maxUnavailable=0 forbids
+  # retiring the pod holding the volume. A stuck rollout beats a
+  # two-minute outage only in the sense that it lasts longer.
+  #
+  # Two things genuinely gate zero-downtime here, and both are real
+  # work rather than a strategy field:
+  #   1. `boss-auth` (RWO) — the break-glass credential store. Two pods
+  #      cannot mount it. idm-kanidm.md keeps local auth deliberately,
+  #      so moving it (to a Secret, or RWX) is an auth-design call.
+  #   2. infra/postgres/migrate.sh takes no advisory lock, so two
+  #      pods starting together race the schema converge.
+  # Until both are answered, `Recreate` is the correct strategy and the
+  # window is shortened rather than removed (see readinessProbe below).
+  #
+  # Not a gate, though it is the usual objection: boss-dispatcher binds
+  # durable PULL consumers (crates/core/boss-nats/src/durable.rs), and
+  # pull consumers sharing a durable name COMPETE rather than duplicate,
+  # so a brief two-pod overlap would not double-fire dispatcher rules.
   strategy: {type: Recreate}
   selector: {matchLabels: {app: boss}}
   template:
@@ -279,9 +308,21 @@ spec:
             # `/` is unauthenticated (the SPA index); /healthz requires a
             # session by design, so it is the wrong probe target.
             httpGet: {path: /, port: 4443}
-            initialDelaySeconds: 30
-            periodSeconds: 10
-            failureThreshold: 30
+            # Because `Recreate` guarantees a dark window (see the
+            # strategy comment), every second of probe latency is a
+            # second of outage. `initialDelaySeconds: 30` was a flat
+            # 30s floor added AFTER migrations finish — the pod was
+            # serving and the kubelet had not looked yet. Probing early
+            # and often costs one cheap unauthenticated GET per 2s and
+            # gives the time back on every deploy.
+            #
+            # The failure budget is deliberately unchanged: it was
+            # 30 + 30*10 = 330s of tolerance for a slow start, and is
+            # now 5 + 150*2 = 305s. Shrinking it here would turn a slow
+            # migration into CrashLoopBackOff.
+            initialDelaySeconds: 5
+            periodSeconds: 2
+            failureThreshold: 150
           resources:
             requests: {cpu: "2", memory: 4Gi}
             limits: {memory: 12Gi}

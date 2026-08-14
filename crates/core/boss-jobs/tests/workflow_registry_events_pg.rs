@@ -5,8 +5,6 @@
 //! is pinned in `registry::tests` (lib test); this file proves the
 //! Pg adapter actually stages the rows in `event_outbox`.
 
-#![cfg(feature = "postgres")]
-
 use boss_core::actor::ActorId;
 use boss_jobs::events::{WORKFLOW_DRAFT_SAVED, WORKFLOW_PUBLISHED, WORKFLOW_RETIRED};
 use boss_jobs::registry::{PgWorkflows, StepSpec, Terminal, WorkflowRegistry, WorkflowSpec};

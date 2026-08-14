@@ -50,3 +50,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "rebuild_e2e"
+required-features = ["postgres"]

@@ -546,3 +546,61 @@ when = "kind = \"maintenance-sweep\" AND outcome = \"remediated\""
 [[rule.do]]
 handler = "jobs.spawn"
 args = { kind = "\"ship-a-change\"", subject_kind = "\"custom\"", subject = "id", title = "title", "metadata.backlog_item" = "id" }
+
+# ---------------------------------------------------------------------
+# Three more maintenance areas (migration 122). 121 seeded the protocol
+# and one area and noted that David expects several; this is the
+# follow-through, filed as d0092947.
+#
+# Seeded together on purpose. David, 2026-08-14: "introducing and
+# changing protocol is cheap, so we can create as many as we need and
+# edit them to find the right operating cadence." The `clear` vs
+# `remediated` counts are what say which cadence is wrong — that is a
+# query, not an opinion, and it needs rows to run against.
+#
+# All three are invisible-until-expensive, and each was found by paying
+# for it once. Cadence `daily` per David's standing instruction; if the
+# dock floods, the fix is a `schedule` edit on these rows, not a deploy.
+# ---------------------------------------------------------------------
+
+# 1. STALE BUILD CACHES. The disk problem 121 was written about had a
+# cause a disk sweep would not have found: 69GB of cargo target dirs
+# under .claude/worktrees for branches that shipped days earlier, 48GB
+# in one worktree. The main tree gave back 9GB, the worktrees 67GB — so
+# an inspection pointed at the repo reports the small number and moves
+# on. Deliberately its own area rather than a bigger disk check: the two
+# look in different places, and collapsing them is how the 67GB stayed
+# invisible the first time.
+[[rule]]
+name = "maintenance-sweep-build-caches-daily"
+schedule = { cadence = "daily", anchor_date = "2026-08-14" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"maintenance-sweep\"", subject_kind = "\"custom\"", subject = "\"stale-build-caches\"", title = "\"Stale build cache sweep\"", "metadata.target" = "\"stale-build-caches\"", "metadata.area" = "\"infra\"" }
+
+# 2. IMAGE FRESHNESS. The CI runner's rootful docker held a 31-hour-old
+# boss-ci image while the registry served a newer one. build.sh's header
+# already warns that a registry retag does not refresh a runner's local
+# tag — the warning existed and the drift happened anyway, which is the
+# signal that a comment is not a mechanism (CLAUDE.md 9a). Cost a
+# 25-minute mystery once, and fails in the worst direction: CI goes
+# green or red against an image nobody is looking at.
+[[rule]]
+name = "maintenance-sweep-image-freshness-daily"
+schedule = { cadence = "daily", anchor_date = "2026-08-14" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"maintenance-sweep\"", subject_kind = "\"custom\"", subject = "\"image-freshness\"", title = "\"CI image freshness sweep\"", "metadata.target" = "\"image-freshness\"", "metadata.area" = "\"ci\"" }
+
+# 3. DEPLOY CONVERGENCE LAG. The converge runner failed silently for
+# hours on a missing `-i` in a docker invocation and the cluster sat on
+# a stale image while forge main moved on. A failed systemd oneshot
+# notifies nobody. This is the one that most directly undermines "the
+# cluster is the system of record": an unconverged cluster is a system
+# of record telling you about a commit that is no longer true.
+[[rule]]
+name = "maintenance-sweep-converge-lag-daily"
+schedule = { cadence = "daily", anchor_date = "2026-08-14" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"maintenance-sweep\"", subject_kind = "\"custom\"", subject = "\"deploy-convergence\"", title = "\"Deploy convergence sweep\"", "metadata.target" = "\"deploy-convergence\"", "metadata.area" = "\"deploy\"" }

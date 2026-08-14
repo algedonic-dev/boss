@@ -18,8 +18,6 @@
 //! docs/architecture-decisions.md §Finance & ledger (Q1–Q3 resolved
 //! 2026-07-07).
 
-#![cfg(feature = "postgres")]
-
 use boss_inventory::PgInventory;
 use boss_inventory::port::InventoryRepository;
 use boss_inventory::types::InventoryItem;

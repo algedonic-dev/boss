@@ -6,8 +6,6 @@
 //! pull surface carries the flag out to My Day, which sees nothing of
 //! the Job but the row.
 
-#![cfg(feature = "postgres")]
-
 use boss_core::job::{Job, JobId, JobStatus, Priority, Step, StepStatus, Subject};
 use boss_jobs::port::JobsRepository;
 use boss_testing::TestDb;

@@ -61,3 +61,27 @@ proptest = "1"
 
 [lints]
 workspace = true
+
+[[test]]
+name = "audit_log_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "operator_baseline_seed_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "pg_people_roundtrip"
+required-features = ["postgres"]
+
+[[test]]
+name = "rebuild_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "requisitions_audit_chain"
+required-features = ["postgres"]
+
+[[test]]
+name = "workflow_status_audit_chain"
+required-features = ["postgres"]

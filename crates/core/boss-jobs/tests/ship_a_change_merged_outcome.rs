@@ -26,8 +26,6 @@
 //! marker → outcome → closed through HTTP, which also covers the
 //! catch-all close path and the terminal skip of the branch not taken.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use async_trait::async_trait;

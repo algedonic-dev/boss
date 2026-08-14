@@ -5,8 +5,6 @@
 //! deterministic `source_id`: replaying the same consume is a no-op on
 //! `on_hand` (and dodges a spurious InsufficientStock once stock falls).
 
-#![cfg(feature = "postgres")]
-
 use boss_inventory::PgInventory;
 use boss_inventory::port::InventoryRepository;
 use boss_inventory::types::InventoryItem;

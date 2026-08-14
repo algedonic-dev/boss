@@ -3,8 +3,6 @@
 //! to catch any divergence between the test-double and production
 //! adapter (e.g. dedup constraint behavior, soft-delete idempotence).
 
-#![cfg(feature = "postgres")]
-
 use chrono::{DateTime, TimeZone, Utc};
 use uuid::Uuid;
 

@@ -5,8 +5,6 @@
 //! delivery) must not double-apply. The guard keys on the deterministic
 //! `source_id`: replaying the same call is a no-op on `on_hand`.
 
-#![cfg(feature = "postgres")]
-
 use boss_products::ProductsRepository;
 use boss_products::postgres::PgProducts;
 use boss_products::types::Product;

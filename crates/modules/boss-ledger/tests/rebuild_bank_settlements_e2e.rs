@@ -27,8 +27,6 @@
 //! dance (the thing that manufactured the NULLs) is deleted — it was
 //! guarding a foreign key that does not exist.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::Router;

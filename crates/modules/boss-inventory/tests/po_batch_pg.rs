@@ -1,8 +1,6 @@
 //! End-to-end test: the PO batch endpoint persists backdated POs into
 //! a real Postgres database.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::Router;

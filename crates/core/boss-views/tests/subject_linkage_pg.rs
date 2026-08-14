@@ -15,8 +15,6 @@
 //! producers emit. So this test writes each shape into `audit_log` and
 //! asserts what comes out the other side.
 
-#![cfg(feature = "postgres")]
-
 use boss_testing::TestDb;
 use sqlx::Row;
 

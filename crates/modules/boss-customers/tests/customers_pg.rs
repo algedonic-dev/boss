@@ -6,8 +6,6 @@
 //! the same row, and a different id claiming a registered email is
 //! rejected, not absorbed.
 
-#![cfg(feature = "postgres")]
-
 use boss_customers::PgCustomers;
 use boss_customers::port::{CustomersError, CustomersRepository};
 use boss_customers::types::{Customer, id_from_email};

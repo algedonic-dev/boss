@@ -24,7 +24,27 @@
   import { navigate } from '../router';
   import { session } from '@boss/web-kit/session/session.svelte';
 
-  let { jobId, stepId } = $props<{ jobId: string; stepId: string }>();
+  let { jobId, stepId, from, fromLabel } = $props<{
+    jobId: string;
+    stepId: string;
+    /// Where the operator came from. David, feedback 40fe7291, filed
+    /// while working the design queue: "The 'Back' functionality from
+    /// a design review went to the job. What I expected: gone back to
+    /// the Design Review queue."
+    ///
+    /// Back used to be hardcoded to the job page, which is the one
+    /// place you were deliberately NOT sent — a review opens the
+    /// full-page step surface precisely because the job page buries
+    /// the document beside a sidebar and a step list. So Back undid
+    /// the routing choice and dropped you one queue further away.
+    ///
+    /// The lens that opened the step says where back goes, because it
+    /// is the only thing that knows. Absent (a deep link, or a
+    /// surface that has not adopted it) the job page remains the
+    /// fallback, so nothing regresses.
+    from?: string;
+    fromLabel?: string;
+  }>();
 
   // Reuse the plugin contract's own step shape rather than
   // redeclaring it — a local copy drifts, and the drift only shows up
@@ -37,6 +57,13 @@
   let step = $state<Step | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
+
+  // Declared after `job` because the label falls back to it. Kept as
+  // one pair so the destination and its name can never disagree — a
+  // Back reading "Design Review" that lands on the job page is worse
+  // than the bug this fixes.
+  const backTo = $derived(from ?? `/ux/jobs/${jobId}`);
+  const backText = $derived(fromLabel ?? (from ? 'Back' : (job?.title ?? 'Back to job')));
 
   // The plugin contract takes `PluginCurrentUser | undefined`, not
   // null — undefined means "no user known", which is what a
@@ -107,8 +134,8 @@
 
 <div class="step-focus">
   <div class="step-focus-bar">
-    <button class="step-focus-back" onclick={() => navigate(`/ux/jobs/${jobId}`)}>
-      ← {job?.title ?? 'Back to job'}
+    <button class="step-focus-back" onclick={() => navigate(backTo)}>
+      ← {backText}
     </button>
     {#if step}
       <span class="step-focus-title">{step.title}</span>

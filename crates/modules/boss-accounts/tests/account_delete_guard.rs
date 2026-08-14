@@ -17,8 +17,6 @@
 //!   - The guard fires BEFORE the SQL delete: we verify the account row
 //!     is still present on 409, and absent on 204.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::Router;

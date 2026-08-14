@@ -14,8 +14,6 @@
 //! non-ignored cases (empty / paid / healthy / cancelled / recent_pm)
 //! exercise the read path and the access-control envelope.
 
-#![cfg(feature = "postgres")]
-
 use axum::http::StatusCode;
 use boss_accounts::account_next_actions::next_actions_router;
 use boss_testing::{TestDb, TestRequest};

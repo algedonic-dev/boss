@@ -12,8 +12,6 @@
 //! shape-resolution for the two drive payloads is pinned in
 //! `http_writes.rs`.
 
-#![cfg(feature = "postgres")]
-
 use boss_commerce::PgCommerce;
 use boss_commerce::port::{CommerceError, CommerceRepository};
 use boss_commerce::types::*;

@@ -12,8 +12,6 @@
 //! the status change AND the `employee_changes` row reappear from
 //! `audit_log` alone.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 /// Drain the outbox through the relay pipeline into audit_log.

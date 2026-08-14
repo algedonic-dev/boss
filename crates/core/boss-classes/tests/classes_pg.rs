@@ -4,8 +4,6 @@
 //! database — and the batch adapter surfaces WHICH kind offended
 //! instead of a generic storage error.
 
-#![cfg(feature = "postgres")]
-
 use boss_classes::port::{ClassError, ClassRepository};
 use boss_classes::postgres::PgClasses;
 use boss_testing::TestDb;

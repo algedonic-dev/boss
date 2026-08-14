@@ -9,8 +9,6 @@
 //! instead of letting prior-cycle rows accumulate and collide with the
 //! synthesize idempotency key.
 
-#![cfg(feature = "postgres")]
-
 use boss_ledger::{rebuild_facts, rebuild_payroll};
 use boss_testing::TestDb;
 use chrono::{DateTime, Utc};

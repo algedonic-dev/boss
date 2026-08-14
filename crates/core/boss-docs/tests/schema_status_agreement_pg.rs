@@ -7,8 +7,6 @@
 //! pins all three together: add a variant anywhere without the others
 //! and CI fails with the exact value.
 
-#![cfg(feature = "postgres")]
-
 use boss_docs::PgDocsRepo;
 use boss_docs::port::DocsRepository;
 use boss_docs::types::{DesignDoc, DocStatus};

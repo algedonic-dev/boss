@@ -20,8 +20,6 @@
 //! its Workflow and its terminal as DATA rather than by fetching the
 //! Job to find out whether the event was even about it.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use async_trait::async_trait;

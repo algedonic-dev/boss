@@ -158,6 +158,38 @@
 }
 .step-review-design .srd-q textarea:disabled { opacity: .7; }
 
+/* The proposal is an offer, so it is visibly NOT the resolution box:
+   its own tinted card, above the label, with the button that copies it
+   down. Reading line-height — this is prose the reviewer has to weigh,
+   not a UI string. */
+.step-review-design .srd-proposal {
+  margin: 12px 0 0; padding: 8px 10px; border-radius: 5px;
+  border: 1px solid var(--border, #e7e5e4);
+  border-left: 3px solid var(--accent, #2563eb);
+  background: var(--bg, #fafaf9);
+}
+.step-review-design .srd-proposal-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+}
+.step-review-design .srd-proposal-label {
+  font-size: 11px; font-weight: 600; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--text-dim, #78716c);
+}
+.step-review-design .srd-proposal-text {
+  margin-top: 6px; font-size: 13px; line-height: 1.55; color: var(--text, #1c1917);
+  white-space: pre-wrap;
+}
+.step-review-design .srd-use {
+  flex: none; font: inherit; font-size: 12px; cursor: pointer;
+  padding: 3px 10px; border-radius: 4px;
+  border: 1px solid var(--accent, #2563eb);
+  background: transparent; color: var(--accent, #2563eb);
+}
+.step-review-design .srd-use:hover:not(:disabled) {
+  background: var(--accent, #2563eb); color: #fff;
+}
+.step-review-design .srd-use:disabled { opacity: .5; cursor: default; }
+
 .step-review-design .srd-empty,
 .step-review-design .srd-loading {
   padding: 20px; border-radius: 6px; background: var(--bg, #f5f5f4);
@@ -245,6 +277,38 @@
     }
     function allAnswered() {
       return questions.length > 0 && answeredCount() === questions.length;
+    }
+
+    /// The doc's own proposed answer, with a button that copies it into
+    /// the resolution box. Returns null when the question proposes
+    /// nothing, which is most of the corpus' older questions and every
+    /// question whose author left the answer open on purpose.
+    ///
+    /// `q.proposal` is parsed by boss-docs from a `Proposed:` line.
+    /// That extractor recognised only `**Proposal**:` until 2026-08-14
+    /// — a spelling no doc uses — so this field was null on every
+    /// question in the corpus and the rail below carries a comment
+    /// concluding there was no proposal to accept.
+    function proposalBlock(q, onUse) {
+      const proposal = typeof q.proposal === 'string' ? q.proposal.trim() : '';
+      if (!proposal) return null;
+      const btn = h(
+        'button',
+        { className: 'srd-use', type: 'button', disabled: isDone },
+        'Use this',
+      );
+      btn.addEventListener('click', () => onUse(proposal));
+      return h(
+        'div',
+        { className: 'srd-proposal' },
+        h(
+          'div',
+          { className: 'srd-proposal-head' },
+          h('span', { className: 'srd-proposal-label' }, 'Proposed in the doc'),
+          btn,
+        ),
+        h('div', { className: 'srd-proposal-text' }, proposal),
+      );
     }
 
     const progressSpan = h('span', { className: 'srd-progress' });
@@ -369,6 +433,26 @@
             }
             return q.body_md ? h('div', { className: 'srd-q-body' }, q.body_md) : null;
           })(),
+          // The proposal, offered rather than applied (David,
+          // 2026-08-14): "give you the ability to populate the
+          // resolution but I have to still click the button ...
+          // basically just authorizing you to copy and paste on my
+          // behalf." So the draft sits here with a button, and the
+          // resolution box stays empty until he presses it. Filling
+          // the box directly would make every question count as
+          // answered on page load, and Complete is gated on that
+          // count — one stray click would then record decisions
+          // nobody read.
+          //
+          // Nothing about this is recorded on the packet: the
+          // proposal is the doc's own text, and what gets stored is
+          // the resolution he committed.
+          proposalBlock(q, (text) => {
+            ta.value = text;
+            setResolution(q.anchor, text);
+            card.classList.add('is-addressed');
+            ta.focus();
+          }),
           h('label', { className: 'srd-label' }, 'Resolution'),
           ta,
         );
@@ -428,10 +512,22 @@
       // so the existing flush-jobs path can extract them to ADRs. We
       // POST one at a time — the endpoint is upsert-style.
       // PendingDecisionInput wants {doc_path, anchor, kind, resolution}.
-      // The reviewer types free-text decisions here (there's no parsed
-      // proposal being accepted), so every row is an Override. The old
-      // body sent `proposal` with no kind — a 422 this catch swallowed,
-      // so flush-jobs always saw zero pending decisions.
+      // The old body sent `proposal` with no kind — a 422 this catch
+      // swallowed, so flush-jobs always saw zero pending decisions.
+      //
+      // `kind` is now a fact rather than a constant. It used to be
+      // hardcoded to override because no question ever carried a
+      // proposal to accept (the parser looked for a spelling the corpus
+      // does not use), which made the accept/override split carry no
+      // information at all. It is derived from what the reviewer
+      // submitted: identical to the doc's proposal means he took it,
+      // anything else means he wrote his own. That is a claim about his
+      // text, not about who drafted it — nothing here records that a
+      // proposal was pre-filled.
+      const proposalFor = (anchor) => {
+        const q = questions.find((x) => x.anchor === anchor);
+        return q && typeof q.proposal === 'string' ? q.proposal.trim() : '';
+      };
       const writes = resolutions
         .filter((r) => r.decision.trim().length > 0)
         .map((r) =>
@@ -441,7 +537,7 @@
             body: JSON.stringify({
               doc_path: docPath,
               anchor: r.anchor,
-              kind: 'override',
+              kind: r.decision.trim() === proposalFor(r.anchor) ? 'accept' : 'override',
               resolution: r.decision,
             }),
           }),

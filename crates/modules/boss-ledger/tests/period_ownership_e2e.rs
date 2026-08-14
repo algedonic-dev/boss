@@ -18,8 +18,6 @@
 //! paths consult. These tests pin that, and pin the SQL copy of it
 //! against the Rust one.
 
-#![cfg(feature = "postgres")]
-
 use boss_ledger::periods::lock_period;
 use boss_ledger::postgres::{OPEN_PERIOD_FACTS_SQL, PERIOD_CLOSED_FACT, owning_period_kind};
 use boss_ledger::{FactRef, post_fact_in_tx};

@@ -17,8 +17,6 @@
 //! sends the same status, changes nothing, and must still succeed.
 //! Only a DIFFERENT status against a terminal row is a real conflict.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use async_trait::async_trait;

@@ -2,8 +2,6 @@
 //! `accounts` + `account_contacts`, drop them, rebuild from
 //! `audit_log`, assert exact match.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::Router;

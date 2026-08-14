@@ -14,8 +14,6 @@
 //!   registered is rejected by the trigger at run time, which is the
 //!   expensive place to find out.
 
-#![cfg(feature = "postgres")]
-
 use boss_core::actor::ActorId;
 use boss_jobs::events::{
     STATION_DRAFT_SAVED, STATION_PUBLISHED, STATION_QUARANTINED, STATION_RETIRED,

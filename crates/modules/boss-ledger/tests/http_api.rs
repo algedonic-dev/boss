@@ -1,7 +1,5 @@
 //! HTTP-layer tests for the read-only ledger API.
 
-#![cfg(feature = "postgres")]
-
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use boss_ledger::http::{LedgerApiState, router};

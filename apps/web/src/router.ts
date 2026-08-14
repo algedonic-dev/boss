@@ -43,7 +43,15 @@ export type Route =
   /// whole viewport instead of a panel inside the job page — review
   /// and authoring steps are reading tasks, and reading competes
   /// badly with a sidebar and a step list.
-  | { kind: 'stepFocus'; jobId: string; stepId: string }
+  | {
+      kind: 'stepFocus';
+      jobId: string;
+      stepId: string;
+      /// In-app path the lens that opened this step wants Back to
+      /// return to, with a label for it. Absent for a deep link.
+      from?: string;
+      fromLabel?: string;
+    }
   | { kind: 'service' }
   | { kind: 'sales' }
   | { kind: 'refurb' }
@@ -291,7 +299,23 @@ export function parseRoute(pathname: string): Route {
   // Before the greedy /jobs/(.+) below, which would otherwise swallow
   // the whole `{id}/steps/{stepId}` tail as a job id.
   const sfm = p.match(/^\/jobs\/([^/]+)\/steps\/([^/]+)$/);
-  if (sfm) return { kind: 'stepFocus', jobId: sfm[1]!, stepId: sfm[2]! };
+  if (sfm) {
+    const sp = new URLSearchParams(window.location.search);
+    const r: Route = { kind: 'stepFocus', jobId: sfm[1]!, stepId: sfm[2]! };
+    // Where "back" goes, and what to call it. Only the lens that sent
+    // the operator here knows — the step surface cannot infer it, and
+    // guessing from the Job's kind would put a per-workflow branch in
+    // core routing (CLAUDE.md 9). Leading-slash check keeps this an
+    // in-app path: a `from` naming another origin would turn a Back
+    // button into an open redirect.
+    const from = sp.get('from');
+    const fromLabel = sp.get('from_label');
+    if (from?.startsWith('/') && !from.startsWith('//')) {
+      (r as { from?: string }).from = from;
+      if (fromLabel) (r as { fromLabel?: string }).fromLabel = fromLabel;
+    }
+    return r;
+  }
 
   const jm = p.match(/^\/jobs\/(.+)$/);
   if (jm) return { kind: 'jobDetail', jobId: jm[1]! };

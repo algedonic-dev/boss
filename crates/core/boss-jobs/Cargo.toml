@@ -65,3 +65,71 @@ proptest = "1"
 
 [lints]
 workspace = true
+
+[[test]]
+name = "job_closed_payload"
+required-features = ["postgres"]
+
+[[test]]
+name = "postgres_filter"
+required-features = ["postgres"]
+
+[[test]]
+name = "rebuild_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "restart_epoch_payroll_clear"
+required-features = ["postgres"]
+
+[[test]]
+name = "restart_epoch_preserves_real_work"
+required-features = ["postgres"]
+
+[[test]]
+name = "scheduling_audit_chain"
+required-features = ["postgres"]
+
+[[test]]
+name = "ship_a_change_merged_outcome"
+required-features = ["postgres"]
+
+[[test]]
+name = "sim_clock_pause_sets_paused_at"
+required-features = ["postgres"]
+
+[[test]]
+name = "simulated_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "stations_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "step_plugin_registry_events_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "step_terminal_refusal"
+required-features = ["postgres"]
+
+[[test]]
+name = "subject_existence_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "user_feedback_lifecycle"
+required-features = ["postgres"]
+
+[[test]]
+name = "waiting_on_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "workflow_reconcile_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "workflow_registry_events_pg"
+required-features = ["postgres"]

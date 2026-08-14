@@ -3,8 +3,6 @@
 //! projection round-trip without requiring a full commerce/inventory
 //! HTTP setup.
 
-#![cfg(feature = "postgres")]
-
 use boss_ledger::{FactRef, post_fact_in_tx};
 use boss_testing::TestDb;
 use chrono::NaiveDate;

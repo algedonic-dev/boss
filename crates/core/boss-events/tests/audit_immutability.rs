@@ -5,8 +5,6 @@
 //! See `docs/architecture-decisions.md` §Correctness protocol &
 //! the audit log.
 
-#![cfg(feature = "postgres")]
-
 use boss_core::audit::AuditWriter;
 use boss_core::event::Event;
 use boss_events::{PgAuditWriter, check_audit_log_integrity};

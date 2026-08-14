@@ -17,8 +17,6 @@
 //!    with the new counts.
 //! 4. Recording a pending decision emits `docs.design.decision_recorded`.
 
-#![cfg(feature = "postgres")]
-
 use boss_docs::port::DocsRepository;
 use boss_docs::postgres::PgDocsRepo;
 use boss_docs::types::{DesignDoc, DesignQuestion};

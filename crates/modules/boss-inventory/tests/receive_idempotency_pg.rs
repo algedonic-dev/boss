@@ -13,8 +13,6 @@
 //! journal line. `received_fact_is_gl_inert` asserts it produces no
 //! gl_journal_entries row.
 
-#![cfg(feature = "postgres")]
-
 use boss_inventory::PgInventory;
 use boss_inventory::port::InventoryRepository;
 use boss_inventory::types::InventoryItem;

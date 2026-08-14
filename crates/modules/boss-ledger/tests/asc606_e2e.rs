@@ -18,8 +18,6 @@
 //! env-var mutation here doesn't leak into rules_v1 / periods_e2e /
 //! http_api which all want v1.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Mutex;
 
 use boss_ledger::{BossRuleSet, FactRef, evaluate, post_fact_in_tx, recognize};

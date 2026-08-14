@@ -8,8 +8,6 @@
 //! column Steps do not have, and "my ready steps" — the question this
 //! source exists to answer — would return nothing.
 
-#![cfg(feature = "postgres")]
-
 use boss_policy_client::{
     AccessTier, Action, FakePolicyClient, PolicyClient, Resource, Scope, User,
 };

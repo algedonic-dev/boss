@@ -16,12 +16,52 @@
     type TrainRow,
   } from './yard';
   import PacketCard from '@boss/web-kit/ui/PacketCard.svelte';
+  import PacketModal, { type PacketJob } from '@boss/web-kit/ui/PacketModal.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { entityHref } from '@boss/web-kit/ui/entity-href';
   import { navigate } from '@boss/web-kit/nav';
 
   let yard = $state<YardState | null>(null);
   let loading = $state(true);
+
+  // The condensed packet panel (David, fc67bed2). The dock rows are a
+  // slim projection — no steps, no metadata — so opening a packet
+  // fetches the Job. Holding the id rather than the row also means the
+  // 10s poll cannot swap the panel's contents underneath a read.
+  let packetId = $state<string | null>(null);
+  let packet = $state<PacketJob | null>(null);
+  let packetLoading = $state(false);
+  let packetError = $state<string | null>(null);
+
+  async function openPacket(id: string): Promise<void> {
+    // Open first, fill in after: waiting on a round trip before the
+    // panel appears reads as a dropped double-click.
+    packetId = id;
+    packet = null;
+    packetError = null;
+    packetLoading = true;
+    try {
+      const r = await fetch(`/api/jobs/${id}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const body = (await r.json()) as PacketJob;
+      // A second double-click while this was in flight wins; dropping
+      // the stale response stops it overwriting the newer packet.
+      if (packetId === id) packet = body;
+    } catch (e) {
+      if (packetId === id) {
+        packetError = `Could not load the packet — ${e instanceof Error ? e.message : String(e)}`;
+      }
+    } finally {
+      if (packetId === id) packetLoading = false;
+    }
+  }
+
+  function closePacket(): void {
+    packetId = null;
+    packet = null;
+    packetError = null;
+    packetLoading = false;
+  }
 
   // The dock's walk upstream, when its registry row declares one.
   // Nothing station-specific lives here: the row says where upstream
@@ -133,7 +173,7 @@
               <span class="yard-empty">consist forming…</span>
             {:else}
               {#each t.cars as c (c.id)}
-                <PacketCard card={c} size="consist" />
+                <PacketCard card={c} size="consist" onOpen={openPacket} />
               {/each}
             {/if}
           </div>
@@ -175,7 +215,7 @@
     {:else}
       <div class="yard-dock">
         {#each yard.dock as c (c.id)}
-          <PacketCard card={c} size="dock" />
+          <PacketCard card={c} size="dock" onOpen={openPacket} />
         {/each}
       </div>
     {/if}
@@ -231,6 +271,17 @@
     <div class="yard-flow">PARKED → BOARDED → <em>DEPARTED</em> → ARRIVED</div>
   {/if}
 </div>
+
+<!-- Outside .yard-root so the backdrop covers the page rather than
+     sitting inside the padded column. -->
+{#if packetId}
+  <PacketModal
+    job={packet}
+    loading={packetLoading}
+    error={packetError}
+    onClose={closePacket}
+  />
+{/if}
 
 <style>
   .yard-root { padding: 0 32px 32px; }

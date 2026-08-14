@@ -16,8 +16,6 @@
 //!    doctrine); a node with no `step.ready.*` audit row reports no
 //!    age rather than a fabricated one.
 
-#![cfg(feature = "postgres")]
-
 use boss_testing::TestDb;
 use boss_views::fleet::FleetRepo;
 use boss_views::postgres::PgViewsRepo;

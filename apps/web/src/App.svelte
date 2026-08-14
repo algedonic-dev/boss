@@ -205,7 +205,7 @@
        sidebar. The chrome bar stays — you can still switch apps —
        but everything below it belongs to the step. -->
   <PerspectiveTabs active={perspective} apps={APPS} searchAppKinds={appKinds} />
-  <StepFocusPage jobId={route.jobId} stepId={route.stepId} />
+  <StepFocusPage jobId={route.jobId} stepId={route.stepId} from={route.from} fromLabel={route.fromLabel} />
 {:else}
   <PerspectiveTabs active={perspective} apps={APPS} searchAppKinds={appKinds} />
 <AppShell {activeSection} {perspective}>
