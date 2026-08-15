@@ -13,6 +13,7 @@
   // This page uses all three.
 
   import { session } from '@boss/web-kit/session/session.svelte';
+  import GuestHome from './GuestHome.svelte';
   import { appNow } from '@boss/web-kit/sim-clock';
   import {
     fetchMyDay,
@@ -173,6 +174,12 @@
       matching employee in the roster.
     </p>
   </div>
+{:else if session.readonly}
+  <!-- A visitor is signed in, so the session resolves — but My Day is
+       an employee's board and renders for them as three empty panels
+       and a failed watchlist under "0.0 years · visitor". They get the
+       front door instead (David, feedback cef0f06f). -->
+  <GuestHome greeting={`Good ${timeOfDay()}`} />
 {:else}
   {@const user = session.value.user}
   <div class="theme-exec" style="padding: 0 32px 32px">

@@ -180,6 +180,17 @@ async fn get_reports<R: PeopleRepository + 'static>(
     }
 }
 
+/// The transitional identity the deployment bootstraps itself with
+/// (`boss-operator-baseline-seed` injects it from
+/// `BOSS_BOOTSTRAP_ADMIN_EMAIL`). It exists so the system can write
+/// before anyone is hired — the F2 keystone — and it has nothing left
+/// to do the moment a named person holds the same authority.
+pub const BOOTSTRAP_IDENTITY: &str = "emp-bootstrap-admin";
+
+/// The role that makes it redundant. A brewer being hired does not
+/// retire the deployment's only administrative identity.
+const BOOTSTRAP_ROLE: &str = "platform-admin";
+
 async fn create_employee<R: PeopleRepository + 'static>(
     State(state): State<Arc<PeopleApiState<R>>>,
     Json(emp): Json<Employee>,
@@ -192,9 +203,64 @@ async fn create_employee<R: PeopleRepository + 'static>(
     // (full row state — what the rebuilder consumes) inside the
     // domain transaction; nothing publishes post-commit.
     let stamp = crate::events::event_stamp(&state.publisher, now).await;
-    match state.people.create_employee_at(&emp, now, &stamp).await {
-        Ok(id) => (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response(),
-        Err(e) => people_error_response(e),
+    let id = match state.people.create_employee_at(&emp, now, &stamp).await {
+        Ok(id) => id,
+        Err(e) => return people_error_response(e),
+    };
+    retire_bootstrap_identity_if_superseded(&state, &emp, now).await;
+    (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response()
+}
+
+/// Hand over from the bootstrap identity to the person who supersedes
+/// it (David, 2026-08-15: "maybe we have it so emp-bootstrap-admin
+/// auto-retires on provisioning of the first real employee").
+///
+/// HIRING is the trigger because hiring is the event that makes the
+/// bootstrap row redundant. Putting the check in the seed instead
+/// would only fire at bootstrap — precisely when no real employee
+/// exists yet — which is how a transitional identity becomes a
+/// permanent one.
+///
+/// Deliberately BEST-EFFORT and after the create. A hire is the
+/// caller's business and it has already succeeded; a deployment with
+/// no bootstrap row, or a retirement that fails, must not turn a good
+/// hire into an error the caller has to interpret. Idempotent: a row
+/// already terminated is left untouched, so re-running a seed does not
+/// emit a second retirement.
+async fn retire_bootstrap_identity_if_superseded<R: PeopleRepository + 'static>(
+    state: &Arc<PeopleApiState<R>>,
+    hired: &Employee,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    if hired.id == BOOTSTRAP_IDENTITY
+        || hired.role.as_deref() != Some(BOOTSTRAP_ROLE)
+        || hired.status.as_deref() != Some("active")
+    {
+        return;
+    }
+    let Ok(Some(mut boot)) = state.people.employee_by_id(BOOTSTRAP_IDENTITY).await else {
+        return; // no bootstrap row — nothing to hand over.
+    };
+    if boot.status.as_deref() == Some("terminated") {
+        return;
+    }
+    boot.status = Some("terminated".to_string());
+    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    match state
+        .people
+        .update_employee_at(BOOTSTRAP_IDENTITY, &boot, now, &stamp)
+        .await
+    {
+        Ok(()) => tracing::info!(
+            superseded_by = %hired.id,
+            "retired {BOOTSTRAP_IDENTITY}: a named {BOOTSTRAP_ROLE} now holds the authority it \
+             was bootstrapping"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not retire {BOOTSTRAP_IDENTITY} after hiring {}; the hire stands",
+            hired.id
+        ),
     }
 }
 
@@ -318,6 +384,17 @@ mod tests {
         }
     }
 
+    fn app_with(people: Arc<InMemoryPeople>) -> Router {
+        let policy: Arc<dyn PolicyClient> = Arc::new(boss_policy_client::PermissivePolicyClient);
+        router(PeopleApiState {
+            people,
+            publisher: None,
+            policy: Some(policy),
+            subject_kinds: None,
+            clock: Arc::new(boss_clock_client::WallClockClient),
+        })
+    }
+
     fn test_app() -> Router {
         let people = Arc::new(InMemoryPeople::new(vec![
             test_emp("emp-001", None),
@@ -332,6 +409,113 @@ mod tests {
             subject_kinds: None,
             clock: Arc::new(boss_clock_client::WallClockClient),
         })
+    }
+
+    /// The bootstrap identity is TRANSITIONAL: it exists so the system
+    /// can write before anyone is hired, and it should stop existing the
+    /// moment a named person can do the writing.
+    ///
+    /// David, 2026-08-15: "We really need to retire emp-bootstrap-admin
+    /// as an actor ... now that my david@algedonic.dev identity is
+    /// established that it give the impression I am still bootstrapping
+    /// things while I am working. Maybe we have it so emp-bootstrap-admin
+    /// auto-retires on provisioning of the first real employee."
+    ///
+    /// Hiring is the trigger because hiring is the event that makes the
+    /// bootstrap row redundant — putting it in the seed instead would only
+    /// fire at bootstrap, which is exactly when the real employee does not
+    /// exist yet.
+    #[tokio::test]
+    async fn hiring_a_real_platform_admin_retires_the_bootstrap_identity() {
+        let mut boot = test_emp(BOOTSTRAP_IDENTITY, None);
+        boot.role = Some("platform-admin".to_string());
+        let people = Arc::new(InMemoryPeople::new(vec![boot]));
+        let app = app_with(people.clone());
+
+        let mut hire = test_emp("emp-david", None);
+        hire.role = Some("platform-admin".to_string());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/people")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&hire).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let after = people
+            .employee_by_id(BOOTSTRAP_IDENTITY)
+            .await
+            .unwrap()
+            .expect("the bootstrap row is retired, never deleted — the audit log names it");
+        assert_eq!(
+            after.status.as_deref(),
+            Some("terminated"),
+            "a named platform-admin exists, so the bootstrap identity has nothing left to do"
+        );
+    }
+
+    /// Hiring anyone else leaves it alone. The bootstrap identity holds
+    /// platform-admin; retiring it because a brewer was hired would take
+    /// the deployment's only administrative identity away.
+    #[tokio::test]
+    async fn hiring_an_ordinary_employee_leaves_the_bootstrap_identity_alone() {
+        let mut boot = test_emp(BOOTSTRAP_IDENTITY, None);
+        boot.role = Some("platform-admin".to_string());
+        let people = Arc::new(InMemoryPeople::new(vec![boot]));
+        let app = app_with(people.clone());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/people")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&test_emp("emp-brewer", None)).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let after = people
+            .employee_by_id(BOOTSTRAP_IDENTITY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.status.as_deref(), Some("active"));
+    }
+
+    /// Re-running the hire is a no-op rather than a second retirement
+    /// event, and a deployment that never had a bootstrap row does not
+    /// fail a hire over its absence.
+    #[tokio::test]
+    async fn retiring_the_bootstrap_identity_is_idempotent_and_optional() {
+        let people = Arc::new(InMemoryPeople::new(vec![]));
+        let app = app_with(people.clone());
+        let mut hire = test_emp("emp-david", None);
+        hire.role = Some("platform-admin".to_string());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/people")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&hire).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "no bootstrap row to retire is not a reason to refuse a hire"
+        );
     }
 
     #[tokio::test]

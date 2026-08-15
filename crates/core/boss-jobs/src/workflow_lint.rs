@@ -375,7 +375,7 @@ fn check_fork_coverage(
         let has_fallback = successors.iter().any(|s| {
             eval_pred(
                 &s.ready_when,
-                &synth_fork_payload(spec, registry, &fork.title, None),
+                &synth_fork_payload(spec, registry, deps, &fork.title, None),
             ) == Some(true)
         });
 
@@ -386,6 +386,7 @@ fn check_fork_coverage(
                         let payload = synth_fork_payload(
                             spec,
                             registry,
+                            deps,
                             &fork.title,
                             Some((field, Value::String(v.clone()))),
                         );
@@ -473,15 +474,47 @@ fn enum_domain(registry: &StepRegistry, fork: &StepSpec, field: &str) -> Option<
 /// Build a synthetic predicate payload where `fork` has completed
 /// (optionally with one metadata field set), every other step is
 /// not-done. Used to probe successor coverage at lint time.
+/// `fork` plus every step it transitively depends on — the set that
+/// must have completed for the fork to have completed.
+///
+/// `deps[x]` is what x depends on, so this walks upstream. The
+/// `seen` guard also terminates on a malformed cyclic edge set; the
+/// lint reports the cycle separately and must not hang first.
+fn ancestors_inclusive<'a>(
+    deps: &'a HashMap<String, Vec<String>>,
+    fork: &'a str,
+) -> HashSet<&'a str> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut stack = vec![fork];
+    while let Some(cur) = stack.pop() {
+        if !seen.insert(cur) {
+            continue;
+        }
+        for parent in deps.get(cur).into_iter().flatten() {
+            stack.push(parent.as_str());
+        }
+    }
+    seen
+}
+
 fn synth_fork_payload(
     spec: &WorkflowSpec,
     registry: &StepRegistry,
+    deps: &HashMap<String, Vec<String>>,
     fork: &str,
     field: Option<(&str, Value)>,
 ) -> Value {
+    // A fork cannot complete before the steps it depends on have, so a
+    // payload where the fork is the ONLY done step describes a state
+    // the engine can never reach. It matters because an ancestor's
+    // required fields are set BY its completion: marking only the fork
+    // done leaves an ancestor's key absent, and a successor reading it
+    // then looks uncoverable (or, worse, coverable for the wrong
+    // reason) on a graph that behaves correctly at run time.
+    let done_set = ancestors_inclusive(deps, fork);
     let mut steps = serde_json::Map::new();
     for s in &spec.steps {
-        let done = s.title == fork;
+        let done = done_set.contains(s.title.as_str());
         // Model what a materialized step ACTUALLY looks like, because
         // `boss-expr` errors on a missing identifier rather than reading
         // it as null — and an erroring predicate is indistinguishable
@@ -494,26 +527,37 @@ fn synth_fork_payload(
         // from the investigation that reached the same conclusion later")
         // — the lint refused to let anyone publish one.
         //
-        // Two layers, in materialization order:
-        //   1. every DECLARED field (inline on the step, or from its
-        //      StepType) as null — the key exists, nobody set it;
-        //   2. `metadata_defaults` over the top — stamped at
-        //      materialization, so those keys carry real values.
+        // Two layers, and which apply depends on whether the step has
+        // run — because that is what decides whether a key is there:
+        //   1. `metadata_defaults`, on EVERY step. Stamped at
+        //      materialization, so a pending step already carries them
+        //      (verified live: an open packet's `closed` step holds its
+        //      `outcome_kind` default while still pending).
+        //   2. declared fields as null, on DONE steps only. Completion
+        //      is what sets them, and a required field is validated at
+        //      done — so a step that has run has its keys, and one that
+        //      has not does not. Seeding them on a pending step would
+        //      make the lint MORE permissive than the engine: the clause
+        //      would read false here and error there, and an orphan
+        //      covered only by that clause would pass the gate and then
+        //      never become ready.
         let mut metadata = serde_json::Map::new();
-        for f in s.fields.iter().map(|f| f.name.to_string()).chain(
-            registry
-                .get(&s.kind)
-                .into_iter()
-                .flat_map(|st| st.fields.iter().map(|f| f.name.to_string())),
-        ) {
-            metadata.insert(f, Value::Null);
-        }
         if let Value::Object(defaults) = &s.metadata_defaults {
             for (k, v) in defaults {
                 metadata.insert(k.clone(), v.clone());
             }
         }
-        if let (true, Some((f, v))) = (done, &field) {
+        if done {
+            for f in s.fields.iter().map(|f| f.name.to_string()).chain(
+                registry
+                    .get(&s.kind)
+                    .into_iter()
+                    .flat_map(|st| st.fields.iter().map(|f| f.name.to_string())),
+            ) {
+                metadata.entry(f).or_insert(Value::Null);
+            }
+        }
+        if let (true, Some((f, v))) = (s.title == fork, &field) {
             // The discriminator under test wins over any default: this
             // payload exists to ask "what happens when the fork completes
             // with THIS value".
@@ -891,6 +935,77 @@ mod tests {
         assert!(
             !errs.iter().any(|e| e.reason.contains("orphan outcome")),
             "every decision outcome is handled; got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_clause_reading_an_unrun_steps_unset_field_does_not_count_as_coverage() {
+        // The other side of the payload fix, and the reason it seeds
+        // declared fields on DONE steps only.
+        //
+        // `ship` is reachable only via a clause reading `watch`'s
+        // `flag`, and `watch` has neither run nor declared a default —
+        // so at run time `steps.watch.metadata.flag` is ABSENT, boss-expr
+        // errors, and `ship` never becomes ready. Seeding every declared
+        // field as null regardless of state would make `!=` read true
+        // here and error there: the gate would pass a workflow with a
+        // branch that can never be taken.
+        let reg = StepRegistry::v1();
+        let spec = WorkflowSpec::platform_seed(
+            "unrun",
+            "unrun",
+            "test",
+            vec!["asset".into()],
+            vec![
+                StepSpec {
+                    title: "decide".into(),
+                    kind: "task".into(),
+                    ready_when: "true".into(),
+                    fields: vec![boss_core::job::StepField {
+                        name: "route".into(),
+                        field_type: "ship|scrap".into(),
+                        required: true,
+                    }],
+                    ..Default::default()
+                },
+                StepSpec {
+                    title: "watch".into(),
+                    kind: "task".into(),
+                    ready_when: "true".into(),
+                    fields: vec![boss_core::job::StepField {
+                        name: "flag".into(),
+                        field_type: "string".into(),
+                        required: false,
+                    }],
+                    ..Default::default()
+                },
+                StepSpec {
+                    title: "ship".into(),
+                    kind: "task".into(),
+                    ready_when: "steps.decide.done AND steps.watch.metadata.flag != \"stop\""
+                        .into(),
+                    terminal: Some(Terminal {
+                        outcome: "shipped".into(),
+                    }),
+                    ..Default::default()
+                },
+                StepSpec {
+                    title: "scrap".into(),
+                    kind: "task".into(),
+                    ready_when: "steps.decide.metadata.route = \"scrap\"".into(),
+                    terminal: Some(Terminal {
+                        outcome: "scrapped".into(),
+                    }),
+                    ..Default::default()
+                },
+            ],
+        );
+        let errs = validate_workflow(&spec, &reg);
+        assert!(
+            errs.iter()
+                .any(|e| e.reason.contains("orphan outcome") && e.reason.contains("\"ship\"")),
+            "route=\"ship\" is reachable only through a key that will not exist; \
+             expected an orphan, got: {errs:?}"
         );
     }
 

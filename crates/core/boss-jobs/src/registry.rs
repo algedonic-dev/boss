@@ -1213,6 +1213,46 @@ fn user_feedback_spec() -> WorkflowSpec {
     // of stranding a Job at runtime.
     const DISPOSITIONS: &str = "reproduce|design|build|duplicate|needs-info|decline";
 
+    // ROUTING IS NOT A ONE-SHOT GUESS (a001c78a, found by exercising
+    // the protocol rather than reading it).
+    //
+    // Every branch predicate used to read `steps.triage.metadata
+    // .disposition` and nothing else, so the packet was routed exactly
+    // once — before the investigation that produces the evidence. An
+    // investigator who discovered the item needed a design decision had
+    // no move: recording that on the investigate step was decorative,
+    // and `closed` fired on `steps.investigate.done`, so FINISHING the
+    // investigation ended the packet whatever it concluded. Observed
+    // live on 3f5f7f63, whose recommendation is stranded on a closed
+    // packet.
+    //
+    // So `investigate` carries the same vocabulary triage does, minus
+    // `reproduce` (it IS the reproduction) and plus `resolved` (the
+    // investigation settled it, which is v9's only behaviour). A branch
+    // is reachable from whichever step reached that conclusion.
+    //
+    // This is what the network framing predicts: routing decided once,
+    // by the actor with the least information, is exactly the property
+    // stations-as-queues exists to replace.
+    const INVESTIGATION_OUTCOMES: &str = "resolved|design|build|needs-info|duplicate|decline";
+
+    /// Reachable from triage's decision OR from the investigation's.
+    ///
+    /// Both halves must be evaluable at once: `boss-expr` errors on a
+    /// missing identifier and OR does not short-circuit past the error,
+    /// so ONE unreadable clause takes down a predicate that is
+    /// otherwise true. That is why `investigate` declares a
+    /// `metadata_defaults` disposition below — materialization stamps
+    /// it, so the key exists from the moment the step does. Registered
+    /// as `a-predicate-reading-another-steps-field-needs-that-key-to-exist`.
+    fn routed_to(disposition: &str) -> String {
+        format!(
+            "(steps.triage.done AND steps.triage.metadata.disposition = \"{disposition}\") \
+             OR (steps.investigate.done \
+             AND steps.investigate.metadata.disposition = \"{disposition}\")"
+        )
+    }
+
     /// A branch that leaves the Job open for someone to do the work.
     /// Authority-gated for the same reason triage is: `task` has no
     /// required roles, so without a gate the simulated workforce
@@ -1221,9 +1261,7 @@ fn user_feedback_spec() -> WorkflowSpec {
         StepSpec {
             title: title.into(),
             kind: "task".into(),
-            ready_when: format!(
-                "steps.triage.done AND steps.triage.metadata.disposition = \"{disposition}\""
-            ),
+            ready_when: routed_to(disposition),
             title_template: label.into(),
             authority_role: Some("platform-admin".into()),
             ..Default::default()
@@ -1245,9 +1283,7 @@ fn user_feedback_spec() -> WorkflowSpec {
         StepSpec {
             title: title.into(),
             kind: "outcome".into(),
-            ready_when: format!(
-                "steps.triage.done AND steps.triage.metadata.disposition = \"{disposition}\""
-            ),
+            ready_when: routed_to(disposition),
             title_template: label.into(),
             metadata_defaults: serde_json::json!({ "outcome_kind": outcome_kind }),
             terminal: Some(Terminal {
@@ -1329,7 +1365,44 @@ fn user_feedback_spec() -> WorkflowSpec {
             ],
             ..Default::default()
         },
-        branch("investigate", "Reproduce and investigate", "reproduce"),
+        StepSpec {
+            // Reached from triage only — an investigation cannot route
+            // to another investigation, and `reproduce` is not in
+            // INVESTIGATION_OUTCOMES for that reason.
+            ready_when: "steps.triage.done AND steps.triage.metadata.disposition = \"reproduce\""
+                .into(),
+            fields: vec![
+                boss_core::job::StepField {
+                    name: "disposition".into(),
+                    field_type: INVESTIGATION_OUTCOMES.into(),
+                    // Required at done, like triage's: an investigation
+                    // that does not say where the item goes next is the
+                    // v9 behaviour this replaces.
+                    required: true,
+                },
+                boss_core::job::StepField {
+                    name: "finding".into(),
+                    field_type: "string".into(),
+                    required: false,
+                },
+            ],
+            // `resolved` — the investigation settled it — is v9's only
+            // outcome, so an investigator who says nothing gets exactly
+            // the old behaviour.
+            //
+            // The default is LOAD-BEARING twice over, and neither
+            // reason is cosmetic. (1) Materialization stamps it, so
+            // every branch predicate above can read
+            // `steps.investigate.metadata.disposition` from the moment
+            // the packet exists — without it the key is absent, the
+            // clause errors, and OR takes the whole predicate down with
+            // it. (2) The `complete-feedback-branch-on-car-merged`
+            // obligation completes `investigate` when a car names the
+            // packet; a required field with no default would 422 that
+            // write and break the feedback loop.
+            metadata_defaults: serde_json::json!({ "disposition": "resolved" }),
+            ..branch("investigate", "Reproduce and investigate", "reproduce")
+        },
         branch("design-review", "Decide the design", "design"),
         branch("build", "Build the change", "build"),
         branch("needs-info", "Waiting on the reporter", "needs-info"),
@@ -1353,7 +1426,17 @@ fn user_feedback_spec() -> WorkflowSpec {
             // Any branch that did real work lands here. The two
             // closing branches terminate on their own and never reach
             // this one.
-            ready_when: "steps.investigate.done OR steps.design-review.done \
+            //
+            // `investigate` is the exception, and the narrowing is the
+            // other half of the re-routing fix: finishing an
+            // investigation ends the packet ONLY when the investigation
+            // said there was nothing further. An investigation that
+            // routed onward leaves this predicate false and the packet
+            // open, waiting at the branch it named — which is the
+            // behaviour a001c78a reported missing.
+            ready_when: "(steps.investigate.done \
+                         AND steps.investigate.metadata.disposition = \"resolved\") \
+                         OR steps.design-review.done \
                          OR steps.build.done OR steps.needs-info.done"
                 .into(),
             title_template: "Feedback closed".into(),
@@ -3811,9 +3894,15 @@ mod tests {
         }
     }
 
-    /// The feedback flow collects exactly ONE thing from an operator —
-    /// the triage disposition — so every step must close on its own
-    /// defaults plus that.
+    /// The feedback flow collects exactly one thing per DECIDING step
+    /// — a disposition — so every step must close on its own defaults
+    /// plus that.
+    ///
+    /// There are two deciding steps since v10: triage routes on what
+    /// the report says, and `investigate` re-routes on what the
+    /// investigation found. Both are human-gated `task` steps whose
+    /// declared fields the generic step surface renders, so both are
+    /// collectable. A required field on any OTHER step would not be.
     ///
     /// Both halves matter. A required field anywhere else is a step
     /// nothing in this flow can satisfy, because no surface asks for
@@ -3882,9 +3971,12 @@ mod tests {
 
         assert_eq!(
             operator_supplied,
-            vec!["Triage feedback.disposition".to_string()],
-            "the feedback flow has exactly one field an operator fills in; anything \
-             else here is a step no surface can complete"
+            vec![
+                "Triage feedback.disposition".to_string(),
+                "Reproduce and investigate.disposition".to_string(),
+            ],
+            "the feedback flow collects a disposition at each deciding step and nothing \
+             else; anything else here is a step no surface can complete"
         );
     }
 

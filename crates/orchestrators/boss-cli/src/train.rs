@@ -2532,7 +2532,19 @@ impl Conductor {
             "kind": "pr-train",
             "subject": {"subject_kind": "custom", "id": train_branch},
             "title": format!("PR train {window}"),
-            "owner_id": "emp-bootstrap-admin",
+            // The conductor is a machine and says so. `resolve_owner`
+            // reads any colon-bearing id as automation and places the
+            // Job on an active holder of the kind's `owner_role`
+            // (`platform-admin` for pr-train) — so the responsible
+            // human is whoever actually holds the role today.
+            //
+            // This used to name `emp-bootstrap-admin` outright, which
+            // survived only because that row happened to be the
+            // deployment's admin. Once the bootstrap identity is
+            // retired in favour of a named person, a hardcoded owner
+            // is a dead id that resolution has to quietly override —
+            // right by accident rather than by construction.
+            "owner_id": ACTOR,
             "status": "open",
             "priority": "standard",
             "metadata": {"actor": ACTOR},
