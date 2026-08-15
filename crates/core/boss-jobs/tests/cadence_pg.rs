@@ -1,0 +1,165 @@
+//! Postgres-backed coverage for the cadence registry surface.
+//!
+//! This file inherits a specific scar. Until 2026-08-14 the train
+//! conductor opened its own `PgPool` and read `cadence_rules`
+//! directly. It ran on a host whose local Postgres was NOT the
+//! cluster's, so the registry an operator inspected said
+//! `min_dock_depth = 4` while the loop actually enforcing boarding
+//! read 8 — and a confident, sourced, wrong answer came out of that
+//! gap ("the dock is at 4, it will board"). It did not board.
+//!
+//! The seed assertion below is the pin from the SERVING side: the
+//! number the API hands the conductor is the number in the schema. The
+//! conductor no longer has a second opinion available to it, because it
+//! no longer has a second database.
+
+use boss_jobs::cadence::{CadenceRepository, NewFiring, PgCadence};
+use boss_testing::TestDb;
+use chrono::{TimeZone, Utc};
+
+fn firing(id: &str, rule: &str) -> NewFiring {
+    NewFiring {
+        firing_id: id.into(),
+        rule_name: rule.into(),
+        verb: "board".into(),
+        basis: "queue-depth".into(),
+        fired_at: Utc.with_ymd_and_hms(2026, 8, 14, 12, 0, 0).unwrap(),
+        detail: serde_json::json!({ "dock_depth": 9 }),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn seeded_rules_serve_the_thresholds_the_schema_declares() {
+    let db = TestDb::new().await;
+    let repo = PgCadence::new(db.pool.clone());
+    let rules = repo.active_rules().await.unwrap();
+
+    let by_name = |n: &str| {
+        rules
+            .iter()
+            .find(|r| r.name == n)
+            .unwrap_or_else(|| panic!("seed rule {n} missing"))
+    };
+
+    let reconcile = by_name("train-reconcile");
+    assert_eq!(reconcile.verb, "reconcile");
+    assert_eq!(reconcile.basis, "wall");
+    assert_eq!(reconcile.every_minutes, Some(10));
+
+    let window = by_name("train-window");
+    assert_eq!(window.verb, "run");
+    assert_eq!(window.basis, "clock");
+    assert_eq!(
+        window.at_times,
+        Some(serde_json::json!(["06:00", "18:00"])),
+        "the clock rule's windows are registry data, not a constant"
+    );
+
+    // The number from the scar. Migration 123 reconciled the seed to
+    // the value the running conductor already enforced; 131 then raised
+    // it to 12 so one CI run carries more work (David: "load up trains
+    // as fast as we can and have CI be the blocker").
+    let depth = by_name("train-board-on-dock-depth");
+    assert_eq!(depth.verb, "board");
+    assert_eq!(depth.basis, "queue-depth");
+    assert_eq!(
+        depth.min_dock_depth,
+        Some(12),
+        "boarding threshold drifted from the schema — this is the \
+         2026-08-13 split-brain, and it made the operator's answer wrong"
+    );
+    assert_eq!(depth.cooldown_minutes, Some(120));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn active_rules_excludes_retired_ones() {
+    let db = TestDb::new().await;
+    let repo = PgCadence::new(db.pool.clone());
+    sqlx::query("UPDATE cadence_rules SET status = 'retired' WHERE name = $1")
+        .bind("train-reconcile")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let rules = repo.active_rules().await.unwrap();
+    assert!(
+        !rules.iter().any(|r| r.name == "train-reconcile"),
+        "a retired rule must stop firing — retirement is how a cadence \
+         is turned off without deleting its firing history"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claim_is_exactly_once_against_the_primary_key() {
+    let db = TestDb::new().await;
+    let repo = PgCadence::new(db.pool.clone());
+    let f = firing(
+        "cadence:board:2026-08-14T12:00Z",
+        "train-board-on-dock-depth",
+    );
+
+    assert!(repo.claim_firing(&f).await.unwrap());
+    assert!(
+        !repo.claim_firing(&f).await.unwrap(),
+        "ON CONFLICT (firing_id) DO NOTHING is the exactly-once gate: a \
+         conductor that crashed mid-verb must not re-run the verb on restart"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claim_records_the_callers_clock_not_the_database_wallclock() {
+    let db = TestDb::new().await;
+    let repo = PgCadence::new(db.pool.clone());
+    // A sim-dated tick, far from real time.
+    let simulated = Utc.with_ymd_and_hms(2031, 1, 2, 3, 4, 0).unwrap();
+    let mut f = firing(
+        "cadence:board:2031-01-02T03:04Z",
+        "train-board-on-dock-depth",
+    );
+    f.fired_at = simulated;
+    repo.claim_firing(&f).await.unwrap();
+
+    let last = repo
+        .last_firing("train-board-on-dock-depth")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        last.fired_at, simulated,
+        "fired_at is bound from boss-clock by the caller; a server-side \
+         NOW() would silently rewrite sim runs to real time"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outcome_merges_and_preserves_why_the_rule_fired() {
+    let db = TestDb::new().await;
+    let repo = PgCadence::new(db.pool.clone());
+    let f = firing(
+        "cadence:board:2026-08-14T12:00Z",
+        "train-board-on-dock-depth",
+    );
+    repo.claim_firing(&f).await.unwrap();
+    repo.record_outcome(&f.firing_id, 0, 37).await.unwrap();
+
+    let row: (serde_json::Value,) =
+        sqlx::query_as("SELECT detail FROM cadence_firings WHERE firing_id = $1")
+            .bind(&f.firing_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0["rc"], 0);
+    assert_eq!(row.0["runtime_secs"], 37);
+    assert_eq!(
+        row.0["dock_depth"], 9,
+        "`detail || $2` merges; replacing would discard the dock depth \
+         that triggered the firing, which is the measurement"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn last_firing_is_none_before_a_rule_has_ever_fired() {
+    let db = TestDb::new().await;
+    let repo = PgCadence::new(db.pool.clone());
+    assert!(repo.last_firing("train-window").await.unwrap().is_none());
+}

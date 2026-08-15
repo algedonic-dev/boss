@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use boss_core::job::{Job, JobStatus, Priority, Step, StepStatus};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 // ---------------------------------------------------------------------------
 // Predicate
@@ -102,6 +103,17 @@ pub struct StepMatch {
     /// The step is assigned to exactly this executor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee_id: Option<String>,
+    /// Step metadata keys whose value must equal exactly this string,
+    /// with the same string-only rule as the Job-level clause.
+    ///
+    /// Some facts only exist on the step. A red train is the worked
+    /// case: the conductor records its verdict as `result` on the `ci`
+    /// step and nowhere else, so a station that wants to hold red
+    /// trains has to read it there. The alternative — stamping a
+    /// second copy of the verdict on the Job so a Job-level clause
+    /// could see it — is the duplication CLAUDE.md 9a exists to stop.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata_equals: BTreeMap<String, String>,
 }
 
 impl StepMatch {
@@ -123,6 +135,11 @@ impl StepMatch {
             && step.assignee_id.as_deref() != Some(assignee.as_str())
         {
             return false;
+        }
+        for (key, want) in &self.metadata_equals {
+            if step.metadata.get(key).and_then(Value::as_str) != Some(want.as_str()) {
+                return false;
+            }
         }
         true
     }
@@ -191,10 +208,10 @@ impl StationPredicate {
     /// is asking.
     pub fn binds_self(&self) -> bool {
         self.metadata_equals.values().any(|v| v == SELF)
-            || self
-                .step
-                .as_ref()
-                .is_some_and(|s| s.assignee_id.as_deref() == Some(SELF))
+            || self.step.as_ref().is_some_and(|s| {
+                s.assignee_id.as_deref() == Some(SELF)
+                    || s.metadata_equals.values().any(|v| v == SELF)
+            })
     }
 
     /// Bind [`SELF`] to `actor`, yielding the concrete predicate to
@@ -222,10 +239,15 @@ impl StationPredicate {
                 *value = actor.to_string();
             }
         }
-        if let Some(step) = &mut bound.step
-            && step.assignee_id.as_deref() == Some(SELF)
-        {
-            step.assignee_id = Some(actor.to_string());
+        if let Some(step) = &mut bound.step {
+            if step.assignee_id.as_deref() == Some(SELF) {
+                step.assignee_id = Some(actor.to_string());
+            }
+            for value in step.metadata_equals.values_mut() {
+                if value == SELF {
+                    *value = actor.to_string();
+                }
+            }
         }
         Some(bound)
     }
@@ -586,6 +608,86 @@ mod tests {
         let mut theirs = step("work", StepStatus::Active);
         theirs.assignee_id = Some("emp-9".into());
         assert!(!p.matches(&job("k", Priority::Standard, 1), &[theirs]));
+    }
+
+    /// A station has to be able to hold packets on a fact the STEP
+    /// carries, not just the Job. The worked case is David's repair
+    /// queue (bb86d687, "maybe we need a repair station queue for
+    /// trains with errors"): a red train is a `pr-train` whose `ci`
+    /// step recorded `result = failing`, and redness lives there and
+    /// nowhere else. Without this clause the only way to express it
+    /// would be to stamp a second copy of the verdict on the Job,
+    /// which is the duplication CLAUDE.md 9a exists to stop.
+    #[test]
+    fn step_clause_matches_step_metadata() {
+        let p = StationPredicate {
+            step: Some(StepMatch {
+                slug: Some("ci".into()),
+                metadata_equals: BTreeMap::from([("result".to_string(), "failing".to_string())]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut red = step("ci", StepStatus::Active);
+        red.spec_slug = Some("ci".into());
+        red.metadata = serde_json::json!({"result": "failing"});
+        assert!(p.matches(&job("pr-train", Priority::Standard, 1), &[red]));
+
+        let mut green = step("ci", StepStatus::Active);
+        green.spec_slug = Some("ci".into());
+        green.metadata = serde_json::json!({"result": "green"});
+        assert!(!p.matches(&job("pr-train", Priority::Standard, 1), &[green]));
+
+        // A step that never recorded a verdict is not red — a pending
+        // train must not sit in the repair queue.
+        let mut pending = step("ci", StepStatus::Active);
+        pending.spec_slug = Some("ci".into());
+        assert!(!p.matches(&job("pr-train", Priority::Standard, 1), &[pending]));
+    }
+
+    /// The self placeholder must be honoured wherever it can be
+    /// written, not only where it was first supported. Adding a new
+    /// string-valued clause without extending `binds_self`/`bind_self`
+    /// would let `@me` past both: unbound, it would compare literally,
+    /// and the module's own warning says what that costs — a packet
+    /// whose metadata holds "@me" lands in EVERY actor's queue.
+    #[test]
+    fn self_placeholder_in_a_step_clause_binds_and_fails_closed() {
+        let p = StationPredicate {
+            step: Some(StepMatch {
+                metadata_equals: BTreeMap::from([("filed_by".to_string(), SELF.to_string())]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(p.binds_self(), "an @me in a step clause must be detected");
+        // No actor: no queue. Never a literal comparison.
+        assert!(p.bind_self(None).is_none());
+        let bound = p.bind_self(Some("emp-7")).expect("binds with an actor");
+        assert_eq!(
+            bound.step.as_ref().unwrap().metadata_equals.get("filed_by"),
+            Some(&"emp-7".to_string()),
+        );
+        // And the unbound predicate matches nothing, even against a
+        // packet that literally carries the placeholder.
+        let mut spoof = step("work", StepStatus::Active);
+        spoof.metadata = serde_json::json!({"filed_by": SELF});
+        assert!(!p.matches(&job("k", Priority::Standard, 1), &[spoof]));
+    }
+
+    /// Same rule the Job-level clause follows: only strings compare.
+    #[test]
+    fn step_metadata_clause_compares_strings_only() {
+        let p = StationPredicate {
+            step: Some(StepMatch {
+                metadata_equals: BTreeMap::from([("result".to_string(), "3".to_string())]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut numeric = step("ci", StepStatus::Active);
+        numeric.metadata = serde_json::json!({"result": 3});
+        assert!(!p.matches(&job("k", Priority::Standard, 1), &[numeric]));
     }
 
     #[test]

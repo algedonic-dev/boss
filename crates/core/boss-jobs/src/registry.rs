@@ -2009,6 +2009,14 @@ fn refs_all_terminal(spec: &WorkflowSpec, steps: &[Step], idx: usize) -> bool {
 /// settles in a single call. A spec/steps length mismatch (only
 /// possible if a Workflow was republished mid-flight with a different
 /// step count) is treated as "leave everything as-is."
+/// Has this job's step list diverged from the spec it was admitted
+/// under? A `true` here means [`reevaluate`] cannot run and the job is
+/// frozen — no step will ever advance again. Exposed so a caller with
+/// the job id in hand can report WHICH job, which `reevaluate` cannot.
+pub fn steps_diverged_from_spec(spec: &WorkflowSpec, steps: &[Step]) -> bool {
+    spec.steps.len() != steps.len()
+}
+
 pub fn reevaluate(
     spec: &WorkflowSpec,
     steps: &mut [Step],
@@ -2017,6 +2025,31 @@ pub fn reevaluate(
 ) -> Vec<usize> {
     let mut changed = Vec::new();
     if spec.steps.len() != steps.len() {
+        // A JOB WHOSE STEP COUNT DIVERGED FROM ITS SPEC CAN NEVER
+        // ADVANCE AGAIN. Predicates are not stored on steps (the table
+        // has no ready_when column) — advancement is recomputed by
+        // pairing spec steps with job steps POSITIONALLY, so one
+        // inserted step misaligns every pair after it and the honest
+        // move is to evaluate nothing.
+        //
+        // Bailing was always right. Bailing SILENTLY was not: on
+        // 2026-08-14 design review 32a4e70d sat in David's queue with
+        // its review step completed and its terminal pending, and the
+        // only symptom was "I finished it and it is still there". The
+        // job could not notice it was finished, and nothing said so.
+        //
+        // `POST /api/jobs/{id}/steps` is a public route, so any
+        // protocol that adds a step to a live job freezes it this way.
+        // Until steps carry their spec slug (the durable fix — then
+        // pairing is by name and extra steps are simply ignored), this
+        // log is what turns an invisible dead job into a visible one.
+        tracing::error!(
+            spec_steps = spec.steps.len(),
+            job_steps = steps.len(),
+            "job steps diverged from its workflow spec — this job is FROZEN \
+             and no step will advance again; a step was almost certainly \
+             added to a live job"
+        );
         return changed;
     }
     loop {
@@ -5256,6 +5289,59 @@ mod title_expansion_tests {
         assert_eq!(
             expand_title("Inspect: {{ job.metadata.target }}", &subject(), &meta),
             "Inspect: {{ job.metadata.target }}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod frozen_job_tests {
+    use super::*;
+
+    /// The 32a4e70d shape: a live job gains a step (a per-question task
+    /// the design-review protocol adds), its count no longer matches
+    /// the spec, and from that moment no step can advance — including
+    /// the terminal, so the job never closes and never leaves the
+    /// reviewer's queue.
+    #[test]
+    fn an_added_step_freezes_the_job_and_is_detectable() {
+        let spec = ship_a_change_spec();
+        let subject = Subject::new("custom", "x");
+        let mut n = 0u32;
+        let mut steps = materialize_steps(
+            &spec,
+            &subject,
+            JobId::new(),
+            &serde_json::json!({}),
+            || {
+                n += 1;
+                StepId::new()
+            },
+        );
+        assert!(
+            !steps_diverged_from_spec(&spec, &steps),
+            "a freshly materialized job matches its spec"
+        );
+
+        // Complete every spec step, then confirm evaluation still runs.
+        let before = reevaluate(&spec, &mut steps, &subject, &serde_json::json!({}));
+        let _ = before;
+
+        // Now the protocol adds a step to the live job.
+        let mut extra = steps[0].clone();
+        extra.id = StepId::new();
+        extra.title = "Q: a question captured as a step".into();
+        extra.status = StepStatus::Completed;
+        steps.push(extra);
+
+        assert!(
+            steps_diverged_from_spec(&spec, &steps),
+            "an added step must be detectable — this is the frozen state"
+        );
+        let changed = reevaluate(&spec, &mut steps, &subject, &serde_json::json!({}));
+        assert!(
+            changed.is_empty(),
+            "a diverged job advances nothing: reevaluate must refuse rather \
+             than pair spec steps against misaligned job steps"
         );
     }
 }

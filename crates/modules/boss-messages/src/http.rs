@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -61,6 +61,7 @@ pub fn router<R: MessageRepository + 'static>(state: MessageApiState<R>) -> Rout
         .route("/api/messages/{id}/read", post(mark_read::<R>))
         .route("/api/messages/{id}/archive", post(archive_message::<R>))
         .route("/api/messages/{id}/thread", get(thread::<R>))
+        .route("/api/messages/expire", post(expire_signals::<R>))
         .route("/api/messages/send", post(send_message::<R>))
         .route("/api/messages/batch", post(batch_messages::<R>))
         .with_state(shared)
@@ -154,12 +155,71 @@ async fn unread<R: MessageRepository + 'static>(
     State(state): State<Arc<MessageApiState<R>>>,
     CurrentUser(user): CurrentUser,
     Path(employee_id): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     if !is_trusted(&user) && user.id != employee_id {
         return StatusCode::FORBIDDEN.into_response();
     }
-    match state.messages.unread_count(&employee_id).await {
+    // `?kind=direct` narrows the count to messages addressed to a
+    // person. The chrome badge asks for that specifically: an inbox
+    // holding 1,980 unread `signal` rows against 3 unread `direct`
+    // ones would otherwise render the noise as a number, which is the
+    // opposite of a signal. Absent, every kind counts, so existing
+    // callers are unchanged.
+    let kind = params.get("kind").map(String::as_str);
+    match state.messages.unread_count(&employee_id, kind).await {
         Ok(count) => Json(UnreadResponse { count }).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ExpireRequest {
+    /// Entity path prefix whose unread signals are past relevancy —
+    /// `/jobs/{id}` expires both the job-level notifications and the
+    /// `/jobs/{id}/steps/{step}` ones beneath it.
+    entity_path_prefix: String,
+}
+
+#[derive(Serialize)]
+struct ExpiredResponse {
+    expired: u32,
+}
+
+/// Archive the unread signals about something that has finished
+/// (David, 2026-08-14: "a way to automatically expire inbox messages
+/// for jobs that have moved past relevancy").
+///
+/// Deliberately NOT gated on the caller matching a recipient: this
+/// expires across every recipient of a finished thing, which is the
+/// point — the dispatcher calls it once per closed job rather than
+/// once per person. `is_trusted` still keeps it to operator-tier and
+/// loopback callers.
+async fn expire_signals<R: MessageRepository + 'static>(
+    State(state): State<Arc<MessageApiState<R>>>,
+    CurrentUser(user): CurrentUser,
+    Json(body): Json<ExpireRequest>,
+) -> Response {
+    if !is_trusted(&user) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    // A prefix has to name something. An empty one would match every
+    // entity_path in the table and quietly archive the whole inbox.
+    if body.entity_path_prefix.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "entity_path_prefix must not be empty",
+        )
+            .into_response();
+    }
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = event_stamp(&state, now).await;
+    match state
+        .messages
+        .expire_signals_under(&body.entity_path_prefix, now, &stamp)
+        .await
+    {
+        Ok(expired) => Json(ExpiredResponse { expired }).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }

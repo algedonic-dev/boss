@@ -40,7 +40,7 @@ station registry shipped, the deploy reported success, and
 **Hand-applied schema is drift**, exactly like a hand-applied manifest —
 it stabilises the box for an hour and hides the fact that the tree and
 the cluster disagree. A schema change is a new file appended to
-`infra/postgres/schema/manifest.txt`, shipped through the train, never
+`infra/postgres/schema/`, shipped through the train, never
 an edit to a file that has already been applied (the runner refuses
 those by name).
 

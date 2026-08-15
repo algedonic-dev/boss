@@ -77,36 +77,74 @@ rows, retiring its ExecStartPre wrapper pattern.
 
 ## Open questions
 
-### Q1: What is the cadence row's shape?
+All 4 open questions were resolved 2026-08-14 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-Proposed: dispatcher rules grow a `[[cadence]]` sibling: `name`,
-`basis: wall|clock`, `every` (interval) or `at` (times-of-day),
-`emit` (topic + payload template). Same table, same hot-reload, same
-ratchet posture as `[[rule]]` — and the departure board's "next
-departure" line reads it as data.
+---
 
-### Q2: Where does the wall-basis tick come from?
 
-The schedule runner drives off the clock service's tick stream,
-which under warp compresses days. Proposed: the clock service
-already knows both times (`ClockNow` carries wall and sim); the
-cadence runner evaluates wall-basis rows against wall time from the
-same feed — one clock service remains authoritative for both bases,
-and no component grows a second time source.
+## Decisions
 
-### Q3: Exactly-once windows across restarts?
+### Q4: Does the conductor's queue use the claim CAS? (resolved)
 
-A cadence firing must not double-emit after a dispatcher restart nor
-skip a window that elapsed while down. Proposed: each firing records
-its event with a deterministic id (`cadence:<name>:<window-stamp>`),
-the outbox dedupes on it, and catch-up on start emits at most the
-single most-recent missed window per rule — a deliberate "no
-thundering backfill" choice matching the conductor's own
-one-window-at-a-time cadence.
+Resolved 2026-08-14 — override.
 
-### Q4: Does the conductor's queue use the claim CAS?
+**The question was:**
 
-Proposed: yes — window packets are ordinary packets; `boss train
-serve` claims via the same CAS the human queues use, which gives the
-board's live dot its data and makes a second conductor instance safe
-by construction rather than by deployment discipline.
+> Proposed: yes — window packets are ordinary packets; `boss train
+> serve` claims via the same CAS the human queues use, which gives the
+> board's live dot its data and makes a second conductor instance safe
+> by construction rather than by deployment discipline.
+
+cadence_firings primary-key dedupe
+
+
+### Q1: What is the cadence row's shape? (resolved)
+
+Resolved 2026-08-14 — override.
+
+**The question was:**
+
+> Proposed: dispatcher rules grow a `[[cadence]]` sibling: `name`,
+> `basis: wall|clock`, `every` (interval) or `at` (times-of-day),
+> `emit` (topic + payload template). Same table, same hot-reload, same
+> ratchet posture as `[[rule]]` — and the departure board's "next
+> departure" line reads it as data.
+
+separate cadence_rule table
+
+
+### Q2: Where does the wall-basis tick come from? (resolved)
+
+Resolved 2026-08-14 — override.
+
+**The question was:**
+
+> The schedule runner drives off the clock service's tick stream,
+> which under warp compresses days. Proposed: the clock service
+> already knows both times (`ClockNow` carries wall and sim); the
+> cadence runner evaluates wall-basis rows against wall time from the
+> same feed — one clock service remains authoritative for both bases,
+> and no component grows a second time source.
+
+shipped as proposed
+
+
+### Q3: Exactly-once windows across restarts? (resolved)
+
+Resolved 2026-08-14 — override.
+
+**The question was:**
+
+> A cadence firing must not double-emit after a dispatcher restart nor
+> skip a window that elapsed while down. Proposed: each firing records
+> its event with a deterministic id (`cadence:<name>:<window-stamp>`),
+> the outbox dedupes on it, and catch-up on start emits at most the
+> single most-recent missed window per rule — a deliberate "no
+> thundering backfill" choice matching the conductor's own
+> one-window-at-a-time cadence.
+
+shipped verbatim

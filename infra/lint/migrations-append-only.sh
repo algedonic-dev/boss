@@ -32,9 +32,11 @@
 # infra/postgres/schema/ may be MODIFIED or DELETED. New files may be
 # added freely — that is how a schema change is supposed to arrive.
 #
-# manifest.txt is exempt: it is the ordered list of migrations, so
-# adding one necessarily appends to it. Its content is not hashed
-# against any database.
+# manifest.txt was exempt while it existed, because adding a migration
+# necessarily appended to it. It was REMOVED on 2026-08-14: the ordered
+# list is now the directory itself, sorted by the NNN- prefix, so adding
+# a migration touches no shared file and two cars carrying migrations no
+# longer conflict. Its allow-list entry stays below as the record.
 #
 # THE ESCAPE HATCH
 # ----------------
@@ -54,7 +56,7 @@ SCHEMA_DIR="infra/postgres/schema"
 
 # One entry per line: "<filename> <YYYY-MM-DD> <reason>"
 read -r -d '' ALLOW <<'ALLOWLIST' || true
-manifest.txt 2026-08-13 the ordered migration list; appending to it is how a migration is added, and no database hashes it
+manifest.txt 2026-08-14 removed; the schema directory is now the ordered list (migrate.sh migration_order), so nothing is appended to add a migration
 ALLOWLIST
 
 is_allowed() {

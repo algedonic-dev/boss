@@ -1,6 +1,6 @@
 # Design: the public API as a surface for other people's agents
 
-**Status**: in-review — open questions tracked at `/system/design`.
+**Status**: approved — in-review — open questions tracked at `/system/design` (2026-08-14).
 **Source**: feedback `78207000` — "publish the 'public' API somewhere so
 that people can let their individual agents code up tools, while our API
 protects them. That API should probably be MCP compliant given mindshare,
@@ -115,51 +115,96 @@ binding. This is the piece with real design decisions left — see Q2.
 
 ## Open questions
 
-### Q1: Are tools the primitives only, or primitives plus per-Workflow specializations?
+All 5 open questions were resolved 2026-08-14 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-The floor is the ~dozen generic tools. The registries could also
-*generate* per-Workflow tools (`open_expansion_purchase`, schema from
-`metadata_schema`) at MCP list-tools time — more legible to agents,
-zero hand-maintenance, but a bigger tool list and a moving one as
-Workflows are authored. The generic floor ships first either way.
+---
 
-### Q2: Does an agent act as its human, or as itself?
 
-Two models: a delegate token inherits the binding human's policy
-scope wholesale (simple; provenance says who to talk to; blast radius
-= that person's blast radius), or agents are first-class actors with
-their own roles in the Class registry (finer control; matches
-"agents are CPUs"; more machinery). Backlog item `afe54132` — an
-agent cannot be named as the initiator of an employee change — is
-already pressing on this from the audit side.
+## Decisions
 
-### Q3: Is the playground's MCP endpoint public?
+### Q5: What compatibility does a published tool contract promise? (resolved)
 
-"Point your agent at the brewery" is the strongest possible demo of
-the human-powered-state-machine pitch, and the demo tenant's data is
-disposable by design. But it means anonymous or guest-tier agent
-traffic: rate limits, abuse handling, and a guest policy scope that
-keeps writes inside the demo tenant. Decide before the endpoint
-exists, not after.
+Resolved 2026-08-14 — override.
 
-### Q4: Where is the canonical published copy?
+**The question was:**
 
-In-repo reference + `/system/kb` page + the MCP server's own
-tool/resource descriptions are three copies of one fact. Proposal:
-the in-repo reference is canonical; the KB page renders it; the MCP
-descriptions are generated from it at build time; one equality test
-pins the set. Needs an owner and a mechanism, not a comment.
+> Publishing is a promise. Tool schemas follow the same
+> expand/contract convention as the schema layer
+> ([schema-migrations.md](./schema-migrations.md)): additive changes
+> freely, destructive changes in two steps, roll-forward only. Whether
+> the cluster's N-1 window (`ad2e28ab`) extends to "someone's agent
+> built last month keeps working" — and for how long — is a policy
+> decision that should be written down with the first published
+> version.
 
-### Q5: What compatibility does a published tool contract promise?
+Agreed
 
-Publishing is a promise. Tool schemas follow the same
-expand/contract convention as the schema layer
-([schema-migrations.md](./schema-migrations.md)): additive changes
-freely, destructive changes in two steps, roll-forward only. Whether
-the cluster's N-1 window (`ad2e28ab`) extends to "someone's agent
-built last month keeps working" — and for how long — is a policy
-decision that should be written down with the first published
-version.
+
+### Q3: Is the playground's MCP endpoint public? (resolved)
+
+Resolved 2026-08-14 — override.
+
+**The question was:**
+
+> "Point your agent at the brewery" is the strongest possible demo of
+> the human-powered-state-machine pitch, and the demo tenant's data is
+> disposable by design. But it means anonymous or guest-tier agent
+> traffic: rate limits, abuse handling, and a guest policy scope that
+> keeps writes inside the demo tenant. Decide before the endpoint
+> exists, not after.
+
+Can we make it public but require getting a token via Guest access that we put behind a captcha to prevent automated abuse?
+
+
+### Q1: Are tools the primitives only, or primitives plus per-Workflow specializations? (resolved)
+
+Resolved 2026-08-14 — override.
+
+**The question was:**
+
+> The floor is the ~dozen generic tools. The registries could also
+> *generate* per-Workflow tools (`open_expansion_purchase`, schema from
+> `metadata_schema`) at MCP list-tools time — more legible to agents,
+> zero hand-maintenance, but a bigger tool list and a moving one as
+> Workflows are authored. The generic floor ships first either way.
+
+Let's do primitives plus per-Workflow specializations
+
+
+### Q2: Does an agent act as its human, or as itself? (resolved)
+
+Resolved 2026-08-14 — override.
+
+**The question was:**
+
+> Two models: a delegate token inherits the binding human's policy
+> scope wholesale (simple; provenance says who to talk to; blast radius
+> = that person's blast radius), or agents are first-class actors with
+> their own roles in the Class registry (finer control; matches
+> "agents are CPUs"; more machinery). Backlog item `afe54132` — an
+> agent cannot be named as the initiator of an employee change — is
+> already pressing on this from the audit side.
+
+An agent acts as itself, a human acts only as the human. An agent can carry an authorization from the human but we want to know the agent was the actual actor.
+
+
+### Q4: Where is the canonical published copy? (resolved)
+
+Resolved 2026-08-14 — override.
+
+**The question was:**
+
+> In-repo reference + `/system/kb` page + the MCP server's own
+> tool/resource descriptions are three copies of one fact. Proposal:
+> the in-repo reference is canonical; the KB page renders it; the MCP
+> descriptions are generated from it at build time; one equality test
+> pins the set. Needs an owner and a mechanism, not a comment.
+
+in-repo is canonical
 
 ## Decision history
 

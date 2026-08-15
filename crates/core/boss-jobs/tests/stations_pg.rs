@@ -1,5 +1,5 @@
 //! Postgres-backed coverage for the station registry
-//! (116-stations.sql, 118-watchlist-station.sql):
+//! (116-stations.sql, 118-watchlist-station.sql, 124-repair-station.sql):
 //!
 //! - the platform seed ships the SDLC batch stations and the filer's
 //!   watchlist, active, with predicates the evaluator can actually
@@ -56,10 +56,29 @@ async fn platform_seed_ships_the_sdlc_batch_stations() {
     let names: Vec<&str> = active.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(
         names,
-        vec!["design-review", "loading-dock", "my-watchlist"],
+        vec!["design-review", "loading-dock", "my-watchlist", "repair"],
         "the platform SDLC batch stations seed active, plus the one \
          per-actor row (per-employee stations stay tenant data; \
          `my-watchlist` needs no roster because @me binds at read time)"
+    );
+
+    // The repair queue (migration 124, David's bb86d687): red trains,
+    // held on a fact that lives on the STEP. Asserting the clause
+    // rather than just the name — the row is only useful if it reads
+    // the conductor's verdict where the conductor writes it.
+    let repair = registry.get_active("repair").await.expect("repair row");
+    assert_eq!(repair.predicate.kind.as_deref(), Some("pr-train"));
+    let ci = repair.predicate.step.as_ref().expect("ci-step clause");
+    assert_eq!(ci.slug.as_deref(), Some("ci"));
+    assert_eq!(
+        ci.metadata_equals.get("result"),
+        Some(&"failing".to_string())
+    );
+    assert_eq!(
+        repair.discipline,
+        vec![boss_jobs::station_queue::DisciplineKey::Age],
+        "age alone — every train carries the same priority, so ordering \
+         by it first would sort by nothing and then by age"
     );
 
     let dock = registry.get_active("loading-dock").await.expect("dock row");
@@ -272,23 +291,35 @@ async fn pg_writes_stage_their_events_in_the_outbox() {
     );
 
     // Versioning against the seeded loading-dock row: a new draft
-    // appends v2, publish demotes v1.
-    let v2 = registry
+    // appends the NEXT version and publish demotes the one before it.
+    //
+    // The numbers are 3 and 2, not 2 and 1, because
+    // 133-dock-wip-limit.sql seeds an active v2 carrying the WIP limit.
+    // Written as next/previous relative to what the seed leaves active
+    // so the next migration that versions this station does not have to
+    // come back and edit arithmetic — the only thing this test is about
+    // is that a draft appends and a publish demotes.
+    let seeded = registry
+        .get_active("loading-dock")
+        .await
+        .expect("seeded active dock");
+    let next = seeded.version + 1;
+    let draft = registry
         .create_draft(spec("loading-dock"), &author(), now)
         .await
-        .expect("draft v2");
-    assert_eq!(v2.version, 2);
+        .expect("draft the next version");
+    assert_eq!(draft.version, next);
     registry
         .publish("loading-dock", &author(), now)
         .await
-        .expect("publish v2");
-    let v1 = registry
-        .get_version("loading-dock", 1)
+        .expect("publish the next version");
+    let previous = registry
+        .get_version("loading-dock", seeded.version)
         .await
-        .expect("v1 row");
-    assert_eq!(v1.status, WorkflowStatus::Retired);
+        .expect("previously active row");
+    assert_eq!(previous.status, WorkflowStatus::Retired);
     let active = registry.get_active("loading-dock").await.expect("active");
-    assert_eq!(active.version, 2);
+    assert_eq!(active.version, next);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -114,33 +114,71 @@ missing is the harness that ties it together:
 
 ## Open questions
 
-### Q1: What declares an experiment?
+All 4 open questions were resolved 2026-08-14 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-Proposed: an `experiments` registry row — name, the kind, the arm
-versions, the assignment rule (`per-packet-hash | per-window`), the
-split, the metrics (named queries over the log), and a review Job
-that owns the verdict. Registry data like everything else; the
-admission edge reads it when fixing a packet's protocol set.
+---
 
-### Q2: What guards a bad arm?
 
-Proposed: arms are subject to the same lint/viability proofs at
-publish; a kill = retiring the arm version (packets in flight finish
-under their pinned version per the packet model); and the algedonic
-default — an arm whose queue depth or failure rate exceeds the
-incumbent's by a declared margin raises to the experiment's owner.
+## Decisions
 
-### Q3: Where do verdicts render?
+### Q2: What guards a bad arm? (resolved)
 
-Proposed: the experiment is a lens (views-as-queue-lenses): its two
-arms are two queue predicates over the same stations, its flow
-strips are the comparison, and the verdict review lands in the same
-Design Review queue as everything else. The yard shows a train's
-arm the way it shows its consist — cohorts visible, never hidden.
+Resolved 2026-08-14 — override.
 
-### Q4: First experiment?
+**The question was:**
 
-Proposed: the locomotive-check change itself — run windows with and
-without the canary for a week and measure red-round rate and
-time-to-green. The protocol that measures protocols should be the
-first thing it measures.
+> Proposed: arms are subject to the same lint/viability proofs at
+> publish; a kill = retiring the arm version (packets in flight finish
+> under their pinned version per the packet model); and the algedonic
+> default — an arm whose queue depth or failure rate exceeds the
+> incumbent's by a declared margin raises to the experiment's owner.
+
+Agreed.  As long as the protocol is valid. But we should also use this opportunity to think about how we do traffic duping to support running an experiment on shadow traffic before attempting to run on real traffic.
+
+
+### Q1: What declares an experiment? (resolved)
+
+Resolved 2026-08-14 — override.
+
+**The question was:**
+
+> Proposed: an `experiments` registry row — name, the kind, the arm
+> versions, the assignment rule (`per-packet-hash | per-window`), the
+> split, the metrics (named queries over the log), and a review Job
+> that owns the verdict. Registry data like everything else; the
+> admission edge reads it when fixing a packet's protocol set.
+
+Sounds good
+
+
+### Q3: Where do verdicts render? (resolved)
+
+Resolved 2026-08-14 — override.
+
+**The question was:**
+
+> Proposed: the experiment is a lens (views-as-queue-lenses): its two
+> arms are two queue predicates over the same stations, its flow
+> strips are the comparison, and the verdict review lands in the same
+> Design Review queue as everything else. The yard shows a train's
+> arm the way it shows its consist — cohorts visible, never hidden.
+
+I like it . Let's give it a try.
+
+
+### Q4: First experiment? (resolved)
+
+Resolved 2026-08-14 — override.
+
+**The question was:**
+
+> Proposed: the locomotive-check change itself — run windows with and
+> without the canary for a week and measure red-round rate and
+> time-to-green. The protocol that measures protocols should be the
+> first thing it measures.
+
+superseded

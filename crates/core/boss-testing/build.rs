@@ -1,23 +1,28 @@
 //! Generates the `SCHEMA_FILES` list that `src/test_db.rs` includes.
 //!
-//! `infra/postgres/schema/manifest.txt` is the ordered migration list
-//! and the single definition of it. `migrate.sh` reads it at runtime;
-//! `TestDb` cannot, because it compiles the SQL in via `include_str!`
-//! and `include_str!` needs literal paths at compile time. So this
-//! script reads the manifest at *build* time and emits the list as
-//! Rust — one definition, two readers, no second copy to keep in step.
+//! The ordered migration list IS `infra/postgres/schema/*.sql`, sorted
+//! by the `NNN-` prefix. `migrate.sh` derives it at runtime; `TestDb`
+//! cannot, because it compiles the SQL in via `include_str!` and
+//! `include_str!` needs literal paths at compile time. So this script
+//! derives the same order at *build* time and emits it as Rust.
 //!
-//! Before this existed the list was maintained by hand in both places
-//! under a sync comment. It drifted (`42-views.sql`, `43-event-facts.sql`
-//! reached the manifest and never reached the Rust side, so every
-//! DB-backed test ran against a schema missing those tables), which
-//! bought it an equality test — and then the equality test meant every
-//! migration touched the tail line of two files, so any two migration
-//! changes in flight at once collided on merge. Four such collisions in
-//! one day is what retired the arrangement. CLAUDE.md §9a: collapse it
-//! if you can, pin it with a test if you cannot. This is the collapse.
+//! This is the second half of one collapse. The list was once
+//! maintained by hand in two places under a sync comment; it drifted
+//! (`42-views.sql`, `43-event-facts.sql` reached the manifest and never
+//! reached the Rust side, so every DB-backed test ran against a schema
+//! missing those tables), which bought it an equality test — and the
+//! equality test meant every migration touched the tail line of two
+//! files. Generating this list from `manifest.txt` fixed the second
+//! file. It left the first: a single contended tail line that any two
+//! cars carrying a migration still conflicted on, which cost four
+//! re-rails on 2026-08-13 and stranded two cars on 2026-08-14.
 //!
-//! Parsing matches `migrate.sh`'s: strip from `#` on, trim, skip blanks.
+//! So the manifest is gone too, and the directory is the definition.
+//! Nothing is appended to add a migration — a file is dropped in — and
+//! two cars adding migrations no longer touch a shared line at all.
+//! CLAUDE.md §9a: prefer collapsing. This finishes it.
+//!
+//! Numeric sort on the prefix, not lexical: `100-` sorts after `20-`.
 
 use std::path::{Path, PathBuf};
 
@@ -30,24 +35,30 @@ fn main() {
         .join("../../../infra/postgres/schema")
         .canonicalize()
         .expect("infra/postgres/schema must exist relative to the crate root");
-    let manifest = schema_dir.join("manifest.txt");
-
-    // Adding or removing a schema file changes the directory's mtime;
-    // editing manifest.txt changes the file's. Content edits to an
-    // individual .sql file need no watch here — the emitted
-    // `include_str!` makes rustc itself track each one.
-    println!("cargo:rerun-if-changed={}", manifest.display());
+    // Adding or removing a schema file changes the directory's mtime.
+    // Content edits to an individual .sql file need no watch here — the
+    // emitted `include_str!` makes rustc itself track each one.
     println!("cargo:rerun-if-changed={}", schema_dir.display());
     println!("cargo:rerun-if-changed=build.rs");
 
-    let text = std::fs::read_to_string(&manifest)
-        .unwrap_or_else(|e| panic!("reading {}: {e}", manifest.display()));
-
-    let entries: Vec<&str> = text
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or("").trim())
-        .filter(|l| !l.is_empty())
+    let mut entries: Vec<String> = std::fs::read_dir(&schema_dir)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", schema_dir.display()))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sql"))
         .collect();
+    // Same ordering rule as migrate.sh's `sort -t- -k1,1n`: the numeric
+    // prefix decides, and a file without one sorts last rather than
+    // silently landing in the middle of the run.
+    entries.sort_by_key(|n| {
+        let num: u32 = n
+            .split('-')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(u32::MAX);
+        (num, n.clone())
+    });
 
     // An empty list would load an empty schema into every TestDb and
     // surface as "relation does not exist" a long way from the cause —
@@ -55,22 +66,19 @@ fn main() {
     // build time instead.
     assert!(
         !entries.is_empty(),
-        "{} names no schema files",
-        manifest.display()
+        "{} holds no .sql migrations",
+        schema_dir.display()
     );
 
     let mut out = String::from(
-        "// @generated by build.rs from infra/postgres/schema/manifest.txt — do not edit.\n\
+        "// @generated by build.rs from infra/postgres/schema/*.sql — do not edit.\n\
          const SCHEMA_FILES: &[(&str, &str)] = &[\n",
     );
     for entry in &entries {
         let path = schema_dir.join(entry);
-        // migrate.sh fails by name when the manifest points at a missing
-        // file; do the same rather than let include_str! complain about
-        // a path inside OUT_DIR.
         assert!(
             path.is_file(),
-            "manifest names {entry} but {} does not exist",
+            "{} is not a readable migration file",
             path.display()
         );
         let name = entry.strip_suffix(".sql").unwrap_or(entry);

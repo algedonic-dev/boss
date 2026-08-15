@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # migrate.sh — the only path schema takes into a database.
 #
-# schema/manifest.txt is the ordered migration list. Entries not yet
-# recorded in schema_migrations are applied in order, each in one
-# transaction WITH its bookkeeping row — so a re-run never re-applies,
-# and a failed migration leaves nothing behind. A schema change is a
-# NEW file appended to the manifest, never an edit to an applied one
-# (expand/contract: see docs/design/schema-migrations.md).
+# The ordered migration list IS schema/*.sql, sorted by its NNN- prefix.
+# Files not yet recorded in schema_migrations are applied in order, each
+# in one transaction WITH its bookkeeping row — so a re-run never
+# re-applies, and a failed migration leaves nothing behind. A schema
+# change is a NEW file, never an edit to an applied one (expand/contract:
+# see docs/design/schema-migrations.md). Dropping a file in the directory
+# is the whole act of adding a migration; there is no list to update.
 #
 #   ./migrate.sh                          # apply what's pending (psql from env)
 #   ./migrate.sh -- psql -h db -U boss -d boss
@@ -20,7 +21,7 @@
 # the repo's files itself (sudo -u postgres across a 0750 home dir).
 #
 # --baseline exists for databases that predate the runner: their tables
-# already exist, so every current manifest entry is recorded as applied
+# already exist, so every current migration is recorded as applied
 # without being run. Needed exactly once per pre-existing deployment.
 # A database that visibly predates the runner (core tables present,
 # nothing recorded) is refused rather than re-applied from scratch.
@@ -29,7 +30,23 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")/schema" && pwd)"
-MANIFEST="$DIR/manifest.txt"
+# THE MIGRATION ORDER IS THE DIRECTORY, NUMERICALLY SORTED. There is no
+# manifest file, deliberately.
+#
+# There used to be one, and adding a migration meant appending a line to
+# its tail. That made the tail a contended line: any two cars carrying a
+# migration at the same time conflicted there on merge. It cost four
+# re-rails on 2026-08-13 and stranded two more cars on 2026-08-14 ("left
+# for the next train"), which is more disruption than the file ever
+# prevented — it held no information the directory listing did not
+# already carry, in the same order.
+#
+# Numeric sort on the `NNN-` prefix, not lexical: `100-` must land after
+# `20-`, and a plain `sort` puts it before.
+migration_order() {
+    find "$DIR" -maxdepth 1 -name '*.sql' -type f -exec basename {} \; \
+        | sort -t- -k1,1n
+}
 
 BASELINE=false
 WITHOUT=()
@@ -44,8 +61,12 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-if [ ! -f "$MANIFEST" ]; then
-    echo "migrate.sh: manifest not found at $MANIFEST" >&2
+if [ ! -d "$DIR" ]; then
+    echo "migrate.sh: schema directory not found at $DIR" >&2
+    exit 1
+fi
+if [ -z "$(migration_order)" ]; then
+    echo "migrate.sh: no .sql migrations found in $DIR" >&2
     exit 1
 fi
 
@@ -66,23 +87,21 @@ while IFS='|' read -r id sum; do
     [ -n "$id" ] && RECORDED[$id]=$sum
 done < <(q "SELECT id || '|' || checksum FROM schema_migrations")
 
-# The entries this run covers, in manifest order, minus --without skips.
+# The entries this run covers, in migration order, minus --without skips.
 ENTRIES=()
 while IFS= read -r f; do
-    f="${f%%#*}"; f="$(echo "$f" | xargs)"    # strip comments + whitespace
     [ -z "$f" ] && continue
     skip=
     for w in "${WITHOUT[@]}"; do
         case "$f" in *"$w"*) skip=1; break ;; esac
     done
     [ -n "$skip" ] && continue
-    [ -f "$DIR/$f" ] || fail "manifest names $f but schema/$f does not exist"
     ENTRIES+=("$f")
-done < "$MANIFEST"
+done < <(migration_order)
 
 # Pass 1 — validate before touching anything. An applied migration whose
 # file has changed is history being rewritten: refuse, by name, before
-# applying anything else. (Changes go in a new manifest entry.)
+# applying anything else. (Changes go in a new migration file.)
 for f in "${ENTRIES[@]}"; do
     if [ -n "${RECORDED[$f]+x}" ]; then
         sum="$(sha256sum < "$DIR/$f" | cut -d' ' -f1)"
@@ -92,7 +111,7 @@ for f in "${ENTRIES[@]}"; do
 done
 
 # Guard — a database with core tables but an empty ledger of migrations
-# predates the runner. Re-applying the full manifest against it would
+# predates the runner. Re-applying every migration against it would
 # duplicate seeds at best; the honest move is a one-time --baseline.
 if ! $BASELINE && [ "${#RECORDED[@]}" -eq 0 ]; then
     present="$(q "SELECT to_regclass('audit_log') IS NOT NULL")"
@@ -123,20 +142,20 @@ for f in "${ENTRIES[@]}"; do
     applied=$((applied + 1))
 done
 
-# A recorded id the manifest no longer names is drift worth hearing
-# about, but not worth blocking on: it can only mean an entry was
-# renamed or retired, and the database already holds its effect.
+# A recorded id with no file on disk is drift worth hearing about, but
+# not worth blocking on: it can only mean a migration was renamed or
+# retired, and the database already holds its effect.
 for id in "${!RECORDED[@]}"; do
     found=
     for f in "${ENTRIES[@]}"; do
         [ "$f" = "$id" ] && { found=1; break; }
     done
     # --without hides entries from this run on purpose; only warn when
-    # the full manifest doesn't know the id either.
-    if [ -z "$found" ] && ! grep -qx "$id" "$MANIFEST"; then
-        echo "migrate.sh: warning: $id is recorded as applied but the manifest no longer names it" >&2
+    # the schema directory doesn't hold the file either.
+    if [ -z "$found" ] && [ ! -f "$DIR/$id" ]; then
+        echo "migrate.sh: warning: $id is recorded as applied but schema/$id no longer exists" >&2
     fi
 done
 
 verb=$($BASELINE && echo baselined || echo applied)
-echo "migrate.sh: $verb $applied, already recorded $recorded_already, of ${#ENTRIES[@]} manifest entries"
+echo "migrate.sh: $verb $applied, already recorded $recorded_already, of ${#ENTRIES[@]} migrations"

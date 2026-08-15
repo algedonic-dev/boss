@@ -604,3 +604,51 @@ schedule = { cadence = "daily", anchor_date = "2026-08-14" }
 [[rule.do]]
 handler = "jobs.spawn"
 args = { kind = "\"maintenance-sweep\"", subject_kind = "\"custom\"", subject = "\"deploy-convergence\"", title = "\"Deploy convergence sweep\"", "metadata.target" = "\"deploy-convergence\"", "metadata.area" = "\"deploy\"" }
+
+# ---------------------------------------------------------------------
+# Expire the notifications about a job that has finished (David,
+# 2026-08-14: "we still need a way to automatically expire inbox
+# messages for jobs that have moved past relevancy"). Migration 128.
+#
+# A ready-step notification is true when it is sent and stops being
+# true the moment the work behind it is done. Nothing retracted them,
+# so the admin inbox reached 2,058 unread — overwhelmingly signals
+# about steps closed days ago. That count was not a backlog, it was
+# sediment, and an inbox nobody can read is a channel that does not
+# exist.
+#
+# A cross-protocol reactor, which is the exemption the ratchet names:
+# no single Workflow definition can express "when a job of any kind
+# closes, retire the messages about it", because the messages are not
+# part of the job's protocol.
+#
+# Only unread `signal` rows move, and never a `direct` — the messages
+# port carries that reasoning. A person asking another person something
+# does not stop asking because a job closed.
+# ---------------------------------------------------------------------
+[[rule]]
+name = "expire-signals-on-job-closed"
+on_event = "jobs.job.closed"
+[[rule.do]]
+handler = "messages.expire_for_job"
+
+# ---------------------------------------------------------------------
+# Publish to the public GitHub mirror, on the clock.
+#
+# The mirror is fed by PULL REQUEST, never by pushing main (the mirror
+# protocol's own rule), so the daily packet is what carries a batch of
+# forge commits over and puts David's sign-off in front of the push.
+#
+# Seeded by 129-publish-to-github-rule.sql. It is here because
+# `dispatcher_rules_seed_matches_toml` compares the seeded registry
+# against this file in BOTH directions: a migration that seeds a rule
+# without adding it here fails the same way an unseeded rule does, and
+# that is exactly how it reddened the 13-car train 20260815-0621. The
+# table is the runtime registry; this file is the human-authored source;
+# neither is allowed to be the only one that knows.
+[[rule]]
+name = "publish-to-github-daily"
+schedule = { cadence = "daily", anchor_date = "2026-08-15" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"publish-to-github\"", subject_kind = "\"custom\"", subject = "\"github-mirror\"", title = "\"Publish to the public GitHub mirror\"", "metadata.target" = "\"origin/main\"", "metadata.area" = "\"platform\"" }

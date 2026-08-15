@@ -115,6 +115,12 @@ impl DocsRepository for InMemoryDocsRepo {
         inner.docs.remove(path);
         inner.questions.remove(path);
         inner.pending.retain(|p| p.doc_path != path);
+        // Same as the Pg adapter: a flush job is a worklist entry for
+        // writing into a file that no longer exists. Leaving them here
+        // would let the in-memory contract pass while Postgres failed
+        // its foreign key, which is exactly the divergence that hid
+        // this bug.
+        inner.jobs.retain(|j| j.doc_path != path);
         Ok(())
     }
 

@@ -286,6 +286,24 @@ a:hover { color: #8ce4c2; }
   transition: background 0.1s, color 0.1s, border-color 0.1s;
 }
 .shell-nav-item:hover { background: var(--wash); color: var(--fog); }
+/* The one filled signal in the shell, deliberately. §02 caps filled
+   signal at one per view, and the nav spends none of it — active is a
+   border rule, not a block. This badge is what that budget is for: it
+   appears ONLY when a message is addressed to a person (kind=direct),
+   which for the platform admin is 3 against ~1,980 unread signals. If
+   it ever starts counting the noise it should stop being filled. */
+.shell-nav-badge {
+  margin-left: auto;
+  min-width: 18px;
+  padding: 1px 5px;
+  border-radius: 9px;
+  background: var(--signal);
+  color: var(--void, #0D1014);
+  font: 500 10px var(--font-mono);
+  letter-spacing: 0;
+  text-align: center;
+  line-height: 16px;
+}
 /* Active is a SIGNAL rule, not a filled block. Filled signal is capped at
    one per view (§02) and the nav would spend it on every page load. */
 .shell-nav-item-active {

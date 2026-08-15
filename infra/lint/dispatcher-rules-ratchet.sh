@@ -62,7 +62,26 @@ set -euo pipefail
 # `maintenance-sweep`'s own protocol row. The number to watch is not
 # this total but the 22 `step.done.*` rules underneath it, which ARE
 # routing and are owed back to the protocol.
-BASELINE=45
+#
+# 45 -> 46 (2026-08-14, migration 128). `expire-signals-on-job-closed`.
+# A CROSS-PROTOCOL REACTOR, which is the exemption above and not the
+# routing this ratchet exists to stop: no single Workflow definition
+# can express "when a job of ANY kind closes, retire the inbox
+# messages about it", because those messages are not part of the
+# job's protocol — they belong to a different domain that merely
+# observed it. Declaring it inside every Workflow would be the
+# duplication, not the discipline.
+# 46 -> 47 (2026-08-15, migration 129). `publish-to-github-daily`.
+# A TIMER, the exemption above: "publish a batch to the public mirror
+# once a day" is triggered by the clock, and there is no Workflow whose
+# definition could declare it because no packet causes it. Note the
+# rule was ALREADY seeded and running — this change only adds it to
+# rules.toml, where it should have been from the start. The count rose
+# because the file caught up with the registry, not because a new
+# reaction was introduced, and the drift guard
+# (`dispatcher_rules_seed_matches_toml`) is what forced the catch-up
+# after it reddened the 13-car train 20260815-0621.
+BASELINE=47
 RULES_FILE="infra/dispatcher/rules.toml"
 
 count=$(grep -c '^\[\[rule\]\]' "$RULES_FILE")

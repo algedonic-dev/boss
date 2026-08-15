@@ -29,9 +29,9 @@ use boss_dispatcher_handlers::handlers::{
     jobs_complete_step::JobsCompleteStep, jobs_subjob_resolve::JobsSubjobResolve,
     ledger_bill_approve::LedgerBillApprove, ledger_payroll_run_submit::LedgerPayrollRunSubmit,
     ledger_tax_accrue::LedgerTaxAccrue, ledger_tax_remit::LedgerTaxRemit,
-    messages_notify::MessagesNotify, messages_notify_job_terminal::MessagesNotifyJobTerminal,
-    packaging_allocate::PackagingAllocate, people_hire::PeopleHire,
-    people_terminate::PeopleTerminate, products_consume::ProductsConsume,
+    messages_expire_for_job::MessagesExpireForJob, messages_notify::MessagesNotify,
+    messages_notify_job_terminal::MessagesNotifyJobTerminal, packaging_allocate::PackagingAllocate,
+    people_hire::PeopleHire, people_terminate::PeopleTerminate, products_consume::ProductsConsume,
     products_consume_from_invoice::ProductsConsumeFromInvoice, products_produce::ProductsProduce,
     shipping_create::ShippingCreate, webhook_notify::WebhookNotify,
 };
@@ -253,6 +253,10 @@ async fn main() -> Result<()> {
                 cfg.jobs_api_url.clone(),
                 cfg.messages_api_url.clone(),
             ));
+            // Retire the notifications about a job once it closes
+            // (David, 2026-08-14). Unread signals only — the port
+            // carries why a direct never expires with the job.
+            handlers.register(MessagesExpireForJob::new(cfg.messages_api_url.clone()));
             let helpers = Arc::new(InventoryHelpers::new(
                 cfg.inventory_api_url.clone(),
                 cfg.jobs_api_url.clone(),

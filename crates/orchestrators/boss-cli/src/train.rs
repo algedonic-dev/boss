@@ -106,6 +106,13 @@ struct Config {
     /// now — this threshold belongs in the cadence_rules registry as
     /// protocol data; follow-up, not this change.
     stall_hours: i64,
+    /// Release a red train's consist automatically once it has stalled
+    /// (BOSS_TRAIN_AUTO_CANCEL, default ON — set to `0` to disable).
+    /// On by default because the failure it prevents is a pipeline that
+    /// stops at the first red and stays stopped until a human looks;
+    /// the kill switch exists so an operator debugging a consist can
+    /// keep it on the rails without editing code.
+    auto_cancel: bool,
     dry: bool,
 }
 
@@ -129,6 +136,7 @@ impl Config {
             auto_merge: std::env::var("BOSS_TRAIN_AUTO_MERGE").as_deref() == Ok("1"),
             allow_local_jobs: std::env::var("BOSS_TRAIN_ALLOW_LOCAL_JOBS").as_deref() == Ok("1"),
             stall_hours: env_or("BOSS_TRAIN_STALL_HOURS", "6").parse().unwrap_or(6),
+            auto_cancel: std::env::var("BOSS_TRAIN_AUTO_CANCEL").as_deref() != Ok("0"),
             gh_repo,
             home,
             dry,
@@ -1004,6 +1012,65 @@ pub(crate) fn releasable_cars(cars: &[Value]) -> Vec<&Value> {
         .collect()
 }
 
+/// The auto-cancel decision, pure: should reconcile kill this train and
+/// release its consist? Some(reason) or None, and the reason is what
+/// lands on every released car.
+///
+/// A red train holds its whole consist hostage — the cars carry a
+/// `train` marker so `parked_ready` no longer counts them, and the
+/// conductor merges only on green, so nothing recovers on its own.
+/// Overnight that is the difference between a pipeline that keeps
+/// running and one that stops at the first fault. This is the reversal
+/// of the older rule that only the operator may cancel (David,
+/// 2026-08-15, choosing auto-cancel with a two-strike hold): raising is
+/// still protocol, but an unattended pipeline has nobody to raise to.
+///
+/// THE VERDICT MUST BE THE LIVE ONE. `reconcile` reads it from the
+/// forge each pass; the train's `ci` step keeps whatever verdict it was
+/// first stamped with and is NOT re-stamped when CI re-runs. Deciding
+/// from the step would cancel a train whose repair had already been
+/// pushed and gone green — the exact case this is meant to rescue. A
+/// re-running check reads `pending`, which is not `failing`, so a train
+/// under repair is left alone.
+pub(crate) fn auto_cancel_reason(
+    train: &Value,
+    live_verdict: &str,
+    now: DateTime<Utc>,
+    stall_hours: i64,
+) -> Option<String> {
+    if live_verdict != "failing" {
+        return None;
+    }
+    // A merged train is not a candidate whatever its checks say — the
+    // content landed and the remaining steps are bookkeeping.
+    if step_done(find_step(train, "merged", "Merged into main")) {
+        return None;
+    }
+    let age = stall_age_hours(train, now, stall_hours)?;
+    Some(format!(
+        "CI red and no progress for {age}h (threshold {stall_hours}h) — cars released to board a later train"
+    ))
+}
+
+/// How many red trains a car may ride before boarding leaves it behind.
+/// Two: one red is bad luck — the fault is usually a neighbour's — and
+/// a second aboard a different consist is the car itself.
+pub(crate) const MAX_RED_TRAINS: i64 = 2;
+
+/// The boarding hold, pure: a car released from that many red trains
+/// stops boarding until someone looks at it. Without this the auto
+/// cancel above is a loop — the same consist re-boards, goes red, and
+/// cancels again all night, burning CI and landing nothing.
+pub(crate) fn car_hold_reason(car: &Value, max_reds: i64) -> Option<String> {
+    let reds = car
+        .get("metadata")
+        .and_then(|m| m.get("red_trains"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    (reds >= max_reds)
+        .then(|| format!("held after {reds} red trains — needs a look before it boards again"))
+}
+
 /// The ONE branch a cancelled train may delete: its own `train/*`
 /// assembly branch (the Job's subject id). Car branches hold the
 /// cars' unmerged work and are never the cancel path's to touch —
@@ -1835,6 +1902,23 @@ impl Conductor {
                     .await?;
             }
 
+            // The overnight rule, before the merge check: a train that
+            // is red AND has stopped moving releases its consist so the
+            // next window can board without it. Decided on the LIVE
+            // verdict just read, never on the `ci` step's first stamp.
+            if self.cfg.auto_cancel
+                && info.get("state").and_then(Value::as_str) == Some("OPEN")
+                && let Some(reason) = auto_cancel_reason(&t, verdict, now, self.cfg.stall_hours)
+            {
+                log(format!("train {} auto-cancelling: {reason}", id8(&tid)));
+                if self.cfg.dry {
+                    log(format!("DRY: would cancel {} ({reason})", id8(&tid)));
+                } else {
+                    self.cancel_train(&tid, &reason, true).await?;
+                }
+                continue;
+            }
+
             if self.cfg.auto_merge
                 && verdict == "green"
                 && info.get("state").and_then(Value::as_str) == Some("OPEN")
@@ -1873,6 +1957,28 @@ impl Conductor {
                     })
                     .unwrap_or_default();
                 for cid in boarded {
+                    // The car's review closes HERE, not at boarding —
+                    // the change was open for review until it landed,
+                    // and leaving the step ready while the car rides is
+                    // what lets a cancelled train release it (see the
+                    // boarding loop). Completed first, because the
+                    // ship-a-change spec gates `merged` on
+                    // `steps.review.done AND job.metadata.merged`, and
+                    // the marker below is what the dispatcher watches to
+                    // close the Job.
+                    let car = self.get_job(&cid).await?;
+                    let review = find_step(&car, "review", "Open for review");
+                    if !step_done(review) {
+                        self.complete_step(
+                            &car,
+                            review,
+                            &[
+                                ("pr_url", Some(pr_url.clone())),
+                                ("note", Some(format!("landed on main as {merge_ref}"))),
+                            ],
+                        )
+                        .await?;
+                    }
                     // v3 ship-a-change gates `merged` on this marker; the
                     // dispatcher closes the Job once it is set.
                     self.merge_job_metadata(
@@ -2198,6 +2304,18 @@ impl Conductor {
             if !parked_ready(&j) {
                 continue;
             }
+            // The two-strike hold. Without it the auto-cancel above is
+            // a loop: the same consist re-boards, goes red, cancels,
+            // and burns the night landing nothing.
+            if let Some(reason) = car_hold_reason(&j, MAX_RED_TRAINS) {
+                log(format!("{}: {reason} — leaving behind", id8(&jid)));
+                left_behind.push(json!({"car_id_short": id8(&jid), "reason": reason.as_str()}));
+                if !self.cfg.dry {
+                    self.merge_job_metadata(&jid, vec![("skip_reason", json!(reason))])
+                        .await?;
+                }
+                continue;
+            }
             let branch = j
                 .get("metadata")
                 .and_then(|m| m.get("branch"))
@@ -2213,6 +2331,60 @@ impl Conductor {
                 "--quiet",
                 &format!("fork/{branch}"),
             ])?;
+            // RECOVER RATHER THAN SKIP. A car is parked at review by its
+            // author pushing the branch; the natural place to push is
+            // the upstream the author cloned, and the fork is an
+            // implementation detail of how this conductor assembles a
+            // train. On 2026-08-14 that gap silently held NINE cars for
+            // a whole session: the dock reported 12 parked while the
+            // boardable count was 0, because `parked_ready` asks
+            // "branch declared, review ready" and this asks "branch on
+            // the fork" — two predicates for one question, and only the
+            // first is on any dashboard.
+            //
+            // So if the branch exists upstream, put it on the fork and
+            // board the car. Copying a ref the author already published
+            // is not a judgement call; refusing to, and reporting a
+            // dock depth that cannot board, is the surprising
+            // behaviour. A branch that exists in NEITHER place is still
+            // a real skip — that car was never pushed at all.
+            let mut ok = ok;
+            if !ok.status.success() {
+                let upstream = sh_unchecked(&[
+                    "git",
+                    "-C",
+                    &self.cfg.clone,
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("origin/{branch}"),
+                ])?;
+                if upstream.status.success() && !self.cfg.dry {
+                    let pushed = sh_unchecked(&[
+                        "git",
+                        "-C",
+                        &self.cfg.clone,
+                        "push",
+                        "fork",
+                        &format!("origin/{branch}:refs/heads/{branch}"),
+                    ])?;
+                    if pushed.status.success() {
+                        log(format!(
+                            "{}: branch {branch} was upstream but not on the fork — pushed it",
+                            id8(&jid)
+                        ));
+                        ok = sh_unchecked(&[
+                            "git",
+                            "-C",
+                            &self.cfg.clone,
+                            "rev-parse",
+                            "--verify",
+                            "--quiet",
+                            &format!("fork/{branch}"),
+                        ])?;
+                    }
+                }
+            }
             if !ok.status.success() {
                 let reason = skip_reason_branch_missing(&branch);
                 log(format!("{}: {reason} — leaving behind", id8(&jid)));
@@ -2479,19 +2651,31 @@ impl Conductor {
         .await?;
 
         for (j, _branch, head) in &boarded {
-            let review = find_step(j, "review", "Open for review");
-            self.complete_step(
-                j,
-                review,
-                &[
-                    ("pr_url", Some(pr_url.clone())),
-                    (
-                        "note",
-                        Some(format!("boarded train {} ({train_branch})", id8(&train_id))),
-                    ),
-                ],
-            )
-            .await?;
+            // BOARDING DOES NOT COMPLETE `review` — the merge does.
+            //
+            // It used to complete it here, and that quietly made
+            // cancelling a loaded train impossible. A released car has
+            // to become `parked_ready` again, which requires its review
+            // step to be ready or active; but a completed step is FROZEN
+            // at the row (`update_step_at` pins status, completed_on and
+            // metadata on terminal rows, deliberately, so a racing
+            // read-modify-write cannot demote it). So the cancel path's
+            // reopen was a no-op that returned 204, and every "released
+            // car back to the dock" line it logged was false — the car
+            // had `train` cleared but stayed unboardable forever. The
+            // only reason nobody hit it is that every cancel until now
+            // carried zero cars.
+            //
+            // Boarded-ness does not need the step at all: it is
+            // `metadata.train`, which is what `parked_ready` already
+            // reads, and which a cancel can clear because metadata is
+            // not frozen. So the step keeps meaning what it says —
+            // this change is open for review until it lands — and
+            // release becomes a metadata write with nothing to reverse.
+            // (Requires no workflow edit: the spec still gates the
+            // `merged` outcome on `steps.review.done`, and the merge
+            // block below is what satisfies it.)
+            //
             // skip_reason cleared on boarding, in the same update that
             // stamps the train: an earlier window's skip note must not
             // outlive the skip — the key is REMOVED (Null), not left
@@ -2540,7 +2724,15 @@ impl Conductor {
     ///   4. delete the train's OWN `train/*` branch — never a car's:
     ///      the cars keep their branches (train_branch_to_delete is
     ///      the pin, and it is tested).
+    /// The operator's verb. Never counts a red against the cars — an
+    /// operator cancels for reasons of their own (a bad consist, a
+    /// withdrawn change), and only the automatic red-stall path below
+    /// has evidence that the CARS were implicated.
     async fn cancel(&self, handle: &str, reason: &str) -> Result<()> {
+        self.cancel_train(handle, reason, false).await
+    }
+
+    async fn cancel_train(&self, handle: &str, reason: &str, count_red: bool) -> Result<()> {
         let listed = rows(
             self.api(
                 Method::GET,
@@ -2572,38 +2764,42 @@ impl Conductor {
         }
         for car in releasable_cars(&cars) {
             let cid = job_id(car)?;
-            let review = find_step(car, "review", "Open for review");
-            if let Some(review) = review.filter(|s| step_done(Some(s))) {
-                if self.cfg.dry {
-                    log(format!("DRY: would reopen review on {}", id8(cid)));
-                } else {
-                    let sid = review
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| anyhow!("review step without an id on job {cid}"))?;
-                    self.api(
-                        Method::PUT,
-                        &format!("/api/jobs/{cid}/steps/{sid}"),
-                        Some(json!({"status": "ready"})),
-                    )
-                    .await?;
-                }
-            }
+            // NOTHING TO REOPEN. Releasing a car is a metadata write and
+            // only a metadata write, because boarding no longer completes
+            // its `review` step — see the boarding loop. This used to PUT
+            // the step back to `ready`, which the row silently refused
+            // (terminal steps are frozen in `update_step_at`) and which
+            // now 409s out loud, taking the whole cancel with it. A car
+            // that predates this change still carries a completed review
+            // and cannot be released; those were translated into fresh
+            // packets by hand on 2026-08-15 rather than reversed.
+            //
             // The boarded head goes with the train stamp: this car
             // boarded nothing now, and a stale head is not evidence
             // about whatever it boards next.
-            self.merge_job_metadata(
-                cid,
-                vec![
-                    ("train", Value::Null),
-                    ("boarded_head", Value::Null),
-                    (
-                        "skip_reason",
-                        json!(format!("returned to dock: train cancelled ({reason})")),
-                    ),
-                ],
-            )
-            .await?;
+            let mut stamps = vec![
+                ("train", Value::Null),
+                ("boarded_head", Value::Null),
+                (
+                    "skip_reason",
+                    json!(format!("returned to dock: train cancelled ({reason})")),
+                ),
+            ];
+            // A red release counts against the car. Every car aboard is
+            // counted, not just the guilty one — which car turned the
+            // consist red is exactly what nobody knows yet. One red is
+            // survivable (see `car_hold_reason`); it takes a second,
+            // aboard a DIFFERENT consist, before boarding holds it.
+            if count_red {
+                let reds = car
+                    .get("metadata")
+                    .and_then(|m| m.get("red_trains"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+                    + 1;
+                stamps.push(("red_trains", json!(reds)));
+            }
+            self.merge_job_metadata(cid, stamps).await?;
             log(format!("released car {} back to the dock", id8(cid)));
         }
 
@@ -2715,12 +2911,12 @@ pub async fn run(phase: Phase, dry: bool, now: DateTime<Utc>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiFailure, Failure, JOBS_API_RETRY, RetryPolicy, SweepGuard, arrival_report,
-        arrival_summary, boarded_head, branch_moved_line, classify_transport, deletable_branches,
-        deploy_needed, local_jobs_problem, overlay_metadata, parked_ready, releasable_cars,
-        repo_path, resolve_train, retryable, retrying, short_cause, skip_reason_branch_missing,
-        skip_reason_conflict, stall_age_hours, sweep_guard, sweep_note, sweep_settled,
-        train_branch_to_delete,
+        ApiFailure, Failure, JOBS_API_RETRY, MAX_RED_TRAINS, RetryPolicy, SweepGuard,
+        arrival_report, arrival_summary, auto_cancel_reason, boarded_head, branch_moved_line,
+        car_hold_reason, classify_transport, deletable_branches, deploy_needed, local_jobs_problem,
+        overlay_metadata, parked_ready, releasable_cars, repo_path, resolve_train, retryable,
+        retrying, short_cause, skip_reason_branch_missing, skip_reason_conflict, stall_age_hours,
+        sweep_guard, sweep_note, sweep_settled, train_branch_to_delete,
     };
     use anyhow::{Result, anyhow};
     use chrono::{DateTime, Utc};
@@ -2767,6 +2963,34 @@ mod tests {
         let mut t = ready_car();
         t["metadata"]["branch"] = json!("train/20260812-0600");
         assert!(!parked_ready(&t));
+    }
+
+    #[test]
+    fn a_released_car_is_parked_ready_again() {
+        // THE INVARIANT THAT MAKES CANCELLING A LOADED TRAIN POSSIBLE.
+        // Releasing a car clears `train` and nothing else, so the car
+        // must be boardable on that write alone. It is — as long as
+        // boarding left the review step ready.
+        let mut boarded = ready_car();
+        boarded["metadata"]["train"] = json!("train-job-id");
+        boarded["metadata"]["boarded_head"] = json!("abc1234");
+        assert!(!parked_ready(&boarded));
+
+        let mut released = boarded.clone();
+        released["metadata"]["train"] = Value::Null;
+        released["metadata"]["boarded_head"] = Value::Null;
+        assert!(
+            parked_ready(&released),
+            "a released car must re-enter the dock on the metadata write alone"
+        );
+
+        // And the reason boarding must NOT complete the step: a
+        // completed review is frozen at the row, so a released car
+        // carrying one could never board again and the cancel would be
+        // a lie.
+        let mut released_but_reviewed = released.clone();
+        released_but_reviewed["steps"][0]["status"] = json!("completed");
+        assert!(!parked_ready(&released_but_reviewed));
     }
 
     #[test]
@@ -2930,6 +3154,21 @@ mod tests {
         assert_eq!(
             skip_reason_conflict(&[]),
             "conflict: unresolved (merge died before conflict markers)"
+        );
+    }
+
+    /// The dock-depth metric and the boardable count must answer the
+    /// same question. On 2026-08-14 they did not: `parked_ready` said
+    /// 12 while `candidates` boarded 0, because every branch had been
+    /// pushed upstream and none to the fork. The conductor now closes
+    /// that gap by copying the ref, so this reason is reserved for a
+    /// branch that exists in NEITHER place — a car never pushed at all.
+    #[test]
+    fn a_branch_missing_everywhere_is_still_a_real_skip() {
+        assert_eq!(
+            skip_reason_branch_missing("feat/never-pushed"),
+            "branch feat/never-pushed not on fork",
+            "the skip survives for the genuine case: nothing to copy"
         );
     }
 
@@ -3205,6 +3444,97 @@ mod tests {
         // guesses an age.
         let t = train_with_stamps(&[]);
         assert_eq!(stall_age_hours(&t, ts("2026-08-13T06:00:00Z"), 6), None);
+    }
+
+    // -- auto-cancelling a red train ---------------------------------------
+    //
+    // The overnight rule: a train that is red AND has stopped moving
+    // releases its consist rather than holding it until morning.
+
+    fn red_train(stamps: &[&str], merged: bool) -> serde_json::Value {
+        let mut steps: Vec<serde_json::Value> = stamps
+            .iter()
+            .map(|t| json!({"status": "completed", "metadata": {"completed_at": t}}))
+            .collect();
+        steps.push(json!({
+            "spec_slug": "merged",
+            "title": "Merged into main",
+            "status": if merged { "completed" } else { "ready" },
+            "metadata": {}
+        }));
+        json!({"id": "t-1", "status": "open", "metadata": {}, "steps": steps})
+    }
+
+    #[test]
+    fn a_red_train_that_stopped_moving_is_auto_cancelled() {
+        let t = red_train(&["2026-08-13T00:00:00Z"], false);
+        let r = auto_cancel_reason(&t, "failing", ts("2026-08-13T08:00:00Z"), 6);
+        assert!(r.is_some(), "red and 8h stalled should cancel");
+        assert!(r.unwrap().contains("8h"), "the reason carries the age");
+    }
+
+    #[test]
+    fn a_red_train_inside_the_threshold_is_left_alone() {
+        // Still young enough that a re-run or a repair may yet save it.
+        let t = red_train(&["2026-08-13T00:00:00Z"], false);
+        assert_eq!(
+            auto_cancel_reason(&t, "failing", ts("2026-08-13T05:00:00Z"), 6),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stalled_train_under_repair_is_not_cancelled() {
+        // THE REGRESSION THIS EXISTS FOR: a repair has been pushed and
+        // CI is re-running, so the LIVE verdict is `pending` even
+        // though the train's own `ci` step still reads `failing` from
+        // the first run. Deciding from the step would cancel the train
+        // the repair was about to save.
+        let t = red_train(&["2026-08-13T00:00:00Z"], false);
+        assert_eq!(
+            auto_cancel_reason(&t, "pending", ts("2026-08-13T09:00:00Z"), 6),
+            None
+        );
+    }
+
+    #[test]
+    fn a_green_stalled_train_is_never_auto_cancelled() {
+        // Green and stalled means waiting on the merge, not broken —
+        // cancelling would throw away a consist that is about to land.
+        let t = red_train(&["2026-08-13T00:00:00Z"], false);
+        assert_eq!(
+            auto_cancel_reason(&t, "green", ts("2026-08-13T09:00:00Z"), 6),
+            None
+        );
+    }
+
+    #[test]
+    fn a_merged_train_is_never_auto_cancelled() {
+        // The content landed; red post-merge checks are not the
+        // consist's problem and its cars must not be released.
+        let t = red_train(&["2026-08-13T00:00:00Z"], true);
+        assert_eq!(
+            auto_cancel_reason(&t, "failing", ts("2026-08-13T09:00:00Z"), 6),
+            None
+        );
+    }
+
+    // -- the two-strike hold -----------------------------------------------
+
+    #[test]
+    fn a_car_that_took_two_trains_red_is_held() {
+        let car = json!({"id": "car-1", "metadata": {"red_trains": 2}});
+        assert!(car_hold_reason(&car, MAX_RED_TRAINS).is_some());
+    }
+
+    #[test]
+    fn a_car_with_one_red_still_boards() {
+        // One red is usually a neighbour's fault — holding on the first
+        // would quarantine innocent cars and stall the queue.
+        let car = json!({"id": "car-1", "metadata": {"red_trains": 1}});
+        assert_eq!(car_hold_reason(&car, MAX_RED_TRAINS), None);
+        let fresh = json!({"id": "car-2", "metadata": {}});
+        assert_eq!(car_hold_reason(&fresh, MAX_RED_TRAINS), None);
     }
 
     // -- cancelling a train ------------------------------------------------

@@ -210,7 +210,7 @@ real failure:
 | pair | what broke | now |
 |---|---|---|
 | `boss-ports` ↔ `deploy-services.sh` fallback arrays | two services silently absent from a deploy | pinned by a test — the fallback must stand alone when the binary is unbuilt |
-| `manifest.txt` ↔ `boss-testing::SCHEMA_FILES` | every DB-backed test ran without two tables | **collapsed** — `boss-testing/build.rs` generates the list from the manifest |
+| `manifest.txt` ↔ `boss-testing::SCHEMA_FILES` | every DB-backed test ran without two tables | **collapsed twice** — `build.rs` generated the list from the manifest, then the manifest itself was deleted and the schema directory became the definition |
 | `MODEL_ROUTES` ↔ `MODEL_KINDS` | pages rendered under the wrong tab, silently | **collapsed** — one `nav-catalog.ts` answers both questions |
 
 All three are now either collapsed to one definition or pinned by a
@@ -222,12 +222,24 @@ one `pub const`, because one constant cannot drift from itself.
 what you write when you cannot collapse *today*; it stops the drift
 but keeps the duplication, and duplication has a running cost the test
 does not pay off. `manifest.txt` ↔ `SCHEMA_FILES` is the worked
-example: the pin held for months, then every new migration had to edit
-the tail line of both files, and on 2026-08-13 four cars in one day
-collided there — each collision costing a re-rail. That is the signal
-to go back and collapse. A generated list cannot drift *and* cannot
-conflict; `include_str!` needing compile-time literals is what a build
-script is for.
+example, and it took two passes. The pin held for months, then every
+new migration had to edit the tail line of both files, and on
+2026-08-13 four cars in one day collided there — each collision
+costing a re-rail. That bought the first collapse: `build.rs` generates
+the Rust list from the manifest, so it cannot drift, and
+`include_str!` needing compile-time literals is what a build script is
+for.
+
+**That was half a fix, and the half it left was still expensive.** One
+file still had a contended tail line, so any two cars carrying a
+migration still conflicted on merge — two more were stranded on
+2026-08-14 ("left for the next train"). The second collapse deleted
+`manifest.txt` outright: the ordered list is `schema/*.sql` sorted by
+the `NNN-` prefix, which every reader derives independently. Adding a
+migration is now dropping a file in a directory, touching no shared
+line at all. The lesson to carry: when a collapse leaves one
+authoritative copy that everyone still has to *edit*, ask whether that
+copy holds any information its source does not. This one held none.
 
 ### 10. Core vs. Example Tenant
 The core state-machine OS lives under `crates/core/` (

@@ -303,7 +303,35 @@ impl DocsRepository for PgDocsRepo {
         // Cascade handles design_questions. Pending decisions have no
         // FK to design_docs (they're keyed by (doc_path, anchor) as
         // free text), so delete them explicitly.
+        //
+        // Flush jobs DO have an FK (`design_flush_jobs_doc_path_fkey`)
+        // and it is not a cascade, so a doc with flush-job history could
+        // not be deleted at all — and the reindex prune is the only
+        // caller. One doc removed from disk with a flush job attached
+        // therefore failed the WHOLE reindex, not just its own prune:
+        //
+        //   update or delete on table "design_docs" violates foreign key
+        //   constraint "design_flush_jobs_doc_path_fkey"
+        //
+        // Which is what happened. `event-kind-registry.md` was folded
+        // away per the docs lifecycle, kept its flush jobs, and every
+        // reindex since has returned 500 — so the tracker stopped
+        // learning about the corpus while continuing to look healthy
+        // from the outside. The upserts run before the prune and commit
+        // in their own transactions, so docs still got re-parsed; only
+        // the caller's answer was an error.
+        //
+        // The jobs go with the doc for the same reason the pending
+        // decisions do: they are a queue of work to write INTO a file
+        // that no longer exists. Their history is preserved in the
+        // audit log, which is the durable record; this table is a
+        // worklist.
         let mut tx = self.pool.begin().await.map_err(storage)?;
+        sqlx::query("DELETE FROM design_flush_jobs WHERE doc_path = $1")
+            .bind(path)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
         sqlx::query("DELETE FROM design_pending_decisions WHERE doc_path = $1")
             .bind(path)
             .execute(&mut *tx)

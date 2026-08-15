@@ -177,6 +177,8 @@ async fn main() -> Result<()> {
             Arc::new(boss_jobs::PgStepPlugins::new(pool.clone()));
         let scheduling: Arc<dyn boss_jobs::scheduling::SchedulingRepository> =
             Arc::new(boss_jobs::scheduling::PgScheduling::new(pool.clone()));
+        let cadence: Arc<dyn boss_jobs::cadence::CadenceRepository> =
+            Arc::new(boss_jobs::cadence::PgCadence::new(pool.clone()));
         // Q7: human job-owner resolution over the people roster.
         let people_url =
             std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people"));
@@ -199,6 +201,7 @@ async fn main() -> Result<()> {
             Some(kind_registry),
             Some(plugin_registry),
             Some(scheduling),
+            Some(cadence),
             calendar,
             subject_kinds,
             subject_existence,
@@ -233,6 +236,7 @@ async fn main() -> Result<()> {
         Some(kind_registry),
         Some(plugin_registry),
         None,
+        None,
         calendar,
         subject_kinds,
         subject_existence,
@@ -256,6 +260,7 @@ async fn run_server<R: JobsRepository + 'static>(
     kind_registry: Option<Arc<dyn boss_jobs::WorkflowRegistry>>,
     plugin_registry: Option<Arc<dyn boss_jobs::StepPluginRegistry>>,
     scheduling: Option<Arc<dyn boss_jobs::scheduling::SchedulingRepository>>,
+    cadence: Option<Arc<dyn boss_jobs::cadence::CadenceRepository>>,
     calendar: Option<Arc<dyn boss_calendar_client::CalendarClient>>,
     subject_kinds: Option<Arc<dyn boss_subject_kinds_client::SubjectKindsClient>>,
     subject_existence: Option<Arc<dyn boss_jobs::subject_existence::SubjectExistenceCheck>>,
@@ -326,6 +331,12 @@ async fn run_server<R: JobsRepository + 'static>(
                 publisher: Some(scheduling_publisher),
                 clock: clock.clone(),
             },
+        ));
+    }
+    if let Some(repo) = cadence {
+        info!("cadence routes mounted at /api/cadence/*");
+        app = app.merge(boss_jobs::cadence::http::router(
+            boss_jobs::cadence::http::CadenceApiState { repo },
         ));
     }
     // Sim-origin middleware: extract x-sim-origin header and set the

@@ -67,6 +67,10 @@ proptest = "1"
 workspace = true
 
 [[test]]
+name = "cadence_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "job_closed_payload"
 required-features = ["postgres"]
 

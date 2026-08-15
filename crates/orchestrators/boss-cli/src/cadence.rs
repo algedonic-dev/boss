@@ -1402,10 +1402,15 @@ mod db_tests {
         );
         let depth = by_name("train-board-on-dock-depth");
         assert_eq!(depth.verb, "board");
+        // 12, not 8, since 131-board-on-twelve.sql: one train is one CI
+        // run whether it carries four cars or twelve, so when CI is the
+        // bottleneck the throughput lever is cars-per-train. The clock
+        // rule above still departs at 06:00/18:00 regardless of depth,
+        // which is what bounds a car's wait.
         assert_eq!(
             depth.basis,
             Basis::QueueDepth {
-                min_depth: 8,
+                min_depth: 12,
                 cooldown_minutes: 120,
             }
         );

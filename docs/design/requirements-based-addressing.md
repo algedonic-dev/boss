@@ -132,64 +132,116 @@ recorded as an event.
 
 ## Open questions
 
-### Q1: Where does the address predicate live?
+All 6 open questions were resolved 2026-08-14 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-On the workflow step alongside `ready_when`, or as its own registry of
-named, reusable queue definitions that steps reference?
+---
 
-Proposed: both, in that order — an inline predicate on the step is the
-primitive, and a named-queue registry is sugar over it once the same
-requirement is written a third time. Starting with the registry invents
-a naming problem before we know which requirements recur.
 
-### Q2: Does `boss-expr` become set-valued, or do addresses compile to a query?
+## Decisions
 
-Extending the evaluator with a collection type and candidate-query
-functions keeps one language for `ready_when` and addresses. Compiling
-an address predicate down to SQL against the people projection is far
-more powerful and much harder to keep deterministic or safely sandboxed.
+### Q2: Does `boss-expr` become set-valued, or do addresses compile to a query? (resolved)
 
-Proposed: extend `boss-expr` with a set-valued result and a small,
-closed function registry (`in_department`, `has_role`, `has_clearance`,
-`has_capacity`). One language, auditable surface, no arbitrary query
-execution driven by tenant data.
+Resolved 2026-08-14 — override.
 
-### Q3: When is the pool resolved, and is the resolution recorded?
+**The question was:**
 
-At hop time only, continuously while the payload waits, or both?
+> Extending the evaluator with a collection type and candidate-query
+> functions keeps one language for `ready_when` and addresses. Compiling
+> an address predicate down to SQL against the people projection is far
+> more powerful and much harder to keep deterministic or safely sandboxed.
+>
+> Proposed: extend `boss-expr` with a set-valued result and a small,
+> closed function registry (`in_department`, `has_role`, `has_clearance`,
+> `has_capacity`). One language, auditable surface, no arbitrary query
+> execution driven by tenant data.
 
-Proposed: resolve at hop time and **emit the resolved pool as an event**,
-so determinism holds and the log can answer "who could have done this"
-after the fact. Re-resolve on a schedule while a payload waits, emitting
-only on change — otherwise a payload addressed to a pool that later
-empties sits in a queue that no longer exists.
+Agreed
 
-### Q4: How does an available payload manifest to the pool?
 
-Push (a message per actor per payload), pull (it appears in My Day for
-everyone in the pool), or both?
+### Q1: Where does the address predicate live? (resolved)
 
-Proposed: pull is the default and push is opt-in per requirement. The
-notification flood item is the evidence — push-per-actor across a pool
-multiplies rather than routes, and the measured inbox was 1,016 unread
-of which 619 were machine notifications.
+Resolved 2026-08-14 — override.
 
-### Q5: What is the undrained-queue signal, and who receives it?
+**The question was:**
 
-An empty pool and an unattended pool are different conditions. Who is
-told, on what latency, and does the payload keep waiting meanwhile?
+> On the workflow step alongside `ready_when`, or as its own registry of
+> named, reusable queue definitions that steps reference?
+>
+> Proposed: both, in that order — an inline predicate on the step is the
+> primitive, and a named-queue registry is sugar over it once the same
+> requirement is written a third time. Starting with the registry invents
+> a naming problem before we know which requirements recur.
 
-Proposed: empty pool fails at address time and routes to the payload's
-owner, because it is a modelling error rather than a workload problem.
-Unattended pool raises after a per-requirement threshold to the owner
-of the requirement, not to an on-call broadcast.
+Agreed
 
-### Q6: Can a layered protocol only narrow the pool, or may it widen?
 
-Conjunction is clean, composes in any order, and is easy to reason
-about. Allowing a layer to widen the pool (an escalation protocol adding
-a fallback group) is more expressive and destroys order-independence.
+### Q6: Can a layered protocol only narrow the pool, or may it widen? (resolved)
 
-Proposed: narrowing only in v1. Escalation is modelled as a distinct hop
-with its own address rather than as a widening layer, which keeps
-composition commutative and keeps every widening visible as traffic.
+Resolved 2026-08-14 — override.
+
+**The question was:**
+
+> Conjunction is clean, composes in any order, and is easy to reason
+> about. Allowing a layer to widen the pool (an escalation protocol adding
+> a fallback group) is more expressive and destroys order-independence.
+>
+> Proposed: narrowing only in v1. Escalation is modelled as a distinct hop
+> with its own address rather than as a widening layer, which keeps
+> composition commutative and keeps every widening visible as traffic.
+
+Agreed. I think escalation is a sub-job that can be fired off within a job, and the sub-job can go to a queue with wider access potentially.
+
+
+### Q5: What is the undrained-queue signal, and who receives it? (resolved)
+
+Resolved 2026-08-14 — override.
+
+**The question was:**
+
+> An empty pool and an unattended pool are different conditions. Who is
+> told, on what latency, and does the payload keep waiting meanwhile?
+>
+> Proposed: empty pool fails at address time and routes to the payload's
+> owner, because it is a modelling error rather than a workload problem.
+> Unattended pool raises after a per-requirement threshold to the owner
+> of the requirement, not to an on-call broadcast.
+
+Agreed, and further, I just put some feedback in that I think we need to elevate the Dispatcher to a 'Q' network service that manages our queues and addresses. I think it can maintain the active registry of valid queues and/or allocate the address when a new queue needs to be formed for a new requirement.
+
+
+### Q4: How does an available payload manifest to the pool? (resolved)
+
+Resolved 2026-08-14 — override.
+
+**The question was:**
+
+> Push (a message per actor per payload), pull (it appears in My Day for
+> everyone in the pool), or both?
+>
+> Proposed: pull is the default and push is opt-in per requirement. The
+> notification flood item is the evidence — push-per-actor across a pool
+> multiplies rather than routes, and the measured inbox was 1,016 unread
+> of which 619 were machine notifications.
+
+Agreed
+
+
+### Q3: When is the pool resolved, and is the resolution recorded? (resolved)
+
+Resolved 2026-08-14 — override.
+
+**The question was:**
+
+> At hop time only, continuously while the payload waits, or both?
+>
+> Proposed: resolve at hop time and **emit the resolved pool as an event**,
+> so determinism holds and the log can answer "who could have done this"
+> after the fact. Re-resolve on a schedule while a payload waits, emitting
+> only on change — otherwise a payload addressed to a pool that later
+> empties sits in a queue that no longer exists.
+
+Agreed
