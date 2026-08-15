@@ -1533,11 +1533,36 @@ fn subject_fields(subject: &Subject) -> Vec<(&'static str, &str)> {
     vec![("id", subject.id.as_str()), ("kind", subject.kind.as_str())]
 }
 
-fn expand_title(template: &str, subject: &Subject) -> String {
+/// Substitute the step-title token alphabet: `{subject.<field>}` and
+/// `{metadata.<field>}`, the same two namespaces `expand_metadata`
+/// exposes to `metadata_defaults`. A title is the sentence telling a
+/// human what this step is asking of them, so it gets the same per-Job
+/// context the step's metadata already had.
+///
+/// Scalar metadata only (string/number/bool), matching
+/// `expand_metadata`: an object or array has no sensible rendering in
+/// a title, and stringifying one would produce a worse label than
+/// leaving the token alone.
+///
+/// An unknown token is left LITERAL rather than blanked, which is the
+/// same choice `{day…}` makes without a date anchor: a visible
+/// `{metadata.typo}` in the UI is a bug report, whereas silently
+/// emitting "Inspect: " reads as finished work.
+fn expand_title(template: &str, subject: &Subject, job_metadata: &serde_json::Value) -> String {
     let mut out = template.to_string();
     for (field, value) in subject_fields(subject) {
-        let token = format!("{{subject.{field}}}");
-        out = out.replace(&token, value);
+        out = out.replace(&format!("{{subject.{field}}}"), value);
+    }
+    if let Some(map) = job_metadata.as_object() {
+        for (key, value) in map {
+            let rendered = match value {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => continue,
+            };
+            out = out.replace(&format!("{{metadata.{key}}}"), &rendered);
+        }
     }
     out
 }
@@ -1727,7 +1752,7 @@ where
         let title = if spec_step.title_template.is_empty() {
             humanize_slug(&spec_step.title)
         } else {
-            expand_title(&spec_step.title_template, subject)
+            expand_title(&spec_step.title_template, subject, job_metadata)
         };
         let merged = merge_metadata(&spec_step.metadata_defaults, spec_step);
         // Per-Job context flows through `{subject.<field>}` + `{day…}`
@@ -5155,6 +5180,82 @@ mod tests {
         assert_eq!(
             events[1].payload["_actor"],
             "automation:bootstrap-reconciler"
+        );
+    }
+}
+
+#[cfg(test)]
+mod title_expansion_tests {
+    use super::*;
+
+    fn subject() -> Subject {
+        Subject::new("custom", "disk-headroom")
+    }
+
+    #[test]
+    fn metadata_tokens_resolve_in_step_titles() {
+        // The bug this exists for: `maintenance-sweep` v1 shipped
+        // `Inspect: {{ job.metadata.target }}` and rendered the mustache
+        // verbatim, because the token alphabet is single-brace
+        // `{metadata.<field>}` and nothing ever spoke mustache. A step
+        // title reading like broken markup is worse than no
+        // interpolation, since it is the sentence telling a human what
+        // is being asked of them.
+        let meta = serde_json::json!({ "target": "disk-headroom" });
+        assert_eq!(
+            expand_title("Inspect: {metadata.target}", &subject(), &meta),
+            "Inspect: disk-headroom"
+        );
+    }
+
+    #[test]
+    fn subject_and_metadata_tokens_compose() {
+        let meta = serde_json::json!({ "area": "infra" });
+        assert_eq!(
+            expand_title(
+                "{subject.kind}/{subject.id} — {metadata.area}",
+                &subject(),
+                &meta
+            ),
+            "custom/disk-headroom — infra"
+        );
+    }
+
+    #[test]
+    fn numbers_and_bools_render_as_scalars() {
+        let meta = serde_json::json!({ "commits_ahead": 34, "urgent": true });
+        assert_eq!(
+            expand_title(
+                "Publish {metadata.commits_ahead} ({metadata.urgent})",
+                &subject(),
+                &meta
+            ),
+            "Publish 34 (true)"
+        );
+    }
+
+    #[test]
+    fn unknown_and_non_scalar_tokens_are_left_literal() {
+        // Left visible on purpose, matching `{day…}` without an anchor:
+        // a `{metadata.typo}` on screen is a bug report, whereas
+        // blanking it renders "Inspect: " and reads as finished work.
+        let meta = serde_json::json!({ "nested": { "a": 1 } });
+        assert_eq!(
+            expand_title("A {metadata.typo} B {metadata.nested}", &subject(), &meta),
+            "A {metadata.typo} B {metadata.nested}"
+        );
+    }
+
+    #[test]
+    fn a_mustache_is_not_the_token_syntax_and_stays_literal() {
+        // Guards the misreading directly: if someone reintroduces
+        // `{{ job.metadata.x }}` in a registry row, this is what they
+        // will get, and the test says so out loud rather than leaving
+        // the next author to discover it in David's queue.
+        let meta = serde_json::json!({ "target": "disk-headroom" });
+        assert_eq!(
+            expand_title("Inspect: {{ job.metadata.target }}", &subject(), &meta),
+            "Inspect: {{ job.metadata.target }}"
         );
     }
 }

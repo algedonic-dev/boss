@@ -169,3 +169,40 @@ export async function fetchWatchlist(): Promise<WatchlistState> {
     return { kind: 'error' };
   }
 }
+
+/// Take a packet off MY watchlist.
+///
+/// Dismissal is a key on the packet (`watchlist_dismissed`), not a row
+/// in a join table, because `my-watchlist`'s predicate already narrows
+/// membership to `submitted_by = @me` — exactly one person can see a
+/// given packet through this station, so one flag cannot leak one
+/// actor's dismissal into another's view (130-watchlist-dismiss.sql).
+///
+/// It goes through the job PUT that already exists rather than a
+/// bespoke unwatch route. That PUT takes a whole job, so this reads the
+/// packet first and writes it back with the one key added. The
+/// read-modify-write is the honest cost of not inventing an endpoint;
+/// it is safe here because a filer dismissing their own packet is not
+/// racing anyone for that field.
+///
+/// Not deletion: `submitted_by` stays, the packet keeps closing and
+/// notifying as before, and clearing the key puts it back on the list.
+export async function dismissFromWatchlist(jobId: string): Promise<boolean> {
+  try {
+    const read = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
+    if (!read.ok) return false;
+    const job = (await read.json()) as Record<string, unknown>;
+    // The PUT rejects a body carrying steps; they are their own resource.
+    delete job.steps;
+    const metadata = (job.metadata ?? {}) as Record<string, unknown>;
+    job.metadata = { ...metadata, watchlist_dismissed: 'true' };
+    const write = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(job),
+    });
+    return write.ok;
+  } catch {
+    return false;
+  }
+}

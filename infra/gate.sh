@@ -79,6 +79,7 @@ check "schema-converge"          infra/lint/schema-converge.sh
 check "migrations-append-only"   infra/lint/migrations-append-only.sh
 check "no-secrets"               infra/lint/no-secrets.sh
 check "invariant-register"       infra/lint/invariant-register.sh
+check "crate-counts-fresh"       infra/lint/crate-counts-fresh.sh
 
 # The frontend type gate. Last, because it is the only check that
 # installs anything, and a Rust-only car should learn about its Rust

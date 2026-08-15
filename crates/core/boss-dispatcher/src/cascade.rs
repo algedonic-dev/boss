@@ -100,6 +100,13 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         // other notifier — the message is the end of the cascade, not
         // a new branch of it.
         ("messages.notify_job_terminal", vec![]),
+        // Archives the unread SIGNALS about a job when it closes
+        // (rule expire-signals-on-job-closed, migration 128). A sink:
+        // it records messages.message.archived per row it touches, and
+        // no dispatcher rule listens on that topic — archiving a stale
+        // notification must not wake anything up, which is the whole
+        // point of archiving it.
+        ("messages.expire_for_job", vec![]),
         // Queues a docs flush job (rule 109) — a docs-api write, no
         // event emitted back into the cascade (the flush WORKER's
         // eventual commit is outside the dispatcher's loop).

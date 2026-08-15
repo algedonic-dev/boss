@@ -362,7 +362,7 @@ the tier it touches.**
 
 The `infra/lint/tier-import-audit.sh` script enforces the
 Tier-1-can't-depend-on-Tier-2 rule (orchestrators excluded);
-runs cleanly today (0 violations across 27 core crates).
+runs cleanly today (0 violations across 29 core crates).
 
 Each domain crate has a matching `*-client` for cross-service
 HTTP calls + a `Pg*` adapter behind the `postgres` feature.

@@ -97,12 +97,33 @@ async fn a_merged_car_fires_the_completion_with_its_edge_and_branches() {
     );
 
     // …and it reaches the handler through the real dispatch loop.
+    // The registry is DERIVED from the rules that actually matched,
+    // not hand-listed. `dispatch` refuses an unknown handler, so a
+    // hand-list is a second roster of handler names that silently
+    // rots: on 2026-08-14 a new rule on this very topic
+    // (expire-signals-on-job-closed, migration 128) turned a train red
+    // by breaking this test, which is about a DIFFERENT rule. That
+    // list was never the subject of the test — it was scaffolding that
+    // could fail.
+    //
+    // Deriving it keeps the assertion honest in the direction that
+    // matters: this test says the completion fires ONCE, not that it
+    // is the only thing firing. Another rule joining this topic is
+    // someone else's business.
     let handler = RecordingHandler::new("jobs.complete_linked_step");
     let mut hreg = HandlerRegistry::new();
     hreg.register(handler.clone());
-    hreg.register(RecordingHandler::new("jobs.clear_waiting"));
-    hreg.register(RecordingHandler::new("jobs.subjob_resolve"));
-    hreg.register(RecordingHandler::new("messages.notify_job_terminal"));
+    // `RecordingHandler::new` wants a &'static str; the handler names
+    // come from the parsed rules, so leak them. A test process is the
+    // one place that is free.
+    for m in &matched {
+        for inv in &m.invocations {
+            if inv.handler != "jobs.complete_linked_step" {
+                let name: &'static str = Box::leak(inv.handler.clone().into_boxed_str());
+                hreg.register(RecordingHandler::new(name));
+            }
+        }
+    }
     let results = dispatch(&matched, &hreg, "evt-1", "jobs.job.closed", &payload)
         .await
         .expect("every named handler is registered");

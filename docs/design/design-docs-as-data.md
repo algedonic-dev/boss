@@ -208,6 +208,60 @@ the export PR ride the train as an ordinary code change (proposal:
 yes — it is the one design artifact that *should*, because it
 changes the repo)?
 
+### Q6: What marks the machine-owned region, and what happens to a hand edit inside it?
+
+David, 2026-08-14, choosing between three splits: **"file wins on
+prose, data wins on questions — the two live in one file with a
+generated section."** That answers Q1 with a sharper knife than Q1
+proposed: the line is not per-DOC (a doc lives in git iff deleting it
+breaks a build) but per-SECTION inside one doc. Every design doc stays
+hand-written in git; only its `## Open questions` block is generated
+from the registry.
+
+Proposed: fenced markers around the generated block
+(`<!-- boss:questions:begin -->` … `:end`), and the reindex REPLACES
+everything between them. A hand edit inside the fence is not merged and
+not preserved — it is overwritten on the next publish, exactly as a
+generated file is. The fence is what makes that fair rather than
+surprising.
+
+The open part is what to do when someone edits inside the fence anyway.
+Silently overwriting loses an author's words; refusing to publish blocks
+the pipeline on a typo. A third option is to overwrite but record the
+discarded text on the question as a comment, so nothing is lost and
+nothing is blocked.
+
+### Q7: What is a question's state model, now that it has one at all?
+
+`design_questions` has no `status` column today. A question is "open"
+if its `### Qn:` heading is still in the markdown and "resolved" if it
+is not — state inferred from the absence of text. That is why answering
+one requires a commit, and why a stalled flush silently re-opens a
+review on the next index.
+
+Proposed: `open | answered | superseded | withdrawn`, with the answer
+and its author on the row. `superseded` matters more than it looks —
+today a re-asked question is a new heading with no link to the old one,
+so "we already decided this" is unanswerable. Twice on 2026-08-14 the
+same ground was covered twice for exactly that reason.
+
+Is four states right, and does an `answered` question stay visible in
+the doc under its answer, or move to Decision history immediately?
+
+### Q8: At reindex, when the file and the registry disagree, which direction wins?
+
+Q6 says the fence is generated, which settles the normal case. This
+asks about the abnormal one: a doc arrives on a branch whose fenced
+block does not match the registry — an older export, a rebase, a
+hand-written doc committed before its questions were ever registered.
+
+Proposed: the registry wins for anything inside the fence, and a
+question that exists ONLY in the file is ingested as new rather than
+discarded, so a doc can still be authored offline with its questions
+written by hand. The risk is a rebase re-ingesting a question that was
+deliberately withdrawn, which argues for matching on a stable
+question id rather than on heading text.
+
 ## Decision history
 
 _None yet._

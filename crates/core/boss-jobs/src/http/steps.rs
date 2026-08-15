@@ -45,6 +45,54 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
         None => return (StatusCode::BAD_REQUEST, "invalid job id").into_response(),
     };
 
+    // A JOB'S STEP SET IS FIXED AT ADMISSION. Step predicates are not
+    // stored on steps (the table has no ready_when column) — readiness
+    // is recomputed by pairing spec steps with job steps positionally,
+    // so one appended step misaligns every pair after it and
+    // `registry::reevaluate` refuses to advance anything. The job is
+    // then frozen: no step moves again, including its terminal, so it
+    // never closes and never leaves its owner's queue.
+    //
+    // That is not hypothetical. Design review 32a4e70d gained a
+    // per-question step on 2026-08-13, sat in David's queue with its
+    // review COMPLETED and its terminal pending, and produced feedback
+    // 55c92985: "I finished the top design review and it still shows
+    // the same metadata and is in the same queue." The divergence was
+    // logged at warn by `reevaluate_and_persist` the whole time; a warn
+    // in a log nobody is reading is not a signal, so the job looked
+    // exactly like one waiting on its owner.
+    //
+    // Refusing here is the honest boundary: a new step is a change to
+    // the WORKFLOW, and the registry is where that belongs — publish a
+    // new version and admit new packets under it. In-flight packets
+    // stay pinned to the version they were admitted under, which is the
+    // whole point of the versioning.
+    //
+    // The route stays for the case it is safe in: a job whose kind has
+    // no spec to diverge from.
+    if let Some(reg) = &state.kind_registry
+        && let Ok(Some(job)) = state.jobs.get_job(&job_id).await
+        && let Ok(spec) = reg.get_version(&job.kind, job.workflow_version).await
+        && let Ok(existing) = state.jobs.list_steps(&job_id).await
+        && existing.len() >= spec.steps.len()
+    {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "refusing to add a step to job {job_id}: it already has {} step(s), \
+                 matching workflow {} v{}. Appending would diverge the job from its \
+                 spec, and readiness is computed by pairing the two positionally — \
+                 the job would freeze and never reach a terminal. Add the step to the \
+                 workflow and publish a new version instead; in-flight jobs stay \
+                 pinned to the version they were admitted under.",
+                existing.len(),
+                job.kind,
+                job.workflow_version
+            ),
+        )
+            .into_response();
+    }
+
     // Ensure the step belongs to this job.
     step.job_id = job_id;
 

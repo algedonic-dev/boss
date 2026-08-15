@@ -25,6 +25,7 @@
   } from './assignments';
   import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
   import {
+    dismissFromWatchlist,
     fetchWatchlist,
     windowNote,
     type WatchlistState,
@@ -99,6 +100,21 @@
   // itself, so this call carries no identity of its own; the id is here
   // to refetch when the signed-in person changes.
   let watchlist = $state<WatchlistState>({ kind: 'loading' });
+  // Packets this reader has dismissed since the page loaded. Held
+  // locally so the row disappears on click instead of after a refetch;
+  // a failed write puts it straight back, because a row that vanished
+  // and quietly came back later is worse than one that never left.
+  let dismissing = $state<ReadonlySet<string>>(new Set());
+
+  async function dismiss(jobId: string) {
+    dismissing = new Set([...dismissing, jobId]);
+    const ok = await dismissFromWatchlist(jobId);
+    if (!ok) {
+      const back = new Set(dismissing);
+      back.delete(jobId);
+      dismissing = back;
+    }
+  }
 
   $effect(() => {
     if (!userId) return;
@@ -265,7 +281,7 @@
             <div class="watch-window">{note}</div>
           {/if}
           <div class="myday-jobs-list">
-            {#each watchlist.entries as entry (entry.card.id)}
+            {#each watchlist.entries.filter((e) => !dismissing.has(e.card.id)) as entry (entry.card.id)}
               <div class="watch-row">
                 <PacketCard card={entry.card} />
                 {#if entry.outcome}
@@ -277,6 +293,12 @@
                     {entry.outcome.label}
                   </span>
                 {/if}
+                <button
+                  type="button"
+                  class="watch-dismiss"
+                  title="Stop watching this packet"
+                  aria-label="Stop watching {entry.card.title}"
+                  onclick={() => dismiss(entry.card.id)}>×</button>
               </div>
             {/each}
           </div>
@@ -346,10 +368,29 @@
 
   /* Card + outcome side by side, the same shape the claim row uses. */
   .watch-row {
+    /* Third column for the dismiss control. It keeps its cell whether
+       or not the packet has an outcome chip, so the × sits on one
+       vertical line down the list instead of jittering per row. */
     display: grid;
-    grid-template-columns: 1fr auto;
+    grid-template-columns: 1fr auto auto;
     gap: 8px;
     align-items: center;
+  }
+  .watch-dismiss {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0 4px;
+    font-size: 16px;
+    line-height: 1;
+    color: var(--static, #7a838c);
+    opacity: 0.55;
+    transition: opacity 0.12s ease;
+  }
+  .watch-dismiss:hover,
+  .watch-dismiss:focus-visible {
+    opacity: 1;
+    color: var(--text, #1b1f23);
   }
   .watch-window {
     font-size: 12px;
