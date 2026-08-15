@@ -177,6 +177,24 @@ first is more machinery; the second quietly gives up
 rebuild-from-log for one domain. Neither is free — this is the
 load-bearing question.
 
+Proposed: the first, reframed — the trim gets a **scope**, not an
+allowlist. The epoch trim is a *tenant-data* operation (it exists to
+reset the demo), and platform-domain history is outside its scope by
+definition, the same way the Class registry and the workflow rows are.
+Written as an allowlist it reads like an exception to be maintained;
+written as a scope it reads like the rule the trim always meant, and
+the integrity checker learns one second sanctioned shape rather than
+one per domain.
+
+The argument that decides it: if a trim can delete the provenance of a
+design decision, then "who decided this, when, and against what
+evidence" becomes unanswerable after any playground reset — and making
+that question answerable is the entire reason for moving design state
+into the log. Option two buys less machinery by giving up the property
+the change is for. It also breaks the correctness protocol's closure
+claim for one domain, and a rebuilder that is correct for eleven
+domains and special for the twelfth is a rebuilder nobody trusts.
+
 ### Q3: What pins doc↔code agreement once discussion docs leave the tree?
 
 `docs_corpus_presents` guards whatever is in the tree at compile
@@ -188,6 +206,24 @@ registry-side mechanism — e.g. a nightly checker that resolves
 cited paths/lints against the deployed tree — or do we accept that
 registry prose can drift and rely on the release-time fold review?
 
+Proposed: neither, because Q6 has since dissolved the premise. The
+split David chose is per-SECTION, not per-DOC: every design doc stays
+hand-written in git and only its `## Open questions` block is
+generated from the registry. So no discussion doc leaves the tree,
+`docs_corpus_presents` keeps guarding the prose at compile time, and
+the generated block is guarded too — it is written INTO the file, so
+the export lands in the same checkout the lint reads.
+
+What is left over is narrow: a *question body* that cites a code fact,
+written in the registry, that reaches the tree only at the next
+export. That is a drift window measured in one export cycle, on the
+one kind of text that is explicitly provisional. It does not earn a
+nightly checker resolving paths against a deployed tree — which is a
+second source of truth about the tree, and §9a's own warning is that
+the pin is a holding action, not a destination. If the window ever
+bites, the cheap fix is to run the existing corpus lint at PUBLISH
+time against the checked-out tree, not to build a new watcher.
+
 ### Q4: Who can publish, and as whom?
 
 Authoring is a write like any other: policy-gated, actor-stamped.
@@ -198,6 +234,27 @@ policy rule on `(publish, design-doc)`, or Job-mediated (a
 work)? The Job-mediated option is the most BOSS-shaped and the
 most ceremony; the policy rule is the least of both.
 
+Proposed: the policy rule on `(publish, design-doc)`, and nothing
+else — because the Job-mediated version already exists and is not
+this. A doc's *thinking* is reviewable work today: that is the
+`design-doc-review` Job, its per-question resolutions, and the docs
+car that carries the flush through a train. A `publish-a-doc`
+Workflow would be a second protocol over the same act, and the
+packets would be indistinguishable on the board.
+
+Not a role Class either. Roles are Classes of `employee` Subjects and
+they describe what a person IS; `design-author` would describe one
+verb they may perform, which is what a policy rule is for. Adding a
+role per verb is how a taxonomy inflates until nobody can say what a
+role means.
+
+The honest consequence to accept with it: a policy rule alone means an
+agent can publish a design doc unreviewed, and the only thing standing
+between a published doc and the corpus is the reindex validator. That
+is the same trust posture agents already have for Workflow rows and
+station rows, both of which are more dangerous, so it is consistent —
+but it should be a decision, not a side effect.
+
 ### Q5: What does the release-time export actually produce?
 
 The fold into `architecture-decisions.md` is currently a human
@@ -207,6 +264,27 @@ narrative), or a full generation the release owner edits. And does
 the export PR ride the train as an ordinary code change (proposal:
 yes — it is the one design artifact that *should*, because it
 changes the repo)?
+
+Proposed: the mechanical appendix, and yes, it rides the train.
+
+`architecture-decisions.md` is described in CLAUDE.md as "the one
+current-truth decision record". Current truth is a synthesis — it says
+what the system believes NOW, with the superseded reasoning left out.
+A full generation cannot produce that, because everything it has is
+the log, and a rendering of the log is a history, not a current truth.
+Generating the whole file would quietly redefine the document into a
+changelog and leave the system with no current-truth record at all.
+
+So the export writes the part that is mechanically checkable and
+therefore worth automating: one entry per resolved question, in
+resolution order, carrying question id, resolution text, deciding
+actor, and date. The narrative above it stays a human editorial act,
+and the appendix is what a reader checks it against — the same
+relationship the audit log has to every other projection.
+
+Riding the train is not a nicety: the export changes the repo, so it
+takes the gate every repo change takes, and a doc export that broke
+`docs_corpus_presents` would be caught the same way any other red is.
 
 ### Q6: What marks the machine-owned region, and what happens to a hand edit inside it?
 

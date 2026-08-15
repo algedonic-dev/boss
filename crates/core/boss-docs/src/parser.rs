@@ -603,16 +603,27 @@ fn bolded_label(body: &str) -> Option<&str> {
     None
 }
 
-/// `Proposed: ...` opening a line — the corpus convention.
+/// `Proposed: ...` / `Proposal: ...` opening a line — the corpus
+/// convention, in both spellings authors actually use. Matching only
+/// one of them is how a written answer becomes an unanswered question
+/// on the review surface: the author sees their proposal in the doc,
+/// the reviewer gets a question with nothing to accept, and nothing
+/// reports the drop.
 fn line_leading_label(body: &str) -> Option<&str> {
-    const NEEDLE: &str = "Proposed:";
-    for (idx, _) in body.match_indices(NEEDLE) {
-        let opens_line = idx == 0 || body[..idx].ends_with('\n');
-        if opens_line {
-            return Some(body[idx + NEEDLE.len()..].trim_start());
+    const NEEDLES: [&str; 2] = ["Proposed:", "Proposal:"];
+    // Earliest match across both spellings, so a body that discusses
+    // one and labels the other still yields the labelled one.
+    let mut best: Option<(usize, usize)> = None;
+    for needle in NEEDLES {
+        for (idx, _) in body.match_indices(needle) {
+            let opens_line = idx == 0 || body[..idx].ends_with('\n');
+            if opens_line && best.is_none_or(|(b, _)| idx < b) {
+                best = Some((idx, needle.len()));
+                break;
+            }
         }
     }
-    None
+    best.map(|(idx, len)| body[idx + len..].trim_start())
 }
 
 /// Title extractor for numbered-list open questions. Handles two
@@ -1126,6 +1137,31 @@ All 7 services or subset?
     fn prose_mentioning_proposed_is_not_a_proposal() {
         assert_eq!(
             extract_proposal("Nobody has proposed: anything here yet."),
+            None,
+        );
+    }
+
+    /// `Proposal:` opening a line is the same act as `Proposed:`, and
+    /// three questions in the live corpus write it that way
+    /// (design-docs-as-data Q1, payload-encryption Q1,
+    /// workflow-ux-as-data Q2 — measured 2026-08-15 over all 55 open
+    /// questions). Reading only one of the two spellings is the SAME
+    /// defect the bolded-only matcher was: the author wrote an answer,
+    /// the reviewer saw a question with nothing to accept, and nothing
+    /// anywhere said the text had been dropped.
+    #[test]
+    fn the_unbolded_proposal_spelling_counts_too() {
+        assert_eq!(
+            extract_proposal("Proposal: content referenced at build time stays in git.").as_deref(),
+            Some("content referenced at build time stays in git."),
+        );
+    }
+
+    /// …and it stays a LABEL, not a word. Same rule as `Proposed:`.
+    #[test]
+    fn prose_mentioning_a_proposal_is_not_a_proposal() {
+        assert_eq!(
+            extract_proposal("We rejected the last proposal: it cost too much."),
             None,
         );
     }
