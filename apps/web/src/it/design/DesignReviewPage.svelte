@@ -1,21 +1,30 @@
 <script lang="ts">
-  // /it/design — design-doc review surface.
+  // /system/design — the design-review station, rendered.
   //
-  // Lists every design doc indexed by boss-docs-api with its live
-  // open-question count + pending (recorded-but-unflushed) decisions
-  // + the in-flight design-doc-review Job if one exists. Opens a fresh
-  // design-doc-review Job on demand for any doc that doesn't already
-  // have an open one.
+  // This page is a LENS: the packets are the `design-review` station's
+  // evaluated queue, and the page's own identity (header, panel set)
+  // is the `lens` its registry row declares. It used to define the
+  // queue itself — `/api/jobs?kind=design-doc-review&status=open`
+  // filtered in the browser — which is two definitions of one queue,
+  // drifting silently. See `designLens.ts` for the full reasoning.
   //
-  // Replaces the in-app decision-tracker surface retired
-  // 2026-05-03 — instead of bespoke decision-tracker tables, the
-  // workflow is a Job whose review-design step (custom plugin) gates
-  // on every open question having a recorded resolution. The Job
-  // itself is the durable record; pending-decisions / ADR-extraction
-  // continue to use the existing /api/design endpoints unchanged.
+  // The doc corpus and the indexer's rejections stay their own reads:
+  // they describe docs that have NO packet yet, which is exactly the
+  // set you need in order to START a review, and they are
+  // boss-docs-api's to serve. The station registry's business is the
+  // queue and how it is framed.
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import { navigate } from '../../router';
+  import {
+    pageHeader,
+    panelsFor,
+    reviewHref,
+    reviewsByDocPath,
+    REVIEW_STEP_KIND,
+    type DesignQueueEnvelope,
+    type ReviewPacket,
+  } from './designLens';
 
   type DesignDoc = {
     path: string;
@@ -28,43 +37,6 @@
     word_count: number;
     last_modified: string;
   };
-
-  type OpenReviewJob = {
-    id: string;
-    status: string;
-    opened_on: string;
-    title: string;
-    /// The `review-design` step, when the Job has materialized one.
-    /// Reading a design doc is the whole point of this Job, and the
-    /// job page renders the doc in a panel beside a sidebar, a job
-    /// header and a step list — so the Review control goes straight
-    /// to the full-page step surface instead. Optional because a Job
-    /// caught mid-materialization has no steps yet; it falls back to
-    /// the job page rather than 404ing on a step id we made up.
-    reviewStepId?: string;
-  };
-
-  /// Step kind backing the review surface (`step_plugins` row
-  /// 'review-design', tier 0 of the design-doc-review Workflow).
-  const REVIEW_STEP_KIND = 'review-design';
-
-  /// Where a review Job should open. The focused step route renders
-  /// outside AppShell — chrome bar on top, the whole panel below it
-  /// for the document.
-  ///
-  /// `from` is what Back returns to. Without it the step surface fell
-  /// back to the job page — the one place the reviewer was
-  /// deliberately not sent — which put them a queue further from this
-  /// list rather than back on it (David, feedback 40fe7291, filed
-  /// while working the queue). The fallback route gets it too: it is
-  /// the job page, and Back from there should still come home.
-  const BACK_HERE = `from=${encodeURIComponent('/system/design')}&from_label=${encodeURIComponent('Design Review')}`;
-
-  function reviewHref(job: OpenReviewJob): string {
-    return job.reviewStepId
-      ? `/jobs/${job.id}/steps/${job.reviewStepId}?${BACK_HERE}`
-      : `/service/${job.id}`;
-  }
 
   type Rejection = {
     path: string;
@@ -80,9 +52,13 @@
   // as "nobody wrote it" — which is how transactional-audit-log.md
   // stayed invisible for six days.
   let rejections = $state<ReadonlyArray<Rejection>>([]);
-  let openReviewsByPath = $state<Record<string, OpenReviewJob | undefined>>({});
+  let queue = $state<DesignQueueEnvelope | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
+
+  const header = $derived(pageHeader(queue?.lens));
+  const panels = $derived(panelsFor(queue?.lens));
+  const openReviewsByPath = $derived(reviewsByDocPath(queue?.data ?? []));
 
   // System actor for opening review Jobs — same shape inventory-api
   // uses for its system-initiated Job opens.
@@ -108,6 +84,12 @@
     loading = true;
     error = null;
     try {
+      // The queue IS the page — if this read fails the surface has
+      // nothing honest to show, so it is the one that throws.
+      const queueResp = await fetch('/api/stations/design-review/queue');
+      if (!queueResp.ok) throw new Error(`queue: HTTP ${queueResp.status}`);
+      queue = (await queueResp.json()) as DesignQueueEnvelope;
+
       const docsResp = await fetch('/api/design/docs');
       if (!docsResp.ok) throw new Error(`docs: HTTP ${docsResp.status}`);
       docs = (await docsResp.json()) as DesignDoc[];
@@ -121,44 +103,36 @@
       rejections = await fetch('/api/design/rejections')
         .then((r) => (r.ok ? (r.json() as Promise<Rejection[]>) : []))
         .catch(() => []);
-
-      // Look up open design-doc-review Jobs. Subject is the
-      // identity-first {subject_kind: 'custom', id: <doc-path>};
-      // jobs-api supports ?kind= + ?status= filters.
-      const jobsResp = await fetch(
-        '/api/jobs?kind=design-doc-review&status=open&limit=200',
-      );
-      if (!jobsResp.ok) throw new Error(`jobs: HTTP ${jobsResp.status}`);
-      const jobsBody = await jobsResp.json();
-      // The list endpoint enriches each Job with its steps
-      // (boss-jobs http/jobs.rs), so the review step is already here —
-      // no per-Job follow-up fetch to find it.
-      const jobs: Array<{
-        id: string;
-        title: string;
-        status: string;
-        opened_on: string;
-        subject: { id?: string };
-        steps?: Array<{ id: string; kind: string }>;
-      }> = Array.isArray(jobsBody) ? jobsBody : (jobsBody.data ?? []);
-      const byPath: Record<string, OpenReviewJob> = {};
-      for (const j of jobs) {
-        const p = j.subject?.id;
-        if (!p) continue;
-        byPath[p] = {
-          id: j.id,
-          status: j.status,
-          opened_on: j.opened_on,
-          title: j.title,
-          reviewStepId: j.steps?.find((s) => s.kind === REVIEW_STEP_KIND)?.id,
-        };
-      }
-      openReviewsByPath = byPath;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
       loading = false;
     }
+  }
+
+  /// The `review-design` step of an open packet, resolved on demand.
+  ///
+  /// The station queue serves packets without steps (it fetches them
+  /// only when the predicate reads step state, and this station's
+  /// predicate is a kind match), so the step id is one read at click
+  /// time for the ONE packet being opened. The page used to enrich
+  /// every packet with its steps on load to find the same id.
+  ///
+  /// A failure here is not an error state: `reviewHref` falls back to
+  /// the job page, which is a worse door but a real one.
+  async function reviewStepId(jobId: string): Promise<string | null> {
+    try {
+      const r = await fetch(`/api/jobs/${jobId}`);
+      if (!r.ok) return null;
+      const job = (await r.json()) as { steps?: Array<{ id: string; kind: string }> };
+      return job.steps?.find((s) => s.kind === REVIEW_STEP_KIND)?.id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function enterReview(packet: ReviewPacket): Promise<void> {
+    navigate(reviewHref(packet.id, await reviewStepId(packet.id)));
   }
 
   /// One action, one destination: the review surface. Whether a review
@@ -169,11 +143,11 @@
   /// launch the review UX"). Creating the Job when there isn't one is
   /// a step on the way, not a different outcome.
   async function openReview(doc: DesignDoc): Promise<void> {
-    // Already under review — go straight in. Posting again would open
-    // a second Job for the same doc.
+    // Already in the station's queue — go straight in. Posting again
+    // would open a second packet for the same doc.
     const existing = openReviewsByPath[doc.path];
     if (existing) {
-      navigate(reviewHref(existing));
+      await enterReview(existing);
       return;
     }
     const body = {
@@ -218,20 +192,19 @@
       // dropping the operator back on a table row means the next
       // click lands on the job page, which renders the document in a
       // panel beside the sidebar and step list — the reason reviewing
-      // a doc in-app felt cramped. If the Job has not materialized
-      // its steps yet, reviewHref falls back to the job page.
+      // a doc in-app felt cramped.
       const opened = openReviewsByPath[doc.path];
       if (opened) {
-        navigate(reviewHref(opened));
+        await enterReview(opened);
         return;
       }
-      // The reload did not see the new Job yet (steps materialize
-      // asynchronously, and the docs list is a separate read). Use the
-      // id the POST just returned rather than leaving the operator on
-      // the table wondering whether the click worked — a click that
-      // creates a Job and goes nowhere is the inconsistency this
-      // function exists to remove.
-      if (created.id) navigate(`/service/${created.id}`);
+      // The reload did not see the new packet yet (steps materialize
+      // asynchronously, and the station evaluates over what exists
+      // when it is asked). Use the id the POST just returned rather
+      // than leaving the operator on the table wondering whether the
+      // click worked — a click that creates a Job and goes nowhere is
+      // the inconsistency this function exists to remove.
+      if (created.id) navigate(reviewHref(created.id, await reviewStepId(created.id)));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
@@ -273,59 +246,57 @@
   }
 </script>
 
-<PageHeader
-  eyebrow="System Model · Design review"
-  title="Design review"
-  subtitle="Open questions, pending decisions, ADRs"
-/>
+<PageHeader eyebrow={header.eyebrow} title={header.title} subtitle={header.subtitle} />
 
 {#if loading}
-  <p class="empty">Loading design docs…</p>
+  <p class="empty">Loading the review queue…</p>
 {:else if error}
   <p class="design-error">Error: {error}</p>
 {:else}
-  {#if rejections.length > 0}
-    <Section title={`Not indexed (${rejections.length})`} wide>
-      <p class="reject-lede">
-        These files are in <code>docs/design/</code> but are <strong>not</strong>
-        in the lists below — the reindexer refused them. Until each is
-        fixed, this panel is showing an incomplete corpus.
-      </p>
-      <table class="design-table">
-        <thead>
-          <tr><th>Doc</th><th>Invisible for</th><th>Why</th></tr>
-        </thead>
-        <tbody>
-          {#each rejections as r (r.path)}
-            <tr>
-              <td><code>{r.path}</code></td>
-              <td class="reject-age">
-                {daysSince(r.first_seen_at)}
-                {daysSince(r.first_seen_at) === 1 ? 'day' : 'days'}
-              </td>
-              <td class="reject-reason">{r.reason}</td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    </Section>
-  {/if}
+  {#each panels as panel (panel)}
+    {#if panel === 'rejections' && rejections.length > 0}
+      <Section title={`Not indexed (${rejections.length})`} wide>
+        <p class="reject-lede">
+          These files are in <code>docs/design/</code> but are <strong>not</strong>
+          in the lists below — the reindexer refused them. Until each is
+          fixed, this panel is showing an incomplete corpus.
+        </p>
+        <table class="design-table">
+          <thead>
+            <tr><th>Doc</th><th>Invisible for</th><th>Why</th></tr>
+          </thead>
+          <tbody>
+            {#each rejections as r (r.path)}
+              <tr>
+                <td><code>{r.path}</code></td>
+                <td class="reject-age">
+                  {daysSince(r.first_seen_at)}
+                  {daysSince(r.first_seen_at) === 1 ? 'day' : 'days'}
+                </td>
+                <td class="reject-reason">{r.reason}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </Section>
+    {:else if panel === 'corpus'}
+      <Section title={`In review & discussion (${reviewing.length})`} wide>
+        {#if reviewing.length === 0}
+          <p class="empty">
+            Nothing under discussion — every design doc is a settled
+            reference. New questions land here when a doc adds
+            <code>### Qn:</code> headings (status → reopened).
+          </p>
+        {:else}
+          {@render docTable(reviewing, 'Start review')}
+        {/if}
+      </Section>
 
-  <Section title={`In review & discussion (${reviewing.length})`} wide>
-    {#if reviewing.length === 0}
-      <p class="empty">
-        Nothing under discussion — every design doc is a settled
-        reference. New questions land here when a doc adds
-        <code>### Qn:</code> headings (status → reopened).
-      </p>
-    {:else}
-      {@render docTable(reviewing, 'Start review')}
+      <Section title={`Living references & settled (${settled.length})`} wide>
+        {@render docTable(settled, 'Reopen discussion')}
+      </Section>
     {/if}
-  </Section>
-
-  <Section title={`Living references & settled (${settled.length})`} wide>
-    {@render docTable(settled, 'Reopen discussion')}
-  </Section>
+  {/each}
 {/if}
 
 {#snippet docTable(rows: ReadonlyArray<DesignDoc>, buttonLabel: string)}
@@ -359,13 +330,13 @@
                  — so the same column carried what looked like a status
                  in some rows and an action in others, and only one of
                  them reliably navigated. Both go to the review surface
-                 now; the Job's state is reported below the control
+                 now; the packet's state is reported below the control
                  instead of impersonating it. -->
             <button class="wb-btn" type="button" onclick={() => openReview(doc)}>
               {review ? 'Review' : buttonLabel}
             </button>
             {#if review}
-              <div class="design-when">Job {review.status}</div>
+              <div class="design-when">In queue · {review.status}</div>
             {/if}
           </td>
         </tr>

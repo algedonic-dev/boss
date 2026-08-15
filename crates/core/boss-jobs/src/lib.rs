@@ -57,8 +57,8 @@ pub use station_queue::{DisciplineKey, StationPredicate, StationQueue, evaluate_
 #[cfg(feature = "postgres")]
 pub use stations::PgStations;
 pub use stations::{
-    InMemoryStations, StationCapability, StationError, StationKind, StationRegistry, StationSpec,
-    StationUpstream,
+    InMemoryStations, StationCapability, StationError, StationKind, StationLens, StationRegistry,
+    StationSpec, StationUpstream,
 };
 #[cfg(feature = "postgres")]
 pub use step_plugins::PgStepPlugins;

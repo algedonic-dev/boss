@@ -114,6 +114,46 @@ pub struct StationUpstream {
     pub href: String,
 }
 
+/// The page context a surface needs to render this station whole.
+///
+/// `upstream` proved the shape one affordance at a time: the row
+/// declares it, the queue envelope echoes it, and the lens renders
+/// whatever the row says with no frontend change. This is the same
+/// move for the rest of a page's identity — its header and which
+/// supplementary panels it carries — so a surface that already holds
+/// the queue holds everything it needs to draw itself.
+///
+/// What it deliberately is NOT: the panels' *data*. A panel key names
+/// a renderer the surface already has (the `step_plugins` idiom: the
+/// row names the bundle, the bundle knows its own source). Putting
+/// fetch URLs in the registry would let a row point a browser
+/// anywhere, and putting the panel *contents* here would make
+/// `boss-jobs` a client of every service a page reads from — the
+/// design corpus is `boss-docs-api`'s to serve, not the station
+/// registry's to carry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StationLens {
+    /// Small type above the title (`System Model · Design review`).
+    /// Optional: not every page sits under a section.
+    #[serde(default)]
+    pub eyebrow: Option<String>,
+    /// The page's heading. The one required field — a lens with no
+    /// title is a page with no name, and falling back to the
+    /// station's `title` would silently publish an operator-facing
+    /// heading that was written as a registry label.
+    pub title: String,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    /// Supplementary panels this page carries, in render order, named
+    /// by renderer key. Plain strings for the same reason
+    /// `DisciplineKey`s are: the surface renders the vocabulary the
+    /// registry declares, and a key it does not know is skipped
+    /// rather than crashing the page. Empty (the default) = the queue
+    /// is the whole page.
+    #[serde(default)]
+    pub panels: Vec<String>,
+}
+
 /// A full station row. Serializes directly to the `stations` columns
 /// with the same names.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -161,6 +201,12 @@ pub struct StationSpec {
     /// = no button renders.
     #[serde(default)]
     pub upstream: Option<StationUpstream>,
+    /// Optional page context for a surface that renders this station
+    /// whole. `None` = no page claims this station, which is the
+    /// common case: most stations are queues read by a lens that has
+    /// its own identity.
+    #[serde(default)]
+    pub lens: Option<StationLens>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -194,6 +240,7 @@ impl StationSpec {
             capability: None,
             rollup_parent: None,
             upstream: None,
+            lens: None,
             created_at: now,
         }
     }
@@ -523,6 +570,7 @@ mod pg {
         capability: Option<serde_json::Value>,
         rollup_parent: Option<String>,
         upstream: Option<serde_json::Value>,
+        lens: Option<serde_json::Value>,
         created_at: DateTime<Utc>,
     }
 
@@ -549,6 +597,11 @@ mod pg {
             .map(serde_json::from_value)
             .transpose()
             .map_err(|e| StationError::Storage(format!("stations.upstream: {e}")))?;
+        let lens: Option<StationLens> = r
+            .lens
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| StationError::Storage(format!("stations.lens: {e}")))?;
         Ok(StationSpec {
             name: r.name,
             version: r.version,
@@ -565,13 +618,14 @@ mod pg {
             capability,
             rollup_parent: r.rollup_parent,
             upstream,
+            lens,
             created_at: r.created_at,
         })
     }
 
     const SELECT: &str = "SELECT name, version, status, title, kind, predicate, discipline, \
                           wip_limit, terminal_window_days, capability, rollup_parent, \
-                          upstream, created_at \
+                          upstream, lens, created_at \
                           FROM stations";
 
     #[async_trait]
@@ -646,8 +700,8 @@ mod pg {
                 "INSERT INTO stations
                     (name, version, status, title, kind, predicate, discipline,
                      wip_limit, terminal_window_days, capability, rollup_parent,
-                     upstream, created_at)
-                 VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                     upstream, lens, created_at)
+                 VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
             )
             .bind(&spec.name)
             .bind(spec.version)
@@ -670,6 +724,11 @@ mod pg {
                 spec.upstream
                     .as_ref()
                     .map(|u| serde_json::to_value(u).unwrap_or_default()),
+            )
+            .bind(
+                spec.lens
+                    .as_ref()
+                    .map(|l| serde_json::to_value(l).unwrap_or_default()),
             )
             .bind(spec.created_at)
             .execute(&mut *tx)
@@ -983,6 +1042,78 @@ mod tests {
         });
         let bound = spec.bind_self(Some("emp-r")).expect("binds");
         assert_eq!(bound.upstream, spec.upstream);
+    }
+
+    // -----------------------------------------------------------
+    // Lens — the page context a surface needs to render this station.
+    // -----------------------------------------------------------
+
+    #[test]
+    fn a_station_declares_no_lens_by_default() {
+        // Most stations are queues nobody renders a whole page for.
+        assert_eq!(sample("dock").lens, None);
+    }
+
+    #[test]
+    fn lens_round_trips_with_its_declared_panels() {
+        let mut spec = sample("design-review");
+        spec.lens = Some(StationLens {
+            eyebrow: Some("System Model · Design review".into()),
+            title: "Design review".into(),
+            subtitle: Some("Open questions, pending decisions, ADRs".into()),
+            panels: vec!["rejections".into(), "corpus".into()],
+        });
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["lens"]["title"], "Design review");
+        assert_eq!(json["lens"]["panels"][0], "rejections");
+        let back: StationSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(back.lens, spec.lens);
+    }
+
+    #[test]
+    fn a_lens_is_a_title_plus_whatever_panels_the_row_names() {
+        // Only `title` is required: a lens with no panels is a page
+        // that renders the queue and nothing else, which is the
+        // common case and must not need three nulls to say so.
+        let lens: StationLens = serde_json::from_value(serde_json::json!({
+            "title": "Loading dock",
+        }))
+        .unwrap();
+        assert_eq!(lens.title, "Loading dock");
+        assert_eq!(lens.eyebrow, None);
+        assert_eq!(lens.subtitle, None);
+        assert!(lens.panels.is_empty());
+    }
+
+    #[test]
+    fn a_row_written_before_the_lens_column_existed_still_parses() {
+        let json = serde_json::json!({
+            "name": "old-station",
+            "version": 1,
+            "status": "active",
+            "title": "Older than the field",
+            "kind": "batch",
+            "predicate": {},
+            "created_at": "2026-08-01T00:00:00Z",
+        });
+        let spec: StationSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.lens, None);
+    }
+
+    #[test]
+    fn binding_self_carries_the_lens_through() {
+        // Same reason `upstream` is carried: the read edge renders the
+        // envelope from the BOUND row, so a per-actor station would
+        // lose its whole page context here.
+        let mut spec = sample("my-watchlist");
+        spec.lens = Some(StationLens {
+            eyebrow: None,
+            title: "My watchlist".into(),
+            subtitle: None,
+            panels: vec![],
+        });
+        let bound = spec.bind_self(Some("emp-r")).expect("binds");
+        assert_eq!(bound.lens, spec.lens);
     }
 
     #[tokio::test]

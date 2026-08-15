@@ -373,7 +373,10 @@ fn check_fork_coverage(
         // A fallback successor is one satisfied by `fork` completing
         // with NO particular metadata (references fork.done only).
         let has_fallback = successors.iter().any(|s| {
-            eval_pred(&s.ready_when, &synth_fork_payload(spec, &fork.title, None)) == Some(true)
+            eval_pred(
+                &s.ready_when,
+                &synth_fork_payload(spec, registry, &fork.title, None),
+            ) == Some(true)
         });
 
         for field in &fields {
@@ -382,6 +385,7 @@ fn check_fork_coverage(
                     for v in &values {
                         let payload = synth_fork_payload(
                             spec,
+                            registry,
                             &fork.title,
                             Some((field, Value::String(v.clone()))),
                         );
@@ -469,14 +473,53 @@ fn enum_domain(registry: &StepRegistry, fork: &StepSpec, field: &str) -> Option<
 /// Build a synthetic predicate payload where `fork` has completed
 /// (optionally with one metadata field set), every other step is
 /// not-done. Used to probe successor coverage at lint time.
-fn synth_fork_payload(spec: &WorkflowSpec, fork: &str, field: Option<(&str, Value)>) -> Value {
+fn synth_fork_payload(
+    spec: &WorkflowSpec,
+    registry: &StepRegistry,
+    fork: &str,
+    field: Option<(&str, Value)>,
+) -> Value {
     let mut steps = serde_json::Map::new();
     for s in &spec.steps {
         let done = s.title == fork;
-        let metadata = match (done, &field) {
-            (true, Some((f, v))) => serde_json::json!({ *f: v.clone() }),
-            _ => serde_json::json!({}),
-        };
+        // Model what a materialized step ACTUALLY looks like, because
+        // `boss-expr` errors on a missing identifier rather than reading
+        // it as null — and an erroring predicate is indistinguishable
+        // here from a false one.
+        //
+        // A payload that named only the fork's own field reported every
+        // fork outcome as an orphan for any successor whose predicate
+        // ALSO read a second step's metadata. That is the shape of every
+        // RE-ROUTING protocol ("this branch is reachable from triage, or
+        // from the investigation that reached the same conclusion later")
+        // — the lint refused to let anyone publish one.
+        //
+        // Two layers, in materialization order:
+        //   1. every DECLARED field (inline on the step, or from its
+        //      StepType) as null — the key exists, nobody set it;
+        //   2. `metadata_defaults` over the top — stamped at
+        //      materialization, so those keys carry real values.
+        let mut metadata = serde_json::Map::new();
+        for f in s.fields.iter().map(|f| f.name.to_string()).chain(
+            registry
+                .get(&s.kind)
+                .into_iter()
+                .flat_map(|st| st.fields.iter().map(|f| f.name.to_string())),
+        ) {
+            metadata.insert(f, Value::Null);
+        }
+        if let Value::Object(defaults) = &s.metadata_defaults {
+            for (k, v) in defaults {
+                metadata.insert(k.clone(), v.clone());
+            }
+        }
+        if let (true, Some((f, v))) = (done, &field) {
+            // The discriminator under test wins over any default: this
+            // payload exists to ask "what happens when the fork completes
+            // with THIS value".
+            metadata.insert((*f).to_string(), v.clone());
+        }
+        let metadata = Value::Object(metadata);
         steps.insert(
             s.title.clone(),
             serde_json::json!({ "done": done, "metadata": metadata }),
@@ -771,6 +814,83 @@ mod tests {
                 .any(|e| e.reason.contains("orphan outcome")
                     && e.reason.contains("changes-requested")),
             "expected changes-requested orphan, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_successor_reading_another_steps_default_is_not_an_orphan() {
+        // The re-routing shape (user-feedback v10): a branch is reachable
+        // from EITHER the triage fork or a later working step that
+        // reaches the same conclusion with better information.
+        //
+        // The second clause reads `steps.investigate.metadata.route`,
+        // and `investigate` declares that key in `metadata_defaults` —
+        // so at materialization the step carries it and the predicate
+        // evaluates. Synthesizing the fork payload WITHOUT defaults made
+        // the whole OR error on a missing identifier (boss-expr is
+        // strict), which reported every triage outcome as an orphan and
+        // refused a workflow that routes correctly at run time.
+        let reg = StepRegistry::v1();
+        let spec = WorkflowSpec::platform_seed(
+            "reroute",
+            "reroute",
+            "test",
+            vec!["asset".into()],
+            vec![
+                StepSpec {
+                    title: "decide".into(),
+                    kind: "task".into(),
+                    ready_when: "true".into(),
+                    fields: vec![boss_core::job::StepField {
+                        name: "route".into(),
+                        field_type: "ship|scrap|investigate".into(),
+                        required: true,
+                    }],
+                    ..Default::default()
+                },
+                StepSpec {
+                    title: "investigate".into(),
+                    kind: "task".into(),
+                    ready_when: "steps.decide.metadata.route = \"investigate\"".into(),
+                    fields: vec![boss_core::job::StepField {
+                        name: "route".into(),
+                        field_type: "ship|scrap".into(),
+                        required: true,
+                    }],
+                    // Stamped at materialization, so the step carries the
+                    // key from the moment it exists — which is why the
+                    // predicates below evaluate rather than error.
+                    metadata_defaults: serde_json::json!({ "route": "scrap" }),
+                    ..Default::default()
+                },
+                StepSpec {
+                    title: "ship".into(),
+                    kind: "task".into(),
+                    ready_when: "(steps.decide.metadata.route = \"ship\") \
+                                 OR (steps.investigate.metadata.route = \"ship\")"
+                        .into(),
+                    terminal: Some(Terminal {
+                        outcome: "shipped".into(),
+                    }),
+                    ..Default::default()
+                },
+                StepSpec {
+                    title: "scrap".into(),
+                    kind: "task".into(),
+                    ready_when: "(steps.decide.metadata.route = \"scrap\") \
+                                 OR (steps.investigate.metadata.route = \"scrap\")"
+                        .into(),
+                    terminal: Some(Terminal {
+                        outcome: "scrapped".into(),
+                    }),
+                    ..Default::default()
+                },
+            ],
+        );
+        let errs = validate_workflow(&spec, &reg);
+        assert!(
+            !errs.iter().any(|e| e.reason.contains("orphan outcome")),
+            "every decision outcome is handled; got: {errs:?}"
         );
     }
 

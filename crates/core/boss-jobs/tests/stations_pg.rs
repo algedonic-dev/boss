@@ -175,6 +175,70 @@ async fn an_authored_upstream_survives_draft_and_publish() {
     assert_eq!(read_back.upstream.as_ref(), Some(&expected));
 }
 
+/// The design-review station's page context round-trips through the
+/// `stations.lens` column (138-station-lens.sql).
+///
+/// Pinned here for the same reason the upstream hrefs are: this row is
+/// what `/system/design` draws its header and panel set from, so a
+/// seed that fails to parse is not a missing button but a page with no
+/// name. The panel keys are the renderers `DesignReviewPage` ships —
+/// a key nothing renders is a declared panel that never appears.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_design_review_lens_round_trips() {
+    let db = TestDb::new().await;
+    let registry = PgStations::new(db.pool.clone());
+
+    let review = registry
+        .get_active("design-review")
+        .await
+        .expect("review row");
+    let lens = review.lens.expect("the review queue declares a lens");
+    assert_eq!(lens.title, "Design review");
+    assert_eq!(
+        lens.eyebrow.as_deref(),
+        Some("System Model · Design review")
+    );
+    assert_eq!(
+        lens.panels,
+        vec!["rejections".to_string(), "corpus".to_string()],
+        "rejections first — an incomplete corpus is read before the corpus"
+    );
+
+    // A station no page renders reads back as "none declared" rather
+    // than as an empty page.
+    let dock = registry.get_active("loading-dock").await.expect("dock row");
+    assert_eq!(dock.lens, None);
+}
+
+/// An authored lens carries through the write path, like `upstream`:
+/// the seed is data, and so is every row published after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_authored_lens_survives_draft_and_publish() {
+    let db = TestDb::new().await;
+    let registry = PgStations::new(db.pool.clone());
+    let now = chrono::Utc::now();
+
+    let mut authored = spec("night-review");
+    authored.lens = Some(boss_jobs::StationLens {
+        eyebrow: None,
+        title: "Night review".into(),
+        subtitle: Some("What came in after hours".into()),
+        panels: vec!["corpus".into()],
+    });
+    let expected = authored.lens.clone();
+    registry
+        .create_draft(authored, &author(), now)
+        .await
+        .expect("draft");
+    let published = registry
+        .publish("night-review", &author(), now)
+        .await
+        .expect("publish");
+    assert_eq!(published.lens, expected);
+    let read_back = registry.get_active("night-review").await.expect("active");
+    assert_eq!(read_back.lens, expected);
+}
+
 /// The seeded watchlist row survives the round trip through the
 /// `stations` columns AND evaluates — the seed is only as good as the
 /// Rust shape's ability to read it back, and this row is the first to

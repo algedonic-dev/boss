@@ -404,6 +404,12 @@ pub struct StationQueue {
     /// the walk-upstream affordance without a second call to the
     /// registry. `None` = the row declares none, and no button renders.
     pub upstream: Option<crate::stations::StationUpstream>,
+    /// The page context for a surface that renders this station whole,
+    /// echoed for the same reason `upstream` is: the call that fetched
+    /// the packets already answered "what page is this", so the page
+    /// draws itself from one response instead of a queue read plus a
+    /// registry read. `None` = no surface claims this station.
+    pub lens: Option<crate::stations::StationLens>,
     pub total: usize,
     pub data: Vec<Job>,
 }
@@ -447,6 +453,7 @@ pub fn evaluate_station(
             .is_some_and(|limit| members.len() as i64 > i64::from(limit)),
         terminal_window_days: spec.terminal_window_days,
         upstream: spec.upstream.clone(),
+        lens: spec.lens.clone(),
         total: members.len(),
         data: members,
     }
@@ -851,6 +858,33 @@ mod tests {
     fn a_station_with_no_upstream_says_so_rather_than_guessing() {
         let q = evaluate_station(&dock_spec(None), vec![], day(20));
         assert_eq!(q.upstream, None, "no pointer declared, no button");
+    }
+
+    /// Same contract as `upstream`, one level up: a surface that
+    /// renders a whole page for a station gets its page context from
+    /// the same envelope that carried the packets, so the page is one
+    /// call and its identity is registry data.
+    #[test]
+    fn the_envelope_carries_the_declared_lens() {
+        let mut spec = dock_spec(None);
+        spec.lens = Some(crate::stations::StationLens {
+            eyebrow: Some("System Model · Design review".into()),
+            title: "Design review".into(),
+            subtitle: Some("Open questions, pending decisions, ADRs".into()),
+            panels: vec!["rejections".into(), "corpus".into()],
+        });
+        let q = evaluate_station(&spec, vec![], day(20));
+        let lens = q.lens.expect("declared, so present");
+        assert_eq!(lens.title, "Design review");
+        assert_eq!(lens.panels, vec!["rejections", "corpus"]);
+    }
+
+    #[test]
+    fn a_station_with_no_lens_says_so_rather_than_guessing() {
+        // A queue nobody renders a page for must not have a page
+        // invented for it from its `title`.
+        let q = evaluate_station(&dock_spec(None), vec![], day(20));
+        assert_eq!(q.lens, None, "no lens declared, no page context");
     }
 
     // ------------------------------------------------------------
