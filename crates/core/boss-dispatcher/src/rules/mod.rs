@@ -20,6 +20,7 @@ pub mod handler;
 pub mod helpers_inventory;
 pub mod jobs_spawn;
 pub mod log_tail;
+pub mod payload_contract;
 pub mod registry;
 pub mod runner;
 pub mod schedule_runner;

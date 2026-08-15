@@ -44,6 +44,20 @@ check() {
     fi
 }
 
+# The shared fixture, checked in BOTH modes and named before anything
+# else. Measured across the forge's CI history on 2026-08-15 (106 runs,
+# 36 trains): 79% of train reds surfaced only in `test`, the slowest
+# stage, and the expensive ones were not a crate's logic failing. They
+# were the shared fixture failing — the schema directory, or the TestDb
+# harness itself — which reds every DB-backed crate at once.
+#
+# Those are exactly the breaks car mode could not see. `-p <crate>`
+# answers "did I break my crate"; a fixture break belongs to everyone,
+# so scoping the gate to the changed crate scoped the check away and the
+# first thing to notice was a train. Running it unscoped here puts a
+# fixture break in front of the agent who caused it.
+check "fixture" cargo test -p boss-testing --features postgres --test fixture_smoke
+
 if [ "${#SCOPE[@]}" -eq 0 ]; then
     # Full gate — the CI shape.
     check "clippy"  cargo clippy --workspace --all-features --tests -- -D warnings

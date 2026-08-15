@@ -44,6 +44,66 @@ const DEFAULT_ADMIN_URL: &str = "postgres://boss:boss@127.0.0.1/postgres";
 /// The escape hatch, named so it cannot be set by accident.
 const ALLOW_PRODUCTION_ENV: &str = "BOSS_TEST_ALLOW_PRODUCTION_SERVER";
 
+/// Every scratch database starts with this.
+const SCRATCH_PREFIX: &str = "test_boss_";
+
+/// How old a scratch database must be before another test process will
+/// drop it. Generous on purpose: the point is to reclaim yesterday's
+/// litter, not to race a suite that is running right now. A slow
+/// DB-backed test is minutes; nothing legitimately holds a scratch
+/// database for half an hour.
+const ORPHAN_TTL_SECS: u64 = 1800;
+
+/// Seconds since the epoch, for stamping a scratch database's name.
+///
+/// This is deliberately NOT the `clock.now()` every other "now" in BOSS
+/// routes through, and it is not what `infra/lint/no-wallclock.sh`
+/// forbids (that lint is about `Utc::now` stamping audit_log with
+/// wallclock in a service). Nothing here reaches audit_log: it is test
+/// harness bookkeeping about when a throwaway database was created, and
+/// a sim clock would make the age meaningless.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The creation stamp encoded in a scratch database's name, if it has
+/// one. `test_boss_<secs>_<hex>` → `Some(secs)`.
+///
+/// Names from before the stamp existed (`test_boss_<hex>`) have no
+/// underscore after the prefix and return `None`. Those are treated as
+/// ancient, which is right: every scratch database created since this
+/// change carries a stamp, so an unstamped one is by construction left
+/// over from an older process that is no longer running.
+fn stamp_of(db_name: &str) -> Option<u64> {
+    let rest = db_name.strip_prefix(SCRATCH_PREFIX)?;
+    // `split_once` is what separates the two shapes: the stamped name
+    // has an underscore here and the legacy one does not, so a legacy
+    // suffix that happens to be all digits cannot be misread as a date.
+    let (secs, suffix) = rest.split_once('_')?;
+    if suffix.is_empty() {
+        return None;
+    }
+    secs.parse::<u64>().ok()
+}
+
+/// Is this scratch database old enough for another process to drop?
+///
+/// Pure so the age decision is testable without a server — the same
+/// reason `production_refusal` above is pure.
+fn is_orphan(db_name: &str, now: u64, ttl_secs: u64) -> bool {
+    match stamp_of(db_name) {
+        // `saturating_sub` matters: a database stamped in the future
+        // (clock skew between two machines sharing one Postgres) yields
+        // 0, so it is left alone rather than dropped underneath its
+        // owner.
+        Some(created) => now.saturating_sub(created) > ttl_secs,
+        None => true,
+    }
+}
+
 /// Should `TestDb` refuse to run against this server?
 ///
 /// THE INCIDENT THIS EXISTS FOR (2026-08-14). The admin URL defaults to
@@ -136,7 +196,9 @@ impl TestDb {
             .unwrap_or_else(|_| DEFAULT_ADMIN_URL.to_string());
 
         let suffix = Uuid::new_v4().simple().to_string();
-        let db_name = format!("test_boss_{}", &suffix[..12]);
+        // The stamp is what lets a later process tell litter from live
+        // work without asking whether a test is still running.
+        let db_name = format!("{SCRATCH_PREFIX}{}_{}", now_secs(), &suffix[..12]);
 
         let admin_opts = PgConnectOptions::from_str(&admin_url)
             .unwrap_or_else(|e| panic!("parsing BOSS_TEST_POSTGRES_ADMIN_URL: {e}"));
@@ -159,6 +221,10 @@ impl TestDb {
         ) {
             panic!("{reason}");
         }
+
+        // Reclaim earlier runs' litter before adding to it. See
+        // `sweep_orphans` for why this happens here rather than on Drop.
+        sweep_orphans(&mut admin, now_secs()).await;
 
         admin
             .execute(format!(r#"CREATE DATABASE "{db_name}""#).as_str())
@@ -227,6 +293,57 @@ impl Drop for TestDb {
                 drop_database(&admin_url, &db_name).await;
             });
         }
+    }
+}
+
+/// Drop scratch databases left behind by earlier test processes.
+///
+/// WHY CLEANUP CANNOT LIVE ONLY ON `Drop` (filed f22369c4). `Drop`
+/// schedules the drop with `handle.spawn`, but a `#[tokio::test]`
+/// runtime is torn down the moment the test function returns — so the
+/// spawned task usually never runs, and the database survives. Measured
+/// 2026-08-15: a scratch instance created at 16:30Z held 196 databases
+/// and 3.0G by 17:15Z, and two ordinary test runs while writing this
+/// added two more. The `Drop` path is kept because it does work when
+/// the runtime outlives the handle; it is simply not sufficient alone.
+///
+/// So a process cleans up after its predecessors rather than after
+/// itself: one query per test PROCESS, not per test.
+///
+/// Two conditions, and both are needed. Age alone would race a suite
+/// running elsewhere against the same server; "no active connections"
+/// alone would race the gap between `CREATE DATABASE` and the pool's
+/// first connect in a parallel process. Requiring both means a database
+/// must be older than the TTL AND have nobody attached — a freshly
+/// created one fails the age test no matter what its connections are
+/// doing.
+///
+/// Best-effort throughout: a concurrent sweeper may drop a row between
+/// our SELECT and our DROP, and that is fine. Never panics — a test
+/// must not fail because someone else's litter would not go away.
+async fn sweep_orphans(admin: &mut PgConnection, now: u64) {
+    let candidates: Vec<String> = match sqlx::query_scalar(
+        "SELECT d.datname FROM pg_database d \
+         WHERE d.datname LIKE 'test\\_boss\\_%' \
+           AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)",
+    )
+    .fetch_all(&mut *admin)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return,
+    };
+
+    for name in candidates
+        .into_iter()
+        .filter(|n| is_orphan(n, now, ORPHAN_TTL_SECS))
+    {
+        // Quote the identifier; never interpolate it anywhere a name
+        // could be read as SQL. These come from pg_database, but the
+        // habit is the point.
+        let _ = admin
+            .execute(format!(r#"DROP DATABASE IF EXISTS "{name}""#).as_str())
+            .await;
     }
 }
 
@@ -318,6 +435,64 @@ mod generated_schema_list {
 /// The production guard's decision, exercised without a server —
 /// which is the difficulty with guards like this: the dangerous case
 /// is precisely the one you must not set up to test.
+#[cfg(test)]
+mod orphan_sweep {
+    use super::{ORPHAN_TTL_SECS, is_orphan, stamp_of};
+
+    const NOW: u64 = 1_786_800_000;
+
+    #[test]
+    fn a_stamped_name_carries_its_creation_time() {
+        assert_eq!(stamp_of("test_boss_1786800000_abc123def456"), Some(NOW));
+    }
+
+    #[test]
+    fn a_legacy_unstamped_name_has_no_time() {
+        // The shape TestDb wrote before the stamp existed.
+        assert_eq!(stamp_of("test_boss_abc123def456"), None);
+    }
+
+    #[test]
+    fn a_legacy_all_digit_suffix_is_not_mistaken_for_a_stamp() {
+        // The uuid suffix is hex, so it can be all digits. Read as a
+        // date this would be the year 5882 and the database would never
+        // be swept; the underscore is what distinguishes the shapes.
+        assert_eq!(stamp_of("test_boss_123456789012"), None);
+        assert!(
+            is_orphan("test_boss_123456789012", NOW, ORPHAN_TTL_SECS),
+            "an unstamped legacy database is litter and must be swept"
+        );
+    }
+
+    #[test]
+    fn a_fresh_database_is_never_swept() {
+        let fresh = format!("test_boss_{NOW}_abc123def456");
+        assert!(!is_orphan(&fresh, NOW, ORPHAN_TTL_SECS));
+        // Still live one second before the TTL expires.
+        assert!(!is_orphan(&fresh, NOW + ORPHAN_TTL_SECS, ORPHAN_TTL_SECS));
+    }
+
+    #[test]
+    fn a_database_older_than_the_ttl_is_swept() {
+        let old = format!("test_boss_{NOW}_abc123def456");
+        assert!(is_orphan(&old, NOW + ORPHAN_TTL_SECS + 1, ORPHAN_TTL_SECS));
+    }
+
+    #[test]
+    fn a_future_stamp_is_left_alone() {
+        // Clock skew between two machines sharing one Postgres must not
+        // make a live database look infinitely old.
+        let future = format!("test_boss_{}_abc123def456", NOW + 10_000);
+        assert!(!is_orphan(&future, NOW, ORPHAN_TTL_SECS));
+    }
+
+    #[test]
+    fn only_scratch_databases_are_candidates() {
+        assert_eq!(stamp_of("boss"), None);
+        assert_eq!(stamp_of("postgres"), None);
+    }
+}
+
 #[cfg(test)]
 mod production_guard {
     use super::{ALLOW_PRODUCTION_ENV, production_refusal};
