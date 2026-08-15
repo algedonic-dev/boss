@@ -154,7 +154,7 @@ source = "CLAUDE.md §9a; crates/core/boss-testing/build.rs"
 enforcement = "enforced"
 mechanism = "crates/core/boss-testing/build.rs"
 last_verified = ""
-note = "Collapsed, not pinned: build.rs generates SCHEMA_FILES from infra/postgres/schema/manifest.txt, parsing it the same way migrate.sh does, and asserts by name that every manifest entry exists on disk. `generated_list_matches_the_manifest` in test_db.rs is the backstop against a stale OUT_DIR artifact."
+note = "Collapsed twice. First build.rs generated SCHEMA_FILES from manifest.txt, which removed the second hand-maintained list but left the manifest itself as a contended tail line — any two cars carrying a migration conflicted there, four re-rails on 2026-08-13 and two stranded cars on 2026-08-14. So on 2026-08-15 the manifest was deleted and the DIRECTORY became the definition: build.rs and migrate.sh each sort infra/postgres/schema/*.sql by the numeric NNN- prefix, and test_db.rs re-reads the directory at run time as the backstop against a stale OUT_DIR artifact. Three readers, one definition, and nothing to append."
 
 [[invariant]]
 id = "migrations-are-append-only"
@@ -466,3 +466,21 @@ enforcement = "unenforced"
 mechanism = ""
 last_verified = "2026-08-15"
 note = "Three red trains in two days, all the same shape: a migration changed registry DATA, and the test that asserts that data lives in a crate the author did not think they had touched. Migration 123 edited a cadence row and broke a boss-cli seed test (eight cars). 130 and 133 inserted a station before retiring its predecessor and broke schema load for the whole workspace (six cars, then thirteen). 129 seeded a dispatcher rule that never reached rules.toml and broke the drift guard in boss-dispatcher (the same thirteen). The tests all EXIST and all work — every one of them caught the fault. They caught it on the train, because that is the first place the whole suite runs. gate.sh already defaults to the full workspace; the narrowing is opt-in via `-p`, so this is not a missing mechanism but an author reaching for the fast path on exactly the class of change where the blast radius is widest. What would enforce it: nothing can verify what an author ran before parking — the honest options are per-car CI, which the whole train design exists to avoid because CI is the measured bottleneck, or moving the cost the other way by making the conductor gate a car at PARK time rather than the consist at board time. Until one of those is chosen this is debt, and it is written here so the next red of this shape is recognised in one minute instead of forty."
+
+[[invariant]]
+id = "tests-never-run-against-a-boss-deployment"
+claim = "`TestDb` refuses to create a scratch database on any Postgres server that hosts a database named `boss`."
+source = "crates/core/boss-testing/src/test_db.rs (production_refusal); infra/cluster/manifests/boss-dev.yaml"
+enforcement = "enforced"
+mechanism = "crates/core/boss-testing/src/test_db.rs"
+last_verified = "2026-08-15"
+note = "`production_refusal` runs on the admin connection before any CREATE DATABASE and panics with the way out; three unit tests cover refuse/allow/override. Exercised against a real server rather than only in unit tests: a decoy `boss` database was planted on the scratch instance, the suite refused on every test, passed 7/7 with BOSS_TEST_ALLOW_PRODUCTION_SERVER=1, and passed 7/7 again once the decoy was dropped. On 2026-08-14 a `cargo test --workspace` created 582 scratch databases on the production cluster through a forgotten `kubectl port-forward`, filled the Longhorn PVC and put Postgres into recovery. Nothing was lost, by luck. Host and port cannot distinguish the cases — a laptop's own Postgres and a port-forwarded production one are both 127.0.0.1, and the admin database is `postgres` in both. What separates them is that a scratch instance has no reason to hold a database called `boss`. The boss-dev pod is the other half: it moves the DEFAULT onto a sidecar that cannot be production, so the guard is the backstop rather than the only line."
+
+[[invariant]]
+id = "a-verdict-the-system-recorded-is-not-the-verdict-now"
+claim = "Any state read once and stamped onto a terminal step must be re-read for decisions, and a change in it must be reported."
+source = "crates/orchestrators/boss-cli/src/train.rs (verdict_drift, ci_overdue, auto_cancel_reason)"
+enforcement = "checked"
+mechanism = "crates/orchestrators/boss-cli/src/train.rs — `verdict_drift` reports a CI verdict that moved after the `ci` step recorded it, and `ci_overdue` reports a PR that CI never answered within BOSS_TRAIN_CI_HOURS (2, roughly twice the measured p90). Seven tests. Not `enforced` because it holds for the CI verdict only; nothing generalises it to the next value stamped on a terminal step."
+last_verified = "2026-08-15"
+note = "Train 20260815-0621 sat red for 45 minutes after a repair with the system reporting nothing, and was found by querying the forge by hand. The `ci` step completes once and is never revisited, so a repaired train's second verdict was recorded nowhere — the repair loop, the path most in need of feedback, had none. The obvious fix is impossible: `update_step_at` freezes status, completed_on AND metadata on a terminal row, which is `no-protocol-step-needs-un-completing` seen from the other side. So the moving fact lives on the train job's metadata beside the immutable record of what the verdict was when it settled. Both are true; they are different facts. The threshold is measured, not guessed: 22 trains, pr->ci median ~33m, p90 ~56m, range 10-169m, and no correlation with car count."

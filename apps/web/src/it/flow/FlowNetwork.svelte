@@ -17,7 +17,7 @@
   // second half of 39d5bfde) and edge pulses (dashboards Q3) — both
   // noted on the item.
   import StepDag from '../../jobs/StepDag.svelte';
-  import { connectLiveFlow, type FlowHit } from './liveFlow';
+  import { connectLiveFlow, sharedExecutors, type FlowHit } from './liveFlow';
   import { workflowToDag } from '../../jobs/workflowToDag';
   import { decorateDagNodes, type FleetNodeStat, type StageStat } from '../../jobs/decorateDag';
   import { navigate } from '../../router';
@@ -46,6 +46,15 @@
   // rules and dispatchers acting; 👤 rows are people.
   let pulses = $state<Record<string, number>>({});
   let ticker = $state<ReadonlyArray<FlowHit>>([]);
+  // Every hit since the page opened, kept SEPARATELY from the ticker.
+  // The ticker is a 30-row window for reading; span is a claim about
+  // the whole session, and computing it from a truncated list would
+  // quietly under-report exactly the long-lived executors the view
+  // exists to surface. Bounded so a page left open overnight cannot
+  // grow without limit.
+  let seen = $state<ReadonlyArray<FlowHit>>([]);
+  const SEEN_CAP = 2000;
+  const shared = $derived(sharedExecutors(seen));
   let liveSeen = $state(false);
 
   async function jsonOr<T>(url: string, fallback: T): Promise<T> {
@@ -155,6 +164,7 @@
       const key = `${hit.jobKind}:${hit.slug}`;
       pulses = { ...pulses, [key]: (pulses[key] ?? 0) + 1 };
       ticker = [hit, ...ticker].slice(0, 30);
+      seen = seen.length >= SEEN_CAP ? [hit, ...seen.slice(0, SEEN_CAP - 1)] : [hit, ...seen];
     });
     return stop;
   });
@@ -212,6 +222,22 @@
         </ul>
       {/if}
     </div>
+    {#if shared.length > 0}
+      <div class="fn-shared">
+        <span class="fn-shared-h">shared executors — working across more than one route</span>
+        <ul class="fn-shared-list">
+          {#each shared.slice(0, 8) as e (e.actor)}
+            <li class="fn-shared-row" class:fn-machine={e.machine}>
+              <span class="fn-who">{e.machine ? '⚙' : '👤'}</span>
+              <span class="fn-actor">{e.actor}</span>
+              <span class="fn-span" title="routes this executor has worked in this session">{e.kinds.length} routes</span>
+              <span class="fn-kinds">{e.kinds.join(' · ')}</span>
+              <span class="fn-hits">{e.hits}</span>
+            </li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
     {#each sections as sec, i (sec.kind)}
       {#if i > 0}
         {@const prev = sections[i - 1]}
@@ -257,6 +283,62 @@
   }
   .fn-err {
     color: var(--err, #e2685c);
+  }
+  /* Shared executors — the network showing through the routes.
+     Tokens carry the same fallbacks the rest of this file uses: an
+     undefined token renders as a light default against a dark card,
+     which is how the readability regression (9a1bbc63) looked. */
+  .fn-shared {
+    margin: 0 0 14px;
+    padding: 10px 12px;
+    border: 1px solid var(--hairline, #2A3138);
+    border-radius: 8px;
+    background: var(--card, var(--ink, #12161C));
+  }
+  .fn-shared-h {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--static, #7A838C);
+    font-weight: 600;
+  }
+  .fn-shared-list {
+    list-style: none;
+    margin: 8px 0 0;
+    padding: 0;
+    display: grid;
+    gap: 4px;
+  }
+  .fn-shared-row {
+    display: grid;
+    grid-template-columns: 1.2rem minmax(9rem, auto) 5rem 1fr 3rem;
+    gap: 8px;
+    font-size: 12px;
+    align-items: baseline;
+  }
+  .fn-shared-row .fn-actor {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .fn-shared-row.fn-machine .fn-actor {
+    color: var(--signal, #5FD4A8);
+  }
+  .fn-shared-row .fn-span {
+    font-variant-numeric: tabular-nums;
+    color: var(--static, #7A838C);
+  }
+  .fn-shared-row .fn-kinds {
+    color: var(--static, #7A838C);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .fn-shared-row .fn-hits {
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    color: var(--static, #7A838C);
   }
   .fn-ticker {
     margin: 6px 0 14px;

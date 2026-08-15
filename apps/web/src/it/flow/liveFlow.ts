@@ -143,3 +143,58 @@ export function connectLiveFlow(onHit: (hit: FlowHit) => void): () => void {
     source = null;
   };
 }
+
+/**
+ * An executor seen working in MORE THAN ONE workflow.
+ *
+ * WHY THIS EXISTS (feedback df8a694c, David): "/system/flow renders N
+ * workflow DAGs as N separate sections — pr-train packets and feedback
+ * packets share David, the agent, and the dispatcher in reality, but
+ * the page cannot SHOW the shared stations because its unit is the
+ * route, not the network."
+ *
+ * The page's unit stays the route — rewriting it into a true node
+ * graph is the it-activity-network design, and this does not pretend
+ * to be that. What it adds is the one fact the per-route sections
+ * structurally cannot carry: which executors appear in several routes
+ * at once. That is the network showing through the routes, computed
+ * from the feed already on the page rather than from a new endpoint.
+ *
+ * Ordering is by SPAN first (how many kinds an executor touches), then
+ * by volume. The most-shared executor is the most interesting one on a
+ * page about where work moves, and a busy actor confined to one
+ * workflow is not a shared station however loud it is.
+ */
+export type SharedExecutor = Readonly<{
+  actor: string;
+  machine: boolean;
+  kinds: ReadonlyArray<string>;
+  hits: number;
+}>;
+
+export function sharedExecutors(
+  hits: ReadonlyArray<FlowHit>,
+  minKinds = 2,
+): ReadonlyArray<SharedExecutor> {
+  const byActor = new Map<string, { kinds: Set<string>; hits: number }>();
+  for (const h of hits) {
+    // An unattributed frame is not an executor. Counting it would
+    // invent a station that nobody works at — the same reason
+    // isMachineActor leaves the empty actor human-side rather than
+    // colouring it in.
+    if (!h.actor) continue;
+    const cur = byActor.get(h.actor) ?? { kinds: new Set<string>(), hits: 0 };
+    if (h.jobKind) cur.kinds.add(h.jobKind);
+    cur.hits += 1;
+    byActor.set(h.actor, cur);
+  }
+  return [...byActor.entries()]
+    .filter(([, v]) => v.kinds.size >= minKinds)
+    .map(([actor, v]) => ({
+      actor,
+      machine: isMachineActor(actor),
+      kinds: [...v.kinds].sort(),
+      hits: v.hits,
+    }))
+    .sort((a, b) => b.kinds.length - a.kinds.length || b.hits - a.hits || a.actor.localeCompare(b.actor));
+}

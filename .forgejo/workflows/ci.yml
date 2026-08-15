@@ -88,6 +88,15 @@ jobs:
       # Postgres is a separate host on the job network — without this
       # every DB-backed test dies on "Connection refused".
       BOSS_TEST_POSTGRES_ADMIN_URL: postgres://boss:boss@postgres:5432/postgres
+      # TestDb refuses to run against a server that hosts a database
+      # named `boss`, because that is what tells a BOSS deployment apart
+      # from a scratch instance (the 2026-08-14 port-forward incident:
+      # 582 scratch databases on the production volume). CI is the one
+      # place that premise is false by construction — the service
+      # container above is created with POSTGRES_DB=boss precisely so
+      # `Apply schema` can migrate it, and it is destroyed with the job.
+      # This is the disposable-server case the guard's own message names.
+      BOSS_TEST_ALLOW_PRODUCTION_SERVER: "1"
     steps:
       # fetch-depth: 0 because the gate's migrations-append-only check
       # asks git whether this branch modified a migration that already

@@ -1391,12 +1391,17 @@ mod db_tests {
         assert_eq!(reconcile.basis, Basis::Wall { every_minutes: 10 });
         let window = by_name("train-window");
         assert_eq!(window.verb, "run");
+        // :05, not :00, since 134-cadence-window-off-grid.sql. The
+        // reconcile rule fires every ten minutes on a grid anchored at
+        // midnight, so a window at :00 lands in the same tick and loses
+        // the conductor's flock — which is why this rule had never once
+        // boarded a train. Five past is off that grid.
         assert_eq!(
             window.basis,
             Basis::Clock {
                 at: vec![
-                    NaiveTime::from_hms_opt(6, 0, 0).unwrap(),
-                    NaiveTime::from_hms_opt(18, 0, 0).unwrap(),
+                    NaiveTime::from_hms_opt(6, 5, 0).unwrap(),
+                    NaiveTime::from_hms_opt(18, 5, 0).unwrap(),
                 ],
             }
         );

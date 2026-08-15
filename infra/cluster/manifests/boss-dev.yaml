@@ -1,0 +1,190 @@
+# boss-dev — a development pod that runs on cluster hardware.
+#
+# WHY THIS EXISTS. Development was happening on a laptop, and on
+# 2026-08-15 that laptop filled its disk: 4,603 scratch test databases,
+# 68G, root at 100% with 117Mi free, mid-session. The cluster has 28
+# vCPU and ~80GB of RAM sitting next to the system under test. This
+# moves builds and DB-backed tests onto it.
+#
+# THE SAFETY PROPERTY IS THE POINT, NOT A BONUS. `boss_testing::TestDb`
+# connects to `postgres://boss:boss@127.0.0.1/postgres` and creates a
+# scratch database per test. On a laptop that default is a loaded gun:
+# open a `kubectl port-forward` to the cluster Postgres for an unrelated
+# read, run the suite, and 127.0.0.1 IS production — which is exactly
+# what happened on 2026-08-14, when a `cargo test --workspace` created
+# 582 databases on the production volume and crashed Postgres into
+# recovery. Inside this pod, 127.0.0.1:5432 is the sidecar below and
+# cannot be anything else. The failure mode is removed by construction
+# rather than by remembering.
+#
+# It also closes a version skew nobody had noticed: the laptop ran
+# Postgres 14 (homebrew) while production runs 16, so every local DB
+# test was run against a different major than the one it ships to.
+#
+# ACCESS
+#   kubectl exec -it -n boss-dev deploy/boss-dev -- bash
+#
+# ONE-TIME BOOTSTRAP (secrets never live in this directory — see
+# README.md, and the registry secret is namespaced so `boss`'s copy
+# does not serve here):
+#   kubectl get secret forgejo-registry -n boss -o yaml \
+#     | sed 's/namespace: boss/namespace: boss-dev/' \
+#     | kubectl apply -n boss-dev -f -
+#
+# NOT IN SCOPE FOR v1, deliberately:
+#   - A second CI runner. David, 2026-08-15: get the current system
+#     running consistently first. This shares CI's IMAGE, which is a
+#     different thing from sharing its job — see the image note below.
+#   - Running the agent itself in-cluster. That needs credentials in the
+#     cluster, which is David's call, not a manifest change.
+#   - A NetworkPolicy fencing this namespace off from `boss`. It is the
+#     right next step and it is omitted on purpose: an allow-list egress
+#     policy that gets the pod/service CIDRs wrong silently breaks
+#     `cargo fetch` and reads as "the dev box is broken", and an
+#     untested policy is worse than a documented gap. The sidecar above
+#     is what actually removes the incident class; the policy is defence
+#     in depth and deserves its own car with a reachability test.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: boss-dev
+  labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: development}
+---
+# A single-replica storage class for disposable volumes.
+#
+# The default `longhorn` class replicates three times, which is correct
+# for the system of record and wrong for a workspace: this volume holds
+# a git clone and a package cache, both reproducible from their source
+# in minutes. Three replicas would cost 3x the space and, worse, put
+# every build's write amplification on the replication path.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: longhorn-dev-disposable
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+parameters:
+  numberOfReplicas: "1"
+  # Keep the single replica on the node running the pod: a dev volume
+  # has no availability requirement, and local reads are the point.
+  dataLocality: "best-effort"
+  staleReplicaTimeout: "30"
+  fsType: "ext4"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: boss-dev-work
+  namespace: boss-dev
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: longhorn-dev-disposable
+  resources:
+    requests:
+      # The clone plus CARGO_HOME's registry cache. The build target dir
+      # is NOT here — see the emptyDir below.
+      storage: 40Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: boss-dev
+  namespace: boss-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: boss-dev}
+  # Recreate, for the same reason boss.yaml uses it: the workspace is a
+  # ReadWriteOnce volume, so a surge pod would block on multi-attach
+  # while the old one holds it. RollingUpdate here deadlocks.
+  strategy: {type: Recreate}
+  template:
+    metadata:
+      labels: {app: boss-dev}
+    spec:
+      imagePullSecrets:
+        - {name: forgejo-registry}
+      # No ServiceAccount token: nothing in here talks to the Kubernetes
+      # API, and a dev shell with cluster credentials is a bigger blast
+      # radius than a dev shell without them.
+      automountServiceAccountToken: false
+      securityContext:
+        # The workspace volume is group-owned so a non-root build can
+        # write to it, matching boss.yaml's posture for boss-auth.
+        fsGroup: 1500
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: dev
+          # THE SAME IMAGE CI RUNS. Not a copy of its tool list — the
+          # image itself, so "works on the dev box" and "passes the
+          # gate" cannot drift apart. required-tools.txt is the manifest
+          # the locomotive check reads, and it is satisfied here by
+          # construction. Sharing the image is not the same as running a
+          # second runner; only the toolchain definition is shared.
+          image: 10.20.0.15:3000/david/boss-ci:rust1.96
+          command: ["sleep", "infinity"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+          workingDir: /work
+          env:
+            # The sidecar, by name rather than by luck. TestDb would
+            # default to this anyway; setting it explicitly means a
+            # future default change cannot silently redirect the suite.
+            - {name: BOSS_TEST_POSTGRES_ADMIN_URL, value: "postgres://boss:boss@127.0.0.1:5432/postgres"}
+            - {name: CARGO_HOME, value: /work/.cargo}
+            # Build artefacts go to node-local disk, not to Longhorn.
+            # A replicated network volume is the wrong medium for a
+            # target dir that rewrites gigabytes on every build; losing
+            # it on reschedule costs one cold build and nothing else.
+            - {name: CARGO_TARGET_DIR, value: /scratch/target}
+            - {name: GIT_CONFIG_GLOBAL, value: /work/.gitconfig}
+          resources:
+            requests: {cpu: "2", memory: 4Gi}
+            # Headroom for a workspace build without being able to
+            # starve the system of record sharing these nodes.
+            limits: {cpu: "8", memory: 16Gi}
+          volumeMounts:
+            - {name: work, mountPath: /work}
+            - {name: scratch, mountPath: /scratch}
+        - name: postgres
+          # Matches production's major (the `boss` StatefulSet runs
+          # postgres:16). A dev database on a different major is a test
+          # of something other than what ships.
+          image: postgres:16
+          securityContext:
+            allowPrivilegeEscalation: false
+            # NOT `drop: ALL`, and the exception is deliberate: this
+            # image's entrypoint starts as root, chowns PGDATA, and
+            # execs gosu to become the postgres user. Dropping CHOWN
+            # and SETUID/SETGID takes away the very capabilities it
+            # uses to STOP being root, so the hardening would either
+            # crash the container or keep it running as root. PGDATA is
+            # a subdirectory of the mount (not the mount itself) so the
+            # entrypoint can chmod it 0700 despite the pod's fsGroup
+            # setgid bit, which Postgres refuses to start without.
+            capabilities: {drop: ["NET_RAW"]}
+          env:
+            - {name: POSTGRES_USER, value: boss}
+            - {name: POSTGRES_PASSWORD, value: boss}
+            - {name: POSTGRES_DB, value: postgres}
+            - {name: PGDATA, value: /pgdata/data}
+          # emptyDir, emphatically: scratch databases accumulate — 4,603
+          # of them in one day on the laptop — and the right lifetime for
+          # them is "until the pod restarts". Persisting them would
+          # rebuild the problem this pod exists to solve.
+          volumeMounts:
+            - {name: pgdata, mountPath: /pgdata}
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "2", memory: 4Gi}
+      volumes:
+        - name: work
+          persistentVolumeClaim: {claimName: boss-dev-work}
+        - name: scratch
+          emptyDir: {}
+        - name: pgdata
+          emptyDir: {}

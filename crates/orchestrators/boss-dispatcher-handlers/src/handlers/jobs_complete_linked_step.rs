@@ -143,6 +143,40 @@ fn step_by_slug<'a>(job: &'a serde_json::Value, slug: &str) -> Option<&'a serde_
         .find(|s| s.get("spec_slug").and_then(|v| v.as_str()) == Some(slug))
 }
 
+/// Can this string possibly name a Job, or is following it a wasted
+/// request that ends in a dead letter?
+///
+/// `GET /api/jobs/{id}` requires a full UUID and answers anything else
+/// with `400 invalid job id`. A 400 is not a transient failure, so the
+/// runner's redelivery does not help: it NAKs eight times and drops the
+/// event — and dropping it takes every OTHER handler's effect on that
+/// event with it, which is a large blast radius for one bad string.
+///
+/// This is not hypothetical. `job_edges` documents that a stored edge
+/// may be a `>= 8-char` prefix, and seven cars stored one. When train
+/// 20260815-0621 merged, car bc6c061a's `backlog_item` — the string
+/// `bb86d687` — did exactly the above (finding `d99b310d`).
+///
+/// So an unusable link is SKIPPED and said out loud, not retried. The
+/// obligation cannot be discharged against a Job nobody can identify,
+/// and pretending a retry might fix it only delays the same answer by
+/// eight deliveries. 136-job-edges-backfill.sql normalises the stored
+/// rows and 125's trigger stops new ones; this makes the handler
+/// correct on its own rather than merely protected by them.
+pub(crate) fn unusable_link(id: &str) -> Option<String> {
+    let ok = id.len() == 36
+        && id.chars().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        });
+    (!ok).then(|| {
+        format!(
+            "link {id:?} is not a full Job id ({} chars) — skipping rather than              dead-lettering the event; the edge needs normalising",
+            id.len()
+        )
+    })
+}
+
 #[async_trait]
 impl Handler for JobsCompleteLinkedStep {
     fn name(&self) -> &'static str {
@@ -190,6 +224,14 @@ impl Handler for JobsCompleteLinkedStep {
         else {
             return Ok(());
         };
+
+        // A link that cannot name a Job is a skip, not a failure —
+        // see `unusable_link`. Retrying a 400 costs eight deliveries
+        // and then drops the event for every handler on it.
+        if let Some(why) = unusable_link(target_id) {
+            tracing::warn!(rule = %ctx.rule_name, link = %link, "{why}");
+            return Ok(());
+        }
 
         let target = self.get_job(target_id, &ctx.rule_name).await?;
 
@@ -320,6 +362,29 @@ mod tests {
     use super::*;
     use axum::{Json, Router, extract::Path, routing::get};
     use std::sync::Mutex;
+
+    #[test]
+    fn a_full_uuid_is_followed() {
+        assert_eq!(unusable_link("bb86d687-4e08-4a55-8b0e-1e0e63d6bb5f"), None);
+    }
+
+    #[test]
+    fn an_eight_char_prefix_is_skipped_not_retried() {
+        // The real one: car bc6c061a's backlog_item, which NAKed eight
+        // times and dead-lettered the event when train 20260815-0621
+        // merged.
+        let why = unusable_link("bb86d687").expect("a prefix cannot name a Job");
+        assert!(why.contains("skipping"), "the message says what it did");
+        assert!(why.contains("normalis"), "and what would fix it");
+    }
+
+    #[test]
+    fn near_misses_are_skipped_too() {
+        // Right length, wrong shape; and right shape, wrong alphabet.
+        assert!(unusable_link("bb86d687-4e08-4a55-8b0e-1e0e63d6bb5").is_some());
+        assert!(unusable_link("zz86d687-4e08-4a55-8b0e-1e0e63d6bb5f").is_some());
+        assert!(unusable_link("").is_some());
+    }
 
     fn ctx(payload: serde_json::Value) -> InvocationContext {
         InvocationContext {

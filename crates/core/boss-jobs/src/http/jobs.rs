@@ -960,6 +960,10 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
                     "closed_on": job.closed_on,
                     "kind": job.kind,
                     "outcome": job.metadata.get("outcome"),
+                    // Same contract as `kind` above: always present, so
+                    // a rule that spawns off a close can name the new
+                    // packet after the one that caused it.
+                    "title": job.title,
                     "parent_step_id": job.metadata.get("parent_step_id"),
                 }),
             ));

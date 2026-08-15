@@ -32,6 +32,13 @@ jobs:
       # otherwise fills the runner's disk (rustc-LLVM "No space left on
       # device") partway through `cargo test`.
       CARGO_PROFILE_DEV_DEBUG: "0"
+      # TestDb refuses to run against a server that hosts a database
+      # named `boss` — the tell that separates a BOSS deployment from a
+      # scratch instance (the 2026-08-14 port-forward incident). The
+      # service container below is created with POSTGRES_DB=boss on
+      # purpose and dies with the job, so this is the disposable-server
+      # case the guard's own message names. Same reason as the forge CI.
+      BOSS_TEST_ALLOW_PRODUCTION_SERVER: "1"
     services:
       postgres:
         image: postgres:16

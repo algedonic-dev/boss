@@ -49,9 +49,16 @@ async fn seeded_rules_serve_the_thresholds_the_schema_declares() {
     let window = by_name("train-window");
     assert_eq!(window.verb, "run");
     assert_eq!(window.basis, "clock");
+    // :05, not :00. 134-cadence-window-off-grid.sql moved the window off
+    // the wall grid the 10-minute reconcile fires on: 06:00 and 18:00 are
+    // both multiples of ten, so the two rules fired in the same tick every
+    // time and the window lost the conductor's flock — having already
+    // claimed its firing row. In the system's whole history the
+    // twice-daily window never boarded a train (filed 4ed0e791). Five past
+    // is off that grid for any interval the reconcile is likely to use.
     assert_eq!(
         window.at_times,
-        Some(serde_json::json!(["06:00", "18:00"])),
+        Some(serde_json::json!(["06:05", "18:05"])),
         "the clock rule's windows are registry data, not a constant"
     );
 

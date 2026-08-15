@@ -850,6 +850,17 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                         // already stamped one.
                         "kind": job.kind,
                         "outcome": job.metadata.get("outcome"),
+                        // What closed, in words. A rule that SPAWNS off
+                        // a close has to title the new packet, and the
+                        // only titles available to it are a literal or
+                        // an identifier from this payload — the arg
+                        // language has no concatenation. Without this
+                        // key, `title = "title"` binds nothing and the
+                        // whole event dead-letters (see below); with a
+                        // literal instead, every spawned packet is
+                        // named identically and the board cannot tell
+                        // them apart.
+                        "title": job.title,
                         // D7: same delegate-subjob back-link as the
                         // terminal-close path, so a child Job that
                         // closes via the all-steps-terminal catch-all
@@ -1266,6 +1277,10 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
                 // kind, and every consumer had to fetch the Job to
                 // find out whether the event was even about them.
                 "kind": job.kind,
+                // Present on all three sites for the same reason `kind`
+                // is: a spawning rule can only name the packet it
+                // creates from a literal or from this payload.
+                "title": job.title,
                 // D7: surface the delegate-subjob back-link (if any) on
                 // the close marker so the jobs.subjob_resolve rule can
                 // gate `when` on it without fetching the Job. Null for

@@ -53,6 +53,18 @@ those by name).
 | `boss-tls.yaml` | One-shot Jobs: DNS A record + lego Let's Encrypt cert for boss.algedonic.dev (publishes secret `boss-tls`) |
 | `boss-tls-front.yaml` | Caddy TLS front terminating boss.algedonic.dev on LB 10.20.0.33 |
 | `boss-backup.yaml` | Nightly pg_dump CronJob, 14-day PVC retention, offsite ship to boss-gcp |
+| `boss-dev.yaml` | Namespace `boss-dev`: a development pod on cluster hardware, with its own Postgres sidecar and a single-replica workspace volume |
+
+`boss-dev.yaml` is the one file here that does not configure the
+system of record. It is in this directory because it converges the
+same way and by the same runner, and splitting it out would mean a
+second convergence path to keep honest. Note that it declares its own
+namespace: the dev pod is deliberately NOT in `boss`, so a shell in it
+does not reach production secrets and services by default. Its Postgres
+sidecar is the load-bearing part — `boss_testing::TestDb` defaults to
+`127.0.0.1`, which in that pod can only be the sidecar, so the
+"port-forward turned my test suite on production" incident of
+2026-08-14 is removed by construction rather than by discipline.
 
 Note on the one-shot Jobs in `boss-tls.yaml`: `kubectl apply` on an
 existing completed Job with an unchanged spec is a no-op; the Jobs

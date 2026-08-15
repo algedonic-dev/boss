@@ -106,6 +106,10 @@ struct Config {
     /// now — this threshold belongs in the cadence_rules registry as
     /// protocol data; follow-up, not this change.
     stall_hours: i64,
+    /// Hours the PR may sit without CI producing ANY verdict before the
+    /// conductor says so (BOSS_TRAIN_CI_HOURS, default 2). David's
+    /// number, 2026-08-15: roughly twice the measured p90 of pr->ci.
+    ci_hours: i64,
     /// Release a red train's consist automatically once it has stalled
     /// (BOSS_TRAIN_AUTO_CANCEL, default ON — set to `0` to disable).
     /// On by default because the failure it prevents is a pipeline that
@@ -136,6 +140,7 @@ impl Config {
             auto_merge: std::env::var("BOSS_TRAIN_AUTO_MERGE").as_deref() == Ok("1"),
             allow_local_jobs: std::env::var("BOSS_TRAIN_ALLOW_LOCAL_JOBS").as_deref() == Ok("1"),
             stall_hours: env_or("BOSS_TRAIN_STALL_HOURS", "6").parse().unwrap_or(6),
+            ci_hours: env_or("BOSS_TRAIN_CI_HOURS", "2").parse().unwrap_or(2),
             auto_cancel: std::env::var("BOSS_TRAIN_AUTO_CANCEL").as_deref() != Ok("0"),
             gh_repo,
             home,
@@ -1052,6 +1057,79 @@ pub(crate) fn auto_cancel_reason(
     ))
 }
 
+/// Has the CI verdict MOVED since it was last recorded?
+///
+/// THE BLIND SPOT THIS CLOSES. The `ci` step is completed exactly once,
+/// the first time the rollup settles, and never looked at again. So the
+/// verdict on a train that was repaired — pushed to, re-run, and gone
+/// red a second time — is recorded nowhere and logged nowhere. On
+/// 2026-08-15 train 20260815-0621 sat red for 45 minutes after a repair
+/// with the system reporting nothing; it was found by querying the
+/// forge by hand. The repair loop is exactly the path with no feedback,
+/// which is the worst place to have none.
+///
+/// WHY THIS DOES NOT RE-STAMP THE STEP, which is the obvious fix and is
+/// impossible: `update_step_at` freezes status, completed_on AND
+/// METADATA on a terminal row, so the step's `result` cannot be
+/// rewritten — and today's other lesson is not to design a path that
+/// needs to un-complete a step. The train JOB's metadata is not frozen,
+/// so the moving fact lives there, next to the immutable record of what
+/// the verdict was when it first settled. Both are true and they are
+/// different facts.
+///
+/// `pending` is never a change worth reporting: a re-run passes through
+/// it on the way to an answer, and announcing it would make the signal
+/// fire on every repair.
+pub(crate) fn verdict_drift(recorded: Option<&str>, live: &str) -> Option<String> {
+    let recorded = recorded?;
+    if live == "pending" || live == recorded {
+        return None;
+    }
+    Some(format!(
+        "CI verdict moved {recorded} -> {live} since it was recorded"
+    ))
+}
+
+/// CI has been asked and has not answered — the case `verdict_drift`
+/// cannot see, because there is no verdict to compare.
+///
+/// Drift reports a verdict that MOVED. A runner that hangs, a job that
+/// never reports, a queue nothing picks up: those produce no verdict at
+/// all, so the train sits with its `ci` step incomplete and every
+/// reconcile finds `pending` and says nothing. This is the backstop for
+/// that, and only that.
+///
+/// THE THRESHOLD IS MEASURED, NOT GUESSED (David, 2026-08-15, choosing
+/// 2x p90). Across 22 trains the pr->ci time had a median of ~33
+/// minutes, a p90 of ~56, and a range of 10 to 169. Half again the
+/// median would be ~50 minutes and would fire on six of those 22 — a
+/// quarter of all trains, which is how an alert becomes furniture. Two
+/// hours is roughly twice p90 and clears every train ever observed
+/// except the 169-minute outlier, so when it fires it means something.
+///
+/// Worth recording alongside it, because it argues for LONGER trains:
+/// that spread has no relationship to car count. A one-car train took
+/// 63 minutes and an eight-car train took 12. The cost is per run, not
+/// per car.
+pub(crate) fn ci_overdue(
+    train: &Value,
+    now: DateTime<Utc>,
+    threshold_hours: i64,
+) -> Option<String> {
+    // Only once the PR exists — before that there is nothing for CI to
+    // answer about, and a train stuck earlier is the stall sentinel's.
+    let asked = parse_stamp(step_stamp(train, "pr", "Open the batched PR"))?;
+    if step_done(find_step(train, "ci", "CI verdict")) {
+        return None;
+    }
+    let hours = now.signed_duration_since(asked).num_hours();
+    (hours >= threshold_hours).then(|| {
+        format!(
+            "CI has not answered in {hours}h (threshold {threshold_hours}h) — no verdict, not a red one"
+        )
+    })
+}
+
 /// How many red trains a car may ride before boarding leaves it behind.
 /// Two: one red is bad luck — the fault is usually a neighbour's — and
 /// a second aboard a different consist is the car itself.
@@ -1900,6 +1978,53 @@ impl Conductor {
             if !step_done(ci_step) && verdict != "pending" {
                 self.complete_step(&t, ci_step, &[("result", Some(verdict.to_string()))])
                     .await?;
+            } else if step_done(ci_step) {
+                // The step has already recorded its verdict and cannot
+                // record another — terminal rows are frozen. Compare
+                // against the last verdict we NOTICED (the job stamp,
+                // falling back to the step's original) so this fires on
+                // each change rather than on every ten-minute tick.
+                let md = t.get("metadata");
+                let noticed = md
+                    .and_then(|m| m.get("ci_verdict_latest"))
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        ci_step
+                            .and_then(|s| s.get("metadata"))
+                            .and_then(|m| m.get("result"))
+                            .and_then(Value::as_str)
+                    });
+                if let Some(note) = verdict_drift(noticed, verdict) {
+                    log(format!("train {}: {note}", id8(&tid)));
+                    if !self.cfg.dry {
+                        self.merge_job_metadata(
+                            &tid,
+                            vec![
+                                ("ci_verdict_latest", json!(verdict)),
+                                ("ci_verdict_changed_at", json!(now.to_rfc3339())),
+                            ],
+                        )
+                        .await?;
+                        t = self.get_job(&tid).await?;
+                    }
+                }
+            }
+
+            // Asked and unanswered. Stamped once, like the stall
+            // sentinel, so a hung runner produces one line rather than
+            // one every ten minutes for as long as it hangs.
+            if !truthy(t.get("metadata").and_then(|m| m.get("ci_overdue_since")))
+                && let Some(note) = ci_overdue(&t, now, self.cfg.ci_hours)
+            {
+                log(format!("train {}: {note}", id8(&tid)));
+                if !self.cfg.dry {
+                    self.merge_job_metadata(
+                        &tid,
+                        vec![("ci_overdue_since", json!(now.to_rfc3339()))],
+                    )
+                    .await?;
+                    t = self.get_job(&tid).await?;
+                }
             }
 
             // The overnight rule, before the merge check: a train that
@@ -2913,10 +3038,11 @@ mod tests {
     use super::{
         ApiFailure, Failure, JOBS_API_RETRY, MAX_RED_TRAINS, RetryPolicy, SweepGuard,
         arrival_report, arrival_summary, auto_cancel_reason, boarded_head, branch_moved_line,
-        car_hold_reason, classify_transport, deletable_branches, deploy_needed, local_jobs_problem,
-        overlay_metadata, parked_ready, releasable_cars, repo_path, resolve_train, retryable,
-        retrying, short_cause, skip_reason_branch_missing, skip_reason_conflict, stall_age_hours,
-        sweep_guard, sweep_note, sweep_settled, train_branch_to_delete,
+        car_hold_reason, ci_overdue, classify_transport, deletable_branches, deploy_needed,
+        local_jobs_problem, overlay_metadata, parked_ready, releasable_cars, repo_path,
+        resolve_train, retryable, retrying, short_cause, skip_reason_branch_missing,
+        skip_reason_conflict, stall_age_hours, sweep_guard, sweep_note, sweep_settled,
+        train_branch_to_delete, verdict_drift,
     };
     use anyhow::{Result, anyhow};
     use chrono::{DateTime, Utc};
@@ -3517,6 +3643,77 @@ mod tests {
             auto_cancel_reason(&t, "failing", ts("2026-08-13T09:00:00Z"), 6),
             None
         );
+    }
+
+    // -- the CI verdict blind spot -----------------------------------------
+
+    #[test]
+    fn a_verdict_that_moves_after_recording_is_reported() {
+        // The 2026-08-15 case: recorded failing, repaired, red again.
+        // Nothing in the system said so for 45 minutes.
+        assert!(verdict_drift(Some("failing"), "green").is_some());
+        let note = verdict_drift(Some("green"), "failing").expect("green -> failing is a change");
+        assert!(note.contains("green"), "the note names where it came from");
+        assert!(note.contains("failing"), "and where it went");
+    }
+
+    #[test]
+    fn an_unchanged_verdict_is_silent() {
+        // Reconcile runs every ten minutes; a verdict that has not moved
+        // must not produce a line each time or the signal is noise.
+        assert_eq!(verdict_drift(Some("failing"), "failing"), None);
+        assert_eq!(verdict_drift(Some("green"), "green"), None);
+    }
+
+    #[test]
+    fn pending_is_not_a_change() {
+        // A re-run passes through pending on its way to an answer.
+        // Reporting it would fire on every repair, twice.
+        assert_eq!(verdict_drift(Some("failing"), "pending"), None);
+    }
+
+    #[test]
+    fn nothing_recorded_yet_is_not_drift() {
+        // Before the step completes, the ordinary path records the
+        // first verdict; this is only about the ones after it.
+        assert_eq!(verdict_drift(None, "failing"), None);
+    }
+
+    #[test]
+    fn ci_that_never_answers_is_reported_after_the_threshold() {
+        // The case drift cannot see: no verdict at all, so there is
+        // nothing to compare against.
+        let t = json!({"id":"t-1","status":"open","metadata":{},"steps":[
+            {"spec_slug":"pr","title":"Open the batched PR","status":"completed",
+             "metadata":{"completed_at":"2026-08-15T06:00:00Z"}},
+            {"spec_slug":"ci","title":"CI verdict","status":"ready","metadata":{}}
+        ]});
+        assert!(ci_overdue(&t, ts("2026-08-15T08:00:00Z"), 2).is_some());
+        assert_eq!(ci_overdue(&t, ts("2026-08-15T07:30:00Z"), 2), None);
+    }
+
+    #[test]
+    fn an_answered_ci_is_never_overdue() {
+        // Red counts as answered. A red train is the stall sentinel's
+        // problem and auto-cancel's; this signal is only about silence.
+        let t = json!({"id":"t-1","status":"open","metadata":{},"steps":[
+            {"spec_slug":"pr","title":"Open the batched PR","status":"completed",
+             "metadata":{"completed_at":"2026-08-15T06:00:00Z"}},
+            {"spec_slug":"ci","title":"CI verdict","status":"completed",
+             "metadata":{"result":"failing","completed_at":"2026-08-15T06:20:00Z"}}
+        ]});
+        assert_eq!(ci_overdue(&t, ts("2026-08-15T20:00:00Z"), 2), None);
+    }
+
+    #[test]
+    fn a_train_with_no_pr_yet_is_not_overdue() {
+        // Nothing has been asked, so nothing is unanswered — a train
+        // stuck before its PR belongs to the stall sentinel.
+        let t = json!({"id":"t-1","status":"open","metadata":{},"steps":[
+            {"spec_slug":"pr","title":"Open the batched PR","status":"ready","metadata":{}},
+            {"spec_slug":"ci","title":"CI verdict","status":"pending","metadata":{}}
+        ]});
+        assert_eq!(ci_overdue(&t, ts("2026-08-16T00:00:00Z"), 2), None);
     }
 
     // -- the two-strike hold -----------------------------------------------

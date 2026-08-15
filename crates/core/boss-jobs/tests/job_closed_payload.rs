@@ -14,11 +14,20 @@
 //! `resolve-subjob-on-child-job-closed` rule (`when =
 //! "parent_step_id != null"`) could not evaluate against it at all.
 //!
-//! So all three sites carry the same four keys, always, with null
-//! standing in for "no answer": `id`, `closed_on`, `kind`, `outcome`,
-//! `parent_step_id`. `kind` and `outcome` are what let a rule select
-//! its Workflow and its terminal as DATA rather than by fetching the
-//! Job to find out whether the event was even about it.
+//! So all three sites carry the same keys, always, with null standing
+//! in for "no answer": `id`, `closed_on`, `kind`, `outcome`,
+//! `parent_step_id`, `title`. `kind` and `outcome` are what let a rule
+//! select its Workflow and its terminal as DATA rather than by fetching
+//! the Job to find out whether the event was even about it; `title` is
+//! what lets a rule that SPAWNS off a close name the packet it creates,
+//! since the arg language offers only a literal or an identifier from
+//! this payload and has no concatenation.
+//!
+//! The set grows by incident, not by design review, which is worth
+//! saying out loud: `parent_step_id` was added because a subjob rule
+//! could not evaluate, and `title` because a spawn rule dead-lettered.
+//! Both times the missing key had been invisible until a rule reached
+//! for it in production.
 
 use std::sync::Arc;
 
@@ -257,7 +266,23 @@ async fn drive_to_quiescence(app: &axum::Router, job_id: &str, choose: &dyn Fn(&
 /// The keys every emit site owes a consumer, in the shape a rule's
 /// `when` binds them.
 fn assert_close_marker_shape(payload: &serde_json::Value, site: &str) {
-    for key in ["id", "closed_on", "kind", "outcome", "parent_step_id"] {
+    // `title` joined the contract on 2026-08-15, and it was a live rule
+    // that forced it: `spawn-car-on-sweep-remediated` binds
+    // `title = "title"` to name the car it spawns, the key was not on
+    // the payload, and the event NAKed eight times and dead-lettered.
+    // The rule had never once fired — the mechanism that makes the dock
+    // self-filling from a remediated sweep has never worked in
+    // production. An arg is not softer than a predicate: both bind
+    // through the same expr binder, and both turn a missing key into a
+    // retry storm.
+    for key in [
+        "id",
+        "closed_on",
+        "kind",
+        "outcome",
+        "parent_step_id",
+        "title",
+    ] {
         assert!(
             payload.get(key).is_some(),
             "the {site} close marker omits `{key}` — a rule binding it gets \

@@ -46,9 +46,12 @@ async fn dispatcher_rules_seed_matches_toml() {
         "dispatcher_rules seed drifted from rules.toml. 41-dispatcher.sql is an \
          APPLIED migration — history, never regenerated (the checksum guard \
          trips on every live database). A rule added or changed after the \
-         migration runner landed gets its OWN manifest entry: a new \
+         migration runner landed gets its OWN migration file: a new \
          NNN-dispatcher-rule-*.sql with an ON CONFLICT-safe INSERT (see \
-         101-dispatcher-rule-step-assigned.sql), appended to manifest.txt."
+         101-dispatcher-rule-step-assigned.sql). Dropping the file into \
+         infra/postgres/schema/ is the whole act — the directory sorted \
+         by NNN- prefix IS the list, and there is no manifest to append \
+         to since 2026-08-15."
     );
 }
 
