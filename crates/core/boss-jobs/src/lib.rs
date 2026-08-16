@@ -26,6 +26,7 @@ pub mod rebuild;
 pub mod registry;
 pub mod scheduling;
 pub mod station_lint;
+pub mod station_projection;
 pub mod station_quarantine;
 pub mod station_queue;
 pub mod stations;

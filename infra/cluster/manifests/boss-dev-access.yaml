@@ -1,0 +1,106 @@
+# boss-dev-access — a credential that reaches the dev pod and nothing else.
+#
+# WHY THIS EXISTS. `boss-dev.yaml` has run since 2026-08-15 and has no
+# Service: it is `kubectl exec` only. The only credential that could
+# reach it was the cluster-admin kubeconfig on David's laptop, which is
+# why the pod sat unused for 25 hours with `/work` holding nothing but
+# `lost+found` — and why every attempt to verify something in the CI
+# image happened on a laptop instead, at the cost of a red train
+# (train 52, `bunx: command not found`).
+#
+# David, 2026-08-16: *"My laptop is really meant to just be a thin
+# terminal to interact with a durable session somewhere in the
+# BossInfra layer."* A durable session needs a credential that is not
+# a person's laptop, and the answer to design Q2 was explicit about
+# its shape: namespace-scoped, on boss-gcp, NOT a copy of the admin
+# kubeconfig.
+#
+# THE SCOPING IS THE WHOLE POINT. `boss-dev` exists to remove an
+# incident class by construction — its Postgres sidecar means
+# `127.0.0.1:5432` cannot be the production database, after a
+# `cargo test --workspace` created 582 scratch databases on the
+# production volume on 2026-08-14 and crashed Postgres into recovery.
+# A dev credential that can also reach the `boss` namespace hands that
+# blast radius straight back. A Role (not ClusterRole) cannot cross a
+# namespace boundary even if someone asks it to.
+#
+# WHAT IT DELIBERATELY CANNOT DO:
+#   - touch the `boss` namespace, where the system of record lives
+#   - read Secrets, here or anywhere (the forge token mounts into the
+#     pod; a shell in the pod reads it from the filesystem, and this
+#     credential has no business fetching it over the API)
+#   - create, patch or delete workloads — applying manifests stays a
+#     human action with the admin config until there is a check that
+#     verifies what it applied (design Q5)
+#   - see cluster-scoped objects: nodes, StorageClasses, PVs. Note
+#     this means it CANNOT answer the node-capacity question from
+#     design Q1; that measurement needs the admin config.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dev-session
+  namespace: boss-dev
+  labels: {app.kubernetes.io/part-of: boss, boss.dev/purpose: development}
+---
+# Exec, and the reads you need to exec sensibly. Nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: dev-session
+  namespace: boss-dev
+rules:
+  # Find the pod to attach to, and see why it is not up when it isn't.
+  - apiGroups: [""]
+    resources: [pods, pods/log, pods/status]
+    verbs: [get, list, watch]
+  # The attach itself. `create` on pods/exec is what `kubectl exec`
+  # spends; there is no lesser verb for it.
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create]
+  # Enough to answer "is the workspace still bound, and did the
+  # deployment roll" without reaching for the admin config.
+  - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get, list]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dev-session
+  namespace: boss-dev
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: dev-session
+subjects:
+  - kind: ServiceAccount
+    name: dev-session
+    namespace: boss-dev
+---
+# A NON-EXPIRING token, on purpose, and the reasoning is worth keeping.
+#
+# Since 1.24 a ServiceAccount gets no Secret automatically, and the
+# ergonomic path is `kubectl create token`, which mints a bounded one.
+# That is the right default and the wrong fit here: the point of this
+# credential is that a session on boss-gcp survives without a person
+# present, and a token that expires makes the durable session need a
+# human on a timer — which is the thing being removed.
+#
+# The trade is real and is accepted because the grant is small: exec
+# into one namespace that holds a disposable workspace and a throwaway
+# Postgres. Rotation is `kubectl delete secret dev-session-token -n
+# boss-dev` and re-applying this file; nothing caches it but the
+# kubeconfig the script writes.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dev-session-token
+  namespace: boss-dev
+  annotations:
+    kubernetes.io/service-account.name: dev-session
+type: kubernetes.io/service-account-token

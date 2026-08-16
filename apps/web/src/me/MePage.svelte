@@ -87,10 +87,14 @@
   const shown = $derived({
     mine: filterByProtocol(queues?.mine ?? [], protocol),
     upForGrabs: filterByProtocol(queues?.upForGrabs ?? [], protocol),
+    notMineToDo: filterByProtocol(queues?.notMineToDo ?? [], protocol),
     inFlightElsewhere: filterByProtocol(queues?.inFlightElsewhere ?? [], protocol),
   });
   const totalShown = $derived(
-    shown.mine.length + shown.upForGrabs.length + shown.inFlightElsewhere.length,
+    shown.mine.length +
+      shown.upForGrabs.length +
+      shown.notMineToDo.length +
+      shown.inFlightElsewhere.length,
   );
 
   // The watchlist: packets THIS person filed, and what became of them.
@@ -241,7 +245,7 @@
         {/if}
         {#if shown.upForGrabs.length === 0}
           <div class="myday-empty">
-            Nothing waiting on your role's queue.
+            Nothing on your role's queue needs a person.
           </div>
         {:else}
           <div class="myday-jobs-list">
@@ -263,6 +267,30 @@
           {/if}
         {/if}
       </Section>
+
+      <!-- Role-matched, unclaimed, and NOT a person's job. The
+           protocol says an agent (or a child job, or an external
+           event) completes these, so a row here is the automation
+           having not run — not work anybody should quietly pick up.
+           Rendered as its own section rather than mixed into "Up for
+           grabs" because the reader's question is different: not
+           "what should I do next" but "what is stuck". Kept out of
+           the queue above entirely, since a human claiming an
+           agent-completion step is how a protocol silently becomes
+           manual. -->
+      {#if shown.notMineToDo.length > 0}
+        <Section title="Waiting on automation" wide>
+          <div class="myday-automation-note">
+            The protocol says these complete without a person. They are
+            on your role's queue because nothing has picked them up.
+          </div>
+          <div class="myday-jobs-list">
+            {#each shown.notMineToDo as row (row.step.id)}
+              <PacketCard card={assignmentPacket(row)} />
+            {/each}
+          </div>
+        </Section>
+      {/if}
 
       <!-- Beneath the two work queues, because it is not work: it is
            the receipt. Read-only by construction — the packets here

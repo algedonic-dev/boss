@@ -27,27 +27,37 @@ const ROUTES: ReadonlyArray<string> = [
   '/ux/marketing-assets', '/ux/marketing-assets/ma-1', '/ux/calendar', '/ux/calendar/me',
   '/ux/support', '/ux/service', '/ux/refurb', '/ux/qa', '/ux/hr', '/ux/sales',
   '/ux/shop', '/ux/manual',
-  // System Model perspective — the "read the running model" surfaces, now
-  // re-rooted under /system/*.
-  '/system', '/system/subjects', '/system/dispatcher', '/system/dispatcher/rules',
-  '/system/monitoring/perf', '/system/monitoring/events',
-  '/system/monitoring/atlas', '/system/step-plugins', '/system/kb', '/system/design',
-  '/system/experiments',
+  // System Model perspective — the "read the running model" surfaces.
+  //
+  // CANONICAL PATHS ARE `/it/*`, which is what ROUTE_CATALOG registers
+  // and what a browser's address bar holds. `/system/*` still answers:
+  // router.ts rewrites the `/it` prefix to `/system` before matching,
+  // so an old bookmark keeps working. This list crawled the `/system/*`
+  // alias for three releases and therefore never rendered a single
+  // canonical URL, while the drift test below reported all twenty as
+  // uncovered. Both halves of that were true at once, which is why the
+  // fix is to crawl what the catalog declares. The alias itself is
+  // pinned in src/router.test.ts, where it costs one line instead of a
+  // browser.
+  '/it', '/it/subjects', '/it/dispatcher', '/it/dispatcher/rules',
+  '/it/monitoring/perf', '/it/monitoring/events',
+  '/it/monitoring/atlas', '/it/step-plugins', '/it/kb', '/it/design',
+  '/it/experiments',
   // Modeling + admin surfaces (System Model).
-  '/system/workflows', '/system/workflows', '/system/workflows/new',
-  '/system/workflows/seasonal-release', '/system/policy', '/system/auth-admin',
+  '/it/workflows', '/it/workflows/new',
+  '/it/workflows/seasonal-release', '/it/policy', '/it/auth-admin',
   // IT surfaces added since the app split. They were absent for three
   // releases and the crawl reported success the whole time — see the
   // drift test at the bottom of this file for why that can no longer
   // happen quietly.
-  '/system/feedback', '/system/flow', '/system/yard',
+  '/it/feedback', '/it/flow', '/it/yard',
   // The network map under the mock's `[]` catch-all: an array where
   // the {data} envelope should be reads as zero stations — chrome +
   // empty state, no crash.
-  '/system/map',
+  '/it/map',
   // Fleet renders its no-Workflows empty state under the mock's
   // empty /api/workflows — a real crawl of the page chrome + picker.
-  '/system/fleet',
+  '/it/fleet',
 ];
 
 // DEFERRED, group 1 — aggregation dashboards that read OBJECT-shaped
@@ -161,7 +171,7 @@ test.describe('the crawl covers every registered surface', () => {
   /// Routes the crawl cannot cover yet, each with why. Shrinking this
   /// list is the work; adding to it is a decision.
   const DEFERRED: ReadonlyMap<string, string> = new Map([
-    ['/system/monitoring', 'aggregation dashboard: snapshot .length needs a faithful fixture'],
+    ['/it/monitoring', 'aggregation dashboard: snapshot .length needs a faithful fixture'],
     ['/ux/finance', 'statements .reduce needs object-shaped fixtures'],
     ['/ux/warehouse', 'summary.below_reorder_count needs a faithful fixture'],
     ['/ux/exec', '.find/.length over object-shaped summaries'],

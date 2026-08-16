@@ -29,14 +29,88 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # THE IMAGE IS BUILT BY THE PIPELINE, FROM THE TREE.
+  #
+  # Until 2026-08-16 the runner image was built by a person running
+  # infra/forge/boss-ci/build.sh on the forge host. That is the same
+  # defect class as every other failure of that day: an artefact whose
+  # definition is in the tree but whose existence depends on somebody
+  # remembering, with nothing able to tell the difference. It cost a
+  # red train twice in one evening — `bunx` missing from the image,
+  # then Node 18 against Playwright's required 20 — because the tree
+  # said one thing and the cached image was another.
+  #
+  # The stamp already made the two comparable: build.sh bakes
+  # sha256(Dockerfile + required-tools.txt) into /etc/boss-ci-stamp and
+  # locomotive.sh recomputes it from the checkout and reds on a
+  # mismatch. This job is the other half — the thing that makes the
+  # image move when the tree does, so the stamp check reports drift
+  # that cannot happen instead of drift nobody fixed.
+  #
+  # KANIKO, NOT DOCKER. Building with the daemon means mounting
+  # /var/run/docker.sock into a CI job, which hands any workflow that
+  # lands on this runner a path to host root. Kaniko builds in
+  # userspace with no daemon and no socket. It also means no
+  # actions/checkout here: that is a JavaScript action and the kaniko
+  # image has no node, so the build takes its context straight from the
+  # forge over git instead.
+  #
+  # NEEDS ONE SECRET: FORGE_PACKAGE_TOKEN, a Forgejo token with
+  # read:repository + write:package. The conductor's
+  # /etc/boss-train/forge.token is NOT it — that one is repo-scoped and
+  # the package registry rejects it (verified: 401 on a blob upload).
+  build-image:
+    runs-on: docker
+    container:
+      image: gcr.io/kaniko-project/executor:v1.23.2-debug
+    steps:
+      - name: Build and push the runner image
+        env:
+          TOKEN: ${{ secrets.FORGE_PACKAGE_TOKEN }}
+          # Kaniko resolves a git:// context over HTTPS by default and
+          # the forge speaks plain HTTP on 3000, so the first run died
+          # with "server gave HTTP response to HTTPS client". This is
+          # the documented knob; the alternative is terminating TLS in
+          # front of Forgejo, which is a bigger change than this job.
+          GIT_PULL_METHOD: http
+        run: |
+          set -eu
+          [ -n "${TOKEN:-}" ] || {
+            echo "build-image: FORGE_PACKAGE_TOKEN is not set."
+            echo "  Create a Forgejo token with read:repository + write:package"
+            echo "  and add it as an Actions secret. Without it the runner image"
+            echo "  cannot be rebuilt, and locomotive will red on any change to"
+            echo "  infra/forge/boss-ci/ — which is the stamp working, not a bug."
+            exit 1
+          }
+          printf '{"auths":{"10.20.0.15:3000":{"auth":"%s"}}}' \
+            "$(printf 'david:%s' "$TOKEN" | base64 | tr -d '\n')" \
+            > /kaniko/.docker/config.json
+          # No --build-arg for the stamp: the Dockerfile hashes its own
+          # build context. This job has no checkout, so any `cat
+          # Dockerfile` here would have hashed empty input and stamped
+          # the image with a value locomotive could never match.
+          /kaniko/executor \
+            --context "git://david:${TOKEN}@10.20.0.15:3000/david/boss.git#${GITHUB_SHA}" \
+            --context-sub-path infra/forge/boss-ci \
+            --dockerfile Dockerfile \
+            --destination 10.20.0.15:3000/david/boss-ci:rust1.96 \
+            --insecure --skip-tls-verify \
+            --cache=true \
+            --cache-repo 10.20.0.15:3000/david/boss-ci-cache
+
   # The locomotive goes first. On 2026-08-12 forge train #1 burned five
   # red rounds and every cause was environment, not car code — so the
   # environment is now checked in seconds before either heavy job
   # spends minutes in it. Costs ~15s of serialization on a green run;
   # buys a named failure with its remediation in the log instead of a
   # panic 20 minutes into the suite.
+  # It runs AFTER build-image now, not first: its stamp check compares
+  # the image against the tree, and asking that question before the
+  # image has been rebuilt from the tree only ever reports the lag.
   locomotive:
     runs-on: docker
+    needs: [build-image]
     container:
       image: 10.20.0.15:3000/david/boss-ci:rust1.96
     steps:
@@ -44,6 +118,76 @@ jobs:
 
       - name: Locomotive check
         run: bash infra/forge/locomotive.sh
+
+  # THE FRONTEND JOB THAT WAS ONLY EVER ON GITHUB.
+  #
+  # `.github/workflows/ci.yml` has carried a `web` job — typecheck,
+  # unit, build, and the mocked Playwright smoke — since 2026-08-08.
+  # This file, the one that actually gates a train, had none. GitHub is
+  # the public mirror and is pushed by hand with David's sign-off, so
+  # in practice those 13 spec files ran when somebody remembered, which
+  # is the same as never: after the `/system/*` → `/it/*` rename the
+  # route-smoke drift test sat red and unseen, and the crawl was
+  # exercising a legacy alias instead of the twenty canonical paths.
+  #
+  # infra/gate.sh deliberately does NOT grow a `test:mocked` check: the
+  # gate runs inside boss-ci and there is no browser in it. The browser
+  # is installed per job instead, which costs ~1 min and keeps the
+  # image free of a 400 MB dependency only one job wants. `playwright`
+  # is absent from required-tools.txt for the same reason — that
+  # manifest lists what must exist in the IMAGE, and this arrives at
+  # run time.
+  #
+  # The image DOES now carry Node 20 (nodesource, not bookworm's 18),
+  # because Playwright 1.61 refuses to start below 20 and that is not
+  # something a job step can paper over.
+  #
+  # Runs parallel to `test`, so it adds no wall-clock to a green train.
+  web:
+    runs-on: docker
+    needs: [locomotive]
+    container:
+      image: 10.20.0.15:3000/david/boss-ci:rust1.96
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        # PUPPETEER_SKIP_DOWNLOAD for the same reason svelte-check.sh
+        # sets it: boss-web depends on puppeteer, whose postinstall
+        # browser download fails in this container, and bun aborts the
+        # WHOLE install on a failed postinstall — so nothing installs
+        # and the failure reads as a missing tool.
+        run: PUPPETEER_SKIP_DOWNLOAD=1 bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Unit tests
+        run: bun run test:unit
+
+      - name: Build
+        run: bun run build
+
+      - name: Install Playwright browser
+        # `bun x`, NOT `bunx`. The image copies a single file from
+        # oven/bun — `COPY --from=bun /usr/local/bin/bun` — and `bunx`
+        # is a separate symlink that does not come with it. Locally
+        # both work, so this passed every check on a developer's box
+        # and exited 127 on train 52's first run. `bun x` is the same
+        # command with no second binary to depend on.
+        #
+        # --with-deps pulls the shared libraries chromium needs on
+        # slim-bookworm; the job container runs as root and the
+        # Dockerfile's own apt-get proves the base can reach a mirror.
+        run: bun x playwright install --with-deps chromium
+
+      - name: Frontend smoke (mocked backend)
+        # Every /api call is intercepted in-browser, so there is no
+        # backend and no seeding — 61 assertions in ~40s.
+        run: bun run test:mocked
 
   fast:
     runs-on: docker

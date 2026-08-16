@@ -105,6 +105,22 @@ spec:
     metadata:
       labels: {app: boss-dev}
     spec:
+      # Q1, measured 2026-08-16 rather than assumed. A cold
+      # `cargo test --all-features` needs ~74 GB of target/ (train 49:
+      # the forge host went 141 GB free to 67 GB), and target/ lives in
+      # the `scratch` emptyDir below — node-local disk, not the 40 Gi
+      # workspace PVC. The three nodes allocate 212 / 212 / 417 GiB of
+      # ephemeral storage, so the headroom is real; cp-2 showed 188 GB
+      # free with the pod already on it.
+      #
+      # Pinned anyway, because "there is room on all three" and "this
+      # build has room" are different claims once the system of record's
+      # Longhorn replicas share the disk. cp-2 is the choice: 12 cores
+      # against 8, and the workspace PVC's single replica already has
+      # dataLocality best-effort to wherever the pod runs — so pinning
+      # to where it already is costs no rebuild, and moving would.
+      nodeSelector:
+        kubernetes.io/hostname: cp-2
       imagePullSecrets:
         - {name: forgejo-registry}
       # No ServiceAccount token: nothing in here talks to the Kubernetes
@@ -150,6 +166,7 @@ spec:
           volumeMounts:
             - {name: work, mountPath: /work}
             - {name: scratch, mountPath: /scratch}
+            - {name: forge-token, mountPath: /etc/forge, readOnly: true}
         - name: postgres
           # Matches production's major (the `boss` StatefulSet runs
           # postgres:16). A dev database on a different major is a test
@@ -182,6 +199,28 @@ spec:
             requests: {cpu: 250m, memory: 512Mi}
             limits: {cpu: "2", memory: 4Gi}
       volumes:
+        # Q4 — the repo-scoped forge token, so a session in here can
+        # publish a car instead of asking a human to run a one-liner.
+        # Three finished cars sat at the dock on 2026-08-16 for exactly
+        # that reason.
+        #
+        # `optional: true` is load-bearing: the Secret is created
+        # out-of-band (README: "Secrets never live here"), and a
+        # required mount would mean an unbootstrapped cluster gets a
+        # pod stuck in ContainerCreating with no explanation. Absent
+        # token = a session that cannot push, which is exactly today's
+        # behaviour and is a better failure than no pod.
+        #
+        # SCOPE: `write:repository` on david/boss, and nothing else.
+        # Deliberately NOT the conductor's /etc/boss-train/forge.token
+        # — that one carries repo admin, and the accepted answer to Q4
+        # was "push only, no admin". Mint a separate one so it can be
+        # revoked without stopping the trains:
+        #
+        #   kubectl create secret generic forge-push -n boss-dev \
+        #     --from-file=token=/path/to/token
+        - name: forge-token
+          secret: {secretName: forge-push, optional: true, defaultMode: 0400}
         - name: work
           persistentVolumeClaim: {claimName: boss-dev-work}
         - name: scratch

@@ -11,8 +11,9 @@ use super::*;
 
 use axum::extract::Path;
 
+use crate::station_projection::derived_stations;
 use crate::station_queue::evaluate_station;
-use crate::stations::{StationError, StationRegistry};
+use crate::stations::{StationError, StationRegistry, StationSpec};
 
 #[allow(
     clippy::result_large_err,
@@ -78,6 +79,50 @@ async fn station_policy_check<R: JobsRepository, B: EventBus>(
     }
 }
 
+/// Q's effective registry: the authored rows PLUS the stations the
+/// active protocol set requires.
+///
+/// Two sources, one list, authored wins — the merge rule lives in
+/// [`derived_stations`], which drops a projected row whose name is
+/// already authored. Reading them together HERE rather than
+/// materialising derived rows into the table is deliberate: a
+/// projection persisted is a second copy that can go stale the moment
+/// a protocol is published, and the whole reason the constraint
+/// stations were never hand-authored is that keeping fifty-one rows in
+/// step with the protocols is work nobody does.
+///
+/// A protocol-set read failure is an ERROR, not a fallback to the
+/// authored rows. Serving four stations where there should be
+/// fifty-five, with a 200 and no explanation, is the exact shape of
+/// defect this whole change exists to remove.
+async fn effective_stations<R: JobsRepository, B: EventBus>(
+    state: &JobsApiState<R, B>,
+    reg: &Arc<dyn StationRegistry>,
+) -> Result<Vec<StationSpec>, Response> {
+    let authored = reg.list_active().await.map_err(station_err_response)?;
+
+    // No workflow registry wired: the same explicit seam every other
+    // optional adapter keeps. There are no protocols to project from,
+    // so the authored rows ARE the registry — not a degraded view of it.
+    let Some(kinds) = state.kind_registry.as_ref() else {
+        return Ok(authored);
+    };
+    let workflows = kinds.list_active(None).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot project stations — protocol set unreadable: {e}"),
+        )
+            .into_response()
+    })?;
+
+    let names: Vec<String> = authored.iter().map(|s| s.name.clone()).collect();
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let mut all = authored;
+    all.extend(derived_stations(&workflows, &names, now));
+    all.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(all)
+}
+
 /// `GET /api/stations` — every active station row. The registry rows
 /// themselves carry no packet data; the policy gate mirrors the job
 /// list's posture (scope predicate on the `job` resource; a caller
@@ -103,12 +148,12 @@ pub(super) async fn list_stations<R: JobsRepository + 'static, B: EventBus + 'st
     if matches!(predicate, boss_policy_client::Predicate::None) {
         return Json(serde_json::json!({ "data": [], "total": 0 })).into_response();
     }
-    match reg.list_active().await {
+    match effective_stations(&state, reg).await {
         Ok(rows) => {
             let total = rows.len();
             Json(serde_json::json!({ "data": rows, "total": total })).into_response()
         }
-        Err(e) => station_err_response(e),
+        Err(r) => r,
     }
 }
 
@@ -125,8 +170,22 @@ pub(super) async fn station_queue<R: JobsRepository + 'static, B: EventBus + 'st
         Ok(r) => r,
         Err(r) => return r,
     };
+    // Authored first, then the projection. A station that /api/stations
+    // lists must have a queue that answers, or the registry advertises
+    // doors that open onto nothing — so the lookup consults exactly the
+    // same two sources the listing does, in the same order.
     let row = match reg.get_active(&name).await {
         Ok(s) => s,
+        Err(StationError::NotFound(msg)) => {
+            let found = match effective_stations(&state, reg).await {
+                Ok(rows) => rows.into_iter().find(|s| s.name == name),
+                Err(r) => return r,
+            };
+            match found {
+                Some(s) => s,
+                None => return station_err_response(StationError::NotFound(msg)),
+            }
+        }
         Err(e) => return station_err_response(e),
     };
     let today = boss_clock_client::now_from(&state.clock).await.date_naive();

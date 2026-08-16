@@ -202,9 +202,29 @@ different and much smaller thing.
 The network path is fine. boss-gcp reaches the LAN over WireGuard,
 and the Kubernetes API on the VIP `10.20.0.10:6443` answers — a clean
 `401 Unauthorized`, so the cluster is listening and simply does not
-know the caller. What is missing is a credential: no kubeconfig in
-`~/.kube`, `~/.talos` or `/etc/kubernetes` on boss-gcp, and no
-`kubectl` binary on boss-gcp or the forge host. Of the cluster's
+know the caller. What was missing on boss-gcp was a credential: no
+kubeconfig in `~/.kube`, `~/.talos` or `/etc/kubernetes`, and no
+`kubectl` binary there or on the forge host.
+
+> **Corrected 2026-08-16.** "No kubeconfig anywhere" was never true,
+> and this paragraph carried the error for two days. An admin
+> kubeconfig has been sitting at `~/talos-homelab/v2/kubeconfig` on
+> David's laptop the whole time, with `kubectl` and `talosctl` both
+> installed — the laptop reaches the VIP directly. The survey above
+> checked boss-gcp and the forge host, found nothing on either, and
+> generalised to "nowhere"; nobody checked the machine the survey was
+> being run from.
+>
+> That error had a cost beyond this file. It is why the dev pod was
+> believed unreachable, why verification kept happening on the laptop
+> instead of in the CI image, and therefore why train 52 went red on
+> `bunx` — a binary present on a Mac and absent from the container.
+>
+> Since corrected: `kubectl` is installed on boss-gcp and a
+> namespace-scoped credential for `boss-dev` lives at
+> `/etc/boss-dev/kubeconfig`
+> (`infra/cluster/manifests/boss-dev-access.yaml`). The admin config
+> stays on the laptop. Of the cluster's
 service ports only `7900` is exposed on `10.20.0.34`; 4443, 8080, 443
 and 80 are closed, as is 443/4443 on the VIP.
 
@@ -215,7 +235,7 @@ against. Extending the existing SSH tunnel is the narrow one — it is
 already `-L 7900:10.20.0.34:7900`, so another service is one more
 `-L` and no new credential exists to leak.
 
-The concrete thing this blocks today: whether an `emp-david` employee
+The concrete thing this blocked: whether an `emp-david` employee
 row exists on the CLUSTER, which is what `classifyProbe` resolves a
 session against and therefore whether My Day renders David's board or
 the bare "no matching employee in the roster" line. boss-gcp's local

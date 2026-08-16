@@ -3,6 +3,7 @@ import {
   assignmentPacket,
   filterByProtocol,
   protocolCounts,
+  needsAPerson,
   splitQueues,
   type AssignmentRow,
 } from './assignments';
@@ -69,6 +70,68 @@ describe('splitQueues', () => {
   });
 });
 
+// David, 2026-08-16: "a special separation between jobs that are in a
+// queue with a human-only policy with jobs that agents are also
+// eligible for as a practical consideration."
+describe('the human/agent separation', () => {
+  test('an agent-completion step is kept out of the claimable queue', () => {
+    const q = splitQueues(
+      [
+        row({ step: { assignee_id: null, completion: 'human' } }),
+        row({ step: { assignee_id: null, kind: 'demand-gate', completion: 'agent' } }),
+      ],
+      'me',
+    );
+    // The point of the split: a person scanning "up for grabs" must
+    // not be offered a step the dispatcher is supposed to execute.
+    // Claiming one is how a protocol silently becomes manual.
+    expect(q.upForGrabs.length).toBe(1);
+    expect(q.upForGrabs[0]?.step.completion).toBe('human');
+    expect(q.notMineToDo.length).toBe(1);
+    expect(q.notMineToDo[0]?.step.kind).toBe('demand-gate');
+  });
+
+  test('nothing is dropped — the two buckets partition the unclaimed', () => {
+    const rows = [
+      row({ step: { assignee_id: null, completion: 'human' } }),
+      row({ step: { assignee_id: null, completion: 'agent' } }),
+      row({ step: { assignee_id: null, completion: 'child-job' } }),
+      row({ step: { assignee_id: null, completion: 'external' } }),
+      row({ step: { assignee_id: null, completion: 'auto-on-materialize' } }),
+    ];
+    const q = splitQueues(rows, 'me');
+    expect(q.upForGrabs.length + q.notMineToDo.length).toBe(rows.length);
+    // Only `human` is a person's job; every other contract completes
+    // by some mechanism that is not somebody reading a queue.
+    expect(q.upForGrabs.length).toBe(1);
+  });
+
+  test('an unknown contract reads as human, not as agent-eligible', () => {
+    // A tenant protocol can name a step kind this deployment has not
+    // registered, and the server sends null. Erring toward "a person
+    // should look at this" costs a glance; erring the other way files
+    // real work under "an agent will get to it" and it stalls.
+    for (const completion of [undefined, null]) {
+      expect(needsAPerson(row({ step: { assignee_id: null, completion } }))).toBe(true);
+    }
+    const q = splitQueues([row({ step: { assignee_id: null } })], 'me');
+    expect(q.upForGrabs.length).toBe(1);
+    expect(q.notMineToDo.length).toBe(0);
+  });
+
+  test('a claimed agent step stays with its claimant, not in the automation list', () => {
+    // The split only ever partitions UNCLAIMED rows. Somebody already
+    // holding an agent-completion step is mid-flight on it, and moving
+    // it out from under them would lose the assignment in the UI.
+    const q = splitQueues(
+      [row({ step: { assignee_id: 'me', completion: 'agent' } })],
+      'me',
+    );
+    expect(q.mine.length).toBe(1);
+    expect(q.notMineToDo.length).toBe(0);
+  });
+});
+
 describe('assignmentPacket', () => {
   test('maps a row onto the packet-card grammar', () => {
     const p = assignmentPacket(row({}));
@@ -106,12 +169,17 @@ describe('protocol filtering', () => {
   const queues = {
     mine: [row({ workflow: 'approval' }), row({ workflow: 'ship-a-change' })],
     upForGrabs: [row({ workflow: 'approval' })],
+    notMineToDo: [row({ workflow: 'demand-forecast' })],
     inFlightElsewhere: [row({ workflow: 'user-feedback' })],
   };
 
-  test('counts every protocol across all three queues, busiest first', () => {
+  test('counts every protocol across all four queues, busiest first', () => {
     expect(protocolCounts(queues)).toEqual([
       { workflow: 'approval', count: 2 },
+      // `demand-forecast` is only in notMineToDo — a chip that skipped
+      // that queue would send the reader to an empty-looking filter
+      // that then renders a row.
+      { workflow: 'demand-forecast', count: 1 },
       { workflow: 'ship-a-change', count: 1 },
       { workflow: 'user-feedback', count: 1 },
     ]);

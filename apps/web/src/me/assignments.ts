@@ -18,6 +18,11 @@ export type AssignmentStep = Readonly<{
   status: string;
   assignee_id?: string | null;
   metadata?: Record<string, unknown> | null;
+  /** The step kind's completion contract, from the StepType registry.
+   *  Optional so a response from a server that predates it still
+   *  parses — {@link needsAPerson} reads absent as human, the safe
+   *  direction. */
+  completion?: Completion | null;
 }>;
 
 export type AssignmentRow = Readonly<{
@@ -38,11 +43,49 @@ export type AssignmentRow = Readonly<{
   step: AssignmentStep;
 }>;
 
+/// How a step reaches `completed` — the server sends the step kind's
+/// `StepType::completion` on every row. `null` when this deployment's
+/// registry does not know the kind.
+export type Completion =
+  | 'human'
+  | 'agent'
+  | 'child-job'
+  | 'external'
+  | 'auto-on-materialize';
+
 export type MyDayQueues = Readonly<{
   mine: readonly AssignmentRow[];
+  /** Unassigned, role-matched, and a PERSON has to do it. */
   upForGrabs: readonly AssignmentRow[];
+  /** Unassigned, role-matched, and the protocol says something other
+   *  than a person completes it. See {@link needsAPerson}. */
+  notMineToDo: readonly AssignmentRow[];
   inFlightElsewhere: readonly AssignmentRow[];
 }>;
+
+/// Does clearing this step require a human?
+///
+/// David, 2026-08-16: *"it probably makes sense to have a special
+/// separation between jobs that are in a queue with a human-only
+/// policy with jobs that agents are also eligible for as a practical
+/// consideration"* — and the reason it is worth the column: *"We
+/// intentionally do not want many protocols where policy requires a
+/// human because that is slow."*
+///
+/// The predicate is `completion === 'human'`, not a list of kinds.
+/// Five of the registry's kinds are `agent`, one is `child-job`, one
+/// is `auto-on-materialize`, and the rest default to `human` — but
+/// that census is registry data and will move, so the frontend must
+/// not hold a copy of it (CLAUDE.md §9a).
+///
+/// UNKNOWN COUNTS AS HUMAN. A missing contract puts the packet in
+/// front of somebody rather than filing it under "an agent will get
+/// to it", and being wrong in that direction costs a glance instead
+/// of a stalled packet.
+export function needsAPerson(row: AssignmentRow): boolean {
+  const c = row.step.completion;
+  return c === undefined || c === null || c === 'human';
+}
 
 const PRIORITY_RANK: Record<string, number> = {
   emergency: 0,
@@ -73,13 +116,19 @@ export function splitQueues(
   uid: string,
 ): MyDayQueues {
   const mine = rows.filter(r => r.step.assignee_id === uid);
-  const upForGrabs = rows.filter(r => !r.step.assignee_id);
+  const unclaimed = rows.filter(r => !r.step.assignee_id);
   const inFlightElsewhere = rows.filter(
     r => r.step.assignee_id && r.step.assignee_id !== uid,
   );
   return {
     mine: orderQueue(mine),
-    upForGrabs: orderQueue(upForGrabs),
+    upForGrabs: orderQueue(unclaimed.filter(needsAPerson)),
+    // An `agent`-completion step sitting unclaimed in a person's queue
+    // is not work waiting for them — the dispatcher executes those on
+    // `step.ready` and the human workforce never pulls them. So a row
+    // here means the automation did not run, which is worth seeing and
+    // is NOT worth burying in the same list as real work.
+    notMineToDo: orderQueue(unclaimed.filter(r => !needsAPerson(r))),
     inFlightElsewhere: orderQueue(inFlightElsewhere),
   };
 }
@@ -172,7 +221,15 @@ export function protocolCounts(
   queues: MyDayQueues | null,
 ): ReadonlyArray<{ workflow: string; count: number }> {
   if (!queues) return [];
-  const all = [...queues.mine, ...queues.upForGrabs, ...queues.inFlightElsewhere];
+  // Every queue the page can render, `notMineToDo` included — a chip
+  // that undercounts sends the reader to a protocol filter that then
+  // shows rows the chip said were not there.
+  const all = [
+    ...queues.mine,
+    ...queues.upForGrabs,
+    ...queues.notMineToDo,
+    ...queues.inFlightElsewhere,
+  ];
   const tally = new Map<string, number>();
   for (const r of all) {
     if (!r.workflow) continue;

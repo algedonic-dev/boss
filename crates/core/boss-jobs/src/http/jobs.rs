@@ -166,10 +166,47 @@ pub(super) async fn list_assignments<R: JobsRepository + 'static, B: EventBus + 
     {
         Ok(rows) => {
             let total = rows.len();
-            Json(serde_json::json!({ "data": rows, "total": total })).into_response()
+            let data: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| assignment_row_json(r, &state.step_registry))
+                .collect();
+            Json(serde_json::json!({ "data": data, "total": total })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// One assignment row, plus the completion contract of its step kind.
+///
+/// WHY THE SERVER ANSWERS THIS. David, 2026-08-16: *"it probably makes
+/// sense to have a special separation between jobs that are in a queue
+/// with a human-only policy with jobs that agents are also eligible
+/// for as a practical consideration"* — and, on why the distinction
+/// matters at all: *"We intentionally do not want many protocols where
+/// policy requires a human because that is slow."*
+///
+/// That separation is already data. `StepType::completion` is the
+/// closed axis of the step alphabet: `human` means an operator holding
+/// the `authority_role` completes it, `agent` means the dispatcher
+/// executes it on `step.ready` and the human workforce never pulls it.
+/// So the queue split needs no new field, no new policy concept, and
+/// no list of kinds in the frontend — just the registry fact the
+/// server already holds, carried on the row.
+///
+/// `null` when the StepType registry does not know the kind. That is
+/// a real condition (a tenant protocol naming a kind this deployment
+/// has not registered) and it is reported rather than smoothed over;
+/// the reader's job is to treat an unknown contract as needing a
+/// person, which is the safe direction — it puts the packet in front
+/// of somebody instead of filing it under "an agent will get it".
+fn assignment_row_json(
+    row: &crate::port::AssignmentRow,
+    steps: &crate::step_registry::StepRegistry,
+) -> serde_json::Value {
+    let mut v = serde_json::to_value(row).unwrap_or_default();
+    v["step"]["completion"] = serde_json::to_value(steps.get(&row.step.kind).map(|t| t.completion))
+        .unwrap_or(serde_json::Value::Null);
+    v
 }
 
 #[derive(Deserialize)]

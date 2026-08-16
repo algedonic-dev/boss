@@ -15,3 +15,10 @@ rustfmt
 cargo-clippy
 psql
 curl
+# tmux — the durable session's multiplexer. `kubectl exec` dies with
+# the terminal that opened it; tmux is what the session attaches to.
+tmux
+# bunx — the symlink beside bun. Absent from the image until
+# 2026-08-16, which cost a red train; listed so it cannot go missing
+# again without ci-tools-declared.sh noticing.
+bunx

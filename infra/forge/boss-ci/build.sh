@@ -15,10 +15,20 @@ cd "$(dirname "$0")"
 REGISTRY="${BOSS_CI_REGISTRY:-10.20.0.15:3000/david}"
 TAG="${BOSS_CI_TAG:-rust1.96}"
 
+# The image stamps itself from its own build context now — see the
+# Dockerfile. This script no longer passes it, so it cannot pass it
+# wrong; it recomputes the same hash only to report and verify.
 stamp="$(cat Dockerfile required-tools.txt | sha256sum | cut -d' ' -f1)"
 
-docker build --build-arg BOSS_CI_STAMP="$stamp" \
-  -t "$REGISTRY/boss-ci:$TAG" .
+docker build -t "$REGISTRY/boss-ci:$TAG" .
+
+baked="$(docker run --rm --entrypoint cat "$REGISTRY/boss-ci:$TAG" /etc/boss-ci-stamp)"
+if [ "$baked" != "$stamp" ]; then
+  echo "build.sh: image stamped $baked but this tree hashes to $stamp — refusing to push." >&2
+  echo "  The two must agree or locomotive reds on every run with no useful message." >&2
+  exit 1
+fi
+
 docker push "$REGISTRY/boss-ci:$TAG"
 
 echo "boss-ci:$TAG pushed, stamp $stamp"
