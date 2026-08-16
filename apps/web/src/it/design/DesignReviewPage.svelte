@@ -15,7 +15,8 @@
   // queue and how it is framed.
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
-  import { navigate } from '../../router';
+  import { href, navigate } from '../../router';
+  import { groupDocs, openWeight } from './designGroups';
   import {
     pageHeader,
     panelsFor,
@@ -214,25 +215,16 @@
     void load();
   });
 
-  // David's distinction (2026-07-08): a doc is "in review & discussion"
-  // when its status says so OR anything actionable is attached (parsed
-  // open questions, unflushed decisions, an open review Job). Everything
-  // else — living references, approved/shipped/superseded designs — is
-  // settled: nobody is acting on it, and showing it as in-review was a
-  // lie the old status parser told (living → in-review collapse).
-  function underReview(doc: DesignDoc): boolean {
-    return (
-      doc.status === 'draft' ||
-      doc.status === 'in-review' ||
-      doc.status === 'reopened' ||
-      doc.open_questions > 0 ||
-      doc.pending_count > 0 ||
-      openReviewsByPath[doc.path] !== undefined
-    );
-  }
-
-  const reviewing = $derived(docs.filter(underReview));
-  const settled = $derived(docs.filter((d) => !underReview(d)));
+  // What is actually asking for something, versus what merely claims
+  // to be. See designGroups.ts — the short version is that a doc's
+  // `**Status**:` line is the one input nobody updates when the last
+  // question closes, so it drifts stale in one direction and eleven
+  // settled docs had accumulated in the top section (David, bedda461:
+  // "This page is full of stale info").
+  const grouped = $derived(
+    groupDocs(docs, (path) => openReviewsByPath[path] !== undefined),
+  );
+  const waiting = $derived(openWeight(grouped.needsYou));
 
   function relTime(iso: string): string {
     const d = new Date(iso);
@@ -280,20 +272,57 @@
         </table>
       </Section>
     {:else if panel === 'corpus'}
-      <Section title={`In review & discussion (${reviewing.length})`} wide>
-        {#if reviewing.length === 0}
+      <Section
+        title={`Needs you (${grouped.needsYou.length})`}
+        wide
+      >
+        {#if grouped.needsYou.length === 0}
           <p class="empty">
-            Nothing under discussion — every design doc is a settled
-            reference. New questions land here when a doc adds
-            <code>### Qn:</code> headings (status → reopened).
+            Nothing is waiting on a decision. New questions land here
+            when a doc adds <code>### Qn:</code> headings, and recorded
+            answers land here until they are flushed into the doc.
           </p>
         {:else}
-          {@render docTable(reviewing, 'Start review')}
+          <p class="design-lede">
+            {waiting.questions}
+            {waiting.questions === 1 ? 'open question' : 'open questions'}{#if waiting.pending > 0},
+              and {waiting.pending} recorded
+              {waiting.pending === 1 ? 'answer' : 'answers'} not yet flushed into
+              {waiting.pending === 1 ? 'its doc' : 'their docs'}{/if}. Deepest first.
+          </p>
+          {@render docTable(grouped.needsYou, 'Start review')}
         {/if}
       </Section>
 
-      <Section title={`Living references & settled (${settled.length})`} wide>
-        {@render docTable(settled, 'Reopen discussion')}
+      {#if grouped.drafts.length > 0}
+        <Section title={`Being written (${grouped.drafts.length})`} wide>
+          <p class="design-lede">
+            Drafts with nothing to decide yet. They are not settled —
+            they just have not asked anything.
+          </p>
+          {@render docTable(grouped.drafts, 'Start review')}
+        </Section>
+      {/if}
+
+      <Section title={`Design library (${grouped.library.length})`} wide>
+        <!-- The settled corpus, and the pointer David asked for. The
+             flattened record is NOT served in-app: it folds into
+             docs/architecture-decisions.md each release, and the IT
+             Knowledge Base is where that is explained. Linking to the
+             page that tells the truth about where it lives beats
+             inventing a URL for a file the SPA does not serve. -->
+        <p class="design-lede">
+          Living references and finished discussions — nothing here is
+          waiting on anyone. Settled decisions fold into
+          <code>docs/architecture-decisions.md</code>, the one
+          current-truth record;
+          <a
+            href={href('/system/kb')}
+            onclick={(e) => { e.preventDefault(); navigate(href('/system/kb')); }}
+          >the IT Knowledge Base</a>
+          is the in-app entry point.
+        </p>
+        {@render docTable(grouped.library, 'Reopen discussion')}
       </Section>
     {/if}
   {/each}
