@@ -71,8 +71,9 @@ pub fn apply_decisions(
     let after_open = lines[open_section.end_line..].to_vec();
 
     // Remove resolved questions from the open section body.
+    let already_resolved = already_resolved_anchors(&lines, &open_section);
     let (new_open_body, removed_titles, removed_bodies, list_fully_drained) =
-        remove_decisions_from_open(&open_body, decisions)?;
+        remove_decisions_from_open(&open_body, decisions, &already_resolved)?;
 
     // If the list was entirely drained (no numbered items remain),
     // replace the whole section body with a stable placeholder so
@@ -159,9 +160,53 @@ fn is_open_question_heading(line: &str) -> bool {
     !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
 }
 
+/// Anchors the document already records as settled, anywhere in it.
+///
+/// Two forms count. A heading that kept its anchor and gained the
+/// tag — `### Q1: … (resolved)` — and a heading that has left the
+/// Open questions section altogether, which is what the flush itself
+/// produces when it moves a question into Decision history.
+///
+/// This exists so the flusher can tell two failures apart. Both used
+/// to read `explicit anchor `Q1` not found in Open questions`, and
+/// they need opposite responses: a question that is already answered
+/// means the job has nothing left to do, while a question that was
+/// never there means the decision is pointed at the wrong document.
+/// On 2026-08-16 two flush jobs for protocol-cadence.md sat `failed`
+/// from 14:40Z, unnoticed, for exactly this reason — the work had
+/// been done by an earlier car and the error could not say so
+/// (5b8f274a).
+fn already_resolved_anchors(
+    lines: &[String],
+    open: &H2Section,
+) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        // Note `is_explicit_q_anchor` takes the ANCHOR, not the
+        // heading — so the anchor has to come out of the line first.
+        let Some(rest) = t.strip_prefix("### ") else {
+            continue;
+        };
+        let Some(anchor) = rest.split([':', ' ']).next() else {
+            continue;
+        };
+        if !is_explicit_q_anchor(anchor) {
+            continue;
+        }
+        let inside_open = i > open.start_line && i < open.end_line;
+        let tagged = t.to_ascii_lowercase().contains("(resolved)");
+        if !inside_open || tagged {
+            out.insert(anchor.to_string());
+        }
+    }
+    out
+}
+
 fn remove_decisions_from_open(
     body: &[String],
     decisions: &[FlushDecision],
+    already_resolved: &std::collections::BTreeSet<String>,
 ) -> Result<(
     Vec<String>,
     std::collections::HashMap<String, String>,
@@ -228,9 +273,17 @@ fn remove_decisions_from_open(
             i += 1;
         }
         if !found {
+            // Say which of the two this is. Only one of them wants a
+            // human.
+            if already_resolved.contains(anchor) {
+                return Err(anyhow!(
+                    "`{anchor}` is already resolved in this doc — nothing left to apply. \
+                     This flush is a duplicate of one that already ran; no decision was lost."
+                ));
+            }
             return Err(anyhow!(
-                "explicit anchor `{}` not found in Open questions",
-                anchor
+                "explicit anchor `{anchor}` not found in Open questions, and it is not \
+                 recorded as resolved either — the decision may be pointed at the wrong doc"
             ));
         }
     }
@@ -1397,5 +1450,61 @@ Body. **Proposal**: yes.
             strip_trailing_status_tag("Title (open) (resolved)"),
             "Title (open)"
         );
+    }
+}
+
+#[cfg(test)]
+mod already_resolved_tests {
+    use super::{DecisionKind, FlushDecision, apply_decisions};
+    use chrono::NaiveDate;
+
+    fn day() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 8, 16).unwrap()
+    }
+
+    fn decide(anchor: &str) -> Vec<FlushDecision> {
+        vec![FlushDecision {
+            anchor: anchor.to_string(),
+            kind: DecisionKind::Accept,
+            resolution: "yes".into(),
+            rationale: None,
+        }]
+    }
+
+    // The 2026-08-16 case: an earlier car already flushed Q1, so the
+    // question now lives under Decisions with the tag. Two flush jobs
+    // sat `failed` for hours because this said only "not found".
+    #[test]
+    fn a_question_already_answered_says_so() {
+        let md = "# D\n\n## Open questions\n\n### Q2: still open\n\nbody\n\n\
+                  ## Decisions\n\n### Q1: the one already done (resolved)\n\nyes\n";
+        let e = apply_decisions(md, &decide("Q1"), day())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("already resolved"), "{e}");
+        assert!(e.contains("no decision was lost"), "{e}");
+    }
+
+    // The other half, which must stay loud: this decision is pointed
+    // at a document that never had the question.
+    #[test]
+    fn a_question_that_was_never_here_says_that_instead() {
+        let md = "# D\n\n## Open questions\n\n### Q2: still open\n\nbody\n";
+        let e = apply_decisions(md, &decide("Q7"), day())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not recorded as resolved"), "{e}");
+        assert!(!e.contains("already resolved in this doc"), "{e}");
+    }
+
+    // And the happy path still works — the guard must not swallow a
+    // legitimate flush.
+    #[test]
+    fn an_open_question_still_flushes() {
+        let md =
+            "# D\n\n## Open questions\n\n### Q1: open\n\nbody\n\n## Decisions\n\n_None yet._\n";
+        let out = apply_decisions(md, &decide("Q1"), day()).expect("flushes");
+        assert!(out.contains("Q1"), "{out}");
+        assert_ne!(out, md);
     }
 }

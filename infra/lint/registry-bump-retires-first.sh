@@ -7,7 +7,7 @@
 # ---------------------------------
 # 2026-08-15. `130-watchlist-dismiss.sql` inserted `my-watchlist` v2 as
 # `active` and retired v1 on the next line. Three hours later, after
-# the class had been diagnosed and written into docs/invariants.toml,
+# the class had been diagnosed and written into docs/invariants/,
 # `133-dock-wip-limit.sql` did the identical thing to `loading-dock`
 # and reddened a THIRTEEN-car train.
 #

@@ -91,6 +91,62 @@ impl JobsCompleteLinkedStep {
         })
     }
 
+    /// Record on the CAR that its `backlog_item` pointed somewhere the
+    /// obligation could not act. PATCH-on-PUT replaces `metadata`
+    /// wholesale, so this re-reads and merges rather than writing a
+    /// bare object — the car's `branch`, `summary` and the rest have to
+    /// survive a note.
+    async fn note_on_car(
+        &self,
+        car_id: &str,
+        packet_id: &str,
+        why: &str,
+        rule: &str,
+    ) -> Result<(), HandlerError> {
+        let car = self.get_job(car_id, rule).await?;
+        let mut merged = match car.get("metadata").cloned() {
+            Some(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        // Idempotent under redelivery: the same car, the same packet,
+        // the same note. Writing it twice is harmless but noisy.
+        if merged
+            .get("obligation_noop")
+            .and_then(|n| n.get("packet"))
+            .and_then(|v| v.as_str())
+            == Some(packet_id)
+        {
+            return Ok(());
+        }
+        merged.insert(
+            "obligation_noop".to_string(),
+            json!({ "packet": packet_id, "rule": rule, "why": why }),
+        );
+        let url = format!(
+            "{}/api/jobs/{}",
+            self.jobs_base.trim_end_matches('/'),
+            car_id
+        );
+        let resp = self
+            .client
+            .put(&url)
+            .header("content-type", "application/json")
+            .header("x-boss-user", dispatcher_actor_header(rule))
+            .header("x-sim-origin", sim_origin_value())
+            .json(&json!({ "metadata": serde_json::Value::Object(merged) }))
+            .send()
+            .await
+            .map_err(|e| HandlerError::Downstream(format!("PUT {url}: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(HandlerError::Downstream(format!(
+                "PUT {url} returned {status}: {text}"
+            )));
+        }
+        Ok(())
+    }
+
     async fn get_job(&self, job_id: &str, rule: &str) -> Result<serde_json::Value, HandlerError> {
         let url = format!(
             "{}/api/jobs/{}",
@@ -132,6 +188,92 @@ fn deployed_generation(summary: &str) -> Option<&str> {
         .strip_prefix("main@")
         .and_then(|rest| rest.split([';', ' ']).next())
         .filter(|sha| !sha.is_empty())
+}
+
+/// Why did the obligation complete nothing, and is that worth saying?
+///
+/// Falling through GUARD 2 covers two situations that look identical
+/// from inside the handler and want opposite treatment.
+///
+/// A REDELIVERY finds the branch it already completed. JetStream is
+/// at-least-once and `jobs.job.closed` has three emit sites, so this
+/// is the common case and must stay silent — a warning per redelivery
+/// is a warning nobody reads.
+///
+/// A CAR NAMING A PACKET WITH NO ACTIONABLE STEP is a different fact
+/// and currently produces nothing at all. `complete-feedback-branch-on-car-merged`
+/// names investigate / design-review / build; `triage` is deliberately
+/// not among them, because choosing a disposition is the routing
+/// decision the whole protocol exists to record and an obligation must
+/// not make it. So a car whose `backlog_item` points at an untriaged
+/// packet merges, does its work, and the packet stays exactly where it
+/// was — with no record on either side that anything was attempted.
+/// Observed on 3adc2c49, David's own directive to retire
+/// emp-bootstrap-admin: car 80345764 named it, merged in PR40, and the
+/// packet was still sitting at `triage` an hour later (c80f08b8).
+///
+/// The distinction is mechanical: if any named step exists and has
+/// already been completed, the work was done. If none of the named
+/// steps is open AND the packet still has some OTHER step open, the
+/// link pointed somewhere the obligation cannot act.
+fn noop_reason(target: &serde_json::Value, allowed: &[&str]) -> Option<String> {
+    let named: Vec<&serde_json::Value> = allowed
+        .iter()
+        .filter_map(|slug| step_by_slug(target, slug))
+        .collect();
+
+    // A named step is OPEN: there was something to do and the caller
+    // does it, so reaching here would be a bug in the caller rather
+    // than a dead link. Checked first so this function is honest on
+    // its own — the caller's control flow is not part of its contract,
+    // and a predicate that only tells the truth from one call site is
+    // one that lies at the next.
+    if named.iter().any(|s| {
+        s.get("status")
+            .and_then(|v| v.as_str())
+            .is_some_and(|st| OPEN_STATUSES.contains(&st))
+    }) {
+        return None;
+    }
+
+    // The work was already done — by an earlier delivery, or by a
+    // person. Nothing to say.
+    if named
+        .iter()
+        .any(|s| s.get("status").and_then(|v| v.as_str()) == Some("completed"))
+    {
+        return None;
+    }
+
+    // What IS open on the packet? If nothing, the packet is between
+    // states and a later event will carry this; silence is right.
+    let open: Vec<&str> = target
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .map(|steps| {
+            steps
+                .iter()
+                .filter(|s| {
+                    s.get("status")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|st| OPEN_STATUSES.contains(&st))
+                })
+                .filter_map(|s| s.get("spec_slug").and_then(|v| v.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if open.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "no actionable step: this obligation completes one of [{}], and the packet's open \
+         step{} [{}] — most often because nobody has triaged it yet, and triage is a routing \
+         decision an obligation must not make",
+        allowed.join(", "),
+        if open.len() == 1 { " is" } else { "s are" },
+        open.join(", "),
+    ))
 }
 
 /// Find a Job's step by `spec_slug` — the stable machine-facing
@@ -257,6 +399,28 @@ impl Handler for JobsCompleteLinkedStep {
                     .is_some_and(|st| OPEN_STATUSES.contains(&st))
             })
         else {
+            // Silent on a redelivery; loud when the link pointed at a
+            // packet this obligation cannot act on. See `noop_reason`.
+            if let Some(why) = noop_reason(&target, &allowed) {
+                tracing::warn!(
+                    rule = %ctx.rule_name,
+                    car = %closing_id,
+                    packet = %target_id,
+                    "obligation completed nothing — {why}"
+                );
+                // A dispatcher log line is not something a car author
+                // reads, so the note also lands on the car — the side
+                // that made the claim, and the side a reviewer opens.
+                // Best-effort: failing to annotate must not fail the
+                // obligation, which has already done all it can.
+                if let Err(e) = self
+                    .note_on_car(closing_id, target_id, &why, &ctx.rule_name)
+                    .await
+                {
+                    tracing::warn!(rule = %ctx.rule_name, car = %closing_id,
+                        "could not record the no-op note: {e}");
+                }
+            }
             return Ok(());
         };
         let Some(step_id) = step.get("id").and_then(|v| v.as_str()) else {
@@ -704,5 +868,94 @@ mod tests {
         );
         assert_eq!(deployed_generation("deployed by hand"), None);
         assert_eq!(deployed_generation("main@"), None);
+    }
+}
+
+#[cfg(test)]
+mod noop_reason_tests {
+    use super::noop_reason;
+    use serde_json::json;
+
+    const ALLOWED: [&str; 3] = ["investigate", "design-review", "build"];
+
+    fn packet(steps: &[(&str, &str)]) -> serde_json::Value {
+        json!({
+            "steps": steps
+                .iter()
+                .map(|(slug, st)| json!({"spec_slug": slug, "status": st}))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    // The case that produced nothing at all. Car 80345764 named
+    // 3adc2c49, merged, and the packet stayed at `triage` — the
+    // obligation cannot complete triage because choosing a disposition
+    // is the routing decision the protocol exists to record.
+    #[test]
+    fn an_untriaged_packet_is_worth_saying_out_loud() {
+        let why = noop_reason(
+            &packet(&[("triage", "ready"), ("build", "pending")]),
+            &ALLOWED,
+        )
+        .expect("reported");
+        assert!(why.contains("triage"), "{why}");
+        assert!(why.contains("no actionable step"), "{why}");
+    }
+
+    // The half that matters just as much. JetStream is at-least-once
+    // and jobs.job.closed has three emit sites, so this is the COMMON
+    // path — a warning here would be a warning per redelivery, which
+    // is a warning nobody reads.
+    #[test]
+    fn a_redelivery_says_nothing() {
+        assert_eq!(
+            noop_reason(
+                &packet(&[("triage", "completed"), ("build", "completed")]),
+                &ALLOWED
+            ),
+            None
+        );
+    }
+
+    // A packet mid-transition has nothing open; a later event carries
+    // it. Silence is right rather than a note that ages badly.
+    #[test]
+    fn a_packet_with_nothing_open_says_nothing() {
+        assert_eq!(
+            noop_reason(
+                &packet(&[("triage", "pending"), ("build", "pending")]),
+                &ALLOWED
+            ),
+            None
+        );
+    }
+
+    // Guard against the report firing on the path that WORKS: if a
+    // named step is open the handler completes it and never reaches
+    // this function, but the predicate must not claim otherwise.
+    #[test]
+    fn an_actionable_packet_is_not_reported_as_a_noop() {
+        // `build` is open and named — the caller completes it, so this
+        // must not claim there was nothing to do.
+        assert_eq!(noop_reason(&packet(&[("build", "ready")]), &ALLOWED), None);
+        // Even alongside another open step, which is the shape that
+        // first tripped this: `triage` open is not evidence of a dead
+        // link when `build` is open too.
+        assert_eq!(
+            noop_reason(
+                &packet(&[("triage", "ready"), ("build", "ready")]),
+                &ALLOWED
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_message_names_what_the_obligation_can_complete() {
+        let why = noop_reason(&packet(&[("needs-info", "active")]), &ALLOWED).expect("reported");
+        for slug in ALLOWED {
+            assert!(why.contains(slug), "{why} is missing {slug}");
+        }
+        assert!(why.contains("needs-info"), "{why}");
     }
 }

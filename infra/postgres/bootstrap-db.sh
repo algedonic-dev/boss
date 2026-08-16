@@ -154,6 +154,26 @@ BUILD_URL="postgres://$DB_USER:$DB_USER@127.0.0.1/$DB_NAME"
 # `examples/brewery/seeds/operator_hires.toml` for the source of
 # truth and `crates/modules/boss-people/src/bin/boss_operator_baseline_seed.rs`
 # for the loader.
+# Platform Workflow rows that live as DATA rather than as Rust
+# literals (docs/design/protocols-as-data.md). INSERT-ONLY: a kind
+# already present is left exactly as it is, including an operator's
+# edits to it. Deliberately NOT bootstrap_reconcile, which republishes
+# the code default over a drifted row and is how two protocol edits
+# were silently undone on 2026-08-14 (68331085).
+#
+# Runs before the reconcile in boss-jobs-api's boot: a kind supplied
+# here is absent from platform_workflows(), so reconcile never
+# considers it.
+if PLATFORM_WF_BIN="$(find_boss_bin boss-platform-workflow-seed)"; then
+    PLATFORM_WF_TOML="$(dirname "$0")/../platform/workflows.toml"
+    if [ -f "$PLATFORM_WF_TOML" ]; then
+        echo "  seeding platform Workflow bundle"
+        "$PLATFORM_WF_BIN" \
+            --database-url "$BUILD_URL" \
+            --seed-path "$PLATFORM_WF_TOML" 2>&1 | grep -E "inserted|already present|seed:" || true
+    fi
+fi
+
 if OPERATOR_SEED_BIN="$(find_boss_bin boss-operator-baseline-seed)"; then
     OPERATOR_HIRES_TOML="$(dirname "$0")/../operator-baseline/operator_hires.toml"
     if [ -f "$OPERATOR_HIRES_TOML" ]; then

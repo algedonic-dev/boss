@@ -1,0 +1,8 @@
+[[invariant]]
+id = "drift-crate-roster-counts"
+claim = "The core state-machine OS lives under crates/core/ (27 crates) … the modules tier (16 crates) … cross-tier orchestrators (5) … tenants (2)."
+source = "CLAUDE.md §10 and §Rust Conventions/Structure (stated twice)"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "WRONG IN THE TREE AS OF 2026-08-13: the real counts are 29 core, 18 modules, 6 orchestrators, 2 tenants. docs/design/testing-strategy.md repeats '0 violations across 27 core crates' and inherits the error. A hand-counted roster in prose is the drift class CLAUDE.md §9a exists to name, and it has now drifted in three files at once. What would enforce it: count the directories under each tier and compare, or stop stating the number in prose."

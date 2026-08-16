@@ -1239,6 +1239,36 @@ pub(crate) fn resolve_train<'a>(trains: &'a [Value], handle: &str) -> Result<&'a
 // The DRY log lines mirror the python conductor's dict/list reprs —
 // the journal is operator surface, and the port keeps its lines.
 
+/// What a completed step announces: the step, the Job, and the
+/// evidence just written to it.
+///
+/// The evidence half is the point. `complete_step` used to log only
+/// `completed <step> on <id>`, which is byte-identical whether the
+/// `ci` step recorded `result: green` or `result: failing`. Green was
+/// loud only by accident — the merge path emits a second line — so a
+/// red train produced strictly less output than a green one and read,
+/// in the journal, as nothing having happened. Trains 46 and 47 both
+/// went red inside an hour on 2026-08-16 and neither said so; the
+/// second was missed by a log monitor that had already been widened
+/// after the first (88c3890c).
+///
+/// Fields carrying nothing are omitted rather than printed as `None`
+/// — most steps complete with no evidence at all, and a line ending
+/// in `with {}` teaches readers to skip the tail of every line,
+/// including the ones that matter.
+fn completion_log_line(label: &str, id8: &str, fields: &[(&str, Option<String>)]) -> String {
+    let evidence: Vec<(&str, Option<String>)> = fields
+        .iter()
+        .filter(|(_, v)| v.is_some())
+        .cloned()
+        .collect();
+    if evidence.is_empty() {
+        format!("completed {label} on {id8}")
+    } else {
+        format!("completed {label} on {id8} with {}", py_dict(&evidence))
+    }
+}
+
 fn py_dict(fields: &[(&str, Option<String>)]) -> String {
     let inner = fields
         .iter()
@@ -1838,7 +1868,11 @@ impl Conductor {
             Some(json!({"status": "completed", "metadata": md})),
         )
         .await?;
-        log(format!("completed {} on {}", step_label(step), id8(jid)));
+        log(completion_log_line(
+            &step_label(step),
+            id8(jid).as_str(),
+            fields,
+        ));
         Ok(())
     }
 
@@ -3344,6 +3378,47 @@ mod tests {
         let mut t = ready_car();
         t["metadata"]["branch"] = json!("train/20260812-0600");
         assert!(!parked_ready(&t));
+    }
+
+    // A red train and a green one must not produce the same line.
+    // Trains 46 and 47 both went red on 2026-08-16 and the journal
+    // said `completed ci on <id>` for each — the same text train 45
+    // produced going green.
+    #[test]
+    fn a_completed_step_says_what_it_recorded() {
+        let red = completion_log_line(
+            "ci",
+            "e78859ab",
+            &[("result", Some("failing".into())), ("notify_on_done", None)],
+        );
+        let green = completion_log_line(
+            "ci",
+            "810a7a3f",
+            &[("result", Some("green".into())), ("notify_on_done", None)],
+        );
+        assert_ne!(
+            red.replace("e78859ab", "X"),
+            green.replace("810a7a3f", "X"),
+            "red and green must be distinguishable without knowing the train id"
+        );
+        assert!(red.contains("failing"), "{red}");
+        // A field with nothing in it is not evidence, and printing it
+        // as None trains the reader to stop at the id.
+        assert!(!red.contains("None"), "{red}");
+    }
+
+    // Most steps complete with no evidence; those lines stay as they
+    // were rather than gaining an empty dict.
+    #[test]
+    fn a_step_with_no_evidence_logs_as_before() {
+        assert_eq!(
+            completion_log_line("assemble", "e78859ab", &[]),
+            "completed assemble on e78859ab"
+        );
+        assert_eq!(
+            completion_log_line("assemble", "e78859ab", &[("skipped", None)]),
+            "completed assemble on e78859ab"
+        );
     }
 
     #[test]

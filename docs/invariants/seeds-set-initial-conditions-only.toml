@@ -1,0 +1,8 @@
+[[invariant]]
+id = "seeds-set-initial-conditions-only"
+claim = "Seed files set initial conditions only, never downstream artifacts that should emerge from a Job step.done."
+source = "docs/design/seed-vs-emergent-state.md; infra/lint/seed-bypass-smell.sh"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "THE MECHANISM SCANS ZERO FILES TODAY. seed-bypass-smell.sh globs examples/<tenant>/seeds/sql/*.sql, and no such file exists anywhere in the tree — the playground_*.sql bundles were retired for `--audit-log-seed` + boss-rebuild-all, and the run prints 'no seed sql files under examples/*/seeds/sql/' and exits 0. What the seeds ARE today is TOML and JSON (accounts.toml, products.toml, workflows.toml, classes.json, employees.json ...), and nothing scans those for downstream artifacts. The lint survives as a useful forward guard against reintroduced SQL seeds — its allowlist is deliberately empty so a new one trips on first commit — but a forward guard against a retired file format is not enforcement of the claim above. What would enforce it: teach the lint the TOML/JSON seed shapes, or assert the seed loader only ever calls public API endpoints."

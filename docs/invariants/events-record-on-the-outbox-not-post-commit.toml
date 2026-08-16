@@ -1,0 +1,8 @@
+[[invariant]]
+id = "events-record-on-the-outbox-not-post-commit"
+claim = "NO crate may call the post-commit publish APIs; domain writes record their event on the transactional outbox, inside the same transaction as the state."
+source = "infra/lint/outbox-migration-ratchet.sh; docs/design/transactional-audit-log.md"
+enforcement = "enforced"
+mechanism = "infra/lint/outbox-migration-ratchet.sh"
+last_verified = ""
+note = "A flat ban since the migration completed 2026-07-28, not a ratchet — a brand-new crate that starts publishing post-commit fails CI immediately. Closes the swallowed-write class behind the 2026-07-13 replay-divergence incident."

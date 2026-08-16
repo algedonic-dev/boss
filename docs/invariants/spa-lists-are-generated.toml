@@ -1,0 +1,8 @@
+[[invariant]]
+id = "spa-lists-are-generated"
+claim = "The SPA's service/port map is generated from boss-ports, never a hand-maintained array of facts that silently drifts from its real source of truth."
+source = "infra/lint/no-snapshot-arrays.sh"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "THE LINT EXISTS AND NOTHING RUNS IT. infra/lint/no-snapshot-arrays.sh is complete and would catch the drift, but it appears in neither infra/gate.sh's roster nor .github/workflows/ci.yml nor any systemd unit, so it fires only if a human invokes it. The same is true of infra/lint/audit-ordering.sh (causal-ordering sweep over audit-log-derived projections). What would enforce it: one `check` line in infra/gate.sh — deliberately out of scope for the car that seeded this register, which adds only its own lint."

@@ -1,0 +1,8 @@
+[[invariant]]
+id = "gate-roster-is-complete"
+claim = "The script must keep covering the checks the gate exists to run — a trimmed roster is exactly the under-covering gate that let both #226 failures through."
+source = "crates/core/boss-testing/tests/gate_sh.rs"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "STATED AS ENFORCED, BUT THE MECHANISM DOES NOT CHECK IT. `gate_script_covers_the_checks` asserts a hardcoded 10-entry lint roster, while infra/gate.sh runs 13. dispatcher-rules-ratchet.sh, schema-converge.sh and no-secrets.sh are unpinned: deleting any of the three from gate.sh leaves the test green. Enforcing it means adding the three names to the roster array in that test (deliberately out of scope for the car that seeded this register)."

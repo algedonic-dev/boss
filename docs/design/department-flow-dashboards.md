@@ -92,15 +92,67 @@ kinds — departments watch kinds they don't own). Probably
 owner-role default with View-level override; deciding where that
 config lives decides who can author dashboards.
 
+Proposed: **owner-role default, and the override is NOT a `views`
+row.** The first half is right and cheap — `owner_role` already
+exists as `metadata.owner_role` on the Workflow kind and
+`owner_resolution.rs` already reads it, so a department's node-set
+is a registry read with nothing new to author.
+
+The second half needs correcting against the table it names.
+`views` is not a dashboard config and was not built to be one: its
+rows are `owner_id NOT NULL`, `visibility` private-or-shared,
+`source` one of subjects/jobs/events, `layout` one of
+table/list/count. It is a **personal saved query**, and its own
+schema comment says so — "Views are personal first; `visibility` is
+what widens them." A department node-set is neither personal nor a
+row-filter over one source; expressing it here means a fourth
+`source`, a fourth `layout`, and an `owner_id` that has to lie.
+
+So the override belongs wherever workflow-ux-as-data lands its view
+registry, not in `views` — which makes this question downstream of
+Q5 rather than parallel to it. Until then the honest answer is
+owner-role only, with the departments that watch kinds they do not
+own listed in the doc as the known gap rather than papered over
+with a config nobody can author.
+
+That also answers the question's own last sentence — "deciding where
+that config lives decides who can author dashboards." If the
+override lives in the view registry, authoring a dashboard is
+publishing a view, and workflow-ux-as-data Q5 already proposes the
+policy rule for that. One answer, not two.
+
 ### Q3: What are the dynamics' window and transport?
 
 Pulses need a trailing window (wall clock, `created_at` — Flow's
 doctrine) and a refresh transport. The SSE policy puts single-event
 state flips in push and aggregates in poll; this surface is an
-aggregate built FROM single events. Proposal: poll the aggregate at
-10–15s like Fleet, with the pulse animation interpolating between
-polls — push only if the demo's "watch it react" property demands
-it.
+aggregate built FROM single events.
+
+Proposal: poll the aggregate at 10s — Fleet's actual number, not an
+approximation of it — with the pulse animation interpolating
+between polls, and push only if the demo's "watch it react"
+property demands it.
+
+(The substance here was already written, but as prose mid-paragraph
+rather than on a line of its own, so the tracker could not see it
+and the question read as unanswered. `line_leading_label` matches
+`Proposed:`/`Proposal:` at the start of a line only. Restating it
+is most of this edit.)
+
+Two things to add. The interval is not a judgement call: Fleet
+declares `POLL_MS = 10_000` and this surface is the same class of
+aggregate, so it should read the same constant rather than pick its
+own number a few pixels away. PerfPage's 2s is the counter-example
+worth naming — it polls that fast because it is watching a process,
+not a department, and copying it here would put a department under
+a microscope built for a crash.
+
+And the window: `created_at` wall clock is right, but the pulse is
+drawn over edges, and edges now have their own timestamps in
+`job_edges`. A hop's age is the fact the animation is about, so the
+trailing window should be over EDGE creation, not Job creation — a
+train that boarded a three-week-old car is a fast hop on an old
+packet, and windowing by Job age draws it as neither.
 
 ### Q4: Does this absorb Flow and a5096c8f?
 
@@ -108,6 +160,30 @@ The stage-duration ask (a5096c8f) is this doc's edge labels; Flow's
 throughput list is arguably one panel of the department view. Absorb
 (one department surface, fewer instruments) or federate (Flow stays
 the team-throughput list, the network view links to it)?
+
+Proposed: **absorb a5096c8f, federate Flow.** They look like one
+question and are not, because one of them shipped.
+
+a5096c8f is not a surface to absorb — it is already an API.
+`GET /api/views/stage-durations/{kind}` exists in boss-views with a
+Postgres test behind it, and it returns exactly the per-hop
+wall-clock this doc wants for edge labels. There is nothing to
+merge: the department view calls it. Recording that here matters
+because the question is phrased as though a decision is pending,
+and the only pending part is drawing the labels.
+
+Flow should stay. `apps/web/src/it/flow/FlowPage.svelte` is a live
+page at `/system/flow`, and it answers a different question from
+this one — "how much is my team getting through", which is a scalar
+per team, versus "where is work moving between kinds", which is a
+topology. Folding a throughput list into a network diagram makes
+the diagram answer a question it is a bad shape for, and removes
+the surface people currently use. Federate: the network view links
+to Flow per department node.
+
+The general form, worth stating because this doc will face it
+again: absorb an API, federate a page. An API with one consumer is
+duplication; a page with its own question is an audience.
 
 ### Q5: Is the department dashboard the first workflow-ux-as-data consumer?
 
@@ -117,6 +193,30 @@ drawn specially. Build the first version as core (the floor, like
 Fleet) and let departments skin it via the plugin registry when that
 lands, or hold the core version minimal and let the plugin
 architecture carry the weight from day one?
+
+Proposed: **core first, and do not wait.** The plugin architecture
+is not ready to carry weight on day one and the evidence is
+measured: nine plugin bundles ship in `infra/step-plugins/` and CI
+mounts exactly one, so a surface built as a plugin today reaches
+production with a human opening the page as its first render check
+(workflow-ux-as-data Q4). Making the department dashboard the first
+consumer of an unproven registry means its first failure mode is
+the registry's, not its own.
+
+There is also a sequencing reason. This doc's whole diagnosis was
+that the links between Jobs were not data — and that has since been
+fixed: `job_edges` ships with three declared edges, a write-path
+trigger, prefix resolution, and a backfill. The interesting,
+unproven part of this surface is whether an inter-workflow topology
+drawn from those edges is legible at all. That question deserves to
+be answered on the floor version, with nothing else failing
+underneath it.
+
+So: build it as core, like Fleet, reading `job_edges` and
+`stage-durations`. When the view registry lands and has the CI
+mounting Q4 asks for, IT skins the train hop specially — and by
+then the core version is the fallback that proves the skin is
+optional, which is what "the floor" is supposed to mean.
 
 ## Decision history
 

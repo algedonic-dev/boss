@@ -1,0 +1,8 @@
+[[invariant]]
+id = "every-deploy-converges-the-schema"
+claim = "Code, config and schema converge from the tree on every deploy."
+source = "infra/lint/schema-converge.sh"
+enforcement = "enforced"
+mechanism = "infra/lint/schema-converge.sh"
+last_verified = ""
+note = "Checks two things: every deploy entry point in the roster invokes infra/postgres/migrate.sh, and the init container's converge does not sit behind an early exit. The 2026-08-13 gap was exactly one `exit 0` above that line, and it let four migrations accumulate unapplied while every other layer rolled forward."

@@ -1,0 +1,8 @@
+[[invariant]]
+id = "audit-log-is-append-only"
+claim = "audit_log is append-only: UPDATE, DELETE and TRUNCATE are rejected."
+source = "infra/postgres/schema/02-events.sql; docs/design/transactional-audit-log.md"
+enforcement = "enforced"
+mechanism = "infra/postgres/schema/02-events.sql"
+last_verified = ""
+note = "Two independent layers: BEFORE UPDATE OR DELETE and BEFORE TRUNCATE triggers that RAISE, plus REVOKE UPDATE, DELETE, TRUNCATE ON audit_log FROM PUBLIC. Layer 3 is the per-row sha256 chain (row_hash = sha256(prev_hash || canonical))."

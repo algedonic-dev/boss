@@ -187,6 +187,32 @@ code gets deleted. Either skills become a real routing term
 lens param) or the table and column go. Keeping unread data
 "just in case" is the one option the coding guidelines rule out.
 
+
+Proposed: **delete the table and the column.** Checked before
+proposing: `employee_skills` is written by the people rebuilder and by
+the projection that repopulates it, and read by nothing. The single
+`.skills` access in the tree is the write path putting them back. So
+this is unread data, and the guidelines rule out keeping it.
+
+The reason to delete rather than wire it up is that skills as a
+separate table is the WEAKER of two mechanisms we already have for the
+same job. Roles are Classes of `employee` Subjects — one `classes`
+table keyed `(subject_kind, code)`, tenant-extensible without a fork.
+A skill is the same kind of noun. If routing ever needs "can operate
+the canning line", that is a Class and a capability term, not a
+bespoke table with its own rebuild path and its own TRUNCATE.
+
+Stations sharpen this further since the question was written: a
+station already carries `capability: {"roles": [...]}`, checked at the
+claim CAS. That is where a skills term would land if it were needed —
+one more key in an object that already exists, on a row an operator can
+edit. Nothing in the routing done to date has wanted it.
+
+So: drop `employee_skills`, drop `Employee.skills`, and if the need
+appears, add `capability.skills` reading Class codes. Deleting is
+reversible in an afternoon; carrying an unread table is the thing that
+quietly costs.
+
 ### Q5: Does assignment strategy become per-step-kind rule data?
 
 Today the strategy is code: hash-spread when a role matches,
@@ -197,6 +223,37 @@ pool). Registries-over-code says this belongs in the dispatcher
 rules registry next to the other routing rules — one `strategy`
 field per rule, not new `match` arms.
 
+
+
+Proposed: **yes, as rule data — but the vocabulary the question assumed
+has been overtaken, and the new one is better.**
+
+When this was written the choice was "push-assigned or pooled for
+pull", and pull had no mechanism. It does now. A station is a
+data-defined queue that HOLDS packets, and the claim CAS
+(`POST /api/jobs/{id}/steps/{step_id}/claim`) makes an actor taking one
+safe against a second actor taking the same one — with membership
+checked 409 and capability 403 before the compare-and-set. So "pooled
+for pull" is no longer a strategy to build; it is what happens when
+nothing assigns the step.
+
+That makes the field smaller and more honest than a `strategy` enum.
+The real question per rule is only whether to PUSH — name a holder now
+— and the existing behaviours are the two values: `assign` (resolve the
+authority_role to a holder, hash-spread over the job id, as the code
+does today) and `leave` (write no assignee; the step is claimed from
+whatever station's predicate matches it).
+
+Put it on the dispatcher rule row beside the other routing terms, so a
+sign-off can be push-assigned and a generic task pooled without a
+`match` arm, which is registries-over-code applied where it belongs.
+
+One thing to carry into the build rather than discover: a step left
+unassigned is only pullable if some station's predicate actually
+matches it. Today two do — the dock and the watchlist — so `leave` on
+an arbitrary step kind can produce a packet in nobody's queue. The rule
+row should be refused at publish time if it says `leave` for a step no
+station holds, the same way the fork lint refuses an orphan outcome.
 
 ## Decisions
 

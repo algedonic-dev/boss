@@ -1,0 +1,8 @@
+[[invariant]]
+id = "data-is-written-through-the-api"
+claim = "Domain + seed data is written by a SERVICE (behind its port adapter) reacting to a public-API call — never poured straight into the DB by a script or a seed binary."
+source = "infra/lint/api-path-bypass-smell.sh; docs/design/seed-vs-emergent-state.md"
+enforcement = "enforced"
+mechanism = "infra/lint/api-path-bypass-smell.sh"
+last_verified = ""
+note = "A direct-DB data write skips policy, validation, and the audit/event path the rest of the system is built on. Pg port adapters, rebuilders, DDL and reads are never flagged."

@@ -1,0 +1,8 @@
+[[invariant]]
+id = "migrations-are-append-only"
+claim = "A schema change is a new file appended to the manifest, never an edit to an already-applied one; nothing is rolled back — roll-forward only."
+source = "docs/design/schema-migrations.md §The convention: applied migrations are history"
+enforcement = "enforced"
+mechanism = "infra/postgres/migrate.sh"
+last_verified = ""
+note = "The runner records a sha256 per applied entry and refuses the whole run BY NAME if a recorded file changed on disk: 'applied migrations are history; put the change in a new migration file'. Also holds the sibling claim that schema reaches a database only through migrate.sh — see `every-deploy-converges-the-schema`. Contract pinned by crates/core/boss-testing/tests/migrate_sh.rs."

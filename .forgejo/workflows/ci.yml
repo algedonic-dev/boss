@@ -72,8 +72,32 @@ jobs:
           POSTGRES_USER: boss
           POSTGRES_PASSWORD: boss
           POSTGRES_DB: boss
-        # Matches the deployed cluster: ~24 services each hold an sqlx
-        # pool, so the default max_connections=100 saturates.
+        # WHAT THESE OPTIONS DO AND DO NOT DO. They are health-check
+        # settings: they make the job wait until Postgres answers
+        # `pg_isready` before any step runs. They do NOT raise
+        # max_connections, which stays at the image default of 100 —
+        # the comment that stood here claimed otherwise ("~24 services
+        # each hold an sqlx pool, so the default max_connections=100
+        # saturates") while sitting above settings that cannot change
+        # it, so it read as a solved problem for as long as it was
+        # here.
+        #
+        # It is not solved, and it is not solvable in this block:
+        # service containers take docker RUN options, not a container
+        # command, and `-c max_connections=N` has to be the command.
+        # The routes that exist are a custom image with a postgresql.conf
+        # baked in, or a step that ALTER SYSTEMs and restarts the
+        # server — neither cheap, both worth it only once this is shown
+        # to be the cause of something.
+        #
+        # It has not been. The one measured failure — train 47,
+        # 2026-08-16, `CREATE DATABASE …: expected to read 5 bytes, got
+        # 0 bytes at EOF` — happened while the test binaries were
+        # running SEQUENTIALLY, 0.8s after the previous one finished,
+        # so connection count was near zero. That is the server closing
+        # a socket, not refusing a 101st client. The change that
+        # actually addresses it is the retry in
+        # boss-testing/src/test_db.rs (70487141).
         options: >-
           --health-cmd "pg_isready -U boss"
           --health-interval 5s

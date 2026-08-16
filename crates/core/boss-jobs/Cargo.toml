@@ -18,6 +18,11 @@ required-features = ["postgres"]
 # docs/design/platform-vs-tenant-jobkinds.md.
 
 [[bin]]
+name = "boss-platform-workflow-seed"
+path = "src/bin/boss_platform_workflow_seed.rs"
+required-features = ["postgres"]
+
+[[bin]]
 name = "boss-jobs-rebuild"
 path = "src/bin/boss_jobs_rebuild.rs"
 required-features = ["postgres"]

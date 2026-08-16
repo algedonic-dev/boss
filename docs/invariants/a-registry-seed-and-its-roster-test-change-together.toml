@@ -1,0 +1,8 @@
+[[invariant]]
+id = "a-registry-seed-and-its-roster-test-change-together"
+claim = "A migration that seeds or edits registry rows lands with the roster test that asserts those rows, in the same change."
+source = "crates/core/boss-jobs/tests/stations_pg.rs; crates/orchestrators/boss-cli/src/cadence.rs (db_tests)"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "This bit twice in one afternoon, in both directions. The stations roster test caught migration 124 adding a repair station and forced the assertion to be updated deliberately — the mechanism working. An hour earlier migration 123 changed a cadence row and the boss-cli seed test was NOT updated, which reddened a train carrying eight cars and cost a repair round; the author had run the neighbouring crate's DB tests (boss-dispatcher, for migration 122) and not the crate whose data actually changed. The general rule is the cheap one: run the tests of the crate whose DATA you changed, not a related one. What would enforce it: nothing generic exists — a lint cannot know which roster belongs to which seed. The tractable version is narrower, a check that every table written by a migration under infra/postgres/schema/ is named in at least one test, which would have caught 123 and is a grep over sqlx queries rather than a proof."

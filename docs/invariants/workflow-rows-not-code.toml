@@ -1,0 +1,8 @@
+[[invariant]]
+id = "workflow-rows-not-code"
+claim = "Adding a new workflow means adding a Workflow row, not touching core code."
+source = "CLAUDE.md §Primitives/Jobs"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "Nothing checks that a new work type landed as data rather than as Rust. `no-step-kind-match` catches the most common SHAPE of the violation (a match on a kind name) but a new bespoke code path that dispatches on any other property passes it. Enforcing this needs a census of workflow-shaped branches, not a grep."

@@ -1,0 +1,8 @@
+[[invariant]]
+id = "the-register-is-one-file-per-invariant"
+claim = "An invariant is a file named for its id under docs/invariants/, so registering one touches no line any other car touches."
+source = "docs/invariants/README.md; CLAUDE.md §9a (the schema-manifest precedent); packet b071994b"
+enforcement = "enforced"
+mechanism = "infra/lint/invariant-register.sh"
+last_verified = ""
+note = "The lint rejects a file holding other than exactly one [[invariant]] entry, and a file whose name does not match the id it declares. Both rules exist to keep the register uncontended: as one appendable file, two cars registering a learning on the same day conflicted on the same line, and on 2026-08-15 resolving one such conflict dropped an entry's header and folded its keys into the entry above — which the lint then passed."

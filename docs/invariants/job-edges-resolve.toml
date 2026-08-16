@@ -1,0 +1,8 @@
+[[invariant]]
+id = "job-edges-resolve"
+claim = "Every Job-metadata key declared in the job_edges registry must reference a resolvable Job."
+source = "infra/postgres/schema/104-job-edges.sql"
+enforcement = "enforced"
+mechanism = "infra/postgres/schema/104-job-edges.sql"
+last_verified = ""
+note = "BEFORE INSERT OR UPDATE OF metadata trigger `jobs_check_job_edges_trg` on `jobs`, reading the edge set as data. Violation behaviour is dialled per-edge by `on_missing`; 105-job-edges-abort.sql moved the seeded edges to 'abort' and 110-waiting-on-edge.sql added a wildcard ('*') edge so a per-kind roster cannot drift."

@@ -178,6 +178,51 @@ becomes pod-shaped: what securityContext/namespace isolation the
 runner pods get, rather than which unix user the runner daemon runs
 as.
 
+Proposed: **the question has two premises and the tree contradicts
+both, so answer the one that is left.** Measured 2026-08-16 rather
+than reasoned about.
+
+*"No fork PRs on it"* is already true, and not by policy. Every pull
+request the forge has ever seen — 38 through 47, the full history —
+is `david/boss -> david/boss`. The fork model the question assumes
+is not how the conductor works: it pushes each car branch to the
+forge repo itself and opens a same-repo PR. `.forgejo/workflows/ci.yml`
+triggers on `push: [main]` and `pull_request: [main]`, with no
+`pull_request_target`, so there is no path today by which a fork's
+code reaches the runner. The decision to make is not "should we
+allow fork PRs to run" but "do we ever intend to accept an outside
+contribution on the forge" — and the answer is no, because that is
+what the GitHub mirror is for. Write that down and the trust
+question closes.
+
+*"Under Talos the containment question becomes pod-shaped"* is not
+true either. The runner is not on Talos. It is a Docker runner on
+the forge host (10.20.0.15), `runs-on: docker`, pulling
+`10.20.0.15:3000/david/boss-ci:rust1.96` from the registry beside
+it. The only cluster-touching automation is
+`infra/forge/cluster-deploy-runner.sh`, which is a systemd unit on
+that same host, not a workflow job — and it is deliberately
+one-directional: "no ssh from the conductor, no shared credentials;
+each side touches only what it owns." So containment is
+Docker-shaped, and the kubeconfig that could reach the cluster is
+held by a unit CI jobs cannot invoke.
+
+What is left, and is a real decision: the runner is **not registered
+at repo scope**. `GET /repos/david/boss/actions/runners` returns
+`[]` — 200, empty, with a repo-scoped token that reads everything
+else fine — so it is registered at user or instance level. That is
+the actual trust surface: a runner shared across every repo the
+instance will ever hold, on the host that also serves the forge, the
+registry, and the deploy unit's kubeconfig. Today there is one repo,
+so nothing is exposed. The recommendation is to re-register it
+repo-scoped now, while that is a one-line operation, rather than at
+the moment a second repo makes it urgent.
+
+The Talos framing should be struck from this question rather than
+answered. If runner pods ever move onto the cluster that is a new
+decision with a new threat model, and leaving the sentence here
+implies a containment story that does not exist.
+
 
 ## Decisions
 

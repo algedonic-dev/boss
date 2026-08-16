@@ -1,0 +1,8 @@
+[[invariant]]
+id = "nothing-reads-the-wall-clock-but-the-clock"
+claim = "Every other \"now\" in BOSS must route through `state.clock.now().await.now` so the receiving service stamps audit_log via clock-api (sim or wall depending on deploy mode)."
+source = "infra/lint/no-wallclock.sh"
+enforcement = "enforced"
+mechanism = "infra/lint/no-wallclock.sh"
+last_verified = ""
+note = "Two passes: `Utc::now` on a word boundary in Rust, and SQL CURRENT_DATE / CURRENT_TIMESTAMP / NOW() inside Rust string literals. Closed the leak class that mis-stamped 116k audit rows in regen 18. The allow-list is large (~45 path prefixes) but each entry carries a written justification and the bar is stated: 'this path's Utc::now() never stamps an audit_log row.'"

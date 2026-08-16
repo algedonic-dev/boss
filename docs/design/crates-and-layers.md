@@ -222,7 +222,7 @@ independently abandonable.
    plus two ratcheted shape rules, `--self-test` green, clean against
    the tree with three allow-listed exceptions. Still to do: wire into
    `infra/gate.sh` so it runs in forge CI.
-3. **Register the layer prohibitions** in `docs/invariants.toml` as
+3. **Register the layer prohibitions** in `docs/invariants/` as
    `enforced` once (2) is wired into the gate. Each name carries one:
    BossNET must not know what work means · BossProtocols must not
    require a deploy to change · BossActors is the attach contract, not

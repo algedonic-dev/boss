@@ -101,7 +101,7 @@ Resolved 2026-08-16 — override.
 **The question was:**
 
 > Candidates: a table in this doc; a machine-readable file
-> (`docs/invariants.toml`) that a lint can read; or rows in a registry
+> (`docs/invariants/`) that a lint can read; or rows in a registry
 > on the cluster, like every other piece of protocol data.
 >
 > Proposed: **a file first, a registry later.** A file can be linted

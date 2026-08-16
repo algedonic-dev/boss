@@ -1,0 +1,8 @@
+[[invariant]]
+id = "drift-group-role-mapping-is-a-registry"
+claim = "Group→role mapping is a registry, not gateway code."
+source = "docs/design/idm-kanidm.md"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "DOES NOT HOLD TODAY, AND DELIBERATELY SO. crates/core/boss-gateway/src/oidc.rs has no such registry and says why at the top of the file: 'an IdP-group→role mapping would be a second source of role truth, so it is deliberately absent (phase 2 may revisit)'. Roles come off the employee row, the same as local login. This is the case where the CODE is right and the doc owes the edit."

@@ -1,0 +1,8 @@
+[[invariant]]
+id = "correctness-provenance"
+claim = "Every recorded fact traces to a real event — no orphan rows, no manual INSERT stand-ins."
+source = "docs/design/correctness-protocol.md §The five properties.1"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "THE ONE NAMED MECHANISM IS VACUOUS TODAY. correctness-protocol.md §Enforcement.3 points at conservation-invariants.sh invariant E, but E filters `WHERE f.source_table = 'steps'` and no financial_facts row is steps-sourced — both the script (line 188: 'this is a future-state guard — passes trivially when no source_table=steps rows exist') and seed-vs-emergent-state.md §Enforcement.1 ('a forward guard today: it passes trivially') say so outright. The source_table values that ARE in use (invoices, payroll_runs, tax_filings, bank_settlements, revenue_schedules, brewery_seed_opening_balance) get no orphan check at all, and the doc's further claim that state tables like inventory_items inherit the same chain is checked nowhere. What would enforce it: widen E to every source_table in rebuild_facts.rs rather than waiting for steps-sourced facts to exist."

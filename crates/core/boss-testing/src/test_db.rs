@@ -45,6 +45,66 @@ const DEFAULT_ADMIN_URL: &str = "postgres://boss:boss@127.0.0.1/postgres";
 const ALLOW_PRODUCTION_ENV: &str = "BOSS_TEST_ALLOW_PRODUCTION_SERVER";
 
 /// Every scratch database starts with this.
+/// How many times to reach for the admin connection before giving up.
+///
+/// Three, and the shape of the retry matters more than the number: a
+/// lost connection is retried by RECONNECTING, never by reissuing on
+/// the dead socket. One transient is what this is for; three failures
+/// in a row is a server that is actually gone, and pretending
+/// otherwise would turn a broken CI database into a slow one.
+const CONNECT_ATTEMPTS: u32 = 3;
+
+/// Is this the database going away, or the database saying no?
+///
+/// The distinction is the whole point. A rejected statement is a
+/// defect in the change under test and must fail loudly on the first
+/// try; a closed socket is weather, and failing on it reds a train
+/// carrying other people's work. Before this existed the two produced
+/// the same panic and an agent had to read the message to tell them
+/// apart — which on 2026-08-16 meant an hour of archaeology to
+/// conclude that a car was innocent.
+///
+/// Transport failures and the two SQLSTATEs that mean "not now, ask
+/// again": 53300 too_many_connections, 57P03 cannot_connect_now.
+/// 08006 connection_failure is included for the same reason.
+fn is_transient(e: &sqlx::Error) -> bool {
+    match e {
+        // `expected to read 5 bytes, got 0 bytes at EOF` — the one
+        // that actually happened — arrives here.
+        sqlx::Error::Io(_) => true,
+        sqlx::Error::Protocol(_) => true,
+        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed => true,
+        sqlx::Error::WorkerCrashed => true,
+        sqlx::Error::Database(db) => {
+            matches!(db.code().as_deref(), Some("53300" | "57P03" | "08006"))
+        }
+        // Everything else — RowNotFound, ColumnDecode, a syntax error
+        // reaching us as Database with another code — is the change
+        // under test being wrong, and must not be retried into
+        // looking flaky.
+        _ => false,
+    }
+}
+
+async fn connect_admin(opts: &PgConnectOptions, admin_url: &str) -> PgConnection {
+    let mut last = String::new();
+    for attempt in 1..=CONNECT_ATTEMPTS {
+        match PgConnection::connect_with(opts).await {
+            Ok(c) => return c,
+            Err(e) if is_transient(&e) && attempt < CONNECT_ATTEMPTS => {
+                eprintln!(
+                    "TestDb: admin connect failed (attempt {attempt}/{CONNECT_ATTEMPTS}): {e}"
+                );
+                last = e.to_string();
+                tokio::time::sleep(std::time::Duration::from_millis(200 * u64::from(attempt)))
+                    .await;
+            }
+            Err(e) => panic!("connecting to admin db at {admin_url}: {e}"),
+        }
+    }
+    panic!("connecting to admin db at {admin_url} after {CONNECT_ATTEMPTS} attempts: {last}");
+}
+
 const SCRATCH_PREFIX: &str = "test_boss_";
 
 /// How old a scratch database must be before another test process will
@@ -203,9 +263,7 @@ impl TestDb {
         let admin_opts = PgConnectOptions::from_str(&admin_url)
             .unwrap_or_else(|e| panic!("parsing BOSS_TEST_POSTGRES_ADMIN_URL: {e}"));
 
-        let mut admin = PgConnection::connect_with(&admin_opts)
-            .await
-            .unwrap_or_else(|e| panic!("connecting to admin db at {admin_url}: {e}"));
+        let mut admin = connect_admin(&admin_opts, &admin_url).await;
 
         // Before creating anything: is this a BOSS deployment? Asked on
         // the admin connection we already hold, so it costs one query
@@ -226,10 +284,29 @@ impl TestDb {
         // `sweep_orphans` for why this happens here rather than on Drop.
         sweep_orphans(&mut admin, now_secs()).await;
 
-        admin
-            .execute(format!(r#"CREATE DATABASE "{db_name}""#).as_str())
-            .await
-            .unwrap_or_else(|e| panic!("CREATE DATABASE {db_name}: {e}"));
+        // Retried, because the failure here is usually not about this
+        // statement. On 2026-08-16 this line killed train 47 with
+        // `CREATE DATABASE …: expected to read 5 bytes, got 0 bytes at
+        // EOF` — the server closing the socket — and took a car that
+        // passed the entire gate locally down with it (70487141).
+        for attempt in 1..=CONNECT_ATTEMPTS {
+            match admin
+                .execute(format!(r#"CREATE DATABASE "{db_name}""#).as_str())
+                .await
+            {
+                Ok(_) => break,
+                Err(e) if is_transient(&e) && attempt < CONNECT_ATTEMPTS => {
+                    eprintln!(
+                        "TestDb: CREATE DATABASE {db_name} lost the connection \
+                         (attempt {attempt}/{CONNECT_ATTEMPTS}): {e}"
+                    );
+                    // The connection is the thing that broke; a retry on
+                    // it would fail the same way forever.
+                    admin = connect_admin(&admin_opts, &admin_url).await;
+                }
+                Err(e) => panic!("CREATE DATABASE {db_name}: {e}"),
+            }
+        }
 
         // Test sessions write audit_log events directly (via
         // PgAuditWriter / seed helpers) without running the projection
@@ -518,5 +595,39 @@ mod production_guard {
     fn the_override_is_honoured_but_only_when_explicit() {
         assert_eq!(production_refusal(true, true), None);
         assert!(production_refusal(true, false).is_some());
+    }
+}
+
+#[cfg(test)]
+mod transient_tests {
+    use super::is_transient;
+
+    // The one that actually happened. sqlx renders a short read at EOF
+    // as Error::Io, and train 47 died on it.
+    #[test]
+    fn a_closed_socket_is_weather() {
+        let e = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "expected to read 5 bytes, got 0 bytes at EOF",
+        ));
+        assert!(is_transient(&e), "{e}");
+    }
+
+    #[test]
+    fn a_protocol_break_and_a_dead_pool_are_weather() {
+        assert!(is_transient(&sqlx::Error::Protocol("bad message".into())));
+        assert!(is_transient(&sqlx::Error::PoolTimedOut));
+        assert!(is_transient(&sqlx::Error::PoolClosed));
+    }
+
+    // The half that matters more: a real defect must fail on the first
+    // try. Retrying it would spend three attempts turning a
+    // reproducible failure into something that reads as flaky, which
+    // is the failure mode this whole change exists to prevent —
+    // pointed the other way.
+    #[test]
+    fn a_query_that_is_simply_wrong_is_not_retried() {
+        assert!(!is_transient(&sqlx::Error::RowNotFound));
+        assert!(!is_transient(&sqlx::Error::ColumnNotFound("nope".into())));
     }
 }

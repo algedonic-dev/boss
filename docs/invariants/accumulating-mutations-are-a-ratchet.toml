@@ -1,0 +1,8 @@
+[[invariant]]
+id = "accumulating-mutations-are-a-ratchet"
+claim = "The event bus is at-least-once, so every handler must be safe to run twice on the same event; an ACCUMULATING mutation is not."
+source = "infra/lint/idempotence-ratchet.sh"
+enforcement = "enforced"
+mechanism = "infra/lint/idempotence-ratchet.sh"
+last_verified = ""
+note = "A ratchet, not a ban — accumulating arithmetic under a row lock is sometimes the right shape. Closes the 2026-06-16 class where non-idempotent on_hand mutations double-applied on redelivery and decoupled GL 1300/1320 from physical inventory, producing no error anywhere, just numbers that stopped reconciling."
