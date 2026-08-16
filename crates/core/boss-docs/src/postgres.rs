@@ -107,6 +107,13 @@ fn storage<E: std::fmt::Display>(e: E) -> DocsError {
     DocsError::Storage(e.to_string())
 }
 
+/// Is this the unique-index violation that means "someone else got
+/// there first"? Matched on SQLSTATE rather than on the message, which
+/// is the database's to reword.
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
+}
+
 #[async_trait]
 impl DocsRepository for PgDocsRepo {
     async fn all_docs(&self) -> Result<Vec<DesignDoc>, DocsError> {
@@ -503,7 +510,19 @@ impl DocsRepository for PgDocsRepo {
         let payload_json = serde_json::to_value(payload)
             .map_err(|e| DocsError::Storage(format!("serializing payload: {e}")))?;
 
-        sqlx::query(
+        // `design_flush_jobs_one_queued_per_doc` (migration 140) is what
+        // makes an answer burst settle clean. Eight decisions recorded
+        // at once fire the queue rule eight times; each reads the same
+        // pending rows OUTSIDE this transaction and arrives here with an
+        // identical payload. Without the index all eight insert, and
+        // the doc ends up with a stack of jobs claiming the same work —
+        // which is what buried David's review on 2026-08-15.
+        //
+        // The loser reads as "already queued", which is both true and a
+        // no-op: the decisions it carries are in the job that won, and
+        // the caller (`docs.flush_queue`) already treats a 400 as
+        // nothing to do.
+        let inserted = sqlx::query(
             "INSERT INTO design_flush_jobs (
                 id, doc_path, status, requested_by, queued_at, payload
              ) VALUES ($1,$2,'queued',$3,$4,$5)",
@@ -514,8 +533,16 @@ impl DocsRepository for PgDocsRepo {
         .bind(now)
         .bind(&payload_json)
         .execute(&mut *tx)
-        .await
-        .map_err(storage)?;
+        .await;
+        if let Err(e) = inserted {
+            if is_unique_violation(&e) {
+                return Err(DocsError::BadRequest(format!(
+                    "a flush is already queued for {} — its payload carries these decisions",
+                    payload.doc_path
+                )));
+            }
+            return Err(storage(e));
+        }
 
         // Delete ONLY the rows this payload actually snapshotted.
         //
@@ -868,6 +895,84 @@ mod tests {
         assert_eq!(
             doc.pending_count, 1,
             "pending_count was zeroed while a decision was still pending"
+        );
+    }
+
+    /// A doc can have at most one flush WAITING, and the database is
+    /// what guarantees it.
+    ///
+    /// David finished a review of eight questions on 2026-08-15 and
+    /// could not find it anywhere. All eight had been recorded — eight
+    /// POSTs, eight 200s — and the queue rule, which fires once per
+    /// recorded decision, turned them into THREE identical jobs. The
+    /// pending rows were consumed into those payloads, so the
+    /// `pending_count` the page reads was 0. A finished review was
+    /// indistinguishable from one that never registered.
+    ///
+    /// `post_flush_job` reads the pending rows OUTSIDE the transaction,
+    /// so under a burst every firing arrives with the same payload and
+    /// the defensive re-read inside the transaction still sees rows —
+    /// a sibling that has not committed is invisible to it. No amount
+    /// of checking fixes that; only a constraint does.
+    ///
+    /// Asserted against the index directly rather than by racing two
+    /// calls. A first attempt at this test drove `create_flush_job`
+    /// twice in sequence and passed with the migration REMOVED — the
+    /// second call was rejected by the pre-existing "no pending
+    /// decisions" path, so it proved nothing about the index. A test
+    /// that cannot fail is worse than no test.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_one_flush_may_wait_per_doc() {
+        let db = TestDb::new().await;
+        let repo = PgDocsRepo::new(db.pool.clone());
+        repo.upsert_doc(&sample_doc("docs/design/a.md"), &[])
+            .await
+            .unwrap();
+
+        let insert = |id: &'static str, status: &'static str| {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO design_flush_jobs
+                        (id, doc_path, status, requested_by, queued_at, payload)
+                     VALUES ($1, 'docs/design/a.md', $2, 'rule', now(), $3::jsonb)",
+                )
+                .bind(id)
+                .bind(status)
+                .bind(
+                    r#"{"doc_path":"docs/design/a.md","base_commit_sha":"0000000","decisions":[]}"#,
+                )
+                .execute(&pool)
+                .await
+            }
+        };
+
+        insert("fj-first", "queued").await.expect("the first waits");
+
+        let second = insert("fj-second", "queued").await;
+        let err = second.expect_err("a second waiting flush for one doc must be refused");
+        assert!(
+            is_unique_violation(&err),
+            "expected the partial unique index to refuse it, got: {err}"
+        );
+
+        // History is unconstrained: a doc accumulates finished flushes
+        // over its life, and only the WAITING one must be singular.
+        insert("fj-done", "succeeded")
+            .await
+            .expect("a succeeded job alongside a queued one is ordinary history");
+        insert("fj-dead", "failed")
+            .await
+            .expect("so is a failed one");
+
+        let queued = repo.flush_jobs_by_status(JobStatus::Queued).await.unwrap();
+        assert_eq!(
+            queued
+                .iter()
+                .filter(|j| j.doc_path == "docs/design/a.md")
+                .count(),
+            1,
+            "one doc, one waiting flush"
         );
     }
 

@@ -1,6 +1,6 @@
 # Design: design docs as data — the discussion moves into BOSS
 
-**Status**: in-review — open questions tracked at `/system/design`.
+**Status**: approved — in-review — open questions tracked at `/system/design` (2026-08-16).
 **Source**: feedback `19614937`, reframed by David 2026-08-08: design
 prose rides the PR train because git is its system of record and BOSS
 is a read-through cache of the checkout — but the train exists for
@@ -153,192 +153,258 @@ supersedes v(n); an open review pins to the version it opened under.
 
 ## Open questions
 
-### Q1: Where exactly is the git/BOSS line?
+All 8 open questions were resolved 2026-08-16 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-Proposal: content referenced at build time stays in git — the
-reading frames CLAUDE.md links, `architecture-decisions.md`, and
-any doc a test cites — and everything decision-shaped (in-review,
-reopened, question-carrying) lives in the registry. The sharp
-version: *a doc lives in git iff deleting it breaks a build*. Is
-that the right knife, and which of the current 18 fall on each
-side?
+---
 
-### Q2: How does event-sourced design state survive the epoch trim?
 
-The trim deletes `audit_log` rows past the baseline id; today's
-design tables survive resets precisely by being outside the log.
-Event-sourcing design state must not make it trimmable. Options: a
-kind-allowlist in the trim (design.* rows are platform state, not
-demo state — the trim already sanctions a baseline gap, so the
-integrity checker can learn a second sanctioned shape); or design
-events land in the log for provenance while the registry projection
-is the durable read state and rebuilds accept the horizon. The
-first is more machinery; the second quietly gives up
-rebuild-from-log for one domain. Neither is free — this is the
-load-bearing question.
+## Decisions
 
-Proposed: the first, reframed — the trim gets a **scope**, not an
-allowlist. The epoch trim is a *tenant-data* operation (it exists to
-reset the demo), and platform-domain history is outside its scope by
-definition, the same way the Class registry and the workflow rows are.
-Written as an allowlist it reads like an exception to be maintained;
-written as a scope it reads like the rule the trim always meant, and
-the integrity checker learns one second sanctioned shape rather than
-one per domain.
+### Q1: Where exactly is the git/BOSS line? (resolved)
 
-The argument that decides it: if a trim can delete the provenance of a
-design decision, then "who decided this, when, and against what
-evidence" becomes unanswerable after any playground reset — and making
-that question answerable is the entire reason for moving design state
-into the log. Option two buys less machinery by giving up the property
-the change is for. It also breaks the correctness protocol's closure
-claim for one domain, and a rebuilder that is correct for eleven
-domains and special for the twelfth is a rebuilder nobody trusts.
+Resolved 2026-08-16 — override.
 
-### Q3: What pins doc↔code agreement once discussion docs leave the tree?
+**The question was:**
 
-`docs_corpus_presents` guards whatever is in the tree at compile
-time. For registry docs the equivalent is publish-time validation
-(server-side, same parser). But some registry docs will still cite
-code facts — lints, file paths, measured contracts. Does the §9a
-rule ("a fact that lives twice gets an equality test") get a
-registry-side mechanism — e.g. a nightly checker that resolves
-cited paths/lints against the deployed tree — or do we accept that
-registry prose can drift and rely on the release-time fold review?
+> Proposal: content referenced at build time stays in git — the
+> reading frames CLAUDE.md links, `architecture-decisions.md`, and
+> any doc a test cites — and everything decision-shaped (in-review,
+> reopened, question-carrying) lives in the registry. The sharp
+> version: *a doc lives in git iff deleting it breaks a build*. Is
+> that the right knife, and which of the current 18 fall on each
+> side?
 
-Proposed: neither, because Q6 has since dissolved the premise. The
-split David chose is per-SECTION, not per-DOC: every design doc stays
-hand-written in git and only its `## Open questions` block is
-generated from the registry. So no discussion doc leaves the tree,
-`docs_corpus_presents` keeps guarding the prose at compile time, and
-the generated block is guarded too — it is written INTO the file, so
-the export lands in the same checkout the lint reads.
+Git is for keeping the 'flat' version of documentation required to support development, but it shouldn't be on an active discussion path for work like a design doc.
 
-What is left over is narrow: a *question body* that cites a code fact,
-written in the registry, that reaches the tree only at the next
-export. That is a drift window measured in one export cycle, on the
-one kind of text that is explicitly provisional. It does not earn a
-nightly checker resolving paths against a deployed tree — which is a
-second source of truth about the tree, and §9a's own warning is that
-the pin is a holding action, not a destination. If the window ever
-bites, the cheap fix is to run the existing corpus lint at PUBLISH
-time against the checked-out tree, not to build a new watcher.
 
-### Q4: Who can publish, and as whom?
+### Q4: Who can publish, and as whom? (resolved)
 
-Authoring is a write like any other: policy-gated, actor-stamped.
-Humans via `/system/design`; agents via the API (and eventually
-MCP). Is publish authority a role (`design-author` Class), a
-policy rule on `(publish, design-doc)`, or Job-mediated (a
-`publish-a-doc` Workflow so publications are themselves reviewable
-work)? The Job-mediated option is the most BOSS-shaped and the
-most ceremony; the policy rule is the least of both.
+Resolved 2026-08-16 — accept.
 
-Proposed: the policy rule on `(publish, design-doc)`, and nothing
-else — because the Job-mediated version already exists and is not
-this. A doc's *thinking* is reviewable work today: that is the
-`design-doc-review` Job, its per-question resolutions, and the docs
-car that carries the flush through a train. A `publish-a-doc`
-Workflow would be a second protocol over the same act, and the
-packets would be indistinguishable on the board.
+**The question was:**
 
-Not a role Class either. Roles are Classes of `employee` Subjects and
-they describe what a person IS; `design-author` would describe one
-verb they may perform, which is what a policy rule is for. Adding a
-role per verb is how a taxonomy inflates until nobody can say what a
-role means.
+> Authoring is a write like any other: policy-gated, actor-stamped.
+> Humans via `/system/design`; agents via the API (and eventually
+> MCP). Is publish authority a role (`design-author` Class), a
+> policy rule on `(publish, design-doc)`, or Job-mediated (a
+> `publish-a-doc` Workflow so publications are themselves reviewable
+> work)? The Job-mediated option is the most BOSS-shaped and the
+> most ceremony; the policy rule is the least of both.
+>
+> Proposed: the policy rule on `(publish, design-doc)`, and nothing
+> else — because the Job-mediated version already exists and is not
+> this. A doc's *thinking* is reviewable work today: that is the
+> `design-doc-review` Job, its per-question resolutions, and the docs
+> car that carries the flush through a train. A `publish-a-doc`
+> Workflow would be a second protocol over the same act, and the
+> packets would be indistinguishable on the board.
+>
+> Not a role Class either. Roles are Classes of `employee` Subjects and
+> they describe what a person IS; `design-author` would describe one
+> verb they may perform, which is what a policy rule is for. Adding a
+> role per verb is how a taxonomy inflates until nobody can say what a
+> role means.
+>
+> The honest consequence to accept with it: a policy rule alone means an
+> agent can publish a design doc unreviewed, and the only thing standing
+> between a published doc and the corpus is the reindex validator. That
+> is the same trust posture agents already have for Workflow rows and
+> station rows, both of which are more dangerous, so it is consistent —
+> but it should be a decision, not a side effect.
 
-The honest consequence to accept with it: a policy rule alone means an
-agent can publish a design doc unreviewed, and the only thing standing
-between a published doc and the corpus is the reindex validator. That
-is the same trust posture agents already have for Workflow rows and
-station rows, both of which are more dangerous, so it is consistent —
-but it should be a decision, not a side effect.
+the policy rule on `(publish, design-doc)`, and nothing else — because the Job-mediated version already exists and is not this. A doc's *thinking* is reviewable work today: that is the `design-doc-review` Job, its per-question resolutions, and the docs car that carries the flush through a train. A `publish-a-doc` Workflow would be a second protocol over the same act, and the packets would be indistinguishable on the board.
 
-### Q5: What does the release-time export actually produce?
 
-The fold into `architecture-decisions.md` is currently a human
-editorial act. Generated-from-events can mean: a mechanical
-appendix (decision entries in order, humans still write the
-narrative), or a full generation the release owner edits. And does
-the export PR ride the train as an ordinary code change (proposal:
-yes — it is the one design artifact that *should*, because it
-changes the repo)?
+### Q6: What marks the machine-owned region, and what happens to a hand edit inside it? (resolved)
 
-Proposed: the mechanical appendix, and yes, it rides the train.
+Resolved 2026-08-16 — accept.
 
-`architecture-decisions.md` is described in CLAUDE.md as "the one
-current-truth decision record". Current truth is a synthesis — it says
-what the system believes NOW, with the superseded reasoning left out.
-A full generation cannot produce that, because everything it has is
-the log, and a rendering of the log is a history, not a current truth.
-Generating the whole file would quietly redefine the document into a
-changelog and leave the system with no current-truth record at all.
+**The question was:**
 
-So the export writes the part that is mechanically checkable and
-therefore worth automating: one entry per resolved question, in
-resolution order, carrying question id, resolution text, deciding
-actor, and date. The narrative above it stays a human editorial act,
-and the appendix is what a reader checks it against — the same
-relationship the audit log has to every other projection.
+> David, 2026-08-14, choosing between three splits: **"file wins on
+> prose, data wins on questions — the two live in one file with a
+> generated section."** That answers Q1 with a sharper knife than Q1
+> proposed: the line is not per-DOC (a doc lives in git iff deleting it
+> breaks a build) but per-SECTION inside one doc. Every design doc stays
+> hand-written in git; only its `## Open questions` block is generated
+> from the registry.
+>
+> Proposed: fenced markers around the generated block
+> (`<!-- boss:questions:begin -->` … `:end`), and the reindex REPLACES
+> everything between them. A hand edit inside the fence is not merged and
+> not preserved — it is overwritten on the next publish, exactly as a
+> generated file is. The fence is what makes that fair rather than
+> surprising.
+>
+> The open part is what to do when someone edits inside the fence anyway.
+> Silently overwriting loses an author's words; refusing to publish blocks
+> the pipeline on a typo. A third option is to overwrite but record the
+> discarded text on the question as a comment, so nothing is lost and
+> nothing is blocked.
 
-Riding the train is not a nicety: the export changes the repo, so it
-takes the gate every repo change takes, and a doc export that broke
-`docs_corpus_presents` would be caught the same way any other red is.
+fenced markers around the generated block (`<!-- boss:questions:begin -->` … `:end`), and the reindex REPLACES everything between them. A hand edit inside the fence is not merged and not preserved — it is overwritten on the next publish, exactly as a generated file is. The fence is what makes that fair rather than surprising.
 
-### Q6: What marks the machine-owned region, and what happens to a hand edit inside it?
 
-David, 2026-08-14, choosing between three splits: **"file wins on
-prose, data wins on questions — the two live in one file with a
-generated section."** That answers Q1 with a sharper knife than Q1
-proposed: the line is not per-DOC (a doc lives in git iff deleting it
-breaks a build) but per-SECTION inside one doc. Every design doc stays
-hand-written in git; only its `## Open questions` block is generated
-from the registry.
+### Q3: What pins doc↔code agreement once discussion docs leave the tree? (resolved)
 
-Proposed: fenced markers around the generated block
-(`<!-- boss:questions:begin -->` … `:end`), and the reindex REPLACES
-everything between them. A hand edit inside the fence is not merged and
-not preserved — it is overwritten on the next publish, exactly as a
-generated file is. The fence is what makes that fair rather than
-surprising.
+Resolved 2026-08-16 — override.
 
-The open part is what to do when someone edits inside the fence anyway.
-Silently overwriting loses an author's words; refusing to publish blocks
-the pipeline on a typo. A third option is to overwrite but record the
-discarded text on the question as a comment, so nothing is lost and
-nothing is blocked.
+**The question was:**
 
-### Q7: What is a question's state model, now that it has one at all?
+> `docs_corpus_presents` guards whatever is in the tree at compile
+> time. For registry docs the equivalent is publish-time validation
+> (server-side, same parser). But some registry docs will still cite
+> code facts — lints, file paths, measured contracts. Does the §9a
+> rule ("a fact that lives twice gets an equality test") get a
+> registry-side mechanism — e.g. a nightly checker that resolves
+> cited paths/lints against the deployed tree — or do we accept that
+> registry prose can drift and rely on the release-time fold review?
+>
+> Proposed: neither, because Q6 has since dissolved the premise. The
+> split David chose is per-SECTION, not per-DOC: every design doc stays
+> hand-written in git and only its `## Open questions` block is
+> generated from the registry. So no discussion doc leaves the tree,
+> `docs_corpus_presents` keeps guarding the prose at compile time, and
+> the generated block is guarded too — it is written INTO the file, so
+> the export lands in the same checkout the lint reads.
+>
+> What is left over is narrow: a *question body* that cites a code fact,
+> written in the registry, that reaches the tree only at the next
+> export. That is a drift window measured in one export cycle, on the
+> one kind of text that is explicitly provisional. It does not earn a
+> nightly checker resolving paths against a deployed tree — which is a
+> second source of truth about the tree, and §9a's own warning is that
+> the pin is a holding action, not a destination. If the window ever
+> bites, the cheap fix is to run the existing corpus lint at PUBLISH
+> time against the checked-out tree, not to build a new watcher.
 
-`design_questions` has no `status` column today. A question is "open"
-if its `### Qn:` heading is still in the markdown and "resolved" if it
-is not — state inferred from the absence of text. That is why answering
-one requires a commit, and why a stalled flush silently re-opens a
-review on the next index.
+The protocol will enforce the proper order and evidence to ensure alignment.
 
-Proposed: `open | answered | superseded | withdrawn`, with the answer
-and its author on the row. `superseded` matters more than it looks —
-today a re-asked question is a new heading with no link to the old one,
-so "we already decided this" is unanswerable. Twice on 2026-08-14 the
-same ground was covered twice for exactly that reason.
 
-Is four states right, and does an `answered` question stay visible in
-the doc under its answer, or move to Decision history immediately?
+### Q2: How does event-sourced design state survive the epoch trim? (resolved)
 
-### Q8: At reindex, when the file and the registry disagree, which direction wins?
+Resolved 2026-08-16 — override.
 
-Q6 says the fence is generated, which settles the normal case. This
-asks about the abnormal one: a doc arrives on a branch whose fenced
-block does not match the registry — an older export, a rebase, a
-hand-written doc committed before its questions were ever registered.
+**The question was:**
 
-Proposed: the registry wins for anything inside the fence, and a
-question that exists ONLY in the file is ingested as new rather than
-discarded, so a doc can still be authored offline with its questions
-written by hand. The risk is a rebase re-ingesting a question that was
-deliberately withdrawn, which argues for matching on a stable
-question id rather than on heading text.
+> The trim deletes `audit_log` rows past the baseline id; today's
+> design tables survive resets precisely by being outside the log.
+> Event-sourcing design state must not make it trimmable. Options: a
+> kind-allowlist in the trim (design.* rows are platform state, not
+> demo state — the trim already sanctions a baseline gap, so the
+> integrity checker can learn a second sanctioned shape); or design
+> events land in the log for provenance while the registry projection
+> is the durable read state and rebuilds accept the horizon. The
+> first is more machinery; the second quietly gives up
+> rebuild-from-log for one domain. Neither is free — this is the
+> load-bearing question.
+>
+> Proposed: the first, reframed — the trim gets a **scope**, not an
+> allowlist. The epoch trim is a *tenant-data* operation (it exists to
+> reset the demo), and platform-domain history is outside its scope by
+> definition, the same way the Class registry and the workflow rows are.
+> Written as an allowlist it reads like an exception to be maintained;
+> written as a scope it reads like the rule the trim always meant, and
+> the integrity checker learns one second sanctioned shape rather than
+> one per domain.
+>
+> The argument that decides it: if a trim can delete the provenance of a
+> design decision, then "who decided this, when, and against what
+> evidence" becomes unanswerable after any playground reset — and making
+> that question answerable is the entire reason for moving design state
+> into the log. Option two buys less machinery by giving up the property
+> the change is for. It also breaks the correctness protocol's closure
+> claim for one domain, and a rebuilder that is correct for eleven
+> domains and special for the twelfth is a rebuilder nobody trusts.
+
+No longer relevant. These are real jobs that are not subject to trimming.
+
+
+### Q5: What does the release-time export actually produce? (resolved)
+
+Resolved 2026-08-16 — accept.
+
+**The question was:**
+
+> The fold into `architecture-decisions.md` is currently a human
+> editorial act. Generated-from-events can mean: a mechanical
+> appendix (decision entries in order, humans still write the
+> narrative), or a full generation the release owner edits. And does
+> the export PR ride the train as an ordinary code change (proposal:
+> yes — it is the one design artifact that *should*, because it
+> changes the repo)?
+>
+> Proposed: the mechanical appendix, and yes, it rides the train.
+>
+> `architecture-decisions.md` is described in CLAUDE.md as "the one
+> current-truth decision record". Current truth is a synthesis — it says
+> what the system believes NOW, with the superseded reasoning left out.
+> A full generation cannot produce that, because everything it has is
+> the log, and a rendering of the log is a history, not a current truth.
+> Generating the whole file would quietly redefine the document into a
+> changelog and leave the system with no current-truth record at all.
+>
+> So the export writes the part that is mechanically checkable and
+> therefore worth automating: one entry per resolved question, in
+> resolution order, carrying question id, resolution text, deciding
+> actor, and date. The narrative above it stays a human editorial act,
+> and the appendix is what a reader checks it against — the same
+> relationship the audit log has to every other projection.
+>
+> Riding the train is not a nicety: the export changes the repo, so it
+> takes the gate every repo change takes, and a doc export that broke
+> `docs_corpus_presents` would be caught the same way any other red is.
+
+the mechanical appendix, and yes, it rides the train.
+
+
+### Q7: What is a question's state model, now that it has one at all? (resolved)
+
+Resolved 2026-08-16 — accept.
+
+**The question was:**
+
+> `design_questions` has no `status` column today. A question is "open"
+> if its `### Qn:` heading is still in the markdown and "resolved" if it
+> is not — state inferred from the absence of text. That is why answering
+> one requires a commit, and why a stalled flush silently re-opens a
+> review on the next index.
+>
+> Proposed: `open | answered | superseded | withdrawn`, with the answer
+> and its author on the row. `superseded` matters more than it looks —
+> today a re-asked question is a new heading with no link to the old one,
+> so "we already decided this" is unanswerable. Twice on 2026-08-14 the
+> same ground was covered twice for exactly that reason.
+>
+> Is four states right, and does an `answered` question stay visible in
+> the doc under its answer, or move to Decision history immediately?
+
+`open | answered | superseded | withdrawn`, with the answer and its author on the row. `superseded` matters more than it looks — today a re-asked question is a new heading with no link to the old one, so "we already decided this" is unanswerable. Twice on 2026-08-14 the same ground was covered twice for exactly that reason.
+
+
+### Q8: At reindex, when the file and the registry disagree, which direction wins? (resolved)
+
+Resolved 2026-08-16 — override.
+
+**The question was:**
+
+> Q6 says the fence is generated, which settles the normal case. This
+> asks about the abnormal one: a doc arrives on a branch whose fenced
+> block does not match the registry — an older export, a rebase, a
+> hand-written doc committed before its questions were ever registered.
+>
+> Proposed: the registry wins for anything inside the fence, and a
+> question that exists ONLY in the file is ingested as new rather than
+> discarded, so a doc can still be authored offline with its questions
+> written by hand. The risk is a rebase re-ingesting a question that was
+> deliberately withdrawn, which argues for matching on a stable
+> question id rather than on heading text.
+
+I think all questions are in the job packet now which is captured by the audit_log so this isn't an issue.
 
 ## Decision history
 

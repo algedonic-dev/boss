@@ -1,6 +1,6 @@
 # Design: holding the implementation to the design
 
-**Status**: in-review
+**Status**: approved — in-review (2026-08-16).
 **Origin**: David, 2026-08-13: *"Our biggest risk is that we aren't
 holding our actual software implementation to the ideals of our
 design."*
@@ -83,30 +83,61 @@ escalate rather than self-resolve.
 
 ## Open questions
 
-### Q1: Where does the register live?
+All 3 open questions were resolved 2026-08-16 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-Candidates: a table in this doc; a machine-readable file
-(`docs/invariants.toml`) that a lint can read; or rows in a registry
-on the cluster, like every other piece of protocol data.
+---
 
-Proposed: **a file first, a registry later.** A file can be linted
-in CI today, diffed in review, and edited in the same car that
-changes the invariant. Moving it into the cluster is the natural
-end state — invariants are protocol data — but that only pays once
-the file exists and has proven its shape.
 
-### Q2: What is the enforcement standard for a NEW invariant?
+## Decisions
 
-Proposed: a design doc may not resolve a question into a
-load-bearing invariant without declaring its enforcement class. The
-lint enforces the *declaration*, not the strength — an author may
-write `unenforced`, and that honesty is the point. Anything else
-turns the rule into pressure to fake enforcement.
+### Q1: Where does the register live? (resolved)
 
-### Q3: Does the conformance run gate anything?
+Resolved 2026-08-16 — override.
 
-Proposed: **no.** It produces findings and escalations, exactly like
-the packet census produces loss numbers, and neither blocks a train.
-Gating on conformance would make it something to route around; the
-value is the visible number, and the number needs to be trustworthy
-more than it needs to be feared.
+**The question was:**
+
+> Candidates: a table in this doc; a machine-readable file
+> (`docs/invariants.toml`) that a lint can read; or rows in a registry
+> on the cluster, like every other piece of protocol data.
+>
+> Proposed: **a file first, a registry later.** A file can be linted
+> in CI today, diffed in review, and edited in the same car that
+> changes the invariant. Moving it into the cluster is the natural
+> end state — invariants are protocol data — but that only pays once
+> the file exists and has proven its shape.
+
+as proposed
+
+
+### Q3: Does the conformance run gate anything? (resolved)
+
+Resolved 2026-08-16 — override.
+
+**The question was:**
+
+> Proposed: **no.** It produces findings and escalations, exactly like
+> the packet census produces loss numbers, and neither blocks a train.
+> Gating on conformance would make it something to route around; the
+> value is the visible number, and the number needs to be trustworthy
+> more than it needs to be feared.
+
+Agree with proposal.
+
+
+### Q2: What is the enforcement standard for a NEW invariant? (resolved)
+
+Resolved 2026-08-16 — override.
+
+**The question was:**
+
+> Proposed: a design doc may not resolve a question into a
+> load-bearing invariant without declaring its enforcement class. The
+> lint enforces the *declaration*, not the strength — an author may
+> write `unenforced`, and that honesty is the point. Anything else
+> turns the rule into pressure to fake enforcement.
+
+as proposed
