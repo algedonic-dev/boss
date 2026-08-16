@@ -2990,12 +2990,35 @@ mod pg {
             let on_complete_create_json = serde_json::to_value(&spec.on_complete_create)
                 .map_err(|e| WorkflowError::Invalid(e.to_string()))?;
 
+            // `created_by` is the discriminator bootstrap_reconcile uses:
+            // it republishes the code default over any row that reads
+            // 'bootstrap', and preserves anything else. The column
+            // defaults to 'bootstrap', and this INSERT used to omit it —
+            // so a workflow published through the API was stamped as if
+            // the platform seed had written it, and the next boot
+            // silently republished the code default over the operator's
+            // edit.
+            //
+            // That is not hypothetical. Two protocol edits on 2026-08-14
+            // — a `satisfied` terminal added to `user-feedback` v8 and to
+            // `ship-a-change` v4 — were gone by the next day, both kinds
+            // bumped one version with the terminal absent, and nobody
+            // noticed for a day. `approval`, edited the same way but
+            // absent from platform_workflows(), kept its edits, which is
+            // what isolated the cause (68331085).
+            //
+            // Stamping the ACTOR makes the write mean what it says: a
+            // person or agent published this, so reconcile preserves it.
+            // Same posture `publish_authored` already had with
+            // `job-<id>`; this closes the gap for the plain path.
+            let created_by = actor.to_string();
             sqlx::query(
                 "INSERT INTO workflows
                     (kind, version, status, label, description, category,
                      subject_kinds, steps, metadata_schema, entitlements, metadata,
-                     on_complete_create, owning_team, authoring_job_id, created_at)
-                 VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                     on_complete_create, owning_team, authoring_job_id, created_by,
+                     created_at)
+                 VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
             )
             .bind(&spec.kind)
             .bind(spec.version)
@@ -3010,6 +3033,7 @@ mod pg {
             .bind(&on_complete_create_json)
             .bind(&spec.owning_team)
             .bind(spec.authoring_job_id)
+            .bind(&created_by)
             .bind(spec.created_at)
             .execute(&mut *tx)
             .await

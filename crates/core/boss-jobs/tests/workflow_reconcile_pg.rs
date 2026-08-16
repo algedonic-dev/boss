@@ -204,6 +204,74 @@ async fn pg_preserves_operator_edits() {
     );
 }
 
+/// A workflow published through the ORDINARY API path is operator-owned
+/// and survives reconcile.
+///
+/// This is the gap that let two protocol edits vanish. `pg_preserves_
+/// operator_edits` above seeds its operator row with direct SQL, so it
+/// proved reconcile PRESERVES such a row while nothing proved the API
+/// ever produced one — and it did not: `create_draft` omitted
+/// `created_by`, the column defaults to 'bootstrap', and the next boot
+/// republished the code default over the edit.
+///
+/// Measured cost: a `satisfied` terminal added to `user-feedback` v8 and
+/// `ship-a-change` v4 on 2026-08-14 was gone by the next day, both kinds
+/// one version higher with the terminal absent. `approval`, edited the
+/// same way but absent from platform_workflows(), kept its edits — which
+/// is what isolated the cause (68331085).
+///
+/// So this drives the real path end to end rather than asserting the
+/// stamp: draft, publish, reconcile against a DIFFERENT code default,
+/// and check the edit is still there afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_preserves_a_workflow_published_through_the_api() {
+    let db = TestDb::new().await;
+    let registry = PgWorkflows::new(db.pool.clone());
+    let editor = boss_core::actor::ActorId::Human("emp-david".into());
+    let now = chrono::Utc::now();
+
+    let mut edited = spec("workflow-design", "David's Label");
+    edited.status = WorkflowStatus::Draft;
+    registry
+        .create_draft(edited, &editor, now)
+        .await
+        .expect("draft through the ordinary API path");
+    registry
+        .publish("workflow-design", &editor, now)
+        .await
+        .expect("publish");
+
+    assert_eq!(
+        created_by(&db, "workflow-design").await.as_deref(),
+        Some("emp-david"),
+        "an API publish must record WHO published it — 'bootstrap' here is the bug"
+    );
+
+    let stats = registry
+        .bootstrap_reconcile(
+            &[spec("workflow-design", "Default Label")],
+            &reconciler(),
+            now,
+        )
+        .await
+        .expect("reconcile");
+
+    assert_eq!(
+        stats.preserved, 1,
+        "the edit is operator-owned, so reconcile must leave it alone"
+    );
+    assert_eq!(
+        stats.republished, 0,
+        "republishing here is the silent revert"
+    );
+
+    let live = registry.get_active("workflow-design").await.unwrap();
+    assert_eq!(
+        live.label, "David's Label",
+        "the edit survived the boot that used to undo it"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_no_op_when_already_matching() {
     let db = TestDb::new().await;

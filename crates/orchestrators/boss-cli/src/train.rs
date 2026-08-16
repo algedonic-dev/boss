@@ -612,6 +612,50 @@ const SKIP_REASON_FILE_BUDGET: usize = 96;
 /// The skip reason for a car whose branch would not merge onto this
 /// window's train: names the conflicted files, truncated to stay
 /// chip-sized. At least one file always shows.
+/// Replay `branch`'s own commits on top of the consist as it stands,
+/// returning a ref that merges cleanly — or `None` when the car has a
+/// conflict a rebase cannot resolve either.
+///
+/// Rebases from the merge-base, so only the car's OWN work is replayed:
+/// anything it carries that already reached main (the squash-merge
+/// case) is dropped by git as an applied patch rather than re-applied
+/// as a conflict.
+///
+/// Leaves the clone on `train_branch` whatever happens — a caller
+/// mid-consist must not be handed a detached HEAD or a half-finished
+/// rebase, and the next car in the loop merges into whatever branch it
+/// finds itself on.
+fn rerail_onto_consist(clone: &str, train_branch: &str, branch: &str) -> Result<Option<String>> {
+    let scratch = "boss-train-rerail";
+    let car = format!("fork/{branch}");
+    let base_out = sh_unchecked(&["git", "-C", clone, "merge-base", train_branch, &car])?;
+    if !base_out.status.success() {
+        return Ok(None);
+    }
+    let base = stdout_str(&base_out).trim().to_string();
+    if base.is_empty() {
+        return Ok(None);
+    }
+    sh_unchecked(&["git", "-C", clone, "checkout", "-q", "-B", scratch, &car])?;
+    let rebase = sh_unchecked(&[
+        "git",
+        "-C",
+        clone,
+        "rebase",
+        "--onto",
+        train_branch,
+        &base,
+        scratch,
+    ])?;
+    if !rebase.status.success() {
+        sh_unchecked(&["git", "-C", clone, "rebase", "--abort"])?;
+        sh_unchecked(&["git", "-C", clone, "checkout", "-q", train_branch])?;
+        return Ok(None);
+    }
+    sh_unchecked(&["git", "-C", clone, "checkout", "-q", train_branch])?;
+    Ok(Some(scratch.to_string()))
+}
+
 pub(crate) fn skip_reason_conflict(conflicted: &[String]) -> String {
     if conflicted.is_empty() {
         return "conflict: unresolved (merge died before conflict markers)".to_string();
@@ -2655,6 +2699,53 @@ impl Conductor {
                     .map(str::to_string)
                     .collect();
                 sh_unchecked(&["git", "-C", clone, "merge", "--abort"])?;
+
+                // Before abandoning it, try re-railing.
+                //
+                // The commonest conflict here is not a real one. The
+                // repo squash-merges, so a car cut before the last
+                // train — or stacked on a car that has since landed —
+                // carries commits whose CHANGES are already in main but
+                // whose SHAS are not ancestors of it. Merging re-applies
+                // landed hunks on top of themselves and collides.
+                //
+                // `git rebase` is the tool that knows the difference: it
+                // drops a patch already present upstream. So replay the
+                // car's own commits onto the consist as it stands and
+                // merge that instead. A car with a GENUINE conflict
+                // fails the rebase too and is skipped exactly as before.
+                //
+                // Measured cost of not doing this: four cars re-railed
+                // by hand in one evening (2026-08-15), each one a fresh
+                // branch name, a repointed `metadata.branch` and a wait
+                // for the next window — and the same by hand on 08-12
+                // and 08-14. The conductor already knows everything it
+                // needs; it just gave up one step early.
+                if let Some(rerailed) = rerail_onto_consist(clone, &train_branch, &branch)? {
+                    let retry = sh_unchecked(&[
+                        "git",
+                        "-C",
+                        clone,
+                        "merge",
+                        "--no-ff",
+                        "-m",
+                        &format!("train: merge {branch} (re-railed)"),
+                        &rerailed,
+                    ])?;
+                    if retry.status.success() {
+                        log(format!(
+                            "{branch}: re-railed onto the consist — its base was no longer an \
+                             ancestor of main"
+                        ));
+                        // The ORIGINAL head is still what boarded: the
+                        // sweep's licence to delete the branch compares
+                        // against the ref the car names, and re-railing
+                        // changed the shas we merged, not the car.
+                        boarded.push((j, branch, head));
+                        continue;
+                    }
+                    sh_unchecked(&["git", "-C", clone, "merge", "--abort"])?;
+                }
                 // ONE reason string, journal and Job alike — the chip
                 // the yard renders and the line the operator greps
                 // must never tell different stories.
@@ -3047,6 +3138,158 @@ pub async fn run(phase: Phase, dry: bool, now: DateTime<Utc>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    // ---------------------------------------------------------------
+    // Re-railing — the conductor's answer to a squash-merged base.
+    // ---------------------------------------------------------------
+
+    /// The exact shape that cost four hand re-rails on 2026-08-15: a
+    /// car whose work is partly in main already, because the branch it
+    /// was cut from was SQUASH-merged and so is not an ancestor of
+    /// main. Merging re-applies the landed hunk onto itself; rebasing
+    /// recognises it as already applied and drops it.
+    #[test]
+    fn a_car_whose_base_was_squash_merged_is_re_railed_not_skipped() {
+        let dir = std::env::temp_dir().join(format!("boss-rerail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        let git = |args: &[&str]| {
+            let mut a = vec!["git", "-C", d];
+            a.extend_from_slice(args);
+            let out = sh_unchecked(&a).unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", stdout_str(&out));
+        };
+        let write = |name: &str, body: &str| {
+            std::fs::write(dir.join(name), body).unwrap();
+        };
+
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        write("base.txt", "base\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        // The parent car adds a line; the child car is cut from it and
+        // adds another to the SAME file.
+        git(&["checkout", "-q", "-b", "parent"]);
+        write("shared.txt", "from parent\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "parent work"]);
+        git(&["checkout", "-q", "-b", "child"]);
+        write("shared.txt", "from parent\nfrom child\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "child work"]);
+
+        // The parent lands as a SQUASH — new sha, same content, and
+        // `parent` is now not an ancestor of main.
+        git(&["checkout", "-q", "main"]);
+        git(&["merge", "-q", "--squash", "parent"]);
+        git(&["commit", "-q", "-m", "train: parent (squashed)"]);
+
+        // The conductor's world: fork/<branch> refs and a train branch
+        // cut from main.
+        git(&["update-ref", "refs/remotes/fork/child", "child"]);
+        git(&["checkout", "-q", "-B", "train", "main"]);
+
+        // A plain merge collides on the line the squash already landed.
+        let merged = sh_unchecked(&[
+            "git",
+            "-C",
+            d,
+            "merge",
+            "--no-ff",
+            "-m",
+            "train: merge child",
+            "fork/child",
+        ])
+        .unwrap();
+        assert!(
+            !merged.status.success(),
+            "the bug only exists because this merge conflicts"
+        );
+        sh_unchecked(&["git", "-C", d, "merge", "--abort"]).unwrap();
+
+        // Re-railing replays only the child's own commit and lands it.
+        let rerailed = rerail_onto_consist(d, "train", "child")
+            .unwrap()
+            .expect("a squash-merged base is exactly what rebase resolves");
+        let retry = sh_unchecked(&[
+            "git",
+            "-C",
+            d,
+            "merge",
+            "--no-ff",
+            "-m",
+            "train: merge child (re-railed)",
+            &rerailed,
+        ])
+        .unwrap();
+        assert!(retry.status.success(), "re-railed car must merge cleanly");
+
+        let body = std::fs::read_to_string(dir.join("shared.txt")).unwrap();
+        assert_eq!(
+            body, "from parent\nfrom child\n",
+            "the child's work lands on top of the parent's, once"
+        );
+
+        // And the clone is left on the train branch, ready for the next
+        // car in the loop.
+        let head = sh_unchecked(&["git", "-C", d, "rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        assert_eq!(stdout_str(&head).trim(), "train");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A car that genuinely disagrees with the consist still gets
+    /// skipped — re-railing must not paper over a real conflict.
+    #[test]
+    fn a_real_conflict_still_refuses_to_re_rail() {
+        let dir = std::env::temp_dir().join(format!("boss-rerail-real-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        let git = |args: &[&str]| {
+            let mut a = vec!["git", "-C", d];
+            a.extend_from_slice(args);
+            let out = sh_unchecked(&a).unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", stdout_str(&out));
+        };
+
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("f.txt"), "original\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        git(&["checkout", "-q", "-b", "car"]);
+        std::fs::write(dir.join("f.txt"), "the car's answer\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "car"]);
+
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(dir.join("f.txt"), "a different answer\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "someone else"]);
+
+        git(&["update-ref", "refs/remotes/fork/car", "car"]);
+        git(&["checkout", "-q", "-B", "train", "main"]);
+
+        assert!(
+            rerail_onto_consist(d, "train", "car").unwrap().is_none(),
+            "two answers to the same line is a conflict a human owns"
+        );
+        let head = sh_unchecked(&["git", "-C", d, "rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        assert_eq!(
+            stdout_str(&head).trim(),
+            "train",
+            "a failed re-rail must still leave the clone usable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::{
         ApiFailure, Failure, JOBS_API_RETRY, MAX_RED_TRAINS, RetryPolicy, SweepGuard,
         arrival_report, arrival_summary, auto_cancel_reason, boarded_head, branch_moved_line,
