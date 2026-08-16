@@ -257,3 +257,68 @@ ready_when = "steps.measure.done OR steps.design-review.done OR steps.build.done
 title_template = "Backlog item closed"
 metadata_defaults = { outcome_kind = "completed" }
 terminal = { outcome = "completed" }
+
+# ---------------------------------------------------------------------
+# design-doc — the doc IS the packet until it settles.
+#
+# David, 2026-08-16: "Should we just have an MD payload in the packet?
+# It only writes to file when the job terminates?" Yes, and the reason
+# is that the current protocol cannot start a review until the thing
+# being reviewed has already shipped. review-design.js carries a 404
+# message apologising for exactly that — "review Jobs are instant data
+# but docs ride trains" — and every design-review bug this week lived
+# in the backflow that arrangement requires: the flusher pushing to the
+# wrong remote, duplicate flush jobs, an anchor-not-found message that
+# could not tell "already answered" from "wrong doc", and a spawn rule
+# that asks a level question on an edge.
+#
+# THIS DELETES THE BACKFLOW rather than repairing it. The prose and the
+# questions ride in step metadata, so there is nothing to index, nothing
+# to flush, and no round trip: the packet is reviewable the second it
+# exists. `review-design.js` reads `metadata.questions` when present and
+# falls back to the docs API when absent, so the ten in-flight
+# design-doc-review Jobs are untouched.
+#
+# It is NOT a rejection of markdown files. David's own Q6 on
+# design-docs-as-data settled the split — "file wins on prose, data wins
+# on questions" — and CLAUDE.md already says settled material folds into
+# architecture-decisions.md and the source doc is deleted. This only
+# moves WHERE the file appears: at the end, as the residue, rather than
+# at the start as a precondition. A doc under discussion has no business
+# in git; git's value is review and history over things that have
+# stopped moving.
+#
+# `publish` is deliberately a plain terminal that records the path
+# rather than a step that writes the file. Writing it is a car's job —
+# David's answer to design-docs-as-data Q4, twice: "the docs car that
+# carries the flush through a train".
+[[workflow]]
+kind = "design-doc"
+label = "Design doc"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "A design doc while it is still being decided. The prose and the open questions ride in the packet, so it is reviewable the moment it exists rather than after it ships; the markdown lands as a file only when the packet terminates. Replaces the index-and-flush round trip that made a review possible only after its doc reached deployed main."
+metadata = { owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "drafted"
+kind = "trigger"
+ready_when = "true"
+title_template = "Draft written"
+metadata_defaults = { trigger_kind = "operator", trigger_name = "author-drafts-a-design-doc" }
+
+[[workflow.step]]
+title = "review"
+kind = "review-design"
+ready_when = "steps.drafted.done"
+title_template = "Answer the open questions"
+authority_role = "platform-admin"
+
+[[workflow.step]]
+title = "published"
+kind = "outcome"
+ready_when = "steps.review.done"
+title_template = "Settled — carry it to a file"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "published" }

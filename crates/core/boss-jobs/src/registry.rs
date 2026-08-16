@@ -3616,6 +3616,34 @@ mod tests {
     /// holding one. A kind that leaves the code without arriving in
     /// the bundle exists in neither place on a fresh deployment, and
     /// nothing else in the tree would have said so.
+    /// The bundle's own kinds pass the same viability lint the code
+    /// kinds do.
+    ///
+    /// `validate_all` is what proves a protocol can FINISH — that
+    /// every terminal is reachable and no step is orphaned. Rust
+    /// kinds get it via `platform_workflows_passes_validate_all`;
+    /// until now nothing pointed it at the bundle, so a protocol
+    /// authored as data had strictly less checking than one authored
+    /// as a literal. That gap is the wrong incentive to leave in
+    /// place while the whole direction of travel is protocols
+    /// becoming data.
+    #[test]
+    fn the_bundle_is_as_viable_as_the_code() {
+        use crate::step_registry::StepRegistry;
+        use crate::workflow_lint::validate_all;
+        let bundled = crate::seed_loader::load_workflows(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../infra/platform/workflows.toml"
+        ))
+        .expect("the platform bundle parses");
+        let registry = StepRegistry::v1();
+        let findings = validate_all(&bundled, &registry);
+        assert!(
+            findings.is_empty(),
+            "the platform bundle has viability findings: {findings:#?}"
+        );
+    }
+
     #[test]
     fn the_platform_bundle_matches_the_specs_it_replaced() {
         let bundle_path = concat!(
@@ -3629,11 +3657,39 @@ mod tests {
             regenerate_deployment_spec(),
             backlog_item_spec(),
         ];
-        assert_eq!(
-            bundled.len(),
-            expected.len(),
-            "bundle and converted-spec list disagree — a kind was moved without moving its pin"
-        );
+        // Every CONVERTED kind must still be here. This is the
+        // load-bearing half and it has earned its keep: it went red
+        // the first time three kinds were removed from
+        // `platform_workflows()` against a bundle holding one. A kind
+        // that leaves the code without arriving in the bundle exists
+        // in neither place on a fresh deployment.
+        //
+        // Not a length equality any more, because the bundle is now
+        // also where NEW platform kinds are authored — `design-doc` was
+        // never a Rust literal and has no spec to be faithful to.
+        // Requiring len() to match would mean every new protocol
+        // authored as data had to be added to a list of things
+        // converted FROM code, which is backwards: the whole direction
+        // of travel is that a new protocol never touches Rust at all.
+        for want in &expected {
+            assert!(
+                bundled.iter().any(|b| b.kind == want.kind),
+                "`{}` was converted to the bundle and has gone missing from it",
+                want.kind
+            );
+        }
+        // …and nothing in the bundle may SHADOW a kind the code still
+        // seeds. That is the other direction of the same guarantee: a
+        // kind in both places gets its bundle row republished from
+        // code by bootstrap_reconcile on every boot.
+        for b in &bundled {
+            assert!(
+                !platform_workflows().iter().any(|p| p.kind == b.kind),
+                "`{}` is in BOTH the bundle and platform_workflows() — bootstrap_reconcile \
+                 will republish the code version over the bundle's on every boot",
+                b.kind
+            );
+        }
         for want in &expected {
             let got = bundled
                 .iter()

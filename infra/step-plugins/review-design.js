@@ -124,7 +124,13 @@
 .step-review-design .srd-doc-inner td {
   border: 1px solid var(--border, #e7e5e4); padding: 6px 10px; text-align: left;
 }
-.step-review-design .srd-docmeta {
+.step-review-design .srd-rawmd {
+      white-space: pre-wrap;
+      word-break: break-word;
+      font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+      margin: 12px 0 0;
+    }
+    .srd-docmeta {
   font-size: 12px; color: var(--text-dim, #78716c);
   margin-bottom: 18px; padding-bottom: 10px;
   border-bottom: 1px solid var(--border, #e7e5e4);
@@ -262,6 +268,12 @@
 
     let doc = null;
     let questions = [];
+    // True when the questions came from the packet rather than the
+    // docs API. Decides whether answers are mirrored to
+    // pending-decisions: a self-carried packet's answers live in step
+    // metadata, which IS the record, so mirroring them into the flush
+    // pipeline would create a second copy that can disagree.
+    let selfCarried = false;
     let loadError = null;
     let saving = false;
     let saveError = null;
@@ -389,11 +401,16 @@
       // thing they are reviewing.
       const docPane = h('div', { className: 'srd-doc' });
       const inner = h('div', { className: 'srd-doc-inner' });
+      // A self-carried packet has no path/status/word_count — it is not
+      // a file yet, which is the point. Say what it IS instead of
+      // rendering three `undefined`s.
       inner.appendChild(
         h(
           'div',
           { className: 'srd-docmeta' },
-          `${doc.path} · ${doc.status} · ${doc.word_count || '—'} words`,
+          doc.path
+            ? `${doc.path} · ${doc.status} · ${doc.word_count || '—'} words`
+            : 'carried by this packet · not yet a file',
         ),
       );
       if (doc.content_html) {
@@ -402,6 +419,15 @@
         // pulldown_cmark pipeline that renders the design page — same
         // trust domain as this bundle.
         prose.innerHTML = doc.content_html;
+        inner.appendChild(prose);
+      } else if (doc.markdown) {
+        // A SELF-CARRIED packet's prose is NOT server-rendered and NOT
+        // in the same trust domain — it is whatever the author put in
+        // step metadata. So it goes in as TEXT, never innerHTML. The
+        // branch above earns its innerHTML by being pulldown_cmark
+        // output; this one has earned nothing.
+        const prose = h('pre', { className: 'srd-rawmd' });
+        prose.textContent = doc.markdown;
         inner.appendChild(prose);
       }
       docPane.appendChild(inner);
@@ -580,7 +606,7 @@
       saveError = null;
       renderActions();
       try {
-        await persistPendingDecisions();
+        if (!selfCarried) await persistPendingDecisions();
         const completing = autoComplete && (allAnswered() || questions.length === 0);
         const workingStatus = step.status === 'pending' ? 'active' : step.status;
         const finalMeta = { ...step.metadata, doc_path: docPath, resolutions };
@@ -625,8 +651,48 @@
     }
 
     async function load() {
+      // SELF-CARRIED FIRST. When the step brings its own questions,
+      // this plugin needs no docs-api and no file on deployed main —
+      // the packet IS the doc.
+      //
+      // That is the whole point. The fetch below carries a 404 message
+      // apologising that "review Jobs are instant data but docs ride
+      // trains, so a review can exist before its doc reaches deployed
+      // main" — which is a fair description of a review protocol that
+      // cannot start until the thing being reviewed has already
+      // shipped. David, 2026-08-16: "our lack of good protocol around
+      // design docs, and the plumbing being broken too, is causing
+      // major slowdowns in my design review handling speed."
+      //
+      // Backward compatible on purpose: every existing
+      // design-doc-review Job has no `questions` key and takes the
+      // fetch path exactly as before. Nothing in flight changes.
+      const carried = step.metadata && step.metadata.questions;
+      if (Array.isArray(carried) && carried.length > 0) {
+        selfCarried = true;
+        questions = carried.map((q, i) => ({
+          anchor: String(q.anchor || `Q${i + 1}`),
+          title: String(q.title || q.question || ''),
+          proposal: typeof q.proposal === 'string' ? q.proposal : '',
+          body: typeof q.body === 'string' ? q.body : '',
+        }));
+        doc = {
+          title: String((step.metadata && step.metadata.title) || docPath || 'Design doc'),
+          // The prose rides with the packet too, so the reviewer reads
+          // the doc and answers its questions on one surface.
+          content_html: null,
+          markdown: String((step.metadata && step.metadata.markdown) || ''),
+        };
+        renderHeader();
+        renderBody();
+        renderProgress();
+        renderActions();
+        return;
+      }
       if (!docPath) {
-        loadError = 'step.metadata.doc_path is empty';
+        loadError =
+          'this step carries neither metadata.questions nor metadata.doc_path — ' +
+          'nothing to review';
         renderBody();
         renderProgress();
         renderActions();

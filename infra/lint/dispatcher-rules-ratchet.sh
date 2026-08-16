@@ -81,7 +81,17 @@ set -euo pipefail
 # reaction was introduced, and the drift guard
 # (`dispatcher_rules_seed_matches_toml`) is what forced the catch-up
 # after it reddened the 13-car train 20260815-0621.
-BASELINE=47
+# 47 -> 48 (2026-08-16, migration 141). `design-review-level-sweep`.
+# A TIMER, the exemption above, and the clearest case of it yet: the
+# condition it watches is a standing STATE of the corpus — "docs with
+# open questions and nobody reviewing them" — which no Workflow
+# definition can declare because no packet causes it. That is not a
+# technicality; asking a level question only on an edge IS the defect
+# (ae8a14f7), and roughly twenty-three questions were unreachable
+# because of it. It adds no routing: the sweep only admits packets the
+# existing `design-review-spawn` rule would have admitted, and hands
+# them to the same `jobs.spawn` args.
+BASELINE=48
 RULES_FILE="infra/dispatcher/rules.toml"
 
 count=$(grep -c '^\[\[rule\]\]' "$RULES_FILE")

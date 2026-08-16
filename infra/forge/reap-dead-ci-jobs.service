@@ -1,0 +1,12 @@
+[Unit]
+Description=Reap the containers and volumes of crashed CI jobs
+Documentation=file:/opt/boss/infra/forge/reap-dead-ci-jobs.sh
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# The script sudos to docker if it has to; running as root avoids that
+# and keeps the unit's failure modes to the script's own.
+User=root
+ExecStart=/home/david/boss/infra/forge/reap-dead-ci-jobs.sh

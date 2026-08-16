@@ -1,0 +1,14 @@
+[Unit]
+Description=Reap crashed CI jobs daily
+
+[Timer]
+# Daily, not hourly. The orphan this reclaims took two days to cause a
+# failure, and the 6h grace period inside the script means a tighter
+# cadence would reap nothing extra — it would only add chances to race
+# a job that is still finishing.
+OnBootSec=15min
+OnUnitActiveSec=24h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -7,6 +7,11 @@
 #
 # Usage:
 #   infra/gate.sh                 # full gate — exactly what CI runs
+#   infra/gate.sh --auto          # car mode, scope DERIVED from the
+#                                 # tree. Skips cargo entirely when
+#                                 # nothing changed implies a crate —
+#                                 # 74 of 164 live branches are in that
+#                                 # class. Never used by CI.
 #   infra/gate.sh -p crate [...]  # car mode — cargo phases scoped to
 #                                 # the named crates (FULL suites, all
 #                                 # features); lints + fmt always run
@@ -25,12 +30,22 @@ cd "$(dirname "$0")/.."
 
 SCOPE=()
 NAMED=()
+AUTO=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -p) shift; SCOPE+=(-p "${1:?-p needs a crate name}"); NAMED+=("$1"); shift ;;
-        *) echo "gate.sh: unknown arg: $1 (only -p <crate> is accepted)" >&2; exit 2 ;;
+        --auto) AUTO=1; shift ;;
+        *) echo "gate.sh: unknown arg: $1 (accepts -p <crate> and --auto)" >&2; exit 2 ;;
     esac
 done
+# Alternatives, not companions: --auto derives exactly what -p states,
+# so accepting both would mean silently preferring one belief over the
+# other — and the whole point of the refusal below is that a stated
+# belief gets checked, never quietly overridden.
+if [ "$AUTO" -eq 1 ] && [ ${#NAMED[@]} -gt 0 ]; then
+    echo "gate.sh: --auto and -p are alternatives; --auto derives what -p would state" >&2
+    exit 2
+fi
 
 # ---------------------------------------------------------------------
 # `-p` states a belief; the tree states a fact
@@ -57,6 +72,22 @@ done
 #       every one), so a docs-only change really can fail a crate's
 #       tests. Path-to-crate is not the same question as which SOURCE
 #       files a crate compiles.
+#
+#   The same reasoning, four more times — each one a file some crate's
+#   test READS, so changing it can redden that crate without touching
+#   a line of its source:
+#     infra/gate.sh, infra/lint/*, .forgejo/workflows/ci.yml
+#         -> boss-testing, which owns gate_sh.rs. That test pins that
+#            ci.yml invokes this script, that this script runs every
+#            check, and that every executable in infra/lint/ appears
+#            here. Omitting these would let `--auto` skip the only
+#            test guarding the file being edited — which this very car
+#            would have done to itself.
+#     infra/dispatcher/rules.toml -> boss-dispatcher, which owns
+#            dispatcher_rules_seed.rs. It compares the seeded registry
+#            against that file in BOTH directions, and skipping the
+#            toml half is what reddened the 13-car train
+#            20260815-0621.
 #
 #   Anything else (infra/, apps/, .forgejo/) maps to no crate and is
 #       REPORTED rather than ignored. The lints already run repo-wide,
@@ -89,7 +120,12 @@ crates_from_paths() {
 # rule under test is paths -> crates; staging files would test git.
 path_map() {
     sed -n -e 's|^crates/[^/]*/\([^/]*\)/.*|\1|p' \
-           -e 's|^docs/design/.*|boss-docs|p' | sort -u | tr '\n' ' '
+           -e 's|^docs/design/.*|boss-docs|p' \
+           -e 's|^infra/gate\.sh$|boss-testing|p' \
+           -e 's|^infra/lint/.*|boss-testing|p' \
+           -e 's|^\.forgejo/workflows/ci\.yml$|boss-testing|p' \
+           -e 's|^infra/dispatcher/rules\.toml$|boss-dispatcher|p' \
+           | sort -u | tr '\n' ' '
 }
 
 scope_self_test() {
@@ -119,9 +155,21 @@ scope_self_test() {
     _case "a crate's root files count" "boss-jobs" "crates/core/boss-jobs/Cargo.toml"
     # Everything outside those two trees implies nothing to scope —
     # the lints already run repo-wide.
-    _case "infra implies no crate" "" "infra/gate.sh" ".forgejo/workflows/ci.yml"
+    # gate.sh and ci.yml are READ by boss-testing's gate_sh.rs, so a
+    # change to either must compile and run that crate.
+    _case "the gate's own files imply boss-testing" "boss-testing" \
+        "infra/gate.sh" ".forgejo/workflows/ci.yml" "infra/lint/no-secrets.sh"
+    _case "the dispatcher rule file implies boss-dispatcher" "boss-dispatcher" \
+        "infra/dispatcher/rules.toml"
+    _case "other infra implies no crate" "" \
+        "infra/forge/locomotive.sh" "infra/deploy-services.sh"
     _case "docs outside design/ imply no crate" "" "docs/invariants/x.toml" "README.md"
     _case "the web app implies no crate" "" "apps/web/src/me/MePage.svelte"
+    # Schema files imply no CRATE, which is why --auto asks
+    # `schema_touched` separately rather than reading it off this map.
+    # Get this wrong in the other direction — map schema to some crate
+    # — and every migration would compile a crate for no reason.
+    _case "a migration implies no crate" "" "infra/postgres/schema/141-x.sql"
     if [ "$fails" -ne 0 ]; then
         echo "gate.sh: the scope check cannot be trusted — fix it before relying on -p" >&2
         exit 2
@@ -149,6 +197,56 @@ if [ ${#NAMED[@]} -gt 0 ]; then
             echo "this rule was earned — this is the moment to notice." >&2
             exit 2
         fi
+    fi
+fi
+
+# ---------------------------------------------------------------------
+# `--auto`: derive the scope instead of stating it
+# ---------------------------------------------------------------------
+# The refusal above is the SAFETY half of scoping — it stops a `-p`
+# that misses a crate. This is the efficiency half, and it is worth
+# having on a measured basis: of 164 live branches, 74 touch no Rust
+# at all, and two of the fourteen cars shipped on 2026-08-16 were in
+# that class. For those, everything cargo does is dead weight — the
+# lint roster and fmt are the entire useful gate, thirty seconds
+# against eight to fifteen minutes.
+#
+# A FLAG, not the default, because bare `infra/gate.sh` is what CI
+# invokes and must keep meaning "the whole workspace,
+# unconditionally". A gate that quietly narrowed itself in CI would be
+# the same hole as the mis-scoped `-p` that reddened a three-car train
+# (a6ffcb7c), pointed the other way.
+#
+# THE FIXTURE IS THE SUBTLE PART. `infra/postgres/schema/**` maps to no
+# crate, but the shared fixture LOADS the schema — so a schema-only
+# change has no crate to compile and can still break every DB-backed
+# test in the workspace. Skipping cargo entirely there would scope away
+# the exact break the fixture check exists to catch, which is what the
+# comment above `check "fixture"` warns about. So the derivation
+# answers two questions: which crates, and whether the fixture is
+# implicated.
+schema_touched() {
+    if changed_paths | grep -qE '^infra/postgres/schema/'; then echo yes; else echo no; fi
+}
+
+AUTO_LINTS_ONLY=0
+AUTO_SKIP_FIXTURE=0
+if [ "$AUTO" -eq 1 ]; then
+    scope_self_test
+    DERIVED=$(crates_from_paths)
+    if [ -n "$DERIVED" ]; then
+        for c in $DERIVED; do SCOPE+=(-p "$c"); NAMED+=("$c"); done
+        echo "gate: --auto scoping to $(echo "$DERIVED" | tr '\n' ' ')"
+    elif [ "$(schema_touched)" = "yes" ]; then
+        # No crate, but the schema moved: the fixture is the one check
+        # that can see that, so it runs and nothing else cargo-shaped.
+        AUTO_LINTS_ONLY=1
+        echo "gate: --auto — no crate changed, but infra/postgres/schema/ did; fixture + lints only"
+    else
+        AUTO_LINTS_ONLY=1
+        AUTO_SKIP_FIXTURE=1
+        echo "gate: --auto — nothing changed implies a crate; lints + fmt only"
+        echo "gate: (changed: $(changed_paths | tr '\n' ' '))"
     fi
 fi
 
@@ -180,9 +278,15 @@ check() {
 # so scoping the gate to the changed crate scoped the check away and the
 # first thing to notice was a train. Running it unscoped here puts a
 # fixture break in front of the agent who caused it.
-check "fixture" cargo test -p boss-testing --features postgres --test fixture_smoke
+if [ "$AUTO_SKIP_FIXTURE" -eq 1 ]; then
+    echo "gate: skipping fixture — no crate and no schema change to break it"
+else
+    check "fixture" cargo test -p boss-testing --features postgres --test fixture_smoke
+fi
 
-if [ "${#SCOPE[@]}" -eq 0 ]; then
+if [ "$AUTO_LINTS_ONLY" -eq 1 ]; then
+    echo "gate: skipping clippy / build / test — nothing changed implies a crate"
+elif [ "${#SCOPE[@]}" -eq 0 ]; then
     # Full gate — the CI shape.
     check "clippy"  cargo clippy --workspace --all-features --tests -- -D warnings
     # Default-feature build: a dangling `#[cfg(feature = ...)]` rebinds

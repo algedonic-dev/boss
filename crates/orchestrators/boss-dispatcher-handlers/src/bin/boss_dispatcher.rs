@@ -20,8 +20,8 @@ use boss_dispatcher::rules::runner::RulesRunner;
 use boss_dispatcher::rules::schedule_runner::{DEFAULT_CATCHUP_CAP, ScheduleRunner};
 use boss_dispatcher_handlers::handlers::{
     bill_payment_batch::BillPaymentBatch, commerce_invoice_issue::CommerceInvoiceIssue,
-    docs_flush_queue::DocsFlushQueue, gate_resolve::GateResolve,
-    inventory_bill_approve::InventoryBillApprove,
+    docs_design_sweep::DocsDesignSweep, docs_flush_queue::DocsFlushQueue,
+    gate_resolve::GateResolve, inventory_bill_approve::InventoryBillApprove,
     inventory_overhead_absorb::InventoryOverheadAbsorb,
     inventory_parts_consume::InventoryPartsConsume, inventory_parts_produce::InventoryPartsProduce,
     inventory_po_place::InventoryPoPlace, inventory_receive::InventoryReceive,
@@ -240,6 +240,13 @@ async fn main() -> Result<()> {
             // (cea82de0 link 1; the worker stays operator-run until
             // its tree/remote question is decided).
             handlers.register(DocsFlushQueue::new(cfg.docs_api_url.clone()));
+            // Reads the docs corpus AND the jobs board: the level
+            // question spans both, which is why it is a sweep rather
+            // than anything either service could answer alone.
+            handlers.register(DocsDesignSweep::new(
+                cfg.docs_api_url.clone(),
+                cfg.jobs_api_url.clone(),
+            ));
             handlers.register(MessagesNotify::new(
                 cfg.people_api_url.clone(),
                 cfg.messages_api_url.clone(),

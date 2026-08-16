@@ -81,6 +81,9 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         ("people.terminate", vec!["people.employee.updated"]),
         ("shipping.create", vec!["shipping.shipment.created"]),
         ("jobs.spawn", vec!["jobs.job.created"]),
+        // Delegates to jobs.spawn per orphaned doc, so it emits
+        // whatever that emits — and nothing of its own.
+        ("docs.design.sweep", vec!["jobs.job.created"]),
         ("jobs.complete_step", vec!["jobs.step.completed"]),
         // Clears waiting_on via PUT /api/jobs — the update emits
         // jobs.job.updated (and wakes metadata-gated steps in the
