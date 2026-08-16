@@ -46,6 +46,13 @@
     last_seen_at: string;
   };
 
+  type StaleStatus = {
+    path: string;
+    title: string;
+    status: string;
+    reason: string;
+  };
+
   let docs = $state<ReadonlyArray<DesignDoc>>([]);
   // Docs on disk that are NOT in the list below, and why. Empty is the
   // healthy state. Without this the panel silently showed a partial
@@ -53,6 +60,12 @@
   // as "nobody wrote it" — which is how transactional-audit-log.md
   // stayed invisible for six days.
   let rejections = $state<ReadonlyArray<Rejection>>([]);
+  // The quieter sibling of a rejection. A rejected doc is missing; a
+  // doc whose status drifted is present and lying — it says "in
+  // review" with nothing left to review. Eleven of the twenty docs
+  // claiming to be live were in that state on 2026-08-15, every one
+  // wrong in the same direction, and nothing surfaced it (0b8ae875).
+  let staleStatuses = $state<ReadonlyArray<StaleStatus>>([]);
   let queue = $state<DesignQueueEnvelope | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
@@ -103,6 +116,11 @@
       // route was unavailable.)
       rejections = await fetch('/api/design/rejections')
         .then((r) => (r.ok ? (r.json() as Promise<Rejection[]>) : []))
+        .catch(() => []);
+      // Same degrade-to-empty contract as rejections above: a report
+      // about the corpus must never be able to blank the corpus.
+      staleStatuses = await fetch('/api/design/stale-statuses')
+        .then((r) => (r.ok ? (r.json() as Promise<StaleStatus[]>) : []))
         .catch(() => []);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -246,6 +264,32 @@
   <p class="design-error">Error: {error}</p>
 {:else}
   {#each panels as panel (panel)}
+    {#if panel === 'rejections' && staleStatuses.length > 0}
+      <Section title={`Status drifted (${staleStatuses.length})`} wide>
+        <p class="reject-lede">
+          These docs say they are under discussion but have no open
+          questions. The status line is hand-written and almost
+          nothing updates it, so it goes stale by default — a doc that
+          reads <code>in-review</code> here may simply be finished.
+          Not an error: a doc can legitimately wait on a person with
+          nothing registered. It is a prompt to check.
+        </p>
+        <table class="design-table">
+          <thead>
+            <tr><th>Doc</th><th>Says</th><th>Why it looks wrong</th></tr>
+          </thead>
+          <tbody>
+            {#each staleStatuses as d (d.path)}
+              <tr>
+                <td><code>{d.path}</code></td>
+                <td class="reject-age">{d.status}</td>
+                <td class="reject-reason">{d.reason}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </Section>
+    {/if}
     {#if panel === 'rejections' && rejections.length > 0}
       <Section title={`Not indexed (${rejections.length})`} wide>
         <p class="reject-lede">

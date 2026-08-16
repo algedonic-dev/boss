@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::port::{DocsError, DocsRepository};
 use crate::reindex::{self, ReindexStats};
 use crate::types::{
-    DesignDoc, DesignQuestion, FlushJobPayload, JobStatus, JobStatusUpdate, PendingDecisionInput,
+    DesignDoc, DesignQuestion, DocStatus, FlushJobPayload, JobStatus, JobStatusUpdate,
+    PendingDecisionInput,
 };
 
 /// Shared state for the HTTP layer.
@@ -36,6 +37,7 @@ pub fn router(state: DocsApiState) -> Router {
         .route("/api/docs/health", get(health))
         .route("/api/design/docs", get(list_docs))
         .route("/api/design/rejections", get(list_rejections))
+        .route("/api/design/stale-statuses", get(list_stale_statuses))
         .route("/api/design/docs/{*path}", get(get_doc))
         .route("/api/design/reindex", post(post_reindex))
         .route("/api/design/pending-decisions", post(post_pending_decision))
@@ -114,6 +116,68 @@ async fn list_rejections(State(state): State<Arc<DocsApiState>>) -> Response {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => err_to_response(e),
     }
+}
+
+/// A doc whose status line no longer describes it.
+#[derive(Serialize)]
+pub struct StaleStatus {
+    pub path: String,
+    pub title: String,
+    pub status: String,
+    pub reason: String,
+}
+
+/// Which docs claim live discussion while having nothing open?
+///
+/// Pure, and separated from the read so the rule can be tested
+/// without a database — the rule is the whole content of this
+/// feature, and it is one a person will want to argue with.
+///
+/// DERIVED, NOT STORED, which is the difference between this and
+/// `design_doc_rejections`. A rejection is a fact with a history
+/// worth keeping ("failing since Tuesday"); a stale status is just
+/// what the current rows say when you read them together, so storing
+/// it would create a second copy that can disagree with the first.
+/// The corpus tells on itself at read time or not at all.
+pub(crate) fn stale_statuses(rows: &[(String, String, DocStatus, usize)]) -> Vec<StaleStatus> {
+    rows.iter()
+        .filter(|(_, _, status, open)| status.claims_live_discussion() && *open == 0)
+        .map(|(path, title, status, _)| StaleStatus {
+            path: path.clone(),
+            title: title.clone(),
+            status: status.as_str().to_string(),
+            reason: format!(
+                "status is `{}`, which asserts live discussion, but the doc has no open questions",
+                status.as_str()
+            ),
+        })
+        .collect()
+}
+
+/// `GET /api/design/stale-statuses` — docs whose status line has
+/// drifted from what the doc actually is.
+///
+/// A REPORT, never a rejection, and the distinction is load-bearing.
+/// `crates-and-layers.md` reads `in-review (agent draft; the
+/// re-tiering call is david's)` — a doc legitimately waiting on a
+/// person with no questions registered. Refusing to index that would
+/// be wrong, and a rule that has to be right about intent is a rule
+/// that will be wrong about it. Saying "these eleven claim to be
+/// live and are not" needs no such judgement.
+async fn list_stale_statuses(State(state): State<Arc<DocsApiState>>) -> Response {
+    let docs = match state.repo.all_docs().await {
+        Ok(docs) => docs,
+        Err(e) => return err_to_response(e),
+    };
+    let mut rows = Vec::with_capacity(docs.len());
+    for doc in docs {
+        let open = match state.repo.questions_for_doc(&doc.path).await {
+            Ok(qs) => qs.iter().filter(|q| !q.resolved).count(),
+            Err(e) => return err_to_response(e),
+        };
+        rows.push((doc.path, doc.title, doc.status, open));
+    }
+    Json(stale_statuses(&rows)).into_response()
 }
 
 async fn list_docs(State(state): State<Arc<DocsApiState>>) -> Response {
@@ -822,5 +886,82 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+}
+
+#[cfg(test)]
+mod stale_status_tests {
+    use super::stale_statuses;
+    use crate::types::DocStatus;
+
+    fn row(path: &str, status: DocStatus, open: usize) -> (String, String, DocStatus, usize) {
+        (path.to_string(), format!("Title of {path}"), status, open)
+    }
+
+    // The measured case. Eleven docs read like this on 2026-08-15 and
+    // nothing in the system said so.
+    #[test]
+    fn a_doc_claiming_review_with_nothing_open_is_reported() {
+        let got = stale_statuses(&[row("docs/design/a.md", DocStatus::InReview, 0)]);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].reason.contains("in-review"), "{}", got[0].reason);
+        assert!(
+            got[0].reason.contains("no open questions"),
+            "{}",
+            got[0].reason
+        );
+    }
+
+    #[test]
+    fn draft_and_reopened_claim_discussion_too() {
+        let got = stale_statuses(&[
+            row("a.md", DocStatus::Draft, 0),
+            row("b.md", DocStatus::Reopened, 0),
+        ]);
+        assert_eq!(got.len(), 2);
+    }
+
+    // The half that keeps this a report worth reading. A doc with
+    // live questions is doing exactly what its status says.
+    #[test]
+    fn a_doc_with_open_questions_is_not_stale() {
+        assert!(stale_statuses(&[row("a.md", DocStatus::InReview, 3)]).is_empty());
+    }
+
+    // Settled statuses are the OTHER predicate's business — the
+    // reindex already rejects a shipped doc carrying questions, and
+    // reporting them here as well would double-count the same drift
+    // under two names.
+    #[test]
+    fn settled_statuses_are_not_this_predicates_business() {
+        let got = stale_statuses(&[
+            row("a.md", DocStatus::Shipped, 0),
+            row("b.md", DocStatus::Approved, 0),
+            row("c.md", DocStatus::Living, 0),
+            row("d.md", DocStatus::Superseded, 0),
+        ]);
+        assert!(got.is_empty(), "{got:?}", got = got.len());
+    }
+
+    // The two predicates must not overlap: a status is either
+    // asserting discussion or forbidding it, never both, or a doc
+    // could be rejected AND reported for opposite reasons.
+    #[test]
+    fn the_two_predicates_are_disjoint() {
+        for s in [
+            DocStatus::Draft,
+            DocStatus::InReview,
+            DocStatus::Approved,
+            DocStatus::Shipped,
+            DocStatus::Reopened,
+            DocStatus::Superseded,
+            DocStatus::Living,
+        ] {
+            assert!(
+                !(s.claims_live_discussion() && s.forbids_open_questions()),
+                "{} both claims and forbids discussion",
+                s.as_str()
+            );
+        }
     }
 }

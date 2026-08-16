@@ -5023,6 +5023,52 @@ mod tests {
              — internal-forge Q6). workflow-design, regenerate-deployment and \
              backlog-item are in the bundle, not here."
         );
+        // NO TENANT NOUNS IN CORE. David, 2026-08-16: "We don't want
+        // brewery nouns in core no matter what. But most nouns should
+        // be data anyway, so that was its own class of problem."
+        //
+        // Two problems were tangled in protocols-as-data Q5 and this
+        // asserts the one that survives. The FORM problem — protocols
+        // as Rust literals — is what the bundle fixes. The LAYER
+        // problem — a tenant's vocabulary living in Tier 1 — is never
+        // acceptable and was held only by vigilance: the roster count
+        // above says "seven", not "seven PLATFORM kinds", so swapping
+        // one for `morning-brew` would keep it green.
+        //
+        // `tier-import-audit.sh` cannot see this. It checks crate
+        // DEPENDENCIES, and a brewery noun hardcoded in a core crate
+        // adds no dependency at all — which is exactly how this class
+        // hides.
+        //
+        // The list is the brewery and used-device-shop vocabularies
+        // that have historically appeared here. Deliberately a
+        // denylist rather than a shape rule: "is this noun
+        // tenant-specific" is a judgement, and encoding a bad guess as
+        // a lint would block legitimate platform kinds. A tenant kind
+        // that is not on this list still gets caught by the count
+        // assertion above, which cannot be satisfied without a
+        // deliberate edit.
+        for tenant_noun in [
+            "sale",
+            "morning-brew",
+            "morning-brew-ipa",
+            "morning-brew-stout",
+            "wholesale-keg-order",
+            "direct-shop-order",
+            "ingredient-restock",
+            "refurb-used",
+            "refurb-device",
+        ] {
+            assert!(
+                !kinds.iter().any(|k| k.kind == tenant_noun),
+                "`{tenant_noun}` is a TENANT noun and must not ship in \
+                 platform_workflows() — tenant kinds seed from examples/<tenant>/, \
+                 and a brewery vocabulary in Tier 1 is the leak CLAUDE.md §10 names. \
+                 tier-import-audit.sh cannot catch this: a hardcoded noun adds no \
+                 crate dependency."
+            );
+        }
+
         for bundled_kind in ["workflow-design", "regenerate-deployment", "backlog-item"] {
             assert!(
                 !kinds.iter().any(|k| k.kind == bundled_kind),

@@ -193,59 +193,62 @@ are exactly the ones that would otherwise stay invisible. Frequency
 should be minutes, not seconds; this is capacity planning, not
 alerting.
 
-### Q4: Does this absorb the reachability problem, or just describe it?
+### Q4: Does this absorb the reachability problem, or just describe it? (resolved)
 
-Modelling the topology does not make the cluster's people API
-reachable. There is a real operational gap underneath — no kubeconfig
-on any host an agent can reach — and a model that records "unreachable"
-is honest but not useful.
+Resolved 2026-08-16 — override. The question assumed a reachability
+problem; measurement found a CREDENTIALS problem, which is a
+different and much smaller thing.
 
-Proposed: **fix the reachability first, and let the model record what
-it finds.** Taking them in the other order builds an inventory whose
-most important rows read "unknown", and an inventory with holes in
-exactly the places that matter teaches people not to trust it.
+The network path is fine. boss-gcp reaches the LAN over WireGuard,
+and the Kubernetes API on the VIP `10.20.0.10:6443` answers — a clean
+`401 Unauthorized`, so the cluster is listening and simply does not
+know the caller. What is missing is a credential: no kubeconfig in
+`~/.kube`, `~/.talos` or `/etc/kubernetes` on boss-gcp, and no
+`kubectl` binary on boss-gcp or the forge host. Of the cluster's
+service ports only `7900` is exposed on `10.20.0.34`; 4443, 8080, 443
+and 80 are closed, as is 443/4443 on the VIP.
 
-The concrete gap is small: no host an agent can reach has a
-kubeconfig, and the cluster exposes only `10.20.0.34:7900`. Either a
-read-only kubeconfig on boss-gcp, or the same SSH tunnel treatment
-7900 already gets for the handful of service ports worth reading,
-closes it. The second is narrower and needs no new credential.
+So the fix is one of two small things rather than a networking
+project. A read-only kubeconfig plus `kubectl` on boss-gcp is the
+general answer and is what Q3's reporters would verify themselves
+against. Extending the existing SSH tunnel is the narrow one — it is
+already `-L 7900:10.20.0.34:7900`, so another service is one more
+`-L` and no new credential exists to leak.
 
-Worth stating plainly: this is the only question here that blocks the
-others. Q3's reporters run ON each node and push outward, so they work
-without it — but nothing can verify their claims against the cluster
-until an agent can read the cluster.
+The concrete thing this blocks today: whether an `emp-david` employee
+row exists on the CLUSTER, which is what `classifyProbe` resolves a
+session against and therefore whether My Day renders David's board or
+the bare "no matching employee in the roster" line. boss-gcp's local
+roster answers that question about the wrong database — 411 employees,
+no `emp-david` — and reading it there is exactly the mistake that
+produced a retracted root cause on packet e8665893.
 
-### Q5: What is authoritative, and who decides?
+### Q5: What is authoritative, and who decides? (resolved)
 
-The two-deployment split needs an answer before the model can record
-one. Today the evidence says the cluster is authoritative for jobs
-(David's packets land there) while boss-gcp runs the conductor and
-dispatcher against its own database. That is not a configuration
-anyone chose; it accumulated.
+Resolved 2026-08-16 — accept. David: *"Cluster should be
+authoritative."*
 
-Proposed, and flagged as a recommendation on a call that is David's:
-**the cluster is authoritative, and boss-gcp stops being a second
-deployment.** Three reasons, in order of weight. The packets David
-files land on the cluster, so it is already where the real work is.
-The cluster has the durable shape — PVCs, a Recreate strategy that has
-been reasoned about, backups. And boss-gcp is the smaller machine by
-every measure that matters here: 4 cores against 16, and 20 GB of free
-disk against 136 GB.
+The cluster is authoritative. boss-gcp stops being a second
+deployment of record.
 
-What that implies is bigger than a config flip and should be said out
-loud rather than discovered: the conductor and the cadence loop run on
-boss-gcp today and read boss-gcp's database. Pointing them at the
-cluster is one drop-in — `BOSS_POSTGRES_URL` — but the unit file's own
-header already warns that getting this wrong on a cutover box caused
-split-brain incident c4b4a6b0, and that migration 123's reconcile must
-land first or the boarding threshold silently halves.
+The consequence is bigger than a config flip and is the reason this
+is written down rather than just done. The conductor and the cadence
+loop run ON boss-gcp and read boss-gcp's database — that is the
+2026-08-14 split-brain, and it is why `cadence_firings` held 244 rows
+locally against 0 on the cluster. Pointing them at the cluster is one
+`BOSS_POSTGRES_URL` drop-in, and the unit file's own header warns what
+happens when that is got wrong: incident c4b4a6b0. Migration 123's
+reconcile must be on the cluster first, or the boarding threshold
+silently halves.
 
-The alternative worth naming: keep boss-gcp as a deliberate
-second environment — a scratch or demo tenant — in which case nothing
-moves, but the model must record it as NOT authoritative and the
-conductor must still be pointed at the cluster it books trains for. A
-second deployment is only a problem when nobody has decided it is one.
+Two things follow that are worth stating so they are not discovered.
+The 66 user-feedback packets in boss-gcp's local Postgres are not
+replicated anywhere; deciding the cluster is authoritative does not
+migrate them, and somebody has to say whether they matter. And a
+second deployment is only a problem when nobody has decided it is
+one — if boss-gcp is to survive as a scratch or demo environment,
+that is fine, but the model must record it as NOT authoritative and
+the conductor must still book trains against the cluster.
 
 ## Decision history
 

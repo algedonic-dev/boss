@@ -94,17 +94,37 @@ fi
 #       so there is nothing to scope — but the author should see the
 #       list, because a file they did not expect is the whole warning.
 changed_paths() {
-    # Staged first: that is what a commit will actually carry. Fall
-    # back to the full working tree so this works before `git add`,
-    # which is when an author is most likely to run the gate.
+    # THE QUESTION IS "what will this car land", and that has three
+    # answers depending on where the author is in the loop. Asking only
+    # the first two is a bug I shipped: `--auto` derived from the
+    # WORKING TREE alone, so gating after a commit — or after a rebase,
+    # which is when you most want to re-check — found a clean tree,
+    # scoped to nothing, skipped every cargo phase and reported
+    # "all checks green". A gate that runs nothing must never say that.
+    #
+    # Staged first: that is what a commit will actually carry.
     local staged
     staged=$(git diff --cached --name-only 2>/dev/null)
     if [ -n "$staged" ]; then
         printf '%s\n' "$staged"
-    else
-        { git diff --name-only 2>/dev/null
-          git ls-files --others --exclude-standard 2>/dev/null; }
+        return
     fi
+    # Then the working tree, for the common case of gating before
+    # `git add`.
+    local dirty
+    dirty=$({ git diff --name-only 2>/dev/null
+              git ls-files --others --exclude-standard 2>/dev/null; })
+    if [ -n "$dirty" ]; then
+        printf '%s\n' "$dirty"
+        return
+    fi
+    # Finally the commits this branch adds over the trunk. A clean tree
+    # on a branch with commits is not "no change" — it is a car that is
+    # ready, which is exactly when it gets gated.
+    local base
+    base=$(git merge-base "$AUTO_TRUNK" HEAD 2>/dev/null) || return 0
+    [ -n "$base" ] || return 0
+    git diff --name-only "$base" HEAD 2>/dev/null
 }
 
 crates_from_paths() {
@@ -229,6 +249,20 @@ schema_touched() {
     if changed_paths | grep -qE '^infra/postgres/schema/'; then echo yes; else echo no; fi
 }
 
+# Which ref is "the trunk" for deriving a branch's own commits. The
+# remote-tracking main this repo actually uses, with the local branch
+# and an override as fallbacks — a box whose remote is named
+# differently must not silently fall through to gating nothing.
+AUTO_TRUNK="${BOSS_GATE_TRUNK:-}"
+if [ -z "$AUTO_TRUNK" ]; then
+    for candidate in gcp/forge-main origin/main main; do
+        if git rev-parse --verify --quiet "$candidate" >/dev/null 2>&1; then
+            AUTO_TRUNK="$candidate"
+            break
+        fi
+    done
+fi
+
 AUTO_LINTS_ONLY=0
 AUTO_SKIP_FIXTURE=0
 if [ "$AUTO" -eq 1 ]; then
@@ -245,8 +279,22 @@ if [ "$AUTO" -eq 1 ]; then
     else
         AUTO_LINTS_ONLY=1
         AUTO_SKIP_FIXTURE=1
+        local_changed=$(changed_paths | tr '\n' ' ')
+        if [ -z "${local_changed// /}" ]; then
+            # Nothing staged, nothing dirty, and nothing this branch
+            # adds over the trunk. Refuse rather than report green:
+            # "the gate passed" and "the gate had nothing to check"
+            # must not look the same, and they did.
+            echo "GATE REFUSED: --auto found no change at all against ${AUTO_TRUNK:-<no trunk>}." >&2
+            echo "" >&2
+            echo "Nothing is staged, the tree is clean, and this branch adds no commit" >&2
+            echo "over the trunk — so there is nothing to scope and nothing to check." >&2
+            echo "If that is wrong, the trunk ref is: ${AUTO_TRUNK:-<none found>}." >&2
+            echo "Set BOSS_GATE_TRUNK to the right one, or run the full gate." >&2
+            exit 2
+        fi
         echo "gate: --auto — nothing changed implies a crate; lints + fmt only"
-        echo "gate: (changed: $(changed_paths | tr '\n' ' '))"
+        echo "gate: (changed: ${local_changed})"
     fi
 fi
 

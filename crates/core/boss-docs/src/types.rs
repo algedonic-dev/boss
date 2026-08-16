@@ -146,6 +146,32 @@ impl DocStatus {
     pub fn forbids_open_questions(&self) -> bool {
         matches!(self, Self::Shipped | Self::Superseded | Self::Living)
     }
+
+    /// Does this status ASSERT there is live discussion?
+    ///
+    /// The mirror of [`forbids_open_questions`]. That one catches a
+    /// doc claiming to be settled while carrying questions, and the
+    /// reindex rejects it. This catches the opposite and much quieter
+    /// drift: a doc claiming to be under discussion with nothing left
+    /// to discuss.
+    ///
+    /// The status line is hand-written and almost nothing updates it.
+    /// Answering a question is a flush, and until recently the flush
+    /// rewrote the Decision-history section without touching the
+    /// frontmatter — so status drifted stale BY DEFAULT. Measured on
+    /// the live corpus on 2026-08-15: eleven of the twenty docs
+    /// claiming to be live had zero open questions, zero pending
+    /// decisions and no open review. Worse than a coin toss, and every
+    /// one wrong in the same direction (0b8ae875).
+    ///
+    /// `promote_status_line_to_approved` has since closed most of it —
+    /// the count is three today — but only for docs whose last
+    /// question was answered THROUGH a flush. A question resolved by
+    /// hand, or a doc whose questions were removed in an edit, still
+    /// drifts and nothing notices.
+    pub fn claims_live_discussion(&self) -> bool {
+        matches!(self, Self::Draft | Self::InReview | Self::Reopened)
+    }
 }
 
 /// A parsed open question from a design doc's `## Open questions` section.

@@ -38,6 +38,22 @@ const DOCS = [
 ];
 
 test.beforeEach(async ({ page }) => {
+  // THE QUEUE IS THE PAGE, and it is the one read that throws — so a
+  // spec that does not mock it renders chrome and nothing else, and
+  // every content assertion below fails with "element not found".
+  //
+  // That is exactly how this suite rotted. `/system/design` grew a
+  // station-lens read on 2026-08-15; these specs were never updated,
+  // and eight of ten went red on main without anyone noticing,
+  // because NOTHING RUNS THEM — not gate.sh, not ci.yml. Thirteen
+  // mocked spec files, zero gated (filed separately).
+  //
+  // An empty lens is deliberate: `panelsFor` falls back to every
+  // known panel when a lens declares none, so this exercises the
+  // default the page ships with rather than a shape invented here.
+  await page.route('**/api/stations/design-review/queue', (route) =>
+    route.fulfill({ json: { station: 'design-review', lens: null, packets: [], steps: {} } }),
+  );
   await page.route('**/api/design/docs', (route) =>
     route.fulfill({ json: DOCS }),
   );
@@ -45,6 +61,9 @@ test.beforeEach(async ({ page }) => {
   // it keeps the panel out of the way of the assertions below. The
   // non-empty case has its own test.
   await page.route('**/api/design/rejections', (route) =>
+    route.fulfill({ json: [] }),
+  );
+  await page.route('**/api/design/stale-statuses', (route) =>
     route.fulfill({ json: [] }),
   );
   await page.route('**/api/jobs?*', (route) =>
@@ -121,18 +140,23 @@ test.describe('Design review list', () => {
     page,
   }) => {
     await mountPage(page, '/system/design', { titleMatch: /design review/i });
-    // The doc with open questions sits in the reviewing section; the
-    // living reference sits below with a reopen affordance — the
-    // pre-2026-07-08 page showed both as "in-review".
-    const reviewing = page
-      .locator('section', { hasText: 'In review & discussion' })
-      .first();
+    // The doc with open questions sits in the section that wants a
+    // decision; the living reference sits in the settled corpus with a
+    // reopen affordance — the pre-2026-07-08 page showed both as
+    // "in-review".
+    //
+    // Section names updated 2026-08-16: the page moved from a two-way
+    // split ("In review & discussion" / "Living references & settled")
+    // to the three-way grouping in designGroups.ts — needs-you / draft
+    // / library. The old names lived on here for days because NOTHING
+    // RUNS THIS SUITE: thirteen mocked spec files, and neither gate.sh
+    // nor ci.yml executes any of them, so eight of these ten tests
+    // were red on main and silent about it.
+    const reviewing = page.locator('section', { hasText: 'Needs you' }).first();
     await expect(
       reviewing.locator('tr', { hasText: 'Inventory value conservation' }),
     ).toBeVisible({ timeout: 10_000 });
-    const settled = page
-      .locator('section', { hasText: 'Living references & settled' })
-      .first();
+    const settled = page.locator('section', { hasText: 'Design library' }).first();
     await expect(
       settled.locator('tr', { hasText: 'correctness protocol' }),
     ).toBeVisible();
@@ -150,7 +174,10 @@ test.describe('Design review list', () => {
     // reference ("Reopen discussion") — every doc gets exactly one
     // affordance, worded for its state.
     await expect(
-      page.getByRole('button', { name: /open review job/i }),
+      // Label updated 2026-08-16: the button reads "Start review"
+      // now, not "Open review Job". Another casualty of a suite
+      // nothing runs.
+      page.getByRole('button', { name: /start review/i }),
     ).toHaveCount(1);
     await expect(
       page.getByRole('button', { name: /reopen discussion/i }),
@@ -165,7 +192,7 @@ test.describe('Design review list', () => {
     const row = page.locator('tr', {
       hasText: 'Inventory value conservation',
     });
-    await row.getByRole('button', { name: /open review job/i }).click();
+    await row.getByRole('button', { name: /start review/i }).click();
     // A 422 from the shape-enforcing mock surfaces as the page error
     // banner; success re-loads the list. Assert no error rendered.
     await expect(page.locator('.empty', { hasText: /HTTP 422/ })).toHaveCount(
@@ -206,9 +233,18 @@ test.describe('Design review list', () => {
     // header and the step list; the step-focus route renders it under
     // the chrome bar with the whole panel to itself. The list must
     // link to the second one.
-    await page.route('**/api/jobs?*', (route) =>
+    // Seeded through the STATION QUEUE, which is where the page reads
+    // open reviews from — `reviewsByDocPath(queue.data)`. It used to
+    // read /api/jobs?*, and seeding the old source here meant the page
+    // saw no existing review and POSTed a second one, navigating to a
+    // freshly minted uuid instead of job-review-9.
+    await page.route('**/api/stations/design-review/queue', (route) =>
       route.fulfill({
         json: {
+          station: 'design-review',
+          discipline: ['priority', 'age'],
+          lens: null,
+          total: 1,
           data: [
             {
               id: 'job-review-9',
@@ -222,13 +258,43 @@ test.describe('Design review list', () => {
               ],
             },
           ],
-          total: 1,
+        },
+      }),
+    );
+    // `reviewStepId` re-reads the Job to find its review-design step
+    // rather than trusting the queue packet, so the step surface is
+    // only reachable when this answers.
+    await page.route('**/api/jobs/job-review-9', (route) =>
+      route.fulfill({
+        json: {
+          id: 'job-review-9',
+          kind: 'design-doc-review',
+          title: 'Review: Inventory value conservation',
+          status: 'open',
+          subject: { subject_kind: 'custom', id: 'docs/architecture-decisions.md' },
+          steps: [
+            { id: 'step-other', spec_slug: 'open', kind: 'sign-off', status: 'completed' },
+            { id: 'step-rd', spec_slug: 'review', kind: 'review-design', status: 'ready' },
+          ],
         },
       }),
     );
     await mountPage(page, '/system/design', { titleMatch: /design review/i });
-    const link = page.getByRole('link', { name: /in review/i });
-    await expect(link).toHaveAttribute('href', '/jobs/job-review-9/steps/step-rd');
+    // Asserted through NAVIGATION, not an href. The column used to
+    // fork — a link when a Job existed, a button when it did not — and
+    // David killed that on 2026-08-14: "that link should just
+    // consistently launch the review UX". There is one button now, so
+    // the property survives but the mechanism it is read through does
+    // not. Rewritten rather than deleted: where the control lands is
+    // still the whole point of the test.
+    await page.getByRole('button', { name: /review/i }).first().click();
+    await expect(page).toHaveURL(/\/jobs\/job-review-9\/steps\/step-rd(\?|$)/);
+    // The `from` pair is not incidental: the step surface cannot infer
+    // where Back should go, and guessing from the Job's kind would put
+    // a per-workflow branch in core routing. Only the lens that sent
+    // the operator here knows, so it says.
+    await expect(page).toHaveURL(/from=%2Fsystem%2Fdesign/);
+    await expect(page).toHaveURL(/from_label=Design(%20|\+)Review/);
   });
 
   test('falls back to the job page when the Job has no review step yet', async ({
@@ -236,9 +302,13 @@ test.describe('Design review list', () => {
   }) => {
     // A Job caught before its steps materialize has no step id. Better
     // the job page than a link to a step id we invented.
-    await page.route('**/api/jobs?*', (route) =>
+    await page.route('**/api/stations/design-review/queue', (route) =>
       route.fulfill({
         json: {
+          station: 'design-review',
+          discipline: ['priority', 'age'],
+          lens: null,
+          total: 1,
           data: [
             {
               id: 'job-review-9',
@@ -249,15 +319,14 @@ test.describe('Design review list', () => {
               steps: [],
             },
           ],
-          total: 1,
         },
       }),
     );
     await mountPage(page, '/system/design', { titleMatch: /design review/i });
-    await expect(page.getByRole('link', { name: /in review/i })).toHaveAttribute(
-      'href',
-      '/service/job-review-9',
-    );
+    await page.getByRole('button', { name: /review/i }).first().click();
+    // No step id to link to, so the job page — never a step id we
+    // invented.
+    await expect(page).toHaveURL(/\/service\/job-review-9(\?|$)/);
   });
 
   test('a failing rejections call does not blank the page', async ({
@@ -277,3 +346,45 @@ test.describe('Design review list', () => {
     await expect(page.locator('.empty', { hasText: /^Error:/ })).toHaveCount(0);
   });
 });
+
+// The status line is hand-written and almost nothing updates it, so it
+// goes stale by default: on 2026-08-15 eleven of the twenty docs
+// claiming to be live had nothing open, every one wrong in the same
+// direction, and no surface said so (0b8ae875). This is the surface.
+//
+// Rendered rather than reasoned about, per the invariant
+// `a-rendered-surface-is-verified-by-rendering-it` — which exists
+// because a landing-page fix was applied to two wrong files before
+// anyone rendered the third.
+test('a doc whose status drifted is reported, with what it claims', async ({ page }) => {
+  await page.route('**/api/design/stale-statuses', (route) =>
+    route.fulfill({
+      json: [
+        {
+          path: 'docs/design/stations.md',
+          title: 'Stations',
+          status: 'in-review',
+          reason:
+            'status is `in-review`, which asserts live discussion, but the doc has no open questions',
+        },
+      ],
+    }),
+  );
+  await mountPage(page, '/system/design');
+
+  await expect(page.getByText('Status drifted (1)')).toBeVisible();
+  await expect(page.getByText('docs/design/stations.md')).toBeVisible();
+  // The reason has to travel to the surface. A panel that says a doc
+  // is wrong without saying how is one an operator has to go
+  // investigate before they can act, which is most of the cost.
+  await expect(page.getByText(/no open questions/)).toBeVisible();
+});
+
+// Empty is the healthy state and must render as NOTHING, not as an
+// empty table. A panel that is always present teaches people to skip
+// the region it lives in.
+test('a corpus with no drift shows no panel at all', async ({ page }) => {
+  await mountPage(page, '/system/design');
+  await expect(page.getByText(/Status drifted/)).toHaveCount(0);
+});
+
