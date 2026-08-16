@@ -31,6 +31,7 @@
 //     is the whole of what is known.
 
 import { isSim, type PacketCardData } from '@boss/web-kit/ui/packet-card';
+import { PACKET_STOPS, stopOf, type StopKey } from './packetTrack';
 
 /// A packet as the station-queue envelope serializes it (bare Jobs,
 /// no steps). Only the fields this lens reads.
@@ -103,7 +104,50 @@ export function watchlistPacket(job: WatchlistJob): PacketCardData {
 export type WatchlistEntry = Readonly<{
   card: PacketCardData;
   outcome: Outcome | null;
+  /// Which stop this packet is standing at, or `null` when it left the
+  /// track (a duplicate, or one we turned down). Requires the queue
+  /// envelope to carry steps, which `my-watchlist`'s lens asks for via
+  /// `with_steps` (139-watchlist-lens.sql). A deployment whose registry
+  /// predates that reads `null` for everything and the section falls
+  /// back to a plain list — the same packets, just not placed.
+  stop: StopKey | null;
 }>;
+
+/// The watchlist grouped into the track: every stop, in order, with
+/// the entries standing at it. Entries that left the track come back
+/// separately rather than being dropped — "we read it and didn't take
+/// it up" is an answer the filer is owed.
+export type WatchlistTrack = Readonly<{
+  stops: ReadonlyArray<Readonly<{ key: StopKey; label: string; entries: readonly WatchlistEntry[] }>>;
+  offTrack: readonly WatchlistEntry[];
+  /// False when nothing could be placed — no steps on the wire, so the
+  /// caller renders the flat list instead of an empty track.
+  placed: boolean;
+}>;
+
+export function watchlistTrack(entries: readonly WatchlistEntry[]): WatchlistTrack {
+  const byStop = new Map<StopKey, WatchlistEntry[]>(
+    PACKET_STOPS.map((s) => [s.key, [] as WatchlistEntry[]]),
+  );
+  const offTrack: WatchlistEntry[] = [];
+  let placed = false;
+  for (const e of entries) {
+    if (e.stop === null) {
+      // Only count it as "left the track" once something proved
+      // placeable; otherwise a stepless envelope would report every
+      // packet as turned down.
+      offTrack.push(e);
+      continue;
+    }
+    placed = true;
+    byStop.get(e.stop)!.push(e);
+  }
+  return {
+    stops: PACKET_STOPS.map((s) => ({ key: s.key, label: s.label, entries: byStop.get(s.key)! })),
+    offTrack: placed ? offTrack : [],
+    placed,
+  };
+}
 
 export type WatchlistState =
   | { kind: 'loading' }
@@ -127,15 +171,30 @@ export function watchlistStateFromResponse(status: number, body: unknown): Watch
     station?: unknown;
     data?: unknown;
     terminal_window_days?: unknown;
+    steps?: unknown;
   };
   if (typeof envelope.station !== 'string' || !Array.isArray(envelope.data)) {
     return { kind: 'error' };
   }
   const jobs = envelope.data as WatchlistJob[];
+  // `steps` is keyed by job id and present only when the station's lens
+  // declares `with_steps`. Absent → every packet reads `stop: null` and
+  // the surface renders the list it always did.
+  const stepsById = (
+    envelope.steps && typeof envelope.steps === 'object' && !Array.isArray(envelope.steps)
+      ? (envelope.steps as Record<string, ReadonlyArray<{ spec_slug?: string | null; title?: string | null; status: string }>>)
+      : {}
+  );
   return {
     kind: 'ready',
     // Server order preserved: the station's discipline decided it.
-    entries: jobs.map(j => ({ card: watchlistPacket(j), outcome: outcomeOf(j) })),
+    entries: jobs.map(j => ({
+      card: watchlistPacket(j),
+      outcome: outcomeOf(j),
+      stop: stepsById[j.id]
+        ? stopOf({ id: j.id, status: j.status, opened_on: j.opened_on, steps: stepsById[j.id] })
+        : null,
+    })),
     windowDays:
       typeof envelope.terminal_window_days === 'number' ? envelope.terminal_window_days : null,
   };

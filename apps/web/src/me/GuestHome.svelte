@@ -18,12 +18,12 @@
   // each piece at the stop it reached.
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { href, navigate } from '../router';
-  import { NO_TRACK, placeOnTrack, type FeedbackPacket, type GuestTrack } from './guestFlow';
+  import { NO_TRACK, placeOnTrack, type FeedbackPacket, type PacketTrack } from './packetTrack';
 
   type Props = Readonly<{ greeting: string }>;
   let { greeting }: Props = $props();
 
-  let track = $state<GuestTrack>(NO_TRACK);
+  let track = $state<PacketTrack>(NO_TRACK);
 
   $effect(() => {
     let cancelled = false;

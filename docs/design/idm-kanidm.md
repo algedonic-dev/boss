@@ -55,69 +55,114 @@ auth; OIDC lands after.
 
 ## Open questions
 
-### Q1: Does the gateway hold the session, or does every request carry the token? (resolved)
+All 5 open questions were resolved 2026-08-16 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-Today the gateway issues its own session after local auth. Keeping
-that (gateway session, OIDC only at login) is the small change and
-keeps every downstream service untouched. The alternative — services
-validating bearer tokens themselves — buys per-service revocation at
-the cost of every service growing an OIDC dependency. Proposed:
-**gateway session**, revisit only if service-to-service auth needs it.
+---
+
+
+## Decisions
 
 ### Q2: What is the employee-mapping key, and what happens on a miss? (resolved)
 
-Email is the obvious join (Kanidm account email ↔ employee email).
-A login with no matching employee: fail closed with a message, or
-land in a "pending access" surface an admin can act on? Proposed:
-**fail closed + audit event**; a pending-access Job is a nice later
-step (the Job model doing IdP onboarding) but not v1.
+Resolved 2026-08-16 — override.
 
-### Q3: Do agents get Kanidm service accounts? (resolved)
+**The question was:**
 
-The executor model says agents are CPUs in the same machine. Today
-agent identity is a forged claim header on a trusted box. Kanidm
-service accounts (API tokens, real group membership) would make agent
-identity honest and revocable — and make the audit log's actor claims
-independently verifiable against the IdP. Cost: every agent caller
-grows a token flow. Proposed: **yes, but phase 2** — humans first,
-agents while the header path still works, then the header path dies.
+> Email is the obvious join (Kanidm account email ↔ employee email).
+> A login with no matching employee: fail closed with a message, or
+> land in a "pending access" surface an admin can act on? Proposed:
+> **fail closed + audit event**; a pending-access Job is a nice later
+> step (the Job model doing IdP onboarding) but not v1.
+
+failed closed + audit event sounds good
+
 
 ### Q4: Where does Kanidm's own state live in the backup/migration story? (resolved)
 
-Kanidm's DB is the second member of the outside-git-and-Postgres
-class (with `credentials.toml`). Its loss means every real person's
-credentials and passkeys vanish. Proposed: its backup rides the
-existing `backup.sh` timer (kanidm has an online backup facility),
-and dev-cluster.md's copy-set section gains the pointer — the GCP
-box is now stateful in one more way the cluster is not.
+Resolved 2026-08-16 — override.
+
+**The question was:**
+
+> Kanidm's DB is the second member of the outside-git-and-Postgres
+> class (with `credentials.toml`). Its loss means every real person's
+> credentials and passkeys vanish. Proposed: its backup rides the
+> existing `backup.sh` timer (kanidm has an online backup facility),
+> and dev-cluster.md's copy-set section gains the pointer — the GCP
+> box is now stateful in one more way the cluster is not.
+
+That works
+
+
+### Q1: Does the gateway hold the session, or does every request carry the token? (resolved)
+
+Resolved 2026-08-16 — override.
+
+**The question was:**
+
+> Today the gateway issues its own session after local auth. Keeping
+> that (gateway session, OIDC only at login) is the small change and
+> keeps every downstream service untouched. The alternative — services
+> validating bearer tokens themselves — buys per-service revocation at
+> the cost of every service growing an OIDC dependency. Proposed:
+> **gateway session**, revisit only if service-to-service auth needs it.
+
+Agreed
+
 
 ### Q5: DNS and TLS shape? (resolved)
 
-Kanidm terminates its own TLS and historically rejects
-TLS-stripping proxies. Proposed: `id.algedonic.dev`, DNS-only
-(grey-cloud) A record to the GCP box, Kanidm's own cert via its ACME
-support or certbot — verify against current Kanidm docs at install
-time. The gateway's OIDC callback stays behind the existing
-Cloudflare front.
+Resolved 2026-08-16 — override.
 
-**Amended 2026-08-13 — the host moved, and this is the ratification.**
-What shipped on 2026-08-11 is not what the paragraph above proposes.
-Kanidm runs **in-cluster** as a StatefulSet at `10.20.0.31`, with an
-online-backup sidecar shipping to GCP hourly over a forced-command
-SSH key, reached from outside through the WireGuard hub. The
-TLS reasoning is unchanged and still correct — Kanidm terminates its
-own TLS, so nothing strips it — only the box it runs on changed.
+**The question was:**
 
-Ratified rather than reverted, on David's stated preference at the
-time ("I don't mind where Kanidm is. Wherever is most secure /
-useful"), because in-cluster is the more secure of the two: it keeps
-the identity provider inside the isolated VLAN alongside the only
-things it serves, and off a shared multi-purpose host that also
-carries the train conductor, the backups, and the public front door.
-A compromise of `boss-gcp` no longer reaches the IdP.
+> Kanidm terminates its own TLS and historically rejects
+> TLS-stripping proxies. Proposed: `id.algedonic.dev`, DNS-only
+> (grey-cloud) A record to the GCP box, Kanidm's own cert via its ACME
+> support or certbot — verify against current Kanidm docs at install
+> time. The gateway's OIDC callback stays behind the existing
+> Cloudflare front.
+>
+> **Amended 2026-08-13 — the host moved, and this is the ratification.**
+> What shipped on 2026-08-11 is not what the paragraph above proposes.
+> Kanidm runs **in-cluster** as a StatefulSet at `10.20.0.31`, with an
+> online-backup sidecar shipping to GCP hourly over a forced-command
+> SSH key, reached from outside through the WireGuard hub. The
+> TLS reasoning is unchanged and still correct — Kanidm terminates its
+> own TLS, so nothing strips it — only the box it runs on changed.
+>
+> Ratified rather than reverted, on David's stated preference at the
+> time ("I don't mind where Kanidm is. Wherever is most secure /
+> useful"), because in-cluster is the more secure of the two: it keeps
+> the identity provider inside the isolated VLAN alongside the only
+> things it serves, and off a shared multi-purpose host that also
+> carries the train conductor, the backups, and the public front door.
+> A compromise of `boss-gcp` no longer reaches the IdP.
+>
+> Verified before writing this: `10.20.0.31:443` answers, and
+> `/var/backups/kanidm` on boss-gcp is receiving the sidecar's shipments.
 
-Verified before writing this: `10.20.0.31:443` answers, and
-`/var/backups/kanidm` on boss-gcp is receiving the sidecar's shipments.
+Sounds good
+
+
+### Q3: Do agents get Kanidm service accounts? (resolved)
+
+Resolved 2026-08-16 — override.
+
+**The question was:**
+
+> The executor model says agents are CPUs in the same machine. Today
+> agent identity is a forged claim header on a trusted box. Kanidm
+> service accounts (API tokens, real group membership) would make agent
+> identity honest and revocable — and make the audit log's actor claims
+> independently verifiable against the IdP. Cost: every agent caller
+> grows a token flow. Proposed: **yes, but phase 2** — humans first,
+> agents while the header path still works, then the header path dies.
+
+Sounds good
 
 ## Decision history
 

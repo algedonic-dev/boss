@@ -28,6 +28,7 @@
   import {
     dismissFromWatchlist,
     fetchWatchlist,
+    watchlistTrack,
     windowNote,
     type WatchlistState,
   } from './watchlist';
@@ -284,9 +285,51 @@
           </div>
         {:else}
           {@const note = windowNote(watchlist.windowDays)}
+          {@const live = watchlist.entries.filter((e) => !dismissing.has(e.card.id))}
+          {@const track = watchlistTrack(live)}
           {#if note}
             <div class="watch-window">{note}</div>
           {/if}
+          {#if track.placed}
+            <!-- Cards standing at the stop they reached, rather than a
+                 flat list (David, 2026-08-15: "show that more as job
+                 cards moving through stations"). Needs the queue
+                 envelope to carry steps, which this station's lens asks
+                 for; a registry that predates that falls through to the
+                 list below, same packets, just not placed. -->
+            <div class="watch-track">
+              {#each track.stops as stop (stop.key)}
+                <div class="watch-stop">
+                  <div class="watch-stop-head">
+                    <span class="watch-stop-dot" class:lit={stop.entries.length > 0}></span>
+                    <span class="watch-stop-label">{stop.label}</span>
+                  </div>
+                  {#each stop.entries as entry (entry.card.id)}
+                    <div class="watch-stop-card">
+                      <PacketCard card={entry.card} />
+                    </div>
+                  {:else}
+                    <p class="watch-stop-empty">—</p>
+                  {/each}
+                </div>
+              {/each}
+            </div>
+            {#if track.offTrack.length > 0}
+              <div class="watch-offtrack">
+                <span class="watch-offtrack-h">Read, not taken up</span>
+                {#each track.offTrack as entry (entry.card.id)}
+                  <div class="watch-row">
+                    <PacketCard card={entry.card} />
+                    {#if entry.outcome}
+                      <span class="watch-outcome watch-{entry.outcome.tone}">
+                        {entry.outcome.label}
+                      </span>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          {:else}
           <div class="myday-jobs-list">
             {#each watchlist.entries.filter((e) => !dismissing.has(e.card.id)) as entry (entry.card.id)}
               <div class="watch-row">
@@ -309,6 +352,7 @@
               </div>
             {/each}
           </div>
+          {/if}
         {/if}
       </Section>
 
@@ -374,6 +418,73 @@
   }
 
   /* Card + outcome side by side, the same shape the claim row uses. */
+  /* Cards standing at the stop they reached. Same five stops the
+     guest track uses — one definition in packetTrack.ts — but rendered
+     with the real PacketCard, because an operator reading their own
+     watchlist wants the packet's protocol and provenance, not a
+     visitor's simplified card. */
+  .watch-track {
+    display: grid;
+    grid-auto-flow: column;
+    /* 150, not 180: five stops plus gaps have to fit the section's
+       width or the last card is clipped at the scroll boundary and
+       reads as broken rather than as scrollable. PacketCard shrinks
+       to its container (min-width: 0), so narrower columns cost
+       ellipsis on the title, not a cut card. */
+    grid-auto-columns: minmax(150px, 1fr);
+    gap: 10px;
+    overflow-x: auto;
+    padding-bottom: 6px;
+  }
+  .watch-stop-head {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--hairline, #2A3138);
+    margin-bottom: 10px;
+  }
+  /* Lit only where something is standing. */
+  .watch-stop-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--hairline, #2A3138);
+    flex: 0 0 auto;
+  }
+  .watch-stop-dot.lit {
+    background: var(--signal, #29C7B0);
+  }
+  .watch-stop-label {
+    font-size: 12px;
+    line-height: 1.3;
+    color: var(--fog, #E8ECEF);
+  }
+  .watch-stop-card {
+    margin-bottom: 8px;
+  }
+  .watch-stop-empty {
+    color: var(--static, #7A838C);
+    margin: 0;
+    font-size: 13px;
+  }
+  /* Off the track, not off the board: a packet we read and turned down
+     is an answer the filer is owed, and burying it would make the
+     track a scoreboard. */
+  .watch-offtrack {
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px solid var(--hairline, #2A3138);
+  }
+  .watch-offtrack-h {
+    display: block;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11px;
+    letter-spacing: var(--ls-nav, 0.14em);
+    text-transform: uppercase;
+    color: var(--static, #7A838C);
+    margin-bottom: 8px;
+  }
   .watch-row {
     /* Third column for the dismiss control. It keeps its cell whether
        or not the packet has an outcome chip, so the × sits on one

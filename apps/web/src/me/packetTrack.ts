@@ -44,7 +44,7 @@ export type FeedbackPacket = Readonly<{
  *  and a track wide enough to need scrolling stops reading as motion.
  *  The protocol's own vocabulary maps onto these; it is never renamed
  *  in the data, only on the platform sign. */
-export const GUEST_STATIONS = [
+export const PACKET_STOPS = [
   { key: 'received', label: 'Received' },
   { key: 'reading', label: 'Being read' },
   { key: 'working', label: 'Being worked out' },
@@ -52,13 +52,13 @@ export const GUEST_STATIONS = [
   { key: 'done', label: 'Done' },
 ] as const;
 
-export type GuestStationKey = (typeof GUEST_STATIONS)[number]['key'];
+export type StopKey = (typeof PACKET_STOPS)[number]['key'];
 
 /** Protocol step slug → the stop a guest sees it standing at.
  *  `needs-info` sits at "Being read" deliberately: from the visitor's
  *  side the honest statement is that someone is still reading it and
  *  wants more, not that it has advanced. */
-const STOP_OF_STEP: Readonly<Record<string, GuestStationKey>> = {
+const STOP_OF_STEP: Readonly<Record<string, StopKey>> = {
   submitted: 'received',
   triage: 'reading',
   'needs-info': 'reading',
@@ -76,21 +76,21 @@ const OFF_TRACK: Readonly<Record<string, string>> = {
   declined: 'not taken up',
 };
 
-export type GuestCard = Readonly<{
+export type PacketCard = Readonly<{
   id: string;
   /** The surface it was about — the route path is the Subject id. */
   about: string;
   when: string;
 }>;
 
-export type GuestStop = Readonly<{
-  key: GuestStationKey;
+export type TrackStop = Readonly<{
+  key: StopKey;
   label: string;
-  cards: readonly GuestCard[];
+  cards: readonly PacketCard[];
 }>;
 
-export type GuestTrack = Readonly<{
-  stops: readonly GuestStop[];
+export type PacketTrack = Readonly<{
+  stops: readonly TrackStop[];
   /** Everything real that has ever been sent. */
   received: number;
   /** Reached the `closed` terminal — feedback that changed something. */
@@ -101,8 +101,8 @@ export type GuestTrack = Readonly<{
   any: boolean;
 }>;
 
-export const NO_TRACK: GuestTrack = {
-  stops: GUEST_STATIONS.map((s) => ({ ...s, cards: [] })),
+export const NO_TRACK: PacketTrack = {
+  stops: PACKET_STOPS.map((s) => ({ ...s, cards: [] })),
   received: 0,
   done: 0,
   setAside: 0,
@@ -123,7 +123,7 @@ function slugOf(step: { spec_slug?: string | null; title?: string | null }): str
  *
  *  A CLOSED packet is `done` only if it reached the terminal that
  *  means something was done. */
-export function stopOf(packet: FeedbackPacket): GuestStationKey | null {
+export function stopOf(packet: FeedbackPacket): StopKey | null {
   const steps = packet.steps ?? [];
   if (packet.status !== 'open') {
     for (const s of steps) {
@@ -149,10 +149,10 @@ export function stopOf(packet: FeedbackPacket): GuestStationKey | null {
 export function placeOnTrack(
   packets: readonly FeedbackPacket[],
   perStop = 4,
-): GuestTrack {
+): PacketTrack {
   const real = packets.filter((p) => p.simulated !== true);
-  const byStop = new Map<GuestStationKey, GuestCard[]>(
-    GUEST_STATIONS.map((s) => [s.key, [] as GuestCard[]]),
+  const byStop = new Map<StopKey, PacketCard[]>(
+    PACKET_STOPS.map((s) => [s.key, [] as PacketCard[]]),
   );
   let setAside = 0;
 
@@ -173,7 +173,7 @@ export function placeOnTrack(
     });
   }
 
-  const stops = GUEST_STATIONS.map((s) => ({
+  const stops = PACKET_STOPS.map((s) => ({
     key: s.key,
     label: s.label,
     cards: byStop.get(s.key)!.slice(0, perStop),

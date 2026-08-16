@@ -152,6 +152,20 @@ pub struct StationLens {
     /// is the whole page.
     #[serde(default)]
     pub panels: Vec<String>,
+    /// Whether the queue envelope should carry each member's STEPS.
+    ///
+    /// Off by default and deliberately opt-in per station: it costs one
+    /// `list_steps` per member, and most lenses render a row from the
+    /// Job alone. A lens that places packets at the stop they have
+    /// reached cannot — "where is this one" is a fact about its steps,
+    /// and without them the surface either guesses or degrades to a
+    /// list, which is what it was trying to stop being.
+    ///
+    /// Declared here rather than inferred from the predicate because
+    /// the predicate answers who is IN the queue; this answers what the
+    /// reader needs in order to draw it.
+    #[serde(default)]
+    pub with_steps: bool,
 }
 
 /// A full station row. Serializes directly to the `stations` columns
@@ -1062,6 +1076,7 @@ mod tests {
             title: "Design review".into(),
             subtitle: Some("Open questions, pending decisions, ADRs".into()),
             panels: vec!["rejections".into(), "corpus".into()],
+            with_steps: false,
         });
         let json = serde_json::to_value(&spec).unwrap();
         assert_eq!(json["lens"]["title"], "Design review");
@@ -1111,6 +1126,7 @@ mod tests {
             title: "My watchlist".into(),
             subtitle: None,
             panels: vec![],
+            with_steps: false,
         });
         let bound = spec.bind_self(Some("emp-r")).expect("binds");
         assert_eq!(bound.lens, spec.lens);

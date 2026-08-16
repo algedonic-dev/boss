@@ -180,8 +180,12 @@ pub(super) async fn station_queue<R: JobsRepository + 'static, B: EventBus + 'st
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    // Steps are fetched only when the predicate reads step state.
-    let needs_steps = spec.predicate.needs_steps();
+    // Steps are fetched when the predicate reads step state, or when
+    // the station's lens declares it needs them to draw the queue —
+    // "where has this packet got to" is a fact about its steps, and a
+    // surface without them can only render a list.
+    let needs_steps =
+        spec.predicate.needs_steps() || spec.lens.as_ref().is_some_and(|l| l.with_steps);
     let mut packets = Vec::with_capacity(jobs.len());
     for job in jobs {
         let steps = if needs_steps {

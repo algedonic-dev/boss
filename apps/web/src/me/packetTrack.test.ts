@@ -1,11 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  GUEST_STATIONS,
+  PACKET_STOPS,
   NO_TRACK,
   placeOnTrack,
   stopOf,
   type FeedbackPacket,
-} from './guestFlow';
+} from './packetTrack';
 
 function packet(over: Partial<FeedbackPacket>): FeedbackPacket {
   return {
@@ -85,7 +85,7 @@ describe('placeOnTrack', () => {
       packet({ id: 'b', steps: [step('build', 'active')] }),
       packet({ id: 'c', status: 'closed', steps: [step('closed', 'completed')] }),
     ]);
-    expect(t.stops.map((s) => s.key)).toEqual(GUEST_STATIONS.map((s) => s.key));
+    expect(t.stops.map((s) => s.key)).toEqual(PACKET_STOPS.map((s) => s.key));
     expect(cardsAt(t, 'reading')).toEqual(['a']);
     expect(cardsAt(t, 'building')).toEqual(['b']);
     expect(cardsAt(t, 'done')).toEqual(['c']);
@@ -130,6 +130,6 @@ describe('placeOnTrack', () => {
     const t = placeOnTrack([]);
     expect(t.any).toBe(false);
     expect(t).toEqual(NO_TRACK);
-    expect(t.stops).toHaveLength(GUEST_STATIONS.length);
+    expect(t.stops).toHaveLength(PACKET_STOPS.length);
   });
 });

@@ -224,6 +224,7 @@ async fn an_authored_lens_survives_draft_and_publish() {
         title: "Night review".into(),
         subtitle: Some("What came in after hours".into()),
         panels: vec!["corpus".into()],
+        with_steps: false,
     });
     let expected = authored.lens.clone();
     registry

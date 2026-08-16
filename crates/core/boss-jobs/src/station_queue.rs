@@ -412,6 +412,16 @@ pub struct StationQueue {
     pub lens: Option<crate::stations::StationLens>,
     pub total: usize,
     pub data: Vec<Job>,
+    /// Members' steps, keyed by job id — present only when the
+    /// station's lens declares `with_steps`, empty otherwise.
+    ///
+    /// A separate map rather than steps nested on each Job because
+    /// `Job` is the envelope the whole system passes around and it
+    /// does not carry its steps; widening it here would put a second
+    /// shape of Job on the wire. A lens that needs them looks them up;
+    /// every other lens serialises an empty object and is unaffected.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub steps: BTreeMap<String, Vec<Step>>,
 }
 
 /// Evaluate a station over a packet universe: keep what is inside the
@@ -430,13 +440,24 @@ pub fn evaluate_station(
     packets: Vec<(Job, Vec<Step>)>,
     today: NaiveDate,
 ) -> StationQueue {
-    let mut members: Vec<Job> = packets
+    let with_steps = spec.lens.as_ref().is_some_and(|l| l.with_steps);
+    let kept: Vec<(Job, Vec<Step>)> = packets
         .into_iter()
         .filter(|(job, steps)| {
             in_window(job, today, spec.terminal_window_days) && spec.predicate.matches(job, steps)
         })
-        .map(|(job, _)| job)
         .collect();
+    // Only MEMBERS' steps, and only when asked. A queue that leaked the
+    // steps of packets it rejected would be answering a question nobody
+    // asked with data the caller's scope was never checked against.
+    let steps: BTreeMap<String, Vec<Step>> = if with_steps {
+        kept.iter()
+            .map(|(job, steps)| (job.id.to_string(), steps.clone()))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    let mut members: Vec<Job> = kept.into_iter().map(|(job, _)| job).collect();
     order_by_discipline(&spec.discipline, &mut members);
     let discipline = if spec.discipline.is_empty() {
         default_discipline()
@@ -455,6 +476,7 @@ pub fn evaluate_station(
         upstream: spec.upstream.clone(),
         lens: spec.lens.clone(),
         total: members.len(),
+        steps,
         data: members,
     }
 }
@@ -872,11 +894,74 @@ mod tests {
             title: "Design review".into(),
             subtitle: Some("Open questions, pending decisions, ADRs".into()),
             panels: vec!["rejections".into(), "corpus".into()],
+            with_steps: false,
         });
         let q = evaluate_station(&spec, vec![], day(20));
         let lens = q.lens.expect("declared, so present");
         assert_eq!(lens.title, "Design review");
         assert_eq!(lens.panels, vec!["rejections", "corpus"]);
+    }
+
+    /// A lens that places packets at the stop they reached needs their
+    /// steps, and the queue is the one read that already has them —
+    /// the handler fetched them to evaluate the predicate. Echoing
+    /// them turns two calls into one.
+    #[test]
+    fn a_lens_that_asks_for_steps_gets_them_for_members_only() {
+        let mut spec = dock_spec(None);
+        spec.lens = Some(crate::stations::StationLens {
+            eyebrow: None,
+            title: "My watchlist".into(),
+            subtitle: None,
+            panels: vec![],
+            with_steps: true,
+        });
+        let member = job("ship-a-change", Priority::Standard, 1);
+        let member_id = member.id.to_string();
+        let outsider = job("wholesale-keg-order", Priority::Standard, 1);
+        let outsider_id = outsider.id.to_string();
+        let q = evaluate_station(
+            &spec,
+            vec![
+                (member, vec![step("review", StepStatus::Ready)]),
+                (outsider, vec![step("deliver", StepStatus::Active)]),
+            ],
+            day(20),
+        );
+        assert_eq!(q.total, 1, "only the ship-a-change is a dock member");
+        assert_eq!(
+            q.steps.get(&member_id).map(Vec::len),
+            Some(1),
+            "the member's steps ride along"
+        );
+        assert!(
+            !q.steps.contains_key(&outsider_id),
+            "a packet the predicate rejected must not leak its steps"
+        );
+    }
+
+    #[test]
+    fn a_lens_that_does_not_ask_gets_no_steps() {
+        // The default, and the reason it is a default: one list_steps
+        // per member is real cost, and most lenses render from the Job.
+        let mut spec = dock_spec(None);
+        spec.lens = Some(crate::stations::StationLens {
+            eyebrow: None,
+            title: "Loading dock".into(),
+            subtitle: None,
+            panels: vec![],
+            with_steps: false,
+        });
+        let q = evaluate_station(
+            &spec,
+            vec![(
+                job("ship-a-change", Priority::Standard, 1),
+                vec![step("review", StepStatus::Ready)],
+            )],
+            day(20),
+        );
+        assert_eq!(q.total, 1);
+        assert!(q.steps.is_empty(), "not asked, not carried");
     }
 
     #[test]

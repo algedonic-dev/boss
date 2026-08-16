@@ -427,6 +427,28 @@ fn ship_a_change_spec() -> WorkflowSpec {
                     field_type: "string".into(),
                     required: true,
                 },
+                // What the change LOOKS like, for a car that changes a
+                // rendered surface — a screenshot path, or what was
+                // rendered and looked at.
+                //
+                // Optional, because most cars change no surface and a
+                // required field would be answered "n/a" into
+                // meaninglessness. It exists because the protocol is a
+                // better place to carry this than any one actor's
+                // notes: on 2026-08-15 a UI change was "fixed" twice in
+                // the wrong file and both diffs compiled, typechecked
+                // and read plausibly. The tooling to render it was
+                // already in the repo — `apps/web/playwright.mocked
+                // .config.ts`, chromium installed — and one screenshot
+                // named the mistake in a minute. Asking the question on
+                // the step is what makes that habit belong to whoever
+                // holds the car rather than to whoever happened to
+                // learn it.
+                boss_core::job::StepField {
+                    name: "rendered".into(),
+                    field_type: "string".into(),
+                    required: false,
+                },
             ],
             ..Default::default()
         },
