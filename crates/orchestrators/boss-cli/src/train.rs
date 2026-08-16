@@ -677,6 +677,53 @@ pub(crate) fn skip_reason_conflict(conflicted: &[String]) -> String {
     }
 }
 
+/// Put a car's branch on the fork when the conductor can already see
+/// it, and say whether it did.
+///
+/// TWO SOURCES, TRIED IN ORDER, and both are refs the author already
+/// published — copying one to the fork is not a judgement call.
+///
+/// 1. `origin/<branch>`. The natural place to push is the upstream you
+///    cloned; the fork is an implementation detail of how this
+///    conductor assembles a train. On 2026-08-14 that gap silently
+///    held NINE cars for a session — the dock reported 12 parked while
+///    the boardable count was 0, because `parked_ready` asks "branch
+///    declared, review ready" and boarding asks "branch on the fork".
+///
+/// 2. `refs/heads/<branch>` — a LOCAL ref in the conductor's own
+///    clone. This is what `git push gcp <branch>` produces, because
+///    the `gcp` remote IS /var/lib/boss-train/repo. The ref lands here
+///    on no remote, and the car was skipped while its branch sat in
+///    the conductor's working copy. On 2026-08-16 that cost five
+///    hand-run pushes in one evening: a human ran `git push origin`
+///    from this very directory, with the credentials the conductor
+///    already holds. The old comment called a branch in neither place
+///    "never pushed at all", which stopped being true the moment
+///    anyone could push to this clone directly.
+///
+/// Returns `Ok(false)` when neither ref exists — that car really was
+/// never pushed, and skipping it is correct. Never called in dry mode.
+pub(crate) fn publish_car_branch(clone: &str, branch: &str) -> Result<bool> {
+    for src in [format!("origin/{branch}"), format!("refs/heads/{branch}")] {
+        let have = sh_unchecked(&["git", "-C", clone, "rev-parse", "--verify", "--quiet", &src])?;
+        if !have.status.success() {
+            continue;
+        }
+        let pushed = sh_unchecked(&[
+            "git",
+            "-C",
+            clone,
+            "push",
+            "fork",
+            &format!("{src}:refs/heads/{branch}"),
+        ])?;
+        if pushed.status.success() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// The skip reason for a car parked at review whose branch was never
 /// pushed to the fork.
 pub(crate) fn skip_reason_branch_missing(branch: &str) -> String {
@@ -2552,41 +2599,23 @@ impl Conductor {
             // behaviour. A branch that exists in NEITHER place is still
             // a real skip — that car was never pushed at all.
             let mut ok = ok;
-            if !ok.status.success() {
-                let upstream = sh_unchecked(&[
+            if !ok.status.success()
+                && !self.cfg.dry
+                && publish_car_branch(&self.cfg.clone, &branch)?
+            {
+                log(format!(
+                    "{}: branch {branch} was not on the fork — published it",
+                    id8(&jid)
+                ));
+                ok = sh_unchecked(&[
                     "git",
                     "-C",
                     &self.cfg.clone,
                     "rev-parse",
                     "--verify",
                     "--quiet",
-                    &format!("origin/{branch}"),
+                    &format!("fork/{branch}"),
                 ])?;
-                if upstream.status.success() && !self.cfg.dry {
-                    let pushed = sh_unchecked(&[
-                        "git",
-                        "-C",
-                        &self.cfg.clone,
-                        "push",
-                        "fork",
-                        &format!("origin/{branch}:refs/heads/{branch}"),
-                    ])?;
-                    if pushed.status.success() {
-                        log(format!(
-                            "{}: branch {branch} was upstream but not on the fork — pushed it",
-                            id8(&jid)
-                        ));
-                        ok = sh_unchecked(&[
-                            "git",
-                            "-C",
-                            &self.cfg.clone,
-                            "rev-parse",
-                            "--verify",
-                            "--quiet",
-                            &format!("fork/{branch}"),
-                        ])?;
-                    }
-                }
             }
             if !ok.status.success() {
                 let reason = skip_reason_branch_missing(&branch);
@@ -4499,5 +4528,179 @@ mod tests {
         );
         assert_eq!(calls, 1, "a 422 is an answer — asked once");
         assert_eq!(lines.get(), 0, "an answer is not a blip and journals none");
+    }
+
+    // ---- publish_car_branch -------------------------------------
+    //
+    // `candidates` skips any parked car whose branch is not on the
+    // fork, and until 2026-08-16 it could recover only one case: the
+    // branch already on `origin`. A branch sitting as a LOCAL ref in
+    // the conductor's own clone counted as "never pushed at all" —
+    // which is exactly what `git push gcp <branch>` produces, since
+    // the `gcp` remote IS /var/lib/boss-train/repo. That cost five
+    // hand-run pushes in one evening, each a human running
+    // `git push origin` from that very directory with credentials the
+    // conductor already held.
+    //
+    // Neither recovery path had a test; only the skip MESSAGE did.
+    // These drive real git repositories, because the behaviour is
+    // entirely "which refs exist and what does git push do with them"
+    // — a faked git would only prove this file agrees with itself.
+
+    /// Removes its directory on drop, so a panicking test does not
+    /// leave repositories in /tmp.
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git_ok(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A bare fork, a bare origin, and a clone wired to both — the
+    /// conductor's actual shape.
+    fn clone_fixture(name: &str) -> (Scratch, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("boss-pcb-{name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        let guard = Scratch(root.clone());
+        let clone = root.join("clone");
+        for bare in ["fork.git", "origin.git"] {
+            let p = root.join(bare);
+            std::fs::create_dir_all(&p).expect("mkdir bare");
+            let out = std::process::Command::new("git")
+                .args(["init", "--bare", "-b", "main"])
+                .arg(&p)
+                .output()
+                .expect("init bare");
+            assert!(out.status.success());
+        }
+        std::fs::create_dir_all(&clone).expect("mkdir clone");
+        git_ok(&clone, &["init", "-b", "main"]);
+        git_ok(&clone, &["config", "user.email", "t@example.com"]);
+        git_ok(&clone, &["config", "user.name", "t"]);
+        std::fs::write(clone.join("README"), name).expect("write");
+        git_ok(&clone, &["add", "-A"]);
+        git_ok(&clone, &["commit", "-qm", "base"]);
+        git_ok(
+            &clone,
+            &[
+                "remote",
+                "add",
+                "fork",
+                root.join("fork.git").to_str().expect("utf8"),
+            ],
+        );
+        git_ok(
+            &clone,
+            &[
+                "remote",
+                "add",
+                "origin",
+                root.join("origin.git").to_str().expect("utf8"),
+            ],
+        );
+        git_ok(&clone, &["push", "-q", "origin", "main"]);
+        git_ok(&clone, &["push", "-q", "fork", "main"]);
+        (guard, clone)
+    }
+
+    fn on_fork(clone: &std::path::Path, branch: &str) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(clone)
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("fork/{branch}"),
+            ])
+            .output()
+            .expect("rev-parse")
+            .status
+            .success()
+    }
+
+    fn commit_branch(clone: &std::path::Path, branch: &str) {
+        git_ok(clone, &["checkout", "-q", "-b", branch]);
+        std::fs::write(clone.join("x"), branch).expect("write");
+        git_ok(clone, &["add", "-A"]);
+        git_ok(clone, &["commit", "-qm", "work"]);
+        git_ok(clone, &["checkout", "-q", "main"]);
+    }
+
+    /// THE CASE THAT COST FIVE PUSHES.
+    #[test]
+    fn a_branch_local_to_the_clone_gets_published() {
+        let (_g, clone) = clone_fixture("local-only");
+        commit_branch(&clone, "feat/local-only");
+        assert!(!on_fork(&clone, "feat/local-only"), "precondition");
+
+        let published =
+            publish_car_branch(clone.to_str().expect("utf8"), "feat/local-only").expect("publish");
+        assert!(
+            published,
+            "a local ref the conductor can see should publish"
+        );
+        assert!(
+            on_fork(&clone, "feat/local-only"),
+            "fork/<branch> must resolve afterwards — that is what candidates checks"
+        );
+    }
+
+    /// The older recovery path, also previously untested.
+    #[test]
+    fn a_branch_on_origin_gets_copied_to_the_fork() {
+        let (_g, clone) = clone_fixture("origin-only");
+        commit_branch(&clone, "feat/upstream");
+        git_ok(&clone, &["push", "-q", "origin", "feat/upstream"]);
+        // Drop the local ref so origin/<branch> is the only source.
+        git_ok(&clone, &["branch", "-qD", "feat/upstream"]);
+
+        assert!(!on_fork(&clone, "feat/upstream"));
+        assert!(
+            publish_car_branch(clone.to_str().expect("utf8"), "feat/upstream").expect("publish")
+        );
+        assert!(on_fork(&clone, "feat/upstream"));
+    }
+
+    /// Recovery must not become "board anything".
+    #[test]
+    fn a_branch_that_exists_nowhere_is_still_a_skip() {
+        let (_g, clone) = clone_fixture("nowhere");
+        assert!(
+            !publish_car_branch(clone.to_str().expect("utf8"), "feat/never-pushed")
+                .expect("publish"),
+            "nothing to copy: that car was never pushed, and skipping is right"
+        );
+        assert!(!on_fork(&clone, "feat/never-pushed"));
+    }
+
+    /// `candidates` runs on every boarding attempt, so an unchanged
+    /// branch is seen again next train. "Already up to date" must not
+    /// read as a failure that strands the car.
+    #[test]
+    fn publishing_an_already_published_branch_is_idempotent() {
+        let (_g, clone) = clone_fixture("twice");
+        commit_branch(&clone, "feat/twice");
+        let path = clone.to_str().expect("utf8");
+        assert!(publish_car_branch(path, "feat/twice").expect("first"));
+        assert!(
+            publish_car_branch(path, "feat/twice").expect("second"),
+            "a second publish of an unchanged branch must still report success"
+        );
+        assert!(on_fork(&clone, "feat/twice"));
     }
 }
