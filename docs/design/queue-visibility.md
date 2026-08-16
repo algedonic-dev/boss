@@ -178,25 +178,6 @@ engineering team is free to change what serves it.
 
 ## Open questions
 
-### Q1: Does My Day move onto the assignments lens?
-
-The page reimplements a weaker client-side version of the lens
-over `/api/jobs?limit=200`, with a self-documented cap bug. Moving
-it to `GET /api/jobs/assignments?assignee_id=me&roles=…` fixes the
-bug, makes the group queue visible to humans for the first time,
-and deletes code. This is close to a defect fix; the open part is
-UX — does My Day show the two branches as one list or as "mine"
-vs "up for grabs"?
-
-### Q2: What are the claim semantics for group-visible steps?
-
-Before any surface serves the group lens, Ready→Active needs
-compare-and-set: claim succeeds only if `assignee_id` is still
-NULL (`rows_affected > 0` gates the event, the same
-idempotency-guard shape every other write path uses). A failed
-claim is a normal outcome, not an error. Without this, two actors
-will eventually complete the same step twice.
-
 ### Q3: Roles only — or do skills join the routing vocabulary, or get deleted?
 
 `authority_role` gates everything today. The `employee_skills`
@@ -205,15 +186,6 @@ code gets deleted. Either skills become a real routing term
 (people-api filter + dispatcher candidate filter + a `skills=`
 lens param) or the table and column go. Keeping unread data
 "just in case" is the one option the coding guidelines rule out.
-
-### Q4: Is per-lens queue depth an algedonic signal, and where does it surface?
-
-Depth and oldest-wait per role lens (computed on wall-clock
-`created_at`) are cheap aggregates over the in-flight set. Are
-they cybernetics telemetry with thresholds (S4 sees "ar-clerk
-queue depth 3× baseline"), a Flow-view panel, or both? And does a
-breach open a Job (the system's native way to make someone own a
-fact)?
 
 ### Q5: Does assignment strategy become per-step-kind rule data?
 
@@ -224,6 +196,57 @@ by workflow (sign-offs want a named person; generic tasks want a
 pool). Registries-over-code says this belongs in the dispatcher
 rules registry next to the other routing rules — one `strategy`
 field per rule, not new `match` arms.
+
+
+## Decisions
+
+### Q1: Does My Day move onto the assignments lens? (resolved)
+
+Resolved 2026-08-16 — override.
+
+**The question was:**
+
+> The page reimplements a weaker client-side version of the lens
+> over `/api/jobs?limit=200`, with a self-documented cap bug. Moving
+> it to `GET /api/jobs/assignments?assignee_id=me&roles=…` fixes the
+> bug, makes the group queue visible to humans for the first time,
+> and deletes code. This is close to a defect fix; the open part is
+> UX — does My Day show the two branches as one list or as "mine"
+> vs "up for grabs"?
+
+Yes — and it already moved. MePage reads GET /api/jobs/assignments (apps/web/src/me/assignments.ts:92); the page's own comment records that this replaced the capped `jobs?status=open` scan filtered client-side. Recording it because the question was answered by building it, and nothing marks a question resolved when the thing that answers it ships.
+
+
+### Q2: What are the claim semantics for group-visible steps? (resolved)
+
+Resolved 2026-08-16 — override.
+
+**The question was:**
+
+> Before any surface serves the group lens, Ready→Active needs
+> compare-and-set: claim succeeds only if `assignee_id` is still
+> NULL (`rows_affected > 0` gates the event, the same
+> idempotency-guard shape every other write path uses). A failed
+> claim is a normal outcome, not an error. Without this, two actors
+> will eventually complete the same step twice.
+
+Settled by the claim CAS, shipped as car a4c8f910: POST /api/jobs/{id}/steps/{step_id}/claim does a compare-and-set on Ready->Active, so two actors cannot claim one step. A claim that names its station additionally checks membership (409) and capability (403) BEFORE the CAS, which is where the group-visible half of this question lands.
+
+
+### Q4: Is per-lens queue depth an algedonic signal, and where does it surface? (resolved)
+
+Resolved 2026-08-16 — override.
+
+**The question was:**
+
+> Depth and oldest-wait per role lens (computed on wall-clock
+> `created_at`) are cheap aggregates over the in-flight set. Are
+> they cybernetics telemetry with thresholds (S4 sees "ar-clerk
+> queue depth 3× baseline"), a Flow-view panel, or both? And does a
+> breach open a Job (the system's native way to make someone own a
+> fact)?
+
+Yes, and advisory rather than enforced. A station declares `wip_limit`; the queue envelope reports `over_limit`; lenses warn and telemetry reads it, and nothing blocks on it — the posture stations.md Q3 ratified. It surfaces wherever a lens renders the station, the dock being the first.
 
 ## Decision history
 

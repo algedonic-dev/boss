@@ -150,12 +150,6 @@ and moving the company is copying them.
 
 ## Open questions
 
-### Q1: What are the five machines?
-
-Per box: hostname, cores/RAM/disk, OS + version, and how they are
-reached today. This gates everything; the design assumes only "Linux,
-4–8 cores, one LAN".
-
 ### Q2: Tailscale or bare WireGuard? (resolved)
 
 Resolved 2026-08-10 — David: **bare WireGuard from the GCP box to the
@@ -184,12 +178,34 @@ becomes pod-shaped: what securityContext/namespace isolation the
 runner pods get, rather than which unix user the runner daemon runs
 as.
 
-### Q4: When does the playground move?
 
-Staying on GCP costs the VM and keeps build/demo separation as a
-LAN→cloud deploy. Moving to the strongest LAN box removes the cloud
-dependency and puts the demo where the cores are, behind the same
-tunnel. Suggest deciding after build-1 has run for a week.
+## Decisions
+
+### Q1: What are the five machines? (resolved)
+
+Resolved 2026-08-16 — override.
+
+**The question was:**
+
+> Per box: hostname, cores/RAM/disk, OS + version, and how they are
+> reached today. This gates everything; the design assumes only "Linux,
+> 4–8 cores, one LAN".
+
+Answered by the build rather than by choosing. The cluster runs three Talos control-plane nodes (cp-1/2/3 at 10.20.0.11-13 behind API VIP 10.20.0.10), the mini PC `david-asus-minipc` at 10.20.0.15 hosting Forgejo, its OCI registry, the CI runner and cluster-deploy-runner, and boss-gcp (34.45.110.40) which still carries the train pipeline and the public demo. The question asked what to build; this is what runs.
+
+
+### Q4: When does the playground move? (resolved)
+
+Resolved 2026-08-16 — override.
+
+**The question was:**
+
+> Staying on GCP costs the VM and keeps build/demo separation as a
+> LAN→cloud deploy. Moving to the strongest LAN box removes the cloud
+> dependency and puts the demo where the cores are, behind the same
+> tunnel. Suggest deciding after build-1 has run for a week.
+
+It moved. The cluster became the system of record on 2026-08-12 and the human door (playground.algedonic.dev) routes to the cluster gateway; the forge cutover followed. What stayed on GCP is deliberately narrower than 'the playground': the train pipeline and the public demo. The 'decide after build-1 has run for a week' condition was met and the decision was taken by doing it.
 
 ## Decision history
 

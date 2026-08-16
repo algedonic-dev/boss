@@ -108,15 +108,6 @@ ship views.
 
 ## Open questions
 
-### Q1: One UI-plugin registry, or a sibling table per slot?
-
-`step_plugins` could generalize to a `ui_plugins` registry with a
-`slot` column (`step:<kind>` | `workflow:<kind>:<surface>`), or a
-sibling `workflow_views` table keeps the two lifecycles apart. One
-registry means one authoring surface, one version discipline, one
-serving path; the split means simpler rows. Precedent (the Class
-registry: one table, kind-keyed) leans single-registry.
-
 ### Q2: What exactly does the host hand a view?
 
 Proposal: the step-plugin props shape, plus a provided client —
@@ -150,6 +141,24 @@ third door: department apps will be authored substantially by
 agents. Policy rule on `(publish, ui-plugin)`, a `publish-a-view`
 Workflow, or role-scoped authoring at `/system/step-plugins`'s
 successor. Should resolve consistently with those two.
+
+
+## Decisions
+
+### Q1: One UI-plugin registry, or a sibling table per slot? (resolved)
+
+Resolved 2026-08-16 — override.
+
+**The question was:**
+
+> `step_plugins` could generalize to a `ui_plugins` registry with a
+> `slot` column (`step:<kind>` | `workflow:<kind>:<surface>`), or a
+> sibling `workflow_views` table keeps the two lifecycles apart. One
+> registry means one authoring surface, one version discipline, one
+> serving path; the split means simpler rows. Precedent (the Class
+> registry: one table, kind-keyed) leans single-registry.
+
+One registry. `step_plugins` (03-jobs.sql) is the single table and carries nine active rows today. The sibling-table-per-slot alternative was never built and nothing has needed it since.
 
 ## Decision history
 

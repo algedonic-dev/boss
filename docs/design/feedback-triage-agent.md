@@ -193,39 +193,48 @@ make the expensive path auditable, which is the same shape as the
 pushdown seam in `boss-views` — push down what is mechanical, evaluate
 the residual honestly.
 
-### Q2: Where does an agent's finding go? — ANSWERED
 
-Today the board records that an agent was *asked* (`agent_requested_at`)
-but has nowhere to put what the agent *found*. Every hand pass so far
-has produced a paragraph of reasoning that lives only in this doc,
-which does not scale past the experiment and is invisible to the
-operator looking at the card.
+Proposed: **rules, for the one thing rules can do; no model for the
+rest, and the rest is nearly all of it.** The evidence table this
+question asked for now exists — 161 real (non-simulated) feedback
+packets, 135 of them triaged:
 
-Answered by the passes rather than by choosing. Across eight
-hand-processed items a finding was consistently two things: **a root
-cause** — a claim about the code that the feedback text never mentions
-— and **what was done about it**, usually a commit. Never a structured
-verdict, never a proposed Job. So it is free text with provenance, and
-a schema would have been invented rather than observed.
+| disposition | count |
+|---|---|
+| build | 62 |
+| design | 48 |
+| reproduce | 23 |
+| duplicate | 1 |
+| decline | 1 |
 
-Built as an optional `finding` field declared on the triage step, so
-it is self-describing data rather than a board convention: the generic
-step surface renders it from the same contract, and no second place
-has to be taught about feedback. Optional because a finding is
-evidence, and triage can legitimately route something obvious without
-one.
+The mechanical class is **2 of 135**. Everything else is a judgement
+about whether an item is a code change, a decision, or something that
+must be reproduced first — and that judgement turned on repo
+comprehension every time it was interesting. `a001c78a` was `build`
+rather than `design` only because reading the workflow's predicates
+showed the routing was already decided and wrong. `0b8ae875` was
+`build` because David had already answered its shape twice in another
+doc. `bedda461` needed the corpus measured — 11 of 23 docs stale —
+before anyone could say the report was real. No rule over route, class
+and text reaches any of those.
 
-Two properties the build had to preserve. A finding is **not a
-decision** — writing one leaves the item in triage, because finding
-something and deciding what to do about it are different acts, and
-collapsing them was the original modelling error behind "With an
-agent" being a column. And it **outlives routing**, rendering on
-routed cards too; otherwise the reason a card went where it went
-disappears the moment it gets there.
+So the hoped-for split in the paragraph above inverts: it is not
+"rules do the bulk, a model takes the residual". Here the residual IS
+the bulk, and a rule engine would earn its keep on 1.5% of traffic.
 
-Provenance (`finding_by`) is recorded for the same reason the
-hand-off record is: an agent taking an automatic first pass writes the
-identical shape, and the surface should not care which wrote it.
+**The caveat that keeps this honest, and it is a big one.** This
+corpus is mostly self-filed: 86 packets from the operator baseline, 48
+from agents, and only 6 from guests or anonymous visitors. Public
+feedback has a noise profile this sample does not contain — blank
+submissions, "it's broken", the same complaint five times — which is
+exactly the class rules serve. So the finding is *"rules cannot triage
+the traffic we have"*, not *"rules cannot triage feedback"*.
+
+What follows: build the deterministic **duplicate check** now, because
+it is cheap, auditable and the one mechanical thing here; do not build
+a model-backed triage agent for this traffic; and re-run this table
+when guest volume exists, since that is the population the question was
+really about.
 
 ### Q3: Should the agent be allowed to close an item?
 
@@ -241,6 +250,73 @@ Note the policy angle: the triage step is gated by
 `authority_role: platform-admin`, which is what stopped the sim
 workforce from completing these Jobs the moment they went ready. Any
 auto-close path has to hold that gate, not route around it.
+
+
+
+Proposed: **no.** Not because closing is wrong in principle, but
+because the saving is not there. Auto-closing noise is worth having
+when noise is a large class; on the measured corpus above it is 2
+packets in 135. Buying 1.5% at the price of a wrong close — a real
+report dismissed by a rule, with the filer told it was a duplicate —
+is a bad trade, and the failure is silent in exactly the way this
+system keeps being bitten by.
+
+Keep the `authority_role: platform-admin` gate as-is. It is what
+stopped the simulated workforce completing these Jobs the moment they
+went ready, and any auto-close path has to hold it rather than route
+around it.
+
+Worth distinguishing from something that already ships and looks
+similar: `complete-feedback-branch-on-car-merged` DOES close a packet
+without a human, and that is correct — it closes on **evidence that
+the work was done** (a car naming the packet merged), not on a
+judgement that the item was worthless. Closing on evidence and closing
+on an opinion are different powers, and the protocol should keep
+granting only the first.
+
+Revisit alongside Q1 if guest volume ever makes the noise class real.
+
+## Decisions
+
+### Q2: Where does an agent's finding go? — ANSWERED (resolved)
+
+Resolved 2026-08-16 — override.
+
+**The question was:**
+
+> Today the board records that an agent was *asked* (`agent_requested_at`)
+> but has nowhere to put what the agent *found*. Every hand pass so far
+> has produced a paragraph of reasoning that lives only in this doc,
+> which does not scale past the experiment and is invisible to the
+> operator looking at the card.
+>
+> Answered by the passes rather than by choosing. Across eight
+> hand-processed items a finding was consistently two things: **a root
+> cause** — a claim about the code that the feedback text never mentions
+> — and **what was done about it**, usually a commit. Never a structured
+> verdict, never a proposed Job. So it is free text with provenance, and
+> a schema would have been invented rather than observed.
+>
+> Built as an optional `finding` field declared on the triage step, so
+> it is self-describing data rather than a board convention: the generic
+> step surface renders it from the same contract, and no second place
+> has to be taught about feedback. Optional because a finding is
+> evidence, and triage can legitimately route something obvious without
+> one.
+>
+> Two properties the build had to preserve. A finding is **not a
+> decision** — writing one leaves the item in triage, because finding
+> something and deciding what to do about it are different acts, and
+> collapsing them was the original modelling error behind "With an
+> agent" being a column. And it **outlives routing**, rendering on
+> routed cards too; otherwise the reason a card went where it went
+> disappears the moment it gets there.
+>
+> Provenance (`finding_by`) is recorded for the same reason the
+> hand-off record is: an agent taking an automatic first pass writes the
+> identical shape, and the surface should not care which wrote it.
+
+Answered in this doc's own body — 'answered by the passes rather than by choosing' — and since shipped: both `triage` and `investigate` declare a `finding` field on the step, so a root cause and what was done about it live on the step that produced them rather than in prose here. The heading has said ANSWERED for some time; this is the tracker catching up.
 
 ## Decision history
 
