@@ -789,6 +789,53 @@ pub(crate) fn skip_reason_branch_missing(branch: &str) -> String {
     format!("branch {branch} not on fork")
 }
 
+/// Which of a repo's action runs belong to this train and are still
+/// burning the runner — the decision half of "cancelling a train
+/// should cancel its CI", kept pure so it can be tested against real
+/// API shapes rather than a fake.
+///
+/// MEASURED FIELD SHAPES, 2026-08-17, against this Forgejo. The
+/// obvious key does not work: **`head_branch` is `null` on every run**
+/// this deployment returns, so a filter written against it cancels
+/// nothing at all, silently, which is indistinguishable from "there
+/// was nothing to cancel". Two fields ARE populated and identify a
+/// train's runs:
+///   - `prettyref`  — `"#64"` for a pull_request run, i.e. the PR the
+///     conductor already holds the url of;
+///   - `commit_sha` — the train branch head the run was queued for.
+/// Either is sufficient; both are matched so a run queued before the
+/// PR existed is still caught.
+///
+/// CONSERVATIVE ON STATUS, deliberately. Only runs in a known-active
+/// state are cancelled. The alternative — "anything not in a terminal
+/// set" — cancels runs whose status this code has never heard of, and
+/// the cost of a false cancel (killing someone's live run) is much
+/// higher than the cost of a miss (the run finishes and wastes the
+/// time it was already wasting).
+pub(crate) fn cancellable_run_ids(runs: &[Value], pr_index: &str, head_sha: &str) -> Vec<i64> {
+    const ACTIVE: [&str; 3] = ["running", "waiting", "blocked"];
+    let want_ref = format!("#{pr_index}");
+    runs.iter()
+        .filter(|r| {
+            let status = r.get("status").and_then(Value::as_str).unwrap_or_default();
+            ACTIVE.contains(&status)
+        })
+        .filter(|r| {
+            let pretty = r
+                .get("prettyref")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let sha = r
+                .get("commit_sha")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            (!pr_index.is_empty() && pretty == want_ref)
+                || (!head_sha.is_empty() && !sha.is_empty() && sha == head_sha)
+        })
+        .filter_map(|r| r.get("id").and_then(Value::as_i64))
+        .collect()
+}
+
 /// Is this ship-a-change Job a parked ready car — at review with a
 /// branch declared and not already on a train? ONE definition, shared
 /// by the boarding collector below and the cadence loop's dock-depth
@@ -1443,6 +1490,25 @@ trait Forge: Send + Sync {
     /// car's branch is only deletable while it still points at what
     /// boarded.
     async fn branch_head(&self, branch: &str) -> Result<Option<String>>;
+    /// Cancel the still-running CI runs belonging to this train, and
+    /// say how many were cancelled.
+    ///
+    /// Cancelling a train releases its cars and closes its PR but used
+    /// to leave the run burning: measured 2026-08-17, a job for the
+    /// cancelled train 58 was still running 27 minutes later, holding
+    /// 78.65GB across three volumes (`docker system df` reporting 0B
+    /// reclaimable is the tell — they are attached to a LIVE
+    /// container), and the runner is single-concurrency, so the next
+    /// train's jobs all sat in `waiting` behind work for a train that
+    /// no longer existed. The forge host fell from 136G free to 44G,
+    /// under locomotive's own 70GB floor, so the following train would
+    /// have red-ed on a preflight telling the truth about a condition
+    /// nobody caused. Packet `89b27e60`.
+    ///
+    /// There is no rerun API on this forge, but cancel works — probed
+    /// against an already-finished run so the probe could not disturb
+    /// live work.
+    async fn cancel_ci_runs(&self, pr_index: &str, head_sha: &str) -> Result<usize>;
 }
 
 /// `owner/name` from a clone url — https or ssh, with or without
@@ -1538,6 +1604,53 @@ impl Forge for GitHubForge {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string))
+    }
+
+    /// GitHub keys runs by head sha, which `gh run list --commit`
+    /// takes directly — so this adapter does not need
+    /// `cancellable_run_ids`, whose whole job is working around the
+    /// Forgejo shape. A failure here is logged, never propagated: the
+    /// pipeline does not run on this adapter any more, and a cancel
+    /// that cannot reach GitHub must still release the cars.
+    async fn cancel_ci_runs(&self, _pr_index: &str, head_sha: &str) -> Result<usize> {
+        if head_sha.is_empty() {
+            return Ok(0);
+        }
+        let r = sh_unchecked(&[
+            "gh",
+            "run",
+            "list",
+            "--commit",
+            head_sha,
+            "--json",
+            "databaseId,status",
+        ])?;
+        if !r.status.success() {
+            log(format!(
+                "cancel: could not list GitHub runs for {head_sha}: {}",
+                String::from_utf8_lossy(&r.stderr).trim()
+            ));
+            return Ok(0);
+        }
+        let runs: Vec<Value> = serde_json::from_str(&stdout_str(&r)).unwrap_or_default();
+        let mut cancelled = 0;
+        for run in runs {
+            let status = run
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !["in_progress", "queued", "waiting", "requested", "pending"].contains(&status) {
+                continue;
+            }
+            let Some(id) = run.get("databaseId").and_then(Value::as_i64) else {
+                continue;
+            };
+            let out = sh_unchecked(&["gh", "run", "cancel", &id.to_string()])?;
+            if out.status.success() {
+                cancelled += 1;
+            }
+        }
+        Ok(cancelled)
     }
 }
 
@@ -1800,6 +1913,56 @@ impl Forge for ForgejoForge {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(str::to_string))
+    }
+
+    /// List the repo's recent runs, pick this train's still-active
+    /// ones with `cancellable_run_ids`, and POST cancel to each.
+    ///
+    /// NEVER PROPAGATES. Cancelling CI is a courtesy to the next
+    /// train; failing to do it must not abort the cancel that
+    /// releases the cars, because a car stuck aboard a dead train is
+    /// far worse than a run left burning. Every failure is logged and
+    /// swallowed, and the count returned is what actually succeeded.
+    async fn cancel_ci_runs(&self, pr_index: &str, head_sha: &str) -> Result<usize> {
+        let listed = match self
+            .api(
+                Method::GET,
+                &format!("/repos/{}/actions/runs?limit=50", self.repo),
+                None,
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                log(format!("cancel: could not list CI runs: {e}"));
+                return Ok(0);
+            }
+        };
+        let runs = listed
+            .as_ref()
+            .and_then(|v| v.get("workflow_runs"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let ids = cancellable_run_ids(&runs, pr_index, head_sha);
+        let mut cancelled = 0;
+        for id in ids {
+            match self
+                .api(
+                    Method::POST,
+                    &format!("/repos/{}/actions/runs/{id}/cancel", self.repo),
+                    None,
+                )
+                .await
+            {
+                Ok(_) => {
+                    cancelled += 1;
+                    log(format!("cancel: cancelled CI run {id}"));
+                }
+                Err(e) => log(format!("cancel: CI run {id} would not cancel: {e}")),
+            }
+        }
+        Ok(cancelled)
     }
 }
 
@@ -3158,6 +3321,40 @@ impl Conductor {
             .and_then(|m| m.get("pr_url"))
             .and_then(Value::as_str)
             .unwrap_or_default();
+        // Cancel the CI BEFORE closing the PR. Closing first leaves a
+        // window where the run is still burning the single-concurrency
+        // runner for a PR that is already gone, which is the state
+        // 89b27e60 measured 27 minutes into.
+        let train_head = train
+            .get("metadata")
+            .and_then(|m| m.get("train_ref"))
+            .and_then(Value::as_str)
+            .and_then(|r| r.rsplit('@').next())
+            .unwrap_or_default()
+            .to_string();
+        if !pr_url.is_empty() || !train_head.is_empty() {
+            // Last path segment of the PR url is its number on both
+            // forges; kept inline rather than reaching for a
+            // Forgejo-specific helper from forge-blind code.
+            let idx = pr_url
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            if self.cfg.dry {
+                log(format!(
+                    "DRY: would cancel CI runs for PR #{idx} / {train_head}"
+                ));
+            } else {
+                match self.forge.cancel_ci_runs(&idx, &train_head).await {
+                    Ok(0) => log("cancel: no CI runs were still active".to_string()),
+                    Ok(n) => log(format!("cancel: cancelled {n} in-flight CI run(s)")),
+                    Err(e) => log(format!("cancel: CI cancellation failed, continuing: {e}")),
+                }
+            }
+        }
+
         if !pr_url.is_empty() {
             if self.cfg.dry {
                 log(format!("DRY: would close {pr_url} unmerged"));
@@ -4779,6 +4976,90 @@ mod tests {
             rev(&clone, "fork/feat/ahead"),
             ahead,
             "the newer upstream ref must win over a stale local one"
+        );
+    }
+
+    // ---- cancellable_run_ids ---------------------------------
+    //
+    // Shapes copied from a live `GET /actions/runs?limit=N` on the
+    // forge on 2026-08-17, INCLUDING `head_branch: null`, which is the
+    // whole reason this function exists rather than a one-line filter.
+
+    fn run(id: i64, status: &str, pretty: &str, sha: &str) -> Value {
+        json!({
+            "id": id,
+            "status": status,
+            "conclusion": Value::Null,
+            "head_branch": Value::Null,
+            "prettyref": pretty,
+            "commit_sha": sha,
+            "event": "pull_request"
+        })
+    }
+
+    /// The measured trap: keying on `head_branch` finds nothing,
+    /// because this forge does not populate it.
+    #[test]
+    fn a_running_train_job_is_found_without_head_branch() {
+        let runs = vec![run(153, "running", "#64", "13c9e4ad")];
+        assert_eq!(
+            cancellable_run_ids(&runs, "64", "13c9e4ad"),
+            vec![153],
+            "the run must be identified by prettyref/commit_sha, since head_branch is null"
+        );
+    }
+
+    #[test]
+    fn finished_runs_are_left_alone() {
+        let runs = vec![
+            run(152, "success", "#64", "13c9e4ad"),
+            run(151, "failure", "#64", "13c9e4ad"),
+            run(150, "cancelled", "#64", "13c9e4ad"),
+        ];
+        assert!(
+            cancellable_run_ids(&runs, "64", "13c9e4ad").is_empty(),
+            "cancelling a finished run is a pointless API call at best"
+        );
+    }
+
+    /// The expensive mistake this guards against: killing a live run
+    /// that belongs to a DIFFERENT train.
+    #[test]
+    fn another_trains_run_is_never_cancelled() {
+        let runs = vec![
+            run(153, "running", "#64", "13c9e4ad"),
+            run(154, "running", "#65", "deadbeef"),
+        ];
+        assert_eq!(
+            cancellable_run_ids(&runs, "64", "13c9e4ad"),
+            vec![153],
+            "only this train's runs"
+        );
+    }
+
+    /// A run queued before the PR existed carries no `#N` but does
+    /// carry the sha, so the sha clause has to stand on its own.
+    #[test]
+    fn a_run_matching_only_on_sha_is_still_ours() {
+        let runs = vec![run(155, "running", "", "13c9e4ad")];
+        assert_eq!(cancellable_run_ids(&runs, "64", "13c9e4ad"), vec![155]);
+    }
+
+    /// Empty selectors must not turn into "match everything" — the
+    /// worst possible reading of a cancel.
+    #[test]
+    fn empty_selectors_cancel_nothing() {
+        let runs = vec![run(153, "running", "", "")];
+        assert!(cancellable_run_ids(&runs, "", "").is_empty());
+    }
+
+    /// An unrecognised status is left running on purpose.
+    #[test]
+    fn an_unknown_status_is_not_assumed_cancellable() {
+        let runs = vec![run(156, "some-future-state", "#64", "13c9e4ad")];
+        assert!(
+            cancellable_run_ids(&runs, "64", "13c9e4ad").is_empty(),
+            "a false cancel costs someone's live run; a miss costs only time"
         );
     }
 
