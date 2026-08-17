@@ -433,6 +433,40 @@ fn ship_a_change_spec() -> WorkflowSpec {
                     field_type: "string".into(),
                     required: true,
                 },
+                // The gate's OWN account of the run, not the author's.
+                //
+                // `gates` and `verified` are prose, so "the gate was
+                // green" has always been something the protocol takes
+                // on trust. On 2026-08-17 a car asserted
+                // `infra/gate.sh --auto green` while its crate did not
+                // compile, and the train it boarded reddened twice
+                // (742d1faa). Two more reds the same day were the
+                // subtler version: the gate really did pass, on a
+                // laptop, in a shape CI does not run — one suite that
+                // had never seen `FORGEJO_ACTIONS`, one that had never
+                // run against a clean tree whose HEAD is its own trunk.
+                // Neither prose field would have shown that, because
+                // the author did not know it either.
+                //
+                // `infra/gate.sh` now writes a receipt (see
+                // `write_receipt`) recording the mode, the commit,
+                // whether the tree was dirty, the host, whether any CI
+                // marker was set, the free space, and every check with
+                // its result. Paste it here.
+                //
+                // This is EVIDENCE, NOT ENFORCEMENT — nothing stops
+                // someone typing a fiction into a string field, and
+                // pretending otherwise would be the same trust the
+                // prose fields already misplace. What it changes is
+                // that the honest answer is now the easy one, and that
+                // the fact which keeps catching us — WHERE the gate ran
+                // — is written down by something other than the person
+                // making the claim.
+                boss_core::job::StepField {
+                    name: "receipt".into(),
+                    field_type: "string".into(),
+                    required: true,
+                },
                 // What the change LOOKS like, for a car that changes a
                 // rendered surface — a screenshot path, or what was
                 // rendered and looked at.

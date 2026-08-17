@@ -783,6 +783,34 @@ pub(crate) fn publish_car_branch(clone: &str, branch: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// The sha `publish_car_branch` would ship for this branch, or `None`
+/// when the conductor can see no ref for it at all.
+///
+/// Exists so BOARDING can ask the same question PUBLISHING answers.
+/// Until 2026-08-17 `candidates` only asked "is this branch on the
+/// fork", which is not the question: once a branch is on the forge, a
+/// later commit to it never gets there, so a car repaired after a red
+/// train boards the version that just failed. It happened twice in one
+/// day — `feat/dev-shared-target` was `3370b42` locally and `96109f7`
+/// on the forge, and train 38d49597 assembled the red one. Packet
+/// `7d2f30b9`.
+pub(crate) fn car_head(clone: &str, branch: &str) -> Result<Option<String>> {
+    for src in [format!("refs/heads/{branch}"), format!("origin/{branch}")] {
+        let out = sh_unchecked(&["git", "-C", clone, "rev-parse", "--verify", "--quiet", &src])?;
+        if out.status.success() {
+            let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !sha.is_empty() {
+                // Whichever of the two publish_car_branch would pick
+                // resolves to a commit; comparing the LOCAL one first
+                // is enough to notice a fork that has fallen behind,
+                // and publish_car_branch still makes the final choice.
+                return Ok(Some(sha));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// The skip reason for a car parked at review whose branch was never
 /// pushed to the fork.
 pub(crate) fn skip_reason_branch_missing(branch: &str) -> String {
@@ -2820,8 +2848,18 @@ impl Conductor {
             // dock depth that cannot board, is the surprising
             // behaviour. A branch that exists in NEITHER place is still
             // a real skip — that car was never pushed at all.
+            // ABSENT **OR STALE**. Existence is not the question: a
+            // branch already on the forge is never refreshed, so a car
+            // fixed after a red train boards the commit that failed.
+            let fork_sha = if ok.status.success() {
+                Some(String::from_utf8_lossy(&ok.stdout).trim().to_string())
+            } else {
+                None
+            };
+            let want = car_head(&self.cfg.clone, &branch)?;
+            let stale = matches!((&fork_sha, &want), (Some(f), Some(w)) if f != w);
             let mut ok = ok;
-            if !ok.status.success()
+            if (!ok.status.success() || stale)
                 && !self.cfg.dry
                 && publish_car_branch(&self.cfg.clone, &branch)?
             {
@@ -5060,6 +5098,56 @@ mod tests {
         assert!(
             cancellable_run_ids(&runs, "64", "13c9e4ad").is_empty(),
             "a false cancel costs someone's live run; a miss costs only time"
+        );
+    }
+
+    /// THE REPAIR PATH, which is where staleness actually costs.
+    ///
+    /// A car boards, its train reddens, the author fixes the branch and
+    /// reboards. `candidates` used to ask only "is this branch on the
+    /// fork" — and it is, from the first boarding — so nothing
+    /// republished it and the new consist carried the commit that just
+    /// failed. Measured twice on 2026-08-17: feat/dev-shared-target was
+    /// 3370b42 locally and 96109f7 on the forge, and train 38d49597
+    /// assembled the red one.
+    #[test]
+    fn a_fork_branch_behind_the_car_is_republished() {
+        let (_g, clone) = clone_fixture("stale-fork");
+        commit_branch(&clone, "feat/repaired");
+        let path = clone.to_str().expect("utf8");
+        assert!(publish_car_branch(path, "feat/repaired").expect("first publish"));
+        let first = rev(&clone, "fork/feat/repaired");
+
+        // The repair.
+        advance_branch(&clone, "feat/repaired", "the fix");
+        let fixed = rev(&clone, "feat/repaired");
+        assert_ne!(first, fixed, "precondition: the branch moved");
+        assert_eq!(
+            rev(&clone, "fork/feat/repaired"),
+            first,
+            "precondition: the fork still holds the pre-repair commit"
+        );
+
+        assert_eq!(
+            car_head(path, "feat/repaired").expect("car_head"),
+            Some(fixed.clone()),
+            "car_head must report the head the car actually names"
+        );
+        assert!(publish_car_branch(path, "feat/repaired").expect("republish"));
+        assert_eq!(
+            rev(&clone, "fork/feat/repaired"),
+            fixed,
+            "the forge must end up holding the repaired commit"
+        );
+    }
+
+    /// A car nobody has pushed anywhere has no head to board.
+    #[test]
+    fn car_head_is_none_when_the_branch_exists_nowhere() {
+        let (_g, clone) = clone_fixture("no-head");
+        assert_eq!(
+            car_head(clone.to_str().expect("utf8"), "feat/never").expect("car_head"),
+            None
         );
     }
 

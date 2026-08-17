@@ -321,3 +321,40 @@ fn the_gate_rechecks_headroom_as_the_run_proceeds() {
         "an aborted gate must never report green.\nstdout: {stdout}"
     );
 }
+
+/// THE HEADROOM CHECK MUST COME BEFORE SCOPE DERIVATION.
+///
+/// It landed after `--auto`'s derivation, which made the two tests
+/// above depend on branch context: on a PR branch `--auto` finds
+/// commits and reaches the disk check, but on a PUSH TO MAIN
+/// `HEAD == origin/main` and the tree is clean, so `--auto` exits
+/// first with "found no change at all" and the disk refusal never
+/// runs. Both tests passed as PR #64 and then reddened main twice
+/// (forge runs 155 and 157).
+///
+/// THIS IS A TEXT PIN, NOT A BEHAVIOURAL ONE, and deliberately so. I
+/// wrote the behavioural version first and it could not fail: it
+/// drives the real script from this working tree, and a working tree
+/// with any edit in it always has changes for `--auto` to find, so
+/// the no-change branch is unreachable from a test run. Reproducing
+/// it needs a clean checkout whose HEAD is its own trunk — which is
+/// CI, not a test. A test that cannot go red is worse than no test,
+/// so this asserts the one thing that actually encodes the fix: the
+/// order of two lines in the script.
+#[test]
+fn headroom_is_checked_before_the_scope_is_derived() {
+    let script = std::fs::read_to_string(repo_root().join("infra/gate.sh")).expect("read gate.sh");
+    let headroom = script
+        .find("require_headroom \"to start\"")
+        .expect("gate.sh still calls require_headroom at startup");
+    let derivation = script
+        .find("AUTO_TRUNK=")
+        .expect("gate.sh still derives a trunk for --auto");
+    assert!(
+        headroom < derivation,
+        "require_headroom must run BEFORE trunk derivation. After it, `--auto` \
+         exits with 'found no change at all' on any clean checkout whose HEAD is \
+         its trunk — every push to main — and the disk refusal never runs. \
+         Refusing for want of disk should not wait on git archaeology either."
+    );
+}

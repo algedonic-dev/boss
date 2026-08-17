@@ -478,10 +478,19 @@ impl Handler for JobsCompleteLinkedStep {
             json!({
                 "car": closing_id,
                 "title": closing.get("title").and_then(|v| v.as_str()).unwrap_or(""),
-                "branch": closing
-                    .get("subject")
-                    .and_then(|s| s.get("id"))
-                    .and_then(|v| v.as_str()),
+                // The car's BRANCH, from its metadata — not its
+                // subject. Until 2026-08-17 this read `subject.id`, so
+                // the evidence on every closed packet named the wrong
+                // thing plausibly enough to read past: `9150dc6b` and
+                // `865992c1` both closed saying `branch: "bosspipeline"`
+                // (the subject) instead of `fix/publish-car-real-head`
+                // and `fix/gate-headroom-guard`, and `bcaf4a54` said
+                // `infra/forge/reap-dead-ci-jobs.sh` because that
+                // packet's subject was a file path. A wrong-but-
+                // believable evidence field is worse than a missing
+                // one: closing on evidence is supposed to save the
+                // next reader from re-deriving it.
+                "branch": closing_meta.get("branch").and_then(|v| v.as_str()),
                 "outcome": ctx.event_payload.get("outcome").and_then(|v| v.as_str()),
                 "closed_on": ctx.event_payload.get("closed_on").cloned(),
                 "train": train_id,
@@ -580,7 +589,12 @@ mod tests {
             "kind": "ship-a-change",
             "title": "Close the feedback loop",
             "status": "closed",
-            "subject": { "subject_kind": "custom", "id": "feat/feedback-obligation" },
+            // The subject is NOT the branch, and this fixture used to
+            // pretend it was — its subject id read "feat/feedback-
+            // obligation", which made the evidence binding look right
+            // while it read `subject.id`. A fixture whose two fields
+            // are indistinguishable cannot catch them being confused.
+            "subject": { "subject_kind": "custom", "id": "bosspipeline" },
             "metadata": metadata,
             "steps": [],
         })
@@ -679,7 +693,7 @@ mod tests {
     #[tokio::test]
     async fn a_merged_car_completes_the_open_branch_with_its_evidence() {
         let (base, puts) = mock_jobs(vec![
-            car(json!({ "backlog_item": PACKET, "train": TRAIN })),
+            car(json!({ "backlog_item": PACKET, "train": TRAIN, "branch": "feat/feedback-obligation" })),
             packet("ready"),
             train(),
         ])
@@ -700,6 +714,11 @@ mod tests {
             "evidence must carry a title a reader can act on"
         );
         assert_eq!(evidence["train"], TRAIN);
+        assert_eq!(
+            evidence["branch"], "feat/feedback-obligation",
+            "evidence must name the car's BRANCH from its metadata, not its subject — \
+             three packets closed in one day naming the subject instead"
+        );
         assert_eq!(
             evidence["generation"], "abc1234",
             "the generation the train carried is reachable: {evidence:#}"
