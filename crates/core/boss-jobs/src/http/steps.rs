@@ -1133,6 +1133,40 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
         return (StatusCode::FORBIDDEN, reason).into_response();
     }
 
+    // ASSURANCE: what this step demands, and what we can actually
+    // produce. The step's own requirement wins when it is stronger
+    // than the kind's floor; a Workflow may raise, never lower.
+    let floor = state
+        .step_registry
+        .get(&step.kind)
+        .map(|t| t.assurance_floor)
+        .unwrap_or_default();
+    let required = step.assurance_required.unwrap_or_default().max(floor);
+
+    // NO BYPASS, which is the point David settled in Q3: "an assurance
+    // level with a bypass is a comment, not a control." A stamp's
+    // assurance is what the server VERIFIED, never what the caller
+    // asked for — so until the WebAuthn ceremony exists there is no
+    // way to produce `Presence`, and a step demanding it cannot be
+    // stamped. Refusing is the honest failure; accepting a claimed
+    // presence would make the whole field decorative on day one.
+    let produced = boss_core::job::Assurance::Session;
+    if required > produced {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "step requires stronger assurance than this request carries",
+                "required": required,
+                "produced": produced,
+                "detail": "this step requires proof of presence (a passkey ceremony \
+                           bound to the step's shape hash). That verifier is not wired \
+                           up yet, so no stamp can satisfy it — this is the gate \
+                           refusing, not a fault.",
+            })),
+        )
+            .into_response();
+    }
+
     let shape = boss_core::job::step_shape_hash(&step.title, &step.metadata);
     if step
         .sign_offs
@@ -1147,6 +1181,7 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
         role: role.clone(),
         stamped_at: now,
         shape_hash: shape.clone(),
+        assurance: produced,
     };
     // OUTBOX (phase 2): the signed-off marker records in the SAME
     // transaction as the stamp append.

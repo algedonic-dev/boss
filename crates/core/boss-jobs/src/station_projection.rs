@@ -27,7 +27,7 @@
 //! and a derived station never silently overwrites an authored row of
 //! the same name (see [`derived_stations`]).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 
@@ -118,6 +118,26 @@ pub fn derived_stations(
                 status: Some(JobStatus::Open),
                 step: Some(StepMatch {
                     kind: Some(c.step_kind.clone()),
+                    // MATCH THE ROLE, not just the kind. Without this
+                    // every `q.<role>.task` station showed the SAME
+                    // packets: measured on the live registry, ten
+                    // role-scoped task queues each reported exactly 48,
+                    // because the predicate matched `kind = task` and
+                    // the role lived only in `capability`. Capability
+                    // gates who may CLAIM; it does not filter what the
+                    // queue HOLDS, and a queue that shows a bookkeeper
+                    // the head-brewer's work is not a queue.
+                    //
+                    // `authority_role` is surfaced into step metadata
+                    // at materialisation for the sign-off gate
+                    // (`merge_metadata`, pinned by
+                    // `materialize_surfaces_authority_role_into_metadata`),
+                    // so it is readable here without widening
+                    // StepMatch.
+                    metadata_equals: BTreeMap::from([(
+                        "authority_role".to_string(),
+                        c.role.clone(),
+                    )]),
                     // Ready OR active: a queue shows what is waiting
                     // AND what is being worked, because an operator
                     // reading load needs both. `pending` is excluded —
@@ -338,5 +358,74 @@ mod tests {
                 s.name
             );
         }
+    }
+
+    /// A role's queue holds that role's work, and nobody else's.
+    ///
+    /// THE BUG THIS PINS. The first version matched only on step kind
+    /// and put the role in `capability`. Capability gates who may
+    /// CLAIM a step; it does not filter what the queue HOLDS. So on
+    /// the live registry ten role-scoped `task` queues each reported
+    /// exactly 48 packets — the same 48 — and a bookkeeper's queue
+    /// showed the head-brewer's work. Found by measuring station depth
+    /// across the network, not by reading the code.
+    #[test]
+    fn a_derived_queue_matches_the_role_not_just_the_kind() {
+        for s in derived_stations(&platform_workflows(), &[], now()) {
+            let step = s
+                .predicate
+                .step
+                .as_ref()
+                .expect("a constraint queue matches a step");
+            let role = &s.capability.as_ref().expect("gated").roles[0];
+            assert_eq!(
+                step.metadata_equals.get("authority_role"),
+                Some(role),
+                "{} gates on `{role}` but its predicate does not filter by it, \
+                 so it would hold every step of that kind regardless of role",
+                s.name
+            );
+        }
+    }
+
+    /// Two roles sharing a step kind get queues that cannot collide.
+    ///
+    /// `task` is the worked case: nine platform roles declare a `task`
+    /// step, so this is the difference between nine useful queues and
+    /// nine copies of one list.
+    #[test]
+    fn two_roles_on_one_step_kind_get_disjoint_predicates() {
+        let mut a = platform_workflows()
+            .into_iter()
+            .find(|w| !w.steps.is_empty())
+            .expect("a platform kind with steps");
+        a.status = WorkflowStatus::Active;
+        a.steps.truncate(1);
+        a.steps[0].kind = "task".into();
+        let mut b = a.clone();
+        a.kind = "brew".into();
+        a.steps[0].authority_role = Some("head-brewer".into());
+        b.kind = "books".into();
+        b.steps[0].authority_role = Some("bookkeeper".into());
+
+        let out = derived_stations(&[a, b], &[], now());
+        assert_eq!(out.len(), 2, "one queue per (kind, role): {out:#?}");
+        let roles: Vec<_> = out
+            .iter()
+            .map(|s| {
+                s.predicate
+                    .step
+                    .as_ref()
+                    .expect("step match")
+                    .metadata_equals
+                    .get("authority_role")
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            roles,
+            vec!["bookkeeper".to_string(), "head-brewer".to_string()]
+        );
     }
 }

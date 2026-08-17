@@ -19,7 +19,9 @@
   import {
     fetchStations,
     fetchQueue,
-    withDepth,
+    fetchLoad,
+    withLoad,
+    byCongestion,
     type MapState,
     type StationQueueView,
   } from './stationMap';
@@ -32,22 +34,23 @@
   // The open queue's walk upstream, when its registry row declares one.
   const upstream = $derived(queue?.upstream ?? null);
 
-  // One poll updates every node's depth (and the open queue panel, so
-  // the lens never goes stale while the tiles tick).
+  // ONE call updates every node. This was a Promise.all over every
+  // node hitting /{name}/queue — 55 requests per poll on the live
+  // registry, each re-fetching an overlapping packet set. The server
+  // now evaluates all predicates against a single shared fetch.
+  //
+  // Ordered by congestion, not by registry order: oldest waiting
+  // packet first (flow-board Q2). Sorting by depth puts the busiest
+  // queue on top and leaves the stuck one out of view.
   async function pollDepths(): Promise<void> {
     if (map.kind !== 'ready' || map.nodes.length === 0) return;
-    const views = await Promise.all(map.nodes.map(n => fetchQueue(n.name)));
-    if (map.kind !== 'ready') return;
-    map = {
-      kind: 'ready',
-      nodes: map.nodes.map((n, i) => {
-        const v = views[i];
-        return v ? withDepth(n, { total: v.total, over_limit: v.overLimit }) : n;
-      }),
-    };
+    const rows = await fetchLoad();
+    if (map.kind !== 'ready' || rows === null) return;
+    map = { kind: 'ready', nodes: byCongestion(withLoad(map.nodes, rows)) };
     if (selected !== null) {
-      const idx = map.nodes.findIndex(n => n.name === selected);
-      const v = idx >= 0 ? (views[idx] ?? null) : null;
+      // Only the open panel needs its packet list; the tiles need
+      // depth alone, which the load call already gave them.
+      const v = await fetchQueue(selected);
       if (v) queue = v;
     }
   }

@@ -1407,15 +1407,27 @@ mod db_tests {
         );
         let depth = by_name("train-board-on-dock-depth");
         assert_eq!(depth.verb, "board");
-        // 12, not 8, since 131-board-on-twelve.sql: one train is one CI
-        // run whether it carries four cars or twelve, so when CI is the
-        // bottleneck the throughput lever is cars-per-train. The clock
-        // rule above still departs at 06:00/18:00 regardless of depth,
-        // which is what bounds a car's wait.
+        // 4 since 147-board-on-four.sql, back where 114 started. The
+        // 8 and 12 raises were made when a train was expensive; the
+        // forge runner now cycles build-image, locomotive, web and fast
+        // in about three minutes, and a dock that never exceeds 3-5
+        // made 12 unreachable — four consecutive trains opened and
+        // cancelled "nothing to board" on 2026-08-17 while three
+        // mergeable cars sat parked. `cooldown_minutes` is the setting
+        // that protects the single-concurrency runner, not the depth.
+        //
+        // This assertion is why the number lives in exactly two places
+        // and both must move together: the migration seeds the row, and
+        // boss-gcp's LOCAL copy is what the boarding loop actually
+        // reads (131 and 147 both say so). Note that `--auto` gates a
+        // schema-only change with "fixture + lints only" and SKIPS the
+        // tests, so editing the migration alone leaves this red and you
+        // will not find out until a crate change drags boss-cli back
+        // into scope.
         assert_eq!(
             depth.basis,
             Basis::QueueDepth {
-                min_depth: 12,
+                min_depth: 4,
                 cooldown_minutes: 120,
             }
         );

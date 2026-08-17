@@ -114,6 +114,7 @@ async fn seed_publish_step(
         sort_order: 0,
         blocked_by: vec![],
         sign_offs_required: Vec::new(),
+        assurance_required: None,
         sign_offs: Vec::new(),
         fields: Vec::new(),
         completed_on: None,

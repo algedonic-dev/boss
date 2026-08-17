@@ -158,6 +158,7 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         // Author-time dry run: lint a spec without persisting, so the
         // editor surfaces the same `station_lint::gate_active` the
         // publish path enforces.
+        .route("/api/stations/load", get(stations_load::<R, B>))
         .route("/api/stations/_validate", post(validate_station::<R, B>))
         .route("/api/stations/{name}/queue", get(station_queue::<R, B>))
         .route(

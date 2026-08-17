@@ -173,6 +173,22 @@ spec:
             # it on reschedule costs one cold build and nothing else.
             - {name: CARGO_TARGET_DIR, value: /scratch/target}
             - {name: GIT_CONFIG_GLOBAL, value: /work/.gitconfig}
+            # GIT CREDENTIALS, DECLARED RATHER THAN SET UP.
+            #
+            # The pod could not clone: "could not read Username for
+            # http://10.20.0.15:3000". It was bootstrapped once with a
+            # git bundle over `kubectl cp`, which proved the
+            # environment and left it unable to fetch.
+            #
+            # These three are git's own env-var config channel, so the
+            # helper exists the moment the container starts. The
+            # alternative — a `git config` line run by hand inside the
+            # pod — writes to the PVC and therefore survives, which is
+            # worse: it works until the volume is recreated and then
+            # fails as a mystery. A manifest cannot be forgotten.
+            - {name: GIT_CONFIG_COUNT, value: "1"}
+            - {name: GIT_CONFIG_KEY_0, value: "credential.http://10.20.0.15:3000.helper"}
+            - {name: GIT_CONFIG_VALUE_0, value: "!f() { echo username=david; echo password=$(cat /etc/forge/token); }; f"}
           resources:
             requests: {cpu: "2", memory: 4Gi}
             # Headroom for a workspace build without being able to
@@ -214,28 +230,30 @@ spec:
             requests: {cpu: 250m, memory: 512Mi}
             limits: {cpu: "2", memory: 4Gi}
       volumes:
-        # Q4 — the repo-scoped forge token, so a session in here can
-        # publish a car instead of asking a human to run a one-liner.
-        # Three finished cars sat at the dock on 2026-08-16 for exactly
-        # that reason.
+        # THE READ TOKEN, and read is the whole point.
         #
-        # `optional: true` is load-bearing: the Secret is created
-        # out-of-band (README: "Secrets never live here"), and a
-        # required mount would mean an unbootstrapped cluster gets a
-        # pod stuck in ContainerCreating with no explanation. Absent
-        # token = a session that cannot push, which is exactly today's
-        # behaviour and is a better failure than no pod.
+        # dev-node-checkout Q5, accepted: "Read-only, and never a push
+        # credential. The conductor now publishes car branches itself
+        # from its own clone, so a workspace has no reason to hold
+        # write access to the forge — the thing it would have been for
+        # is already solved."
         #
-        # SCOPE: `write:repository` on david/boss, and nothing else.
-        # Deliberately NOT the conductor's /etc/boss-train/forge.token
-        # — that one carries repo admin, and the accepted answer to Q4
-        # was "push only, no admin". Mint a separate one so it can be
-        # revoked without stopping the trains:
+        # This mount was called `forge-push` when it was still meant to
+        # let a session publish its own cars. That need disappeared the
+        # moment `publish_car_branch` landed, and a secret whose name
+        # claims more privilege than it holds is a trap for whoever
+        # reads it next.
         #
-        #   kubectl create secret generic forge-push -n boss-dev \
-        #     --from-file=token=/path/to/token
+        # `optional: true` stays: the Secret is created out-of-band
+        # (README: "Secrets never live here"), and a required mount
+        # would leave an unbootstrapped cluster with a pod stuck in
+        # ContainerCreating and no explanation. Absent token = a pod
+        # that cannot clone, which is a better failure than no pod.
+        #
+        #   kubectl create secret generic forge-read -n boss-dev \
+        #     --from-literal=token=<a read:repository token>
         - name: forge-token
-          secret: {secretName: forge-push, optional: true, defaultMode: 0400}
+          secret: {secretName: forge-read, optional: true, defaultMode: 0400}
         - name: work
           persistentVolumeClaim: {claimName: boss-dev-work}
         - name: scratch

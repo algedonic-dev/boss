@@ -35,6 +35,12 @@ set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
 DEPLOY="infra/deploy-services.sh"
+# The FORGE host's own installer, added 2026-08-17. This lint read
+# boss-gcp's TIMERS array and called itself complete, which was the
+# same shape as the bug it was written for: the forge host runs two
+# timers of its own and neither was covered. reap-dead-ci-jobs was
+# committed and never installed anywhere as a result.
+FORGE_INSTALL="infra/forge/install.sh"
 BUNDLE="infra/platform/workflows.toml"
 for f in "$DEPLOY" "$BUNDLE"; do
     [ -f "$f" ] || { echo "timers-leave-a-packet: $f not found" >&2; exit 1; }
@@ -51,6 +57,15 @@ kinds=$(
 )
 
 rows=$(sed -n '/^TIMERS=(/,/^)/p' "$DEPLOY" | grep -oE '"[a-z0-9-]+:[^"]+"' | tr -d '"')
+# Forge-host units live beside their installer, so the "subdirectory"
+# is always forge/. Same shape as a TIMERS row so the loop below is
+# unchanged.
+if [ -f "$FORGE_INSTALL" ]; then
+    forge_rows=$(sed -n '/^UNITS=(/,/^)/p' "$FORGE_INSTALL" \
+        | grep -oE '^\s+[a-z0-9-]+' | tr -d ' ' | sed 's|$|:forge|')
+    rows="${rows}
+${forge_rows}"
+fi
 count=$(printf '%s\n' "$rows" | grep -c . || true)
 if [ "$count" -lt 5 ]; then
     echo "timers-leave-a-packet: only parsed $count timer rows from $DEPLOY —" >&2

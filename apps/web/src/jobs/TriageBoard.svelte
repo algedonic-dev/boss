@@ -45,6 +45,20 @@
     title: string;
     subtitle?: string;
     emptyMessage?: string;
+    /// How many days of FINISHED work the terminal columns keep.
+    ///
+    /// A board renders each card in the column of its current step, so
+    /// terminal packets have to be fetched or the terminal columns are
+    /// empty — which is why this board originally asked for the whole
+    /// history and got it. On the feedback queue that meant 173 rows
+    /// fetched to show 14 live ones, 27 short of silently truncating at
+    /// its own limit, and a board that read as an enormous backlog when
+    /// the backlog was fourteen.
+    ///
+    /// A board is a working surface, not an archive. Everything live is
+    /// always here regardless of age; finished work ages out and stays
+    /// one click away in the list below.
+    terminalWindowDays?: number;
     /// The card body. Defaults to the Job title; callers whose Jobs
     /// carry a better headline supply their own.
     card?: Snippet<[Job]>;
@@ -55,11 +69,21 @@
     title,
     subtitle = 'Routing an item completes its triage step, which opens the next one — so a card cannot disagree with the Job behind it.',
     emptyMessage = 'Nothing is waiting on a person right now.',
+    terminalWindowDays = 14,
     card,
   }: Props = $props();
 
   let jobs = $state<ReadonlyArray<Job>>([]);
   let fork = $state<Fork | null>(null);
+
+  /// Finished packets older than the window — the ones the board is
+  /// deliberately not showing.
+  ///
+  /// Named rather than merely omitted. A board that quietly drops
+  /// history teaches the next person that the history is gone, which
+  /// is the same confusion in the opposite direction. `null` means not
+  /// counted yet, and renders nothing.
+  let archived = $state<number | null>(null);
 
   /// The Job shown in the detail modal, or null when it is closed.
   ///
@@ -185,6 +209,29 @@
   });
 
 
+  /// How much finished work the window is holding back.
+  ///
+  /// One extra request, and only on a foreground load — the 15s poll
+  /// skips it. The count moves when something closes, which is rare on
+  /// the timescale of a poll tick, and the alternative is doubling the
+  /// board's request rate forever to keep a footnote current.
+  ///
+  /// `limit=1` because only `total` is wanted; the rows are discarded.
+  /// A failure here is silent: the count is a footnote, and a board
+  /// that shows an error because its footnote did not load is worse
+  /// than a board with no footnote.
+  async function countArchived(shown: number, background: boolean): Promise<void> {
+    if (background && archived !== null) return;
+    try {
+      const res = await fetch(`/api/jobs?kind=${encodeURIComponent(kind)}&limit=1`);
+      if (!res.ok) return;
+      const total = (await res.json())?.total;
+      if (typeof total === 'number') archived = Math.max(0, total - shown);
+    } catch {
+      // Footnote only — leave it as it was.
+    }
+  }
+
   async function load(background = false): Promise<void> {
     // Background refreshes are silent (feedback 15c6004e): flipping
     // `loading` re-renders the whole board into its spinner every
@@ -193,15 +240,25 @@
     if (!background) loading = true;
     error = null;
     try {
+      const q = new URLSearchParams({
+        kind,
+        limit: '200',
+        // The retention window, applied SERVER-side. Filtering after
+        // the fetch would not help: the limit truncates first, so a
+        // board with more history than its limit silently loses live
+        // cards off the end and looks fine doing it.
+        closed_within: String(terminalWindowDays),
+      });
       const [jobsRes, kindsRes] = await Promise.all([
         // The list endpoint enriches each Job with its steps, so the
         // board needs one request rather than one per card.
-        fetch(`/api/jobs?kind=${encodeURIComponent(kind)}&limit=200`),
+        fetch(`/api/jobs?${q}`),
         fetch('/api/workflows'),
       ]);
       if (!jobsRes.ok) throw new Error(`${kind} jobs: HTTP ${jobsRes.status}`);
       const body = await jobsRes.json();
       jobs = Array.isArray(body) ? body : (body.data ?? []);
+      countArchived(typeof body.total === 'number' ? body.total : jobs.length, background);
 
       // A missing registry costs the columns, not the board — the
       // cards still render and the fallback is waiting/done.
@@ -395,6 +452,7 @@
   <p class="tb-msg tb-err">{error}</p>
 {:else if jobs.length === 0}
   <p class="tb-msg">{emptyMessage}</p>
+  {@render archiveNote()}
 {:else}
   <div class="tb-board">
     {#each columns as col (col.id)}
@@ -541,7 +599,28 @@
       </section>
     {/each}
   </div>
+  {@render archiveNote()}
 {/if}
+
+<!-- What the retention window is holding back, said out loud with a
+     way through to it.
+
+     The board is a working surface: everything live plus a recent tail
+     of finished work. The rest is not gone, and a person who has just
+     noticed the board is shorter than they remember should not have to
+     ask where it went — that question is exactly what this window was
+     built in response to. -->
+{#snippet archiveNote()}
+  {#if archived !== null && archived > 0}
+    <p class="tb-note">
+      Showing all live work plus {terminalWindowDays} days of finished items.
+      <a href="/jobs?kind={encodeURIComponent(kind)}&status=closed">
+        {archived} older {archived === 1 ? 'item' : 'items'}
+      </a>
+      have closed and aged off the board.
+    </p>
+  {/if}
+{/snippet}
 
 <!-- The shared packet panel (PacketModal, web-kit). This board used to
      carry its own copy — same header, facts list, steps and metadata
@@ -754,5 +833,15 @@
   }
   .tb-err {
     color: #b91c1c;
+  }
+  /* A footnote, not a banner. It answers a question someone might
+     have; it is not news. */
+  .tb-note {
+    margin: 12px 2px 0;
+    color: var(--text-dim, #78716c);
+    font-size: 12px;
+  }
+  .tb-note a {
+    color: inherit;
   }
 </style>

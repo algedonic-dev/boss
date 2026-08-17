@@ -157,6 +157,114 @@ pub(super) async fn list_stations<R: JobsRepository + 'static, B: EventBus + 'st
     }
 }
 
+/// `GET /api/stations/load` — every station's depth and the age of
+/// the oldest packet waiting in it, in one call.
+///
+/// WHY IT EXISTS. Reading congestion across the network meant calling
+/// each station's queue in turn: on 2026-08-17 that was 55 round
+/// trips, each re-fetching an overlapping packet set. The flow board
+/// (Q1: "the station is the unit") and M's matchmaking both want the
+/// same answer, so it is one surface rather than two.
+///
+/// AGE, NOT DEPTH, IS THE SIGNAL (flow-board Q2). Depth is close to
+/// meaningless without a drain rate — ten role queues each read
+/// exactly 48 the day this was written and none was a bottleneck, they
+/// were a bug. Age needs no rate to interpret. So `oldest_age_days` is
+/// what the board sorts by; depth and the advisory `over_limit` ride
+/// along because a reader wants both.
+///
+/// WHAT `oldest_age_days` ACTUALLY MEASURES, stated rather than
+/// implied: the age of the oldest MEMBER PACKET, from its `opened_on`.
+/// That is packet age, not time-in-this-queue — a packet that spent
+/// eight days in review before arriving here reads as eight days old
+/// on arrival. Time-in-queue needs a `ready_at` on the step, which
+/// does not exist; `opened_on` is the honest available proxy and
+/// over-reports rather than under-reports, which is the safer
+/// direction for a congestion signal.
+///
+/// OPEN PACKETS ONLY. Stations with a `terminal_window_days` also hold
+/// recently-departed packets so a filer can see an outcome; those are
+/// not congestion and are excluded here, so a load figure can be lower
+/// than the same station's queue length.
+///
+/// Cost: one packet query plus one step query per packet, versus that
+/// multiplied by the station count. Steps are fetched once and shared
+/// across every predicate evaluation.
+pub(super) async fn stations_load<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    CurrentUser(user): CurrentUser,
+) -> Response {
+    let reg = match stations_or_503(&state) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    let predicate = match state.policy.scope_predicate(&user, Resource::job()).await {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("policy check failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+    if matches!(predicate, boss_policy_client::Predicate::None) {
+        return Json(serde_json::json!({ "data": [], "total": 0 })).into_response();
+    }
+    let stations = match effective_stations(&state, reg).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+
+    let scope = job_scope_from_predicate(&user, &predicate);
+    let filter = JobFilter {
+        status: Some(JobStatus::Open),
+        scope,
+        ..Default::default()
+    };
+    let (jobs, _total) = match state.jobs.list_jobs(&filter, MAX_LIMIT, 0).await {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    // Fetched ONCE and shared. Every constraint station matches on a
+    // step, so per-station fetching would re-read the same rows 55
+    // times.
+    let mut packets = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let steps = state.jobs.list_steps(&job.id).await.unwrap_or_default();
+        packets.push((job, steps));
+    }
+
+    let today = boss_clock_client::now_from(&state.clock).await.date_naive();
+    let mut rows: Vec<serde_json::Value> = Vec::with_capacity(stations.len());
+    for spec in &stations {
+        // A per-actor station binds to the caller, exactly as its own
+        // queue endpoint does; an unbindable one holds nothing rather
+        // than everything.
+        let Some(bound) = spec.bind_self(self_id(&user)) else {
+            continue;
+        };
+        let members: Vec<&(boss_core::job::Job, Vec<boss_core::job::Step>)> = packets
+            .iter()
+            .filter(|(job, steps)| bound.predicate.matches(job, steps))
+            .collect();
+        let depth = members.len();
+        let oldest = members.iter().map(|(j, _)| j.opened_on).min();
+        rows.push(serde_json::json!({
+            "station": bound.name,
+            "kind": bound.kind,
+            "depth": depth,
+            "wip_limit": bound.wip_limit,
+            "over_limit": bound.wip_limit.is_some_and(|l| depth as i64 > i64::from(l)),
+            "oldest_opened_on": oldest,
+            "oldest_age_days": oldest.map(|d| (today - d).num_days()),
+            "capability_roles": bound.capability.as_ref().map(|c| c.roles.clone()),
+        }));
+    }
+    let total = rows.len();
+    Json(serde_json::json!({ "data": rows, "total": total })).into_response()
+}
+
 /// `GET /api/stations/{name}/queue` — the station's evaluated,
 /// ordered queue: derived membership (the predicate, bound to the
 /// caller, over their policy-scoped packets), data-declared

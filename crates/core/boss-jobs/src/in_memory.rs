@@ -59,10 +59,25 @@ fn matches_filter(job: &Job, filter: &JobFilter) -> bool {
     {
         return false;
     }
-    if let Some(status) = filter.status
-        && job.status != status
-    {
-        return false;
+    // The retention window replaces the status equality when set:
+    // "live OR closed on/after this date". Same contract as the SQL
+    // adapter, which expresses it as a CASE over the same two columns
+    // — two implementations of one rule, so the behaviour is pinned by
+    // a test rather than trusted.
+    match filter.closed_since {
+        Some(since) => {
+            let terminal = matches!(job.status, JobStatus::Closed | JobStatus::Cancelled);
+            if terminal && job.closed_on.is_none_or(|c| c < since) {
+                return false;
+            }
+        }
+        None => {
+            if let Some(status) = filter.status
+                && job.status != status
+            {
+                return false;
+            }
+        }
     }
     if let Some(priority) = filter.priority
         && job.priority != priority
@@ -925,5 +940,125 @@ mod tests {
         s1.status = StepStatus::Completed;
         let s2 = Step::new(job_id, "generic", "B", 1); // Pending
         assert_eq!(compute_job_status(&[s1, s2]), JobStatus::Open);
+    }
+
+    /// The terminal retention window, in-memory half.
+    ///
+    /// The Postgres adapter expresses this rule as a CASE over
+    /// `status` and `closed_on`; this adapter expresses it as Rust.
+    /// Two implementations of one contract, so the contract is pinned
+    /// here as well as in `tests/postgres_filter.rs` — the sibling
+    /// there carries the full reasoning for why the window exists.
+    #[tokio::test]
+    async fn closed_since_keeps_live_and_recent_and_drops_the_rest() {
+        let repo = InMemoryJobs::new();
+        let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
+
+        let mut live = make_job("user-feedback");
+        // Blocked, not Open: live is live regardless of age, and this
+        // is the half of the rule a bare `closed_on >= x` deletes.
+        live.status = JobStatus::Blocked;
+        let mut recent = make_job("user-feedback");
+        recent.status = JobStatus::Closed;
+        recent.closed_on = Some(d(8, 14));
+        let mut old = make_job("user-feedback");
+        old.status = JobStatus::Closed;
+        old.closed_on = Some(d(1, 5));
+        let mut cancelled = make_job("user-feedback");
+        cancelled.status = JobStatus::Cancelled;
+        cancelled.closed_on = Some(d(1, 6));
+        // Terminal with no close date recorded. Postgres drops it
+        // (`NULL >= date` is NULL, not true); this must agree.
+        let mut undated = make_job("user-feedback");
+        undated.status = JobStatus::Closed;
+
+        for j in [&live, &recent, &old, &cancelled, &undated] {
+            repo.create_job(j).await.unwrap();
+        }
+
+        let filter = JobFilter {
+            kind: Some("user-feedback".into()),
+            closed_since: Some(d(8, 1)),
+            ..Default::default()
+        };
+        let (rows, total) = repo.list_jobs(&filter, 100, 0).await.unwrap();
+        assert_eq!(total, 2, "count must apply the same window as the page");
+        assert!(
+            rows.iter().any(|j| j.id == live.id),
+            "live packets always survive"
+        );
+        assert!(rows.iter().any(|j| j.id == recent.id));
+        assert!(!rows.iter().any(|j| j.id == old.id));
+        assert!(
+            !rows.iter().any(|j| j.id == cancelled.id),
+            "cancelled is terminal too — an old cancellation is not recent work"
+        );
+        assert!(
+            !rows.iter().any(|j| j.id == undated.id),
+            "a terminal packet with no closed_on cannot prove it is recent"
+        );
+    }
+
+    /// `closed_since` wins over `status` rather than intersecting it.
+    ///
+    /// If they combined as AND, `status=open&closed_within=14` would
+    /// return open packets only and the terminal columns would be
+    /// empty again — the exact bug the window exists to fix.
+    #[tokio::test]
+    async fn closed_since_overrides_status_rather_than_intersecting_it() {
+        let repo = InMemoryJobs::new();
+        let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
+
+        // Job::new starts a packet at Draft, so say Open out loud —
+        // otherwise the status filter below is testing nothing.
+        let mut open = make_job("user-feedback");
+        open.status = JobStatus::Open;
+        let mut recent = make_job("user-feedback");
+        recent.status = JobStatus::Closed;
+        recent.closed_on = Some(d(8, 14));
+        repo.create_job(&open).await.unwrap();
+        repo.create_job(&recent).await.unwrap();
+
+        let filter = JobFilter {
+            kind: Some("user-feedback".into()),
+            status: Some(JobStatus::Open),
+            closed_since: Some(d(8, 1)),
+            ..Default::default()
+        };
+        let (rows, total) = repo.list_jobs(&filter, 100, 0).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "the recently-closed packet survives status=open"
+        );
+        assert_eq!(total, 2);
+    }
+
+    /// With no window, `status` behaves exactly as it always has.
+    #[tokio::test]
+    async fn no_window_means_the_old_status_behaviour() {
+        let repo = InMemoryJobs::new();
+        let mut open = make_job("user-feedback");
+        open.status = JobStatus::Open;
+        let mut closed = make_job("user-feedback");
+        closed.status = JobStatus::Closed;
+        closed.closed_on = NaiveDate::from_ymd_opt(2026, 1, 5);
+        repo.create_job(&open).await.unwrap();
+        repo.create_job(&closed).await.unwrap();
+
+        let all = JobFilter {
+            kind: Some("user-feedback".into()),
+            ..Default::default()
+        };
+        assert_eq!(repo.list_jobs(&all, 100, 0).await.unwrap().1, 2);
+
+        let only_open = JobFilter {
+            kind: Some("user-feedback".into()),
+            status: Some(JobStatus::Open),
+            ..Default::default()
+        };
+        let (rows, _) = repo.list_jobs(&only_open, 100, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, open.id);
     }
 }

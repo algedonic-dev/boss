@@ -268,6 +268,39 @@ pub struct StepField {
 /// attestation of a step *in its current shape*. Policy-checked at
 /// stamp time and recorded as its own audit event; `shape_hash`
 /// binds the stamp to the content it attested.
+/// How hard a stamp was to produce.
+///
+/// A stamp already answers WHO attested and WHAT they attested
+/// (`shape_hash`). It never answered how strong the evidence was, so
+/// "David clicked approve" and "David logged in this morning and
+/// something clicked approve" were the same fact.
+///
+/// David, 2026-08-16: *"Passkey authorization as actor-auth feature
+/// for job packets is broadly useful. Let's make sure we design and
+/// build it that way."* — so this is a property of a STAMP, not a
+/// feature of one workflow. Elevation, a payment release, a deploy
+/// sign-off and an incident's closure all want it and none should
+/// invent it.
+///
+/// ORDERED, and the order is the whole contract: a step declares the
+/// minimum it will accept and the endpoint refuses anything weaker.
+/// Adding a variant means deciding where it sits on that scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Assurance {
+    /// An authenticated session said yes. Today's behaviour, and the
+    /// default so that every existing stamp and every existing
+    /// protocol keeps its current meaning.
+    #[default]
+    Session,
+    /// A fresh WebAuthn assertion proved the actor was present, over a
+    /// challenge bound to this step's `shape_hash`. The signature is
+    /// itself the binding: it cannot be replayed against a different
+    /// step (different challenge) or against an edited one (the hash
+    /// moved).
+    Presence,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SignOffStamp {
     /// Who stamped — an employee id (stamping is a human act; the
@@ -278,6 +311,11 @@ pub struct SignOffStamp {
     pub stamped_at: chrono::DateTime<chrono::Utc>,
     /// `step_shape_hash` of the step when stamped.
     pub shape_hash: String,
+    /// How strong the evidence was. `serde(default)` so every stamp
+    /// written before this field existed reads as `Session`, which is
+    /// exactly what it was.
+    #[serde(default)]
+    pub assurance: Assurance,
 }
 
 /// Hash of a step's completion-relevant content — what a sign-off
@@ -357,6 +395,16 @@ pub struct Step {
     /// step's authority_role). Empty = no sign-offs required.
     #[serde(default)]
     pub sign_offs_required: Vec<String>,
+    /// The weakest stamp this step will accept. `None` means "whatever
+    /// the StepType's floor says", which is `Session` unless the kind
+    /// raises it — so an unset field changes nothing.
+    ///
+    /// Declared on the step rather than only on the kind because two
+    /// `sign-off` steps can want different strengths depending on what
+    /// they gate: the same kind approves a stationery order and a
+    /// production deploy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assurance_required: Option<Assurance>,
     /// Step-authored completion-contract fields (inline authoring): validated
     /// at completion in union with the step type's bundle fields.
     #[serde(default)]
@@ -424,6 +472,7 @@ impl Step {
             sort_order,
             blocked_by: Vec::new(),
             sign_offs_required: Vec::new(),
+            assurance_required: None,
             sign_offs: Vec::new(),
             fields: Vec::new(),
             completed_on: None,

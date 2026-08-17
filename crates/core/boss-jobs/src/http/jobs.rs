@@ -38,6 +38,14 @@ pub(super) struct ListJobsQuery {
     /// here; the stored value may be a >= 8-char prefix). The
     /// clear-on-close handler's query.
     waiting_on: Option<String>,
+    /// Terminal retention window, in days. `closed_within=14` returns
+    /// live packets plus anything closed in the last fortnight, and
+    /// drops the rest — what a BOARD wants, since it must fetch
+    /// terminal packets to place them in terminal columns but has no
+    /// use for a year of them. The feedback board was pulling all 173
+    /// user-feedback packets to show 14 live ones and was 27 short of
+    /// silently truncating at its own limit.
+    closed_within: Option<i64>,
 }
 
 pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static>(
@@ -73,6 +81,7 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
         owner_id: q.owner_id,
         subject_id: q.subject_id,
         waiting_on: q.waiting_on,
+        closed_since: closed_since_from(q.closed_within, &state).await,
         scope,
         ..Default::default()
     };
@@ -105,6 +114,22 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
         "offset": offset,
     }))
     .into_response()
+}
+
+/// Resolve `closed_within=<days>` to a date on the authoritative
+/// clock, not the process's wall time — the sim runs on boss-clock and
+/// a board asking for "the last 14 days" must mean the same fortnight
+/// the packets were closed in.
+async fn closed_since_from<R: JobsRepository, B: EventBus>(
+    days: Option<i64>,
+    state: &JobsApiState<R, B>,
+) -> Option<chrono::NaiveDate> {
+    let days = days?;
+    // Negative or absurd values are a caller mistake, not a filter:
+    // clamp rather than return an empty board with no explanation.
+    let days = days.clamp(0, 3650);
+    let today = boss_clock_client::now_from(&state.clock).await.date_naive();
+    Some(today - chrono::Duration::days(days))
 }
 
 #[derive(Deserialize)]
@@ -274,6 +299,7 @@ pub(super) async fn jobs_live<R: JobsRepository + 'static, B: EventBus + 'static
         kind: None,
         kind_prefix: None,
         status: Some(boss_core::job::JobStatus::Open),
+        closed_since: None,
         priority: None,
         owner_id: None,
         subject_id: None,

@@ -34,6 +34,24 @@ pub struct JobFilter {
     /// both match `kind_prefix = "refurb"`).
     pub kind_prefix: Option<String>,
     pub status: Option<JobStatus>,
+    /// A retention window on TERMINAL packets: keep everything still
+    /// live, plus anything closed on or after this date. Drop
+    /// everything closed before it.
+    ///
+    /// A board renders a card in the column of its current step, so
+    /// terminal packets have to be fetched to appear in terminal
+    /// columns — and the feedback board was fetching all 173
+    /// user-feedback packets to show 14 live ones, 92% of it finished
+    /// work, 27 packets away from silently truncating at its
+    /// `limit=200`. Filtering after the fetch does not fix that; the
+    /// window has to be in the query.
+    ///
+    /// Same idea as `stations.md`'s `terminal_window_days`, which
+    /// `my-watchlist` sets to 14 so a filer can still see an outcome.
+    /// Combines with `status` as OR, not AND: `status = open` plus a
+    /// window means "live OR recently closed", which is the useful
+    /// question and the only one a board asks.
+    pub closed_since: Option<chrono::NaiveDate>,
     pub priority: Option<Priority>,
     pub owner_id: Option<String>,
     /// Filter by subject reference (e.g., device serial, account id).

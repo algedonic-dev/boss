@@ -629,6 +629,32 @@ schedule = { cadence = "daily", anchor_date = "2026-08-17" }
 handler = "jobs.spawn"
 args = { kind = "\"maintenance-sweep\"", subject_kind = "\"custom\"", subject = "\"cluster-conformance\"", title = "\"Cluster conformance sweep\"", "metadata.target" = "\"cluster-conformance\"", "metadata.area" = "\"cluster\"" }
 
+# 6. DOC STATUS DRIFT. A design doc's `**Status**:` line is
+# hand-written and nothing ever updates it. Answering a question is a
+# flush, and the flush rewrites the Decision-history section without
+# touching the header — so status is stale BY DEFAULT, as fresh as the
+# last time a human happened to edit that line (feedback 0b8ae875,
+# filed as the mechanism behind bedda461).
+#
+# The detector already exists: `GET /api/design/stale-statuses` reports
+# docs whose status claims live discussion (`draft`, `in-review`,
+# `reopened`) while the tracker holds zero open questions for them. It
+# has existed and reported to nobody, which is the same defect as the
+# conformance script — a check with no caller is not a mechanism.
+#
+# Deliberately a REPORT feeding a sweep, not a rejection at index time.
+# `crates-and-layers.md` reads "in-review (agent draft; the re-tiering
+# call is David's)" — legitimately waiting on a person with no
+# questions registered. Refusing to index that would be wrong, and a
+# rule that has to be right about intent is a rule that will be wrong.
+# A sweep puts it in front of someone who can tell the difference.
+[[rule]]
+name = "maintenance-sweep-doc-status-daily"
+schedule = { cadence = "daily", anchor_date = "2026-08-17" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"maintenance-sweep\"", subject_kind = "\"custom\"", subject = "\"doc-status\"", title = "\"Design doc status sweep\"", "metadata.target" = "\"doc-status\"", "metadata.area" = "\"docs\"" }
+
 # ---------------------------------------------------------------------
 # Expire the notifications about a job that has finished (David,
 # 2026-08-14: "we still need a way to automatically expire inbox

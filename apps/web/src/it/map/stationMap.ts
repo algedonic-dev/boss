@@ -41,6 +41,12 @@ export type StationNode = Readonly<{
   discipline: string;
   wipLimit: number | null;
   depth: number | null;
+  /// Days since the oldest waiting packet was opened, or null when the
+  /// station holds nothing. THE SORT KEY, per flow-board Q2: depth
+  /// without a drain rate is close to meaningless — ten role queues
+  /// read exactly 48 on 2026-08-17 and none was a bottleneck, they
+  /// were a bug — while nine days waiting is neglect at any volume.
+  oldestAgeDays: number | null;
   overLimit: boolean;
 }>;
 
@@ -86,6 +92,7 @@ export function toStationNode(row: StationRow): StationNode {
     discipline: disciplineLabel(row.discipline),
     wipLimit: row.wip_limit ?? null,
     depth: null,
+    oldestAgeDays: null,
     overLimit: false,
   };
 }
@@ -163,6 +170,68 @@ export async function fetchStations(): Promise<MapState> {
     return stationsStateFromResponse(r.status, body);
   } catch {
     return { kind: 'error' };
+  }
+}
+
+/// One row of `GET /api/stations/load`.
+export type StationLoad = Readonly<{
+  station: string;
+  depth: number;
+  over_limit: boolean;
+  oldest_age_days: number | null;
+}>;
+
+/// Fold a load response onto the nodes, in ONE pass.
+///
+/// This replaced a `Promise.all` over every node calling
+/// `/{name}/queue` — 55 requests per poll on the live registry, each
+/// re-fetching an overlapping packet set. The server evaluates all
+/// predicates against one shared fetch instead.
+///
+/// A node absent from the response keeps its previous depth rather
+/// than blanking: a partial response should not make the map look
+/// empty, which is the failure mode that reads as "nothing is queued".
+export function withLoad(
+  nodes: readonly StationNode[],
+  rows: readonly StationLoad[],
+): StationNode[] {
+  const by = new Map(rows.map((r) => [r.station, r]));
+  return nodes.map((n) => {
+    const r = by.get(n.name);
+    return r
+      ? { ...n, depth: r.depth, overLimit: r.over_limit, oldestAgeDays: r.oldest_age_days }
+      : n;
+  });
+}
+
+/// Oldest first, then deepest, then by name so the order is stable.
+///
+/// Sorting by depth would put the busiest queue on top and leave the
+/// STUCK one out of view, which is the whole distinction flow-board Q2
+/// draws. Stations holding nothing sort last — they are not a
+/// bottleneck, but they stay listed, because a queue that usually
+/// holds work being empty today is itself a signal.
+export function byCongestion(nodes: readonly StationNode[]): StationNode[] {
+  return [...nodes].sort((a, b) => {
+    const aa = a.oldestAgeDays ?? -1;
+    const bb = b.oldestAgeDays ?? -1;
+    if (aa !== bb) return bb - aa;
+    const ad = a.depth ?? 0;
+    const bd = b.depth ?? 0;
+    if (ad !== bd) return bd - ad;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+export async function fetchLoad(): Promise<StationLoad[] | null> {
+  try {
+    const r = await fetch('/api/stations/load');
+    if (!r.ok) return null;
+    const body: unknown = await r.json().catch(() => null);
+    const data = (body as { data?: unknown })?.data;
+    return Array.isArray(data) ? (data as StationLoad[]) : null;
+  } catch {
+    return null;
   }
 }
 

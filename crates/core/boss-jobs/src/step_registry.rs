@@ -159,6 +159,11 @@ pub struct StepType {
     /// computer speed on `step.ready` (`Agent`); the workforce reads it to
     /// skip agent steps. Defaults to `Human`.
     pub completion: Completion,
+    /// The floor a Workflow cannot go below. A kind that is always a
+    /// human-presence act says so once here instead of relying on
+    /// every protocol author to remember.
+    #[serde(default)]
+    pub assurance_floor: boss_core::job::Assurance,
     /// Which render surface mounts this kind: an id
     /// into the surface table — platform-shipped components and
     /// tenant StepPlugins are the two suppliers. "generic" renders
@@ -481,6 +486,7 @@ impl LoadedStepType {
             required_roles: Vec::leak(roles),
             block_probability: self.block_probability,
             completion: self.completion,
+            assurance_floor: Default::default(),
             surface: String::leak(self.surface),
             sign_offs_required: Vec::leak(
                 self.sign_offs_required

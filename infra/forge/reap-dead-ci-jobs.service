@@ -9,4 +9,8 @@ Type=oneshot
 # The script sudos to docker if it has to; running as root avoids that
 # and keeps the unit's failure modes to the script's own.
 User=root
+# Job visibility. The forge host has no /opt/boss — it runs from
+# this checkout, which is where the installed units already point.
+ExecStartPre=/home/david/boss/infra/boss-maintenance-wrap.sh maintenance-reap-ci-jobs "Reap dead CI jobs"
 ExecStart=/home/david/boss/infra/forge/reap-dead-ci-jobs.sh
+ExecStartPost=/home/david/boss/infra/boss-step.sh maintenance-reap-ci-jobs run result=ok

@@ -93,6 +93,10 @@ pub struct StepSpec {
     /// at materialization.
     #[serde(default)]
     pub sign_offs_required: Vec<String>,
+    /// The weakest stamp this step accepts. Protocol data: raising a
+    /// step to `presence` is a Workflow edit, not a deploy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assurance_required: Option<boss_core::job::Assurance>,
     /// Step-authored completion-contract fields (inline
     /// authoring) — validated in union with the kind bundle's fields,
     /// so vocabulary that isn't shared needs no registry row.
@@ -269,6 +273,7 @@ fn workflow_design_spec() -> WorkflowSpec {
             // platform-admin alone: authoring a work-type is the
             // operational leaders' job, not solely the deploy operator's.
             sign_offs_required: vec!["workflow-approver".into()],
+            assurance_required: None,
             authority_role: Some("workflow-approver".into()),
             metadata_defaults: serde_json::json!({ "authority_role": "workflow-approver" }),
             ..Default::default()
@@ -1905,6 +1910,11 @@ where
             kind: spec_step.kind.clone(),
             title,
             spec_slug: Some(spec_step.title.clone()),
+            // The protocol's requirement travels onto the packet at
+            // materialisation, like every other step property — so an
+            // in-flight step keeps the assurance its Workflow version
+            // declared even if the protocol is later edited.
+            assurance_required: spec_step.assurance_required,
             assignee_id: None,
             status: StepStatus::Pending,
             sort_order: idx as i32,
@@ -4253,6 +4263,7 @@ mod tests {
                 ready_when: "true".into(),
                 title_template: "Annual".into(),
                 sign_offs_required: vec!["platform-admin".into()],
+                assurance_required: None,
                 authority_role: Some("qa-lead".into()),
                 terminal: Some(Terminal {
                     outcome: "certified".into(),

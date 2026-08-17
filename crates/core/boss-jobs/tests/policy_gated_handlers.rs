@@ -774,3 +774,116 @@ async fn put_step_active_allowed_with_open_blockers() {
         "active transition must be allowed even with open blockers"
     );
 }
+
+// --- Assurance: how strong a stamp had to be ------------------------------
+//
+// A stamp already recorded WHO attested and WHAT they attested
+// (`shape_hash`). It never recorded how hard it was to produce, so
+// "David clicked approve" and "David logged in this morning and
+// something clicked approve" were the same fact.
+//
+// David, 2026-08-16, on the bypass question: "an assurance level with
+// a bypass is a comment, not a control." So a stamp's assurance is
+// what the server VERIFIED, never what the caller asked for — and
+// until the WebAuthn ceremony exists, a step demanding presence simply
+// cannot be stamped. These tests pin both halves: the default path is
+// unchanged, and the raised path refuses rather than pretending.
+
+fn qa_policy() -> Arc<dyn PolicyClient> {
+    Arc::new(
+        FakePolicyClient::builder()
+            .allow("qa-lead", Action::Update, Resource::step(), Scope::All)
+            .allow(
+                "qa-lead",
+                Action::SignOff,
+                Resource::new("step-signoff:qa-lead"),
+                Scope::All,
+            )
+            .build(),
+    )
+}
+
+fn qa_lead(id: &str) -> User {
+    let mut u = service_tech(id);
+    u.role = "qa-lead".to_string();
+    u
+}
+
+/// The default is unchanged, which is what makes this safe to ship.
+///
+/// Every existing step leaves `assurance_required` unset and every
+/// StepType floors at `Session`, so the gate is inert until a protocol
+/// raises it. A stamp records `session` — the truth about how it was
+/// produced — rather than leaving the field meaningless.
+#[tokio::test]
+async fn an_ordinary_step_still_stamps_and_records_session_assurance() {
+    let (app, jobs) = build_app(qa_policy());
+    let user = qa_lead("emp-90");
+    let job = job_owned_by("00000000-0000-0000-0000-000000000090", &user.id);
+    jobs.create_job(&job).await.unwrap();
+    let step = sign_off_step(job.id, "qa-lead");
+    jobs.add_step(&step).await.unwrap();
+
+    let resp = post_sign_off(app, &user, &step, "qa-lead").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the default path must not change"
+    );
+
+    let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+    let stamp = stored.sign_offs.first().expect("a stamp was appended");
+    assert_eq!(
+        stamp.assurance,
+        boss_core::job::Assurance::Session,
+        "a session-authenticated stamp must say so, not claim more"
+    );
+}
+
+/// A step that demands presence REFUSES, because nothing can prove it yet.
+///
+/// This is the test that would catch a bypass being added later: if
+/// someone makes the endpoint honour a caller-supplied assurance, this
+/// starts returning 200 and the control becomes decoration.
+#[tokio::test]
+async fn a_step_requiring_presence_refuses_until_a_verifier_exists() {
+    let (app, jobs) = build_app(qa_policy());
+    let user = qa_lead("emp-91");
+    let job = job_owned_by("00000000-0000-0000-0000-000000000091", &user.id);
+    jobs.create_job(&job).await.unwrap();
+    let mut step = sign_off_step(job.id, "qa-lead");
+    step.assurance_required = Some(boss_core::job::Assurance::Presence);
+    jobs.add_step(&step).await.unwrap();
+
+    let resp = post_sign_off(app, &user, &step, "qa-lead").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "presence cannot be satisfied yet, so the stamp must be refused"
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["required"], "presence");
+    assert_eq!(body["produced"], "session");
+
+    let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert!(
+        stored.sign_offs.is_empty(),
+        "a refused stamp must leave no trace on the step"
+    );
+}
+
+/// Ordering is the contract: a step may raise, and `Presence` is
+/// strictly stronger than `Session`.
+#[test]
+fn assurance_orders_presence_above_session() {
+    use boss_core::job::Assurance;
+    assert!(Assurance::Presence > Assurance::Session);
+    assert_eq!(Assurance::default(), Assurance::Session);
+    // max() is how a step's requirement combines with its kind's
+    // floor; a Workflow may raise but never lower.
+    assert_eq!(
+        Assurance::Session.max(Assurance::Presence),
+        Assurance::Presence
+    );
+}

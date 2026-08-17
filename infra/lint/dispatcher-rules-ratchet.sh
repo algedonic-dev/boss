@@ -106,7 +106,13 @@ set -euo pipefail
 # is not a mechanism. David, 2026-08-16: "let's try and get as much
 # maintenance and management into job protocols rather than floating
 # around scripts or system timers elsewhere."
-BASELINE=49
+# 49 -> 50 (2026-08-17). `maintenance-sweep-doc-status-daily`.
+# A TIMER under the exemption above, same shape as the five sweeps
+# already here: no packet causes "a day passed". It adds no routing —
+# `jobs.spawn` with the same maintenance-sweep args, a different
+# target. Buys a caller for /api/design/stale-statuses, which has
+# existed and reported to nobody (feedback 0b8ae875).
+BASELINE=50
 RULES_FILE="infra/dispatcher/rules.toml"
 
 count=$(grep -c '^\[\[rule\]\]' "$RULES_FILE")

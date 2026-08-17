@@ -308,6 +308,52 @@ if [ "$AUTO" -eq 1 ]; then
     fi
 fi
 
+# DISK FLOOR, before anything compiles.
+#
+# On 2026-08-16 this box ran out of disk mid-`cargo build`. The failure
+# was not a build error: the volume filled, the tool harness could no
+# longer create a file to hold a command's output, and NOTHING would
+# run — not the gate, not `df`, not the cleanup. Recovering it needed a
+# human at a terminal.
+#
+# locomotive.sh has had exactly this check for the CI runner since
+# 2026-08-14 (`min_free_gb`, default 70), written after a full disk
+# surfaced as four unrelated boss-ledger tests failing on "could not
+# extend file" and cost an hour of archaeology. Three hosts run builds
+# — the runner, the dev pod, this box — and only the runner could say
+# "not enough disk" before spending twenty minutes finding out. That
+# asymmetry is the defect (CLAUDE.md 9a), not the number.
+#
+# A FLOOR, not a prediction. A cold workspace build measured ~74GB on
+# the forge host; an incremental one on a warm target is a fraction of
+# that, so a gate floor set at 74 would refuse almost every honest run.
+# 12GB is set where it means something: below it a compile is likely to
+# die partway and take the shell with it, and refusing costs two
+# seconds instead of a wedged machine. It will not catch every
+# too-tight case, and that is stated rather than papered over.
+#
+# The durable fix is not a bigger number: it is building in the dev pod
+# (188GB on node-local scratch, one workspace instead of six worktrees
+# each with their own target/). This is the guard for whichever host
+# ends up running it.
+gate_min_free_gb="${BOSS_GATE_MIN_FREE_GB:-12}"
+gate_avail_kb="$(df -Pk . 2>/dev/null | awk 'NR==2 {print $4}')"
+if [ -z "${gate_avail_kb}" ]; then
+    echo "gate: could not read free space for $(pwd) — refusing rather than guessing." >&2
+    exit 2
+fi
+gate_avail_gb=$((gate_avail_kb / 1024 / 1024))
+if [ "${gate_avail_gb}" -lt "${gate_min_free_gb}" ]; then
+    echo "gate: ${gate_avail_gb}GB free, need ${gate_min_free_gb}GB. Refusing to start." >&2
+    echo "  A build that fills this volume does not fail cleanly — it wedges the" >&2
+    echo "  shell, and on 2026-08-16 it stopped even \`df\` from running." >&2
+    echo "  remediation: drop target/ dirs from landed worktrees —" >&2
+    echo "    du -sh */target | sort -hr        # the usual culprits" >&2
+    echo "    rm -rf <landed-worktree>/target" >&2
+    echo "  Better: build in the dev pod, which has 188GB of scratch." >&2
+    exit 2
+fi
+
 FAILED=()
 
 # Each check runs even if an earlier one failed — a red gate should
@@ -377,12 +423,14 @@ check "idempotence-ratchet"      infra/lint/idempotence-ratchet.sh
 check "dispatcher-rules-ratchet" infra/lint/dispatcher-rules-ratchet.sh
 check "schema-converge"          infra/lint/schema-converge.sh
 check "migrations-append-only"   infra/lint/migrations-append-only.sh
+check "migration-numbers-unique"  infra/lint/migration-numbers-unique.sh
 check "no-secrets"               infra/lint/no-secrets.sh
 check "invariant-register"       infra/lint/invariant-register.sh
 check "crate-counts-fresh"       infra/lint/crate-counts-fresh.sh
 check "registry-bump-order"      infra/lint/registry-bump-retires-first.sh
 check "ci-tools-declared"        infra/lint/ci-tools-declared.sh
 check "timers-leave-a-packet"    infra/lint/timers-leave-a-packet.sh
+check "step-plugin-bundle"       infra/lint/step-plugin-bundle-exists.sh
 
 # The frontend type gate. Last, because it is the only check that
 # installs anything, and a Rust-only car should learn about its Rust

@@ -268,3 +268,78 @@ async fn an_authored_row_of_the_same_name_wins_and_appears_once() {
         "the authored row's own settings must survive the merge"
     );
 }
+
+/// The load surface agrees with the per-station queue.
+///
+/// Two ways of computing one number is the drift CLAUDE.md 9a is about.
+/// `/api/stations/load` evaluates every predicate against a shared
+/// packet set; `/api/stations/{name}/queue` evaluates one against its
+/// own fetch. If they disagree, the board and the claimant see
+/// different queues and the board is the one nobody trusts again.
+#[tokio::test]
+async fn load_depth_agrees_with_the_stations_own_queue() {
+    let app = app(None);
+    post_bill(&app, "bill-1").await;
+    post_bill(&app, "bill-2").await;
+    post_bill(&app, "bill-3").await;
+
+    let (status, load) = get_json(&app, "/api/stations/load").await;
+    assert_eq!(status, StatusCode::OK);
+    let row = load["data"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|r| r["station"] == DERIVED)
+        .unwrap_or_else(|| panic!("`{DERIVED}` missing from the load surface: {load:#}"));
+
+    let (qs, queue) = get_json(&app, &format!("/api/stations/{DERIVED}/queue")).await;
+    assert_eq!(qs, StatusCode::OK);
+    assert_eq!(
+        row["depth"], queue["total"],
+        "load and queue must not disagree about the same station"
+    );
+    assert_eq!(row["depth"], 3);
+}
+
+/// Age is reported, and it is the oldest member's.
+///
+/// flow-board Q2: the board sorts by age, not depth, because depth
+/// without a drain rate is close to meaningless — ten role queues read
+/// exactly 48 the day this was written and none was a bottleneck.
+#[tokio::test]
+async fn load_reports_the_age_of_the_oldest_waiting_packet() {
+    let app = app(None);
+    post_bill(&app, "old-one").await;
+    let (_s, load) = get_json(&app, "/api/stations/load").await;
+    let row = load["data"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|r| r["station"] == DERIVED)
+        .expect("the derived station");
+    assert_eq!(row["oldest_opened_on"], "2026-08-16");
+    assert!(
+        row["oldest_age_days"].as_i64().expect("a day count") >= 0,
+        "age must be a non-negative day count, got {}",
+        row["oldest_age_days"]
+    );
+}
+
+/// An empty station reports zero depth and no age, not an absence.
+///
+/// A board that drops idle queues cannot show that a queue which
+/// USUALLY holds work is empty today, which is a signal in itself.
+#[tokio::test]
+async fn an_idle_station_is_reported_with_no_age() {
+    let app = app(None);
+    let (_s, load) = get_json(&app, "/api/stations/load").await;
+    let row = load["data"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|r| r["station"] == DERIVED)
+        .expect("the derived station is listed even with nothing in it");
+    assert_eq!(row["depth"], 0);
+    assert!(row["oldest_age_days"].is_null());
+    assert_eq!(row["over_limit"], false);
+}

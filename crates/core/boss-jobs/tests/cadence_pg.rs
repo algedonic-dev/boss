@@ -62,16 +62,32 @@ async fn seeded_rules_serve_the_thresholds_the_schema_declares() {
         "the clock rule's windows are registry data, not a constant"
     );
 
-    // The number from the scar. Migration 123 reconciled the seed to
-    // the value the running conductor already enforced; 131 then raised
-    // it to 12 so one CI run carries more work (David: "load up trains
-    // as fast as we can and have CI be the blocker").
+    // The number from the scar. Migration 123 reconciled the seed to the
+    // value the running conductor already enforced; 131 raised it to 12
+    // so one CI run carries more work (David: "load up trains as fast as
+    // we can and have CI be the blocker"); 147 put it back to 4.
+    //
+    // Why it came back down: 12 was unreachable. This project's dock
+    // does not exceed 3-5, so on 2026-08-17 four consecutive trains
+    // opened and cancelled "nothing to board" while three mergeable cars
+    // sat parked, and the depth rule had not fired for a day. Combined
+    // with the window above never having boarded anything, the pipeline
+    // had no working automatic trigger at all.
+    //
+    // THIS NUMBER LIVES IN FOUR PLACES and they do not move together:
+    // the migration, boss-gcp's LOCAL cadence_rules (which is what the
+    // boarding loop actually reads — see 131 and 147), this assertion,
+    // and the sibling in boss-cli's cadence::db_tests. `--auto` gates a
+    // schema-only change with "fixture + lints only" and SKIPS tests, so
+    // editing the migration alone leaves both assertions red and reports
+    // green. That is how this one was found: not by the change that
+    // broke it, but by an unrelated merge dragging the crate into scope.
     let depth = by_name("train-board-on-dock-depth");
     assert_eq!(depth.verb, "board");
     assert_eq!(depth.basis, "queue-depth");
     assert_eq!(
         depth.min_dock_depth,
-        Some(12),
+        Some(4),
         "boarding threshold drifted from the schema — this is the \
          2026-08-13 split-brain, and it made the operator's answer wrong"
     );

@@ -117,6 +117,11 @@ struct StepToml {
     title_template: String,
     #[serde(default)]
     sign_offs_required: Vec<String>,
+    /// A bundle may raise a step's assurance; omitted means "the
+    /// StepType's floor", which is Session unless the kind says
+    /// otherwise. Protocol data, so raising it is a Workflow edit.
+    #[serde(default)]
+    assurance_required: Option<boss_core::job::Assurance>,
     #[serde(default)]
     fields: Vec<boss_core::job::StepField>,
     #[serde(default)]
@@ -193,6 +198,7 @@ fn workflow_toml_to_spec(toml: WorkflowToml, default_owner: &str) -> WorkflowSpe
         .map(|s| StepSpec {
             title: s.title,
             kind: s.kind,
+            assurance_required: s.assurance_required,
             ready_when: s.ready_when,
             terminal: s.terminal.map(|t| Terminal { outcome: t.outcome }),
             title_template: s.title_template,
