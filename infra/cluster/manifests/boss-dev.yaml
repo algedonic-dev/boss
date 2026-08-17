@@ -141,6 +141,21 @@ spec:
           # construction. Sharing the image is not the same as running a
           # second runner; only the toolchain definition is shared.
           image: 10.20.0.15:3000/david/boss-ci:rust1.96
+          # ALWAYS, because rust1.96 is a MUTABLE tag. build-image
+          # rebuilds and re-pushes it whenever infra/forge/boss-ci/
+          # changes, so `IfNotPresent` pins this pod to whatever the
+          # node happened to cache first — which it did: the image
+          # gained Node 20 and tmux, and the pod went on running Node
+          # 18 with no tmux because cp-2 had the old layer.
+          #
+          # The CI runner hit the identical defect the same evening
+          # (locomotive caught it: stamp d1ccc81a against a tree
+          # wanting 3104b286). Two consumers, one wrong assumption —
+          # that a tag is immutable. Pinning by digest would be the
+          # stronger fix and needs the digest threaded from the build;
+          # this is the one-line version that makes the pod track the
+          # tag it names.
+          imagePullPolicy: Always
           command: ["sleep", "infinity"]
           securityContext:
             allowPrivilegeEscalation: false

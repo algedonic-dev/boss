@@ -91,7 +91,22 @@ set -euo pipefail
 # because of it. It adds no routing: the sweep only admits packets the
 # existing `design-review-spawn` rule would have admitted, and hands
 # them to the same `jobs.spawn` args.
-BASELINE=48
+# 48 -> 49 (2026-08-16). `maintenance-sweep-cluster-conformance-daily`.
+# A TIMER under the exemption above, and the same shape as the four
+# maintenance sweeps already here: no packet causes "a day passed", so
+# no Workflow definition can declare it. It adds no routing — it hands
+# `jobs.spawn` the same maintenance-sweep args the other four use, with
+# a different target.
+#
+# What it buys: infra/cluster/manifests/ describes what should be
+# running and nothing checked that any of it was. boss-dev.yaml was
+# merged, applied by hand, and a day later a design doc asserted in
+# review that the pod had never run while it had 25 hours of uptime.
+# The check that answers this existed as a script; a script nobody runs
+# is not a mechanism. David, 2026-08-16: "let's try and get as much
+# maintenance and management into job protocols rather than floating
+# around scripts or system timers elsewhere."
+BASELINE=49
 RULES_FILE="infra/dispatcher/rules.toml"
 
 count=$(grep -c '^\[\[rule\]\]' "$RULES_FILE")

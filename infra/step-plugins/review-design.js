@@ -676,13 +676,44 @@
           proposal: typeof q.proposal === 'string' ? q.proposal : '',
           body: typeof q.body === 'string' ? q.body : '',
         }));
+        // THE PROSE MAY BE ON EITHER BAG, and this reads both.
+        //
+        // The questions must live on the STEP — that is what makes the
+        // packet self-carried. The prose has no such requirement, and
+        // an author who puts `markdown` in the Job's metadata (the
+        // natural place for "the document this packet is about") got a
+        // review surface with questions and an EMPTY doc pane. That
+        // shipped: David reviewed a design on 2026-08-16 seeing only
+        // the questions, and answered four of them blind before asking
+        // whether the content side was supposed to be empty.
+        //
+        // Falling back is the right shape rather than a workaround.
+        // "Which metadata bag" is exactly the kind of detail that will
+        // keep being got wrong, and the cost of guessing wrong should
+        // be nothing rather than a silently unreadable review.
+        const sm = step.metadata || {};
         doc = {
-          title: String((step.metadata && step.metadata.title) || docPath || 'Design doc'),
-          // The prose rides with the packet too, so the reviewer reads
-          // the doc and answers its questions on one surface.
+          title: String(sm.title || docPath || 'Design doc'),
           content_html: null,
-          markdown: String((step.metadata && step.metadata.markdown) || ''),
+          markdown: String(sm.markdown || ''),
         };
+        if (!doc.markdown) {
+          try {
+            const jr = await fetch(`/api/jobs/${jobId}`, {
+              headers: { accept: 'application/json' },
+            });
+            if (jr.ok) {
+              const job = await jr.json();
+              const jm = (job && job.metadata) || {};
+              doc.markdown = String(jm.markdown || '');
+              if (!sm.title && jm.title) doc.title = String(jm.title);
+            }
+          } catch (_) {
+            // A packet with questions and no readable prose is still
+            // reviewable; leave the doc pane empty rather than fail
+            // the whole surface.
+          }
+        }
         renderHeader();
         renderBody();
         renderProgress();

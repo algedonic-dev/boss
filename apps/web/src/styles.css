@@ -441,7 +441,28 @@ a:hover { color: #8ce4c2; }
   background: var(--bg);
   color: var(--text);
   min-height: 100vh;
-  padding: var(--s7) max(var(--s5), calc((100vw - 1280px) / 2)) var(--s8);
+  /* MEASURED, feedback 6b80ba52 — David: "Visuals are very cramped
+     despite large black spaces. Use the available horizontal space."
+
+     The old rule centred every exec view on a 1280px measure with
+     `max(var(--s5), calc((100vw - 1280px) / 2))`. On a 1920 viewport
+     that is 320px of padding PER SIDE, and it was worse than it looks:
+     the calc reads 100vw, which includes the 200px sidebar this
+     element sits beside, so it over-pads by half the sidebar again.
+
+     Measured on the job page at 1920 before the change: 1656px of
+     available width, 640px eaten by this padding, a 1016px content
+     column, and the step surface — the thing you actually read —
+     660px wide.
+
+     Centring is still right; a full-bleed 2560px line length is
+     unreadable. So keep a measure and widen it, and derive the gutter
+     from the element's OWN width (100%) rather than the viewport, so
+     the sidebar is not double-counted. --exec-measure is a variable
+     because "how wide is a page" is a decision worth naming once. */
+  --exec-measure: 1600px;
+  padding: var(--s7) max(var(--s5), calc((100% - var(--exec-measure)) / 2))
+    var(--s8);
 }
 
 .theme-exec .theme-nav {

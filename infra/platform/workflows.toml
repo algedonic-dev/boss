@@ -429,3 +429,306 @@ title_template = "The original claim held up"
 # taken back because measurement upheld the original claim.
 metadata_defaults = { outcome_kind = "withdrawn" }
 terminal = { outcome = "unfounded" }
+
+
+# THE FIVE UNWATCHED CHORES.
+#
+# boss-maintenance-wrap.sh states the contract already: "the timer is
+# the EXECUTOR, the Job is the VISIBILITY". ExecStartPre opens (or
+# reuses) a Job, ExecStartPost completes it, and a FAILED run completes
+# nothing — so the Job stays open on the fleet view until a later run
+# succeeds or a human closes it. Three chores were wired that way:
+# backup, audit-integrity, ledger-replay.
+#
+# Five were not, and had no packet, no findings, no event-log trace and
+# nobody's queue. A silent failure in any of them looks exactly like a
+# success. That is the whole defect class of the day, running nightly.
+#
+# David, 2026-08-16: "Let's make sure we have a job to handle each."
+#
+# In the BUNDLE and not in platform_workflows(), deliberately, and the
+# comment in registry.rs argues it better than this one can: a kind in
+# Rust is a protocol that cannot change without a deploy and that
+# bootstrap_reconcile will rewrite over an operator's edit; a kind in
+# the bundle is data. The three existing maintenance kinds are still in
+# Rust and should follow — separately, since moving a kind with live
+# packets is its own change.
+
+# boss-conservation-invariants.service
+[[workflow]]
+kind = "maintenance-conservation-invariants"
+label = "Conservation-invariant sweep"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "The hourly conservation-invariant scan (infra/lint/conservation-invariants.sh). Hourly rather than nightly because a conservation break is a correctness fault, not housekeeping."
+metadata = { owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "scheduled"
+kind = "trigger"
+ready_when = "true"
+title_template = "Timer fired"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "systemd-timer" }
+
+[[workflow.step]]
+title = "run"
+kind = "task"
+ready_when = "steps.scheduled.done"
+title_template = "Run to completion"
+# Gated so the simulated workforce cannot role-match and "complete"
+# real maintenance; the timer's boss-step call presents the automation
+# actor with this role.
+authority_role = "platform-admin"
+fields = [{ name = "result", field_type = "string", required = true }]
+
+[[workflow.step]]
+title = "completed"
+kind = "outcome"
+ready_when = "steps.run.done"
+title_template = "Maintenance completed"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "completed" }
+
+# boss-ledger-recognize.service
+[[workflow]]
+kind = "maintenance-ledger-recognize"
+label = "Revenue-recognition run"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "The 02:00 ASC 606 step-3 scheduler (boss-ledger-recognize). A missed run silently understates recognised revenue, which is the kind of failure nobody notices from the outside."
+metadata = { owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "scheduled"
+kind = "trigger"
+ready_when = "true"
+title_template = "Timer fired"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "systemd-timer" }
+
+[[workflow.step]]
+title = "run"
+kind = "task"
+ready_when = "steps.scheduled.done"
+title_template = "Run to completion"
+# Gated so the simulated workforce cannot role-match and "complete"
+# real maintenance; the timer's boss-step call presents the automation
+# actor with this role.
+authority_role = "platform-admin"
+fields = [{ name = "result", field_type = "string", required = true }]
+
+[[workflow.step]]
+title = "completed"
+kind = "outcome"
+ready_when = "steps.run.done"
+title_template = "Maintenance completed"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "completed" }
+
+# boss-ml-inference-batch.service
+[[workflow]]
+kind = "maintenance-ml-inference-batch"
+label = "ML inference batch"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "The 02:30 batch inference trigger (infra/ml/run-inference-batch.sh)."
+metadata = { owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "scheduled"
+kind = "trigger"
+ready_when = "true"
+title_template = "Timer fired"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "systemd-timer" }
+
+[[workflow.step]]
+title = "run"
+kind = "task"
+ready_when = "steps.scheduled.done"
+title_template = "Run to completion"
+# Gated so the simulated workforce cannot role-match and "complete"
+# real maintenance; the timer's boss-step call presents the automation
+# actor with this role.
+authority_role = "platform-admin"
+fields = [{ name = "result", field_type = "string", required = true }]
+
+[[workflow.step]]
+title = "completed"
+kind = "outcome"
+ready_when = "steps.run.done"
+title_template = "Maintenance completed"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "completed" }
+
+# boss-messages-events-purge.service
+[[workflow]]
+kind = "maintenance-messages-purge"
+label = "messages_events retention sweep"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "The 03:30 messages_events retention purge (boss-messages-events-purge)."
+metadata = { owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "scheduled"
+kind = "trigger"
+ready_when = "true"
+title_template = "Timer fired"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "systemd-timer" }
+
+[[workflow.step]]
+title = "run"
+kind = "task"
+ready_when = "steps.scheduled.done"
+title_template = "Run to completion"
+# Gated so the simulated workforce cannot role-match and "complete"
+# real maintenance; the timer's boss-step call presents the automation
+# actor with this role.
+authority_role = "platform-admin"
+fields = [{ name = "result", field_type = "string", required = true }]
+
+[[workflow.step]]
+title = "completed"
+kind = "outcome"
+ready_when = "steps.run.done"
+title_template = "Maintenance completed"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "completed" }
+
+# boss-files-gc.service
+[[workflow]]
+kind = "maintenance-files-gc"
+label = "file_refs garbage collection"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "The 04:16 file_refs GC sweep (boss-files-gc)."
+metadata = { owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "scheduled"
+kind = "trigger"
+ready_when = "true"
+title_template = "Timer fired"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "systemd-timer" }
+
+[[workflow.step]]
+title = "run"
+kind = "task"
+ready_when = "steps.scheduled.done"
+title_template = "Run to completion"
+# Gated so the simulated workforce cannot role-match and "complete"
+# real maintenance; the timer's boss-step call presents the automation
+# actor with this role.
+authority_role = "platform-admin"
+fields = [{ name = "result", field_type = "string", required = true }]
+
+[[workflow.step]]
+title = "completed"
+kind = "outcome"
+ready_when = "steps.run.done"
+title_template = "Maintenance completed"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "completed" }
+
+# boss-views-catchup.service
+[[workflow]]
+kind = "maintenance-views-catchup"
+label = "event_facts catch-up"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "Projects audit_log rows past the event_facts watermark. Before this timer existed the projection only moved on a full boss-rebuild-all and sat tens of thousands of events behind on a live box."
+metadata = { owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "scheduled"
+kind = "trigger"
+ready_when = "true"
+title_template = "Timer fired"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "systemd-timer" }
+
+[[workflow.step]]
+title = "run"
+kind = "task"
+ready_when = "steps.scheduled.done"
+title_template = "Run to completion"
+authority_role = "platform-admin"
+fields = [{ name = "result", field_type = "string", required = true }]
+
+[[workflow.step]]
+title = "completed"
+kind = "outcome"
+ready_when = "steps.run.done"
+title_template = "Maintenance completed"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "completed" }
+
+# boss-search-reindex.service
+[[workflow]]
+kind = "maintenance-search-reindex"
+label = "search_index rebuild"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "Rebuilds the global search projection. It has no incremental form - events are capped per Subject, so an append cannot be correct - and outside boss-rebuild-all nothing refreshed it."
+metadata = { owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "scheduled"
+kind = "trigger"
+ready_when = "true"
+title_template = "Timer fired"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "systemd-timer" }
+
+[[workflow.step]]
+title = "run"
+kind = "task"
+ready_when = "steps.scheduled.done"
+title_template = "Run to completion"
+authority_role = "platform-admin"
+fields = [{ name = "result", field_type = "string", required = true }]
+
+[[workflow.step]]
+title = "completed"
+kind = "outcome"
+ready_when = "steps.run.done"
+title_template = "Maintenance completed"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "completed" }
+
+# boss-deploy-confirm.service
+[[workflow]]
+kind = "maintenance-deploy-confirm"
+label = "Deploy confirm"
+category = "platform"
+subject_kinds = ["custom"]
+owning_team = "platform"
+description = "Evaluates the active generation and reverts on failure. The one chore here that CHANGES production on its own, which is the strongest case for it leaving a packet behind: a revert nobody can see is a deploy nobody can explain."
+metadata = { owner_role = "platform-admin" }
+
+[[workflow.step]]
+title = "scheduled"
+kind = "trigger"
+ready_when = "true"
+title_template = "Timer fired"
+metadata_defaults = { trigger_kind = "periodic", trigger_name = "systemd-timer" }
+
+[[workflow.step]]
+title = "run"
+kind = "task"
+ready_when = "steps.scheduled.done"
+title_template = "Run to completion"
+authority_role = "platform-admin"
+fields = [{ name = "result", field_type = "string", required = true }]
+
+[[workflow.step]]
+title = "completed"
+kind = "outcome"
+ready_when = "steps.run.done"
+title_template = "Maintenance completed"
+metadata_defaults = { outcome_kind = "completed" }
+terminal = { outcome = "completed" }

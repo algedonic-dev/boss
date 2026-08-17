@@ -605,6 +605,30 @@ schedule = { cadence = "daily", anchor_date = "2026-08-14" }
 handler = "jobs.spawn"
 args = { kind = "\"maintenance-sweep\"", subject_kind = "\"custom\"", subject = "\"deploy-convergence\"", title = "\"Deploy convergence sweep\"", "metadata.target" = "\"deploy-convergence\"", "metadata.area" = "\"deploy\"" }
 
+# 5. TREE-vs-CLUSTER CONFORMANCE. infra/cluster/manifests/ describes
+# what should be running; nothing checked that any of it was. boss-dev.yaml
+# was merged on 2026-08-15, applied by hand, and a day later a design doc
+# asserted in review that the pod had never run — while it had 25 hours of
+# uptime. The tree could not answer the question either way.
+#
+# check-manifests-applied.sh answers it. This rule is what makes somebody
+# ask: a sweep packet lands daily with a target, an actor runs the check
+# and records what it found, and the fork is the protocol's own —
+# remediate when a manifest is missing from the cluster, clear when the
+# two agree. The script stops being a file nobody runs and becomes the
+# instrument of a step.
+#
+# Deliberately a sweep and not a systemd timer. A timer that finds drift
+# has nowhere to put the finding; David, 2026-08-16: "let's try and get as
+# much maintenance and management into job protocols rather than floating
+# around scripts or system timers elsewhere."
+[[rule]]
+name = "maintenance-sweep-cluster-conformance-daily"
+schedule = { cadence = "daily", anchor_date = "2026-08-17" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"maintenance-sweep\"", subject_kind = "\"custom\"", subject = "\"cluster-conformance\"", title = "\"Cluster conformance sweep\"", "metadata.target" = "\"cluster-conformance\"", "metadata.area" = "\"cluster\"" }
+
 # ---------------------------------------------------------------------
 # Expire the notifications about a job that has finished (David,
 # 2026-08-14: "we still need a way to automatically expire inbox
