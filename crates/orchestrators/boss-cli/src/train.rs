@@ -703,25 +703,84 @@ pub(crate) fn skip_reason_conflict(conflicted: &[String]) -> String {
 ///
 /// Returns `Ok(false)` when neither ref exists — that car really was
 /// never pushed, and skipping it is correct. Never called in dry mode.
+///
+/// WHICH REF WINS WHEN BOTH EXIST: the DESCENDANT, never "whichever
+/// was listed first". Until 2026-08-17 this returned on the first ref
+/// that pushed successfully, with `origin/<branch>` listed first, so a
+/// stale remote-tracking ref beat the car's real head. Two trains in a
+/// row assembled code their author had already fixed
+/// (`feat/presence-assurance` origin=58083e8 vs local=6cfc15e;
+/// `feat/estate-subjects` origin=0381fe6 vs local=d00307b, eight
+/// commits behind) and both failed CI on those exact fixed errors —
+/// silently, while reporting success. Packet `9150dc6b`.
+///
+/// Reordering the list is NOT sufficient, and the second test below
+/// is the reason: this function is only ever called when the fork
+/// does not have the branch, so *any* source pushes cleanly and
+/// nothing rejects a stale one. Fast-forward rejection cannot be
+/// leaned on as the tiebreak — the choice has to be made here.
+///
+/// Both remotes are the same forge in production, so "ahead" is the
+/// only thing that distinguishes the refs. Unrelated histories cannot
+/// be ordered, so the local head wins as the more recent statement of
+/// intent in this clone.
 pub(crate) fn publish_car_branch(clone: &str, branch: &str) -> Result<bool> {
-    for src in [format!("origin/{branch}"), format!("refs/heads/{branch}")] {
-        let have = sh_unchecked(&["git", "-C", clone, "rev-parse", "--verify", "--quiet", &src])?;
-        if !have.status.success() {
-            continue;
+    let exists = |src: &str| -> Result<bool> {
+        Ok(
+            sh_unchecked(&["git", "-C", clone, "rev-parse", "--verify", "--quiet", src])?
+                .status
+                .success(),
+        )
+    };
+    // `<a> is an ancestor of <b>`, i.e. b is at or ahead of a.
+    let is_ancestor = |a: &str, b: &str| -> Result<bool> {
+        Ok(
+            sh_unchecked(&["git", "-C", clone, "merge-base", "--is-ancestor", a, b])?
+                .status
+                .success(),
+        )
+    };
+
+    let local = format!("refs/heads/{branch}");
+    let upstream = format!("origin/{branch}");
+    let (have_local, have_upstream) = (exists(&local)?, exists(&upstream)?);
+
+    let src = match (have_local, have_upstream) {
+        (false, false) => return Ok(false),
+        (true, false) => local,
+        (false, true) => upstream,
+        // Prefer the local head unless upstream is strictly ahead of
+        // it. Equal refs take the local branch, which is the same
+        // commit by definition.
+        (true, true) => {
+            if is_ancestor(&local, &upstream)? && !is_ancestor(&upstream, &local)? {
+                upstream
+            } else {
+                local
+            }
         }
-        let pushed = sh_unchecked(&[
-            "git",
-            "-C",
-            clone,
-            "push",
-            "fork",
-            &format!("{src}:refs/heads/{branch}"),
-        ])?;
-        if pushed.status.success() {
-            return Ok(true);
-        }
+    };
+
+    let pushed = sh_unchecked(&[
+        "git",
+        "-C",
+        clone,
+        "push",
+        "fork",
+        &format!("{src}:refs/heads/{branch}"),
+    ])?;
+    if !pushed.status.success() {
+        return Ok(false);
     }
-    Ok(false)
+    // Name the ref and the sha that actually shipped. The 2026-08-17
+    // diagnosis cost a second red train precisely because publishing
+    // said nothing about WHAT it published.
+    let sha = sh_unchecked(&["git", "-C", clone, "rev-parse", "--short", &src])?;
+    log(format!(
+        "published {branch} to the fork from {src} @ {}",
+        String::from_utf8_lossy(&sha.stdout).trim()
+    ));
+    Ok(true)
 }
 
 /// The skip reason for a car parked at review whose branch was never
@@ -4639,6 +4698,88 @@ mod tests {
         git_ok(clone, &["add", "-A"]);
         git_ok(clone, &["commit", "-qm", "work"]);
         git_ok(clone, &["checkout", "-q", "main"]);
+    }
+
+    /// One more commit on an existing branch, leaving `main` checked
+    /// out — what fixing a car looks like in the conductor's clone.
+    fn advance_branch(clone: &std::path::Path, branch: &str, marker: &str) {
+        git_ok(clone, &["checkout", "-q", branch]);
+        std::fs::write(clone.join("x"), marker).expect("write");
+        git_ok(clone, &["add", "-A"]);
+        git_ok(clone, &["commit", "-qm", marker]);
+        git_ok(clone, &["checkout", "-q", "main"]);
+    }
+
+    fn rev(clone: &std::path::Path, refname: &str) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(clone)
+            .args(["rev-parse", refname])
+            .output()
+            .expect("rev-parse");
+        assert!(out.status.success(), "rev-parse {refname}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// THE BUG THAT REDDENED TWO TRAINS ON 2026-08-17.
+    ///
+    /// `origin/<branch>` existed and was stale; the fix sat on the
+    /// local head. Preferring whichever ref was tried first shipped
+    /// the stale commit to the fork, so the train compiled code the
+    /// author had already fixed — and reported success doing it.
+    #[test]
+    fn a_stale_origin_ref_does_not_beat_the_cars_real_head() {
+        let (_g, clone) = clone_fixture("stale-origin");
+        commit_branch(&clone, "feat/stale");
+        git_ok(&clone, &["push", "-q", "origin", "feat/stale"]);
+        let stale = rev(&clone, "feat/stale");
+
+        // The fix lands locally and is NOT pushed upstream — exactly
+        // what `git push gcp <branch>` leaves behind.
+        advance_branch(&clone, "feat/stale", "the fix");
+        let real = rev(&clone, "feat/stale");
+        assert_ne!(stale, real, "precondition: the branch moved");
+        assert_eq!(
+            rev(&clone, "origin/feat/stale"),
+            stale,
+            "precondition: origin is behind"
+        );
+
+        assert!(
+            publish_car_branch(clone.to_str().expect("utf8"), "feat/stale").expect("publish"),
+            "a car with a real head must publish"
+        );
+        assert_eq!(
+            rev(&clone, "fork/feat/stale"),
+            real,
+            "the fork must carry the car's real head, not the stale origin ref"
+        );
+    }
+
+    /// The mirror image, and the reason ordering alone is not the fix:
+    /// when the fork does not have the branch at all, ANY source
+    /// pushes cleanly, so nothing rejects a stale one. The descendant
+    /// has to be chosen deliberately.
+    #[test]
+    fn an_origin_ref_ahead_of_a_stale_local_head_wins() {
+        let (_g, clone) = clone_fixture("stale-local");
+        commit_branch(&clone, "feat/ahead");
+        // Advance on a scratch clone and push, so `origin/<branch>`
+        // moves ahead while this clone's local ref stays put.
+        let stale_local = rev(&clone, "feat/ahead");
+        git_ok(&clone, &["push", "-q", "origin", "feat/ahead"]);
+        advance_branch(&clone, "feat/ahead", "upstream work");
+        let ahead = rev(&clone, "feat/ahead");
+        git_ok(&clone, &["push", "-q", "origin", "feat/ahead"]);
+        git_ok(&clone, &["branch", "-qf", "feat/ahead", &stale_local]);
+        assert_eq!(rev(&clone, "feat/ahead"), stale_local, "precondition");
+
+        assert!(publish_car_branch(clone.to_str().expect("utf8"), "feat/ahead").expect("publish"));
+        assert_eq!(
+            rev(&clone, "fork/feat/ahead"),
+            ahead,
+            "the newer upstream ref must win over a stale local one"
+        );
     }
 
     /// THE CASE THAT COST FIVE PUSHES.

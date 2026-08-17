@@ -204,3 +204,120 @@ fn gate_script_covers_the_checks() {
          with the reason they are exempt."
     );
 }
+
+/// THE GATE MUST NOT EAT THE DISK IT IS RUNNING ON.
+///
+/// Twice in two days a full `infra/gate.sh` on the Mac filled the
+/// volume and took the whole session with it, not just the run
+/// (packet `865992c1`). The second time is the instructive one: every
+/// subsequent command failed *before executing*, because the agent
+/// harness could not create the file it writes command output into
+/// ("ENOSPC ... open '.../tasks/*.output'"), so `df` and `rm` were
+/// equally unavailable and the failure had disabled its own diagnosis.
+///
+/// A one-shot precondition cannot catch this. The run STARTS with
+/// plenty and then grows a `target/` — 32GB in the reported incident,
+/// 81GB on this machine when the guard was written — so the check has
+/// to be re-evaluated as the run proceeds. `check()` is where every
+/// phase passes through, which makes it the poll point.
+///
+/// Driven through the real script with an impossible floor, because
+/// the behaviour under test is "does the guard actually stop the run"
+/// and a unit test of the arithmetic would not answer that.
+#[test]
+fn the_gate_refuses_to_run_without_headroom() {
+    let out = std::process::Command::new("bash")
+        .arg(repo_root().join("infra/gate.sh"))
+        .arg("--auto")
+        .env("BOSS_GATE_MIN_FREE_GB", "99999999")
+        .current_dir(repo_root())
+        .output()
+        .expect("run gate.sh");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a floor no disk can satisfy must fail the gate.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Refusing to start"),
+        "the refusal must name itself so it is not read as a test failure — \
+         that misreading is the whole packet.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("99999999"),
+        "the refusal must state the floor it applied.\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("all checks green"),
+        "an aborted gate must never report green.\nstdout: {stdout}"
+    );
+}
+
+/// THE POLL, which is the half a startup check cannot cover.
+///
+/// A fake `df` that reports plenty once and then almost nothing models
+/// the incident directly: the gate started with headroom and the run
+/// itself consumed it. The assertion is that the gate notices at the
+/// next phase boundary and stops — and that it says "to continue", so
+/// a log reader can tell this from a machine that was too small to
+/// begin with.
+#[test]
+fn the_gate_rechecks_headroom_as_the_run_proceeds() {
+    let root = repo_root();
+    let dir = std::env::temp_dir().join("boss-gate-headroom-poll");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let counter = dir.join("calls");
+    let fake = dir.join("df");
+    // 1st call: 900GB free. Every later call: 1GB.
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/usr/bin/env bash\n\
+             n=$(cat {c} 2>/dev/null || echo 0)\n\
+             echo $((n+1)) > {c}\n\
+             echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'\n\
+             if [ \"$n\" -eq 0 ]; then echo '/dev/fake 1 1 943718400 1% /'; \
+             else echo '/dev/fake 1 1 1048576 99% /'; fi\n",
+            c = counter.display()
+        ),
+    )
+    .expect("write fake df");
+    std::fs::set_permissions(
+        &fake,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .expect("chmod");
+
+    let out = std::process::Command::new("bash")
+        .arg(root.join("infra/gate.sh"))
+        .arg("--auto")
+        .env("BOSS_GATE_DF_CMD", fake.to_str().expect("utf8"))
+        .env("BOSS_GATE_MIN_FREE_GB", "12")
+        .current_dir(&root)
+        .output()
+        .expect("run gate.sh");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        stdout.contains("gate:") || !stdout.is_empty(),
+        "the gate should have started — the first reading was 900GB.\nstderr: {stderr}"
+    );
+    assert!(
+        !out.status.success(),
+        "the run consumed its own headroom and must stop.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Refusing to continue"),
+        "a mid-run trip must be distinguishable from a too-small machine.\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("all checks green"),
+        "an aborted gate must never report green.\nstdout: {stdout}"
+    );
+}

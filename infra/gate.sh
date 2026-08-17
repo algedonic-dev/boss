@@ -336,15 +336,47 @@ fi
 # (188GB on node-local scratch, one workspace instead of six worktrees
 # each with their own target/). This is the guard for whichever host
 # ends up running it.
+#
+# AND IT IS CHECKED BEFORE EVERY PHASE, not only at startup. A one-shot
+# precondition cannot catch the failure it was written for: the run
+# STARTS above the floor and then grows a `target/` — 32GB in the
+# 2026-08-16 incident, 81GB on the Mac when this poll was added — so
+# the only reading that matters is the one taken while the build is
+# under way. `check()` is where every phase passes through, which makes
+# it the poll point; the cost is one `df` per phase against a gate whose
+# phases run for minutes.
+#
+# Tripping mid-run EXITS rather than recording a failed check. A gate
+# that keeps going after this consumes the disk it just warned about,
+# and the reported incident is precisely what that costs: the harness
+# could no longer create the file it writes command output into, so
+# `df` and `rm` stopped working too and the failure had disabled its
+# own diagnosis.
 gate_min_free_gb="${BOSS_GATE_MIN_FREE_GB:-12}"
-gate_avail_kb="$(df -Pk . 2>/dev/null | awk 'NR==2 {print $4}')"
-if [ -z "${gate_avail_kb}" ]; then
-    echo "gate: could not read free space for $(pwd) — refusing rather than guessing." >&2
-    exit 2
-fi
-gate_avail_gb=$((gate_avail_kb / 1024 / 1024))
-if [ "${gate_avail_gb}" -lt "${gate_min_free_gb}" ]; then
-    echo "gate: ${gate_avail_gb}GB free, need ${gate_min_free_gb}GB. Refusing to start." >&2
+
+# The free-space reader, overridable ONLY so the poll itself can be
+# tested — a fake that shrinks across calls is a faithful model of the
+# incident, and there is no other way to prove re-evaluation without
+# actually filling a disk.
+gate_avail_gb() {
+    local kb
+    kb="$(${BOSS_GATE_DF_CMD:-df -Pk .} 2>/dev/null | awk 'NR==2 {print $4}')"
+    if [ -z "${kb}" ]; then
+        echo "gate: could not read free space for $(pwd) — refusing rather than guessing." >&2
+        exit 2
+    fi
+    echo $((kb / 1024 / 1024))
+}
+
+# `when` is "to start" or "to continue" — the distinction matters when
+# reading a log: the second means the run itself ate the headroom.
+require_headroom() {
+    local when="$1" avail
+    avail="$(gate_avail_gb)" || exit 2
+    if [ "${avail}" -ge "${gate_min_free_gb}" ]; then
+        return 0
+    fi
+    echo "gate: ${avail}GB free, need ${gate_min_free_gb}GB. Refusing ${when}." >&2
     echo "  A build that fills this volume does not fail cleanly — it wedges the" >&2
     echo "  shell, and on 2026-08-16 it stopped even \`df\` from running." >&2
     echo "  remediation: drop target/ dirs from landed worktrees —" >&2
@@ -352,7 +384,9 @@ if [ "${gate_avail_gb}" -lt "${gate_min_free_gb}" ]; then
     echo "    rm -rf <landed-worktree>/target" >&2
     echo "  Better: build in the dev pod, which has 188GB of scratch." >&2
     exit 2
-fi
+}
+
+require_headroom "to start"
 
 FAILED=()
 
@@ -360,6 +394,9 @@ FAILED=()
 # report every failure it can see, not make the author fix serially.
 check() {
     local name="$1"; shift
+    # The poll. Growth during the run is what wedges the box, so the
+    # reading taken before this phase is the one that counts.
+    require_headroom "to continue before '${name}'"
     echo "::group::gate: ${name}"
     if "$@"; then
         echo "::endgroup::"
