@@ -369,3 +369,60 @@ fn headroom_is_checked_before_the_scope_is_derived() {
          Refusing for want of disk should not wait on git archaeology either."
     );
 }
+
+/// The receipt must distinguish "the database-backed checks did not
+/// run here" from "this change is fine".
+///
+/// Three red trains on 2026-08-18 came from cars whose local gate read
+/// "26 of 28 — the two failures are the absent local Postgres". That
+/// sentence was true every time and the car was broken every time:
+/// migration ordering against a unique index, then a registry seed
+/// disagreeing with its migration, then the same pin again. None is
+/// visible to `bash -n` or to the shape lints, and the receipt gave no
+/// way to tell an environmental failure from a real one — so the
+/// author supplied the optimistic reading three times running.
+///
+/// `unverifiable` closes that: it lists the changed paths only a
+/// database can judge, and it is empty unless the DB-backed checks
+/// actually failed to pass.
+#[test]
+fn the_receipt_names_what_only_a_database_could_have_judged() {
+    let script = read("infra/gate.sh");
+
+    assert!(
+        script.contains("db_backed_paths()"),
+        "the gate must be able to name the paths a database judges"
+    );
+    assert!(
+        script.contains("db_checks_passed()"),
+        "the gate must know whether the DB-backed checks actually passed"
+    );
+    assert!(
+        script.contains("\"unverifiable\": [${unver}]"),
+        "the receipt must carry the `unverifiable` list — a consumer \
+         reading only `verdict` and `checks` cannot tell an absent \
+         database from a sound change"
+    );
+
+    // The classification itself. Schema and the dispatcher registry are
+    // the two that actually bit; seed TOMLs are the same shape.
+    let filter = script
+        .lines()
+        .find(|l| l.contains("changed_paths | grep -E '^infra/postgres/schema/"))
+        .expect("db_backed_paths filters changed paths");
+    for needle in ["infra/postgres/schema/", "rules\\.toml", "/seeds/"] {
+        assert!(
+            filter.contains(needle),
+            "db_backed_paths must cover {needle} — it is DB-judged and has drifted before:\n{filter}"
+        );
+    }
+
+    // Emptiness is load-bearing: if it listed paths whenever the DB
+    // checks failed, every car on this Mac would carry the warning and
+    // it would be ignored within a day.
+    assert!(
+        script.contains("if ! db_checks_passed; then"),
+        "the list must be gated on the DB checks NOT passing, so it \
+         stays silent on changes a database has nothing to say about"
+    );
+}

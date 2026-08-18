@@ -208,6 +208,35 @@ changed_paths() {
     git diff --name-only "$base" HEAD 2>/dev/null
 }
 
+# Paths whose correctness ONLY a database can judge. A migration is
+# valid SQL long before it is a valid migration: ordering against a
+# unique index, agreement with the registry seed it duplicates, and
+# whether it applies at all on top of the migrations already recorded
+# are all invisible to shape lints and to `bash -n`.
+#
+# This list is the answer to three red trains on 2026-08-18, every one
+# of them from a car whose local gate read "26 of 28 — the two
+# failures are the absent local Postgres". That sentence was true and
+# the car was still broken; the receipt gave no way to tell those
+# apart, so the author (me) supplied the optimistic reading each time.
+db_backed_paths() {
+    changed_paths | grep -E '^infra/postgres/schema/|^infra/dispatcher/rules\.toml$|/seeds/[^/]*\.toml$' || true
+}
+
+# Did the checks that need a live database actually pass? `fixture`
+# standing up IS the database being reachable, so a fixture failure
+# means every DB-backed result below it is absent rather than green.
+db_checks_passed() {
+    local entry name result seen=0
+    for entry in ${RAN+"${RAN[@]}"}; do
+        name="${entry%:*}"; result="${entry##*:}"
+        case "$name" in
+            fixture|test) seen=1; [ "$result" = "pass" ] || return 1 ;;
+        esac
+    done
+    [ "$seen" -eq 1 ]
+}
+
 crates_from_paths() {
     changed_paths | path_map | tr ' ' '\n' | sed '/^$/d'
 }
@@ -428,6 +457,16 @@ write_receipt() {
     # marker is set cannot have exercised anything those markers gate.
     local in_ci=false
     if [ -n "${CI:-}${GITHUB_ACTIONS:-}${FORGEJO_ACTIONS:-}" ]; then in_ci=true; fi
+    # The honest-reading guard. Empty when nothing DB-backed changed,
+    # or when the DB-backed checks actually ran and passed.
+    local unver="" unver_count=0 p
+    if ! db_checks_passed; then
+        for p in $(db_backed_paths); do
+            [ "$unver_count" -eq 0 ] || unver="${unver},"
+            unver="${unver}\"${p}\""
+            unver_count=$((unver_count + 1))
+        done
+    fi
     cat > "${GATE_RECEIPT}" <<RECEIPT
 {
   "verdict": "${verdict}",
@@ -438,9 +477,15 @@ write_receipt() {
   "host": "$(hostname 2>/dev/null || echo unknown)",
   "ci": ${in_ci},
   "free_gb": $(gate_avail_gb),
+  "unverifiable": [${unver}],
   "checks": [${checks}]
 }
 RECEIPT
+    if [ -n "${unver}" ]; then
+        printf 'gate: UNVERIFIABLE — this change touches %s, and the database-backed checks did not pass here.\n' "${unver_count} path(s)" >&2
+        printf '      A migration or registry row cannot be called green on a machine that cannot apply it.\n' >&2
+        printf '      Do not record this receipt as evidence of green; let CI judge it.\n' >&2
+    fi
 }
 
 # Each check runs even if an earlier one failed — a red gate should

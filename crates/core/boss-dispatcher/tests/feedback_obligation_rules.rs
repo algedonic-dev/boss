@@ -27,7 +27,7 @@
 //!    would silently complete nothing, which is precisely the failure
 //!    mode this whole car exists to remove.
 
-use boss_dispatcher::rules::expr::{NoHelpers, Value};
+use boss_dispatcher::rules::expr::{EvalError, HelperResolver, Value};
 use boss_dispatcher::rules::handler::{HandlerRegistry, RecordingHandler, dispatch};
 use boss_dispatcher::rules::registry::{MatchedRule, Registry, load_active_rules, match_event};
 use boss_jobs::registry::feedback_branch_for_disposition;
@@ -54,7 +54,27 @@ fn close_marker(kind: &str, outcome: serde_json::Value) -> serde_json::Value {
         "kind": kind,
         "outcome": outcome,
         "parent_step_id": null,
+        // Always a real value at the emit sites — every Job has a
+        // Subject — but any binding satisfies the predicates here.
+        "subject_id": "subject-under-test",
     })
+}
+
+/// The registry is loaded whole, so every helper any `jobs.job.closed`
+/// rule names must RESOLVE here even though these tests only assert the
+/// two feedback rules — `spawn-car-on-sweep-remediated` (v2) calls
+/// `open_car_exists`, and an unresolvable helper is a `PredicateFailed`
+/// for the whole match, same as an absent identifier. Answering `false`
+/// (no open car) keeps that rule inert without dead-lettering the rest.
+struct NoOpenCars;
+
+impl HelperResolver for NoOpenCars {
+    fn call(&self, name: &str, _args: &[Value]) -> Result<Value, EvalError> {
+        match name {
+            "open_car_exists" => Ok(Value::Bool(false)),
+            other => Err(EvalError::UnknownHelper(other.to_string())),
+        }
+    }
 }
 
 fn matched_named<'a>(matched: &'a [MatchedRule], name: &str) -> Option<&'a MatchedRule> {
@@ -81,7 +101,7 @@ async fn a_merged_car_fires_the_completion_with_its_edge_and_branches() {
     let reg = shipped_registry(&db).await;
     let payload = close_marker("ship-a-change", json!("merged"));
 
-    let matched = match_event(&reg, "jobs.job.closed", &payload, &NoHelpers)
+    let matched = match_event(&reg, "jobs.job.closed", &payload, &NoOpenCars)
         .expect("the shipped predicates evaluate against a close marker");
     let m = matched_named(&matched, COMPLETE_RULE)
         .unwrap_or_else(|| panic!("{COMPLETE_RULE} did not match a merged car: {matched:?}"));
@@ -141,7 +161,7 @@ async fn an_abandoned_car_completes_nothing() {
     let db = TestDb::new().await;
     let reg = shipped_registry(&db).await;
     let payload = close_marker("ship-a-change", json!("abandoned"));
-    let matched = match_event(&reg, "jobs.job.closed", &payload, &NoHelpers).expect("evaluates");
+    let matched = match_event(&reg, "jobs.job.closed", &payload, &NoOpenCars).expect("evaluates");
     assert!(
         matched_named(&matched, COMPLETE_RULE).is_none(),
         "an abandoned change must not close the packet that authorized it"
@@ -160,7 +180,7 @@ async fn a_feedback_terminal_fires_the_notification_only() {
     for outcome in ["completed", "duplicate", "declined"] {
         let payload = close_marker("user-feedback", json!(outcome));
         let matched =
-            match_event(&reg, "jobs.job.closed", &payload, &NoHelpers).expect("evaluates");
+            match_event(&reg, "jobs.job.closed", &payload, &NoOpenCars).expect("evaluates");
         let m = matched_named(&matched, NOTIFY_RULE).unwrap_or_else(|| {
             panic!("{NOTIFY_RULE} did not match a `{outcome}` terminal: {matched:?}")
         });
@@ -192,7 +212,7 @@ async fn a_close_marker_with_no_outcome_evaluates_to_a_clean_false() {
         close_marker("pr-train", json!("arrived")),
     ] {
         let matched =
-            match_event(&reg, "jobs.job.closed", &payload, &NoHelpers).unwrap_or_else(|e| {
+            match_event(&reg, "jobs.job.closed", &payload, &NoOpenCars).unwrap_or_else(|e| {
                 panic!(
                     "a shipped predicate failed on a legitimate close marker ({e}) — \
                      that is a dead-letter storm, not a skipped rule. Payload: {payload:#}"
@@ -213,7 +233,7 @@ async fn every_branch_the_rule_names_is_a_live_non_terminal_feedback_branch() {
     let db = TestDb::new().await;
     let reg = shipped_registry(&db).await;
     let payload = close_marker("ship-a-change", json!("merged"));
-    let matched = match_event(&reg, "jobs.job.closed", &payload, &NoHelpers).expect("evaluates");
+    let matched = match_event(&reg, "jobs.job.closed", &payload, &NoOpenCars).expect("evaluates");
     let m = matched_named(&matched, COMPLETE_RULE).expect("the completion rule matched");
     let listed: Vec<String> = arg_of(m, "jobs.complete_linked_step", "steps")
         .split(',')

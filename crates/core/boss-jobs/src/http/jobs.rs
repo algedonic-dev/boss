@@ -1039,6 +1039,9 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
                     // a rule that spawns off a close can name the new
                     // packet after the one that caused it.
                     "title": job.title,
+                    // Third of the three close sites. Same contract:
+                    // the subject is what a spawning rule dedupes on.
+                    "subject_id": boss_core::primitives::Subject::id(&job.subject),
                     "parent_step_id": job.metadata.get("parent_step_id"),
                 }),
             ));

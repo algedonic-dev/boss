@@ -293,6 +293,7 @@ mod tests {
             assurance_required: None,
             fields: Vec::new(),
             authority_role: None,
+            claimable: None,
             metadata_defaults: serde_json::json!({}),
         }
     }

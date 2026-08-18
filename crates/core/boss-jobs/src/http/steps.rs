@@ -861,6 +861,16 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                         // named identically and the board cannot tell
                         // them apart.
                         "title": job.title,
+                        // WHAT the closed packet was about. A recurring
+                        // sweep names its target here
+                        // (`stale-build-caches`), and that is the only
+                        // stable identity a spawning rule can dedupe
+                        // on: the sweep's `id` differs every firing and
+                        // its `title` is templated per target, so two
+                        // days of the same finding are indistinguishable
+                        // without this. Present on all three sites for
+                        // the same reason `kind` and `title` are.
+                        "subject_id": boss_core::primitives::Subject::id(&job.subject),
                         // D7: same delegate-subjob back-link as the
                         // terminal-close path, so a child Job that
                         // closes via the all-steps-terminal catch-all
@@ -1316,6 +1326,10 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
                 // is: a spawning rule can only name the packet it
                 // creates from a literal or from this payload.
                 "title": job.title,
+                // See the status-transition site above: the subject is
+                // the recurring packet's stable identity, and the only
+                // key a spawn rule can dedupe a repeating finding on.
+                "subject_id": boss_core::primitives::Subject::id(&job.subject),
                 // D7: surface the delegate-subjob back-link (if any) on
                 // the close marker so the jobs.subjob_resolve rule can
                 // gate `when` on it without fetching the Job. Null for

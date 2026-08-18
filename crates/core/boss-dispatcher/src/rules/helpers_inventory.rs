@@ -83,6 +83,7 @@ impl HelperResolver for InventoryHelpers {
             // outgrew its name the day a second domain needed a dedup
             // helper (design-review-spawn, dogfooding arc e556c000).
             "open_review_exists" => open_review_exists(self, args),
+            "open_car_exists" => open_car_exists(self, args),
             other => Err(EvalError::UnknownHelper(other.to_string())),
         }
     }
@@ -173,6 +174,42 @@ fn open_review_exists(h: &InventoryHelpers, args: &[Value]) -> Result<Value, Eva
     );
     let r: JobsListResponse = h.get_json(&url, "open_review_exists")?;
     Ok(Value::Bool(!r.data.is_empty()))
+}
+
+/// Is there already an open `ship-a-change` car for this recurring
+/// finding? The dedup for `spawn-car-on-sweep-remediated`.
+///
+/// A sweep runs on a cadence and spawns a car every time it closes
+/// `remediated`, so a condition that PERSISTS across days mints one
+/// car per day. Measured 2026-08-17 (defect e74b32a1): two cars on the
+/// board, `dcff2c74` and `5621606f`, both titled exactly "Stale build
+/// cache sweep", both from the same `stale-build-caches` target, one
+/// day apart — with no summary, no branch and no body, because the
+/// title is templated from the sweep. They are only distinguishable by
+/// opening each one and reading its metadata. The agent holding the
+/// measurements nearly closed one as a duplicate of the other and had
+/// to revert the flag; a reader scanning My Day has no chance.
+///
+/// Keyed on the sweep's SUBJECT (`stale-build-caches`), not its id or
+/// title: the id is fresh every firing, and the title is templated per
+/// target, so neither separates "the same finding again" from "a
+/// different finding". `design-review-spawn` has had exactly this
+/// guard — `NOT open_review_exists(path)` — since it was written; this
+/// rule simply never got one.
+fn open_car_exists(h: &InventoryHelpers, args: &[Value]) -> Result<Value, EvalError> {
+    let target = first_string(args, "open_car_exists")?;
+    let url = format!(
+        "{}/api/jobs?kind=ship-a-change&status=open&limit=200",
+        h.jobs_base.trim_end_matches('/')
+    );
+    let r: JobsListResponse = h.get_json(&url, "open_car_exists")?;
+    let exists = r.data.iter().any(|j| {
+        j.get("metadata")
+            .and_then(|m| m.get("sweep_target"))
+            .and_then(|s| s.as_str())
+            == Some(target)
+    });
+    Ok(Value::Bool(exists))
 }
 
 fn open_restock_exists(h: &InventoryHelpers, args: &[Value]) -> Result<Value, EvalError> {

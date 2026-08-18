@@ -259,6 +259,35 @@ async fn handle_event(ctx: &DispatcherCtx, subject: &str, payload: &Value) -> Re
         );
         return Ok(());
     }
+    // CLAIMABLE: the protocol asked for a role QUEUE, not a
+    // nomination. Leave the step unassigned and let any holder of its
+    // `authority_role` take it.
+    //
+    // The loop below resolves a role-gated step to ONE eligible
+    // employee and assigns it. Where a role has a single holder that
+    // is not routing, it is a permanent nomination — every
+    // `platform-admin` step lands on the same person and nobody else
+    // can pick one up even holding the role. Measured 2026-08-18: all
+    // six open design reviews assigned to `emp-david`, none claimable.
+    //
+    // Claimability is not authority. `authority_role` still decides
+    // who MAY claim and complete, and policy still runs at the claim;
+    // this only decides whether the packet arrives pre-nominated or
+    // waits in a queue. It is protocol data, so making a step
+    // claimable is a Workflow edit rather than a deploy (§9).
+    if step
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("claimable"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        debug!(
+            job_id,
+            step_id, "step is claimable — leaving it for its role queue"
+        );
+        return Ok(());
+    }
     // Resolve required roles: prefer the per-step authority_role
     // if the event carries one (some publishers may add it in
     // the future), then fall back to the StepType registry's

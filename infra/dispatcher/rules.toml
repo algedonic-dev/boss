@@ -541,11 +541,15 @@ args = { kind = "\"maintenance-sweep\"", subject_kind = "\"custom\"", subject = 
 # almost all of them. The outcome is the more honest trigger anyway.
 [[rule]]
 name = "spawn-car-on-sweep-remediated"
+# Bumped by migration 148, which retired v1 (the unguarded spawn) and
+# inserted this row as v2. Absent, version defaults to 1 and the
+# seed-matches-toml pin reads the two as drifted.
+version = 2
 on_event = "jobs.job.closed"
-when = "kind = \"maintenance-sweep\" AND outcome = \"remediated\""
+when = "kind = \"maintenance-sweep\" AND outcome = \"remediated\" AND NOT open_car_exists(subject_id)"
 [[rule.do]]
 handler = "jobs.spawn"
-args = { kind = "\"ship-a-change\"", subject_kind = "\"custom\"", subject = "id", title = "title", "metadata.backlog_item" = "id" }
+args = { kind = "\"ship-a-change\"", subject_kind = "\"custom\"", subject = "id", title = "title", "metadata.backlog_item" = "id", "metadata.sweep_target" = "subject_id" }
 
 # ---------------------------------------------------------------------
 # Three more maintenance areas (migration 122). 121 seeded the protocol

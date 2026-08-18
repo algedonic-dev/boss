@@ -31,6 +31,7 @@
 //! terminal = { outcome = "brewed" }    # optional; marks a terminal
 //! sign_offs_required = []          # role codes; "@authority_role" resolves
 //! authority_role = "head-brewer"
+//! claimable = true              # role queue, not a nomination
 //! metadata_defaults = { mash_temp_f = 152 }
 //! ```
 //!
@@ -126,6 +127,10 @@ struct StepToml {
     fields: Vec<boss_core::job::StepField>,
     #[serde(default)]
     authority_role: Option<String>,
+    /// Leave the step for its role to claim rather than
+    /// nominating one holder. See `StepSpec::claimable`.
+    #[serde(default)]
+    claimable: Option<bool>,
     #[serde(default)]
     metadata_defaults: serde_json::Value,
 }
@@ -205,6 +210,7 @@ fn workflow_toml_to_spec(toml: WorkflowToml, default_owner: &str) -> WorkflowSpe
             sign_offs_required: s.sign_offs_required,
             fields: s.fields,
             authority_role: s.authority_role,
+            claimable: s.claimable,
             metadata_defaults: s.metadata_defaults,
         })
         .collect();

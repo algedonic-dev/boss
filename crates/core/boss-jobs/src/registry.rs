@@ -104,6 +104,30 @@ pub struct StepSpec {
     pub fields: Vec<boss_core::job::StepField>,
     #[serde(default)]
     pub authority_role: Option<String>,
+    /// Leave this step UNASSIGNED for whoever holds `authority_role`
+    /// to claim, instead of the dispatcher handing it to one person.
+    ///
+    /// The dispatcher's role-assignment loop resolves a role-gated
+    /// step to a single eligible employee and assigns it. Where a role
+    /// has one holder that is not routing, it is a permanent
+    /// nomination: every `platform-admin` step in the system is
+    /// assigned to the same person, and nobody else — human or agent —
+    /// can pick one up even when they hold the role. Measured
+    /// 2026-08-18: all six open design reviews assigned to `emp-david`,
+    /// none claimable, which is why answered reviews still read as his
+    /// queue.
+    ///
+    /// CLAIMABILITY IS NOT AUTHORITY, which is what makes this safe.
+    /// `authority_role` still decides who MAY claim and complete; this
+    /// only decides whether the packet arrives pre-nominated or waits
+    /// in a role queue. Nothing here widens what an actor is permitted
+    /// to do, and policy is still enforced at the claim.
+    ///
+    /// Protocol data, not a code path (§9): making a step claimable is
+    /// a Workflow edit, not a deploy. `None` means today's behaviour,
+    /// so every existing spec is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimable: Option<bool>,
     #[serde(default)]
     pub metadata_defaults: serde_json::Value,
 }
@@ -2314,6 +2338,12 @@ fn merge_metadata(defaults: &serde_json::Value, step: &StepSpec) -> serde_json::
             serde_json::Value::String(role.clone()),
         );
     }
+    // Surfaced the same way `authority_role` is, because the
+    // dispatcher reads the materialized STEP, never the spec — it is
+    // reacting to an event and has no workflow row in hand.
+    if let (Some(claimable), serde_json::Value::Object(m)) = (step.claimable, &mut merged) {
+        m.insert("claimable".to_string(), serde_json::Value::Bool(claimable));
+    }
     merged
 }
 
@@ -4434,6 +4464,94 @@ mod tests {
     fn an_unknown_disposition_opens_no_branch() {
         assert_eq!(feedback_branch_for_disposition("wontfix"), None);
         assert_eq!(feedback_branch_for_disposition(""), None);
+    }
+
+    #[test]
+    fn materialize_surfaces_claimable_and_leaves_authority_intact() {
+        // The dispatcher reads the materialized STEP, never the spec —
+        // it reacts to an event with no workflow row in hand. So
+        // `claimable` has to ride into step metadata the same way
+        // `authority_role` does, or the flag is invisible where it is
+        // consulted.
+        //
+        // The second assertion is the one that matters for security:
+        // making a step claimable must not disturb its authority.
+        // Claimability decides who the packet WAITS for; authority
+        // decides who may act. Widening the first while silently
+        // clearing the second would turn a queue into an open door.
+        let spec = WorkflowSpec::platform_seed(
+            "review",
+            "Review",
+            "governance",
+            vec!["custom".into()],
+            vec![StepSpec {
+                title: "decide".into(),
+                kind: "sign-off".into(),
+                ready_when: "true".into(),
+                authority_role: Some("platform-admin".into()),
+                claimable: Some(true),
+                terminal: Some(Terminal {
+                    outcome: "decided".into(),
+                }),
+                ..Default::default()
+            }],
+        );
+        let subject = Subject::new("custom", "docs/design/x.md");
+        let job_metadata = serde_json::Value::Object(Default::default());
+        let mut i = 0u32;
+        let steps = materialize_steps(&spec, &subject, JobId::new(), &job_metadata, || {
+            i += 1;
+            StepId::from_uuid(Uuid::from_u128(i as u128))
+        });
+        let md = &steps[0].metadata;
+        assert_eq!(
+            md.get("claimable").and_then(|v| v.as_bool()),
+            Some(true),
+            "the dispatcher cannot honour a flag it cannot see"
+        );
+        assert_eq!(
+            md.get("authority_role").and_then(|v| v.as_str()),
+            Some("platform-admin"),
+            "claimable must not disturb authority — a role queue is \
+             still gated on the role"
+        );
+    }
+
+    #[test]
+    fn a_step_says_nothing_about_claimability_by_default() {
+        // Absent means today's behaviour. Every existing Workflow row
+        // deserialises with `claimable: None` and must materialize
+        // exactly as it does now, or this change silently unassigns
+        // the whole system.
+        let spec = WorkflowSpec::platform_seed(
+            "review",
+            "Review",
+            "governance",
+            vec!["custom".into()],
+            vec![StepSpec {
+                title: "decide".into(),
+                kind: "sign-off".into(),
+                ready_when: "true".into(),
+                authority_role: Some("platform-admin".into()),
+                terminal: Some(Terminal {
+                    outcome: "decided".into(),
+                }),
+                ..Default::default()
+            }],
+        );
+        let subject = Subject::new("custom", "x");
+        let job_metadata = serde_json::Value::Object(Default::default());
+        let mut i = 0u32;
+        let steps = materialize_steps(&spec, &subject, JobId::new(), &job_metadata, || {
+            i += 1;
+            StepId::from_uuid(Uuid::from_u128(i as u128))
+        });
+        assert!(
+            steps[0].metadata.get("claimable").is_none(),
+            "an unset flag must not appear in step metadata at all — the \
+             dispatcher defaults it to false, and writing it explicitly \
+             would make every step look deliberately non-claimable"
+        );
     }
 
     #[test]

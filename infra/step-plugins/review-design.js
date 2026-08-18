@@ -519,6 +519,11 @@
           ),
         );
       }
+      // A doc that failed to LOAD must not offer completion: with
+      // `questions` still empty the gate below reads as "no questions"
+      // and renders "Mark reviewed" on top of the error — reviewing a
+      // doc nobody has seen (found by the 6f40b23f harness).
+      if (loadError) return;
       if (isDone) return;
       const saveBtn = h(
         'button',
@@ -751,7 +756,27 @@
           return;
         }
         if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
-        const detail = await r.json();
+        // The other honest miss (6f40b23f): a front that does not
+        // route /api/design/* answers 200 with a ZERO-BYTE body — the
+        // docs service runs on the operator instance only. Left to
+        // r.json() this rendered as a JSON parse error, which reads
+        // like a broken doc rather than an absent service.
+        const raw = await r.text();
+        if (!raw.trim()) {
+          loadError =
+            `this instance does not serve the docs API (an empty reply ` +
+            `for ${docPath}) — the docs service runs on the operator ` +
+            `instance only. Reviews spawned since 2026-08-18 carry ` +
+            `their questions in the packet and never need this fetch; ` +
+            `this older packet carries only a pointer. Open it on the ` +
+            `operator instance, or re-spawn the review to get a ` +
+            `self-carried packet.`;
+          renderBody();
+          renderProgress();
+          renderActions();
+          return;
+        }
+        const detail = JSON.parse(raw);
         doc = detail;
         questions = Array.isArray(detail.questions) ? detail.questions : [];
       } catch (e) {
