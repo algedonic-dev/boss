@@ -296,6 +296,17 @@ fn the_gate_rechecks_headroom_as_the_run_proceeds() {
         .arg("--auto")
         .env("BOSS_GATE_DF_CMD", fake.to_str().expect("utf8"))
         .env("BOSS_GATE_MIN_FREE_GB", "12")
+        // THE POLL NEEDS THE GATE TO REACH A PHASE, and `--auto` only
+        // reaches one if it derives a scope. Against the default trunk
+        // that holds on a feature branch and NOT on main, where the
+        // tree is clean and HEAD is its own trunk — so this test
+        // passed everywhere except the one place it had to run, and
+        // left main red after the startup half was fixed.
+        //
+        // `HEAD~1` always yields exactly the last commit's changes, on
+        // a branch or on main, so the derivation succeeds in both and
+        // the poll is tested rather than the scope.
+        .env("BOSS_GATE_TRUNK", "HEAD~1")
         .current_dir(&root)
         .output()
         .expect("run gate.sh");

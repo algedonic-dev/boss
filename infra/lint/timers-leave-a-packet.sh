@@ -109,6 +109,53 @@ for row in $rows; do
     fi
 done
 
+# 5. AND THE DEPLOY MUST POINT THEM AT A JOBS API.
+#
+# The four checks above prove a timer opens and completes a packet of a
+# real kind. They cannot see WHERE it writes it, and that turns out to
+# be the difference between visibility and none.
+#
+# boss-maintenance-wrap.sh falls back to
+# `BOSS_JOBS_URL:-http://127.0.0.1:7900`. On a box whose local instance
+# is not the system of record, that default is a silent redirect:
+# measured 2026-08-17, the backup / audit-integrity / ledger-replay
+# timers had fired on schedule for weeks and left 7 packets EACH on
+# boss-gcp's legacy instance and ZERO on the cluster SoR. Every check
+# in this lint passed the whole time. The 2026-08-13 split-brain
+# (incident c4b4a6b0) fixed the pipeline units by hand and missed
+# these.
+#
+# So: the deploy that installs a timer must also write its
+# BOSS_JOBS_URL, from the tree, where a reader can see it.
+if ! grep -q 'BOSS_JOBS_URL=' "$DEPLOY" || ! grep -q 'jobs-url.conf' "$DEPLOY"; then
+    echo "timers-leave-a-packet: deploy-services.sh installs timers but writes no" >&2
+    echo "    BOSS_JOBS_URL drop-in for them, so boss-maintenance-wrap.sh falls back to" >&2
+    echo "    127.0.0.1 — which on this deployment is not the system of record. Every" >&2
+    echo "    nightly packet would open and close where nobody is looking." >&2
+    problems=$((problems + 1))
+fi
+
+# 6. AND NEITHER HELPER MAY CARRY A LOCALHOST DEFAULT.
+#
+# The drop-in above is the belt; this is the braces. A default of
+# 127.0.0.1 in boss-maintenance-wrap.sh or boss-step.sh makes a missing
+# BOSS_JOBS_URL look like a working configuration, which is exactly how
+# 21 nightly packets landed on a non-authoritative instance without one
+# check in this file noticing. If the wiring is ever dropped again, the
+# helpers must FAIL rather than quietly pick somewhere plausible.
+for helper in infra/boss-maintenance-wrap.sh infra/boss-step.sh; do
+    # Comment lines are exempt: the refusal blocks quote the old
+    # default to explain what they replaced, and a lint that cannot
+    # tell code from prose would forbid documenting the fix.
+    if grep -v '^[[:space:]]*#' "$helper" 2>/dev/null | grep -q 'BOSS_JOBS_URL:-http'; then
+        echo "timers-leave-a-packet: $helper still defaults BOSS_JOBS_URL to a host." >&2
+        echo "    A maintenance tool with no system of record configured must refuse," >&2
+        echo "    not guess: a failed unit is noticed, a packet in the wrong database" >&2
+        echo "    is not." >&2
+        problems=$((problems + 1))
+    fi
+done
+
 if [ "$problems" -gt 0 ]; then
     echo "" >&2
     echo "  $problems timer(s) without working Job visibility." >&2

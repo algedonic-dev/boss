@@ -51,7 +51,35 @@ fi
 WORKFLOW="$1"; shift
 STEP_TITLE="$1"; shift
 
-BASE="${BOSS_JOBS_URL:-http://127.0.0.1:7900}"
+# WHERE THE PACKET GOES IS NOT A DEFAULT, IT IS A DECISION.
+#
+# This read `${BOSS_JOBS_URL:-http://127.0.0.1:7900}` until 2026-08-17.
+# On a box whose local instance is not the system of record that
+# fallback is a silent redirect, and it ran for weeks: the backup,
+# audit-integrity and ledger-replay timers each left 7 packets on
+# boss-gcp's demo instance and ZERO on the cluster SoR, while firing
+# exactly on schedule. Every check in `timers-leave-a-packet` passed
+# the whole time, because none of them can see WHERE a packet lands.
+#
+# The estate model already knows: `service_instances.authoritative` is
+# true for boss-cluster and false for boss-gcp-local. It was inert
+# metadata — nothing consulted it, and a plausible default beat it.
+#
+# So: no default. A maintenance tool with no system of record
+# configured refuses, loudly, and systemd records a failed unit — which
+# is a state somebody notices, unlike a packet filed in the wrong
+# database. Set BOSS_JOBS_URL explicitly; deploy-services.sh writes it
+# into a drop-in for every timer it installs.
+if [ -z "${BOSS_JOBS_URL:-}" ]; then
+    echo "$(basename "$0"): BOSS_JOBS_URL is not set, and there is no safe default." >&2
+    echo "    Defaulting to 127.0.0.1 is how nightly maintenance packets spent weeks" >&2
+    echo "    landing on a non-authoritative instance (2026-08-17). Name the system of" >&2
+    echo "    record explicitly:" >&2
+    echo "        BOSS_JOBS_URL=http://<jobs-api-host>:<port> $(basename "$0") ..." >&2
+    echo "    Installed timers get it from deploy-services.sh's jobs-url.conf drop-in." >&2
+    exit 78   # EX_CONFIG — a configuration fault, not a run-time one.
+fi
+BASE="${BOSS_JOBS_URL}"
 
 # An automated close should read as automation in the audit trail, not
 # as whichever human happened to be logged in.
