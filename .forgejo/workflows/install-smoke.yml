@@ -48,9 +48,25 @@ name: Install smoke
 # is single-concurrency so they serialise, but the floor below fails
 # fast and names the reason rather than dying halfway through a build —
 # the same lesson as locomotive.sh's own headroom check.
+# DISABLED 2026-08-18. This workflow is `runs-on: host` — it runs
+# docker compose build/up/down directly on the CI runner host, and
+# creating/destroying a compose bridge network rewrites the host's
+# iptables NAT and FORWARD rules. Job containers already running
+# under the act runner lost their default route when that happened:
+# every Rust job began failing with `Network is unreachable`
+# (errno 101) on crates.io and static.rust-lang.org.
+#
+# The timeline is exact — run 169 (main) and run 170 (PR 75) were
+# fully green with no smoke job; run 172 was this workflow's FIRST
+# ever execution, and run 171 on the same push is where `fast`
+# first failed. It never ran on the PR because the trigger below
+# was push-to-main only, so it merged green and broke main.
+#
+# Re-enable only once it has a host that is not also the CI runner,
+# or a concurrency group that guarantees it never overlaps another
+# job. Defect c6dc938d carries the full diagnosis.
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
     paths-ignore:
       - "docs/**"
       - "**.md"
