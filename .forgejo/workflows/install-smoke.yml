@@ -1,0 +1,189 @@
+name: Install smoke
+
+# Boots the actual OSS quickstart Docker stack on the forge runner and
+# asserts the install works — the same gate .github/workflows/
+# install-smoke.yml provides on the mirror, moved somewhere it can
+# actually be seen.
+#
+# WHY THIS EXISTS HERE. The quickstart is the first thing a new user
+# touches, and until now its ONLY test lived on the GitHub mirror. That
+# mirror has been red since 2026-08-12, so the install path went five
+# days unguarded — and the bug that kept the mirror red is one this job
+# would have caught the day it landed: the brewery sim emits
+# `asset.installed` against `location:loc-brewery-brewhouse`, the
+# quickstart never seeds that location subject, and the audit_log write
+# is rejected. Circular, too: the only thing that could detect the
+# mirror's blocker was the mirror's own CI.
+#
+# ─────────────────────────────────────────────────────────────────────
+# `runs-on: host`, AND THAT IS A REAL TRADE — read before copying it.
+#
+# Every other job in this repo's forge CI runs in a container, and
+# build-image goes out of its way to use kaniko specifically so no job
+# ever sees /var/run/docker.sock: "building with the daemon means
+# mounting /var/run/docker.sock into a CI job, which hands any workflow
+# that lands on this runner a path to host root."
+#
+# `docker compose up` cannot be done without the daemon. There is no
+# third option available: this Mac has no container runtime, boss-gcp
+# has none (and 20G free besides), and the dev pod has neither docker,
+# podman, nerdctl nor a socket. The forge host is the only machine in
+# the estate that can boot this stack.
+#
+# So the exposure is narrowed where it can be: **push to main ONLY, no
+# pull_request trigger**. The concern in that kaniko comment is branch
+# code — anything a contributor can push. Code on main has already been
+# through review, the gate, and a train merge. This job never runs
+# untrusted branch code, which is the property worth keeping; it does
+# not preserve "no job ever touches the daemon", which it cannot.
+#
+# The cost of that choice, stated plainly: this detects a broken
+# install AFTER merge rather than blocking it. That is still strictly
+# better than the status quo of detecting it nowhere.
+#
+# ─────────────────────────────────────────────────────────────────────
+# DISK. Measured 2026-08-17: a single CI job's workspace volume is
+# ~80GB on a 228GB disk, and this job builds the whole workspace into
+# an image on top. Two heavy jobs at once would exhaust it. The runner
+# is single-concurrency so they serialise, but the floor below fails
+# fast and names the reason rather than dying halfway through a build —
+# the same lesson as locomotive.sh's own headroom check.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+
+concurrency:
+  group: install-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: host
+    timeout-minutes: 60
+    steps:
+      # No actions/checkout: that is a JavaScript action and this host
+      # has no node (verified — only git and docker). Cloning straight
+      # from the forge is what build-image already does for the same
+      # reason.
+      - name: Clone main at this commit
+        env:
+          TOKEN: ${{ secrets.FORGE_PACKAGE_TOKEN }}
+        run: |
+          set -eu
+          [ -n "${TOKEN:-}" ] || {
+            echo "install-smoke: FORGE_PACKAGE_TOKEN is not set — cannot clone."
+            exit 1
+          }
+          rm -rf "$RUNNER_TEMP/boss-smoke"
+          git clone --depth 50 \
+            "http://david:${TOKEN}@10.20.0.15:3000/david/boss.git" \
+            "$RUNNER_TEMP/boss-smoke"
+          cd "$RUNNER_TEMP/boss-smoke"
+          git checkout -q "${GITHUB_SHA}"
+          echo "cloned $(git rev-parse --short HEAD)"
+
+      - name: Headroom
+        run: |
+          set -eu
+          avail=$(df -Pk / | awk 'NR==2 {print int($4/1048576)}')
+          echo "free: ${avail}GB"
+          if [ "$avail" -lt 90 ]; then
+            echo "install-smoke: ${avail}GB free, need 90GB."
+            echo "  This job builds the whole workspace into an image and then boots"
+            echo "  the stack; a job's workspace volume alone measured ~80GB."
+            echo "  Failing here costs seconds instead of dying mid-build."
+            exit 1
+          fi
+
+      - name: Build the quickstart image
+        # Plain `docker compose build`, not buildx with a remote cache:
+        # `cache-to: type=gha` is GitHub Actions' cache service and does
+        # not exist here. The host daemon keeps layers between runs,
+        # which is the cache that matters on a dedicated runner.
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/boss-smoke/infra/oss-quickstart"
+          cp .env.example .env
+          docker compose build
+
+      - name: Boot the stack
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/boss-smoke/infra/oss-quickstart"
+          docker compose up -d --no-build
+
+      - name: Wait for the sim to seed emergent data
+        # Poll until the sim has both closed Jobs and issued invoices —
+        # proof the install booted AND the seed path produced emergent
+        # state, not just empty tables.
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/boss-smoke/infra/oss-quickstart"
+          for i in $(seq 1 60); do
+            counts=$(docker compose exec -T postgres psql -U boss -d boss -At -F' ' -c \
+              "select (select count(*) from jobs where closed_on is not null),
+                      (select count(*) from invoices);" 2>/dev/null || echo "0 0")
+            closed=$(echo "$counts" | awk '{print $1}')
+            invoices=$(echo "$counts" | awk '{print $2}')
+            echo "t=${i} closed_jobs=${closed:-0} invoices=${invoices:-0}"
+            if [ "${closed:-0}" -gt 0 ] && [ "${invoices:-0}" -gt 0 ]; then
+              echo "emergent data present"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "install-smoke: sim did not produce emergent data within timeout"
+          docker compose ps
+          docker compose logs --tail=120 boss-services
+          exit 1
+
+      - name: Assert seeded events are causally ordered
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/boss-smoke/infra/oss-quickstart"
+          docker cp ../lint/audit-ordering.sh "$(docker compose ps -q postgres)":/tmp/ord.sh
+          docker compose exec -T \
+            -e PGHOST=127.0.0.1 -e PGUSER=boss -e PGPASSWORD=boss -e PGDATABASE=boss \
+            postgres bash /tmp/ord.sh
+
+      - name: Gate on dispatcher dead-letters
+        # Same threshold and reasoning as the mirror's copy: a short
+        # smoke window can honestly dead-letter a handful while
+        # production catches up to an early invoice; hundreds is a
+        # systemic regression.
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/boss-smoke/infra/oss-quickstart"
+          n=$(docker compose logs boss-services 2>&1 | grep -c 'DEAD-LETTER' || true)
+          echo "dispatcher dead-letters observed: ${n}"
+          docker compose logs boss-services 2>&1 | grep 'DEAD-LETTER' | tail -10 || true
+          if [ "${n:-0}" -gt 20 ]; then
+            echo "install-smoke: ${n} dispatcher dead-letters (threshold 20)"
+            exit 1
+          fi
+
+      - name: Capture stack diagnostics
+        # BEFORE teardown and on every exit path, cancellation included.
+        # The mirror's copy learned this from a 2026-08-09 flake whose
+        # evidence evaporated when a timeout cancelled the poll and
+        # teardown discarded the containers.
+        if: always()
+        run: |
+          cd "$RUNNER_TEMP/boss-smoke/infra/oss-quickstart" || exit 0
+          echo "--- compose ps ---"
+          docker compose ps || true
+          echo "--- boss-services logs (tail 400) ---"
+          docker compose logs --no-color --tail=400 boss-services || true
+
+      - name: Tear down
+        # Also reclaims the stack's volumes. A cancelled run that skipped
+        # this is how the forge host lost 63GB to an orphan on
+        # 2026-08-14 (packet 1b63456b).
+        if: always()
+        run: |
+          cd "$RUNNER_TEMP/boss-smoke/infra/oss-quickstart" 2>/dev/null || exit 0
+          docker compose down -v || true
+          rm -rf "$RUNNER_TEMP/boss-smoke" || true

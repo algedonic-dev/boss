@@ -112,6 +112,38 @@ PROD_DB_URL="postgres://boss:boss@127.0.0.1/boss"
 SCRATCH_DB_URL="postgres://boss:boss@127.0.0.1/boss_scratch"
 REPO_ROOT="/opt/boss"
 
+# ---------------------------------------------------------------------
+# Per-machine deploy configuration
+# ---------------------------------------------------------------------
+# WHERE THE SYSTEM OF RECORD LIVES IS A PROPERTY OF THIS BOX, not of
+# whoever ran the deploy — so it belongs in a file on the box rather
+# than an environment variable somebody has to remember.
+#
+# Measured 2026-08-17: the conductor invokes this script as
+# `sudo -n .../deploy-services.sh prod`, and sudo strips the
+# environment. boss-train.service carries
+# BOSS_JOBS_URL=http://10.20.0.34:7900, that value never reached here,
+# and the timer drop-in was written with the local default instead. So
+# every nightly maintenance packet still filed against the demo
+# instance — the wiring was repo-borne and visible, and still pointed
+# at the wrong database.
+#
+# `set -a` so plain `KEY=value` lines export without each needing the
+# word `export`, which is what makes this a config file rather than a
+# shell script someone has to get right. Absent file = defaults hold,
+# which is correct for a fresh box and for a deploy running ON the
+# cluster, where the SoR is localhost.
+#
+# Template: infra/deploy.env.example.
+DEPLOY_ENV_FILE="${BOSS_DEPLOY_ENV:-/etc/boss/deploy.env}"
+if [ -f "$DEPLOY_ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$DEPLOY_ENV_FILE"
+    set +a
+    echo "deploy: config from $DEPLOY_ENV_FILE"
+fi
+
 # Generation store paths + atomic-flip helpers, shared with
 # deploy-web.sh and deploy-confirm.sh so they cannot drift.
 # shellcheck source=infra/generation.sh
