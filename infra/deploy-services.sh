@@ -1066,18 +1066,7 @@ case "$MODE" in
     probe)
         echo "==> strict health probes (env=$TARGET)"
         run_probes "$TARGET"
-        # RESOLVED ONCE, UNCONDITIONALLY, and used twice: the timer drop-in
-# below and this script's own boss-step.sh call at the end. Both
-# helpers now REFUSE without it — they used to default to 127.0.0.1,
-# which is how nightly maintenance packets spent weeks landing on a
-# non-authoritative instance — so the deploy must state the answer
-# rather than let each caller guess it separately. Deliberately OUTSIDE
-# the prod-only block: the bookkeeping call at the end runs on every
-# target, and a deploy that skipped the timer section would otherwise
-# leave it unset.
-export BOSS_JOBS_URL="${BOSS_JOBS_URL:-http://127.0.0.1:$(port_of jobs prod)}"
-
-if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
+        if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
             probe_front_door
         fi
         if (( ${#PROBE_FAILED[@]} > 0 )); then
@@ -1461,7 +1450,7 @@ if [[ "$TARGET" == "prod" || "$TARGET" == "both" ]]; then
         install -d -m 0755 "/etc/systemd/system/${stem}.service.d"
         cat > "/etc/systemd/system/${stem}.service.d/jobs-url.conf" <<UNIT
 [Service]
-Environment=BOSS_JOBS_URL=${BOSS_JOBS_URL}
+Environment=BOSS_JOBS_URL=${BOSS_JOBS_URL:-http://127.0.0.1:$(port_of jobs prod)}
 UNIT
         echo "  installed $stem unit + timer"
     done
@@ -1687,6 +1676,14 @@ echo "done."
 # `|| true` because a deploy must not fail on bookkeeping: the services
 # are already running by this point, and a Job that cannot be updated
 # is a worse thing to abort a deploy over than to report.
-"$(dirname "$0")/boss-step.sh" regenerate-deployment deploy \
+# boss-step.sh REFUSES without a system of record now, so state it
+# here rather than inherit it. Same default as the drop-in above: one
+# expression, written twice, because the alternative was one export
+# whose correctness depended on which block it sat in — and it sat in
+# do_revert(), so a normal deploy never ran it and the heredoc below
+# died on `set -u`. A default at each use site cannot be defeated by
+# placement.
+BOSS_JOBS_URL="${BOSS_JOBS_URL:-http://127.0.0.1:$(port_of jobs prod)}" \
+    "$(dirname "$0")/boss-step.sh" regenerate-deployment deploy \
     "deployed=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     || echo "WARN: deploy step NOT recorded on the regen Job (boss-step failed above)" >&2

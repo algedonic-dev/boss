@@ -58,7 +58,27 @@ jobs:
         ports:
           - 4222:4222
     steps:
+      # fetch-depth: 0 because the gate's `migrations-append-only` lint
+      # needs a TRUNK REF to tell history from this branch's additions.
+      # GitHub's default shallow checkout has none, and the lint
+      # correctly refuses rather than guess:
+      #   "no trunk ref found (tried origin/main, forge/main, main).
+      #    Cannot tell which migrations are history without one."
+      # That failed every mirror sync PR — 2026-08-14's included — on
+      # every tree, which is why the public mirror has not merged since
+      # 2026-08-12 and is 52 commits behind.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4 (pinned per OpenSSF Scorecard)
+        with:
+          fetch-depth: 0
+
+      # The gate runs svelte-check, which needs bun. The forge runs the
+      # gate inside boss-ci, which HAS bun; this runner does not, so the
+      # check refused — "bun not found ... Refusing to skip: a check
+      # that passes without running verifies nothing." Installing it
+      # here is what makes the gate on this runner the same gate,
+      # which is the whole point of there being one definition.
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
       - name: Free up runner disk space
         # The default GitHub-hosted runner has ~14 GB free; the large
