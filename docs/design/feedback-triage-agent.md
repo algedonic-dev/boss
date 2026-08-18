@@ -1,6 +1,6 @@
 # Design: What kind of agent should triage feedback?
 
-**Status**: open — evidence gathering. No implementation work yet.
+**Status**: approved — open — evidence gathering. No implementation work yet (2026-08-18).
 **Related**: [human-powered-state-machine.md](./human-powered-state-machine.md) ·
 [extending-boss.md](./extending-boss.md)
 
@@ -178,103 +178,13 @@ cosmetic.
 
 ## Open questions
 
-### Q1: Does feedback triage need a language model, or do rules suffice?
+All 2 open questions were resolved 2026-08-18 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-The evidence table decides this. The shape to watch for: if most items
-are dispositioned by *route + class + a duplicate check*, rules win and
-an LLM is expensive ceremony. If most need "is this already fixed, and
-does the described behaviour match what the code does" — that is repo
-comprehension, and rules cannot fake it.
-
-A likely third answer is a split: rules do classification, routing, and
-duplicate detection deterministically; a model is invoked only for the
-residual that a rule declines. That would keep the cheap path cheap and
-make the expensive path auditable, which is the same shape as the
-pushdown seam in `boss-views` — push down what is mechanical, evaluate
-the residual honestly.
-
-
-Proposed: **rules, for the one thing rules can do; no model for the
-rest, and the rest is nearly all of it.** The evidence table this
-question asked for now exists — 161 real (non-simulated) feedback
-packets, 135 of them triaged:
-
-| disposition | count |
-|---|---|
-| build | 62 |
-| design | 48 |
-| reproduce | 23 |
-| duplicate | 1 |
-| decline | 1 |
-
-The mechanical class is **2 of 135**. Everything else is a judgement
-about whether an item is a code change, a decision, or something that
-must be reproduced first — and that judgement turned on repo
-comprehension every time it was interesting. `a001c78a` was `build`
-rather than `design` only because reading the workflow's predicates
-showed the routing was already decided and wrong. `0b8ae875` was
-`build` because David had already answered its shape twice in another
-doc. `bedda461` needed the corpus measured — 11 of 23 docs stale —
-before anyone could say the report was real. No rule over route, class
-and text reaches any of those.
-
-So the hoped-for split in the paragraph above inverts: it is not
-"rules do the bulk, a model takes the residual". Here the residual IS
-the bulk, and a rule engine would earn its keep on 1.5% of traffic.
-
-**The caveat that keeps this honest, and it is a big one.** This
-corpus is mostly self-filed: 86 packets from the operator baseline, 48
-from agents, and only 6 from guests or anonymous visitors. Public
-feedback has a noise profile this sample does not contain — blank
-submissions, "it's broken", the same complaint five times — which is
-exactly the class rules serve. So the finding is *"rules cannot triage
-the traffic we have"*, not *"rules cannot triage feedback"*.
-
-What follows: build the deterministic **duplicate check** now, because
-it is cheap, auditable and the one mechanical thing here; do not build
-a model-backed triage agent for this traffic; and re-run this table
-when guest volume exists, since that is the population the question was
-really about.
-
-### Q3: Should the agent be allowed to close an item?
-
-An agent looking is deliberately not a decision — the card stays in
-flight, and only a human completes the triage step. Whether that
-should stay true depends on Q1's answer. If rules handle a clean
-majority with high confidence, letting them auto-close noise (blank
-submissions, duplicates of an open item) is a real saving. If every
-disposition needs judgment, the human stays in the loop and the agent
-is an assistant that drafts.
-
-Note the policy angle: the triage step is gated by
-`authority_role: platform-admin`, which is what stopped the sim
-workforce from completing these Jobs the moment they went ready. Any
-auto-close path has to hold that gate, not route around it.
-
-
-
-Proposed: **no.** Not because closing is wrong in principle, but
-because the saving is not there. Auto-closing noise is worth having
-when noise is a large class; on the measured corpus above it is 2
-packets in 135. Buying 1.5% at the price of a wrong close — a real
-report dismissed by a rule, with the filer told it was a duplicate —
-is a bad trade, and the failure is silent in exactly the way this
-system keeps being bitten by.
-
-Keep the `authority_role: platform-admin` gate as-is. It is what
-stopped the simulated workforce completing these Jobs the moment they
-went ready, and any auto-close path has to hold it rather than route
-around it.
-
-Worth distinguishing from something that already ships and looks
-similar: `complete-feedback-branch-on-car-merged` DOES close a packet
-without a human, and that is correct — it closes on **evidence that
-the work was done** (a car naming the packet merged), not on a
-judgement that the item was worthless. Closing on evidence and closing
-on an opinion are different powers, and the protocol should keep
-granting only the first.
-
-Revisit alongside Q1 if guest volume ever makes the noise class real.
+---
 
 ## Decisions
 
@@ -317,6 +227,118 @@ Resolved 2026-08-16 — override.
 > identical shape, and the surface should not care which wrote it.
 
 Answered in this doc's own body — 'answered by the passes rather than by choosing' — and since shipped: both `triage` and `investigate` declare a `finding` field on the step, so a root cause and what was done about it live on the step that produced them rather than in prose here. The heading has said ANSWERED for some time; this is the tracker catching up.
+
+### Q1: Does feedback triage need a language model, or do rules suffice? (resolved)
+
+Resolved 2026-08-18 — override.
+
+**The question was:**
+
+> The evidence table decides this. The shape to watch for: if most items
+> are dispositioned by *route + class + a duplicate check*, rules win and
+> an LLM is expensive ceremony. If most need "is this already fixed, and
+> does the described behaviour match what the code does" — that is repo
+> comprehension, and rules cannot fake it.
+>
+> A likely third answer is a split: rules do classification, routing, and
+> duplicate detection deterministically; a model is invoked only for the
+> residual that a rule declines. That would keep the cheap path cheap and
+> make the expensive path auditable, which is the same shape as the
+> pushdown seam in `boss-views` — push down what is mechanical, evaluate
+> the residual honestly.
+>
+>
+> Proposed: **rules, for the one thing rules can do; no model for the
+> rest, and the rest is nearly all of it.** The evidence table this
+> question asked for now exists — 161 real (non-simulated) feedback
+> packets, 135 of them triaged:
+>
+> | disposition | count |
+> |---|---|
+> | build | 62 |
+> | design | 48 |
+> | reproduce | 23 |
+> | duplicate | 1 |
+> | decline | 1 |
+>
+> The mechanical class is **2 of 135**. Everything else is a judgement
+> about whether an item is a code change, a decision, or something that
+> must be reproduced first — and that judgement turned on repo
+> comprehension every time it was interesting. `a001c78a` was `build`
+> rather than `design` only because reading the workflow's predicates
+> showed the routing was already decided and wrong. `0b8ae875` was
+> `build` because David had already answered its shape twice in another
+> doc. `bedda461` needed the corpus measured — 11 of 23 docs stale —
+> before anyone could say the report was real. No rule over route, class
+> and text reaches any of those.
+>
+> So the hoped-for split in the paragraph above inverts: it is not
+> "rules do the bulk, a model takes the residual". Here the residual IS
+> the bulk, and a rule engine would earn its keep on 1.5% of traffic.
+>
+> **The caveat that keeps this honest, and it is a big one.** This
+> corpus is mostly self-filed: 86 packets from the operator baseline, 48
+> from agents, and only 6 from guests or anonymous visitors. Public
+> feedback has a noise profile this sample does not contain — blank
+> submissions, "it's broken", the same complaint five times — which is
+> exactly the class rules serve. So the finding is *"rules cannot triage
+> the traffic we have"*, not *"rules cannot triage feedback"*.
+>
+> What follows: build the deterministic **duplicate check** now, because
+> it is cheap, auditable and the one mechanical thing here; do not build
+> a model-backed triage agent for this traffic; and re-run this table
+> when guest volume exists, since that is the population the question was
+> really about.
+
+We don't need to make a real choice here. This is matter of protocol and policy, which is expressed in data and so should not affect any designs.
+
+
+### Q3: Should the agent be allowed to close an item? (resolved)
+
+Resolved 2026-08-18 — override.
+
+**The question was:**
+
+> An agent looking is deliberately not a decision — the card stays in
+> flight, and only a human completes the triage step. Whether that
+> should stay true depends on Q1's answer. If rules handle a clean
+> majority with high confidence, letting them auto-close noise (blank
+> submissions, duplicates of an open item) is a real saving. If every
+> disposition needs judgment, the human stays in the loop and the agent
+> is an assistant that drafts.
+>
+> Note the policy angle: the triage step is gated by
+> `authority_role: platform-admin`, which is what stopped the sim
+> workforce from completing these Jobs the moment they went ready. Any
+> auto-close path has to hold that gate, not route around it.
+>
+>
+>
+> Proposed: **no.** Not because closing is wrong in principle, but
+> because the saving is not there. Auto-closing noise is worth having
+> when noise is a large class; on the measured corpus above it is 2
+> packets in 135. Buying 1.5% at the price of a wrong close — a real
+> report dismissed by a rule, with the filer told it was a duplicate —
+> is a bad trade, and the failure is silent in exactly the way this
+> system keeps being bitten by.
+>
+> Keep the `authority_role: platform-admin` gate as-is. It is what
+> stopped the simulated workforce completing these Jobs the moment they
+> went ready, and any auto-close path has to hold it rather than route
+> around it.
+>
+> Worth distinguishing from something that already ships and looks
+> similar: `complete-feedback-branch-on-car-merged` DOES close a packet
+> without a human, and that is correct — it closes on **evidence that
+> the work was done** (a car naming the packet merged), not on a
+> judgement that the item was worthless. Closing on evidence and closing
+> on an opinion are different powers, and the protocol should keep
+> granting only the first.
+>
+> Revisit alongside Q1 if guest volume ever makes the noise class real.
+
+This is also outdated thinking. The protocol will allow what the protocol allows.
+
 
 ## Decision history
 

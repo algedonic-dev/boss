@@ -1822,14 +1822,54 @@ fn expand_metadata(
             }
         }
     }
+    /// A default written as EXACTLY `{metadata.<key>}` whose Job value
+    /// is an array or an object is substituted whole, not stringified.
+    ///
+    /// Without this, structured Job metadata cannot reach a step at
+    /// all: `meta_fields` above keeps only String/Number/Bool, so an
+    /// array is not in the substitution table, the token matches
+    /// nothing, and the step is materialized carrying the literal text
+    /// `{metadata.questions}`. Silent, and it looks like the spawn rule
+    /// failed to bind.
+    ///
+    /// That is why a design review opens blank (defect 6f40b23f). The
+    /// review plugin renders `step.metadata.questions` when the packet
+    /// carries its own work, and falls back to fetching the doc from a
+    /// service the cluster does not route. The questions could not ride
+    /// into the step even when the spawn bound them onto the Job.
+    ///
+    /// SCALARS ARE DELIBERATELY UNTOUCHED. They already substitute
+    /// correctly, and whole-value substitution would change their TYPE
+    /// — `{metadata.count}` returns String("5") today and would start
+    /// returning Number(5), which `check_metadata_defaults_values`
+    /// type-checks against the StepType's declared field. Narrowing
+    /// this to the case that is currently broken keeps every existing
+    /// template byte-identical.
+    fn whole_value<'a>(s: &str, job_meta: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+        let key = s.strip_prefix("{metadata.")?.strip_suffix('}')?;
+        // One token and nothing else — `"{metadata.a}{metadata.b}"` is
+        // string concatenation and has no whole-value reading.
+        if key.contains('{') || key.contains('}') {
+            return None;
+        }
+        match job_meta.get(key) {
+            Some(v @ (Value::Array(_) | Value::Object(_))) => Some(v),
+            _ => None,
+        }
+    }
+
     fn walk(
         v: &serde_json::Value,
         fields: &[(&'static str, &str)],
         meta_fields: &[(String, String)],
+        job_meta: &serde_json::Value,
         date_anchor: Option<chrono::NaiveDate>,
     ) -> serde_json::Value {
         match v {
             Value::String(s) => {
+                if let Some(whole) = whole_value(s, job_meta) {
+                    return whole.clone();
+                }
                 let mut out = s.clone();
                 for (field, value) in fields {
                     let token = format!("{{subject.{field}}}");
@@ -1847,20 +1887,23 @@ fn expand_metadata(
             Value::Array(items) => Value::Array(
                 items
                     .iter()
-                    .map(|x| walk(x, fields, meta_fields, date_anchor))
+                    .map(|x| walk(x, fields, meta_fields, job_meta, date_anchor))
                     .collect(),
             ),
             Value::Object(map) => {
                 let mut out = serde_json::Map::with_capacity(map.len());
                 for (k, v) in map {
-                    out.insert(k.clone(), walk(v, fields, meta_fields, date_anchor));
+                    out.insert(
+                        k.clone(),
+                        walk(v, fields, meta_fields, job_meta, date_anchor),
+                    );
                 }
                 Value::Object(out)
             }
             other => other.clone(),
         }
     }
-    walk(template, &fields, &meta_fields, date_anchor)
+    walk(template, &fields, &meta_fields, job_metadata, date_anchor)
 }
 
 /// Turn a `WorkflowSpec` + concrete `Subject` + fresh `JobId` into
@@ -3808,6 +3851,118 @@ mod tests {
         assert_eq!(
             expanded.get("po_id").and_then(|v| v.as_str()),
             Some("PO-vnd-malt-001")
+        );
+    }
+
+    #[test]
+    fn expand_metadata_carries_a_structured_job_value_whole_into_a_step() {
+        // Defect 6f40b23f: a design review opened blank because the
+        // question set could not reach the step. The plugin renders
+        // `step.metadata.questions` when a packet carries its own
+        // work; the spawn bound the questions onto the JOB, and this
+        // expansion dropped them, because only scalars were in the
+        // substitution table.
+        let subject = Subject::new("custom", "docs/design/packet-loss.md");
+        let job_meta = serde_json::json!({
+            "questions": [
+                {"anchor": "Q1", "title": "How do we detect a dropped packet?"},
+                {"anchor": "Q2", "title": "Who is told, and how fast?"},
+            ],
+        });
+        let template = serde_json::json!({ "questions": "{metadata.questions}" });
+        let expanded = expand_metadata(&template, &subject, &job_meta, None);
+        let got = expanded.get("questions").expect("questions present");
+        assert!(
+            got.is_array(),
+            "the step must receive the ARRAY, not the literal token — it was {got:?}"
+        );
+        assert_eq!(got.as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            got[1].get("anchor").and_then(|v| v.as_str()),
+            Some("Q2"),
+            "carried whole, not flattened or re-ordered"
+        );
+    }
+
+    #[test]
+    fn expand_metadata_carries_a_structured_value_that_is_an_object_too() {
+        let subject = Subject::new("custom", "x");
+        let job_meta = serde_json::json!({ "doc": {"title": "Packet loss", "words": 900} });
+        let expanded = expand_metadata(
+            &serde_json::json!({ "doc": "{metadata.doc}" }),
+            &subject,
+            &job_meta,
+            None,
+        );
+        assert_eq!(
+            expanded
+                .get("doc")
+                .and_then(|d| d.get("title"))
+                .and_then(|v| v.as_str()),
+            Some("Packet loss")
+        );
+    }
+
+    #[test]
+    fn expand_metadata_still_stringifies_scalars_exactly_as_before() {
+        // The narrowing that keeps this change safe. A scalar token
+        // must keep returning a STRING: `check_metadata_defaults_values`
+        // type-checks the result against the StepType's declared field,
+        // and every existing template was authored against this
+        // behaviour.
+        let subject = Subject::new("custom", "x");
+        let job_meta = serde_json::json!({ "part_sku": "malt-2row", "count": 5 });
+        let expanded = expand_metadata(
+            &serde_json::json!({ "sku": "{metadata.part_sku}", "n": "{metadata.count}" }),
+            &subject,
+            &job_meta,
+            None,
+        );
+        assert_eq!(
+            expanded.get("sku").and_then(|v| v.as_str()),
+            Some("malt-2row")
+        );
+        assert_eq!(
+            expanded.get("n").and_then(|v| v.as_str()),
+            Some("5"),
+            "a number token stays a string — changing this would retype every existing default"
+        );
+    }
+
+    #[test]
+    fn expand_metadata_does_not_take_a_whole_value_for_a_concatenation() {
+        // Two tokens in one string is string-building; there is no
+        // whole-value reading of it, so it must fall through to
+        // substitution (and an array, absent from the scalar table,
+        // simply leaves its token alone rather than corrupting it).
+        let subject = Subject::new("custom", "x");
+        let job_meta = serde_json::json!({ "a": [1, 2], "b": "tail" });
+        let expanded = expand_metadata(
+            &serde_json::json!({ "joined": "{metadata.a}{metadata.b}" }),
+            &subject,
+            &job_meta,
+            None,
+        );
+        assert_eq!(
+            expanded.get("joined").and_then(|v| v.as_str()),
+            Some("{metadata.a}tail"),
+            "concatenation stays a string"
+        );
+    }
+
+    #[test]
+    fn expand_metadata_leaves_a_structured_token_alone_when_the_job_has_no_such_key() {
+        let subject = Subject::new("custom", "x");
+        let expanded = expand_metadata(
+            &serde_json::json!({ "questions": "{metadata.questions}" }),
+            &subject,
+            &serde_json::json!({}),
+            None,
+        );
+        assert_eq!(
+            expanded.get("questions").and_then(|v| v.as_str()),
+            Some("{metadata.questions}"),
+            "an unbound token passes through verbatim, as every other unknown token does"
         );
     }
 

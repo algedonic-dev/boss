@@ -1,6 +1,6 @@
 # Design: the dev cluster — build and pipeline off the demo's machine
 
-**Status**: in-review — open questions tracked at `/system/design`.
+**Status**: approved — in-review — open questions tracked at `/system/design` (2026-08-18).
 **Source**: backlog `ad2e28ab` (decisions recorded there 2026-08-07) and
 the operator's 2026-08-08 direction: the twice-daily train and its
 deployments should run against infrastructure BOSS models, on the five
@@ -150,79 +150,13 @@ and moving the company is copying them.
 
 ## Open questions
 
-### Q2: Tailscale or bare WireGuard? (resolved)
+All 2 open questions were resolved 2026-08-18 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-Resolved 2026-08-10 — David: **bare WireGuard from the GCP box to the
-cluster** (node↔node inside the cluster stays KubeSpan). The GCP box
-is the hub — stable public IP, UDP 51820, overlay `10.99.0.0/24`,
-hub at `10.99.0.1`; cluster nodes are spokes that dial OUT (no
-inbound hole in the home router; `PersistentKeepalive` holds the NAT
-mapping). **The hub is already live**: `infra/cluster/wireguard/`
-holds `setup-hub.sh` (ran 2026-08-10; key generated, `wg-quick@wg0`
-enabled, GCP firewall rule `allow-wireguard` created),
-`peer-template.conf` (the spoke shape Talos machine config consumes),
-and `add-peer.sh` (append + hot-add; re-running setup cannot drop
-peers). Registering a node is: generate a spoke key on the node, fill
-the template with the hub pubkey + endpoint, `add-peer.sh <name>
-<pubkey> <10.99.0.N>` on the hub. Kanidm and the log-copy migration
-both ride this wire: the cluster reaches `id.algedonic.dev` and the
-export tarball over the overlay if the public path is ever down.
-
-### Q3: Runner scope and trust
-
-A self-hosted runner executes workflow code from PRs. Repo-scoped
-runner + no fork PRs on it (the fork model here means train branches
-come from `dauld:boss-fork`) needs an explicit decision: which events
-may run on cluster runners — and under Talos the containment question
-becomes pod-shaped: what securityContext/namespace isolation the
-runner pods get, rather than which unix user the runner daemon runs
-as.
-
-Proposed: **the question has two premises and the tree contradicts
-both, so answer the one that is left.** Measured 2026-08-16 rather
-than reasoned about.
-
-*"No fork PRs on it"* is already true, and not by policy. Every pull
-request the forge has ever seen — 38 through 47, the full history —
-is `david/boss -> david/boss`. The fork model the question assumes
-is not how the conductor works: it pushes each car branch to the
-forge repo itself and opens a same-repo PR. `.forgejo/workflows/ci.yml`
-triggers on `push: [main]` and `pull_request: [main]`, with no
-`pull_request_target`, so there is no path today by which a fork's
-code reaches the runner. The decision to make is not "should we
-allow fork PRs to run" but "do we ever intend to accept an outside
-contribution on the forge" — and the answer is no, because that is
-what the GitHub mirror is for. Write that down and the trust
-question closes.
-
-*"Under Talos the containment question becomes pod-shaped"* is not
-true either. The runner is not on Talos. It is a Docker runner on
-the forge host (10.20.0.15), `runs-on: docker`, pulling
-`10.20.0.15:3000/david/boss-ci:rust1.96` from the registry beside
-it. The only cluster-touching automation is
-`infra/forge/cluster-deploy-runner.sh`, which is a systemd unit on
-that same host, not a workflow job — and it is deliberately
-one-directional: "no ssh from the conductor, no shared credentials;
-each side touches only what it owns." So containment is
-Docker-shaped, and the kubeconfig that could reach the cluster is
-held by a unit CI jobs cannot invoke.
-
-What is left, and is a real decision: the runner is **not registered
-at repo scope**. `GET /repos/david/boss/actions/runners` returns
-`[]` — 200, empty, with a repo-scoped token that reads everything
-else fine — so it is registered at user or instance level. That is
-the actual trust surface: a runner shared across every repo the
-instance will ever hold, on the host that also serves the forge, the
-registry, and the deploy unit's kubeconfig. Today there is one repo,
-so nothing is exposed. The recommendation is to re-register it
-repo-scoped now, while that is a one-line operation, rather than at
-the moment a second repo makes it urgent.
-
-The Talos framing should be struck from this question rather than
-answered. If runner pods ever move onto the cluster that is a new
-decision with a new threat model, and leaving the sentence here
-implies a containment story that does not exist.
-
+---
 
 ## Decisions
 
@@ -251,6 +185,93 @@ Resolved 2026-08-16 — override.
 > tunnel. Suggest deciding after build-1 has run for a week.
 
 It moved. The cluster became the system of record on 2026-08-12 and the human door (playground.algedonic.dev) routes to the cluster gateway; the forge cutover followed. What stayed on GCP is deliberately narrower than 'the playground': the train pipeline and the public demo. The 'decide after build-1 has run for a week' condition was met and the decision was taken by doing it.
+
+### Q2: Tailscale or bare WireGuard? (resolved)
+
+Resolved 2026-08-18 — override.
+
+**The question was:**
+
+> Resolved 2026-08-10 — David: **bare WireGuard from the GCP box to the
+> cluster** (node↔node inside the cluster stays KubeSpan). The GCP box
+> is the hub — stable public IP, UDP 51820, overlay `10.99.0.0/24`,
+> hub at `10.99.0.1`; cluster nodes are spokes that dial OUT (no
+> inbound hole in the home router; `PersistentKeepalive` holds the NAT
+> mapping). **The hub is already live**: `infra/cluster/wireguard/`
+> holds `setup-hub.sh` (ran 2026-08-10; key generated, `wg-quick@wg0`
+> enabled, GCP firewall rule `allow-wireguard` created),
+> `peer-template.conf` (the spoke shape Talos machine config consumes),
+> and `add-peer.sh` (append + hot-add; re-running setup cannot drop
+> peers). Registering a node is: generate a spoke key on the node, fill
+> the template with the hub pubkey + endpoint, `add-peer.sh <name>
+> <pubkey> <10.99.0.N>` on the hub. Kanidm and the log-copy migration
+> both ride this wire: the cluster reaches `id.algedonic.dev` and the
+> export tarball over the overlay if the public path is ever down.
+
+Wireguard
+
+
+### Q3: Runner scope and trust (resolved)
+
+Resolved 2026-08-18 — accept.
+
+**The question was:**
+
+> A self-hosted runner executes workflow code from PRs. Repo-scoped
+> runner + no fork PRs on it (the fork model here means train branches
+> come from `dauld:boss-fork`) needs an explicit decision: which events
+> may run on cluster runners — and under Talos the containment question
+> becomes pod-shaped: what securityContext/namespace isolation the
+> runner pods get, rather than which unix user the runner daemon runs
+> as.
+>
+> Proposed: **the question has two premises and the tree contradicts
+> both, so answer the one that is left.** Measured 2026-08-16 rather
+> than reasoned about.
+>
+> *"No fork PRs on it"* is already true, and not by policy. Every pull
+> request the forge has ever seen — 38 through 47, the full history —
+> is `david/boss -> david/boss`. The fork model the question assumes
+> is not how the conductor works: it pushes each car branch to the
+> forge repo itself and opens a same-repo PR. `.forgejo/workflows/ci.yml`
+> triggers on `push: [main]` and `pull_request: [main]`, with no
+> `pull_request_target`, so there is no path today by which a fork's
+> code reaches the runner. The decision to make is not "should we
+> allow fork PRs to run" but "do we ever intend to accept an outside
+> contribution on the forge" — and the answer is no, because that is
+> what the GitHub mirror is for. Write that down and the trust
+> question closes.
+>
+> *"Under Talos the containment question becomes pod-shaped"* is not
+> true either. The runner is not on Talos. It is a Docker runner on
+> the forge host (10.20.0.15), `runs-on: docker`, pulling
+> `10.20.0.15:3000/david/boss-ci:rust1.96` from the registry beside
+> it. The only cluster-touching automation is
+> `infra/forge/cluster-deploy-runner.sh`, which is a systemd unit on
+> that same host, not a workflow job — and it is deliberately
+> one-directional: "no ssh from the conductor, no shared credentials;
+> each side touches only what it owns." So containment is
+> Docker-shaped, and the kubeconfig that could reach the cluster is
+> held by a unit CI jobs cannot invoke.
+>
+> What is left, and is a real decision: the runner is **not registered
+> at repo scope**. `GET /repos/david/boss/actions/runners` returns
+> `[]` — 200, empty, with a repo-scoped token that reads everything
+> else fine — so it is registered at user or instance level. That is
+> the actual trust surface: a runner shared across every repo the
+> instance will ever hold, on the host that also serves the forge, the
+> registry, and the deploy unit's kubeconfig. Today there is one repo,
+> so nothing is exposed. The recommendation is to re-register it
+> repo-scoped now, while that is a one-line operation, rather than at
+> the moment a second repo makes it urgent.
+>
+> The Talos framing should be struck from this question rather than
+> answered. If runner pods ever move onto the cluster that is a new
+> decision with a new threat model, and leaving the sentence here
+> implies a containment story that does not exist.
+
+**the question has two premises and the tree contradicts both, so answer the one that is left.** Measured 2026-08-16 rather than reasoned about.
+
 
 ## Decision history
 

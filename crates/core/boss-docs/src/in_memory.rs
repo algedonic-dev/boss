@@ -1,7 +1,7 @@
 //! In-memory adapter. Used in tests and as a fallback when the
 //! service is started without `--features postgres`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 use async_trait::async_trait;
@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::port::{DocsError, DocsRepository};
 use crate::types::{
     DesignDoc, DesignQuestion, FlushJob, FlushJobPayload, JobStatus, JobStatusUpdate,
-    PendingDecision, PendingDecisionInput, RejectedDocRecord,
+    PendingDecision, PendingDecisionInput, RejectedDocRecord, apply_recorded_decisions,
 };
 
 #[derive(Default)]
@@ -71,8 +71,29 @@ impl DocsRepository for InMemoryDocsRepo {
         questions: &[DesignQuestion],
     ) -> Result<(), DocsError> {
         let mut inner = self.inner.write().unwrap();
+        // Same merge the postgres adapter does — the packet decides.
+        // Both call one function so the rule cannot drift between the
+        // adapter under test and the adapter in production (§9a).
+        let decided: HashSet<String> = inner
+            .pending
+            .iter()
+            .filter(|p| p.doc_path == doc.path)
+            .map(|p| p.anchor.clone())
+            .chain(
+                // Queuing a flush moves the answers out of `pending`
+                // and into the job payload. Until that job SUCCEEDS
+                // the file is unchanged, so those anchors are still
+                // answered-but-unwritten.
+                inner
+                    .jobs
+                    .iter()
+                    .filter(|j| j.doc_path == doc.path && j.status != JobStatus::Succeeded)
+                    .flat_map(|j| j.payload.decisions.iter().map(|d| d.anchor.clone())),
+            )
+            .collect();
+        let questions = apply_recorded_decisions(questions, &decided);
         inner.docs.insert(doc.path.clone(), doc.clone());
-        inner.questions.insert(doc.path.clone(), questions.to_vec());
+        inner.questions.insert(doc.path.clone(), questions);
         Ok(())
     }
 
@@ -368,6 +389,103 @@ mod tests {
         assert_eq!(docs.len(), 2);
         assert_eq!(docs[0].path, "docs/design/a.md");
         assert_eq!(docs[1].path, "docs/design/b.md");
+    }
+
+    /// David, 2026-08-18: "I keep seeing jobs that I have responded
+    /// to." This is that bug, at the port.
+    #[tokio::test]
+    async fn an_answered_question_stops_counting_as_open() {
+        let repo = InMemoryDocsRepo::new();
+        let doc = sample_doc("docs/design/a.md");
+        repo.upsert_doc(&doc, &[sample_question("docs/design/a.md", "Q1", 0)])
+            .await
+            .unwrap();
+
+        repo.upsert_pending_decision(
+            &PendingDecisionInput {
+                doc_path: "docs/design/a.md".to_string(),
+                anchor: "Q1".to_string(),
+                kind: DecisionKind::Accept,
+                resolution: "WireGuard".to_string(),
+                rationale: None,
+            },
+            "david@algedonic.dev",
+        )
+        .await
+        .unwrap();
+
+        // Reindex. The markdown is UNCHANGED — nothing wrote
+        // `(resolved)` into the heading — so the parser still hands us
+        // an open question, exactly as it does in production.
+        repo.upsert_doc(&doc, &[sample_question("docs/design/a.md", "Q1", 0)])
+            .await
+            .unwrap();
+
+        let qs = repo.questions_for_doc("docs/design/a.md").await.unwrap();
+        assert!(
+            qs[0].resolved,
+            "he answered Q1; a reindex must not resurrect it as open, or \
+             design-review-spawn hands him the same question again"
+        );
+    }
+
+    /// The half that made the bug survive its first fix: queuing a
+    /// flush MOVES the answers out of `pending` and into the job
+    /// payload. Queuing is not writing. On 2026-08-18 five queued jobs
+    /// held sixteen answers this way and every one of their docs read
+    /// as fully open.
+    #[tokio::test]
+    async fn an_answer_stranded_in_a_queued_flush_still_counts_as_answered() {
+        let repo = InMemoryDocsRepo::new();
+        let doc = sample_doc("docs/design/a.md");
+        repo.upsert_doc(&doc, &[sample_question("docs/design/a.md", "Q1", 0)])
+            .await
+            .unwrap();
+        repo.upsert_pending_decision(
+            &PendingDecisionInput {
+                doc_path: "docs/design/a.md".to_string(),
+                anchor: "Q1".to_string(),
+                kind: DecisionKind::Accept,
+                resolution: "WireGuard".to_string(),
+                rationale: None,
+            },
+            "david@algedonic.dev",
+        )
+        .await
+        .unwrap();
+        repo.create_flush_job(
+            &FlushJobPayload {
+                doc_path: "docs/design/a.md".to_string(),
+                base_commit_sha: "abc".to_string(),
+                decisions: vec![FlushDecision {
+                    anchor: "Q1".to_string(),
+                    kind: DecisionKind::Accept,
+                    resolution: "WireGuard".to_string(),
+                    rationale: None,
+                }],
+            },
+            "david@algedonic.dev",
+        )
+        .await
+        .unwrap();
+        assert!(
+            repo.pending_decisions_for_doc("docs/design/a.md")
+                .await
+                .unwrap()
+                .is_empty(),
+            "precondition: queuing the flush consumed the pending row"
+        );
+
+        repo.upsert_doc(&doc, &[sample_question("docs/design/a.md", "Q1", 0)])
+            .await
+            .unwrap();
+
+        let qs = repo.questions_for_doc("docs/design/a.md").await.unwrap();
+        assert!(
+            qs[0].resolved,
+            "the answer is sitting in a queued flush payload — it was \
+             recorded, so the question is not open"
+        );
     }
 
     #[tokio::test]

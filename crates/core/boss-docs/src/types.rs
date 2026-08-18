@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// Status lifecycle for a design doc. Parsed from the `**Status**:`
 /// line in the markdown file.
@@ -191,6 +192,56 @@ pub struct DesignQuestion {
     /// open, so a doc whose review had just been flushed still
     /// reported its questions outstanding.
     pub resolved: bool,
+}
+
+/// Mark every question whose anchor carries a recorded decision as
+/// resolved, whatever the file says.
+///
+/// **The packet is authoritative.** (David, 2026-08-18: "the packet
+/// should be authoritative. And really, this is the truth of BOSS. The
+/// data in job packet form travels with the work directly.") A
+/// question's `resolved` flag arrives here parsed from the markdown
+/// heading's `(resolved)` suffix — that is the *file* deciding. But
+/// the answer is given on a review packet, and it reaches this crate
+/// as a recorded decision long before any file changes.
+///
+/// Without this merge, an answered question keeps counting as open,
+/// because `upsert_doc` deletes and reinserts the whole question set
+/// on every index — so anything known only outside the file is erased
+/// each time the doc is reindexed. That is the loop David reported:
+///
+///   he answers -> the decision is recorded -> the file is unchanged
+///   -> reindex parses the question as open -> `open_questions > 0`
+///   -> `design-review-spawn` fires -> a fresh review packet for a
+///   question he already answered.
+///
+/// MEASURED 2026-08-18, before this change: 13 of 32 design docs
+/// carried more than one review packet — `dev-cluster.md` had three,
+/// each closed, each superseded because the answers never landed in
+/// the file. Closed review `8b3c092d` carries
+/// `resolutions: [{anchor: "Q3", ...}, {anchor: "Q2", "WireGuard"}]`
+/// on its review step: the packet knew the answer the whole time.
+///
+/// The file is now a projection that may lag. When the flush does
+/// eventually write `(resolved)` into the heading the two agree, so
+/// this is convergent rather than a second opinion.
+pub fn apply_recorded_decisions(
+    questions: &[DesignQuestion],
+    decided_anchors: &HashSet<String>,
+) -> Vec<DesignQuestion> {
+    questions
+        .iter()
+        .map(|q| {
+            if q.resolved || !decided_anchors.contains(&q.anchor) {
+                q.clone()
+            } else {
+                DesignQuestion {
+                    resolved: true,
+                    ..q.clone()
+                }
+            }
+        })
+        .collect()
 }
 
 /// Metadata snapshot for a design doc.
@@ -432,4 +483,76 @@ pub struct RejectedDocRecord {
     pub reason: String,
     pub first_seen_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod recorded_decision_tests {
+    use super::*;
+
+    fn q(anchor: &str, resolved: bool) -> DesignQuestion {
+        DesignQuestion {
+            id: format!("docs/design/a.md#{anchor}"),
+            doc_path: "docs/design/a.md".to_string(),
+            anchor: anchor.to_string(),
+            ordinal: 0,
+            title: "does it".to_string(),
+            body_md: String::new(),
+            proposal: None,
+            context_md: None,
+            resolved,
+        }
+    }
+
+    fn anchors(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_recorded_decision_resolves_a_question_the_file_still_calls_open() {
+        // The whole point: the answer lives on the packet, and the
+        // markdown has not been rewritten yet.
+        let out = apply_recorded_decisions(&[q("Q1", false)], &anchors(&["Q1"]));
+        assert!(
+            out[0].resolved,
+            "a question with a recorded decision must stop counting as open \
+             even though the heading carries no `(resolved)` suffix"
+        );
+    }
+
+    #[test]
+    fn a_question_nobody_answered_stays_open() {
+        let out = apply_recorded_decisions(&[q("Q1", false)], &anchors(&["Q2"]));
+        assert!(!out[0].resolved, "an unanswered question is still open");
+    }
+
+    #[test]
+    fn the_file_can_still_resolve_a_question_on_its_own() {
+        // The flush eventually writes `(resolved)` and drops the
+        // recorded decision. The doc must not spring back open.
+        let out = apply_recorded_decisions(&[q("Q1", true)], &HashSet::new());
+        assert!(out[0].resolved, "a flushed question stays resolved");
+    }
+
+    #[test]
+    fn nothing_else_about_the_question_is_touched() {
+        let before = q("Q1", false);
+        let out = apply_recorded_decisions(std::slice::from_ref(&before), &anchors(&["Q1"]));
+        assert_eq!(
+            DesignQuestion {
+                resolved: false,
+                ..out[0].clone()
+            },
+            before,
+            "the merge sets `resolved` and nothing else"
+        );
+    }
+
+    #[test]
+    fn it_is_idempotent() {
+        // Correctness protocol, idempotence: reindexing an unchanged
+        // doc must not move the counts.
+        let once = apply_recorded_decisions(&[q("Q1", false)], &anchors(&["Q1"]));
+        let twice = apply_recorded_decisions(&once, &anchors(&["Q1"]));
+        assert_eq!(once, twice);
+    }
 }

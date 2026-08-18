@@ -111,6 +111,10 @@ NATS_URL="nats://127.0.0.1:4222"
 PROD_DB_URL="postgres://boss:boss@127.0.0.1/boss"
 SCRATCH_DB_URL="postgres://boss:boss@127.0.0.1/boss_scratch"
 REPO_ROOT="/opt/boss"
+# Attachment bytes for the file_refs surface. One definition, shared
+# with infra/backup.sh — see infra/files-root.sh for why.
+# shellcheck source=infra/files-root.sh
+. "$(dirname "$0")/files-root.sh"
 
 # ---------------------------------------------------------------------
 # Per-machine deploy configuration
@@ -494,11 +498,32 @@ EOF
             # NATS publisher gates content.bulletin.* emission to
             # audit_log; without it bulletins write to the projection
             # but never enter the event stream.
+            #
+            # `policy_api_url` IS NOT OPTIONAL HERE, and the binary
+            # will not tell you so. `build_files_router` falls back to
+            # `PermissivePolicyClient` when it is absent — uploads and
+            # downloads with NO policy enforcement, announced only by a
+            # tracing::warn nobody reads. That is a second
+            # unauthenticated machine door (7fcd78fa is the first), and
+            # it would open the moment the `[files]` block below
+            # appeared. The two lines belong together.
+            #
+            # `[files]` turns on the per-packet attachment surface:
+            # file_refs rows attach bytes to a subject, job, step or
+            # event, keyed `sha256/<hex>` so a reference is immutable by
+            # construction and identical bytes dedupe. Built, tested and
+            # shipped long ago; never switched on, so it had zero
+            # callers. Bytes land under `root`, which
+            # `LocalDiskStorage::new` creates on startup if absent.
             cat <<EOF
 # Managed by infra/deploy-services.sh — edits will be overwritten.
 postgres_url = "$PROD_DB_URL"
 http_bind = "127.0.0.1:$port"
 nats_url = "$NATS_URL"
+policy_api_url = "http://127.0.0.1:$(port_of policy prod)"
+
+[files]
+root = "$BOSS_FILES_ROOT"
 EOF
             ;;
         search|views)

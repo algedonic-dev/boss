@@ -21,6 +21,7 @@ pub mod policy_glue;
 pub mod port;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod protocol_conversion;
 #[cfg(feature = "postgres")]
 pub mod rebuild;
 pub mod registry;

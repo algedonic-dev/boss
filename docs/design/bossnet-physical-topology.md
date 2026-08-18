@@ -1,6 +1,6 @@
 # Design: the physical layer, virtualized — nodes and instances as data
 
-**Status**: in-review — open questions tracked at `/system/design`.
+**Status**: approved — in-review — open questions tracked at `/system/design` (2026-08-18).
 **Origin**: David, 2026-08-16: *"I have wanted a view on the physical
 infrastructure for a while, and it is because I figured we have
 confusion in this area about exactly what resources we had under what
@@ -142,133 +142,178 @@ knowable by SSH.
 
 ## Open questions
 
-### Q1: Node and service-instance — new Subject kinds, or Classes of `asset`?
+All 5 open questions were resolved 2026-08-18 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-`asset` already exists as a Subject kind with a KB view, and a server
-is an asset in the ordinary sense. Reusing it costs no new crate and
-inherits the existing surfaces; the Class registry already carries
-taxonomies like this one. Against: an `asset` in this tenant means
-brewery equipment, and mixing "fermenter FV-3" with "cp-2" in one kind
-makes every asset view ask which sort it is looking at — the same
-complaint that made `refurb-device` its own thing.
+---
 
-Proposed: **new `node` and `service-instance` Subject kinds.** The
-deciding argument is that these are BOSS's own substrate, not the
-tenant's inventory: every deployment has them regardless of what it
-models, which is the test for whether something belongs in
-`crates/core/`. A brewery's fermenters and BOSS's servers are the same
-noun only by coincidence of English.
 
-### Q2: Where does the inventory live — the tree, or the database?
+## Decisions
 
-The manifests and `boss-ports` are in the tree, which makes them
-reviewable and versioned; the running truth is in the cluster, which
-makes it current. A node's declared capacity could reasonably live in
-either.
+### Q3: What produces the observations, and how often? (resolved)
 
-Proposed: **declared capacity in the tree, observed state in the log.**
-Intent is versioned and reviewable (`deployment-as-network`'s own
-split: intent versioned, derived state reconverged), so "cp-2 is
-supposed to have 200 GB" is a repo fact that arrives through a car.
-"cp-2 has 41 GB free right now" is an observation, and observations
-are events. The two disagreeing is then a finding rather than a
-mystery — which is exactly the check that would have caught the 63 GB
-orphan.
+Resolved 2026-08-18 — accept.
 
-### Q3: What produces the observations, and how often?
+**The question was:**
 
-Nothing in BOSS reaches the nodes today, and the cluster's services
-are not reachable from boss-gcp at all — during this investigation
-`10.20.0.34` answered on 7900 and nothing else, no `kubectl` exists on
-either reachable host, and the cluster's people API could not be read.
-So an agent cannot currently gather what this design wants to store.
-
-Proposed: **a reporter per node, pushing to an endpoint, on a
-cadence.** Not a central poller: a poller needs credentials and a
-route to every node, which is the thing that does not exist and is
-also the thing worth not building. A small unit on each node that
-reads `df`, `free`, `nproc` and posts them inverts the dependency —
-each node needs one outbound path, and the nodes BOSS cannot reach
-are exactly the ones that would otherwise stay invisible. Frequency
-should be minutes, not seconds; this is capacity planning, not
-alerting.
-
-### Q4: Does this absorb the reachability problem, or just describe it? (resolved)
-
-Resolved 2026-08-16 — override. The question assumed a reachability
-problem; measurement found a CREDENTIALS problem, which is a
-different and much smaller thing.
-
-The network path is fine. boss-gcp reaches the LAN over WireGuard,
-and the Kubernetes API on the VIP `10.20.0.10:6443` answers — a clean
-`401 Unauthorized`, so the cluster is listening and simply does not
-know the caller. What was missing on boss-gcp was a credential: no
-kubeconfig in `~/.kube`, `~/.talos` or `/etc/kubernetes`, and no
-`kubectl` binary there or on the forge host.
-
-> **Corrected 2026-08-16.** "No kubeconfig anywhere" was never true,
-> and this paragraph carried the error for two days. An admin
-> kubeconfig has been sitting at `~/talos-homelab/v2/kubeconfig` on
-> David's laptop the whole time, with `kubectl` and `talosctl` both
-> installed — the laptop reaches the VIP directly. The survey above
-> checked boss-gcp and the forge host, found nothing on either, and
-> generalised to "nowhere"; nobody checked the machine the survey was
-> being run from.
+> Nothing in BOSS reaches the nodes today, and the cluster's services
+> are not reachable from boss-gcp at all — during this investigation
+> `10.20.0.34` answered on 7900 and nothing else, no `kubectl` exists on
+> either reachable host, and the cluster's people API could not be read.
+> So an agent cannot currently gather what this design wants to store.
 >
-> That error had a cost beyond this file. It is why the dev pod was
-> believed unreachable, why verification kept happening on the laptop
-> instead of in the CI image, and therefore why train 52 went red on
-> `bunx` — a binary present on a Mac and absent from the container.
->
-> Since corrected: `kubectl` is installed on boss-gcp and a
-> namespace-scoped credential for `boss-dev` lives at
-> `/etc/boss-dev/kubeconfig`
-> (`infra/cluster/manifests/boss-dev-access.yaml`). The admin config
-> stays on the laptop. Of the cluster's
-service ports only `7900` is exposed on `10.20.0.34`; 4443, 8080, 443
-and 80 are closed, as is 443/4443 on the VIP.
+> Proposed: **a reporter per node, pushing to an endpoint, on a
+> cadence.** Not a central poller: a poller needs credentials and a
+> route to every node, which is the thing that does not exist and is
+> also the thing worth not building. A small unit on each node that
+> reads `df`, `free`, `nproc` and posts them inverts the dependency —
+> each node needs one outbound path, and the nodes BOSS cannot reach
+> are exactly the ones that would otherwise stay invisible. Frequency
+> should be minutes, not seconds; this is capacity planning, not
+> alerting.
 
-So the fix is one of two small things rather than a networking
-project. A read-only kubeconfig plus `kubectl` on boss-gcp is the
-general answer and is what Q3's reporters would verify themselves
-against. Extending the existing SSH tunnel is the narrow one — it is
-already `-L 7900:10.20.0.34:7900`, so another service is one more
-`-L` and no new credential exists to leak.
+**a reporter per node, pushing to an endpoint, on a cadence.** Not a central poller: a poller needs credentials and a route to every node, which is the thing that does not exist and is also the thing worth not building. A small unit on each node that reads `df`, `free`, `nproc` and posts them inverts the dependency — each node needs one outbound path, and the nodes BOSS cannot reach are exactly the ones that would otherwise stay invisible. Frequency should be minutes, not seconds; this is capacity planning, not alerting.
 
-The concrete thing this blocked: whether an `emp-david` employee
-row exists on the CLUSTER, which is what `classifyProbe` resolves a
-session against and therefore whether My Day renders David's board or
-the bare "no matching employee in the roster" line. boss-gcp's local
-roster answers that question about the wrong database — 411 employees,
-no `emp-david` — and reading it there is exactly the mistake that
-produced a retracted root cause on packet e8665893.
 
 ### Q5: What is authoritative, and who decides? (resolved)
 
-Resolved 2026-08-16 — accept. David: *"Cluster should be
-authoritative."*
+Resolved 2026-08-18 — override.
 
-The cluster is authoritative. boss-gcp stops being a second
-deployment of record.
+**The question was:**
 
-The consequence is bigger than a config flip and is the reason this
-is written down rather than just done. The conductor and the cadence
-loop run ON boss-gcp and read boss-gcp's database — that is the
-2026-08-14 split-brain, and it is why `cadence_firings` held 244 rows
-locally against 0 on the cluster. Pointing them at the cluster is one
-`BOSS_POSTGRES_URL` drop-in, and the unit file's own header warns what
-happens when that is got wrong: incident c4b4a6b0. Migration 123's
-reconcile must be on the cluster first, or the boarding threshold
-silently halves.
+> Resolved 2026-08-16 — accept. David: *"Cluster should be
+> authoritative."*
+>
+> The cluster is authoritative. boss-gcp stops being a second
+> deployment of record.
+>
+> The consequence is bigger than a config flip and is the reason this
+> is written down rather than just done. The conductor and the cadence
+> loop run ON boss-gcp and read boss-gcp's database — that is the
+> 2026-08-14 split-brain, and it is why `cadence_firings` held 244 rows
+> locally against 0 on the cluster. Pointing them at the cluster is one
+> `BOSS_POSTGRES_URL` drop-in, and the unit file's own header warns what
+> happens when that is got wrong: incident c4b4a6b0. Migration 123's
+> reconcile must be on the cluster first, or the boarding threshold
+> silently halves.
+>
+> Two things follow that are worth stating so they are not discovered.
+> The 66 user-feedback packets in boss-gcp's local Postgres are not
+> replicated anywhere; deciding the cluster is authoritative does not
+> migrate them, and somebody has to say whether they matter. And a
+> second deployment is only a problem when nobody has decided it is
+> one — if boss-gcp is to survive as a scratch or demo environment,
+> that is fine, but the model must record it as NOT authoritative and
+> the conductor must still book trains against the cluster.
 
-Two things follow that are worth stating so they are not discovered.
-The 66 user-feedback packets in boss-gcp's local Postgres are not
-replicated anywhere; deciding the cluster is authoritative does not
-migrate them, and somebody has to say whether they matter. And a
-second deployment is only a problem when nobody has decided it is
-one — if boss-gcp is to survive as a scratch or demo environment,
-that is fine, but the model must record it as NOT authoritative and
-the conductor must still book trains against the cluster.
+Resolved
+
+
+### Q1: Node and service-instance — new Subject kinds, or Classes of `asset`? (resolved)
+
+Resolved 2026-08-18 — accept.
+
+**The question was:**
+
+> `asset` already exists as a Subject kind with a KB view, and a server
+> is an asset in the ordinary sense. Reusing it costs no new crate and
+> inherits the existing surfaces; the Class registry already carries
+> taxonomies like this one. Against: an `asset` in this tenant means
+> brewery equipment, and mixing "fermenter FV-3" with "cp-2" in one kind
+> makes every asset view ask which sort it is looking at — the same
+> complaint that made `refurb-device` its own thing.
+>
+> Proposed: **new `node` and `service-instance` Subject kinds.** The
+> deciding argument is that these are BOSS's own substrate, not the
+> tenant's inventory: every deployment has them regardless of what it
+> models, which is the test for whether something belongs in
+> `crates/core/`. A brewery's fermenters and BOSS's servers are the same
+> noun only by coincidence of English.
+
+**new `node` and `service-instance` Subject kinds.** The deciding argument is that these are BOSS's own substrate, not the tenant's inventory: every deployment has them regardless of what it models, which is the test for whether something belongs in `crates/core/`. A brewery's fermenters and BOSS's servers are the same noun only by coincidence of English.
+
+
+### Q2: Where does the inventory live — the tree, or the database? (resolved)
+
+Resolved 2026-08-18 — accept.
+
+**The question was:**
+
+> The manifests and `boss-ports` are in the tree, which makes them
+> reviewable and versioned; the running truth is in the cluster, which
+> makes it current. A node's declared capacity could reasonably live in
+> either.
+>
+> Proposed: **declared capacity in the tree, observed state in the log.**
+> Intent is versioned and reviewable (`deployment-as-network`'s own
+> split: intent versioned, derived state reconverged), so "cp-2 is
+> supposed to have 200 GB" is a repo fact that arrives through a car.
+> "cp-2 has 41 GB free right now" is an observation, and observations
+> are events. The two disagreeing is then a finding rather than a
+> mystery — which is exactly the check that would have caught the 63 GB
+> orphan.
+
+**declared capacity in the tree, observed state in the log.** Intent is versioned and reviewable (`deployment-as-network`'s own split: intent versioned, derived state reconverged), so "cp-2 is supposed to have 200 GB" is a repo fact that arrives through a car. "cp-2 has 41 GB free right now" is an observation, and observations are events. The two disagreeing is then a finding rather than a mystery — which is exactly the check that would have caught the 63 GB orphan.
+
+
+### Q4: Does this absorb the reachability problem, or just describe it? (resolved)
+
+Resolved 2026-08-18 — override.
+
+**The question was:**
+
+> Resolved 2026-08-16 — override. The question assumed a reachability
+> problem; measurement found a CREDENTIALS problem, which is a
+> different and much smaller thing.
+>
+> The network path is fine. boss-gcp reaches the LAN over WireGuard,
+> and the Kubernetes API on the VIP `10.20.0.10:6443` answers — a clean
+> `401 Unauthorized`, so the cluster is listening and simply does not
+> know the caller. What was missing on boss-gcp was a credential: no
+> kubeconfig in `~/.kube`, `~/.talos` or `/etc/kubernetes`, and no
+> `kubectl` binary there or on the forge host.
+>
+> > **Corrected 2026-08-16.** "No kubeconfig anywhere" was never true,
+> > and this paragraph carried the error for two days. An admin
+> > kubeconfig has been sitting at `~/talos-homelab/v2/kubeconfig` on
+> > David's laptop the whole time, with `kubectl` and `talosctl` both
+> > installed — the laptop reaches the VIP directly. The survey above
+> > checked boss-gcp and the forge host, found nothing on either, and
+> > generalised to "nowhere"; nobody checked the machine the survey was
+> > being run from.
+> >
+> > That error had a cost beyond this file. It is why the dev pod was
+> > believed unreachable, why verification kept happening on the laptop
+> > instead of in the CI image, and therefore why train 52 went red on
+> > `bunx` — a binary present on a Mac and absent from the container.
+> >
+> > Since corrected: `kubectl` is installed on boss-gcp and a
+> > namespace-scoped credential for `boss-dev` lives at
+> > `/etc/boss-dev/kubeconfig`
+> > (`infra/cluster/manifests/boss-dev-access.yaml`). The admin config
+> > stays on the laptop. Of the cluster's
+> service ports only `7900` is exposed on `10.20.0.34`; 4443, 8080, 443
+> and 80 are closed, as is 443/4443 on the VIP.
+>
+> So the fix is one of two small things rather than a networking
+> project. A read-only kubeconfig plus `kubectl` on boss-gcp is the
+> general answer and is what Q3's reporters would verify themselves
+> against. Extending the existing SSH tunnel is the narrow one — it is
+> already `-L 7900:10.20.0.34:7900`, so another service is one more
+> `-L` and no new credential exists to leak.
+>
+> The concrete thing this blocked: whether an `emp-david` employee
+> row exists on the CLUSTER, which is what `classifyProbe` resolves a
+> session against and therefore whether My Day renders David's board or
+> the bare "no matching employee in the roster" line. boss-gcp's local
+> roster answers that question about the wrong database — 411 employees,
+> no `emp-david` — and reading it there is exactly the mistake that
+> produced a retracted root cause on packet e8665893.
+
+Resolved
 
 ## Decision history
 

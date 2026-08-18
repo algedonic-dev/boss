@@ -1,5 +1,7 @@
 //! Postgres adapter for `DocsRepository`.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
@@ -10,6 +12,7 @@ use crate::port::{DocsError, DocsRepository};
 use crate::types::{
     DecisionKind, DesignDoc, DesignQuestion, DocStatus, FlushJob, FlushJobPayload, JobStatus,
     JobStatusUpdate, PendingDecision, PendingDecisionInput, RejectedDocRecord,
+    apply_recorded_decisions,
 };
 
 pub struct PgDocsRepo {
@@ -149,6 +152,44 @@ impl DocsRepository for PgDocsRepo {
         questions: &[DesignQuestion],
     ) -> Result<(), DocsError> {
         let mut tx = self.pool.begin().await.map_err(storage)?;
+
+        // The packet decides, not the file. `questions` arrives with
+        // `resolved` parsed from the markdown heading; a decision
+        // recorded against an anchor resolves it regardless. See
+        // `apply_recorded_decisions` for why — briefly, the reinsert
+        // below wipes the question set on every index, so an answer
+        // that lives only on the review packet would be forgotten and
+        // the doc would re-spawn a review for a question already
+        // answered.
+        //
+        // Both sources count, because a recorded answer moves between
+        // them: `create_flush_job` snapshots the pending rows into the
+        // job payload and deletes them, so once a flush is queued the
+        // answer lives ONLY in that payload. Queuing a flush is not
+        // writing the file — the 2026-08-18 measurement found five
+        // queued jobs holding sixteen answers and twenty-nine more
+        // marked failed, every one of them invisible to this count.
+        // A `succeeded` job is excluded: that one did write the file,
+        // so the heading now carries `(resolved)` on its own.
+        // `->> 'anchor'` is nullable in the type system (a malformed
+        // payload entry yields NULL), hence `Option` + `flatten`.
+        let decided: HashSet<String> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT anchor FROM design_pending_decisions WHERE doc_path = $1
+             UNION
+             SELECT d ->> 'anchor'
+               FROM design_flush_jobs j,
+                    LATERAL jsonb_array_elements(j.payload -> 'decisions') AS d
+              WHERE j.doc_path = $1 AND j.status <> 'succeeded'",
+        )
+        .bind(&doc.path)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(storage)?
+        .into_iter()
+        .flatten()
+        .collect();
+        let questions = apply_recorded_decisions(questions, &decided);
+        let questions = &questions[..];
 
         // Change detection for the `docs.design.indexed` event
         // (dogfooding arc e556c000, S1): the startup auto-reindex
@@ -742,6 +783,69 @@ mod tests {
             .unwrap();
         let docs = repo.all_docs().await.unwrap();
         assert_eq!(docs.len(), 2);
+    }
+
+    /// The UNION in `upsert_doc` is the whole fix, and only a real
+    /// database exercises it. Two answers, in the two different places
+    /// an answer can be sitting when the file has not been rewritten
+    /// yet: one still pending, one already snapshotted into a queued
+    /// flush job. Neither doc heading says `(resolved)`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recorded_answers_resolve_their_questions_wherever_they_sit() {
+        let db = TestDb::new().await;
+        let repo = PgDocsRepo::new(db.pool.clone());
+        let doc = sample_doc("docs/design/a.md");
+        let parsed = || {
+            vec![
+                sample_question("docs/design/a.md", "Q1", 0),
+                sample_question("docs/design/a.md", "Q2", 1),
+                sample_question("docs/design/a.md", "Q3", 2),
+            ]
+        };
+        repo.upsert_doc(&doc, &parsed()).await.unwrap();
+
+        for anchor in ["Q1", "Q2"] {
+            repo.upsert_pending_decision(
+                &PendingDecisionInput {
+                    doc_path: "docs/design/a.md".to_string(),
+                    anchor: anchor.to_string(),
+                    kind: DecisionKind::Accept,
+                    resolution: "WireGuard".to_string(),
+                    rationale: None,
+                },
+                "david@algedonic.dev",
+            )
+            .await
+            .unwrap();
+        }
+        // Q2's answer moves into a queued flush job, which deletes its
+        // pending row. Q1's stays pending.
+        repo.create_flush_job(
+            &FlushJobPayload {
+                doc_path: "docs/design/a.md".to_string(),
+                base_commit_sha: "abc".to_string(),
+                decisions: vec![FlushDecision {
+                    anchor: "Q2".to_string(),
+                    kind: DecisionKind::Accept,
+                    resolution: "WireGuard".to_string(),
+                    rationale: None,
+                }],
+            },
+            "david@algedonic.dev",
+        )
+        .await
+        .unwrap();
+
+        repo.upsert_doc(&doc, &parsed()).await.unwrap();
+
+        let qs = repo.questions_for_doc("docs/design/a.md").await.unwrap();
+        let by_anchor = |a: &str| qs.iter().find(|q| q.anchor == a).unwrap().resolved;
+        assert!(by_anchor("Q1"), "Q1 has a pending decision — answered");
+        assert!(
+            by_anchor("Q2"),
+            "Q2's answer is in a queued flush — answered"
+        );
+        assert!(!by_anchor("Q3"), "Q3 was never answered — still open");
     }
 
     #[tokio::test(flavor = "multi_thread")]
