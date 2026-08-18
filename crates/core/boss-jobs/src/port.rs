@@ -77,6 +77,26 @@ pub struct JobFilter {
     /// and pages that only contain jobs they can see (no wasted page
     /// space on rows the post-fetch filter would discard).
     pub scope: JobScope,
+    /// Keep only real packets (`Some(false)`) or only simulated ones
+    /// (`Some(true)`). `None` — the default — is every packet, which
+    /// is what every existing caller already gets.
+    ///
+    /// WHY IT IS A QUERY FILTER AND NOT A CLIENT-SIDE `.filter()`, for
+    /// exactly the reason `closed_since` above is: measured
+    /// 2026-08-17, **5,201 of 5,964 packets (87%) are simulated**, and
+    /// a page of 200 drawn from that population holds roughly 26 real
+    /// ones. A surface that fetches a page and then discards the
+    /// simulated rows shows a nearly empty list, a wrong `total`, and
+    /// silently truncates — the same failure the retention window was
+    /// added to fix, one order of magnitude worse.
+    ///
+    /// `simulated` is set at admission and immutable afterwards
+    /// (`update_job` restores it from the existing row), so this is a
+    /// stable partition rather than a mutable label. Measured on the
+    /// same population: of 39 kinds, **zero are mixed** — a kind is
+    /// either entirely simulated or entirely real — so filtering here
+    /// never splits a kind's packets across two answers.
+    pub simulated: Option<bool>,
 }
 
 /// The policy-scope slice applied to a listing. Mirrors the shapes

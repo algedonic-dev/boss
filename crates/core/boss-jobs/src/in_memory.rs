@@ -84,6 +84,11 @@ fn matches_filter(job: &Job, filter: &JobFilter) -> bool {
     {
         return false;
     }
+    if let Some(simulated) = filter.simulated
+        && job.simulated != simulated
+    {
+        return false;
+    }
     if let Some(ref owner) = filter.owner_id
         && &job.owner_id != owner
     {
@@ -582,6 +587,58 @@ mod tests {
 
     fn test_date() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 4, 16).unwrap()
+    }
+
+    /// THE PARTITION HAS TO HAPPEN IN THE QUERY, not on the page.
+    ///
+    /// Measured on the live system 2026-08-17: 5,201 of 5,964 packets
+    /// (87%) are simulated. A surface that fetches a page and then
+    /// drops the simulated rows shows a nearly empty list AND a
+    /// `total` that disagrees with it — the same failure the retention
+    /// window exists to prevent, an order of magnitude worse. So the
+    /// filter is asserted through `list_jobs`, including its total.
+    #[tokio::test]
+    async fn simulated_partitions_both_the_rows_and_the_total() {
+        let repo = InMemoryJobs::default();
+        for i in 0..3 {
+            let mut j = make_job("wholesale-keg-order");
+            j.simulated = true;
+            j.title = format!("sim {i}");
+            repo.create_job(&j).await.expect("create sim");
+        }
+        let mut real = make_job("ship-a-change");
+        real.title = "real one".into();
+        repo.create_job(&real).await.expect("create real");
+
+        let only_real = JobFilter {
+            simulated: Some(false),
+            ..Default::default()
+        };
+        let (rows, total) = repo.list_jobs(&only_real, 50, 0).await.expect("list");
+        assert_eq!(rows.len(), 1, "one real packet");
+        assert_eq!(
+            total, 1,
+            "the total must agree with the rows, not count the sim ones"
+        );
+        assert_eq!(rows[0].title, "real one");
+
+        let only_sim = JobFilter {
+            simulated: Some(true),
+            ..Default::default()
+        };
+        let (rows, total) = repo.list_jobs(&only_sim, 50, 0).await.expect("list");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(total, 3);
+
+        // Absent means everything — every existing caller keeps its
+        // answer, which is what makes this safe to land before any
+        // surface opts in.
+        let (rows, total) = repo
+            .list_jobs(&JobFilter::default(), 50, 0)
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(total, 4);
     }
 
     fn make_job(kind: &str) -> Job {

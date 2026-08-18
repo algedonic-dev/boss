@@ -316,3 +316,81 @@ async fn closed_since_overrides_status_rather_than_intersecting_it() {
     );
     assert_eq!(total, 2);
 }
+
+/// `simulated` partitions the packet population, and BOTH the rows
+/// and the `total` have to obey it.
+///
+/// WHY THIS IS A REAL FILTER AND NOT A CLIENT CONCERN. Measured on the
+/// live system 2026-08-17: **5,201 of 5,964 packets (87%) are
+/// simulated**, and of 39 kinds **zero are mixed** — a kind is either
+/// entirely the demo tenant's or entirely real. A surface that fetched
+/// a page and dropped the simulated rows would draw roughly 26 real
+/// packets from a page of 200, report a `total` of 200, and truncate
+/// without saying so. That is the failure `closed_since` above was
+/// added to prevent, one order of magnitude worse.
+///
+/// Runs against Postgres because the list and the count are two
+/// separate SQL statements with independently numbered binds, and the
+/// way this breaks is that one of them gets the clause and the other
+/// does not — which no in-memory test can see.
+#[tokio::test(flavor = "multi_thread")]
+async fn simulated_partitions_the_rows_and_the_total() {
+    let db = TestDb::new().await;
+    let repo = boss_jobs::PgJobs::new(db.pool.clone());
+    let board = Subject::new("account", "board");
+
+    let mut real = job(
+        "00000000-0000-0000-0000-0000000000b1",
+        "ship-a-change",
+        board.clone(),
+    );
+    real.title = "real work".into();
+    let mut sim_a = job(
+        "00000000-0000-0000-0000-0000000000b2",
+        "ship-a-change",
+        board.clone(),
+    );
+    sim_a.simulated = true;
+    let mut sim_b = job(
+        "00000000-0000-0000-0000-0000000000b3",
+        "ship-a-change",
+        board.clone(),
+    );
+    sim_b.simulated = true;
+
+    for j in [&real, &sim_a, &sim_b] {
+        repo.create_job(j).await.unwrap();
+    }
+
+    let only_real = JobFilter {
+        kind: Some("ship-a-change".into()),
+        simulated: Some(false),
+        ..Default::default()
+    };
+    let (rows, total) = repo.list_jobs(&only_real, 100, 0).await.unwrap();
+    assert_eq!(rows.len(), 1, "one real packet");
+    assert_eq!(
+        total, 1,
+        "the count query must carry the same clause as the list query — \
+         a total that disagrees with the rows is how this breaks"
+    );
+    assert_eq!(rows[0].title, "real work");
+
+    let only_sim = JobFilter {
+        kind: Some("ship-a-change".into()),
+        simulated: Some(true),
+        ..Default::default()
+    };
+    let (rows, total) = repo.list_jobs(&only_sim, 100, 0).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(total, 2);
+
+    // Absent means everything, so nothing that exists today moves.
+    let all = JobFilter {
+        kind: Some("ship-a-change".into()),
+        ..Default::default()
+    };
+    let (rows, total) = repo.list_jobs(&all, 100, 0).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(total, 3);
+}

@@ -528,6 +528,11 @@ impl JobsRepository for PgJobs {
               -- predicate's bound `metadata_equals`): every key/value
               -- in it must be present on the packet.
               AND ($12::jsonb IS NULL OR metadata @> $12::jsonb)
+              -- $14 partitions real work from the demo tenant's.
+              -- Pushed into SQL, not applied to the page: 87% of
+              -- packets are simulated, so a post-fetch filter returns
+              -- a nearly empty page and a wrong total.
+              AND ($14::bool IS NULL OR simulated = $14)
             ORDER BY opened_on DESC
             LIMIT $5 OFFSET $6
         "#;
@@ -546,6 +551,7 @@ impl JobsRepository for PgJobs {
             .bind(filter.waiting_on.as_deref())
             .bind(filter.metadata_contains.as_ref())
             .bind(filter.closed_since)
+            .bind(filter.simulated)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -578,6 +584,9 @@ impl JobsRepository for PgJobs {
                     AND $9 LIKE (metadata->>'waiting_on') || '%')
               )
               AND ($10::jsonb IS NULL OR metadata @> $10::jsonb)
+              -- Same partition as the list query, so `total` agrees
+              -- with the rows actually returned.
+              AND ($12::bool IS NULL OR simulated = $12)
             "#,
         )
         .bind(filter.kind.as_deref())
@@ -591,6 +600,7 @@ impl JobsRepository for PgJobs {
         .bind(filter.waiting_on.as_deref())
         .bind(filter.metadata_contains.as_ref())
         .bind(filter.closed_since)
+        .bind(filter.simulated)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;

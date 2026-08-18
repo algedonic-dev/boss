@@ -2007,6 +2007,46 @@ fn make_forge(cfg: &Config) -> Result<Box<dyn Forge>> {
 }
 
 /// Collapse the forge's per-check rollup to green/pending/failing.
+/// The per-check detail behind a CI verdict, as `context:state`
+/// pairs — the evidence `ci_verdict` reduces to a single word and
+/// then discards.
+///
+/// David, 2026-08-17: "especially with agent actors, we want
+/// verifiable evidence like a commit hash, actual CI pass report, or
+/// other data that should already be getting generated as a result of
+/// actually doing the work. This should be more about accounting and
+/// documenting than needing a new step or capability."
+///
+/// This is exactly that: the rollup is already fetched to compute the
+/// verdict, so recording it costs one string and no new call. Reading
+/// a red train used to mean hand-querying the forge for the run and
+/// then its jobs — three API shapes, none of them obvious — to learn
+/// which check failed. Now the packet says.
+fn ci_check_summary(rollup: Option<&Value>) -> String {
+    let Some(items) = rollup.and_then(Value::as_array) else {
+        return String::new();
+    };
+    items
+        .iter()
+        .map(|c| {
+            let ctx = c
+                .get("context")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("?");
+            let state = c
+                .get("conclusion")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .or_else(|| c.get("status").and_then(Value::as_str))
+                .filter(|s| !s.is_empty())
+                .unwrap_or("?");
+            format!("{ctx}:{state}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn ci_verdict(rollup: Option<&Value>) -> &'static str {
     let Some(items) = rollup.and_then(Value::as_array).filter(|a| !a.is_empty()) else {
         return "pending";
@@ -2351,8 +2391,17 @@ impl Conductor {
             let ci_step = find_step(&t, "ci", "CI verdict");
             let verdict = ci_verdict(info.get("statusCheckRollup"));
             if !step_done(ci_step) && verdict != "pending" {
-                self.complete_step(&t, ci_step, &[("result", Some(verdict.to_string()))])
-                    .await?;
+                let checks = ci_check_summary(info.get("statusCheckRollup"));
+                self.complete_step(
+                    &t,
+                    ci_step,
+                    &[
+                        ("result", Some(verdict.to_string())),
+                        // WHICH check, not just that one failed.
+                        ("checks", (!checks.is_empty()).then_some(checks)),
+                    ],
+                )
+                .await?;
             } else if step_done(ci_step) {
                 // The step has already recorded its verdict and cannot
                 // record another — terminal rows are frozen. Compare
@@ -3172,6 +3221,42 @@ impl Conductor {
             })
             .collect::<Vec<_>>()
             .join(", ");
+        // THE SHA EACH CAR CONTRIBUTED, recorded because twice on
+        // 2026-08-17 a consist carried a commit nobody intended and
+        // nothing said so: `feat/dev-shared-target` was 3370b42
+        // locally and 96109f7 on the forge, and the train assembled
+        // the stale one silently. The head is already resolved to
+        // board the car, so writing it down costs nothing and turns
+        // "which commit did this train actually carry" from a hand
+        // diff into a field.
+        let heads_note = boarded
+            .iter()
+            .map(|(j, b, _)| {
+                // `fork/<branch>` on purpose, not the local ref: this
+                // records what the train ASSEMBLED FROM, which is the
+                // thing a reader needs when a consist misbehaves.
+                let sha = sh_unchecked(&[
+                    "git",
+                    "-C",
+                    &self.cfg.clone,
+                    "rev-parse",
+                    "--short",
+                    "--verify",
+                    "--quiet",
+                    &format!("fork/{b}"),
+                ])
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown".to_string());
+                format!(
+                    "{} {b}@{sha}",
+                    id8(j.get("id").and_then(Value::as_str).unwrap_or("?"))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         self.complete_step(
             &train,
             find_step(&train, "collect", "Collect what is ready to board"),
@@ -3183,6 +3268,7 @@ impl Conductor {
             find_step(&train, "assemble", "Assemble the train branch"),
             &[
                 ("train_ref", Some(format!("{train_branch}@{train_ref}"))),
+                ("car_heads", (!heads_note.is_empty()).then_some(heads_note)),
                 (
                     "skipped",
                     Some(if skipped_names.is_empty() {
@@ -5149,6 +5235,48 @@ mod tests {
             car_head(clone.to_str().expect("utf8"), "feat/never").expect("car_head"),
             None
         );
+    }
+
+    // ---- ci_check_summary ----------------------------------------
+    //
+    // Shapes taken from a real Forgejo rollup: the adapter builds each
+    // entry with `context` and `status`, and `conclusion` is null on
+    // this forge (see cancellable_run_ids for the same lesson about
+    // trusting field names).
+
+    #[test]
+    fn the_ci_summary_names_each_check_and_its_state() {
+        let rollup = json!([
+            {"context": "CI / fast", "status": "success", "conclusion": Value::Null},
+            {"context": "CI / test", "status": "failure", "conclusion": Value::Null},
+        ]);
+        assert_eq!(
+            ci_check_summary(Some(&rollup)),
+            "CI / fast:success, CI / test:failure",
+            "a red train must say WHICH check, not just that one failed"
+        );
+    }
+
+    /// The verdict and the detail must agree about the same rollup —
+    /// they are two readings of one fetch, and a summary that
+    /// disagreed with the verdict would be worse than none.
+    #[test]
+    fn the_summary_and_the_verdict_read_the_same_rollup() {
+        let rollup = json!([
+            {"context": "a", "status": "success"},
+            {"context": "b", "status": "failure"},
+        ]);
+        assert_eq!(ci_verdict(Some(&rollup)), "failing");
+        assert!(ci_check_summary(Some(&rollup)).contains("b:failure"));
+    }
+
+    /// No rollup is not an empty rollup: pending CI has nothing to
+    /// report and must not stamp a misleading empty summary as if it
+    /// had looked and found nothing.
+    #[test]
+    fn an_absent_rollup_summarises_to_nothing() {
+        assert_eq!(ci_check_summary(None), "");
+        assert_eq!(ci_check_summary(Some(&json!([]))), "");
     }
 
     /// THE CASE THAT COST FIVE PUSHES.

@@ -46,6 +46,11 @@ pub(super) struct ListJobsQuery {
     /// user-feedback packets to show 14 live ones and was 27 short of
     /// silently truncating at its own limit.
     closed_within: Option<i64>,
+    /// `simulated=false` drops the demo tenant's packets; `true` keeps
+    /// only those; absent is everything, so no existing caller moves.
+    /// 87% of packets are simulated, so a surface that wants real work
+    /// has to say so in the query rather than filter the page it got.
+    simulated: Option<bool>,
 }
 
 pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static>(
@@ -83,6 +88,7 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
         waiting_on: q.waiting_on,
         closed_since: closed_since_from(q.closed_within, &state).await,
         scope,
+        simulated: q.simulated,
         ..Default::default()
     };
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
@@ -306,6 +312,12 @@ pub(super) async fn jobs_live<R: JobsRepository + 'static, B: EventBus + 'static
         waiting_on: None,
         metadata_contains: None,
         scope: JobScope::All,
+        // Unchanged on purpose. This feed currently shows every
+        // packet, 87% of which are the demo tenant's; narrowing it is
+        // a decision about what this surface is FOR, not part of
+        // adding the capability, so it is left to the caller that
+        // owns the surface.
+        simulated: None,
     };
     let jobs = match state.jobs.list_jobs(&filter, 12, 0).await {
         Ok((jobs, _total)) => jobs,
