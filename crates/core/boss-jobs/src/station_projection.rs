@@ -175,7 +175,7 @@ mod tests {
         DateTime::from_timestamp(1_760_000_000, 0).expect("fixed instant")
     }
 
-    /// What the CODE-SEEDED platform set declares — exactly two.
+    /// What the CODE-SEEDED platform set declares — exactly three.
     ///
     /// Pinned at the real number rather than a comfortable inequality.
     /// The 51 constraints in this module's header are the RUNNING
@@ -197,7 +197,15 @@ mod tests {
         let names: Vec<String> = found.iter().map(station_name).collect();
         assert_eq!(
             names,
-            vec!["q.platform-admin.review-design", "q.platform-admin.task"],
+            vec![
+                // user-feedback v11's design-review (0ab5fa3a): the
+                // decision steps of the feedback protocol became a
+                // constraint queue of their own the moment their kind
+                // stopped being generic `task` — which is the docket.
+                "q.platform-admin.answer-question",
+                "q.platform-admin.review-design",
+                "q.platform-admin.task",
+            ],
             "the code-seeded platform set's constraints changed"
         );
         // Every constraint names both halves — a queue with no role is

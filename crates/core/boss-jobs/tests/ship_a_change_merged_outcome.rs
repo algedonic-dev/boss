@@ -274,18 +274,58 @@ async fn merged_outcome_survives_review_and_closes_on_the_marker() {
     .await;
     assert!(status.is_success(), "marker write failed: {status} {body}");
 
-    // The marker write itself must wake the outcome.
+    // The marker write itself must wake the chain — which now starts
+    // at `proven`, not at the terminal: merged means visible in prod,
+    // not landed on main (David, 2026-08-19), so the marker readies
+    // the proof step and the terminal keeps waiting.
     let marked = get_job(&app, &job_id).await;
     assert_eq!(
-        step(&marked, "Merged")["status"],
+        step(&marked, "Proven in prod")["status"],
         "ready",
-        "the metadata write must promote the Merged outcome: {marked:#}"
+        "the metadata write must promote the proof step: {marked:#}"
+    );
+    assert_eq!(
+        step(&marked, "Merged")["status"],
+        "pending",
+        "the terminal must wait for the prod proof, not the marker"
+    );
+
+    // The proof: verified evidence recorded at the consuming layer
+    // (what the post-converge browser check writes).
+    let proven_id = step(&marked, "Proven in prod")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut proven_md = step(&marked, "Proven in prod")["metadata"].clone();
+    proven_md["verified"] =
+        serde_json::Value::String("uxprobe: surface renders on prod, controls present".into());
+    proven_md["method"] = serde_json::Value::String("browser".into());
+    let (status, body) = send(
+        &app,
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/api/jobs/{job_id}/steps/{proven_id}"))
+            .header("content-type", "application/json")
+            .header("x-boss-user", admin_header())
+            .body(Body::from(
+                serde_json::json!({ "status": "completed", "metadata": proven_md }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert!(status.is_success(), "proving failed: {status} {body}");
+
+    let proven = get_job(&app, &job_id).await;
+    assert_eq!(
+        step(&proven, "Merged")["status"],
+        "ready",
+        "the prod proof must promote the Merged outcome: {proven:#}"
     );
 
     // Completing the outcome (what the dispatcher's marker handler
     // does) closes the Job THROUGH it: Merged completed, the branch
     // not taken skipped.
-    let merged_id = step(&marked, "Merged")["id"].as_str().unwrap().to_string();
+    let merged_id = step(&proven, "Merged")["id"].as_str().unwrap().to_string();
     let (status, body) = send(
         &app,
         Request::builder()

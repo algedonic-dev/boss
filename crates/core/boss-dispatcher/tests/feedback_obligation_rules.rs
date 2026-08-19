@@ -116,6 +116,24 @@ async fn a_merged_car_fires_the_completion_with_its_edge_and_branches() {
         "investigate,design-review,build"
     );
 
+    // v2 (migration 150): the rule carries the completed step kind's
+    // own vocabulary. user-feedback v11's design-review is
+    // `answer-question` — verdict + answer required at done — and an
+    // evidence-only completion would 400 there, breaking the loop on
+    // the very version that fixes the review UX. The value must be a
+    // JSON OBJECT (the handler tolerates a malformed one, but tolerated
+    // is not shipped) whose keys are the two the StepType requires.
+    let done: serde_json::Value =
+        serde_json::from_str(&arg_of(m, "jobs.complete_linked_step", "done_metadata"))
+            .expect("done_metadata parses as JSON");
+    assert!(done.get("verdict").is_some_and(|v| v == "approved"));
+    assert!(
+        done.get("answer")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.contains("{branch}")),
+        "the answer names WHAT shipped via the {{branch}} placeholder"
+    );
+
     // …and it reaches the handler through the real dispatch loop.
     // The registry is DERIVED from the rules that actually matched,
     // not hand-listed. `dispatch` refuses an unknown handler, so a

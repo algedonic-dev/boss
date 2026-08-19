@@ -197,6 +197,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
     wget \
     curl \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
 # BOSS runs as a non-root user. UID 1500 matches the systemd-deploy
@@ -276,6 +277,11 @@ COPY infra/seed-brewery-tenant.sh /opt/boss/infra/seed-brewery-tenant.sh
 # Quickstart launcher + init scripts.
 COPY infra/oss-quickstart/init.sh /usr/local/bin/boss-init
 COPY infra/oss-quickstart/services-launcher.sh /usr/local/bin/boss-launch
+# The maintenance-packet wrap scripts, so in-cluster CronJob chores
+# (boss-search-reindex first) open and complete their packets the same
+# way the boss-gcp timers do — one script pair, both hosts (jq above
+# is theirs).
+COPY infra/boss-maintenance-wrap.sh infra/boss-step.sh /usr/local/bin/
 COPY infra/oss-quickstart/generate-configs.sh /usr/local/bin/boss-generate-configs
 RUN chmod +x /usr/local/bin/boss-init /usr/local/bin/boss-launch \
     /usr/local/bin/boss-generate-configs \

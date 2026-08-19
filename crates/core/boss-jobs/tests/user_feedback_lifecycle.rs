@@ -242,6 +242,22 @@ async fn every_disposition_drives_the_job_to_closed() {
                     };
                     metadata[name] = serde_json::Value::String(value.to_string());
                 }
+                // …and the KIND's own required fields, exactly as the
+                // kind's surface collects them (v11's design-review is
+                // `answer-question`: its plugin's form is what asks
+                // for verdict + answer, so the operator's completion
+                // carries them). Filled from the StepType registry —
+                // the same union the API validates against.
+                if let Some(st) = boss_jobs::step_registry::StepRegistry::v1()
+                    .get(step["kind"].as_str().unwrap_or_default())
+                {
+                    for f in st.fields.iter().filter(|f| f.required) {
+                        if metadata.get(f.name).is_none() {
+                            let sample = f.field_type.split('|').next().unwrap_or("x");
+                            metadata[f.name] = serde_json::Value::String(sample.to_string());
+                        }
+                    }
+                }
 
                 let (status, body) = send(
                     &app,

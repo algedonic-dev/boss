@@ -175,6 +175,13 @@
   /// no disposition at all, and a route the registry later drops would
   /// otherwise take its cards off the board with it.
   function columnOf(j: Job): string {
+    // A closed packet is not queue contents, whatever its triage step
+    // says. Placing by fork-step state alone put every closed packet
+    // under the route it was once sent to, indistinguishable from live
+    // work — measured 2026-08-19: the board showed 198 cards of which
+    // 16 were open, and read as "150+ still open" (David). The Job's
+    // own status outranks the program counter of one of its steps.
+    if (j.status === 'closed' || j.status === 'cancelled') return CLOSED;
     const s = forkStep(j);
     if (!isTerminal(s)) return WAITING;
     const chosen = fork ? s?.metadata?.[fork.field] : undefined;
@@ -193,7 +200,7 @@
     // Only shown when something is in it — an always-empty trailing
     // column is noise on a board that already scrolls.
     const closed = jobs.some((j) => columnOf(j) === CLOSED)
-      ? [{ id: CLOSED, label: 'Closed', hint: 'Triaged before these routes existed, or closed outright.' }]
+      ? [{ id: CLOSED, label: 'Closed', hint: 'Closed packets (any route), and items triaged before these routes existed.' }]
       : [];
     return [...head, ...routes, ...closed];
   });

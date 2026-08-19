@@ -140,6 +140,14 @@ fi
 $K set image -n boss deploy/boss "boss=$REGISTRY:$HEAD"
 $K patch deploy boss -n boss --type=json \
     -p "[{\"op\":\"replace\",\"path\":\"/spec/template/spec/initContainers/0/image\",\"value\":\"$REGISTRY:$HEAD\"}]"
+# CronJob chores run the same build as the deployment. `set image` on
+# a deploy does not touch CronJobs, so the whole labeled set is pinned
+# here — a chore running a stale image is exactly the split this repo
+# keeps paying for. The chore contract (boss-chore=true label +
+# container named `chore`) is what makes this one selector instead of
+# a per-chore list that drifts. `|| true`: a cluster with no chores
+# applied yet must not fail the whole converge.
+$K set image -n boss cronjobs -l boss-chore=true "chore=$REGISTRY:$HEAD" || true
 $K rollout status deploy/boss -n boss --timeout=420s
 
 echo "$HEAD" > "$STAMP_FILE"

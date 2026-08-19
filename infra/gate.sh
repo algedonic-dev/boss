@@ -541,6 +541,22 @@ else
     check "test"    cargo test "${SCOPE[@]}" --all-features
 fi
 
+# THE WEB SUITE, when the web moved. Train #86 went red on three
+# mocked Playwright specs this gate never ran: its web coverage was
+# svelte-check alone, while CI's web job runs typecheck + unit + build
+# + the mocked suite — a car could pass here and red the train on a
+# check it never saw (§9a: this block and ci.yml's web job are two
+# copies of one definition; this one now matches it). Scoped to
+# web-touching changes because the suite needs Playwright's browser
+# and ~a minute — a docs car should not pay that, and CI still runs it
+# unconditionally.
+web_touched() {
+    if changed_paths | grep -qE '^(apps/web|apps/simulator|libs/web-kit)/'; then echo yes; else echo no; fi
+}
+if [ "$AUTO" -eq 1 ] && [ "$(web_touched)" = "yes" ]; then
+    check "web-suite (unit+build+mocked)" bash -c 'cd apps/web && bun run test:unit && bun run build && bun run test:mocked'
+fi
+
 check "fmt" cargo fmt -- --check
 
 # The lint roster. These are repo-wide greps and audits — fast in car

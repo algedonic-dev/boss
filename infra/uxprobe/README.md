@@ -27,6 +27,15 @@ Screenshots land beside the script (`probe-*.png`); the console log
 reports the rendered text, the interactive-control inventory, and
 every HTTP >= 400 the page triggered.
 
+## smoke.mjs — the post-converge floor
+
+`BASE=… node smoke.mjs` runs the fixed sweep behind ship-a-change's
+`proven` step: shell mounts, jobs list renders, a live step surface
+renders with markdown intact, no page errors, no 5xx/404 on API or
+bundles. Exit 0/1 so a runner can gate on it. The per-car judgment
+still goes in the step's `verified` field; this is the floor every
+deploy must clear.
+
 ## How it authenticates
 
 `POST /api/auth/guest` mints a read-only session (rendering is a

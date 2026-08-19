@@ -65,12 +65,19 @@ function job(
   id: string,
   message: string,
   triage: { status: string; metadata?: Record<string, unknown>; kind?: string },
+  jobStatus?: string,
 ) {
   return {
     id,
     kind: 'user-feedback',
     title: 'Feedback on /ux/jobs',
-    status: triage.status === 'completed' ? 'closed' : 'open',
+    // A routed packet is OPEN at its branch step — triage completing
+    // opens the next step, it does not close the Job. The old fixture
+    // conflated the two, which is exactly the confusion the live
+    // board reproduced (198 cards, 16 open, closed packets sitting in
+    // route columns — David, 2026-08-19). Closed is now an explicit
+    // fixture choice, never an inference from the fork step.
+    status: jobStatus ?? 'open',
     subject: { subject_kind: 'custom', id: '/ux/jobs' },
     owner_id: 'emp-bootstrap-admin',
     metadata: { message, route: '/ux/jobs' },
@@ -105,6 +112,15 @@ const JOBS = [
     status: 'completed',
     metadata: { disposition: 'design' },
   }),
+  // Routed AND finished: must render in Closed, never under its old
+  // route — a closed packet is not queue contents whatever its fork
+  // step says.
+  job(
+    'fb-done',
+    'Fixed last week',
+    { status: 'completed', metadata: { disposition: 'design' } },
+    'closed',
+  ),
 ];
 
 test.describe('feedback triage board', () => {
@@ -153,6 +169,13 @@ test.describe('feedback triage board', () => {
     await expect(page.locator('section[aria-label="Decide the design"]')).toContainText(
       'Needs a design call',
     );
+
+    // Routed AND closed: only in Closed. A closed packet rendering
+    // under its old route is the live defect this board shipped with —
+    // 182 closed cards indistinguishable from 16 open ones.
+    const design = page.locator('section[aria-label="Decide the design"]');
+    await expect(design).not.toContainText('Fixed last week');
+    await expect(page.locator('section[aria-label="Closed"]')).toContainText('Fixed last week');
   });
 
   test('routing an item completes the fork step with that disposition', async ({ page }) => {

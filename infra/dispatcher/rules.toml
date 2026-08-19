@@ -481,11 +481,18 @@ handler = "jobs.clear_waiting"
 # live by 117-feedback-obligation.sql.
 [[rule]]
 name = "complete-feedback-branch-on-car-merged"
+# Bumped by migration 150: v2 adds `done_metadata`, the rule row's own
+# translation of "this car merged" into the completed step kind's
+# vocabulary. user-feedback v11's design-review is `answer-question`
+# (verdict + answer required at done), and an evidence-only completion
+# would 400 there. String values substitute {branch}/{car}/{title};
+# absent keys only — a person's own written metadata always wins.
+version = 2
 on_event = "jobs.job.closed"
 when = "kind = \"ship-a-change\" AND outcome = \"merged\""
 [[rule.do]]
 handler = "jobs.complete_linked_step"
-args = { link = "\"backlog_item\"", steps = "\"investigate,design-review,build\"" }
+args = { link = "\"backlog_item\"", steps = "\"investigate,design-review,build\"", done_metadata = '"{\"verdict\": \"approved\", \"answer\": \"shipped: {branch} — {title}\"}"' }
 
 # …and the filer always hears how it ended (same ratification: "But, we
 # should always notify the filer with the terminal state"). ANY

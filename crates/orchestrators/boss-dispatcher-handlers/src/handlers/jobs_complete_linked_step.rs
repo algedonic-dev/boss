@@ -447,6 +447,52 @@ impl Handler for JobsCompleteLinkedStep {
             return Ok(());
         }
 
+        // The rule row's translation of "this shipped" into the step
+        // kind's own completion vocabulary (0ab5fa3a, accepted (a)).
+        // user-feedback v11 makes design-review an `answer-question`
+        // step, whose `verdict` + `answer` are required at done — and
+        // this handler used to write only evidence, so its completion
+        // would 400 and the feedback loop would break exactly where it
+        // was fixed. `done_metadata` is a JSON object on the rule row:
+        // the TRANSLATION IS DATA, the handler stays generic. String
+        // values substitute {branch}/{car}/{title} from facts already
+        // in hand. Fills ABSENT keys only — metadata a person already
+        // wrote is their record, not this obligation's to overwrite.
+        if let Some(Value::String(tpl)) = arg(args, "done_metadata") {
+            match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(tpl) {
+                Ok(done) => {
+                    let branch = closing_meta
+                        .get("branch")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no branch recorded)");
+                    let title = closing.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                    for (k, v) in done {
+                        if merged.contains_key(&k) {
+                            continue;
+                        }
+                        let v = match v {
+                            serde_json::Value::String(s) => serde_json::Value::String(
+                                s.replace("{branch}", branch)
+                                    .replace("{car}", closing_id)
+                                    .replace("{title}", title),
+                            ),
+                            other => other,
+                        };
+                        merged.insert(k, v);
+                    }
+                }
+                // Bad rule authoring is permanent — redelivery cannot
+                // fix a malformed template, and dying here would also
+                // kill the evidence write below.
+                Err(e) => {
+                    tracing::warn!(
+                        rule = %ctx.rule_name,
+                        "done_metadata is not a JSON object ({e}) — completing with evidence only"
+                    );
+                }
+            }
+        }
+
         // The evidence. "The work you asked for shipped" is only worth
         // saying if it names WHAT shipped — an id and a title a reader
         // can go look at, plus the train that carried it and the
@@ -576,6 +622,19 @@ mod tests {
                 Value::String("investigate,design-review,build".into()),
             ),
         ]
+    }
+
+    /// v2 rule args (migration 150): the completion vocabulary rides
+    /// as data.
+    fn args_with_done_metadata() -> Vec<(String, Value)> {
+        let mut a = args();
+        a.push((
+            "done_metadata".to_string(),
+            Value::String(
+                r#"{"verdict": "approved", "answer": "shipped: {branch} — {title}"}"#.into(),
+            ),
+        ));
+        a
     }
 
     const CAR: &str = "11111111-1111-1111-1111-111111111111";
@@ -727,6 +786,72 @@ mod tests {
         // replaces `metadata` wholesale, and `authority_role` living
         // there is what keeps the step gated.
         assert_eq!(body["metadata"]["authority_role"], "platform-admin");
+    }
+
+    /// v2's `done_metadata` (0ab5fa3a): the completion carries the
+    /// step kind's required vocabulary, with the car's facts
+    /// substituted — a v11 `answer-question` design-review would 400
+    /// an evidence-only completion.
+    #[tokio::test]
+    async fn done_metadata_fills_the_kinds_vocabulary_with_the_cars_facts() {
+        let (base, puts) = mock_jobs(vec![
+            car(json!({ "backlog_item": PACKET, "train": TRAIN, "branch": "feat/feedback-obligation" })),
+            packet("ready"),
+            train(),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        h.invoke(&args_with_done_metadata(), &ctx(close_marker()))
+            .await
+            .expect("runs");
+
+        let calls = puts.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        let (_, body) = &calls[0];
+        assert_eq!(body["metadata"]["verdict"], "approved");
+        assert_eq!(
+            body["metadata"]["answer"],
+            "shipped: feat/feedback-obligation — Close the feedback loop",
+            "the answer names WHAT shipped, substituted from the car"
+        );
+        // The evidence write is unchanged beside it.
+        assert_eq!(body["metadata"]["arrived_from"]["car"], CAR);
+    }
+
+    /// Absent keys only: a verdict a person already recorded is their
+    /// decision, and the obligation must not restate it.
+    #[tokio::test]
+    async fn done_metadata_never_overwrites_what_a_person_wrote() {
+        let mut p = packet("ready");
+        // The open branch already carries an operator's own verdict.
+        let steps = p["steps"].as_array_mut().unwrap();
+        for s in steps.iter_mut() {
+            if s["id"] == BRANCH_STEP {
+                s["metadata"]["verdict"] = json!("declined");
+            }
+        }
+        let (base, puts) = mock_jobs(vec![
+            car(json!({ "backlog_item": PACKET, "train": TRAIN, "branch": "feat/x" })),
+            p,
+            train(),
+        ])
+        .await;
+        let h = JobsCompleteLinkedStep::with_client(reqwest::Client::new(), base);
+        h.invoke(&args_with_done_metadata(), &ctx(close_marker()))
+            .await
+            .expect("runs");
+
+        let calls = puts.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        let (_, body) = &calls[0];
+        assert_eq!(
+            body["metadata"]["verdict"], "declined",
+            "the person's verdict survives the obligation"
+        );
+        assert_eq!(
+            body["metadata"]["answer"], "shipped: feat/x — Close the feedback loop",
+            "keys the person did NOT write still fill"
+        );
     }
 
     /// A car with no linked feedback is a no-op — the legacy /

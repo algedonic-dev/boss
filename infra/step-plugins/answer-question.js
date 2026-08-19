@@ -1,4 +1,13 @@
-// answer-question.js — custom Step UX for the `approval` Workflow.
+// answer-question.js — the question-and-response decision surface.
+//
+// v2 (0ab5fa3a, David accepted 2026-08-19): reads the step's OWN
+// metadata first, the Job's second. v1 read only the Job, which was
+// right for the approval Workflow (one decide step per packet) and
+// wrong for every protocol that carries the brief on the step —
+// user-feedback v11's design-review steps hold their docket brief in
+// step.metadata.context_md, where the agent files it. The question
+// falls back to the Job's filed message: on a feedback packet, what
+// the filer wrote IS the question being decided.
 //
 // David, 2026-08-14, on the first version of this protocol: "I don't
 // have any context for the question. The sender should be able to
@@ -315,6 +324,13 @@
     root.appendChild(body);
 
     function meta(key) {
+      // Step first, Job second: the step's brief is written for THIS
+      // decision; the Job's fields are the packet-wide fallback.
+      const own =
+        step.metadata && typeof step.metadata[key] === 'string'
+          ? step.metadata[key].trim()
+          : '';
+      if (own) return own;
       return job && job.metadata && typeof job.metadata[key] === 'string'
         ? job.metadata[key].trim()
         : '';
@@ -362,7 +378,9 @@
       // ---- Right: the decision. ----
       const rail = h('div', { className: 'aq-rail' });
 
-      const q = meta('question');
+      // A feedback packet rarely carries a `question` key — the filed
+      // message is the question. Chain, never blank.
+      const q = meta('question') || meta('message') || meta('body');
       rail.appendChild(
         h('div', { className: 'aq-card' },
           h('span', { className: 'aq-label' }, 'The question'),

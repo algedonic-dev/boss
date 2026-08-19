@@ -89,6 +89,15 @@ pub async fn rebuild_search(pool: &PgPool) -> Result<RebuildSearchReport, Search
     // names no subject are skipped rather than indexed subject-less:
     // an event you cannot trace to a thing is not a search result, it
     // is noise.
+    //
+    // The candidate filter requires the COMPLETE (kind, id) pair. A
+    // candidate can resolve an id with no kind (a payload carrying
+    // `subject_id` alone, or a subject_edges row whose target_kind and
+    // target_kind_path both come up empty) — and `NULL || ' ' || id`
+    // is NULL, so one such event nulled `body` and aborted the whole
+    // rebuild on the NOT NULL constraint. Measured 2026-08-19: the
+    // reindex timer had been crash-looping on exactly this while the
+    // index it was rebuilding fell behind.
     // Subject resolution matches boss-views' event_facts exactly:
     // flat keys, then the `subject_edges` registry, then the Job the
     // event names — with kind and id taken as a pair from whichever
@@ -125,7 +134,7 @@ pub async fn rebuild_search(pool: &PgPool) -> Result<RebuildSearchReport, Search
                       a.payload #>> string_to_array(se.field_path, '.')), \
                      (j.subject_kind, j.subject_id) \
                  ) AS candidates(k, i) \
-                 WHERE i IS NOT NULL LIMIT 1 \
+                 WHERE k IS NOT NULL AND i IS NOT NULL LIMIT 1 \
              ) sub ON TRUE \
              WHERE sub.subject_id IS NOT NULL \
          ) ranked \
