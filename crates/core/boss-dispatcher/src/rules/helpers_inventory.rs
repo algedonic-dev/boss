@@ -84,6 +84,7 @@ impl HelperResolver for InventoryHelpers {
             // helper (design-review-spawn, dogfooding arc e556c000).
             "open_review_exists" => open_review_exists(self, args),
             "open_car_exists" => open_car_exists(self, args),
+            "open_publish_exists" => open_publish_exists(self, args),
             other => Err(EvalError::UnknownHelper(other.to_string())),
         }
     }
@@ -208,6 +209,36 @@ fn open_car_exists(h: &InventoryHelpers, args: &[Value]) -> Result<Value, EvalEr
             .and_then(|m| m.get("sweep_target"))
             .and_then(|s| s.as_str())
             == Some(target)
+    });
+    Ok(Value::Bool(exists))
+}
+
+/// True if a `publish-to-github` packet for this mirror subject is
+/// already open — the dedup for `publish-to-github-daily`.
+///
+/// Same defect class as `open_car_exists` above, on a SCHEDULED rule:
+/// the daily spawner asked no question, so while one packet sat at its
+/// approval sign-off (which, unassigned, notified nobody — 13128a0c),
+/// every morning minted another. Measured 2026-08-18: ab13f05f and
+/// f4e9cdf6 open at once, one day apart, identical titles (9f0c566a).
+///
+/// Keyed on the packet's SUBJECT (`github-mirror`): there is one mirror,
+/// so one open publish packet is the invariant. Matching on subject
+/// rather than a metadata key differs from the car guard deliberately —
+/// the mirror subject is the packet's declared identity, not a
+/// breadcrumb stamped for the guard's benefit.
+fn open_publish_exists(h: &InventoryHelpers, args: &[Value]) -> Result<Value, EvalError> {
+    let subject = first_string(args, "open_publish_exists")?;
+    let url = format!(
+        "{}/api/jobs?kind=publish-to-github&status=open&limit=200",
+        h.jobs_base.trim_end_matches('/')
+    );
+    let r: JobsListResponse = h.get_json(&url, "open_publish_exists")?;
+    let exists = r.data.iter().any(|j| {
+        j.get("subject")
+            .and_then(|s| s.get("id"))
+            .and_then(|s| s.as_str())
+            == Some(subject)
     });
     Ok(Value::Bool(exists))
 }

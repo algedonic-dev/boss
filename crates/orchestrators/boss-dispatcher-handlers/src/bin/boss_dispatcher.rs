@@ -336,6 +336,7 @@ async fn main() -> Result<()> {
                     let schedule_runner = Arc::new(ScheduleRunner {
                         registry: registry.clone(),
                         handlers: handlers.clone(),
+                        helpers: helpers.clone(),
                         clock_url: clock_url.clone(),
                         pool: pool_rules.clone(),
                         calendar: calendar.clone(),

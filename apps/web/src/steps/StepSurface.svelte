@@ -12,6 +12,7 @@
   // no-step-kind-match lint fails the build if one returns.
 
   import GenericSurface from './GenericSurface.svelte';
+  import DecisionContext from './DecisionContext.svelte';
   import ApprovalSurface from './ApprovalSurface.svelte';
   import RepairSurface from './RepairSurface.svelte';
   import InspectionSurface from './InspectionSurface.svelte';
@@ -94,30 +95,39 @@
     {onUpdate}
     currentUser={user}
   />
-{:else if surfaceOf(step.kind) === 'approval'}
-  <ApprovalSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'repair'}
-  <RepairSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'inspection'}
-  <InspectionSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'billing'}
-  <BillingSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'intake'}
-  <IntakeSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'shipment'}
-  <ShipmentSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'scheduling'}
-  <SchedulingSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'production-consume'}
-  <ProductionConsumeSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'handoff'}
-  <HandoffSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'receiving'}
-  <ReceivingSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'procurement'}
-  <ProcurementSurface {step} {jobId} {onUpdate} />
 {:else}
-  <GenericSurface {step} {jobId} {onUpdate} />
+  <!-- Non-plugin surfaces get the packet's case rendered above the
+       action (19db52de: "there is just a sign and complete button,
+       which doesn't seem like much of a choice"). A mounted plugin is
+       its own presentation, so the panel lives on this side of the
+       fork — once, for every platform surface and the generic
+       fallback alike. -->
+  <DecisionContext {step} {jobId} />
+  {#if surfaceOf(step.kind) === 'approval'}
+    <ApprovalSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'repair'}
+    <RepairSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'inspection'}
+    <InspectionSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'billing'}
+    <BillingSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'intake'}
+    <IntakeSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'shipment'}
+    <ShipmentSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'scheduling'}
+    <SchedulingSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'production-consume'}
+    <ProductionConsumeSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'handoff'}
+    <HandoffSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'receiving'}
+    <ReceivingSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'procurement'}
+    <ProcurementSurface {step} {jobId} {onUpdate} />
+  {:else}
+    <GenericSurface {step} {jobId} {onUpdate} />
+  {/if}
 {/if}
 
 <!--

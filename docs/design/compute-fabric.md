@@ -1,7 +1,9 @@
 # Design: the compute fabric
 
-**Status**: draft — worked up from packets `a59de54d` (the directive)
-and `6796ee5f` (IT operations are substrate, not protocol), 2026-08-18.
+**Status**: decided — all five questions answered by David in review
+packet `a96c4027` on 2026-08-18, the day the doc landed. Worked up from
+packets `a59de54d` (the directive) and `6796ee5f` (IT operations are
+substrate, not protocol).
 
 **Origin**: David, 2026-08-18, verbatim: *"Can we make boss-gcp
 effectively part of the 'cluster' while not necessarily running Talos,
@@ -103,59 +105,54 @@ the network framing wins.
 
 ## Open questions
 
-### Q1: What is the membership test for "in the fabric"?
+None — all five resolved on the day the doc landed; see Decision
+history.
 
-Is a machine in the fabric when it is a Subject with a station and
-its operations are protocols — or only when its workloads are also
-cluster-scheduled?
+## Decision history
 
-Proposed: the former. Subject + station + protocol-visible
+**Q1 — the membership test (decided by David, review `a96c4027`,
+2026-08-18, as proposed).** Subject + station + protocol-visible
 operations is the whole test; the scheduling substrate (kubelet,
-systemd, launchd) stays per-machine, replaceable without touching
-the fabric. Option (a) is not foreclosed — a machine that later
-joins Kubernetes changes its supervisor, not its identity.
+systemd, launchd) stays per-machine, replaceable without touching the
+fabric. Kubernetes-joining a machine later changes its supervisor,
+not its identity.
 
-### Q2: How does a machine register, and what keeps its record honest?
+**Q2 — registration and honesty (decided by David, review `a96c4027`,
+2026-08-18, as proposed).** Seed the four machines as data (they
+change rarely) under a `node` Subject kind with capabilities as Class
+rows, and extend the conformance-sweep pattern: a per-node daily
+sweep whose inspect step verifies declared capabilities against the
+machine (forge reachability, expected units, disk headroom) — the
+same loop `instance-registry-asymmetry-is-declared` closes for
+registries.
 
-A `node` Subject kind (per `bossnet-physical-topology` Q1, already
-accepted for dev nodes) with capabilities as Class rows — but what
-creates the rows for boss-gcp, the minipc, the Mac, and what notices
-when the record drifts from the machine?
+**Q3 — the conductor's home (decided by David, review `a96c4027`,
+2026-08-18, as proposed).** It stays on boss-gcp under systemd,
+unmoved — the cadence fold makes its location irrelevant, which is
+the point. Moving it in-cluster becomes a one-line choice later, not
+a prerequisite now.
 
-Proposed: seed the four as data (they change rarely), and extend the
-conformance-sweep pattern: a per-node daily sweep whose inspect step
-verifies the declared capabilities against the machine (can it reach
-the forge? does the conductor unit exist? disk headroom), closing
-the loop the same way `instance-registry-asymmetry-is-declared`
-closes it for registries.
+**Q4 — the demo instance (decided by David, review `a96c4027`,
+2026-08-18, OVERRIDING the doc's keep-it-separate proposal).** His
+words: *"No, let's converge into a single, living system.
+playground.algedonic.dev is where we both run and develop BOSS
+together. Guest access is our mechanism to prevent unauthorized use
+and problems. This will help ensure that we are safe enough to deploy
+at real enterprises because the development is in the open. But there
+is no multi-tenancy concept here. We can potentially create inter-op
+protocols later, but the network, while flexible does not need to
+worry about multiple enterprises being managed by a 3rd party. The
+operator and enterprise will be the same."* Consequences: the
+boss-gcp demo instance converges into the one system rather than
+staying a declared asymmetry; the invariant
+`instance-registry-asymmetry-is-declared` is a HOLDING declaration
+that retires when the convergence lands; openness-plus-guest-access
+replaces blast-radius isolation as the safety story; and there is no
+multi-tenant fork ahead — operator and enterprise are the same party.
+The convergence program is tracked as its own packet.
 
-### Q3: Where does the conductor run after the cadence fold?
-
-Once window packets are claimed through the CAS, the conductor is a
-station consumer that happens to hold a git clone and a forge token.
-
-Proposed: it stays on boss-gcp under systemd, unmoved — the fold
-makes its location irrelevant, which is the point. Moving it
-in-cluster becomes a one-line choice later, not a prerequisite now.
-
-### Q4: Does the public demo stay a separate BOSS instance?
-
-The demo on boss-gcp is a second BOSS instance with its own
-Postgres, which is why a conformance sweep and a declared baseline
-exist at all. Folding it into the SoR as a tenant would delete that
-whole class of drift — at the cost of putting public traffic on the
-system of record.
-
-Proposed: keep it separate. Blast-radius isolation for the public
-door is worth one declared, sweep-checked asymmetry. Revisit only
-alongside real multi-tenancy work.
-
-### Q5: What retires a memory file?
-
-`6796ee5f`'s thesis needs an acceptance test, or the memory
-directory keeps growing beside whatever protocols land.
-
-Proposed: every IT protocol that ships names the memory entries it
-supersedes (the way registries are expected to retire the code they
-replace), and the count of superseded-but-still-cited entries is the
-measure of whether this doc's direction is actually working.
+**Q5 — what retires a memory file (decided by David, review
+`a96c4027`, 2026-08-18, as proposed).** Every IT protocol that ships
+names the memory entries it supersedes, and the count of
+superseded-but-still-cited entries is the measure of whether this
+doc's direction is working.
