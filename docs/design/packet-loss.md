@@ -1,6 +1,6 @@
 # Design: packet loss
 
-**Status**: in-review
+**Status**: decided — all questions answered by David in review `9fb9904f`, 2026-08-19.
 **Origin**: David, 2026-08-13: "I am also afraid that 'packet loss' is
 going to be a real issue for us."
 **Related**: [job-packet-network.md](./job-packet-network.md) ·
@@ -73,50 +73,19 @@ Two things landed today that were not available before:
 
 ## Open questions
 
-### Q1: What is the conservation invariant, exactly?
+None — every question was answered in review `9fb9904f` on 2026-08-19; see Decision history.
 
-Proposed: **every admitted packet reaches a terminal, and every
-non-terminal packet is visible at ≥1 station.** The first half is
-conservation over time; the second is conservation over space, and
-it is the one stations make checkable. A census can compute both
-without new state.
+## Decision history
 
-### Q2: What does the network do when it finds loss?
+**Q1 — What is the conservation invariant, exactly (decided by David in review `9fb9904f`, 2026-08-19).**
+**every admitted packet reaches a terminal, and every non-terminal packet is visible at ≥1 station.** The first half is conservation over time; the second is conservation over space, and it is the one stations make checkable. A census can compute both without new state.
 
-(Note: unsent loss is out of this question's reach — no raiser can
-fire on a packet that does not exist. Its countermeasures are the
-ones already ratified: closure on arrival, notification of the filer,
-and the watchlist. Their effectiveness is measurable only as
-sustained signal volume.)
+**Q2 — What does the network do when it finds loss (decided by David in review `9fb9904f`, 2026-08-19).**
+**(a) then (b)**. Report first, because we do not yet know the base rate and a noisy raiser trains people to ignore it; then raise once the thresholds are calibrated against real numbers. (c) is tempting and wrong for now: a catch-all station that silently absorbs orphans converts a visible defect into a tidy queue nobody reads.
 
-Candidates: (a) report only — a census lens an operator reads; (b)
-raise — an algedonic signal that files a job when a packet is
-stalled past a threshold or orphaned; (c) repair — auto-route
-orphans to a catch-all station.
+**Q3 — Where does the census run (decided by David in review `9fb9904f`, 2026-08-19).**
+a **cadence rule** writing its counts to the log, so loss becomes a measured series rather than a spot check — the same move that turned train timings into the retro's evidence. The lens then reads the series instead of recomputing it.
 
-Proposed: **(a) then (b)**. Report first, because we do not yet know
-the base rate and a noisy raiser trains people to ignore it; then
-raise once the thresholds are calibrated against real numbers. (c)
-is tempting and wrong for now: a catch-all station that silently
-absorbs orphans converts a visible defect into a tidy queue nobody
-reads.
+**Q4 — Is destroyed-content detectable at all (decided by David in review `9fb9904f`, 2026-08-19).**
+out of scope for the census, and worth its own answer; naming it here so it is not mistaken for covered.
 
-### Q3: Where does the census run?
-
-Candidates: a `boss` CLI verb an operator runs; a cadence rule that
-runs it on a schedule and records the counts; a lens that computes
-it live per page-load.
-
-Proposed: a **cadence rule** writing its counts to the log, so loss
-becomes a measured series rather than a spot check — the same move
-that turned train timings into the retro's evidence. The lens then
-reads the series instead of recomputing it.
-
-### Q4: Is destroyed-content detectable at all?
-
-Instance #2 is the frightening one: the record was internally
-consistent and still wrong. The boarded-head guard now prevents that
-specific case, but the general question stands — does anything check
-that a branch a car claims still contains what the car said it did?
-Proposed: out of scope for the census, and worth its own answer;
-naming it here so it is not mistaken for covered.

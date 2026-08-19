@@ -70,7 +70,13 @@ fi
 
 echo "cluster-deploy-runner: forge main moved $LAST -> $HEAD; building"
 git checkout -q "$HEAD" 2>/dev/null || git checkout -qf "$HEAD"
-docker build -q -f infra/oss-quickstart/Dockerfile -t "$REGISTRY:$HEAD" .
+# The FULL commit rides into the binaries (Capabilities.commit) so the
+# conductor's `converged` step can verify the running pod serves this
+# exact merge — the short tag stays the image name, the full sha is
+# the attestation (prefix-compared, so either length matches).
+docker build -q -f infra/oss-quickstart/Dockerfile \
+    --build-arg BOSS_BUILD_COMMIT="$(git rev-parse HEAD)" \
+    -t "$REGISTRY:$HEAD" .
 docker push "$REGISTRY:$HEAD"
 
 K="sudo docker run --rm --network host -v $KUBECONFIG_PATH:/kc:ro alpine/k8s:1.33.3 kubectl --kubeconfig=/kc"

@@ -110,6 +110,12 @@ struct Config {
     /// conductor says so (BOSS_TRAIN_CI_HOURS, default 2). David's
     /// number, 2026-08-15: roughly twice the measured p90 of pr->ci.
     ci_hours: i64,
+    /// Minutes after the merge before an unconverged cluster is a loud
+    /// packet instead of a quiet wait (BOSS_TRAIN_CONVERGE_ALARM_MINS,
+    /// default 30 — David's number, 2026-08-19; the healthy path
+    /// measures ~10-20 min of image build + rollout, the failure this
+    /// exists for measured six silent hours).
+    converge_alarm_mins: i64,
     /// Release a red train's consist automatically once it has stalled
     /// (BOSS_TRAIN_AUTO_CANCEL, default ON — set to `0` to disable).
     /// On by default because the failure it prevents is a pipeline that
@@ -141,6 +147,9 @@ impl Config {
             allow_local_jobs: std::env::var("BOSS_TRAIN_ALLOW_LOCAL_JOBS").as_deref() == Ok("1"),
             stall_hours: env_or("BOSS_TRAIN_STALL_HOURS", "6").parse().unwrap_or(6),
             ci_hours: env_or("BOSS_TRAIN_CI_HOURS", "2").parse().unwrap_or(2),
+            converge_alarm_mins: env_or("BOSS_TRAIN_CONVERGE_ALARM_MINS", "30")
+                .parse()
+                .unwrap_or(30),
             auto_cancel: std::env::var("BOSS_TRAIN_AUTO_CANCEL").as_deref() != Ok("0"),
             gh_repo,
             home,
@@ -1186,6 +1195,54 @@ pub(crate) fn arrival_summary(report: &Value) -> String {
 /// rest on absence.
 pub(crate) fn deploy_needed(current_key: &str, remote_main: &str) -> bool {
     current_key.is_empty() || remote_main.is_empty() || !remote_main.starts_with(current_key)
+}
+
+/// Do two commit identifiers name the same commit? Shas arrive at
+/// different lengths from different mouths — the merge_ref is the
+/// forge's 12-char answer, `Capabilities.commit` is the full 40 the
+/// image build baked in — so equality is prefix containment, gated at
+/// >=7 chars a side so an empty or truncated report can never
+/// accidentally "match".
+pub(crate) fn commits_match(a: &str, b: &str) -> bool {
+    a.len() >= 7 && b.len() >= 7 && (a.starts_with(b) || b.starts_with(a))
+}
+
+/// What the `converged` step should do this reconcile pass.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ConvergenceVerdict {
+    /// The running cluster binary self-reports the merge commit —
+    /// complete the step with that evidence.
+    Converged,
+    /// Not there yet and inside the patience window — say nothing,
+    /// look again next pass.
+    Waiting,
+    /// Not there and past the window — file the loud packet (once).
+    /// Waiting silently is the defect this verdict exists to end:
+    /// measured at six unnoticed hours on 2026-08-19.
+    Overdue,
+}
+
+/// The convergence decision, pure. `cluster_commit` is what the
+/// cluster's health endpoint self-reported (None: unreachable, or a
+/// binary from before the commit field existed — evidence of absence
+/// is absence of evidence here, so it converges nothing and times out
+/// like any other lag).
+pub(crate) fn convergence_verdict(
+    merge_ref: &str,
+    cluster_commit: Option<&str>,
+    mins_since_merge: i64,
+    alarm_after_mins: i64,
+) -> ConvergenceVerdict {
+    if let Some(c) = cluster_commit
+        && commits_match(merge_ref, c)
+    {
+        return ConvergenceVerdict::Converged;
+    }
+    if mins_since_merge >= alarm_after_mins {
+        ConvergenceVerdict::Overdue
+    } else {
+        ConvergenceVerdict::Waiting
+    }
 }
 
 /// The live generation's key — the basename of the store's `current`
@@ -2357,6 +2414,129 @@ impl Conductor {
         Ok(())
     }
 
+    /// Verify the CLUSTER is serving this train's merge, and complete
+    /// the `converged` step with the evidence — or file the loud
+    /// packet when convergence has lagged past the threshold.
+    ///
+    /// The proof is self-report: the jobs API's health endpoint
+    /// answers with the commit its binary was BUILT from
+    /// (`Capabilities.commit`, baked in by the image build). That is
+    /// stronger than reading the image tag off the Deployment — a tag
+    /// proves a push was requested; a running binary reporting the
+    /// commit proves the pod restarted onto it.
+    async fn verify_convergence(&self, train: &Value, now: DateTime<Utc>) -> Result<()> {
+        let tid = job_id(train)?.to_string();
+        let converged_step = find_step(train, "converged", "Cluster converged")
+            .ok_or_else(|| anyhow!("converged step missing on job {}", id8(&tid)))?;
+        let merge_ref = find_step(train, "merged", "Merged into main")
+            .and_then(|s| s.get("metadata"))
+            .and_then(|m| m.get("merge_ref"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("no merge_ref on job {} — nothing to verify", id8(&tid)))?
+            .to_string();
+        let health = self.api(Method::GET, "/api/jobs/health", None).await?;
+        let cluster_commit = health
+            .as_ref()
+            .and_then(|h| h.get("capabilities"))
+            .and_then(|c| c.get("commit"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let merged_at = parse_stamp(step_stamp(train, "merged", "Merged into main"));
+        let mins_since_merge = merged_at
+            .map(|m| (now.fixed_offset() - m).num_minutes())
+            .unwrap_or(0);
+        match convergence_verdict(
+            &merge_ref,
+            cluster_commit.as_deref(),
+            mins_since_merge,
+            self.cfg.converge_alarm_mins,
+        ) {
+            ConvergenceVerdict::Converged => {
+                let commit = cluster_commit.unwrap_or_default();
+                self.complete_step(
+                    train,
+                    Some(converged_step),
+                    &[
+                        ("cluster_commit", Some(commit.clone())),
+                        (
+                            "verified",
+                            Some(format!(
+                                "the running cluster jobs API self-reports build commit \
+                                 {} — matches merge {merge_ref}; verified {} min after merge",
+                                id8(&commit),
+                                mins_since_merge
+                            )),
+                        ),
+                    ],
+                )
+                .await
+            }
+            ConvergenceVerdict::Waiting => {
+                log(format!(
+                    "train {}: cluster not yet on {} ({} min since merge, alarm at {})",
+                    id8(&tid),
+                    id8(&merge_ref),
+                    mins_since_merge,
+                    self.cfg.converge_alarm_mins
+                ));
+                Ok(())
+            }
+            ConvergenceVerdict::Overdue => {
+                if truthy(
+                    train
+                        .get("metadata")
+                        .and_then(|m| m.get("converge_alarm_filed")),
+                ) {
+                    return Ok(());
+                }
+                log(format!(
+                    "train {}: cluster convergence OVERDUE ({} min since merge) — filing packet",
+                    id8(&tid),
+                    mins_since_merge
+                ));
+                if self.cfg.dry {
+                    return Ok(());
+                }
+                let reported = cluster_commit.as_deref().unwrap_or("nothing");
+                self.api(
+                    Method::POST,
+                    "/api/jobs",
+                    Some(json!({
+                        "kind": "user-feedback",
+                        "status": "open",
+                        "title": format!(
+                            "Cluster convergence overdue: train {} merged {} min ago",
+                            id8(&tid), mins_since_merge
+                        ),
+                        "subject": {"subject_kind": "custom", "id": "cluster-convergence"},
+                        "tags": ["deploy", "pipeline"],
+                        "owner_id": "emp-david",
+                        "priority": "urgent",
+                        "opened_on": now.date_naive().to_string(),
+                        "metadata": {
+                            "message": format!(
+                                "The train merged {merge_ref} {mins_since_merge} minutes ago and \
+                                 the cluster's running binary still reports {reported} — past the \
+                                 {}-minute threshold (BOSS_TRAIN_CONVERGE_ALARM_MINS). Filed by \
+                                 the conductor's converged step (fdff316c / 7e5ee013): the likely \
+                                 suspects are the deploy-runner timer on the forge host, the image \
+                                 build failing, or the rollout wedged — check \
+                                 cluster-deploy-runner's journal first. The train's arrival report \
+                                 will not fire until convergence verifies.",
+                                self.cfg.converge_alarm_mins
+                            ),
+                            "train": tid,
+                        },
+                    })),
+                )
+                .await?;
+                self.merge_job_metadata(&tid, vec![("converge_alarm_filed", json!(true))])
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
     async fn reconcile(&self, now: DateTime<Utc>) -> Result<()> {
         let trains = rows(
             self.api(
@@ -2548,6 +2728,24 @@ impl Conductor {
                 let deployed_step = deployed_step
                     .ok_or_else(|| anyhow!("deployed step missing on job {}", id8(&tid)))?;
                 self.deploy(&t, deployed_step).await?;
+                t = self.get_job(&tid).await?;
+            }
+            // Installation is not the finish line either — the cluster
+            // must be SERVING the merge before the train can claim
+            // arrival (fdff316c / 7e5ee013, decided 2026-08-19).
+            // Trains admitted under the pre-converged spec have no
+            // such step and skip this whole pass — version pinning
+            // working as designed, nothing stranded.
+            let converged_step = find_step(&t, "converged", "Cluster converged");
+            if step_done(find_step(&t, "deployed", "Deployed to the playground"))
+                && converged_step.is_some()
+                && !step_done(converged_step)
+                && let Err(e) = self.verify_convergence(&t, now).await
+            {
+                // Convergence checking must not fail the run whose
+                // deploys succeeded — the next pass looks again, and
+                // the overdue alarm bounds the silence.
+                log(format!("convergence check failed (run stands): {e}"));
             }
         }
         // Housekeeping must not fail a run whose real work succeeded.
@@ -3734,13 +3932,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
     use super::{
-        ApiFailure, Failure, JOBS_API_RETRY, MAX_RED_TRAINS, RetryPolicy, SweepGuard,
-        arrival_report, arrival_summary, auto_cancel_reason, boarded_head, branch_moved_line,
-        car_hold_reason, ci_overdue, classify_transport, deletable_branches, deploy_needed,
-        local_jobs_problem, overlay_metadata, parked_ready, releasable_cars, repo_path,
-        resolve_train, retryable, retrying, short_cause, skip_reason_branch_missing,
-        skip_reason_conflict, stall_age_hours, sweep_guard, sweep_note, sweep_settled,
-        train_branch_to_delete, verdict_drift,
+        ApiFailure, ConvergenceVerdict, Failure, JOBS_API_RETRY, MAX_RED_TRAINS, RetryPolicy,
+        SweepGuard, arrival_report, arrival_summary, auto_cancel_reason, boarded_head,
+        branch_moved_line, car_hold_reason, ci_overdue, classify_transport, commits_match,
+        convergence_verdict, deletable_branches, deploy_needed, local_jobs_problem,
+        overlay_metadata, parked_ready, releasable_cars, repo_path, resolve_train, retryable,
+        retrying, short_cause, skip_reason_branch_missing, skip_reason_conflict, stall_age_hours,
+        sweep_guard, sweep_note, sweep_settled, train_branch_to_delete, verdict_drift,
     };
     use anyhow::{Result, anyhow};
     use chrono::{DateTime, Utc};
@@ -4085,6 +4283,59 @@ mod tests {
     }
 
     // -- the drift sentinel (split-brain incident c4b4a6b0) ----------------
+    // ----- convergence_verdict — installation is not the finish line
+    //
+    // fdff316c / 7e5ee013, decided 2026-08-19: the arrival report may
+    // only fire once the RUNNING cluster binary self-reports the merge
+    // commit, and a lag past the threshold files a packet instead of
+    // waiting silently (six unnoticed hours, measured).
+
+    #[test]
+    fn commit_identities_match_by_prefix_with_a_floor() {
+        let full = "4ee5bba7a17a0123456789abcdef0123456789ab";
+        assert!(commits_match("4ee5bba7a17a", full), "short vs full");
+        assert!(commits_match(full, "4ee5bba7a17a"), "full vs short");
+        assert!(commits_match(full, full), "identical");
+        assert!(!commits_match("4ee5bba7a17a", "9da5e4fe1234"), "different");
+        // The floor: nothing under 7 chars can match anything — an
+        // empty or truncated self-report must never read as converged.
+        assert!(!commits_match("", full));
+        assert!(!commits_match("4ee5bb", full), "6 chars is below the floor");
+    }
+
+    #[test]
+    fn a_matching_self_report_converges_regardless_of_elapsed_time() {
+        for mins in [0, 29, 500] {
+            assert_eq!(
+                convergence_verdict("4ee5bba7a17a", Some("4ee5bba7a17a0123456789ab"), mins, 30),
+                ConvergenceVerdict::Converged,
+            );
+        }
+    }
+
+    #[test]
+    fn no_or_wrong_report_waits_inside_the_window_and_alarms_past_it() {
+        // None: unreachable, or a binary predating the commit field —
+        // absence never converges and times out like any other lag.
+        assert_eq!(
+            convergence_verdict("4ee5bba7a17a", None, 29, 30),
+            ConvergenceVerdict::Waiting,
+        );
+        assert_eq!(
+            convergence_verdict("4ee5bba7a17a", None, 30, 30),
+            ConvergenceVerdict::Overdue,
+        );
+        // The previous release still running: same shape.
+        assert_eq!(
+            convergence_verdict("4ee5bba7a17a", Some("d92230071234"), 10, 30),
+            ConvergenceVerdict::Waiting,
+        );
+        assert_eq!(
+            convergence_verdict("4ee5bba7a17a", Some("d92230071234"), 31, 30),
+            ConvergenceVerdict::Overdue,
+        );
+    }
+
     //
     // BOSS_JOBS_URL defaulted to localhost and the conductor silently
     // booked a whole window on the wrong instance. Preflight goes red

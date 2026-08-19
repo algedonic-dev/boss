@@ -84,6 +84,16 @@ COPY crates ./crates
 COPY examples ./examples
 COPY infra/postgres ./infra/postgres
 
+# The commit this image is built from, exported to the cargo build so
+# `Capabilities` self-reports it from every service's health endpoint
+# (option_env! in boss-core). Declared AFTER the chef cook layer on
+# purpose: the arg changes every build, and placing it above would
+# invalidate the cached dependency tree each time. The train's
+# `converged` step reads this back from the RUNNING pod — the proof of
+# installation the arrival report now requires (fdff316c / 7e5ee013).
+ARG BOSS_BUILD_COMMIT=
+ENV BOSS_BUILD_COMMIT=$BOSS_BUILD_COMMIT
+
 # Build every binary the runtime needs. --features postgres pulls in
 # the sqlx-backed adapters; the workspace builds in one cargo
 # invocation so dep compilation is shared across crates. The cooked

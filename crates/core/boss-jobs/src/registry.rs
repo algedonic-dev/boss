@@ -1241,13 +1241,34 @@ fn pr_train_spec() -> WorkflowSpec {
             ..Default::default()
         },
         StepSpec {
+            title: "converged".into(),
+            kind: "task".into(),
+            ready_when: "steps.deployed.done".into(),
+            title_template: "Cluster converged".into(),
+            authority_role: admin.clone(),
+            // Merging installs nothing (fdff316c), and the cluster
+            // converge was fire-and-forget with no packet and no alarm
+            // (7e5ee013) — measured at six silent hours on 2026-08-19,
+            // which armed a dedup guard late and minted a duplicate
+            // packet. David, 2026-08-19: fix it at the TRAIN layer.
+            // The conductor completes this step only when the RUNNING
+            // cluster binary self-reports the merge commit (the health
+            // endpoint's build commit — proof the pod restarted onto
+            // it, where an image tag would only prove a push), and
+            // files a loud packet when convergence lags past the
+            // threshold instead of waiting silently.
+            fields: vec![req("cluster_commit"), req("verified")],
+            ..Default::default()
+        },
+        StepSpec {
             title: "arrived".into(),
             kind: "outcome".into(),
-            // Both evidence trails must be on the record: the deploys
-            // that carried it out AND the CI verdict — without the ci
-            // edge the verdict step is a leaf no terminal depends on,
-            // which the viability lint rightly rejects.
-            ready_when: "steps.deployed.done AND steps.ci.done".into(),
+            // Three evidence trails must be on the record: the deploys
+            // that carried it out, the CLUSTER actually serving the
+            // merge, AND the CI verdict — without the ci edge the
+            // verdict step is a leaf no terminal depends on, which the
+            // viability lint rightly rejects.
+            ready_when: "steps.converged.done AND steps.ci.done".into(),
             title_template: "Train arrived".into(),
             metadata_defaults: serde_json::json!({ "outcome_kind": "completed" }),
             terminal: Some(Terminal {

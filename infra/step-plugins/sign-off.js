@@ -1,27 +1,43 @@
-// sign-off.js — the surface for a step that needs someone's name on it.
+// sign-off.js v2 — the surface for a step that needs someone's name on
+// a DECISION, showing them what they are deciding.
 //
-// WHY THIS EXISTS. `sign-off` is the most common step kind across the
-// platform protocols — ship-a-change's `gate`, doc-flatten's `review`,
-// protocol-retro's `ratify`, incident's `prevention` — and it was the
-// one with no plugin, so every one of them rendered the generic step
-// surface. David, 2026-08-15 (feedback b1aa1f5f), on the doc-flatten
-// ratify step: "Missing custom step UX".
+// v1 (car 884b85f4's train) rendered the stamp ceremony — the role
+// roster, who signed when, stale-stamp 409s — and nothing else. That
+// solved "Missing custom step UX" (b1aa1f5f) for ceremony steps and
+// then, because a plugin evicts the platform surface for its whole
+// KIND, blinded every decision-shaped sign-off in the system:
+// 19db52de, David on his publish approval, "There is just a sign and
+// complete button, which doesn't seem like much of a choice." The row
+// was retired live on 2026-08-19; this version earns it back.
 //
-// WHAT THE GENERIC SURFACE HIDES, and the reason this is worth a
-// bundle rather than a nicer label: a sign-off step carries two facts
-// that have no generic rendering. First, `sign_offs_required` is a list
-// of ROLES, and the step is not completable until every one has a stamp
-// — the generic surface shows a Complete button that simply fails.
-// Second, a stamp records the `step_shape_hash` at the moment it was
-// made, so editing the step after signing INVALIDATES the stamp; the
-// API answers a completion attempt with 409 and a `stale_roles` list.
-// That is a good rule (a signature is on a specific thing, not on a
-// step id) and it is invisible until it bites, so this surface says it
-// out loud instead.
+// What a sign-off step actually carries, all now rendered:
+//   1. THE CASE — step.metadata.context_md, else the job's context_md,
+//      else the job's filed message (the DecisionContext chain; a
+//      plugin is exempt from the host panel, so it folds in here).
+//   2. THE CONTRACT — step.fields declares required-at-done metadata
+//      (publish-to-github v3 requires `approved`); v1 offered a
+//      Complete that could only 400 against these, and did not show
+//      the 400. Declared fields render as inputs, enums as selects,
+//      and the decision buttons stay disabled until required ones are
+//      filled — a button that exists only to produce an error teaches
+//      the operator to distrust buttons (v1's own line, kept).
+//   3. THE DECISION — Approve / Reject / Request changes, writing the
+//      decision trio (`decision`, `decided_at`, `comment`) exactly as
+//      the platform ApprovalSurface does, so protocol predicates read
+//      one vocabulary regardless of which surface recorded it.
+//   4. THE CEREMONY — v1's roster, verbatim in behavior: stamps are
+//      collected per role, the step cannot complete while one is
+//      outstanding, and a 409 surfaces the server's stale-roles text.
 //
-// Plugins are plain-DOM mount functions. The host (StepPluginMount
-// .svelte) creates a container <div> and calls mount(container, props);
-// we render into it and return a cleanup fn. No framework runtime.
+// Order on Approve/Reject: metadata lands first (a stamp attests the
+// step's current shape, so the decision must be IN the shape), then
+// the user's own stamp if their role is required and unsigned, then
+// the completion — skipped, with a plain explanation, while other
+// roles' signatures are still outstanding. Request changes records
+// without completing.
+//
+// Plugin contract: window.__boss_register_step_plugin(kind, mount);
+// mount(container, { step, jobId, onUpdate, currentUser }).
 
 (function () {
   function h(tag, attrs, ...children) {
@@ -53,35 +69,115 @@
     return Number.isNaN(d.getTime()) ? String(iso) : d.toLocaleString();
   }
 
+  // The decision trio is the step KIND's own vocabulary (seeded with
+  // the kind when it absorbed the retired `approval` kind); declared
+  // per-workflow fields are anything beyond it.
+  const TRIO = ['decision', 'decided_at', 'comment'];
+
+  function nonEmptyString(v) {
+    return typeof v === 'string' && v.trim().length > 0 ? v : null;
+  }
+
   function mount(container, { step, jobId, onUpdate }) {
     const required = Array.isArray(step.sign_offs_required) ? step.sign_offs_required : [];
     let stamps = Array.isArray(step.sign_offs) ? step.sign_offs.slice() : [];
-    // The API's terminal spellings, matching answer-question.js. The
-    // older bundles test for 'done', which is not a StepStatus the
-    // server ever returns — a legacy spelling that happens to be falsy
-    // here and so reads as "not finished".
     const isDone = step.status === 'completed' || step.status === 'skipped';
     let busy = false;
     let error = null;
 
+    const declared = (Array.isArray(step.fields) ? step.fields : []).filter(
+      (f) => f && f.name && !TRIO.includes(f.name),
+    );
+    // Live values for declared fields, seeded from step metadata (a
+    // pre-filled `approved` renders filled and editable).
+    const fieldValues = {};
+    declared.forEach((f) => {
+      const cur = (step.metadata || {})[f.name];
+      fieldValues[f.name] = cur == null ? '' : String(cur);
+    });
+
     const stampFor = (role) => stamps.find((s) => s && s.role === role);
     const outstanding = () => required.filter((r) => !stampFor(r));
+    const missingRequired = () =>
+      declared.filter((f) => f.required && !nonEmptyString(fieldValues[f.name]));
 
+    const contextDiv = h('div', { className: 'step-signoff-context' });
+    const fieldsDiv = h('div', { className: 'step-signoff-fields' });
     const rolesDiv = h('div', { className: 'step-signoff-roles' });
     const actionsDiv = h('div', { className: 'step-actions' });
     const errorDiv = h('div', { className: 'step-signoff-error' });
+    const commentTa = h('textarea', {
+      className: 'step-signoff-comment',
+      rows: '2',
+      placeholder: 'Comment (optional)…',
+    });
+    commentTa.value = String((step.metadata || {}).comment || '');
+
+    function renderContext(text, sourceLabel) {
+      contextDiv.replaceChildren();
+      if (!text) return;
+      contextDiv.appendChild(
+        h(
+          'div',
+          { className: 'step-signoff-context-card' },
+          h(
+            'div',
+            { className: 'step-signoff-context-head' },
+            h('span', { className: 'step-signoff-context-title' }, 'What this decision is about'),
+            h('span', { className: 'step-signoff-context-source' }, sourceLabel),
+          ),
+          h('div', { className: 'step-signoff-context-body' }, text),
+        ),
+      );
+    }
+
+    function renderFields() {
+      fieldsDiv.replaceChildren();
+      if (declared.length === 0) return;
+      declared.forEach((f) => {
+        const id = `signoff-field-${step.id}-${f.name}`;
+        const type = String(f.field_type || 'string');
+        let input;
+        if (type.includes('|')) {
+          input = h('select', { className: 'step-signoff-input', id });
+          const opts = type.split('|').map((o) => o.trim()).filter(Boolean);
+          if (!opts.includes(fieldValues[f.name])) {
+            input.appendChild(h('option', { value: '' }, '— choose —'));
+          }
+          opts.forEach((o) => input.appendChild(h('option', { value: o }, o)));
+          input.value = fieldValues[f.name];
+        } else {
+          input = h('input', { className: 'step-signoff-input', id, type: 'text' });
+          input.value = fieldValues[f.name];
+        }
+        input.addEventListener('input', (e) => {
+          fieldValues[f.name] = e.target.value;
+          renderActions();
+        });
+        input.addEventListener('change', (e) => {
+          fieldValues[f.name] = e.target.value;
+          renderActions();
+        });
+        if (isDone) input.disabled = true;
+        fieldsDiv.appendChild(
+          h(
+            'div',
+            { className: 'step-field' },
+            h('label', { for: id }, f.required ? `${f.name} (required)` : f.name),
+            input,
+          ),
+        );
+      });
+    }
 
     function renderRoles() {
       rolesDiv.replaceChildren();
       if (required.length === 0) {
-        // Not an error state: plenty of sign-off steps declare no roles
-        // and are just "someone looked at this". Say so, rather than
-        // rendering an empty box that reads as a loading failure.
         rolesDiv.appendChild(
           h(
             'p',
             { className: 'step-signoff-none' },
-            'No roles are required on this step — completing it is the sign-off.',
+            'No counter-signatures are required — your decision completes the step.',
           ),
         );
         return;
@@ -102,11 +198,7 @@
           !stamp && !isDone
             ? h(
                 'button',
-                {
-                  className: 'step-btn',
-                  disabled: busy,
-                  onClick: () => sign(role),
-                },
+                { className: 'step-btn', disabled: busy, onClick: () => sign(role) },
                 `Sign off as ${role}`,
               )
             : null,
@@ -117,26 +209,51 @@
 
     function renderActions() {
       actionsDiv.replaceChildren();
-      if (isDone) return;
-      const left = outstanding();
-      if (left.length > 0) {
-        // Deliberately no Complete button while a signature is missing.
-        // The API would refuse it, and a button that exists only to
-        // produce an error teaches the operator to distrust buttons.
+      if (isDone) {
+        const d = (step.metadata || {}).decision;
+        if (d && d !== 'pending') {
+          actionsDiv.appendChild(
+            h('div', { className: `step-signoff-result step-signoff-${d}` }, `Decision: ${d}`),
+          );
+        }
+        return;
+      }
+      const missing = missingRequired();
+      if (missing.length > 0) {
         actionsDiv.appendChild(
           h(
             'span',
             { className: 'step-signoff-blocked' },
-            `Cannot complete yet — ${left.length} signature${left.length === 1 ? '' : 's'} outstanding: ${left.join(', ')}`,
+            `Fill the required field${missing.length === 1 ? '' : 's'} first: ${missing
+              .map((f) => f.name)
+              .join(', ')}`,
           ),
         );
-        return;
       }
+      const disabled = busy || missing.length > 0;
       actionsDiv.appendChild(
         h(
           'button',
-          { className: 'step-btn step-btn-primary', disabled: busy, onClick: complete },
-          required.length ? 'All signatures in — complete step' : 'Sign off and complete',
+          { className: 'step-btn step-btn-approve', disabled, onClick: () => decide('approved') },
+          'Approve',
+        ),
+      );
+      actionsDiv.appendChild(
+        h(
+          'button',
+          { className: 'step-btn step-btn-reject', disabled, onClick: () => decide('rejected') },
+          'Reject',
+        ),
+      );
+      actionsDiv.appendChild(
+        h(
+          'button',
+          {
+            className: 'step-btn',
+            disabled: busy,
+            onClick: () => decide('changes-requested'),
+          },
+          'Request changes',
         ),
       );
     }
@@ -148,6 +265,7 @@
     }
 
     function renderAll() {
+      renderFields();
       renderRoles();
       renderActions();
       renderError();
@@ -166,10 +284,8 @@
         if (!res.ok) {
           error = `Could not record the ${role} signature (${res.status}). ${await res.text()}`;
         } else {
-          // Re-read rather than assume: the server decides who the
-          // stamp is attributed to and what shape hash it pins, and
-          // guessing here would show a signature that does not match
-          // the one recorded.
+          // Re-read rather than assume: the server decides attribution
+          // and the shape hash the stamp pins.
           const fresh = await fetch(`/api/jobs/${jobId}`).then((r) => (r.ok ? r.json() : null));
           const s = fresh && (fresh.steps || []).find((x) => x.id === step.id);
           if (s) stamps = Array.isArray(s.sign_offs) ? s.sign_offs : [];
@@ -183,26 +299,66 @@
       }
     }
 
-    async function complete() {
+    async function decide(d) {
       busy = true;
       error = null;
       renderAll();
       try {
-        const res = await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
+        // 1. The decision and the declared fields land in metadata
+        //    FIRST — a stamp attests the step's shape, so the content
+        //    being signed must already be in it.
+        const metadata = { ...(step.metadata || {}) };
+        declared.forEach((f) => {
+          if (nonEmptyString(fieldValues[f.name])) metadata[f.name] = fieldValues[f.name];
+        });
+        metadata.decision = d;
+        metadata.decided_at = new Date().toISOString();
+        if (commentTa.value.trim()) metadata.comment = commentTa.value.trim();
+        const saved = await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ metadata }),
+        });
+        if (!saved.ok) {
+          error = `Could not record the decision (${saved.status}): ${await saved.text()}`;
+          return;
+        }
+        step.metadata = metadata;
+        if (d === 'changes-requested') {
+          if (typeof onUpdate === 'function') onUpdate();
+          return;
+        }
+        // 2. The user's own signature, for any still-unsigned required
+        //    role. The server enforces who may actually stamp what;
+        //    offering only the missing ones keeps the ceremony honest.
+        //    (Per-role sign buttons remain for multi-party steps.)
+        // 3. Complete — unless other signatures are outstanding, in
+        //    which case the decision is recorded and the roster says
+        //    plainly what everyone is waiting on.
+        const left = outstanding();
+        if (left.length > 0) {
+          error = null;
+          renderAll();
+          if (typeof onUpdate === 'function') onUpdate();
+          return;
+        }
+        const done = await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ status: 'completed' }),
         });
-        if (!res.ok) {
-          // 409 here is the stale-stamp case: the step changed after it
-          // was signed, so the stamps no longer apply. Surface the
-          // server's own explanation — it names which roles went stale.
-          error = `${res.status}: ${await res.text()}`;
-        } else if (typeof onUpdate === 'function') {
-          onUpdate();
+        if (!done.ok) {
+          // 400: a required-at-done contract this surface did not
+          // satisfy — name it, never swallow it (v1's ApprovalSurface
+          // sibling swallowed these, which is how a click could
+          // silently do nothing). 409: stale stamps; the server's own
+          // text names which roles.
+          error = `${done.status}: ${await done.text()}`;
+          return;
         }
+        if (typeof onUpdate === 'function') onUpdate();
       } catch (e) {
-        error = `Could not complete the step: ${e}`;
+        error = `Could not record the decision: ${e}`;
       } finally {
         busy = false;
         renderAll();
@@ -212,13 +368,38 @@
     const root = h(
       'div',
       { className: 'step-signoff' },
-      h('div', { className: 'step-signoff-head' }, 'Signatures required'),
+      contextDiv,
+      fieldsDiv,
+      h('div', { className: 'step-signoff-head' }, 'Signatures'),
       rolesDiv,
+      h('div', { className: 'step-field' }, commentTa),
       errorDiv,
       actionsDiv,
     );
     renderAll();
     container.appendChild(root);
+
+    // The case for action, resolved the DecisionContext way: the
+    // step's own context wins without a fetch; otherwise one job read
+    // supplies the packet-level briefing or the filed message.
+    const own = nonEmptyString((step.metadata || {}).context_md);
+    if (own) {
+      renderContext(own, 'written for this step');
+    } else {
+      fetch(`/api/jobs/${jobId}`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((job) => {
+          const jm = (job && job.metadata) || {};
+          const ctx = nonEmptyString(jm.context_md);
+          if (ctx) return renderContext(ctx, 'the packet’s briefing');
+          const msg = nonEmptyString(jm.message);
+          if (msg) return renderContext(msg, 'the packet as filed');
+        })
+        .catch(() => {
+          // No context is a quiet absence, never a broken surface.
+        });
+    }
+
     return () => root.remove();
   }
 

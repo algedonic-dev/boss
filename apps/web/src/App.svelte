@@ -13,6 +13,7 @@
   import { loadStepTypeRegistry } from './steps/surfaceRegistry.svelte';
   import { loadClasses } from '@boss/web-kit/session/classes.svelte';
   import AppShell from './shell/AppShell.svelte';
+  import UpdateBar from './shell/UpdateBar.svelte';
   import { APPS, appForSection, APP_SUBJECT_KINDS, type AppId } from './shell/nav-catalog';
   import { SECTION_FOR_ROUTE } from './shell/sections';
   import StepFocusPage from './steps/StepFocusPage.svelte';
@@ -197,6 +198,11 @@
   // on exactly the surface built for focused reading.
   let appKinds: ReadonlyArray<string> = $derived(APP_SUBJECT_KINDS[perspective] ?? []);
 </script>
+
+<!-- Every route, every state: a stale tab is stale regardless of
+     where it is parked (72c7c36e). Renders nothing until a deploy
+     actually lands. -->
+<UpdateBar />
 
 {#if route.kind === 'login'}
   <LoginPage />
