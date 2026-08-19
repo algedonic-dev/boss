@@ -1,0 +1,9 @@
+{
+  "name": "boss-uxprobe",
+  "private": true,
+  "type": "module",
+  "description": "Browser-truth checks against the live gateway (see README.md)",
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}

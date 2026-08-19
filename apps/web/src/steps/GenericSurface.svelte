@@ -177,6 +177,12 @@
   /// hidden.
   const HIDDEN_KEYS = new Set([
     'authority_role', 'due_on', 'notify_on_done', 'trigger_kind', 'trigger_name',
+    // The decision panel (DecisionContext, mounted by StepSurface
+    // above every platform surface) already renders context_md as the
+    // step's brief. Re-dumping it here printed the same brief twice on
+    // one screen — the second time as a flattened raw-markdown wall
+    // (browser-verified on the live gateway, 2026-08-19).
+    'context_md',
   ]);
   let contextEntries = $derived.by(() => {
     const declared = new Set((step.fields ?? []).map((f) => f.name));
