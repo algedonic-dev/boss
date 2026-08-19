@@ -17,7 +17,7 @@ pub struct ShippingCreate {
 impl ShippingCreate {
     pub fn new(shipping_base: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: crate::handlers::common::api_client(),
             shipping_base: shipping_base.into(),
         })
     }

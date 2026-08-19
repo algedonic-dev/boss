@@ -54,7 +54,7 @@ pub struct JobsCompleteStep {
 impl JobsCompleteStep {
     pub fn new(jobs_base: impl Into<String>, registry: Arc<StepRegistry>) -> Arc<Self> {
         Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: crate::handlers::common::api_client(),
             jobs_base: jobs_base.into(),
             registry,
         })

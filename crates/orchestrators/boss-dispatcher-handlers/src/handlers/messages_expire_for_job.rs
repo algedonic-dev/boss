@@ -36,7 +36,7 @@ pub struct MessagesExpireForJob {
 impl MessagesExpireForJob {
     pub fn new(messages_base: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: crate::handlers::common::api_client(),
             messages_base: messages_base.into(),
         })
     }

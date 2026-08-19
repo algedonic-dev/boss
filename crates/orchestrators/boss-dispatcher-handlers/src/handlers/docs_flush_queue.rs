@@ -26,7 +26,7 @@ pub struct DocsFlushQueue {
 impl DocsFlushQueue {
     pub fn new(docs_base: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: crate::handlers::common::api_client(),
             docs_base: docs_base.into(),
         })
     }

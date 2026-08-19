@@ -36,7 +36,7 @@ pub struct CommerceInvoiceIssue {
 impl CommerceInvoiceIssue {
     pub fn new(commerce_base: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: crate::handlers::common::api_client(),
             commerce_base: commerce_base.into(),
         })
     }

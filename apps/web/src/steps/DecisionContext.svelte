@@ -4,10 +4,10 @@
   // a choice; this panel is the default that makes one. Plugins are
   // exempt — a mounted plugin IS the bespoke presentation.
   //
-  // Text renders whitespace-preserved rather than through a markdown
-  // pipeline — the SPA has no markdown renderer today, and the review
-  // plugin's raw fallback proved readable. Swap the interior when one
-  // lands; the resolution chain stays.
+  // Prose renders through web-kit's escape-first markdown renderer
+  // (2244db9e) — safe for {@html} because every character is escaped
+  // before any tag the renderer emits.
+  import { renderMarkdown } from '@boss/web-kit/markdown';
   import { contextFromJob, contextFromStep } from './decisionContext';
   import type { DecisionContext } from './decisionContext';
 
@@ -65,7 +65,8 @@
       <span class="sdc-toggle">{collapsed ? 'show' : 'hide'}</span>
     </button>
     {#if !collapsed}
-      <div class="sdc-body">{resolved.text}</div>
+      <!-- eslint-disable-next-line svelte/no-at-html-tags — renderMarkdown escapes first -->
+      <div class="sdc-body">{@html renderMarkdown(resolved.text)}</div>
     {/if}
   </div>
 {/if}
@@ -110,9 +111,40 @@
     font-size: 13px;
     line-height: 1.6;
     color: var(--text, #1c1917);
-    white-space: pre-wrap;
     word-break: break-word;
     max-height: 22em;
     overflow-y: auto;
+  }
+  /* Rendered-markdown children ({@html} output is outside Svelte's
+     scoping, so :global). Tight rhythm — this is a briefing card. */
+  .sdc-body :global(p),
+  .sdc-body :global(ul),
+  .sdc-body :global(ol),
+  .sdc-body :global(blockquote) {
+    margin: 0 0 8px;
+  }
+  .sdc-body :global(pre) {
+    background: var(--bg, #f5f5f4);
+    padding: 8px 10px;
+    border-radius: 5px;
+    overflow-x: auto;
+    font-size: 12px;
+  }
+  .sdc-body :global(code) {
+    background: var(--bg, #f5f5f4);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 0.9em;
+  }
+  .sdc-body :global(table) {
+    border-collapse: collapse;
+    font-size: 12px;
+    margin: 0 0 8px;
+  }
+  .sdc-body :global(th),
+  .sdc-body :global(td) {
+    border: 1px solid var(--border, #e7e5e4);
+    padding: 3px 8px;
+    text-align: left;
   }
 </style>

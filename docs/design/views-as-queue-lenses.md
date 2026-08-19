@@ -74,44 +74,22 @@ endpoint carries from its first version — hold for views too.
 
 ## Open questions
 
-### Q1: What is the lens registry's row shape?
+None — every question was answered in review `6f33df26` on 2026-08-19; see Decision history.
 
-Proposed: `lenses(id, title, queue_predicates jsonb, presentation,
-flow_window, scope, owner_role)` — predicates in the same `boss-expr`
-surface the admission edge evaluates (PPP's one-evaluator rule),
-presentation naming a registered renderer the way `step_plugins`
-rows name bundles, scope as the canvas layers carry it. Append-only,
-versioned, seeded from the table above.
+## Decision history
 
-### Q2: Are presentations code or data?
+**Q1 — What is the lens registry's row shape (decided by David in review `6f33df26`, 2026-08-19).**
+`lenses(id, title, queue_predicates jsonb, presentation, flow_window, scope, owner_role)` — predicates in the same `boss-expr` surface the admission edge evaluates (PPP's one-evaluator rule), presentation naming a registered renderer the way `step_plugins` rows name bundles, scope as the canvas layers carry it. Append-only, versioned, seeded from the table above.
 
-Proposed: registered renderers (board, cards, kanban, list) ship in
-core as the vocabulary; a lens row picks one plus options. Bespoke
-presentations follow the StepPlugin escape hatch — a plugin bundle
-named by the row — so a new view idiom never requires a core change.
-Board and kanban land first (departure board, TriageBoard).
+**Q2 — Are presentations code or data (decided by David in review `6f33df26`, 2026-08-19).**
+registered renderers (board, cards, kanban, list) ship in core as the vocabulary; a lens row picks one plus options. Bespoke presentations follow the StepPlugin escape hatch — a plugin bundle named by the row — so a new view idiom never requires a core change. Board and kanban land first (departure board, TriageBoard).
 
-### Q3: What does the flow strip compute, exactly?
+**Q3 — What does the flow strip compute, exactly (decided by David in review `6f33df26`, 2026-08-19).**
+depth (now), arrivals/drains over the window, oldest waiting, and a small trend — all from marker events joined on `step_id`, windowed like `/api/views/stages`. One shared endpoint: `/api/views/flow-strip?lens=<id>`, cached at the os-map cadence. The strip is the algedonic surface: a queue nobody drains shows itself on every page that renders it.
 
-Proposed: depth (now), arrivals/drains over the window, oldest
-waiting, and a small trend — all from marker events joined on
-`step_id`, windowed like `/api/views/stages`. One shared endpoint:
-`/api/views/flow-strip?lens=<id>`, cached at the os-map cadence.
-The strip is the algedonic surface: a queue nobody drains shows
-itself on every page that renders it.
+**Q4 — Do the bespoke pages get deleted as they convert (decided by David in review `6f33df26`, 2026-08-19).**
+yes, ruthlessly (§1, "delete code freely") — each conversion car deletes the page's fetch/filter/render code in the same diff, the way os-map retires into the canvas. A page that survives conversion is a lens row plus at most a thin route alias.
 
-### Q4: Do the bespoke pages get deleted as they convert?
+**Q5 — In what order do the cars run (decided by David in review `6f33df26`, 2026-08-19).**
+(1) the lens registry + renderer + flow strip, proven by the departure board as first tenant; (2) TriageBoard (kanban renderer, columns-as-queues); (3) Design Review + Fleet; (4) JobsList as the lens builder; (5) My Day retrofit onto the registry it predates. The canvas proceeds independently on its approved design and adopts lens scoping when both exist.
 
-Proposed: yes, ruthlessly (§1, "delete code freely") — each
-conversion car deletes the page's fetch/filter/render code in the
-same diff, the way os-map retires into the canvas. A page that
-survives conversion is a lens row plus at most a thin route alias.
-
-### Q5: In what order do the cars run?
-
-Proposed: (1) the lens registry + renderer + flow strip, proven by
-the departure board as first tenant; (2) TriageBoard (kanban
-renderer, columns-as-queues); (3) Design Review + Fleet; (4)
-JobsList as the lens builder; (5) My Day retrofit onto the registry
-it predates. The canvas proceeds independently on its approved
-design and adopts lens scoping when both exist.

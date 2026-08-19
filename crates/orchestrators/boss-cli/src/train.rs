@@ -2148,6 +2148,14 @@ impl Conductor {
     fn new(cfg: Config, forge: Box<dyn Forge>) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            .default_headers({
+                // Machine token (7fcd78fa phase 1): rides as a default
+                // header so every jobs-API verb the conductor runs
+                // carries it once the operator configures one.
+                let mut h = reqwest::header::HeaderMap::new();
+                boss_core::machine_token::attach(&mut h);
+                h
+            })
             .build()?;
         Ok(Conductor { cfg, http, forge })
     }

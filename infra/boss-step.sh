@@ -150,7 +150,9 @@ payload=$(printf '%s' "$merged" | jq -c '{status: "completed", metadata: .}')
 step_id=$(printf '%s' "$step" | jq -r '.id')
 url="$BASE/api/jobs/$job_id/steps/$step_id"
 if ! put_err=$(curl -fsS -X PUT -H "content-type: application/json" \
-        -H "x-boss-user: $BOSS_USER" -d "$payload" "$url" 2>&1 >/dev/null); then
+        -H "x-boss-user: $BOSS_USER" \
+        ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
+        -d "$payload" "$url" 2>&1 >/dev/null); then
     echo "boss-step: PUT failed — $put_err" >&2
     exit 1
 fi

@@ -72,7 +72,7 @@ pub struct MessagesNotifyJobTerminal {
 impl MessagesNotifyJobTerminal {
     pub fn new(jobs_base: impl Into<String>, messages_base: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: crate::handlers::common::api_client(),
             jobs_base: jobs_base.into(),
             messages_base: messages_base.into(),
         })

@@ -33,7 +33,7 @@ pub struct WebhookNotify {
 impl WebhookNotify {
     pub fn new(webhook_url: Option<String>) -> Arc<Self> {
         Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: crate::handlers::common::api_client(),
             webhook_url: webhook_url.filter(|s| !s.trim().is_empty()),
         })
     }

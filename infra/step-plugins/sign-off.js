@@ -116,6 +116,19 @@
     function renderContext(text, sourceLabel) {
       contextDiv.replaceChildren();
       if (!text) return;
+      // The case renders as MARKDOWN when the host provides its
+      // escape-first renderer (window.__boss_markdown, one definition
+      // for every bundle — 2244db9e), and as preserved text when it
+      // does not (older SPA, tests). The innerHTML is earned by the
+      // renderer's contract: everything is escaped before any tag it
+      // emits, hrefs are http(s)/relative only.
+      const render = window.__boss_markdown;
+      const body = h('div', { className: 'step-signoff-context-body' });
+      if (typeof render === 'function') {
+        body.innerHTML = render(text);
+      } else {
+        body.textContent = text;
+      }
       contextDiv.appendChild(
         h(
           'div',
@@ -126,7 +139,7 @@
             h('span', { className: 'step-signoff-context-title' }, 'What this decision is about'),
             h('span', { className: 'step-signoff-context-source' }, sourceLabel),
           ),
-          h('div', { className: 'step-signoff-context-body' }, text),
+          body,
         ),
       );
     }

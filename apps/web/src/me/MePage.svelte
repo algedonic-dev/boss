@@ -35,6 +35,7 @@
   import PacketCard from '@boss/web-kit/ui/PacketCard.svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
+  import DecideModal from './DecideModal.svelte';
 
   // The session rune exposes the current user. The fetch effect
   // tracks exactly (id, role) — the two halves of the lens query:
@@ -85,13 +86,15 @@
   let protocol = $state<string | null>(null);
   const protocols = $derived(protocolCounts(queues));
   const shown = $derived({
+    verdicts: filterByProtocol(queues?.verdicts ?? [], protocol),
     mine: filterByProtocol(queues?.mine ?? [], protocol),
     upForGrabs: filterByProtocol(queues?.upForGrabs ?? [], protocol),
     notMineToDo: filterByProtocol(queues?.notMineToDo ?? [], protocol),
     inFlightElsewhere: filterByProtocol(queues?.inFlightElsewhere ?? [], protocol),
   });
   const totalShown = $derived(
-    shown.mine.length +
+    shown.verdicts.length +
+      shown.mine.length +
       shown.upForGrabs.length +
       shown.notMineToDo.length +
       shown.inFlightElsewhere.length,
@@ -133,6 +136,20 @@
       cancelled = true;
     };
   });
+
+  // The verdict being decided in the modal (feedback 0ab5fa3a). One at
+  // a time by construction; closing without deciding changes nothing.
+  let deciding = $state<AssignmentRow | null>(null);
+
+  // The step reached a terminal status inside the modal: the row is no
+  // longer a verdict, so refetch the queues. The modal stays up — the
+  // surface is showing its receipt — and Close hands back a list the
+  // decided row has already left.
+  async function onDecided() {
+    if (userId && userRole) {
+      queues = await fetchMyDay(userId, userRole);
+    }
+  }
 
   // The claim hop. A 409 names the winner — losing a race is
   // ordinary queue life, so it reads as information, not an error.
@@ -220,6 +237,34 @@
     {/if}
 
     <div class="me-grid">
+      <!-- Verdicts first (d598681f, accepted 2026-08-19): the steps
+           that need YOUR decision — sign-offs, reviews, corrections —
+           separated from work you merely own, because 47 rows of
+           "mine" made the two indistinguishable. -->
+      <Section title="Yours to decide" wide>
+        {#if loading}
+          <div class="myday-loading">Loading…</div>
+        {:else if shown.verdicts.length === 0}
+          <div class="myday-empty">No verdicts waiting on you.</div>
+        {:else}
+          <div class="myday-jobs-list">
+            {#each shown.verdicts as row (row.step.id)}
+              <!-- Decide beside the card, the same grammar as Claim:
+                   the card is the packet, the button is the queue
+                   mechanic. It opens the step's real surface in a
+                   modal, so a docket of verdicts is decide → next
+                   without leaving the queue (feedback 0ab5fa3a). -->
+              <div class="myday-grab-row">
+                <PacketCard card={assignmentPacket(row)} />
+                <button class="myday-claim-btn" onclick={() => (deciding = row)}>
+                  Decide
+                </button>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </Section>
+
       <Section title="My queue" wide>
         {#if loading}
           <div class="myday-loading">Loading your queue…</div>
@@ -394,6 +439,15 @@
       </Section>
     </div>
   </div>
+
+  {#if deciding}
+    <DecideModal
+      jobId={deciding.job_id}
+      stepId={deciding.step.id}
+      onClose={() => (deciding = null)}
+      {onDecided}
+    />
+  {/if}
 {/if}
 
 <style>

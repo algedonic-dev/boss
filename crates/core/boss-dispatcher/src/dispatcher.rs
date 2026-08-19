@@ -65,6 +65,7 @@ impl DispatcherCtx {
                 if let Ok(v) = reqwest::header::HeaderValue::from_str(&actor) {
                     h.insert("x-boss-user", v);
                 }
+                boss_core::machine_token::attach(&mut h);
                 h
             })
             .build()

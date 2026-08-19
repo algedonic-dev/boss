@@ -10,6 +10,7 @@ pub mod http_client;
 pub mod id;
 pub mod job;
 pub mod knowledge;
+pub mod machine_token;
 pub mod money;
 pub mod port;
 pub mod primitives;

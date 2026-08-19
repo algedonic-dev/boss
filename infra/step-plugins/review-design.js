@@ -423,12 +423,23 @@
       } else if (doc.markdown) {
         // A SELF-CARRIED packet's prose is NOT server-rendered and NOT
         // in the same trust domain — it is whatever the author put in
-        // step metadata. So it goes in as TEXT, never innerHTML. The
-        // branch above earns its innerHTML by being pulldown_cmark
-        // output; this one has earned nothing.
-        const prose = h('pre', { className: 'srd-rawmd' });
-        prose.textContent = doc.markdown;
-        inner.appendChild(prose);
+        // step metadata. The host's escape-first renderer
+        // (window.__boss_markdown, web-kit's renderMarkdown) makes it
+        // READABLE without trusting it: every character is escaped
+        // before any tag the renderer emits, and hrefs admit only
+        // http(s)/relative (2244db9e — "showed special markdown
+        // characters"). Absent the host renderer (older SPA, tests),
+        // the preserved-text fallback stands.
+        const render = window.__boss_markdown;
+        if (typeof render === 'function') {
+          const prose = h('div', { className: 'srd-doc-inner-md' });
+          prose.innerHTML = render(doc.markdown);
+          inner.appendChild(prose);
+        } else {
+          const prose = h('pre', { className: 'srd-rawmd' });
+          prose.textContent = doc.markdown;
+          inner.appendChild(prose);
+        }
       }
       docPane.appendChild(inner);
       bodyDiv.appendChild(docPane);

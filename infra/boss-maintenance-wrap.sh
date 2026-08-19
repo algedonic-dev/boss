@@ -71,6 +71,7 @@ fi
 
 curl -fsS -X POST "$BASE/api/jobs" \
     -H "x-boss-user: $BOSS_USER" -H "content-type: application/json" \
+    ${BOSS_MACHINE_TOKEN:+-H "x-boss-machine-token: $BOSS_MACHINE_TOKEN"} \
     -d "$(jq -n --arg kind "$KIND" --arg label "$LABEL" --arg today "$(date +%F)" '{
         kind: $kind,
         subject: {subject_kind: "custom", id: ("infra/" + $kind)},

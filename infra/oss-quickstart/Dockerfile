@@ -240,6 +240,17 @@ COPY infra/postgres /opt/boss/infra/postgres
 # MUST be available — seed-operator-baseline.sh reads this dir to POST
 # them to /api/people once the stack is up.
 COPY infra/operator-baseline /opt/boss/infra/operator-baseline
+# The platform Workflow bundle — protocols shipped as DATA
+# (protocols-as-data step 1). bootstrap-db.sh seeds it insert-if-
+# missing at ../platform/workflows.toml relative to itself, and until
+# this COPY existed that path was absent from the image, so the seed
+# SILENTLY SKIPPED on every cluster boot: ten bundle kinds (the eight
+# timer-maintenance protocols among them) never reached the SoR, and
+# every boss-gcp maintenance unit died on a 400 posting a packet of an
+# unknown kind — deploy-confirm and the conservation checks included,
+# red on every tick since the cutover, invisible because a failed
+# oneshot notifies nobody (found 2026-08-19).
+COPY infra/platform /opt/boss/infra/platform
 # Dispatcher rule registry — boss-dispatcher's side-effect runner reads
 # BOSS_DISPATCHER_RULES (set in docker-compose.yml) which points at
 # /opt/boss/infra/dispatcher/rules.toml. Without this dir the rules runner

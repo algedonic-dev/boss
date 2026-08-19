@@ -16,7 +16,7 @@ use boss_nats::NatsEventBus;
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -346,6 +346,26 @@ async fn run_server<R: JobsRepository + 'static>(
     let app = app.layer(axum::middleware::from_fn(
         boss_policy_client::request_context_middleware,
     ));
+    // The machine door's write gate (7fcd78fa phase 1): when
+    // BOSS_MACHINE_TOKEN is set, state-changing requests must carry
+    // it. Layered in the binary — this process is the one that knows
+    // the door is on a network — and wrapping the merged app so the
+    // scheduling/cadence routers are behind the same gate.
+    let machine_token = boss_core::machine_token::from_env();
+    if machine_token.is_some() {
+        info!(
+            "machine token configured: writes require {}",
+            boss_core::machine_token::HEADER
+        );
+    } else {
+        warn!(
+            "no BOSS_MACHINE_TOKEN configured: the machine door accepts unauthenticated writes \
+             (7fcd78fa phase 1 is dormant)"
+        );
+    }
+    let app = app.layer(axum::middleware::from_fn(move |req, next| {
+        boss_jobs::http::machine_gate::machine_gate(machine_token.clone(), req, next)
+    }));
     let http_addr: SocketAddr = http_bind
         .parse()
         .with_context(|| format!("invalid http_bind `{http_bind}`"))?;

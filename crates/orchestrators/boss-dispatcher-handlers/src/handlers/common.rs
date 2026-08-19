@@ -157,6 +157,21 @@ pub fn dispatcher_reader_header() -> String {
     .to_string()
 }
 
+/// The client every handler's production constructor uses: a plain
+/// reqwest client that carries the machine token as a default header
+/// when the process has one configured (7fcd78fa phase 1). One
+/// definition, so a new handler cannot forget the token by writing
+/// `Client::new()` out of habit -- the gate's 401 names the header if
+/// one does.
+pub fn api_client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    boss_core::machine_token::attach(&mut headers);
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("reqwest client always builds")
+}
+
 pub fn dispatcher_actor_header(rule_name: &str) -> String {
     serde_json::json!({
         "id": format!("rule:{}", rule_name),

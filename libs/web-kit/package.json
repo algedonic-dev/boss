@@ -7,6 +7,7 @@
     "./ui/*": "./src/ui/*",
     "./session/*": "./src/session/*",
     "./nav": "./src/nav.ts",
+    "./markdown": "./src/markdown.ts",
     "./sim-clock": "./src/sim-clock.svelte.ts",
     "./sim-clock-types": "./src/sim-clock-types.ts",
     "./SystemTime.svelte": "./src/SystemTime.svelte",

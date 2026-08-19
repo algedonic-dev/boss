@@ -856,6 +856,7 @@ pub mod live {
             if let Ok(v) = reqwest::header::HeaderValue::from_str(&actor) {
                 headers.insert("x-boss-user", v);
             }
+            boss_core::machine_token::attach(&mut headers);
             // Mark every outbound call as part of a simulated event
             // chain. Receivers' SimOrigin middleware extracts this
             // and sets the per-request task-local so the publisher

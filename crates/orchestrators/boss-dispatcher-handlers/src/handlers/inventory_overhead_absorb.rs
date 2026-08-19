@@ -44,7 +44,7 @@ pub struct InventoryOverheadAbsorb {
 impl InventoryOverheadAbsorb {
     pub fn new(jobs_base: impl Into<String>, inventory_base: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: crate::handlers::common::api_client(),
             jobs_base: jobs_base.into(),
             inventory_base: inventory_base.into(),
         })

@@ -77,6 +77,19 @@ pub async fn inject_role_headers(
         if let Ok(val) = axum::http::HeaderValue::from_str(&session.access_tier) {
             req.headers_mut().insert("x-boss-access-tier", val);
         }
+        // Machine token (7fcd78fa phase 1): the gateway vouches for
+        // session-authenticated browser traffic at the machine door.
+        // Stamped INSIDE the session branch on purpose — the token
+        // asserts "this write came through an authenticated front
+        // door", and stamping it on sessionless traffic would turn the
+        // door's one credential into a blanket pass. The edge strip
+        // above already removed any client-forged copy (x-boss-*).
+        if let Some(token) = boss_core::machine_token::from_env()
+            && let Ok(val) = axum::http::HeaderValue::from_str(&token)
+        {
+            req.headers_mut()
+                .insert(boss_core::machine_token::HEADER, val);
+        }
     }
 
     next.run(req).await

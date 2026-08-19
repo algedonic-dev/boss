@@ -53,7 +53,33 @@ export type Completion =
   | 'external'
   | 'auto-on-materialize';
 
+/// The step kinds whose completion IS a decision — a verdict someone
+/// renders, not work someone performs. Decided by David (d598681f,
+/// accepted 2026-08-19): My Day partitions "yours to DECIDE" from
+/// "yours because you own it", on exactly the kind + completion facts
+/// the row already carries. A kind roster is a deliberate,
+/// presentation-only trade: it can lag a new decision kind (which then
+/// lands in the owned list — visible, never lost), and the honest
+/// upgrade is a `decision_shaped` flag on the StepType registry when a
+/// second consumer wants this split.
+export const VERDICT_KINDS: ReadonlySet<string> = new Set([
+  'sign-off',
+  'answer-question',
+  'correction-verdict',
+  'review-design',
+]);
+
+export function isVerdict(row: AssignmentRow): boolean {
+  return (
+    VERDICT_KINDS.has(row.step.kind) &&
+    (row.step.completion ?? 'human') === 'human'
+  );
+}
+
 export type MyDayQueues = Readonly<{
+  /** Assigned to you AND verdict-shaped: sign-offs, reviews,
+   *  corrections — the "what actually needs ME" list (d598681f). */
+  verdicts: readonly AssignmentRow[];
   mine: readonly AssignmentRow[];
   /** Unassigned, role-matched, and a PERSON has to do it. */
   upForGrabs: readonly AssignmentRow[];
@@ -115,12 +141,15 @@ export function splitQueues(
   rows: readonly AssignmentRow[],
   uid: string,
 ): MyDayQueues {
-  const mine = rows.filter(r => r.step.assignee_id === uid);
+  const assigned = rows.filter(r => r.step.assignee_id === uid);
+  const verdicts = assigned.filter(isVerdict);
+  const mine = assigned.filter(r => !isVerdict(r));
   const unclaimed = rows.filter(r => !r.step.assignee_id);
   const inFlightElsewhere = rows.filter(
     r => r.step.assignee_id && r.step.assignee_id !== uid,
   );
   return {
+    verdicts: orderQueue(verdicts),
     mine: orderQueue(mine),
     upForGrabs: orderQueue(unclaimed.filter(needsAPerson)),
     // An `agent`-completion step sitting unclaimed in a person's queue

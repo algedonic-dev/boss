@@ -64,6 +64,7 @@ pub const SUPPORT_CASE_UPDATED: &str = "accounts.support-case.updated";
 /// context (else `automation:accounts`), and its clock probe settles
 /// `_simulated` — the same envelope the retired post-commit emits
 /// carried (outbox phase 2).
+#[cfg(feature = "postgres")]
 pub(crate) async fn event_stamp(
     publisher: &Option<boss_core::publisher::DomainPublisher>,
     now: chrono::DateTime<chrono::Utc>,

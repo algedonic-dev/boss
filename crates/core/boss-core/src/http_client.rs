@@ -89,8 +89,14 @@ impl<S: ServiceLabel> std::error::Error for HttpClientError<S> {}
 /// ```
 pub fn base(base_url: impl Into<String>) -> (String, reqwest::Client) {
     let base_url = base_url.into().trim_end_matches('/').to_string();
+    // Every folded client carries the machine token when the process
+    // has one configured (machine_token.rs) — attaching here is what
+    // makes "wire every writer" one definition instead of a checklist.
+    let mut headers = reqwest::header::HeaderMap::new();
+    crate::machine_token::attach(&mut headers);
     let http = reqwest::Client::builder()
         .timeout(CLIENT_TIMEOUT)
+        .default_headers(headers)
         .build()
         .expect("building reqwest client");
     (base_url, http)

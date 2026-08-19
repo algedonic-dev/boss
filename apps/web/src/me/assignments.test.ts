@@ -171,6 +171,7 @@ describe('protocol filtering', () => {
     upForGrabs: [row({ workflow: 'approval' })],
     notMineToDo: [row({ workflow: 'demand-forecast' })],
     inFlightElsewhere: [row({ workflow: 'user-feedback' })],
+    verdicts: [],
   };
 
   test('counts every protocol across all four queues, busiest first', () => {
@@ -199,5 +200,36 @@ describe('protocol filtering', () => {
     // "no filter" — that would silently show everything at the moment
     // the operator believes they are looking at one protocol.
     expect(filterByProtocol(queues.mine, 'retired-protocol')).toHaveLength(0);
+  });
+});
+
+// d598681f, accepted 2026-08-19: verdicts split from owned work.
+import { isVerdict } from './assignments';
+
+describe('verdicts split from owned work', () => {
+  const row = (kind: string, completion?: 'human' | 'agent') =>
+    ({
+      job_id: 'j1', job_title: 't', workflow: 'w', subject_kind: 'custom',
+      subject_id: 's', priority: 'standard',
+      step: { id: kind, job_id: 'j1', kind, title: 't', status: 'ready',
+              assignee_id: 'me', completion: completion ?? 'human' },
+    }) as never;
+
+  test('sign-offs and reviews are verdicts; tasks are owned work', () => {
+    expect(isVerdict(row('sign-off'))).toBe(true);
+    expect(isVerdict(row('review-design'))).toBe(true);
+    expect(isVerdict(row('correction-verdict'))).toBe(true);
+    expect(isVerdict(row('task'))).toBe(false);
+    expect(isVerdict(row('checklist'))).toBe(false);
+  });
+
+  test('an agent-completed kind is never a verdict for a person', () => {
+    expect(isVerdict(row('sign-off', 'agent'))).toBe(false);
+  });
+
+  test('splitQueues partitions assigned rows into verdicts and mine', () => {
+    const q = splitQueues([row('sign-off'), row('task')], 'me');
+    expect(q.verdicts.map((r) => r.step.kind)).toEqual(['sign-off']);
+    expect(q.mine.map((r) => r.step.kind)).toEqual(['task']);
   });
 });
