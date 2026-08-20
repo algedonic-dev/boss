@@ -1,0 +1,8 @@
+[[invariant]]
+id = "a-boot-read-data-file-ships-in-the-image"
+claim = "Every data file a boot-path script reads conditionally (bootstrap-db.sh's bundle seed, the operator-baseline hires, the dispatcher rules) is COPY'd into the runtime image, and the script says so LOUDLY when the file is absent instead of skipping in silence."
+source = "infra/postgres/bootstrap-db.sh (the platform-bundle seed guard); infra/oss-quickstart/Dockerfile (the runtime COPY block); the 2026-08-19 finding"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = "2026-08-19"
+note = "The failure this names cost two silent days: the platform Workflow bundle landed in-tree on 2026-08-17, bootstrap-db.sh seeds it only `if [ -f ]`, and the image never COPY'd infra/platform/ — so every cluster boot skipped the seed wordlessly, ten bundle kinds never reached the system of record, and all eight timer-maintenance units on boss-gcp (deploy-confirm and the conservation checks among them) died on every tick posting packets of unknown kinds, invisible because a failed oneshot notifies nobody. The absent-file branch now warns loudly, which converts the next instance of this class from archaeology into a boot-log line. What WOULD enforce it: a lint that extracts every `$(dirname $0)/..`-style data path a boot script tests for and asserts the Dockerfile COPYs a prefix of it; the narrow tractable version is a fixed list (platform/, operator-baseline/, dispatcher/, postgres/) asserted present in the runtime stage's COPY set, which would have caught exactly this."
