@@ -171,6 +171,15 @@ if PLATFORM_WF_BIN="$(find_boss_bin boss-platform-workflow-seed)"; then
         "$PLATFORM_WF_BIN" \
             --database-url "$BUILD_URL" \
             --seed-path "$PLATFORM_WF_TOML" 2>&1 | grep -E "inserted|already present|seed:" || true
+    else
+        # LOUD, deliberately. This exact silence cost two days: the
+        # image lacked infra/platform/, the [ -f ] guard skipped the
+        # seed without a word on every cluster boot, ten bundle kinds
+        # never reached the registry, and every timer unit posting one
+        # of them died on a 400 nobody saw (2026-08-19). A missing
+        # bundle is a packaging fault and must read like one.
+        echo "  WARNING: platform Workflow bundle NOT FOUND at $PLATFORM_WF_TOML — the seed" >&2
+        echo "  is being SKIPPED; bundle-supplied kinds will be missing from this deployment" >&2
     fi
 fi
 
