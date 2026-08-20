@@ -10,4 +10,5 @@ pub mod audit;
 pub mod local_auth;
 pub mod mail;
 pub mod oidc;
+pub mod passkey;
 pub mod session;

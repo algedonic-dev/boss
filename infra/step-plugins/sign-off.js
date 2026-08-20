@@ -284,16 +284,95 @@
       renderError();
     }
 
+    // Presence ceremony (docs/design/presence.md): a presence-gated
+    // step refuses a plain stamp with 422 {required:"presence"}; the
+    // passkey then signs a challenge bound to this step's CURRENT
+    // shape hash and the stamp retries with the issued ticket. Plugins
+    // are self-contained bundles, so the ceremony rides along here
+    // rather than importing the app's helper. No fallback path (Q3).
+    const b64uBytes = (s) => {
+      const pad = s.length % 4 === 2 ? '==' : s.length % 4 === 3 ? '=' : '';
+      return Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/') + pad), (c) =>
+        c.charCodeAt(0),
+      );
+    };
+    const bytesB64u = (buf) =>
+      btoa(String.fromCharCode(...new Uint8Array(buf)))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+    async function presenceTicket() {
+      const begin = await fetch('/api/auth/passkey/assert/begin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_id: jobId, step_id: step.id }),
+      });
+      if (begin.status === 409) throw new Error('No passkey enrolled — add one first.');
+      if (!begin.ok) throw new Error(`presence ceremony unavailable (${begin.status})`);
+      const opts = await begin.json();
+      const cred = await navigator.credentials.get({
+        publicKey: {
+          challenge: b64uBytes(opts.publicKey.challenge).buffer,
+          rpId: opts.publicKey.rpId || undefined,
+          allowCredentials: (opts.publicKey.allowCredentials || []).map((c) => ({
+            type: c.type,
+            id: b64uBytes(c.id).buffer,
+          })),
+          userVerification: opts.publicKey.userVerification,
+          timeout: opts.publicKey.timeout,
+        },
+      });
+      if (!cred) throw new Error('Passkey prompt returned no credential.');
+      const a = cred.response;
+      const finish = await fetch('/api/auth/passkey/assert/finish', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          challenge_id: opts.challenge_id,
+          credential: {
+            id: cred.id,
+            rawId: bytesB64u(cred.rawId),
+            type: cred.type,
+            response: {
+              authenticatorData: bytesB64u(a.authenticatorData),
+              clientDataJSON: bytesB64u(a.clientDataJSON),
+              signature: bytesB64u(a.signature),
+              userHandle: a.userHandle ? bytesB64u(a.userHandle) : null,
+            },
+          },
+        }),
+      });
+      if (!finish.ok) throw new Error(`assertion rejected (${finish.status})`);
+      return (await finish.json()).ticket;
+    }
+
     async function sign(role) {
       busy = true;
       error = null;
       renderAll();
       try {
-        const res = await fetch(`/api/jobs/${jobId}/steps/${step.id}/sign-offs`, {
+        let res = await fetch(`/api/jobs/${jobId}/steps/${step.id}/sign-offs`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ role }),
         });
+        if (res.status === 422) {
+          const refusal = await res
+            .clone()
+            .json()
+            .catch(() => null);
+          if (refusal && refusal.required === 'presence') {
+            const ticket = await presenceTicket();
+            res = await fetch(`/api/jobs/${jobId}/steps/${step.id}/sign-offs`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-presence-ticket': ticket,
+              },
+              body: JSON.stringify({ role }),
+            });
+          }
+        }
         if (!res.ok) {
           error = `Could not record the ${role} signature (${res.status}). ${await res.text()}`;
         } else {

@@ -1,9 +1,9 @@
 # Design: Kanidm IDM — the front door for real people (and agents)
 
 **Status:** draft — open questions tracked at `/system/design`
-**Origin:** David's direction (2026-08-10): Kanidm runs on the GCP box
-and provides IDM to the Playground on the local cluster. Item
-`98816e6a`.
+**Origin:** David's direction (2026-08-10): Kanidm provides IDM to
+the Playground; originally planned for the GCP box, deployed
+in-cluster (see Topology and the Q5 amendment). Item `98816e6a`.
 **Related**: [dev-cluster.md](./dev-cluster.md) ·
 [payload-encryption.md](./payload-encryption.md) (the other half of
 "real people arrive")
@@ -17,16 +17,23 @@ are a bootstrap tool, not one. Kanidm fits the house style: Rust,
 single binary, passkey-first, a real OIDC provider, and its own
 state — no external database.
 
-Topology: Kanidm lives on the GCP box (stable public IP, survives
-cluster churn — the "admin seat in the sky" role), serving the
-Playground wherever it runs. The cluster is a *client* of identity,
-never its host: rebuilding the cluster must not lose the company's
-logins.
+Topology: Kanidm runs **in-cluster** — StatefulSet `kanidm-0` in
+namespace `kanidm`, served at `10.20.0.31`, terminating its own TLS
+(ratified under Q5 below; corrected here from the original "GCP box"
+plan via correct-the-record `4c8259ea`). The original invariant —
+rebuilding the cluster must not lose the company's logins — is now
+carried by state replication rather than host placement: an
+online-backup sidecar ships Kanidm's state to boss-gcp hourly
+(`/var/backups/kanidm`), so a cluster rebuild restores the IdP from
+the last shipment. The inversion has a consequence the old text hid:
+cluster repair must never depend on in-cluster Kanidm being up, so
+break-glass local auth (below) is load-bearing for exactly that
+path, and the DR runbook's access-recovery story is the other half.
 
 ## The shape
 
 ```
-person/agent ──(OIDC auth-code, passkey)──► Kanidm (GCP box)
+person/agent ──(OIDC auth-code, passkey)──► Kanidm (in-cluster, ns kanidm)
                                               │ id_token: sub, email, groups
                                               ▼
                       boss-gateway (OIDC client, session issuer)

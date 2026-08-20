@@ -629,6 +629,41 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
     // CredentialStore + the session_key + an http client for
     // bootstrap_email lookups against boss-people-api).
     if let Some(la) = local_auth_state {
+        // Passkey ceremony (docs/design/presence.md, packet 7218c3f1):
+        // best-effort mount — a malformed BOSS_PUBLIC_URL must degrade
+        // to "no passkey routes", never crash the front door.
+        let app = match boss_gateway::passkey::PasskeyState::from_env(la.session_key.clone()) {
+            Ok(pk) => {
+                let pk = std::sync::Arc::new(pk);
+                app.route(
+                    "/api/auth/passkey/register/begin",
+                    axum::routing::post(boss_gateway::passkey::register_begin)
+                        .with_state(pk.clone()),
+                )
+                .route(
+                    "/api/auth/passkey/register/finish",
+                    axum::routing::post(boss_gateway::passkey::register_finish)
+                        .with_state(pk.clone()),
+                )
+                .route(
+                    "/api/auth/passkey/assert/begin",
+                    axum::routing::post(boss_gateway::passkey::assert_begin).with_state(pk.clone()),
+                )
+                .route(
+                    "/api/auth/passkey/assert/finish",
+                    axum::routing::post(boss_gateway::passkey::assert_finish)
+                        .with_state(pk.clone()),
+                )
+                .route(
+                    "/api/auth/passkey/credentials",
+                    axum::routing::get(boss_gateway::passkey::credentials_list).with_state(pk),
+                )
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "passkey ceremony not mounted");
+                app
+            }
+        };
         app.route(
             "/api/auth/login",
             axum::routing::post(local_auth::login).with_state(la.clone()),

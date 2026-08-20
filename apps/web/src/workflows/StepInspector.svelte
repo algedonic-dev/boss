@@ -180,6 +180,25 @@
     />
   </label>
 
+  <label class="jk-field">
+    <span class="jk-field-label">
+      Assurance
+      <span class="jk-field-hint">presence = passkey signs the step's content</span>
+    </span>
+    <select
+      value={step.assurance_required ?? ''}
+      onchange={(e) => {
+        const v = (e.target as HTMLSelectElement).value;
+        onpatch({
+          assurance_required: v === 'presence' ? 'presence' : null,
+        });
+      }}
+    >
+      <option value="">session (default)</option>
+      <option value="presence">presence</option>
+    </select>
+  </label>
+
   <div class="jk-field jk-field-terminal">
     <label class="jk-check">
       <input

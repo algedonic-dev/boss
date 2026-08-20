@@ -316,6 +316,13 @@ pub struct SignOffStamp {
     /// exactly what it was.
     #[serde(default)]
     pub assurance: Assurance,
+    /// Presence stamps only: the server nonce folded into the WebAuthn
+    /// challenge (`sha256(shape_hash || ":" || nonce)`). Recorded so a
+    /// stamp names the exact single-use challenge that produced it —
+    /// the audit trail from stamp back to ceremony. Absent on Session
+    /// stamps and on every stamp written before presence existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_nonce: Option<String>,
 }
 
 /// Hash of a step's completion-relevant content — what a sign-off

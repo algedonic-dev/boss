@@ -4,6 +4,7 @@
 
   import { session } from '@boss/web-kit/session/session.svelte';
   import { appNow, appToday } from '@boss/web-kit/sim-clock';
+  import { needsPresence, performPresenceCeremony } from './presence';
 
   type StepData = {
     id: string;
@@ -64,11 +65,30 @@
       });
       const required = step.sign_offs_required ?? [];
       if (required.includes(userRole)) {
-        await fetch(`/api/jobs/${jobId}/steps/${step.id}/sign-offs`, {
+        const stamp = await fetch(`/api/jobs/${jobId}/steps/${step.id}/sign-offs`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ role: userRole }),
         });
+        // A presence-gated step refuses a plain session stamp; run
+        // the passkey ceremony against this step's current shape and
+        // retry with the issued ticket. No fallback: if the ceremony
+        // fails, the refusal surfaces and the step waits (Q3).
+        if (await needsPresence(stamp)) {
+          try {
+            const ticket = await performPresenceCeremony(jobId, step.id);
+            await fetch(`/api/jobs/${jobId}/steps/${step.id}/sign-offs`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'x-presence-ticket': ticket,
+              },
+              body: JSON.stringify({ role: userRole }),
+            });
+          } catch (e) {
+            signError = e instanceof Error ? e.message : String(e);
+          }
+        }
       }
       if (d === 'approved' || d === 'rejected') {
         const done = await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {

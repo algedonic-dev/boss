@@ -1098,6 +1098,7 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
     State(state): State<Arc<JobsApiState<R, B>>>,
     Path((id, step_id_str)): Path<(String, String)>,
     CurrentUser(user): CurrentUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<SignOffBody>,
 ) -> Response {
     let job_id = match parse_job_id(&id) {
@@ -1156,11 +1157,47 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
     // NO BYPASS, which is the point David settled in Q3: "an assurance
     // level with a bypass is a comment, not a control." A stamp's
     // assurance is what the server VERIFIED, never what the caller
-    // asked for — so until the WebAuthn ceremony exists there is no
-    // way to produce `Presence`, and a step demanding it cannot be
-    // stamped. Refusing is the honest failure; accepting a claimed
-    // presence would make the whole field decorative on day one.
-    let produced = boss_core::job::Assurance::Session;
+    // asked for. `Presence` is producible exactly one way: the
+    // gateway's passkey ceremony verified a WebAuthn assertion over
+    // sha256(shape_hash || ":" || nonce) and swapped the resulting
+    // ticket for an `x-boss-presence` header — a header the edge
+    // strips from every inbound request, so its presence here means
+    // the gateway itself vouched. We still re-check the binding
+    // against the step's CURRENT shape: a stale hash means the
+    // content moved after the ceremony, and the stamp must not
+    // survive an edit it never saw.
+    let shape = boss_core::job::step_shape_hash(&step.title, &step.metadata);
+    let presence_claim = headers
+        .get("x-boss-presence")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    let (produced, presence_nonce, presence_detail) = match &presence_claim {
+        Some(p)
+            if p["step_id"] == step_id_str.as_str()
+                && p["shape_hash"] == shape.as_str()
+                && p["employee_id"] == user.id.as_str() =>
+        {
+            (
+                boss_core::job::Assurance::Presence,
+                p["nonce"].as_str().map(String::from),
+                "",
+            )
+        }
+        Some(_) => (
+            boss_core::job::Assurance::Session,
+            None,
+            " A presence ticket WAS presented but did not match: either the step's \
+             content changed after the ceremony (stale shape hash — re-run it against \
+             the current content) or it was minted for a different step or actor.",
+        ),
+        None => (
+            boss_core::job::Assurance::Session,
+            None,
+            " Complete the passkey ceremony for this step \
+             (POST /api/auth/passkey/assert/begin, then .../finish) and retry with \
+             the issued ticket.",
+        ),
+    };
     if required > produced {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1168,16 +1205,14 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
                 "error": "step requires stronger assurance than this request carries",
                 "required": required,
                 "produced": produced,
-                "detail": "this step requires proof of presence (a passkey ceremony \
-                           bound to the step's shape hash). That verifier is not wired \
-                           up yet, so no stamp can satisfy it — this is the gate \
-                           refusing, not a fault.",
+                "detail": format!(
+                    "this step requires proof of presence — a passkey assertion bound \
+                     to the step's shape hash.{presence_detail}"
+                ),
             })),
         )
             .into_response();
     }
-
-    let shape = boss_core::job::step_shape_hash(&step.title, &step.metadata);
     if step
         .sign_offs
         .iter()
@@ -1192,6 +1227,7 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
         stamped_at: now,
         shape_hash: shape.clone(),
         assurance: produced,
+        presence_nonce: presence_nonce.clone(),
     };
     // OUTBOX (phase 2): the signed-off marker records in the SAME
     // transaction as the stamp append.
@@ -1210,6 +1246,8 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
             "role": role,
             "authority_id": user.id,
             "shape_hash": shape,
+            "assurance": produced,
+            "presence_nonce": presence_nonce,
         }),
     );
     if let Err(e) = state

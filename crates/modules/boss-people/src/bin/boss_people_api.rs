@@ -153,7 +153,11 @@ async fn main() -> Result<()> {
         publisher.clone(),
         clock.clone(),
     ))
-    .merge(boss_people::scope::scope_router(pool.clone()));
+    .merge(boss_people::scope::scope_router(pool.clone()))
+    .merge(boss_people::webauthn::webauthn_router(
+        pool.clone(),
+        clock.clone(),
+    ));
     // people-api owns only the employee-side routers. The
     // accounts-side routers (accounts, account_team_members,
     // account_notes, account_next_actions, account_risk_scores,

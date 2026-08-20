@@ -36,6 +36,7 @@
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import DecideModal from './DecideModal.svelte';
+  import PasskeysPanel from './PasskeysPanel.svelte';
 
   // The session rune exposes the current user. The fetch effect
   // tracks exactly (id, role) — the two halves of the lens query:
@@ -436,6 +437,7 @@
             <div class="me-stat-label">steps in your queue</div>
           </div>
         </div>
+        <PasskeysPanel />
       </Section>
     </div>
   </div>

@@ -840,13 +840,15 @@ async fn an_ordinary_step_still_stamps_and_records_session_assurance() {
     );
 }
 
-/// A step that demands presence REFUSES, because nothing can prove it yet.
+/// A step that demands presence REFUSES a plain session request.
 ///
 /// This is the test that would catch a bypass being added later: if
-/// someone makes the endpoint honour a caller-supplied assurance, this
-/// starts returning 200 and the control becomes decoration.
+/// someone makes the endpoint honour a caller-supplied assurance (the
+/// body, a query param — anything other than the gateway-vouched
+/// `x-boss-presence` header), this starts returning 200 and the
+/// control becomes decoration.
 #[tokio::test]
-async fn a_step_requiring_presence_refuses_until_a_verifier_exists() {
+async fn a_step_requiring_presence_refuses_without_a_ceremony_ticket() {
     let (app, jobs) = build_app(qa_policy());
     let user = qa_lead("emp-91");
     let job = job_owned_by("00000000-0000-0000-0000-000000000091", &user.id);
@@ -859,7 +861,7 @@ async fn a_step_requiring_presence_refuses_until_a_verifier_exists() {
     assert_eq!(
         resp.status(),
         StatusCode::UNPROCESSABLE_ENTITY,
-        "presence cannot be satisfied yet, so the stamp must be refused"
+        "a session request cannot satisfy presence, so the stamp must be refused"
     );
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -871,6 +873,107 @@ async fn a_step_requiring_presence_refuses_until_a_verifier_exists() {
         stored.sign_offs.is_empty(),
         "a refused stamp must leave no trace on the step"
     );
+}
+
+/// The sign-off request with the gateway's presence header attached.
+/// In production the edge strips every inbound `x-boss-*` header and
+/// re-injects this one only after verifying a passkey ticket, so its
+/// presence at this service means the gateway vouched. See
+/// role_headers.rs; the machine token guards the service port itself.
+async fn post_sign_off_with_presence(
+    app: Router,
+    user: &User,
+    step: &Step,
+    role: &str,
+    presence: &serde_json::Value,
+) -> axum::http::Response<Body> {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/api/jobs/{}/steps/{}/sign-offs",
+                step.job_id, step.id,
+            ))
+            .header("content-type", "application/json")
+            .header("x-boss-user", user_header(user))
+            .header("x-boss-presence", presence.to_string())
+            .body(Body::from(format!("{{\"role\":\"{role}\"}}")))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+/// The ceremony's happy path: a gateway-vouched presence header whose
+/// binding matches the step's CURRENT shape produces a Presence stamp
+/// carrying the challenge nonce — the audit trail from stamp back to
+/// the exact single-use ceremony that produced it.
+#[tokio::test]
+async fn a_matching_presence_header_produces_a_presence_stamp_with_its_nonce() {
+    let (app, jobs) = build_app(qa_policy());
+    let user = qa_lead("emp-92");
+    let job = job_owned_by("00000000-0000-0000-0000-000000000092", &user.id);
+    jobs.create_job(&job).await.unwrap();
+    let mut step = sign_off_step(job.id, "qa-lead");
+    step.assurance_required = Some(boss_core::job::Assurance::Presence);
+    jobs.add_step(&step).await.unwrap();
+
+    let shape = boss_core::job::step_shape_hash(&step.title, &step.metadata);
+    let presence = serde_json::json!({
+        "employee_id": user.id,
+        "step_id": step.id.to_string(),
+        "shape_hash": shape,
+        "nonce": "ceremony-nonce-1",
+    });
+    let resp = post_sign_off_with_presence(app, &user, &step, "qa-lead", &presence).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+    let stamp = stored.sign_offs.first().expect("a stamp was appended");
+    assert_eq!(stamp.assurance, boss_core::job::Assurance::Presence);
+    assert_eq!(
+        stamp.presence_nonce.as_deref(),
+        Some("ceremony-nonce-1"),
+        "the stamp names the exact challenge that produced it"
+    );
+}
+
+/// The binding is to CONTENT, not to the step id: a ticket minted
+/// before an edit carries the old shape hash, and the stamp must not
+/// survive an edit it never saw. The refusal names the staleness so
+/// the actor knows to re-run the ceremony, not to hunt a bug.
+#[tokio::test]
+async fn a_stale_presence_header_downgrades_to_session_and_refuses() {
+    let (app, jobs) = build_app(qa_policy());
+    let user = qa_lead("emp-93");
+    let job = job_owned_by("00000000-0000-0000-0000-000000000093", &user.id);
+    jobs.create_job(&job).await.unwrap();
+    let mut step = sign_off_step(job.id, "qa-lead");
+    step.assurance_required = Some(boss_core::job::Assurance::Presence);
+    jobs.add_step(&step).await.unwrap();
+
+    let presence = serde_json::json!({
+        "employee_id": user.id,
+        "step_id": step.id.to_string(),
+        "shape_hash": "a-hash-from-before-the-step-was-edited",
+        "nonce": "ceremony-nonce-2",
+    });
+    let resp = post_sign_off_with_presence(app, &user, &step, "qa-lead", &presence).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["produced"], "session");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stale"),
+        "the refusal must name staleness: {}",
+        body["detail"]
+    );
+
+    let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert!(stored.sign_offs.is_empty());
 }
 
 /// Ordering is the contract: a step may raise, and `Presence` is
