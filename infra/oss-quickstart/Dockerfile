@@ -117,6 +117,16 @@ RUN set -eu && \
     # land accounts/vendors.
     cargo build --release -p boss-accounts --bin boss-accounts-api --features accounts-api && \
     cargo build --release -p boss-events --bin boss-events-api --features events-api && \
+    # Same class a third time, found the hard way: the platform-Workflow
+    # seed binary is `required-features = ["postgres"]`, so the workspace
+    # pass above skips it silently — and bootstrap-db.sh's find_boss_bin
+    # guard then skips the SEED silently, so every fresh install came up
+    # without the bundle-supplied kinds and brewery prepare died on
+    # `unknown job kind: workflow-design`. The live instances never saw
+    # it (their registry rows pre-exist; the ten kinds were hand-published
+    # on 2026-08-19) — the public mirror's install smoke was the first
+    # fresh-install gate to look. Packet c93e115a.
+    cargo build --release -p boss-jobs --bin boss-platform-workflow-seed --features postgres && \
     mkdir -p /out && \
     # Copy every workspace binary to /out — the runtime stage's COPY
     # source. Strict mode (set -e) means the build fails if the

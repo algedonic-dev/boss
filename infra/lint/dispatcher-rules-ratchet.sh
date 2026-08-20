@@ -112,7 +112,15 @@ set -euo pipefail
 # `jobs.spawn` with the same maintenance-sweep args, a different
 # target. Buys a caller for /api/design/stale-statuses, which has
 # existed and reported to nobody (feedback 0b8ae875).
-BASELINE=50
+# 50 -> 51 (2026-08-20, migration 152). `network-census-daily`.
+# A TIMER under the exemption above, and the purest case: it spawns
+# nothing and routes nothing — one firing writes one
+# `jobs.network.census` event, the packet-loss census's measured
+# series (packet-loss.md, decided 9fb9904f). The condition it watches
+# is a standing state of the network — what is NOT moving — which no
+# Workflow definition can declare, because no packet causes it; a
+# census's whole point is to run when no event fired.
+BASELINE=51
 RULES_FILE="infra/dispatcher/rules.toml"
 
 count=$(grep -c '^\[\[rule\]\]' "$RULES_FILE")

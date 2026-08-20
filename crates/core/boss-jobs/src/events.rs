@@ -79,6 +79,12 @@ pub const WORKFLOW_QUARANTINED: &str = "jobs.kind.quarantined";
 /// one carrying the problems that condemned the row. Rebuild ignores
 /// it.
 pub const STATION_QUARANTINED: &str = "jobs.station.quarantined";
+/// One firing of the packet-loss census (packet-loss.md Q3): the
+/// network's conservation counts as a measured series, one event per
+/// firing. A marker in the strict sense — it duplicates nothing and
+/// projects nothing; the payload IS the datum, and lenses read the
+/// series from the log instead of recomputing it. Rebuild ignores it.
+pub const NETWORK_CENSUS: &str = "jobs.network.census";
 
 /// The state-event payload for a Step: the serialized struct plus a
 /// top-level `step_id` — the same key every marker event uses.
@@ -162,6 +168,21 @@ pub fn station_quarantined_event(
         actor,
     );
     boss_core::event::Event::new("jobs", STATION_QUARANTINED, payload, now)
+}
+
+/// One packet-loss census firing — same contract as the quarantine
+/// markers: built where the write happens, actor riding as `_actor`
+/// exactly as EventStamp injects it. `counts` is the census payload
+/// verbatim (the dispatcher handler computed it; this side only
+/// stamps and records), so the field list lives in ONE place — the
+/// handler that measures — rather than being re-declared here.
+pub fn network_census_event(
+    actor: &boss_core::actor::ActorId,
+    now: chrono::DateTime<chrono::Utc>,
+    counts: serde_json::Value,
+) -> boss_core::event::Event {
+    let payload = boss_core::publisher::inject_actor(counts, actor);
+    boss_core::event::Event::new("jobs", NETWORK_CENSUS, payload, now)
 }
 
 /// A step-plugin registry event — same contract as

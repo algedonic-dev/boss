@@ -98,6 +98,13 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         ("jobs.complete_linked_step", vec!["jobs.step.completed"]),
         ("gate.resolve", vec!["jobs.step.completed"]),
         ("packaging.allocate", vec!["jobs.step.completed"]),
+        // The packet-loss census (migration 152): reads the whole
+        // board through the jobs API and lands one
+        // `jobs.network.census` event per firing via the census door.
+        // No rule listens on that topic — the series is for lenses,
+        // not for the cascade — so the loop terminates here by design
+        // (packet-loss.md Q2: report first, raise later).
+        ("network.census", vec!["jobs.network.census"]),
         ("messages.notify", vec![]),
         // Tells the filer how their packet ended. A sink, like every
         // other notifier — the message is the end of the cascade, not

@@ -578,6 +578,7 @@ check "schema-converge"          infra/lint/schema-converge.sh
 check "migrations-append-only"   infra/lint/migrations-append-only.sh
 check "migration-numbers-unique"  infra/lint/migration-numbers-unique.sh
 check "no-secrets"               infra/lint/no-secrets.sh
+check "no-session-paths"         infra/lint/no-session-paths.sh
 check "invariant-register"       infra/lint/invariant-register.sh
 check "crate-counts-fresh"       infra/lint/crate-counts-fresh.sh
 check "registry-bump-order"      infra/lint/registry-bump-retires-first.sh

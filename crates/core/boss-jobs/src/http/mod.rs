@@ -29,6 +29,7 @@ use crate::step_registry::StepRegistry;
 
 pub mod machine_gate;
 
+mod census;
 mod jobs;
 mod kinds;
 mod plugins;
@@ -36,6 +37,7 @@ mod sim_clock;
 mod stations;
 mod steps;
 
+use census::*;
 use jobs::*;
 use kinds::*;
 use plugins::*;
@@ -157,10 +159,15 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
             "/api/stations",
             get(list_stations::<R, B>).post(create_station::<R, B>),
         )
+        // The packet-loss census door (packet-loss.md Q3): the
+        // dispatcher's `network.census` handler measures over the
+        // read surfaces above and lands its counts here, one
+        // `jobs.network.census` event per firing.
+        .route("/api/network/census", post(record_network_census::<R, B>))
+        .route("/api/stations/load", get(stations_load::<R, B>))
         // Author-time dry run: lint a spec without persisting, so the
         // editor surfaces the same `station_lint::gate_active` the
         // publish path enforces.
-        .route("/api/stations/load", get(stations_load::<R, B>))
         .route("/api/stations/_validate", post(validate_station::<R, B>))
         .route("/api/stations/{name}/queue", get(station_queue::<R, B>))
         .route(

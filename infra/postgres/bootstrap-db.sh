@@ -181,6 +181,18 @@ if PLATFORM_WF_BIN="$(find_boss_bin boss-platform-workflow-seed)"; then
         echo "  WARNING: platform Workflow bundle NOT FOUND at $PLATFORM_WF_TOML — the seed" >&2
         echo "  is being SKIPPED; bundle-supplied kinds will be missing from this deployment" >&2
     fi
+else
+    # The OTHER half of the same invariant, which the warning above
+    # missed: the 2026-08-19 fix made a missing BUNDLE loud but left a
+    # missing BINARY silent, and that is exactly how every fresh
+    # install shipped broken — the seed bin is feature-gated and the
+    # image's workspace build skipped it, so this outer guard fell
+    # through without a word (packet c93e115a, caught by the public
+    # mirror's install smoke). A boot-read binary is packaging, and
+    # absent packaging must read like a fault, not like silence.
+    echo "  WARNING: boss-platform-workflow-seed binary NOT FOUND on PATH or in" >&2
+    echo "  target/release — the platform Workflow seed is being SKIPPED;" >&2
+    echo "  bundle-supplied kinds will be missing from this deployment" >&2
 fi
 
 if OPERATOR_SEED_BIN="$(find_boss_bin boss-operator-baseline-seed)"; then

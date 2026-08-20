@@ -30,8 +30,9 @@ use boss_dispatcher_handlers::handlers::{
     ledger_bill_approve::LedgerBillApprove, ledger_payroll_run_submit::LedgerPayrollRunSubmit,
     ledger_tax_accrue::LedgerTaxAccrue, ledger_tax_remit::LedgerTaxRemit,
     messages_expire_for_job::MessagesExpireForJob, messages_notify::MessagesNotify,
-    messages_notify_job_terminal::MessagesNotifyJobTerminal, packaging_allocate::PackagingAllocate,
-    people_hire::PeopleHire, people_terminate::PeopleTerminate, products_consume::ProductsConsume,
+    messages_notify_job_terminal::MessagesNotifyJobTerminal, network_census::NetworkCensus,
+    packaging_allocate::PackagingAllocate, people_hire::PeopleHire,
+    people_terminate::PeopleTerminate, products_consume::ProductsConsume,
     products_consume_from_invoice::ProductsConsumeFromInvoice, products_produce::ProductsProduce,
     shipping_create::ShippingCreate, webhook_notify::WebhookNotify,
 };
@@ -247,6 +248,12 @@ async fn main() -> Result<()> {
                 cfg.docs_api_url.clone(),
                 cfg.jobs_api_url.clone(),
             ));
+            // The packet-loss census (packet-loss.md, 9fb9904f): count
+            // the network's conservation invariant on a clock and land
+            // the counts as one jobs.network.census event per firing.
+            // Report first — no raiser, no threshold; the series this
+            // accumulates is what calibrates one later.
+            handlers.register(NetworkCensus::new(cfg.jobs_api_url.clone()));
             handlers.register(MessagesNotify::new(
                 cfg.people_api_url.clone(),
                 cfg.messages_api_url.clone(),
