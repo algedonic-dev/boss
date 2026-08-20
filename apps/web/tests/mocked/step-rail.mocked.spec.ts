@@ -79,9 +79,9 @@ test('the workflow renders as a rail beside the step surface', async ({ page }) 
   await expect(page.locator('.sg-canvas .dag')).toBeHidden();
 });
 
-test('job page rail screenshot', async ({ page }) => {
+test('job page rail screenshot', async ({ page }, testInfo) => {
   await mocks(page);
   await page.goto(`/ux/jobs/${JOB_ID}`);
   await page.waitForTimeout(1200);
-  await page.screenshot({ path: '/Users/david/.claude/jobs/1260ae92/tmp/shots/rail.png', fullPage: true });
+  await page.screenshot({ path: testInfo.outputPath('rail.png'), fullPage: true });
 });
