@@ -940,6 +940,63 @@ pub(crate) fn deletable_branches(
 /// The branch head recorded when this car boarded — stamped by the
 /// assembly onto the car Job in the same update that stamps `train`
 /// (see `board`). Absent or empty reads as no stamp at all.
+/// The gate-receipt spot-check (David's "Agreed" on 742d1faa): what
+/// makes a car's green claim honest at the moment it matters — boarding.
+/// `None` = the receipt vouches for exactly the head being boarded;
+/// `Some(reason)` = leave the car behind, with the reason named on it.
+///
+/// Catches exactly the two lies that cost red trains: a receipt from a
+/// different commit than the branch now points at (gate, then "one more
+/// tiny fix" pushed after), and a receipt that was never green (or was
+/// taken on a dirty tree, which is the same claim with extra steps —
+/// the gate reads the tree live, so dirty means "green about something
+/// else"). A car with NO receipt is unverifiable and stays behind too:
+/// this check exists because claims without receipts already shipped.
+pub(crate) fn receipt_skip_reason(car: &Value, boarding_head: Option<&str>) -> Option<String> {
+    let gate = find_step(car, "gate", "Green, and observed working")?;
+    // Present as a JSON string (how the gate step records it) or as an
+    // object (tooling that parses before writing) — both are receipts.
+    let md = gate.get("metadata")?;
+    let receipt: Value = match md.get("receipt") {
+        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
+        Some(v @ Value::Object(_)) => v.clone(),
+        _ => Value::Null,
+    };
+    if receipt.is_null() {
+        return Some(
+            "no machine receipt on the gate step — the green claim is unverifiable".into(),
+        );
+    }
+    let verdict = receipt
+        .get("verdict")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    if verdict != "green" {
+        return Some(format!("gate receipt verdict is '{verdict}', not green"));
+    }
+    if receipt.get("dirty").and_then(Value::as_bool) == Some(true) {
+        return Some(
+            "gate receipt was taken on a dirty tree — it vouches for something else".into(),
+        );
+    }
+    let receipt_head = receipt.get("head").and_then(Value::as_str).unwrap_or("");
+    if receipt_head.is_empty() {
+        return Some("gate receipt names no head — the green claim is unverifiable".into());
+    }
+    match boarding_head {
+        Some(b) if commits_match(receipt_head, b) => None,
+        Some(b) => Some(format!(
+            "gate receipt is for {} but the branch boards {} — gated, then changed",
+            &receipt_head[..receipt_head.len().min(8)],
+            &b[..b.len().min(8)]
+        )),
+        // No boardable head resolved — the branch checks after this
+        // will name that failure themselves; the receipt is not the
+        // lie here.
+        None => None,
+    }
+}
+
 pub(crate) fn boarded_head(car: &Value) -> Option<&str> {
     car.get("metadata")?
         .get("boarded_head")?
@@ -3144,6 +3201,20 @@ impl Conductor {
                 }
                 continue;
             }
+            // The receipt spot-check (742d1faa): the head this car will
+            // actually board must be the head its gate receipt vouches
+            // for, and the receipt must be green on a clean tree. The
+            // check is against `want` — the branch head as it stands
+            // NOW — because that is what the train would carry.
+            if let Some(reason) = receipt_skip_reason(&j, want.as_deref()) {
+                log(format!("{}: {reason} — leaving behind", id8(&jid)));
+                left_behind.push(json!({"car_id_short": id8(&jid), "reason": reason.as_str()}));
+                if !self.cfg.dry {
+                    self.merge_job_metadata(&jid, vec![("skip_reason", json!(reason))])
+                        .await?;
+                }
+                continue;
+            }
             out.push((j, branch));
         }
         Ok((out, left_behind))
@@ -3965,6 +4036,83 @@ mod tests {
                 {"spec_slug": "review", "title": "Open for review", "status": "ready"}
             ],
         })
+    }
+
+    /// The receipt spot-check (742d1faa, David: "Agreed"): the two
+    /// lies it exists to catch, the unverifiable cases, and the one
+    /// honest pass.
+    fn car_with_receipt(receipt: serde_json::Value) -> serde_json::Value {
+        let mut c = ready_car();
+        c["steps"].as_array_mut().unwrap().push(json!({
+            "spec_slug": "gate",
+            "title": "Green, and observed working",
+            "status": "completed",
+            "metadata": {"receipt": receipt.to_string()},
+        }));
+        c
+    }
+
+    #[test]
+    fn an_honest_receipt_boards() {
+        let c = car_with_receipt(json!({
+            "verdict": "green", "dirty": false,
+            "head": "abcdef1234567890abcdef1234567890abcdef12",
+        }));
+        assert_eq!(
+            receipt_skip_reason(&c, Some("abcdef1234567890abcdef1234567890abcdef12")),
+            None
+        );
+        // Prefix-tolerant like every other head comparison here.
+        assert_eq!(receipt_skip_reason(&c, Some("abcdef12345678")), None);
+    }
+
+    #[test]
+    fn a_receipt_for_a_different_head_is_named_and_left_behind() {
+        let c = car_with_receipt(json!({
+            "verdict": "green", "dirty": false,
+            "head": "abcdef1234567890abcdef1234567890abcdef12",
+        }));
+        let reason = receipt_skip_reason(&c, Some("1234567890abcdef1234567890abcdef12345678"))
+            .expect("gated-then-changed must be caught");
+        assert!(reason.contains("gated, then changed"), "{reason}");
+    }
+
+    #[test]
+    fn a_non_green_or_dirty_receipt_is_left_behind() {
+        let red = car_with_receipt(json!({"verdict": "failed", "dirty": false, "head": "abc"}));
+        assert!(
+            receipt_skip_reason(&red, Some("abc"))
+                .expect("red must be caught")
+                .contains("not green")
+        );
+        let dirty = car_with_receipt(json!({"verdict": "green", "dirty": true, "head": "abc"}));
+        assert!(
+            receipt_skip_reason(&dirty, Some("abc"))
+                .expect("dirty must be caught")
+                .contains("dirty tree")
+        );
+    }
+
+    #[test]
+    fn a_missing_receipt_is_unverifiable_not_a_pass() {
+        let mut c = ready_car();
+        c["steps"].as_array_mut().unwrap().push(json!({
+            "spec_slug": "gate", "title": "Green, and observed working",
+            "status": "completed", "metadata": {},
+        }));
+        assert!(
+            receipt_skip_reason(&c, Some("abc"))
+                .expect("no receipt must be caught")
+                .contains("unverifiable")
+        );
+        // An OBJECT-shaped receipt is a receipt too.
+        let mut obj = ready_car();
+        obj["steps"].as_array_mut().unwrap().push(json!({
+            "spec_slug": "gate", "title": "Green, and observed working",
+            "status": "completed",
+            "metadata": {"receipt": {"verdict": "green", "dirty": false, "head": "abc12345"}},
+        }));
+        assert_eq!(receipt_skip_reason(&obj, Some("abc12345")), None);
     }
 
     #[test]

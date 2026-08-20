@@ -23,6 +23,10 @@ export type AssignmentStep = Readonly<{
    *  parses — {@link needsAPerson} reads absent as human, the safe
    *  direction. */
   completion?: Completion | null;
+  /** Is completing this step a decision (registry fact, same
+   *  null-when-unknown contract as `completion`)? {@link isVerdict}
+   *  falls back to the kind roster when absent. */
+  decision_shaped?: boolean | null;
 }>;
 
 export type AssignmentRow = Readonly<{
@@ -53,15 +57,14 @@ export type Completion =
   | 'external'
   | 'auto-on-materialize';
 
-/// The step kinds whose completion IS a decision — a verdict someone
-/// renders, not work someone performs. Decided by David (d598681f,
-/// accepted 2026-08-19): My Day partitions "yours to DECIDE" from
-/// "yours because you own it", on exactly the kind + completion facts
-/// the row already carries. A kind roster is a deliberate,
-/// presentation-only trade: it can lag a new decision kind (which then
-/// lands in the owned list — visible, never lost), and the honest
-/// upgrade is a `decision_shaped` flag on the StepType registry when a
-/// second consumer wants this split.
+/// The upgrade the roster below documented arrived the same day it
+/// shipped: `decision_shaped` is now a StepType registry fact the row
+/// carries (the dispatcher became the second consumer — 291a73a7
+/// option c routes decisions to people and executable work to the
+/// agent off the same flag). The server's answer wins; the roster
+/// survives only as the fallback for a server that predates the
+/// field, and for kinds the registry does not know (correction-verdict
+/// rides permissively with no StepType row).
 export const VERDICT_KINDS: ReadonlySet<string> = new Set([
   'sign-off',
   'answer-question',
@@ -70,10 +73,9 @@ export const VERDICT_KINDS: ReadonlySet<string> = new Set([
 ]);
 
 export function isVerdict(row: AssignmentRow): boolean {
-  return (
-    VERDICT_KINDS.has(row.step.kind) &&
-    (row.step.completion ?? 'human') === 'human'
-  );
+  const decides =
+    row.step.decision_shaped ?? VERDICT_KINDS.has(row.step.kind);
+  return decides && (row.step.completion ?? 'human') === 'human';
 }
 
 export type MyDayQueues = Readonly<{

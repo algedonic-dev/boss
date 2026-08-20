@@ -277,6 +277,14 @@ spec:
             - {name: BOSS_EVENT_WEBHOOK_URL, value: "http://127.0.0.1:7099/callback"}
             - {name: BOSS_SIM_CALLBACK_BIND, value: "127.0.0.1:7099"}
             - {name: BOSS_DISPATCH_STRATEGY, value: spread}
+            # Decides-vs-executes (291a73a7, option c): decision-shaped
+            # steps go to the role's human holder; executable platform
+            # work defaults to the agent, who drains it. Which agent
+            # runs here is a deployment fact, same class as the
+            # strategy above. Scoped to platform-admin so brewery-role
+            # steps never land on the platform agent.
+            - {name: BOSS_DISPATCH_EXECUTOR_ID, value: "claude@algedonic.dev"}
+            - {name: BOSS_DISPATCH_EXECUTOR_ROLES, value: "platform-admin"}
             - {name: BOSS_DISPATCHER_RULES, value: /opt/boss/infra/dispatcher/rules.toml}
             # Bind all interfaces so the Service can reach the gateway;
             # the default 127.0.0.1 is right for systemd+Caddy, wrong here.

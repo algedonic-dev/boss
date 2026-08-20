@@ -34,6 +34,7 @@
 
 [[step_type]]
 kind = "sign-off"
+decision_shaped = true
 surface = "approval"
 label = "Sign-off"
 category = "coordination"
@@ -1803,6 +1804,7 @@ completion = "agent"
 
 [[step_type]]
 kind = "review-design"
+decision_shaped = true
 label = "Review Design"
 category = "coordination"
 ux = "expanded"
@@ -1838,6 +1840,7 @@ required_roles = ["platform-admin"]
 
 [[step_type]]
 kind = "answer-question"
+decision_shaped = true
 label = "Answer a question"
 category = "coordination"
 ux = "expanded"

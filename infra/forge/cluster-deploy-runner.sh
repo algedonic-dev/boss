@@ -50,7 +50,7 @@ if [ -z "${BOSS_RUNNER_SNAPSHOT:-}" ]; then
     cat "$0" > "$snap"
     BOSS_RUNNER_SNAPSHOT="$snap" exec bash "$snap" "$@"
 fi
-trap 'rm -f "$BOSS_RUNNER_SNAPSHOT"' EXIT
+trap 'rm -f "$BOSS_RUNNER_SNAPSHOT" ${BOSS_RUNNER_SNAPSHOT2:+"$BOSS_RUNNER_SNAPSHOT2"}' EXIT
 
 REPO="${BOSS_FORGE_REPO_DIR:-$HOME/boss}"
 REGISTRY="${BOSS_FORGE_REGISTRY:-10.20.0.15:3000/david/boss}"
@@ -70,6 +70,26 @@ fi
 
 echo "cluster-deploy-runner: forge main moved $LAST -> $HEAD; building"
 git checkout -q "$HEAD" 2>/dev/null || git checkout -qf "$HEAD"
+
+# STAGE 2: converge on HEAD's OWN driver (David accepted (a) on
+# d0b5efd4, through the v11 decision surface). The stage-0 snapshot is
+# necessarily the PRE-checkout copy — so without this hop, a change to
+# this script merged on train N only executes at train N+1's converge.
+# Measured cost of that property, 2026-08-19: the chore-CronJob image
+# pin sat out its own train's converge and seven CronJobs pulled a
+# stale :latest for a full cycle.
+#
+# So after checkout, snapshot the checked-out copy and exec THAT. The
+# re-executed prefix (env, cd, fetch, stamp check, checkout) is
+# idempotent — same HEAD, stamp not yet written — and the second guard
+# var is what stops a third hop. Both snapshots are cleaned by the
+# stage that actually exits (exec replaces the process, so an exec'ing
+# stage's trap never fires — the trap above cleans BOTH paths).
+if [ -z "${BOSS_RUNNER_SNAPSHOT2:-}" ]; then
+    snap2="$(mktemp -t cluster-deploy-runner-head.XXXXXX)"
+    cat infra/forge/cluster-deploy-runner.sh > "$snap2"
+    BOSS_RUNNER_SNAPSHOT2="$snap2" exec bash "$snap2" "$@"
+fi
 # The FULL commit rides into the binaries (Capabilities.commit) so the
 # conductor's `converged` step can verify the running pod serves this
 # exact merge — the short tag stays the image name, the full sha is

@@ -173,6 +173,17 @@ pub struct StepType {
     /// before completion (the sign-off contract). Registry-level default;
     /// Workflows may extend per step. Empty = no sign-offs required.
     pub sign_offs_required: &'static [&'static str],
+    /// Is completing this kind a DECISION — a verdict someone renders —
+    /// rather than work someone performs? David decided the split twice
+    /// on the same day (2026-08-19): My Day partitions "yours to decide"
+    /// from "yours because you own it" (d598681f), and assignment
+    /// routes decisions to the role's human holder while executable
+    /// work defaults to an agent (291a73a7, option c). Both consumers
+    /// read THIS flag — the client's interim kind roster documented
+    /// exactly this field as its upgrade path (CLAUDE.md §9a: one fact,
+    /// one home).
+    #[serde(default)]
+    pub decision_shaped: bool,
 }
 
 /// Validation error for step metadata.
@@ -434,6 +445,8 @@ struct LoadedStepType {
     surface: String,
     #[serde(default)]
     sign_offs_required: Vec<String>,
+    #[serde(default)]
+    decision_shaped: bool,
 }
 
 fn default_surface() -> String {
@@ -494,6 +507,7 @@ impl LoadedStepType {
                     .map(|r| -> &'static str { String::leak(r) })
                     .collect::<Vec<_>>(),
             ),
+            decision_shaped: self.decision_shaped,
         }
     }
 }

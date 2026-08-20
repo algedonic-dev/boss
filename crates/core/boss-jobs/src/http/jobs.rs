@@ -237,6 +237,13 @@ fn assignment_row_json(
     let mut v = serde_json::to_value(row).unwrap_or_default();
     v["step"]["completion"] = serde_json::to_value(steps.get(&row.step.kind).map(|t| t.completion))
         .unwrap_or(serde_json::Value::Null);
+    // The second registry fact the queues split on (291a73a7, option
+    // c): is completing this step a DECISION? Same null-when-unknown
+    // contract as `completion`, and the same safe direction for the
+    // reader — an unknown kind is treated as a decision for a person.
+    v["step"]["decision_shaped"] =
+        serde_json::to_value(steps.get(&row.step.kind).map(|t| t.decision_shaped))
+            .unwrap_or(serde_json::Value::Null);
     v
 }
 

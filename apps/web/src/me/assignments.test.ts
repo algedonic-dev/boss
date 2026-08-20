@@ -227,6 +227,18 @@ describe('verdicts split from owned work', () => {
     expect(isVerdict(row('sign-off', 'agent'))).toBe(false);
   });
 
+  test('the registry flag outranks the client roster both ways', () => {
+    // A new decision kind the roster has never heard of: the server
+    // says decides, the client believes it.
+    const flagged = row('novel-verdict') as { step: { decision_shaped?: boolean } };
+    flagged.step.decision_shaped = true;
+    expect(isVerdict(flagged as never)).toBe(true);
+    // And the server saying "not a decision" beats a roster kind.
+    const unflagged = row('sign-off') as { step: { decision_shaped?: boolean } };
+    unflagged.step.decision_shaped = false;
+    expect(isVerdict(unflagged as never)).toBe(false);
+  });
+
   test('splitQueues partitions assigned rows into verdicts and mine', () => {
     const q = splitQueues([row('sign-off'), row('task')], 'me');
     expect(q.verdicts.map((r) => r.step.kind)).toEqual(['sign-off']);

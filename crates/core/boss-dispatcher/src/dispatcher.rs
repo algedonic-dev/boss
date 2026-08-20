@@ -327,6 +327,48 @@ async fn handle_event(ctx: &DispatcherCtx, subject: &str, payload: &Value) -> Re
         debug!(job_id, step_id, "no role constraint; leaving for operator");
         return Ok(());
     }
+    // DECIDES vs EXECUTES (David, 291a73a7, option c). A decision-
+    // shaped step — a verdict someone renders — goes to the role's
+    // human holder, exactly as before. Executable work whose role the
+    // configured executor holds goes to the executor first, with the
+    // human always able to claim. Measured before this existed: all
+    // 16 open feedback packets' steps parked on the one platform-admin
+    // holder, three agent-workable builds among them, blocked for
+    // days.
+    //
+    // The flag is registry data (`StepType::decision_shaped`) — the
+    // same fact My Day's "Yours to decide" queue reads, one home. An
+    // UNKNOWN kind counts as a decision: erring that way costs the
+    // human a glance; erring the other way files a verdict under "an
+    // agent will get to it".
+    //
+    // The executor identity and the roles it may execute for are
+    // deployment facts (which agent runs here), not protocol data —
+    // same class as BOSS_DISPATCH_STRATEGY. Absent either, behavior
+    // is exactly what it was. The station-discipline migration the
+    // boundary doc schedules will move this into station data with
+    // the rest of matchmaking.
+    let decision_shaped = step
+        .kind
+        .as_deref()
+        .and_then(|k| ctx.registry.get(k))
+        .map(|t| t.decision_shaped)
+        .unwrap_or(true);
+    if let Some(executor) = executor_for(
+        decision_shaped,
+        std::env::var("BOSS_DISPATCH_EXECUTOR_ID").ok().as_deref(),
+        std::env::var("BOSS_DISPATCH_EXECUTOR_ROLES")
+            .ok()
+            .as_deref(),
+        &role_candidates,
+    ) {
+        assign(ctx, job_id, step_id, &executor).await?;
+        debug!(
+            job_id,
+            step_id, executor, "dispatcher assigned executable step to the executor"
+        );
+        return Ok(());
+    }
     let chosen = pick_employee_with_role_fallback(ctx, &role_candidates, step_id).await?;
     let Some((emp_id, role_used)) = chosen else {
         // A role IS required (role_candidates is non-empty) but no active
@@ -365,6 +407,35 @@ async fn handle_event(ctx: &DispatcherCtx, subject: &str, payload: &Value) -> Re
 /// `""` when no role constraint applied. `step_id` is threaded
 /// through so the underlying pick spreads load deterministically
 /// across the role's holders (see `pick_employee`).
+/// The decides-vs-executes pick (291a73a7, option c), pure so the rule
+/// is testable without a roster or an env-mutating test. `Some(id)` =
+/// assign the executor; `None` = fall through to the human pick.
+///
+/// Never fires for a decision-shaped step, never fires without a
+/// configured executor, and only fires when one of the step's candidate
+/// roles is a role the executor is declared to execute for — a brewery
+/// `brewer` step must not land on the platform agent just because the
+/// agent exists.
+fn executor_for(
+    decision_shaped: bool,
+    executor_id: Option<&str>,
+    executor_roles: Option<&str>,
+    role_candidates: &[&str],
+) -> Option<String> {
+    if decision_shaped {
+        return None;
+    }
+    let id = executor_id?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let eligible = executor_roles?
+        .split(',')
+        .map(str::trim)
+        .any(|r| !r.is_empty() && role_candidates.contains(&r));
+    if eligible { Some(id.to_string()) } else { None }
+}
+
 async fn pick_employee_with_role_fallback(
     ctx: &DispatcherCtx,
     role_candidates: &[&str],
@@ -560,8 +631,9 @@ async fn assign(ctx: &DispatcherCtx, job_id: &str, step_id: &str, emp_id: &str) 
 
 #[cfg(test)]
 mod tests {
-    use super::{pick_index, pick_index_for, stable_hash};
+    use super::{executor_for, pick_index, pick_index_for, stable_hash};
     use crate::config::AssignmentStrategy;
+    use boss_jobs::step_registry::StepRegistry;
     use std::collections::HashMap;
 
     /// FNV-1a is a fixed function of the input bytes — the SAME bytes hash to
@@ -588,6 +660,78 @@ mod tests {
             assert_eq!(pick_index(step_id, len), first, "pick must be repeatable");
         }
         assert!(first < len, "index stays in bounds");
+    }
+
+    /// The decides-vs-executes pick (291a73a7, option c), in every
+    /// direction it must NOT fire.
+    #[test]
+    fn executor_takes_executable_platform_work_and_nothing_else() {
+        let platform = ["platform-admin"];
+        let brewer = ["brewer"];
+        // The case the rule exists for: executable, executor configured,
+        // role eligible.
+        assert_eq!(
+            executor_for(
+                false,
+                Some("claude@algedonic.dev"),
+                Some("platform-admin"),
+                &platform
+            ),
+            Some("claude@algedonic.dev".to_string())
+        );
+        // A DECISION never goes to the executor, whatever the config.
+        assert_eq!(
+            executor_for(
+                true,
+                Some("claude@algedonic.dev"),
+                Some("platform-admin"),
+                &platform
+            ),
+            None
+        );
+        // A role the executor is not declared for stays with its people
+        // — the brewery's brewer steps must not land on the platform
+        // agent just because the agent exists.
+        assert_eq!(
+            executor_for(
+                false,
+                Some("claude@algedonic.dev"),
+                Some("platform-admin"),
+                &brewer
+            ),
+            None
+        );
+        // Unconfigured deployments behave exactly as before.
+        assert_eq!(
+            executor_for(false, None, Some("platform-admin"), &platform),
+            None
+        );
+        assert_eq!(
+            executor_for(false, Some(""), Some("platform-admin"), &platform),
+            None
+        );
+        assert_eq!(executor_for(false, Some("x"), None, &platform), None);
+    }
+
+    /// An UNKNOWN kind counts as a decision: the registry lookup that
+    /// feeds `executor_for` defaults decision_shaped=true when the kind
+    /// has no StepType row (correction-verdict rides permissively), so
+    /// a verdict on an unregistered kind still reaches a person.
+    #[test]
+    fn the_registry_flag_marks_exactly_the_verdict_kinds() {
+        let reg = StepRegistry::v1();
+        for k in ["sign-off", "answer-question", "review-design"] {
+            assert!(
+                reg.get(k).map(|t| t.decision_shaped) == Some(true),
+                "{k} must be decision_shaped"
+            );
+        }
+        for k in ["task", "checklist", "outcome", "scheduling"] {
+            assert!(
+                reg.get(k).map(|t| t.decision_shaped) == Some(false),
+                "{k} must NOT be decision_shaped"
+            );
+        }
     }
 
     /// (b) Distribution: a spread of distinct step ids fans out across MORE
