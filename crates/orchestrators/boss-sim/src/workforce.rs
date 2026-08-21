@@ -107,6 +107,10 @@ pub struct WorkforceStats {
     pub checkins: u64,
     pub claimed: u64,
     pub completed: u64,
+    /// Real (non-simulated) assignments the boundary refused to touch.
+    /// Nonzero is normal - humans and agents have queues too - but this
+    /// number existing is what makes the boundary observable.
+    pub real_skipped: u64,
     /// Steps left Ready because real inventory was short (the
     /// auto-reorder catches up).
     pub deferred: u64,
@@ -343,11 +347,35 @@ impl Workforce {
             .send()
             .with_context(|| format!("GET {url}"))?;
         let body: Value = resp.json().context("decode /api/jobs/assignments")?;
-        let rows = body
+        let all_rows = body
             .get("data")
             .and_then(|d| d.as_array())
             .cloned()
             .unwrap_or_default();
+        // THE SIM BOUNDARY, enforced where selection happens. This
+        // query returns every assigned workable step in the SYSTEM -
+        // real packets included - and on 2026-08-20/21 this executor
+        // "completed" two real cars' proven steps and all six daily
+        // maintenance sweeps under their assignees' identities, filling
+        // required fields with capitalized field-name echoes
+        // (verified='Verified'), and left the sweeps fork-unfireable
+        // (defect 88798c96). A simulated worker works simulated
+        // packets, full stop. FAIL CLOSED: a row that does not say
+        // simulated=true is not the sim's to touch - absent means real
+        // (rows predating the column carry sim tags the envelope
+        // already folds into `simulated`).
+        let mut real_skipped = 0u64;
+        let rows: Vec<Value> = all_rows
+            .into_iter()
+            .filter(|row| {
+                let sim = row_is_simulated(row);
+                if !sim {
+                    real_skipped += 1;
+                }
+                sim
+            })
+            .collect();
+        self.stats.real_skipped += real_skipped;
 
         // Drive steps with bounded parallelism (see WORKFORCE_WORKERS). The
         // blocking client is Clone+Send+Sync and each step claims/completes
@@ -787,8 +815,29 @@ fn humanize(name: &str) -> String {
     }
 }
 
+/// The sim boundary as one checkable question. `true` only when the
+/// assignment row SAYS simulated=true; absent, null, or false all read
+/// as REAL and are not the sim's to touch (fail closed - defect
+/// 88798c96 is what the open version of this predicate did).
+fn row_is_simulated(row: &Value) -> bool {
+    row.get("simulated").and_then(Value::as_bool) == Some(true)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_boundary_fails_closed() {
+        use serde_json::json;
+        assert!(super::row_is_simulated(&json!({"simulated": true})));
+        assert!(!super::row_is_simulated(&json!({"simulated": false})));
+        assert!(!super::row_is_simulated(&json!({})), "absent means real");
+        assert!(!super::row_is_simulated(&json!({"simulated": null})));
+        assert!(
+            !super::row_is_simulated(&json!({"simulated": "true"})),
+            "a string is not a claim - fail closed on shape too"
+        );
+    }
+
     use super::*;
 
     #[test]

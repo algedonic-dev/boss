@@ -20,6 +20,10 @@
 //!     evidence, because squash-merged trains leave no git ancestry to
 //!     prove a landing (see `deletable_branches`), and only while the
 //!     branch still points at the head that boarded (`sweep_guard`).
+//!     The train's OWN branch comes off the same way at arrival
+//!     (`arrival_branch_to_delete`): the internal forge keeps merged
+//!     PR heads, and 62 stale `train/*` branches piled up in a week
+//!     before arrival owned its own housekeeping (ab3fa473).
 //!
 //!  2. BOARD — open this window's train Job, collect the ship-a-change
 //!     Jobs that are ready (review step ready/active, a branch pushed to
@@ -90,6 +94,12 @@ struct Config {
     home: String,
     clone: String,
     deploy_tree: String,
+    /// Which forge adapter is active (BOSS_TRAIN_FORGE: `github` or
+    /// `forgejo`). Stored on the config so decisions that hinge on
+    /// WHICH forge — the arrival branch cleanup only runs against the
+    /// internal forge, whose merged PR heads outlive their PRs — read
+    /// the same answer `make_forge` acted on.
+    forge_kind: String,
     /// The train protocol revision (directive 27ab7680): under the
     /// forge, CI-green trains merge themselves — GitHub was a 10-hour
     /// permission wall on an all-green train, and the human wall in
@@ -143,6 +153,7 @@ impl Config {
             ),
             clone: format!("{home}/repo"),
             deploy_tree: env_or("BOSS_TRAIN_DEPLOY_TREE", "/opt/boss"),
+            forge_kind: env_or("BOSS_TRAIN_FORGE", "github"),
             auto_merge: std::env::var("BOSS_TRAIN_AUTO_MERGE").as_deref() == Ok("1"),
             allow_local_jobs: std::env::var("BOSS_TRAIN_ALLOW_LOCAL_JOBS").as_deref() == Ok("1"),
             stall_hours: env_or("BOSS_TRAIN_STALL_HOURS", "6").parse().unwrap_or(6),
@@ -1501,6 +1512,50 @@ pub(crate) fn train_branch_to_delete(train: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The branch an ARRIVED train sheds: its own `train/*` branch (the
+/// same pin the cancel path deletes through), and only when the
+/// record proves the happy landing — the `arrived` terminal strictly
+/// `completed`, never `skipped`. A cancelled train closes with
+/// `arrived` skipped, and its branch was the cancel verb's to delete
+/// at cancel time.
+///
+/// `boss train cancel` has owned its branch since the verb existed;
+/// nothing owned the branch after a HAPPY landing, and 62 stale
+/// `train/*` branches accumulated on the forge between 08-13 and
+/// 08-20 (packet ab3fa473). Squash merges are why nothing git-side
+/// can ever classify them after the fact — the arrival record is the
+/// proof, held here at exactly the right moment.
+///
+/// Gated on the forgejo adapter: the internal forge keeps merged PR
+/// heads, which is the debt this cleans; GitHub auto-deletes them
+/// repo-side, so under that adapter there is nothing to own.
+pub(crate) fn arrival_branch_to_delete(train: &Value, forge_kind: &str) -> Option<String> {
+    if forge_kind != "forgejo" {
+        return None;
+    }
+    let arrived = find_step(train, "arrived", "Train arrived")?;
+    (arrived.get("status").and_then(Value::as_str) == Some("completed"))
+        .then(|| train_branch_to_delete(train))
+        .flatten()
+}
+
+/// The journal line for an arrival cleanup's outcome — and the pin
+/// that a failed delete is a LINE, never a failed arrival: the
+/// `Result` is consumed here, so the caller has nothing left to
+/// propagate. A leftover branch is housekeeping debt; a failed
+/// arrival is an outage. Ok(false) (already gone) says nothing — the
+/// sweep revisits an unsettled train every pass, and done work
+/// narrated hourly reads as work happening.
+pub(crate) fn arrival_cleanup_note(branch: &str, outcome: Result<bool>) -> Option<String> {
+    match outcome {
+        Ok(true) => Some(format!("deleted branch {branch} (train arrived)")),
+        Ok(false) => None,
+        Err(e) => Some(format!(
+            "branch {branch} not deleted (arrival stands, debt noted): {e}"
+        )),
+    }
+}
+
 /// Resolve the operator's handle — a Job id, an id prefix, or the
 /// train's PR url — against the open trains. Exactly one match or an
 /// error saying what went wrong; an ambiguous prefix refuses rather
@@ -2109,8 +2164,7 @@ impl Forge for ForgejoForge {
 }
 
 fn make_forge(cfg: &Config) -> Result<Box<dyn Forge>> {
-    let kind = env_or("BOSS_TRAIN_FORGE", "github");
-    match kind.as_str() {
+    match cfg.forge_kind.as_str() {
         "github" => Ok(Box::new(GitHubForge {
             head_owner: cfg.head_owner.clone(),
             fork_repo: repo_path(&cfg.fork_url),
@@ -2872,11 +2926,11 @@ impl Conductor {
     /// reached a terminal is stamped `branches_swept`, so the steady
     /// state costs one list call and no per-car fetches.
     ///
-    /// Forge cost, unchanged by the quieting: one list call, plus per
-    /// UNSWEPT train one fetch per boarded car and one `branch_head`
-    /// per deletable branch. The `branches_swept` stamp is what bounds
-    /// it — coverage is never capped, so no landed branch goes
-    /// uninspected.
+    /// Forge cost: one list call, plus per UNSWEPT train one fetch
+    /// per boarded car, one `branch_head` per deletable branch, and
+    /// one delete of the train's own branch (a silent 404 once it is
+    /// gone). The `branches_swept` stamp is what bounds it — coverage
+    /// is never capped, so no landed branch goes uninspected.
     async fn sweep_landed_branches(&self) -> Result<()> {
         let arrived = rows(
             self.api(
@@ -2918,7 +2972,12 @@ impl Conductor {
             for cid in &boarded {
                 cars.push(self.get_job(cid).await?);
             }
-            self.file_arrival_report(tid, &cars).await?;
+            // The full record, once per unswept train: the arrival
+            // report and the branch cleanup both read its steps,
+            // which the list rows do not carry.
+            let train = self.get_job(tid).await?;
+            self.file_arrival_report(&train, &cars).await?;
+            self.clean_arrived_train_branch(&train).await;
             for (branch, car) in deletable_branches(&cars, &open_branches) {
                 // The job record proved the CONTENT landed; the head
                 // guard proves the branch still holds only that
@@ -2972,9 +3031,9 @@ impl Conductor {
     /// the sweep already fetched. The step PUT merges metadata (the
     /// same rule `overlay_metadata` pins): the outcome step's own
     /// keys survive the filing.
-    async fn file_arrival_report(&self, tid: &str, cars: &[Value]) -> Result<()> {
-        let train = self.get_job(tid).await?;
-        let Some(step) = find_step(&train, "arrived", "Train arrived") else {
+    async fn file_arrival_report(&self, train: &Value, cars: &[Value]) -> Result<()> {
+        let tid = job_id(train)?;
+        let Some(step) = find_step(train, "arrived", "Train arrived") else {
             return Ok(());
         };
         let filed = step
@@ -2988,7 +3047,7 @@ impl Conductor {
         if !arrived || filed {
             return Ok(());
         }
-        let report = arrival_report(&train, cars);
+        let report = arrival_report(train, cars);
         let summary = arrival_summary(&report);
         let n = report
             .get("consist")
@@ -3025,6 +3084,27 @@ impl Conductor {
             id8(tid)
         ));
         Ok(())
+    }
+
+    /// Housekeeping at arrival: the train's OWN branch comes off the
+    /// forge once the landing is on the record — the same forge
+    /// delete the cancel path has always used, now owned by the happy
+    /// path too (`arrival_branch_to_delete` says when and which).
+    /// Infallible by signature: a delete that fails is a journal line
+    /// and the arrival stands — a leftover branch is debt, a failed
+    /// arrival is an outage.
+    async fn clean_arrived_train_branch(&self, train: &Value) {
+        let Some(branch) = arrival_branch_to_delete(train, &self.cfg.forge_kind) else {
+            return;
+        };
+        if self.cfg.dry {
+            log(format!("DRY: would delete branch {branch} (train arrived)"));
+            return;
+        }
+        let outcome = self.forge.delete_branch(&branch).await;
+        if let Some(note) = arrival_cleanup_note(&branch, outcome) {
+            log(note);
+        }
     }
 
     /// The branches named by still-open ship-a-change cars — never
@@ -4917,6 +4997,198 @@ mod tests {
         });
         assert_eq!(train_branch_to_delete(&odd), None);
         assert_eq!(train_branch_to_delete(&json!({"id": "t-3"})), None);
+    }
+
+    // -- the arrival branch cleanup ----------------------------------------
+    //
+    // Cancel has deleted its train's branch since the verb existed;
+    // nothing owned the branch after a HAPPY landing, and 62 stale
+    // train/* branches accumulated on the forge between 08-13 and
+    // 08-20 — squash merges mean ancestry can never classify them
+    // after the fact (ab3fa473). The arrival record is the proof, and
+    // the cleanup reads it at exactly the right moment.
+
+    /// The forge as a call recorder: `delete_branch` notes the branch
+    /// it was asked for and answers as told; every other verb is
+    /// unreachable in these tests. The seam the Forge trait exists
+    /// for, pointed at the cleanup.
+    struct FakeForge {
+        deleted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        fail_deletes: bool,
+    }
+
+    #[async_trait]
+    impl Forge for FakeForge {
+        async fn pr_info(&self, _url: &str) -> Result<Value> {
+            bail!("not exercised")
+        }
+        async fn pr_create(
+            &self,
+            _repo: &str,
+            _head_branch: &str,
+            _title: &str,
+            _body: &str,
+        ) -> Result<String> {
+            bail!("not exercised")
+        }
+        async fn merge(&self, _url: &str) -> Result<()> {
+            bail!("not exercised")
+        }
+        async fn close_pr(&self, _url: &str) -> Result<()> {
+            bail!("not exercised")
+        }
+        async fn delete_branch(&self, branch: &str) -> Result<bool> {
+            self.deleted.lock().unwrap().push(branch.to_string());
+            if self.fail_deletes {
+                bail!("HTTP 500: forge down");
+            }
+            Ok(true)
+        }
+        async fn branch_head(&self, _branch: &str) -> Result<Option<String>> {
+            bail!("not exercised")
+        }
+        async fn cancel_ci_runs(&self, _pr_index: &str, _head_sha: &str) -> Result<usize> {
+            bail!("not exercised")
+        }
+    }
+
+    /// A conductor whose config is literals and whose forge is the
+    /// recorder — the cleanup touches neither the jobs API nor the
+    /// tree, so nothing else needs to exist.
+    fn cleanup_conductor(forge_kind: &str, forge: Box<dyn Forge>) -> Conductor {
+        Conductor {
+            cfg: Config {
+                jobs: "http://jobs.invalid".into(),
+                gh_repo: "example/boss".into(),
+                head_owner: "example".into(),
+                fork_url: "https://github.com/example/boss-fork.git".into(),
+                upstream_url: "https://github.com/example/boss.git".into(),
+                home: "/tmp/boss-train-test".into(),
+                clone: "/tmp/boss-train-test/repo".into(),
+                deploy_tree: "/tmp/boss-train-test/tree".into(),
+                forge_kind: forge_kind.into(),
+                auto_merge: false,
+                allow_local_jobs: true,
+                stall_hours: 6,
+                ci_hours: 2,
+                converge_alarm_mins: 30,
+                auto_cancel: false,
+                dry: false,
+            },
+            http: reqwest::Client::new(),
+            forge,
+        }
+    }
+
+    /// The `arrived_train` fixture plus the subject the cleanup keys
+    /// on — the train's own `train/*` branch.
+    fn arrived_train_with_branch() -> Value {
+        let mut train = arrived_train();
+        train["subject"] = json!({"subject_kind": "custom", "id": "train/20260820-0600"});
+        train
+    }
+
+    #[tokio::test]
+    async fn a_happy_arrival_requests_deletion_of_the_trains_own_branch() {
+        let deleted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let forge = Box::new(FakeForge {
+            deleted: std::sync::Arc::clone(&deleted),
+            fail_deletes: false,
+        });
+        let c = cleanup_conductor("forgejo", forge);
+        c.clean_arrived_train_branch(&arrived_train_with_branch())
+            .await;
+        assert_eq!(
+            *deleted.lock().unwrap(),
+            vec!["train/20260820-0600".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_delete_does_not_fail_the_arrival() {
+        let deleted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let forge = Box::new(FakeForge {
+            deleted: std::sync::Arc::clone(&deleted),
+            fail_deletes: true,
+        });
+        let c = cleanup_conductor("forgejo", forge);
+        // Returns () — there is no Result to fail: the forge blowing
+        // up costs a journal line and nothing else. A leftover branch
+        // is debt; a failed arrival is an outage.
+        c.clean_arrived_train_branch(&arrived_train_with_branch())
+            .await;
+        // And the delete WAS attempted — the line narrates a real event.
+        assert_eq!(
+            *deleted.lock().unwrap(),
+            vec!["train/20260820-0600".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_forgejo_happy_arrival_cleans_its_branch() {
+        let deleted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Under the github adapter the repo auto-deletes merged
+        // train/* PR heads — nothing to own, nothing requested.
+        let c = cleanup_conductor(
+            "github",
+            Box::new(FakeForge {
+                deleted: std::sync::Arc::clone(&deleted),
+                fail_deletes: false,
+            }),
+        );
+        c.clean_arrived_train_branch(&arrived_train_with_branch())
+            .await;
+        // A cancelled train closes with `arrived` SKIPPED — its
+        // branch was the cancel verb's, deleted at cancel time, and
+        // the arrival cleanup asks for nothing.
+        let mut cancelled = arrived_train_with_branch();
+        cancelled["steps"][3]["status"] = json!("skipped");
+        let c2 = cleanup_conductor(
+            "forgejo",
+            Box::new(FakeForge {
+                deleted: std::sync::Arc::clone(&deleted),
+                fail_deletes: false,
+            }),
+        );
+        c2.clean_arrived_train_branch(&cancelled).await;
+        assert!(deleted.lock().unwrap().is_empty());
+        // Cancel's own pin is untouched by the arrival filter: the
+        // cancelled train's branch is still exactly the one the
+        // cancel path deletes.
+        assert_eq!(
+            train_branch_to_delete(&cancelled),
+            Some("train/20260820-0600".to_string())
+        );
+    }
+
+    #[test]
+    fn the_arrival_cleanup_never_names_a_cars_branch() {
+        let mut odd = arrived_train_with_branch();
+        odd["subject"] = json!({"subject_kind": "custom", "id": "feat/x"});
+        assert_eq!(arrival_branch_to_delete(&odd, "forgejo"), None);
+        // The happy case, pure: an arrived record under forgejo names
+        // the train's own branch and nothing else.
+        assert_eq!(
+            arrival_branch_to_delete(&arrived_train_with_branch(), "forgejo"),
+            Some("train/20260820-0600".to_string())
+        );
+    }
+
+    #[test]
+    fn the_cleanup_narrates_deletes_and_failures_and_swallows_the_gone() {
+        assert_eq!(
+            arrival_cleanup_note("train/x", Ok(true)),
+            Some("deleted branch train/x (train arrived)".to_string())
+        );
+        // Already gone says nothing: the sweep revisits an unsettled
+        // train every pass, and done work narrated every pass reads
+        // as work happening.
+        assert_eq!(arrival_cleanup_note("train/x", Ok(false)), None);
+        let line = arrival_cleanup_note("train/x", Err(anyhow!("HTTP 500: down")))
+            .expect("a failure must be narrated");
+        assert!(line.contains("train/x"), "{line}");
+        assert!(line.contains("HTTP 500: down"), "{line}");
+        assert!(line.contains("arrival stands"), "{line}");
     }
 
     #[test]

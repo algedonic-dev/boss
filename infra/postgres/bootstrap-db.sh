@@ -168,9 +168,19 @@ if PLATFORM_WF_BIN="$(find_boss_bin boss-platform-workflow-seed)"; then
     PLATFORM_WF_TOML="$(dirname "$0")/../platform/workflows.toml"
     if [ -f "$PLATFORM_WF_TOML" ]; then
         echo "  seeding platform Workflow bundle"
-        "$PLATFORM_WF_BIN" \
+        # Filter the happy path's noise but NEVER the failure: the old
+        # `| grep ... || true` swallowed a failing seed's error text AND
+        # its exit code — the third silence in this one code path (after
+        # the missing file and the missing binary), each found the hard
+        # way. On failure everything the seed said is shown.
+        if SEED_OUT="$("$PLATFORM_WF_BIN" \
             --database-url "$BUILD_URL" \
-            --seed-path "$PLATFORM_WF_TOML" 2>&1 | grep -E "inserted|already present|seed:" || true
+            --seed-path "$PLATFORM_WF_TOML" 2>&1)"; then
+            printf '%s\n' "$SEED_OUT" | grep -E "inserted|already present|seed:" || true
+        else
+            echo "  WARNING: platform Workflow bundle seed FAILED — full output follows" >&2
+            printf '%s\n' "$SEED_OUT" >&2
+        fi
     else
         # LOUD, deliberately. This exact silence cost two days: the
         # image lacked infra/platform/, the [ -f ] guard skipped the
