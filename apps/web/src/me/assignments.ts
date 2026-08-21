@@ -164,15 +164,28 @@ export function splitQueues(
   };
 }
 
+/// What the assignments call produced. A non-2xx (or the network
+/// failing outright — `status: 0`) is an ERROR the page must say out
+/// loud: collapsing it to an empty result is how "the server is down"
+/// once rendered as "you have no work". Same honesty contract the
+/// watchlist keeps with its unavailable/error states.
+export type MyDayFetch =
+  | { kind: 'ready'; queues: MyDayQueues }
+  | { kind: 'error'; status: number };
+
 export async function fetchMyDay(
   uid: string,
   role: string,
-): Promise<MyDayQueues | null> {
+): Promise<MyDayFetch> {
   const params = new URLSearchParams({ assignee_id: uid, roles: role });
-  const resp = await fetch(`/api/jobs/assignments?${params}`);
-  if (!resp.ok) return null;
-  const body = (await resp.json()) as { data?: AssignmentRow[] };
-  return splitQueues(body.data ?? [], uid);
+  try {
+    const resp = await fetch(`/api/jobs/assignments?${params}`);
+    if (!resp.ok) return { kind: 'error', status: resp.status };
+    const body = (await resp.json()) as { data?: AssignmentRow[] };
+    return { kind: 'ready', queues: splitQueues(body.data ?? [], uid) };
+  } catch {
+    return { kind: 'error', status: 0 };
+  }
 }
 
 // My Day rows render as packet cards — the same card the train yard
@@ -244,7 +257,7 @@ export async function claimStep(
 // ---------------------------------------------------------------------
 
 /** Every protocol present across the queues, with how many rows each
- *  holds, most-work-first then alphabetical. Counting all three queues
+ *  holds, most-work-first then alphabetical. Counting every queue
  *  together is deliberate: the question a chip answers is "how much
  *  approval work is in front of me", not "how much of it is already
  *  mine". */
@@ -252,10 +265,11 @@ export function protocolCounts(
   queues: MyDayQueues | null,
 ): ReadonlyArray<{ workflow: string; count: number }> {
   if (!queues) return [];
-  // Every queue the page can render, `notMineToDo` included — a chip
-  // that undercounts sends the reader to a protocol filter that then
-  // shows rows the chip said were not there.
+  // Every queue the page can render, `verdicts` and `notMineToDo`
+  // included — a chip that undercounts sends the reader to a protocol
+  // filter that then shows rows the chip said were not there.
   const all = [
+    ...queues.verdicts,
     ...queues.mine,
     ...queues.upForGrabs,
     ...queues.notMineToDo,

@@ -74,7 +74,7 @@
         return;
       }
       const params = new URLSearchParams(window.location.search);
-      window.location.href = params.get('next') || '/';
+      window.location.href = safeNext(params);
     } catch (e) {
       error = String(e);
     } finally {
@@ -98,13 +98,24 @@
       // Gateway set the boss_session cookie. Drop the next-page
       // intent into the URL if a 401-redirect put one there.
       const params = new URLSearchParams(window.location.search);
-      const next = params.get('next') || '/';
-      window.location.href = next;
+      window.location.href = safeNext(params);
     } catch (e) {
       error = String(e);
     } finally {
       busy = false;
     }
+  }
+
+
+  // The `next` param is attacker-reachable (anything can link to
+  // /login?next=...), so it admits in-app paths only — the same rule
+  // router.ts applies to `from`, where the comment names the attack:
+  // a value on another origin turns sign-in into an open redirect.
+  // `//evil.example` is scheme-relative and just as hostile as
+  // `https://`, hence the second test.
+  function safeNext(params: URLSearchParams): string {
+    const next = params.get('next');
+    return next?.startsWith('/') && !next.startsWith('//') ? next : '/';
   }
 
   async function consumeReset(): Promise<void> {

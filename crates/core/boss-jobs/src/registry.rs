@@ -269,6 +269,7 @@ impl WorkflowSpec {
 /// CustomSubject support without forcing a new Subject variant
 /// in `boss-core`.
 #[cfg(test)]
+#[cfg(test)]
 fn workflow_design_spec() -> WorkflowSpec {
     let steps = vec![
         StepSpec {
@@ -691,6 +692,7 @@ fn ship_a_change_spec() -> WorkflowSpec {
 // `the_platform_bundle_matches_the_specs_it_replaced`. Out of
 // `platform_workflows()`, so the lib build has no caller.
 #[cfg(test)]
+#[cfg(test)]
 fn regenerate_deployment_spec() -> WorkflowSpec {
     /// A step in the chain, gated on its predecessor, carrying one
     /// required record of what was done.
@@ -882,6 +884,7 @@ fn regenerate_deployment_spec() -> WorkflowSpec {
 ///   0. `triage`  — measure the claim, choose a route (human-gated)
 ///   1..n         — one branch per route
 ///   999. `closed`
+#[cfg(test)]
 #[cfg(test)]
 fn backlog_item_spec() -> WorkflowSpec {
     const DISPOSITIONS: &str = "verify|design|build|duplicate|stale|decline";

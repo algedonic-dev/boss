@@ -1,6 +1,7 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import {
   assignmentPacket,
+  fetchMyDay,
   filterByProtocol,
   protocolCounts,
   needsAPerson,
@@ -171,12 +172,17 @@ describe('protocol filtering', () => {
     upForGrabs: [row({ workflow: 'approval' })],
     notMineToDo: [row({ workflow: 'demand-forecast' })],
     inFlightElsewhere: [row({ workflow: 'user-feedback' })],
-    verdicts: [],
+    // A protocol living ONLY in verdicts — the queue the tally forgot
+    // when d598681f added it (audited 2026-08-20).
+    verdicts: [
+      row({ workflow: 'correction-cycle', step: { assignee_id: 'me', kind: 'sign-off' } }),
+    ],
   };
 
-  test('counts every protocol across all four queues, busiest first', () => {
+  test('counts every protocol across all five queues, busiest first', () => {
     expect(protocolCounts(queues)).toEqual([
       { workflow: 'approval', count: 2 },
+      { workflow: 'correction-cycle', count: 1 },
       // `demand-forecast` is only in notMineToDo — a chip that skipped
       // that queue would send the reader to an empty-looking filter
       // that then renders a row.
@@ -184,6 +190,21 @@ describe('protocol filtering', () => {
       { workflow: 'ship-a-change', count: 1 },
       { workflow: 'user-feedback', count: 1 },
     ]);
+  });
+
+  test('a verdicts-only protocol gets a chip, and All agrees with the page', () => {
+    // Before the fix a sign-off docket had no chip at all, and All (N)
+    // disagreed with the cards by exactly the verdict rows.
+    const counts = protocolCounts(queues);
+    expect(counts.find((c) => c.workflow === 'correction-cycle')?.count).toBe(1);
+    const allChip = counts.reduce((n, c) => n + c.count, 0);
+    const rendered =
+      queues.verdicts.length +
+      queues.mine.length +
+      queues.upForGrabs.length +
+      queues.notMineToDo.length +
+      queues.inFlightElsewhere.length;
+    expect(allChip).toBe(rendered);
   });
 
   test('no queues means no chips, rather than a crash', () => {
@@ -200,6 +221,43 @@ describe('protocol filtering', () => {
     // "no filter" — that would silently show everything at the moment
     // the operator believes they are looking at one protocol.
     expect(filterByProtocol(queues.mine, 'retired-protocol')).toHaveLength(0);
+  });
+});
+
+// The 2026-08-20 audit: a server failure must never render as "you
+// have no work". The fetch edge says which one happened; the page
+// decides what stays on screen.
+describe('fetchMyDay is explicit about failure', () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  test('a 2xx answer carries the split queues', async () => {
+    globalThis.fetch = (async (_input: RequestInfo | URL) =>
+      new Response(
+        JSON.stringify({ data: [row({ step: { assignee_id: 'me' } })] }),
+        { status: 200 },
+      )) as typeof fetch;
+    const res = await fetchMyDay('me', 'brewer');
+    expect(res.kind).toBe('ready');
+    if (res.kind === 'ready') expect(res.queues.mine).toHaveLength(1);
+  });
+
+  test('a non-2xx is an error carrying its status, not an empty day', async () => {
+    globalThis.fetch = (async (_input: RequestInfo | URL) =>
+      new Response('down', { status: 502 })) as typeof fetch;
+    expect(await fetchMyDay('me', 'brewer')).toEqual({
+      kind: 'error',
+      status: 502,
+    });
+  });
+
+  test('the network failing outright is an error too, status 0', async () => {
+    globalThis.fetch = (async (_input: RequestInfo | URL): Promise<Response> => {
+      throw new TypeError('fetch failed');
+    }) as typeof fetch;
+    expect(await fetchMyDay('me', 'brewer')).toEqual({ kind: 'error', status: 0 });
   });
 });
 
