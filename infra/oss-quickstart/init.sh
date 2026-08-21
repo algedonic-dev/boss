@@ -81,7 +81,7 @@ fi
 # manifest entries` summary — the evidence that a converge happened. Not
 # silenced: silence is what let four migrations accumulate unapplied.
 
-echo "==> [1/3] converging per-module schema (migrate.sh, manifest order)"
+echo "==> [1/4] converging per-module schema (migrate.sh, manifest order)"
 if ! "$REPO/infra/postgres/migrate.sh"; then
     {
         echo
@@ -96,6 +96,33 @@ if ! "$REPO/infra/postgres/migrate.sh"; then
         echo "   adopted once, by hand:  migrate.sh --baseline"
     } >&2
     exit 1
+fi
+
+# ---- platform Workflow bundle, every start ----------------------------------
+# Protocols shipped as DATA (infra/platform/workflows.toml) reach the
+# registry through boss-platform-workflow-seed — insert-if-missing, so
+# re-running converges rather than overwrites, and a bundle kind that
+# arrives with an image update seeds on the restart that delivers it.
+# THIS PATH WAS MISSING ENTIRELY: bootstrap-db.sh (the cluster/gcp boot)
+# had the seed, the quickstart's init never did, and a fresh install came
+# up without workflow-design/backlog-item/regenerate-deployment — brewery
+# prepare then died on a 400 four steps of silence later. Found by the
+# public mirror's install smoke, twice (2026-08-20/21). Output is shown
+# UNFILTERED and a failure warns loudly but does not kill init: the
+# downstream prepare error now has its cause printed directly above it.
+echo "==> [2/4] seeding the platform Workflow bundle (insert-if-missing)"
+SEED_URL="postgres://${PGUSER}:${PGPASSWORD:-}@${PGHOST}:${PGPORT:-5432}/${PGDATABASE:-$PGUSER}"
+if ! boss-platform-workflow-seed \
+    --database-url "$SEED_URL" \
+    --seed-path "$REPO/infra/platform/workflows.toml"; then
+    {
+        echo
+        echo "!! PLATFORM BUNDLE SEED FAILED — bundle-supplied Workflow kinds"
+        echo "   are missing or stale in this deployment. The seed's own error"
+        echo "   is printed above. Services still start; tenant prepare will"
+        echo "   name the first missing kind it hits."
+        echo
+    } >&2
 fi
 
 # The demo builds itself live: boss-services seeds the operator-baseline +
@@ -123,7 +150,7 @@ fi
 # the operator MUST rotate via `boss-auth set $EMAIL` after first login. The
 # file lives under /var/lib/boss/auth/credentials.toml, persisted via the
 # docker volume so it survives container recreation.
-echo "==> [2/3] provisioning bootstrap-admin credential"
+echo "==> [3/4] provisioning bootstrap-admin credential"
 DEFAULT_PASSWORD="${BOSS_BOOTSTRAP_ADMIN_PASSWORD:-change-me}"
 export BOSS_AUTH_FILE="${BOSS_AUTH_FILE:-/var/lib/boss/auth/credentials.toml}"
 mkdir -p "$(dirname "$BOSS_AUTH_FILE")"
@@ -146,7 +173,7 @@ fi
 # seeds (in services-launcher.sh) run against this clock so their events land
 # on day 0. This is a direct sim_clock write because clock-api isn't up yet.
 DEMO_EPOCH="${BOSS_DEMO_EPOCH_START:-2025-04-01}"
-echo "==> [3/3] priming sim_clock to $DEMO_EPOCH for the live playground"
+echo "==> [4/4] priming sim_clock to $DEMO_EPOCH for the live playground"
 # epoch_end = epoch_start + 365 gives the playground a 12-month range; without
 # an epoch_end past epoch_start the loop is zero-length and the sim auto-pauses
 # on the first tick ('epoch complete'), leaving the demo frozen.
