@@ -94,7 +94,37 @@ BOSS_GATE_RECEIPT=/scratch/receipt-<branch>.json ./infra/gate.sh
   before the common cause surfaced). `fix/dev-pg-gets-real-shm`
   mounts a 1Gi memory-backed `/dev/shm`; the throttle stays a good
   idea until that lands and the pod restarts.
-- Receipts in `/scratch/receipt-*.json` survive the gate, not the pod.
+- ~~Receipts in `/scratch/receipt-*.json` survive the gate, not the
+  pod.~~ **Superseded 2026-08-22 evening:** receipts and logs go to
+  `/work/gate-out/` — the PVC. `/scratch` is an emptyDir and the pod
+  was replaced three times in one day (a converge at 03:45Z, then
+  cp-2 itself bouncing twice under gate load); every `/scratch`
+  receipt died with it.
+
+## The gate-runner protocol (2026-08-22, after losing a queue twice)
+
+A gate queue that lives only in tmux + emptyDir is invisible state —
+when the pod died, six queued gates vanished and a human asking "how
+are we looking" was the detection mechanism. The rules that fix that:
+
+1. **Every gate run is a `gate-run` packet**, registered BEFORE
+   launch (branch, sha, receipt slug, `due_on` a few hours out) and
+   closed with a verdict — `green`, `failed`, or `lost`; `lost` is an
+   honest verdict. An overdue open `gate-run` packet IS the alarm.
+2. **Receipts and logs on the PVC** (`/work/gate-out/`), never
+   `/scratch`.
+3. **Throttle the chain**: `CARGO_BUILD_JOBS=6 RUST_TEST_THREADS=4`
+   and `nice -n 10`. Unthrottled, a six-gate chain starved etcd into
+   failing readiness (18:10Z) and then bounced cp-2's kubelet
+   outright (19:17:49Z) — the control plane shares this node's disk
+   and memory. The manifest-side backstop (container resource
+   limits) is `fix/dev-pod-cannot-eat-the-node`.
+4. **After any pod replacement**: playwright's system deps are gone
+   (container layer). Reinstall via direct `apt-get -o
+   APT::Sandbox::User=root -o Dir::Cache::archives=/tmp/apt-cache
+   install …` and verify by RUNNING the browser binary — the `bunx
+   playwright install-deps` path exits nonzero here, and piping its
+   output can mask that.
 
 ## What this is not
 

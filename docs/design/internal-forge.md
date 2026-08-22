@@ -99,7 +99,7 @@ The ship-a-change review step gains sign_offs_required: [operator] — a version
 
 Resolved 2026-08-12 — accept.
 
-Forgejo-to-GitHub push-mirror on every main update, superseding dev-cluster's 'daily'. The mirror is a disaster-recovery artifact of the system of record — a day-stale copy is a day of lost commits — and the GitHub-native checks (CodeQL, Scorecard, install-smoke) only audit what the mirror shows them. Inbound stays deliberate-pull via GitHub PRs; the fork model keeps external code off internal runners.
+Forgejo-to-GitHub push-mirror on every main update, superseding dev-cluster's 'daily'. The mirror is a disaster-recovery artifact of the system of record — a day-stale copy is a day of lost commits — and the GitHub-native checks (CodeQL, Scorecard) only audit what the mirror shows them. (install-smoke was in that list, but it is not currently a live automated check: the forge copy has been workflow_dispatch-only since 2026-08-18 — its compose run took the CI runner's network down — and the mirror copy's guardianship is not current, since the mirror only advances when a publish is pushed.) Inbound stays deliberate-pull via GitHub PRs; the fork model keeps external code off internal runners.
 
 **Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
 

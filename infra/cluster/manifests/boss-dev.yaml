@@ -157,6 +157,17 @@ spec:
           # tag it names.
           imagePullPolicy: Always
           command: ["sleep", "infinity"]
+          # The dev container had NO resource bounds, and on 2026-08-22
+          # that cost the whole node twice: a six-gate cargo chain on
+          # cp-2 starved etcd into failing readiness (18:10Z) and then
+          # bounced the kubelet outright (19:17:49Z - every node
+          # condition re-transitioned at once, pod replaced 30s later).
+          # A bounded build dies alone; an unbounded one takes the
+          # control plane with it. Requests stay modest so scheduling
+          # is unchanged; the limits are the point.
+          resources:
+            requests: {cpu: "2", memory: 4Gi}
+            limits: {cpu: "10", memory: 20Gi}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: {drop: ["ALL"]}

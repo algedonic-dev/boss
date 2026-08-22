@@ -3,17 +3,20 @@
 # Brings up Postgres, NATS, every boss-* service in one container
 # (the gateway in that container also serves the SPA static files,
 # so no separate Caddy / nginx is needed). Total: 3 long-running
-# containers + 1 one-shot init. ~5 minutes to first SPA load.
+# containers + 1 one-shot init. Expected timings live in README.md
+# in this directory (the first `up` builds the Rust workspace).
 #
 # Setup:
 #   1. cp .env.example .env
 #   2. Edit .env — at minimum set BOSS_BOOTSTRAP_ADMIN_EMAIL.
 #   3. docker compose up
 #
-# First run runs the init container, which loads the brewery
-# 12-month seed bundle (~5 min) and seeds the bootstrap-admin
-# Employee. Subsequent runs skip init (the marker file in the
-# postgres volume tells it the DB is already bootstrapped).
+# boss-init runs on EVERY start: it converges the schema from the
+# tree and seeds the platform Workflow bundle; on first start only
+# it also provisions the bootstrap-admin credential and primes the
+# sim clock (init.sh is the authority on that chain). There is no
+# bulk seed load — boss-services seeds the tenant through the
+# public API and the sim builds the demo live from an empty log.
 #
 # Open http://localhost:4443 once the boss-services container
 # logs "all services up".
@@ -68,9 +71,11 @@ services:
       retries: 6
 
   # -------------------------------------------------------------------
-  # Init — runs once per fresh DB. Applies schema, loads the brewery
-  # 12-month seed, seeds the bootstrap-admin Employee. Exits 0 on
-  # success. The boss-services container waits on it via depends_on.
+  # Init — runs on every start (init.sh's 4-step chain): converges
+  # the schema + platform Workflow bundle; on first start it also
+  # provisions the bootstrap-admin credential and primes the sim
+  # clock. Exits 0 on success. The boss-services container waits on
+  # it via depends_on.
   # -------------------------------------------------------------------
   boss-init:
     build:
@@ -112,10 +117,10 @@ services:
       BOSS_POSTGRES_URL: postgres://boss:boss@postgres:5432/boss
       BOSS_NATS_URL: nats://nats:4222
       # Run boss-clock-api as the sim (formula) clock rather than wall
-      # time: it reads the sim_clock row boss-init seeds (epoch = the
-      # seed's last day, 8640x warp), so the brewery-sim advances
-      # ~1 sim-day per 10 wall-seconds and the playground is live, not
-      # frozen at today's date.
+      # time: it reads the sim_clock row boss-init primes on first
+      # start (epoch + warp live in init.sh step [4/4]), so the
+      # brewery-sim ticks sim-days forward and the playground is
+      # live, not frozen at today's date.
       BOSS_CLOCK_MODE: sim
       BOSS_DEFAULT_USER_EMAIL: ${BOSS_BOOTSTRAP_ADMIN_EMAIL:?}
       # services-launcher.sh seeds the operator-baseline + bootstrap-admin
@@ -126,12 +131,12 @@ services:
       BOSS_STATIC_DIR: /opt/boss/spa
       BOSS_AUTH_FILE: /var/lib/boss/auth/credentials.toml
       BOSS_AUTH_PROVIDER: local-auth
-      # Demo Mode: anonymous visitors (no `boss_session` cookie)
-      # get a synthetic `audit-readonly` session — read every
-      # projection, write nothing — so the SPA renders the brewery
-      # immediately without forcing a login. Local-auth login is
-      # still available at /login: bootstrap-admin email + password
-      # upgrades the session to platform-admin (full write access).
+      # Guest access: adds a "Browse as a guest" button to /login
+      # (POST /api/auth/guest) that mints an `audit-readonly`
+      # session — read every projection, write nothing. Sessions
+      # exist only when asked for; anonymous requests get nothing.
+      # Local-auth login on the same page: bootstrap-admin email +
+      # password mints platform-admin (full write access).
       # Real-tenant deployments should remove this line.
       BOSS_GUEST_ACCESS: "1"
       # Tenant manifest the gateway loads for /api/finance/revenue-categories

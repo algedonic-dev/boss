@@ -520,9 +520,14 @@ which one matters first.
       core.
 
 - [ ] **Cloud-provider blueprints — opt-in recipes, no core
-      dependence.** The release ships exactly two install paths
-      (`infra/oss-quickstart/quickstart.sh` for bare-metal +
-      the Docker compose stack). Cloud-provider provisioning
+      dependence.** The release ships one supported install
+      path (the Docker compose stack under
+      `infra/oss-quickstart/`), plus a source-tree dev-mode
+      script (`quickstart.sh`, whose engine is
+      `infra/bootstrap-local.sh`) and the
+      undocumented-with-known-flaws `infra/bootstrap-vm.sh`
+      (no SPA deploy, hardcoded binary list — packets exist
+      for both). Cloud-provider provisioning
       recipes (Azure Bicep, GCP, Cloudflare Tunnel + Origin
       Cert, AWS, Hetzner) come back post-release as
       `infra/blueprints/<provider>/` directories, each with a
