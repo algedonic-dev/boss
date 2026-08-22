@@ -15,6 +15,12 @@
 
   let pos = $state<PurchaseOrder[]>([]);
   let vendorInvoices = $state<VendorInvoice[]>([]);
+  /// Non-null when the PO list fetch FAILED — rendered instead of
+  /// "Purchase order not found", which is a claim only a successful
+  /// lookup gets to make (packet 3fba9c35). A failed invoice fetch
+  /// degrades that section the same way.
+  let loadFailed = $state<string | null>(null);
+  let invoicesFailed = $state<string | null>(null);
   let loading = $state(true);
 
   $effect(() => {
@@ -28,16 +34,24 @@
         ]);
         if (pResp.ok) {
           const body = await pResp.json();
-          if (!cancelled) pos = Array.isArray(body) ? body : (body.data ?? []);
+          if (!cancelled) {
+            pos = Array.isArray(body) ? body : (body.data ?? []);
+            loadFailed = null;
+          }
+        } else {
+          if (!cancelled) loadFailed = `HTTP ${pResp.status}`;
         }
         if (vResp.ok) {
           const body = await vResp.json();
           if (!cancelled) {
             vendorInvoices = Array.isArray(body) ? body : (body.data ?? []);
+            invoicesFailed = null;
           }
+        } else {
+          if (!cancelled) invoicesFailed = `HTTP ${vResp.status}`;
         }
-      } catch {
-        // ignore
+      } catch (e) {
+        if (!cancelled) loadFailed = e instanceof Error ? e.message : String(e);
       }
       if (!cancelled) loading = false;
     })();
@@ -53,6 +67,12 @@
 {#if loading && pos.length === 0}
   <div class="catalog theme-exec">
     <p class="empty">Loading PO…</p>
+  </div>
+{:else if loadFailed}
+  <div class="catalog theme-exec">
+    <p class="empty load-failed" role="alert">
+      Couldn't load this purchase order — {loadFailed}
+    </p>
   </div>
 {:else if !po}
   <div class="catalog theme-exec">
@@ -142,7 +162,11 @@
       </Section>
 
       <Section title={`Vendor invoices (${bills.length})`} wide>
-          {#if bills.length === 0}
+          {#if invoicesFailed}
+            <p class="empty load-failed" role="alert">
+              Couldn't load vendor invoices — {invoicesFailed}
+            </p>
+          {:else if bills.length === 0}
             <p class="empty">No invoices received against this PO.</p>
           {:else}
             <table class="data-table">

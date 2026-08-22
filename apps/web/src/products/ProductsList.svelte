@@ -13,6 +13,10 @@
 
   let products = $state<Product[]>([]);
   let totals = $state<Record<string, number>>({});
+  /// Non-null when the load failed — rendered instead of the empty
+  /// state, so an outage never reads as "no products yet" (packet
+  /// 3fba9c35, the false-empty sweep).
+  let loadFailed = $state<string | null>(null);
   let loading = $state(true);
   let query = $state('');
 
@@ -22,9 +26,11 @@
     (async () => {
       try {
         const resp = await fetch('/api/products');
-        const body = resp.ok ? ((await resp.json()) as Product[]) : [];
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const body = (await resp.json()) as Product[];
         if (cancelled) return;
         products = body;
+        loadFailed = null;
         // Roll up total_on_hand per SKU via the detail endpoint —
         // the list endpoint omits inventory to keep payloads small.
         const detailEntries = await Promise.all(
@@ -42,8 +48,11 @@
         if (cancelled) return;
         totals = Object.fromEntries(detailEntries);
         loading = false;
-      } catch {
-        if (!cancelled) loading = false;
+      } catch (e) {
+        if (!cancelled) {
+          loadFailed = e instanceof Error ? e.message : String(e);
+          loading = false;
+        }
       }
     })();
     return () => {
@@ -87,6 +96,10 @@
 
   {#if loading}
     <p class="empty">Loading products…</p>
+  {:else if loadFailed}
+    <p class="empty load-failed" role="alert">
+      Couldn't load products — {loadFailed}
+    </p>
   {:else if filteredRows.length === 0}
     <p class="empty">
       {#if query}

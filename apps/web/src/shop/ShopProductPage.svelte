@@ -26,17 +26,29 @@
   let product = $state<BreweryProduct | null>(findProduct(sku) ?? null);
   let onHand = $state<number | null>(null);
   let invLoaded = $state(false);
+  /// True when the availability check FAILED. It used to render as
+  /// "Currently sold out" — a stock claim the page had no basis for
+  /// (packet 3fba9c35, the false-empty sweep). A failed check says
+  /// so, and keeps the order form open.
+  let invFailed = $state(false);
 
   $effect(() => {
     const s = sku;
     let cancelled = false;
     product = findProduct(s) ?? null;
     invLoaded = false;
+    invFailed = false;
     onHand = null;
     (async () => {
       try {
         const r = await fetch('/api/inventory/items');
-        if (!r.ok) return;
+        if (!r.ok) {
+          if (!cancelled) {
+            invFailed = true;
+            invLoaded = true;
+          }
+          return;
+        }
         const body = (await r.json()) as
           | Array<{ part_sku: string; on_hand: number; allocated: number }>
           | { data: Array<{ part_sku: string; on_hand: number; allocated: number }> };
@@ -46,7 +58,10 @@
         onHand = row ? Math.max(0, (row.on_hand ?? 0) - (row.allocated ?? 0)) : 0;
         invLoaded = true;
       } catch {
-        invLoaded = true;
+        if (!cancelled) {
+          invFailed = true;
+          invLoaded = true;
+        }
       }
     })();
     return () => {
@@ -244,7 +259,12 @@
           {/if}
         </div>
         {#if invLoaded}
-          {#if inStock}
+          {#if invFailed}
+            <p class="shop-stock-line">
+              Couldn't check availability right now — place the order and
+              the shipping team will confirm stock.
+            </p>
+          {:else if inStock}
             <p class="shop-stock-line shop-stock-in">
               {onHand} unit{onHand === 1 ? '' : 's'} on hand at the brewhouse cooler
             </p>
@@ -269,7 +289,7 @@
           </p>
         </div>
       </div>
-    {:else if inStock || !invLoaded}
+    {:else if inStock || !invLoaded || invFailed}
       <div class="shop-quote-form">
         <h4>Order — {p.brand} ({packageLabel(p.package)})</h4>
         <div class="shop-quote-grid">

@@ -19,6 +19,10 @@
 
   let employee = $state<Employee | null>(null);
   let allEmployees = $state<Employee[]>([]);
+  /// Non-null when the record fetch FAILED (5xx / network) — rendered
+  /// instead of "Employee not found", which is a claim only a
+  /// successful lookup gets to make (packet 3fba9c35).
+  let loadFailed = $state<string | null>(null);
   let loading = $state(true);
 
   $effect(() => {
@@ -32,12 +36,24 @@
           fetch('/api/people'),
         ]);
         if (!cancelled) {
-          employee = eResp.ok ? ((await eResp.json()) as Employee) : null;
+          if (eResp.ok) {
+            employee = (await eResp.json()) as Employee;
+            loadFailed = null;
+          } else if (eResp.status === 404) {
+            employee = null;
+            loadFailed = null;
+          } else {
+            employee = null;
+            loadFailed = `HTTP ${eResp.status}`;
+          }
           allEmployees = rosterResp.ok ? ((await rosterResp.json()) as Employee[]) : [];
           loading = false;
         }
-      } catch {
-        if (!cancelled) loading = false;
+      } catch (e) {
+        if (!cancelled) {
+          loadFailed = e instanceof Error ? e.message : String(e);
+          loading = false;
+        }
       }
     })();
     return () => {
@@ -92,6 +108,12 @@
 {#if loading}
   <div class="catalog theme-exec">
     <p class="empty">Loading employee…</p>
+  </div>
+{:else if loadFailed}
+  <div class="catalog theme-exec">
+    <p class="empty load-failed" role="alert">
+      Couldn't load this employee — {loadFailed}
+    </p>
   </div>
 {:else if !employee}
   <div class="catalog theme-exec">

@@ -44,6 +44,10 @@
   // instead of hardcoding brewery slugs. Drives both the open-job
   // counts and the recent-jobs feed below.
   let qaKinds = $state<Set<string>>(new Set());
+  /// Non-null when any of the page's primary reads failed — rendered
+  /// instead of zeroed counts and empty rosters, which an outage is
+  /// not (packet 3fba9c35, the false-empty sweep).
+  let loadFailed = $state<string | null>(null);
   let loading = $state(true);
   let tab = $state<Tab>('overview');
 
@@ -58,6 +62,7 @@
           fetch('/api/jobs/live'),
           fetch('/api/workflows'),
         ]);
+        const down = [pResp, sResp, lResp, kResp].find((x) => !x.ok);
         const pBody = pResp.ok ? ((await pResp.json()) as Employee[]) : [];
         const sBody = sResp.ok ? await sResp.json() : { counts: {} };
         const lBody = lResp.ok ? await lResp.json() : { recent: [] };
@@ -71,10 +76,14 @@
               .filter((k) => workflowSurfaces(k).includes('qa'))
               .map((k) => k.kind),
           );
+          loadFailed = down ? `HTTP ${down.status}` : null;
           loading = false;
         }
-      } catch {
-        if (!cancelled) loading = false;
+      } catch (e) {
+        if (!cancelled) {
+          loadFailed = e instanceof Error ? e.message : String(e);
+          loading = false;
+        }
       }
     })();
     return () => {
@@ -165,6 +174,10 @@
 
   {#if loading}
     <p class="empty">Loading…</p>
+  {:else if loadFailed}
+    <p class="empty load-failed" role="alert">
+      Couldn't load QA data — {loadFailed}
+    </p>
   {:else if tab === 'overview'}
     <div
       class="tab-content"

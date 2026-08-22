@@ -758,6 +758,14 @@ a:hover { color: #8ce4c2; }
   padding: 12px 0;
 }
 
+/* A failed load is a failure, not an empty (packet 3fba9c35). Every
+   surface that renders its primary dataset marks the failed state
+   with this class so an outage can never pass for "truly empty". */
+.load-failed {
+  color: var(--err);
+  font-style: normal;
+}
+
 /* =============================================================================
    Catalog (shares theme-exec)
    ========================================================================== */

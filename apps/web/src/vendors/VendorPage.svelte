@@ -40,6 +40,10 @@
   let { vendorLookup } = $props<{ vendorLookup: string }>();
 
   let vendors = $state<Vendor[]>([]);
+  /// Non-null when the vendor list fetch FAILED — rendered instead of
+  /// "Vendor not found", which is a claim only a successful lookup
+  /// gets to make (packet 3fba9c35).
+  let loadFailed = $state<string | null>(null);
   let pos = $state<PurchaseOrder[]>([]);
   let vendorInvoices = $state<VendorInvoice[]>([]);
   let empNames = $state<Map<string, string>>(new Map());
@@ -73,6 +77,7 @@
         const iBody = iResp.ok ? await iResp.json() : [];
         const peopleBody = peopleResp.ok ? await peopleResp.json() : [];
         if (!cancelled) {
+          loadFailed = vResp.ok ? null : `HTTP ${vResp.status}`;
           vendors = Array.isArray(vBody) ? vBody : (vBody.data ?? []);
           pos = Array.isArray(pBody) ? pBody : (pBody.data ?? []);
           vendorInvoices = Array.isArray(iBody) ? iBody : (iBody.data ?? []);
@@ -83,8 +88,11 @@
           empNames = names;
           loading = false;
         }
-      } catch {
-        if (!cancelled) loading = false;
+      } catch (e) {
+        if (!cancelled) {
+          loadFailed = e instanceof Error ? e.message : String(e);
+          loading = false;
+        }
       }
     })();
     return () => {
@@ -186,6 +194,12 @@
 {#if loading}
   <div class="catalog theme-exec">
     <p class="empty">Loading vendor…</p>
+  </div>
+{:else if loadFailed}
+  <div class="catalog theme-exec">
+    <p class="empty load-failed" role="alert">
+      Couldn't load this vendor — {loadFailed}
+    </p>
   </div>
 {:else if !vendor}
   <div class="catalog theme-exec">

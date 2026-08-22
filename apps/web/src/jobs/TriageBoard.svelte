@@ -263,17 +263,21 @@
         fetch('/api/workflows'),
       ]);
       if (!jobsRes.ok) throw new Error(`${kind} jobs: HTTP ${jobsRes.status}`);
+      // The registry read is part of the board's truth, not an
+      // enhancement. Placement derives from the fork, so "no fork"
+      // (null) files every routed card under WAITING — a column whose
+      // hint says nobody has routed them. When the registry genuinely
+      // has no fork for this kind that is the right render; when the
+      // FETCH failed it is a false statement, so the failure is the
+      // board's failure (packet 3fba9c35, the false-empty sweep).
+      if (!kindsRes.ok) throw new Error(`workflows registry: HTTP ${kindsRes.status}`);
       const body = await jobsRes.json();
       jobs = Array.isArray(body) ? body : (body.data ?? []);
       countArchived(typeof body.total === 'number' ? body.total : jobs.length, background);
 
-      // A missing registry costs the columns, not the board — the
-      // cards still render and the fallback is waiting/done.
-      if (kindsRes.ok) {
-        const kinds = await kindsRes.json();
-        const rows: unknown[] = Array.isArray(kinds) ? kinds : (kinds.data ?? []);
-        fork = readFork(rows.find((k) => (k as { kind?: string }).kind === kind));
-      }
+      const kinds = await kindsRes.json();
+      const rows: unknown[] = Array.isArray(kinds) ? kinds : (kinds.data ?? []);
+      fork = readFork(rows.find((k) => (k as { kind?: string }).kind === kind));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {

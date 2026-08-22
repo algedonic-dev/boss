@@ -67,14 +67,25 @@
     }
   }
 
+  /// Strict fetch for the loads the page cannot stand without. jsonOr
+  /// is for per-kind enrichment only — using it on the ROOT reads
+  /// meant a failed /api/views/flow rendered the department as having
+  /// zero workflows, with the error state unreachable (packet
+  /// 3fba9c35, the false-empty sweep).
+  async function jsonStrict<T>(url: string): Promise<T> {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
+    return (await r.json()) as T;
+  }
+
   async function load(background = false): Promise<void> {
     if (!background) loading = true;
     try {
       // The Flow endpoint already knows the team's kinds (owner_role
       // over the registry — no list in code, CLAUDE.md §9).
-      const flow = await jsonOr<{ kinds?: string[] }>('/api/views/flow?limit=1', {});
+      const flow = await jsonStrict<{ kinds?: string[] }>('/api/views/flow?limit=1');
       const teamKinds = Array.isArray(flow.kinds) ? flow.kinds : [];
-      const declared = await jsonOr<EdgeSpec[]>('/api/jobs/job-edges', []);
+      const declared = await jsonStrict<EdgeSpec[]>('/api/jobs/job-edges');
       edgeSpecs = Array.isArray(declared) ? declared : [];
       // The pipeline can reference kinds outside the owner set
       // (pr-train is the conductor's, not feedback's) — the network

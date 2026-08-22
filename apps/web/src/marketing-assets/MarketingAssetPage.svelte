@@ -14,6 +14,10 @@
 
   let asset = $state<MarketingAsset | null>(null);
   let history = $state<MarketingAsset[]>([]);
+  /// Non-null when the record fetch FAILED (5xx / network) — rendered
+  /// instead of "Asset not found", which is a claim only a successful
+  /// lookup gets to make (packet 3fba9c35).
+  let loadFailed = $state<string | null>(null);
   let loading = $state(true);
   let empNames = $state<Map<string, string>>(new Map());
 
@@ -43,10 +47,21 @@
           fetch('/api/people'),
         ]);
         if (aResp.status === 404) {
-          if (!cancelled) asset = null;
+          if (!cancelled) {
+            asset = null;
+            loadFailed = null;
+          }
         } else if (aResp.ok) {
           const body = (await aResp.json()) as MarketingAsset;
-          if (!cancelled) asset = body;
+          if (!cancelled) {
+            asset = body;
+            loadFailed = null;
+          }
+        } else {
+          if (!cancelled) {
+            asset = null;
+            loadFailed = `HTTP ${aResp.status}`;
+          }
         }
         if (hResp.ok) {
           const body = (await hResp.json()) as MarketingAsset[];
@@ -58,8 +73,11 @@
           for (const e of people) m.set(e.id, e.name);
           if (!cancelled) empNames = m;
         }
-      } catch {
-        if (!cancelled) asset = null;
+      } catch (e) {
+        if (!cancelled) {
+          asset = null;
+          loadFailed = e instanceof Error ? e.message : String(e);
+        }
       }
       if (!cancelled) loading = false;
     })();
@@ -85,6 +103,10 @@
 
   {#if loading && !asset}
     <p class="empty">Loading…</p>
+  {:else if loadFailed}
+    <p class="empty load-failed" role="alert">
+      Couldn't load this asset — {loadFailed}
+    </p>
   {:else if !asset}
     <header class="detail-hero">
       <h1 class="detail-title">Asset not found</h1>

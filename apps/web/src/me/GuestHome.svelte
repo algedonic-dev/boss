@@ -24,18 +24,33 @@
   let { greeting }: Props = $props();
 
   let track = $state<PacketTrack>(NO_TRACK);
+  /// Non-null when the feedback read FAILED (5xx / network) — the
+  /// panel says so instead of silently vanishing (packet 3fba9c35).
+  /// A policy refusal (403) keeps the old quiet absence: a guest
+  /// whose read scope says no is not looking at an outage.
+  let trackFailed = $state<string | null>(null);
 
   $effect(() => {
     let cancelled = false;
     (async () => {
       try {
         const r = await fetch('/api/jobs?kind=user-feedback&limit=100');
-        if (!r.ok) return; // read scope says no: no panel, no error
+        if (!r.ok) {
+          // Read scope says no: no panel, no error. Anything else
+          // failing is an outage, not an answer.
+          if (!cancelled && r.status !== 401 && r.status !== 403) {
+            trackFailed = `HTTP ${r.status}`;
+          }
+          return;
+        }
         const body = await r.json();
         const rows: FeedbackPacket[] = Array.isArray(body) ? body : (body.data ?? []);
-        if (!cancelled) track = placeOnTrack(rows);
-      } catch {
-        // A blip costs the panel, never the page.
+        if (!cancelled) {
+          track = placeOnTrack(rows);
+          trackFailed = null;
+        }
+      } catch (e) {
+        if (!cancelled) trackFailed = e instanceof Error ? e.message : String(e);
       }
     })();
     return () => {
@@ -92,6 +107,11 @@
     </span>
   </section>
 
+  {#if trackFailed}
+    <p class="empty load-failed" role="alert">
+      Couldn't load the feedback track — {trackFailed}
+    </p>
+  {/if}
   {#if track.any}
     <section class="guest-track-wrap">
       <h2 class="guest-track-title">What guests told us, and where it got to</h2>

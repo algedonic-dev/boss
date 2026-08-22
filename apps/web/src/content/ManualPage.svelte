@@ -15,6 +15,10 @@
   };
 
   let sections = $state<ManualSection[]>([]);
+  /// Non-null when the tree load failed — rendered instead of the
+  /// empty state, so an outage never reads as "no sections yet"
+  /// (packet 3fba9c35, the false-empty sweep).
+  let sectionsFailed = $state<string | null>(null);
   let sectionsLoading = $state(true);
   let collapsed = $state<Set<string>>(new Set());
 
@@ -46,10 +50,15 @@
         const r = await fetch('/api/content/manual');
         if (r.ok) {
           const body = (await r.json()) as ManualSection[];
-          if (!cancelled) sections = body;
+          if (!cancelled) {
+            sections = body;
+            sectionsFailed = null;
+          }
+        } else {
+          if (!cancelled) sectionsFailed = `HTTP ${r.status}`;
         }
-      } catch {
-        // ignore
+      } catch (e) {
+        if (!cancelled) sectionsFailed = e instanceof Error ? e.message : String(e);
       }
       if (!cancelled) sectionsLoading = false;
       try {
@@ -166,6 +175,10 @@
     <aside class="manual-tree">
       {#if sectionsLoading}
         <div class="manual-placeholder">Loading tree…</div>
+      {:else if sectionsFailed}
+        <div class="manual-placeholder load-failed" role="alert">
+          Couldn't load the manual — {sectionsFailed}
+        </div>
       {:else if tree.length === 0}
         <div class="manual-placeholder">No sections yet.</div>
       {:else}

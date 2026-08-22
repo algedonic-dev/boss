@@ -19,9 +19,13 @@
 
   type Props = {
     invoices: ReadonlyArray<Invoice>;
+    /// Non-null when the invoice load failed — rendered instead of
+    /// the empty state, so an outage never reads as "no invoices"
+    /// (packet 3fba9c35).
+    loadError?: string | null;
     totalCount: number;
   };
-  let { invoices, totalCount }: Props = $props();
+  let { invoices, loadError = null, totalCount }: Props = $props();
 
   type StatusFilter = InvoiceStatus | 'all' | 'unpaid';
   type MethodFilter = PaymentMethod | 'all';
@@ -156,7 +160,11 @@
         hint="Use search or status filters to narrow the list."
       />
     {/if}
-    {#if visible.length === 0}
+    {#if loadError}
+      <p class="empty load-failed" role="alert">
+        Couldn't load invoices — {loadError}
+      </p>
+    {:else if visible.length === 0}
       <p class="empty">No invoices match those filters.</p>
     {:else}
       <table class="data-table data-table-striped">

@@ -22,6 +22,10 @@
   type StatusFilter = EmploymentStatus | 'all';
 
   let roster = $state<Employee[]>([]);
+  /// Non-null when the roster load failed — rendered instead of the
+  /// empty state, so an outage never reads as "no employees" (packet
+  /// 3fba9c35, the false-empty sweep).
+  let loadFailed = $state<string | null>(null);
   let loading = $state(true);
   let dept = $state<DeptFilter>('all');
   let status = $state<StatusFilter>('active');
@@ -37,10 +41,14 @@
         const body = (await r.json()) as Employee[];
         if (!cancelled) {
           roster = body;
+          loadFailed = null;
           loading = false;
         }
-      } catch {
-        if (!cancelled) loading = false;
+      } catch (e) {
+        if (!cancelled) {
+          loadFailed = e instanceof Error ? e.message : String(e);
+          loading = false;
+        }
       }
     })();
     return () => {
@@ -167,6 +175,10 @@
     <section class="list-section">
       {#if loading}
         <p class="empty">Loading…</p>
+      {:else if loadFailed}
+        <p class="empty load-failed" role="alert">
+          Couldn't load the roster — {loadFailed}
+        </p>
       {:else if viewMode === 'tree'}
         {#if treeRoots.length === 0}
           <p class="empty">No leadership rooted org chart yet.</p>

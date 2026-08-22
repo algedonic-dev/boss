@@ -10,6 +10,7 @@
   import type { Employee } from '../people/types';
   import { href, navigate } from '../router';
   import { session } from '@boss/web-kit/session/session.svelte';
+  import { fetchRemote, type Remote } from '../data/remote';
 
   /// `needs-you` is the default view, and the reason this file changed.
   ///
@@ -28,7 +29,13 @@
   /// nothing is hidden.
   type KindFilter = MessageKind | 'all' | 'unread' | 'needs-you';
 
-  let messages = $state<Message[]>([]);
+  /// The inbox itself, as a discriminated union — a failed fetch is a
+  /// FAILED inbox, never an empty one. The old shape (`messages = []`
+  /// plus a swallowed error) made an outage render "Nothing is
+  /// waiting on you", which is a claim about the world the page had
+  /// no basis for (packet 3fba9c35, the false-empty sweep).
+  let inbox = $state<Remote<Message[]>>({ kind: 'loading' });
+  let messages = $derived(inbox.kind === 'ready' ? inbox.data : []);
   let employees = $state<Employee[]>([]);
   let kindFilter = $state<KindFilter>('needs-you');
   let query = $state('');
@@ -45,14 +52,10 @@
 
   async function refreshInbox(): Promise<void> {
     if (!userId) return;
-    try {
-      const r = await fetch(`/api/messages/inbox/${encodeURIComponent(userId)}`);
-      if (r.ok) {
-        messages = (await r.json()) as Message[];
-      }
-    } catch {
-      // empty
-    }
+    inbox = await fetchRemote(
+      `/api/messages/inbox/${encodeURIComponent(userId)}`,
+      (raw) => (Array.isArray(raw) ? (raw as Message[]) : []),
+    );
   }
 
   $effect(() => {
@@ -155,12 +158,21 @@
 </script>
 
 <div class="catalog theme-exec">
+  <!-- The headline is a claim about the world; the page only gets to
+       make it from a loaded inbox. While loading or failed it says
+       neither "nothing waiting" nor a count. -->
   <PageHeader
     eyebrow="Inbox"
-    title={needsYou.length === 0
-      ? 'Nothing is waiting on you'
-      : `${needsYou.length} waiting on you`}
-    subtitle={`${unread.length} unread · ${directCount} direct · ${signalCount} signals · ${messages.length} total`}
+    title={inbox.kind !== 'ready'
+      ? 'Inbox'
+      : needsYou.length === 0
+        ? 'Nothing is waiting on you'
+        : `${needsYou.length} waiting on you`}
+    subtitle={inbox.kind === 'ready'
+      ? `${unread.length} unread · ${directCount} direct · ${signalCount} signals · ${messages.length} total`
+      : inbox.kind === 'failed'
+        ? 'The message store could not be reached.'
+        : 'Loading…'}
   />
 
   <div style="padding:0 32px 12px">
@@ -263,7 +275,17 @@
     </aside>
 
     <section class="list-section">
-      {#if visible.length === 0}
+      {#if inbox.kind === 'loading'}
+        <p class="empty">Loading…</p>
+      {:else if inbox.kind === 'failed'}
+        <!-- A failed load is a failure, distinct from an empty inbox. -->
+        <p class="empty load-failed" role="alert">
+          Couldn't load your inbox — {inbox.error}
+        </p>
+        <div style="padding:0 32px">
+          <button class="hr-action-btn" onclick={() => void refreshInbox()}>Retry</button>
+        </div>
+      {:else if visible.length === 0}
         <p class="empty">No messages match those filters.</p>
       {:else}
         <div class="inbox-list">

@@ -54,18 +54,27 @@
   let saving = $state(false);
   let error = $state<string | null>(null);
 
+  /// Non-null when the account list failed to load. Without it the
+  /// picker rendered one blank option and Create stayed disabled with
+  /// no explanation — an outage disguised as an empty roster (packet
+  /// 3fba9c35, the false-empty sweep).
+  let accountsFailed = $state<string | null>(null);
   $effect(() => {
     let cancelled = false;
     (async () => {
       try {
         const r = await fetch('/api/people/accounts');
-        if (!r.ok) return;
+        if (!r.ok) {
+          if (!cancelled) accountsFailed = `HTTP ${r.status}`;
+          return;
+        }
         const body = await r.json();
         if (!cancelled) {
           accounts = Array.isArray(body) ? body : (body.data ?? []);
+          accountsFailed = null;
         }
-      } catch {
-        // empty account list is OK
+      } catch (e) {
+        if (!cancelled) accountsFailed = e instanceof Error ? e.message : String(e);
       }
     })();
     return () => {
@@ -231,6 +240,11 @@
               </option>
             {/each}
           </select>
+          {#if accountsFailed}
+            <div class="ni-hint load-failed" role="alert">
+              Couldn't load accounts — {accountsFailed}
+            </div>
+          {/if}
           {#if selectedAccount}
             <div class="ni-hint">
               Billing to <strong>{selectedAccount.name}</strong> ·

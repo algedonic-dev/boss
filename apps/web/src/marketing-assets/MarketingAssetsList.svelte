@@ -29,6 +29,10 @@
   let includeRetired = $state(false);
   let query = $state('');
   let assets = $state<MarketingAsset[]>([]);
+  /// Non-null when the load failed — rendered instead of the empty
+  /// state, so an outage never reads as "no marketing assets yet"
+  /// (packet 3fba9c35, the false-empty sweep).
+  let loadFailed = $state<string | null>(null);
   let loading = $state(true);
 
   $effect(() => {
@@ -45,10 +49,15 @@
         const resp = await fetch(`/api/catalog/marketing-assets?${qs.toString()}`);
         if (resp.ok) {
           const body = (await resp.json()) as MarketingAsset[];
-          if (!cancelled) assets = Array.isArray(body) ? body : [];
+          if (!cancelled) {
+            assets = Array.isArray(body) ? body : [];
+            loadFailed = null;
+          }
+        } else {
+          if (!cancelled) loadFailed = `HTTP ${resp.status}`;
         }
-      } catch {
-        // ignore
+      } catch (e) {
+        if (!cancelled) loadFailed = e instanceof Error ? e.message : String(e);
       }
       if (!cancelled) loading = false;
     })();
@@ -108,6 +117,10 @@
     <section class="list-section">
       {#if loading && assets.length === 0}
         <p class="empty">Loading…</p>
+      {:else if loadFailed}
+        <p class="empty load-failed" role="alert">
+          Couldn't load marketing assets — {loadFailed}
+        </p>
       {:else if visible.length === 0}
         <p class="empty">
           {assets.length === 0 ? 'No marketing assets yet.' : 'No assets match those filters.'}

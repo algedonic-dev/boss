@@ -96,6 +96,10 @@
 
   let weekOffset = $state(0);
   let data = $state<WeekGridResponse | null>(null);
+  /// Non-null when the load failed — rendered instead of the empty
+  /// state, so an outage never reads as "no techs have availability"
+  /// (packet 3fba9c35, the false-empty sweep).
+  let loadFailed = $state<string | null>(null);
   let loading = $state(true);
   let empNames = $state<Map<string, string>>(new Map());
 
@@ -121,12 +125,21 @@
         const r = await fetch(`/api/scheduling/week-grid?${qs.toString()}`);
         if (r.ok) {
           const body = (await r.json()) as WeekGridResponse;
-          if (!cancelled) data = body;
+          if (!cancelled) {
+            data = body;
+            loadFailed = null;
+          }
         } else {
-          if (!cancelled) data = null;
+          if (!cancelled) {
+            data = null;
+            loadFailed = `HTTP ${r.status}`;
+          }
         }
-      } catch {
-        if (!cancelled) data = null;
+      } catch (e) {
+        if (!cancelled) {
+          data = null;
+          loadFailed = e instanceof Error ? e.message : String(e);
+        }
       }
       if (!cancelled) loading = false;
     })();
@@ -207,6 +220,10 @@
 
   {#if loading && !data}
     <p class="empty">Loading…</p>
+  {:else if loadFailed}
+    <p class="empty load-failed" role="alert">
+      Couldn't load the week grid — {loadFailed}
+    </p>
   {:else if !data || data.rows.length === 0}
     <p class="empty">No techs have availability or assignments this week.</p>
   {:else}

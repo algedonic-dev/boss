@@ -33,6 +33,10 @@
   ];
 
   let roster = $state<Employee[]>([]);
+  /// Non-null when the roster load failed — rendered instead of the
+  /// zeroed-out overview, so an outage never reads as "0 active
+  /// employees" (packet 3fba9c35, the false-empty sweep).
+  let rosterFailed = $state<string | null>(null);
   let loading = $state(true);
   let tab = $state<Tab>('overview');
 
@@ -44,10 +48,15 @@
         const r = await fetch('/api/people');
         if (r.ok) {
           const body = (await r.json()) as Employee[];
-          if (!cancelled) roster = body;
+          if (!cancelled) {
+            roster = body;
+            rosterFailed = null;
+          }
+        } else {
+          if (!cancelled) rosterFailed = `HTTP ${r.status}`;
         }
-      } catch {
-        // Empty roster renders fine.
+      } catch (e) {
+        if (!cancelled) rosterFailed = e instanceof Error ? e.message : String(e);
       }
       if (!cancelled) loading = false;
     })();
@@ -148,6 +157,11 @@
   let startTarget = $state('');
 
   let workflowsApiAvailable = $state<boolean | null>(null);
+  /// Non-null when the registry or jobs reads behind the workflows
+  /// tab FAILED — rendered instead of "No HR workflows / No active
+  /// workflows", which are claims only successful reads get to make
+  /// (packet 3fba9c35, the false-empty sweep).
+  let workflowsFailed = $state<string | null>(null);
 
   async function fetchHrKinds(): Promise<void> {
     // /api/workflows is the canonical Workflow list. The HR
@@ -156,7 +170,10 @@
     // SPA tenant-agnostic — no brewery slugs baked into HR.
     try {
       const r = await fetch('/api/workflows');
-      if (!r.ok) return;
+      if (!r.ok) {
+        workflowsFailed = `workflows registry: HTTP ${r.status}`;
+        return;
+      }
       const all = (await r.json()) as WorkflowSpec[];
       hrKinds = all
         .filter(
@@ -165,8 +182,9 @@
             k.subject_kinds.includes('employee'),
         )
         .map((k) => ({ kind: k.kind, label: k.label }));
-    } catch {
-      // Empty hrKinds renders the empty/loading state gracefully.
+      workflowsFailed = null;
+    } catch (e) {
+      workflowsFailed = e instanceof Error ? e.message : String(e);
     }
   }
 
@@ -181,7 +199,12 @@
         const r = await fetch(
           `/api/jobs?kind=${kind}&status=open&limit=200`,
         );
-        if (!r.ok) continue;
+        if (!r.ok) {
+          // A failed kind is a failed list — skipping it would render
+          // the remainder as if it were everything.
+          workflowsFailed = `${kind} jobs: HTTP ${r.status}`;
+          continue;
+        }
         const payload = (await r.json()) as {
           jobs?: Array<{
             id: string;
@@ -329,6 +352,12 @@
   <div class="tab-panel" style="padding:0 32px 32px">
     {#if loading}
       <p class="empty">Loading…</p>
+    {:else if rosterFailed && tab !== 'workflows' && tab !== 'requisitions'}
+      <!-- Overview, certs and headcount all derive from the roster —
+           with the roster fetch failed their zeros would be fiction. -->
+      <p class="empty load-failed" role="alert">
+        Couldn't load the roster — {rosterFailed}
+      </p>
     {:else if tab === 'overview'}
       <div class="tab-grid">
         <Section title="At a glance">
@@ -364,7 +393,11 @@
     {:else if tab === 'workflows'}
       <div>
         <Section title="Start Workflow">
-            {#if hrKinds.length === 0}
+            {#if workflowsFailed && hrKinds.length === 0}
+              <p class="load-failed" role="alert" style="font-size:13px">
+                Couldn't load HR workflows — {workflowsFailed}
+              </p>
+            {:else if hrKinds.length === 0}
               <p style="color:#78716c; font-size:13px">
                 No HR workflows are published in this deployment.
                 Workflows appear here once they declare
@@ -394,6 +427,10 @@
         <Section title="Active Workflows">
             {#if workflowsLoading}
               <p style="color:#78716c; font-size:13px">Loading...</p>
+            {:else if workflowsFailed}
+              <p class="load-failed" role="alert" style="font-size:13px">
+                Couldn't load active workflows — {workflowsFailed}
+              </p>
             {:else if workflowsApiAvailable === false}
               <p style="color:#78716c; font-size:13px">
                 Active-workflows list is not yet wired in this deployment.

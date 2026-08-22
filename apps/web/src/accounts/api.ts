@@ -131,7 +131,10 @@ function capState<T>(p: Paged<T> | null): { total: number; capped: boolean } {
 export async function loadTimeline(
   accountId: string,
   windowDays: number,
-): Promise<TimelineEntry[]> {
+): Promise<
+  | { kind: 'ready'; entries: TimelineEntry[] }
+  | { kind: 'failed'; error: string }
+> {
   const cutoff = cutoffDate(windowDays);
   const [invoicesPage, jobsPage, shipmentsPage] = await Promise.all([
     fetchPaged<Invoice>(
@@ -144,9 +147,16 @@ export async function loadTimeline(
       `/api/shipping/shipments?account_id=${q(accountId)}&limit=${SHIPMENT_CAP}`,
     ),
   ]);
-  const invoices = invoicesPage?.data ?? [];
-  const jobs = jobsPage?.data ?? [];
-  const shipments = shipmentsPage?.data ?? [];
+  // Any failed leg fails the timeline — merging the legs that
+  // happened to arrive would render a partial history as if it were
+  // the whole one, which is the same false-empty class one level up
+  // (packet 3fba9c35).
+  for (const page of [invoicesPage, jobsPage, shipmentsPage]) {
+    if (page.kind === 'failed') return page;
+  }
+  const invoices = invoicesPage.kind === 'ready' ? invoicesPage.page.data : [];
+  const jobs = jobsPage.kind === 'ready' ? jobsPage.page.data : [];
+  const shipments = shipmentsPage.kind === 'ready' ? shipmentsPage.page.data : [];
 
   const merged: TimelineEntry[] = [];
   for (const inv of invoices) {
@@ -204,7 +214,7 @@ export async function loadTimeline(
   }
 
   merged.sort((a, b) => b.date.localeCompare(a.date));
-  return merged;
+  return { kind: 'ready', entries: merged };
 }
 
 export async function loadContracts(
