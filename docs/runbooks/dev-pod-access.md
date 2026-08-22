@@ -21,10 +21,16 @@ Layout, measured:
 |---|---|
 | `/work/boss` | the clone, on a Longhorn PVC (survives pod restarts) |
 | `/scratch` | node-local, ~188 GB free — `CARGO_TARGET_DIR` lives here |
-| toolchain | cargo (via `~/.cargo/env` — see below), bun, tmux, psql |
+| toolchain | cargo (`/usr/local/cargo/bin` — see below), bun, tmux, psql |
 
-**Cargo note:** `kubectl exec` shells don't source it. Start with
-`. "$HOME/.cargo/env"` or prefix commands with it.
+**Cargo note:** this image installs the toolchain system-wide, not
+per-user — there is no `~/.cargo/env` to source (an earlier revision
+of this page said otherwise; a session lost time to it 2026-08-21).
+Export instead:
+
+```
+export PATH=/usr/local/cargo/bin:$PATH RUSTUP_HOME=/usr/local/rustup
+```
 
 ## Getting a terminal
 
@@ -55,6 +61,40 @@ the access-recovery runbook's older pointer predates a `/tmp` clean.)
 
 Detach with `C-b d`; the session keeps running. Reattach with the same
 command — `new -As` attaches if `main` exists, creates it otherwise.
+
+## Running gates here (this is the gate host now)
+
+Full gates run in this pod, in tmux, since 2026-08-21. The working
+recipe, every line earned:
+
+```
+cd /work/boss
+export PATH=/usr/local/cargo/bin:$PATH RUSTUP_HOME=/usr/local/rustup \
+  PLAYWRIGHT_BROWSERS_PATH=/work/.ms-playwright \
+  CARGO_TARGET_DIR=/scratch/target RUST_TEST_THREADS=4
+BOSS_GATE_RECEIPT=/scratch/receipt-<branch>.json ./infra/gate.sh
+```
+
+- **`PLAYWRIGHT_BROWSERS_PATH` on the PVC.** A pod restart wipes the
+  container layer: browsers installed to the default `~/.cache` path
+  vanish, and the mocked suite dies mid-gate. `/work` survives.
+  Restarts also wipe the browsers' *system* deps — reinstall needs
+  `/etc/apt/apt.conf.d/99-pod-no-sandbox` (`APT::Sandbox::User
+  "root";` + `Dir::Cache::archives "/tmp/apt-cache";`,
+  `DEBIAN_FRONTEND=noninteractive`) because apt's sandbox user cannot
+  read the layer. The durable fix is baking the deps into the CI
+  image; until then this is the recovery path (2026-08-21).
+- **`RUST_TEST_THREADS=4`.** The pg sidecar's `/dev/shm` is the
+  container-default 64Mi; unthrottled parallel pg suites exhaust it
+  ("could not resize shared memory segment … No space left on
+  device"), a backend dies, and postgres drops into crash recovery
+  MID-GATE — which then fails *unrelated* suites ("database system is
+  in recovery mode"). That signature means the environment, not the
+  branch (it read as three different cars failing on 2026-08-22
+  before the common cause surfaced). `fix/dev-pg-gets-real-shm`
+  mounts a 1Gi memory-backed `/dev/shm`; the throttle stays a good
+  idea until that lands and the pod restarts.
+- Receipts in `/scratch/receipt-*.json` survive the gate, not the pod.
 
 ## What this is not
 

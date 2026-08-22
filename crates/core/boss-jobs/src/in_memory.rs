@@ -756,7 +756,7 @@ mod tests {
     #[tokio::test]
     async fn list_assigned_workable_returns_only_assigned_open_workable() {
         let repo = InMemoryJobs::new();
-        let mut job = make_job("ingredient-restock");
+        let mut job = make_job("ingredient-restock").with_workflow_version(3);
         job.status = JobStatus::Open;
         repo.create_job(&job).await.unwrap();
 
@@ -793,6 +793,11 @@ mod tests {
         assert_eq!(titles.len(), 2, "only assigned+open+workable: {titles:?}");
         assert!(titles.contains(&"Place PO"));
         assert!(titles.contains(&"Send bill"));
+        // The row names the protocol version the packet is pinned to,
+        // so an executor can resolve the step's spec (e.g. its
+        // spec-authored duration) against the exact Workflow row the
+        // Job was admitted under.
+        assert!(rows.iter().all(|r| r.workflow_version == 3));
     }
 
     #[tokio::test]

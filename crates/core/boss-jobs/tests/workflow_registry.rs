@@ -306,6 +306,72 @@ async fn full_create_publish_retire_cycle() {
 }
 
 #[tokio::test]
+async fn duration_hours_survives_round_trip_and_publish() {
+    // A StepSpec may author its own `duration_hours` — how long the
+    // work actually takes (a 168h fermentation), preferred by
+    // executors over the StepType kind's typical duration. The field
+    // must survive (a) plain JSON serde and (b) the authored →
+    // published → versioned-read path the sim workforce resolves
+    // durations through.
+    let mut spec = draft_spec("ferment-pale");
+    spec.steps.insert(
+        1,
+        StepSpec {
+            title: "ferment".into(),
+            kind: "task".into(),
+            ready_when: "steps.start.done".into(),
+            duration_hours: Some(168.0),
+            ..Default::default()
+        },
+    );
+    spec.steps[2].ready_when = "steps.ferment.done".into();
+
+    // (a) JSON round-trip; unset steps omit the key entirely.
+    let as_json = serde_json::to_value(&spec).unwrap();
+    assert_eq!(as_json["steps"][1]["duration_hours"], 168.0);
+    assert!(
+        as_json["steps"][0].get("duration_hours").is_none(),
+        "unset duration_hours must not serialize"
+    );
+    let back: WorkflowSpec = serde_json::from_value(as_json.clone()).unwrap();
+    assert_eq!(back.steps[1].duration_hours, Some(168.0));
+    assert_eq!(back.steps[0].duration_hours, None);
+
+    // (b) Authored → published → read back through the versioned
+    // surface (the one an executor resolves a pinned Job against).
+    let registry: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
+    let app = build_app(registry.clone());
+    let resp = send_json(app.clone(), "POST", "/api/workflows", &cto(), Some(as_json)).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = send_json(
+        app.clone(),
+        "POST",
+        "/api/workflows/ferment-pale/publish",
+        &cto(),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = send_json(
+        app,
+        "GET",
+        "/api/workflows/ferment-pale/versions/1",
+        &cto(),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let published: WorkflowSpec = serde_json::from_slice(&body_bytes).unwrap();
+    let ferment = published
+        .steps
+        .iter()
+        .find(|s| s.title == "ferment")
+        .expect("published spec keeps the ferment step");
+    assert_eq!(ferment.duration_hours, Some(168.0));
+}
+
+#[tokio::test]
 async fn guest_cannot_publish_even_if_they_could_create() {
     // A policy where guests can create drafts but can't publish. Verifies
     // that Publish is independently gated from Create, per the design.

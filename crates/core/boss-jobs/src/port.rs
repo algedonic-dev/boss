@@ -156,6 +156,11 @@ pub struct AssignmentRow {
     pub job_title: String,
     pub due_on: Option<chrono::NaiveDate>,
     pub workflow: String,
+    /// The protocol version this packet was admitted under. Rides on
+    /// the row so an executor can resolve the step's spec (its
+    /// spec-authored `duration_hours`, for one) against the exact
+    /// Workflow row the Job is pinned to, without a second fetch.
+    pub workflow_version: i32,
     pub subject_kind: String,
     pub subject_id: String,
     pub priority: Priority,
@@ -378,6 +383,7 @@ pub trait JobsRepository: Send + Sync {
                         job_title: job.title.clone(),
                         due_on: job.due_on,
                         workflow: job.kind.clone(),
+                        workflow_version: job.workflow_version,
                         subject_kind: boss_core::primitives::Subject::kind(&job.subject)
                             .to_string(),
                         subject_id: boss_core::primitives::Subject::id(&job.subject).to_string(),
@@ -432,6 +438,7 @@ pub trait JobsRepository: Send + Sync {
                     job_title: job.title.clone(),
                     due_on: job.due_on,
                     workflow: job.kind.clone(),
+                    workflow_version: job.workflow_version,
                     subject_kind: boss_core::primitives::Subject::kind(&job.subject).to_string(),
                     subject_id: boss_core::primitives::Subject::id(&job.subject).to_string(),
                     priority: job.priority,

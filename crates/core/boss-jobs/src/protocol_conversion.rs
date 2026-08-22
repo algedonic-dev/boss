@@ -291,6 +291,7 @@ mod tests {
             title_template: String::new(),
             sign_offs_required: Vec::new(),
             assurance_required: None,
+            duration_hours: None,
             fields: Vec::new(),
             authority_role: None,
             claimable: None,

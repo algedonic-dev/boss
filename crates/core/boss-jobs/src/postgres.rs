@@ -102,6 +102,7 @@ struct AssignmentRowSql {
     job_title: String,
     due_on: Option<chrono::NaiveDate>,
     workflow: String,
+    workflow_version: i32,
     subject_kind: String,
     subject_id: String,
     priority: String,
@@ -982,7 +983,8 @@ impl JobsRepository for PgJobs {
                     s.sort_order, s.blocked_by, s.sign_offs_required, s.assurance_required, s.sign_offs, \
                     s.fields, s.completed_on, s.metadata, s.notes, \
                     s.step_plugin_version, s.embedded_job, \
-                    j.title AS job_title, j.due_on, j.kind AS workflow, j.subject_kind, j.subject_id, j.priority, \
+                    j.title AS job_title, j.due_on, j.kind AS workflow, j.workflow_version, \
+                    j.subject_kind, j.subject_id, j.priority, \
                     j.simulated, j.tags \
              FROM steps s \
              JOIN jobs j ON s.job_id = j.id \
@@ -1009,6 +1011,7 @@ impl JobsRepository for PgJobs {
                     job_title: r.job_title,
                     due_on: r.due_on,
                     workflow: r.workflow,
+                    workflow_version: r.workflow_version,
                     subject_kind: r.subject_kind,
                     subject_id: r.subject_id,
                     priority: parse_priority(&r.priority),
@@ -1030,7 +1033,8 @@ impl JobsRepository for PgJobs {
                     s.sort_order, s.blocked_by, s.sign_offs_required, s.assurance_required, s.sign_offs, \
                     s.fields, s.completed_on, s.metadata, s.notes, \
                     s.step_plugin_version, s.embedded_job, \
-                    j.title AS job_title, j.due_on, j.kind AS workflow, j.subject_kind, j.subject_id, j.priority, \
+                    j.title AS job_title, j.due_on, j.kind AS workflow, j.workflow_version, \
+                    j.subject_kind, j.subject_id, j.priority, \
                     j.simulated, j.tags \
              FROM steps s \
              JOIN jobs j ON s.job_id = j.id \
@@ -1051,6 +1055,7 @@ impl JobsRepository for PgJobs {
                     job_title: r.job_title,
                     due_on: r.due_on,
                     workflow: r.workflow,
+                    workflow_version: r.workflow_version,
                     subject_kind: r.subject_kind,
                     subject_id: r.subject_id,
                     priority: parse_priority(&r.priority),

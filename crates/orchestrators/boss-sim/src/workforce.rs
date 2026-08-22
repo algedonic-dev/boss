@@ -16,7 +16,10 @@
 //! `now ≥ started_at + duration` — so a 5-day fermentation is genuinely
 //! held for five sim-days of clock time while a 15-minute QC finishes
 //! almost immediately. Durations are real, paced by the clock, not a
-//! per-tick completion-probability roll.
+//! per-tick completion-probability roll. The duration itself resolves
+//! spec-first: a step whose Workflow spec authors `duration_hours`
+//! (read via the Job's pinned workflow version) is paced by that; the
+//! StepType kind's typical duration is only the fallback.
 //!
 //! ## Pull the whole assigned backlog in one query
 //!
@@ -162,8 +165,19 @@ pub struct Workforce {
     client: reqwest::blocking::Client,
     api_base: String,
     /// StepType kind → typical duration hours, sourced from the
-    /// StepRegistry. Drives the duration-gated completion.
+    /// StepRegistry. Drives the duration-gated completion — as the
+    /// FALLBACK: a step whose Workflow spec authors its own
+    /// `duration_hours` is paced by that instead (see
+    /// `step_duration_hours`).
     durations: HashMap<String, f64>,
+    /// (workflow kind, pinned version) → spec slug → spec-authored
+    /// `duration_hours`. Lazily fetched from the registry's versioned
+    /// read surface on first sight of a (workflow, version) pair and
+    /// cached — Workflow versions are append-only, so a cached row
+    /// can never go stale. Mutex, not RwLock: the critical sections
+    /// are a lookup or an insert, and the worker threads spend their
+    /// time in HTTP round-trips, not here.
+    spec_durations: std::sync::Mutex<HashMap<(String, i32), HashMap<String, f64>>>,
     /// StepType kind → its required-at-done fields, sourced from the
     /// StepRegistry. On completion the workforce supplies any the Workflow
     /// didn't default — the executor filling the step's form.
@@ -225,6 +239,7 @@ impl Workforce {
             client,
             api_base: api_base.to_string(),
             durations,
+            spec_durations: std::sync::Mutex::new(HashMap::new()),
             required_fields,
             api_activity: api_activity::new_handle(),
             emp_roles: HashMap::new(),
@@ -283,6 +298,91 @@ impl Workforce {
             .get(kind)
             .copied()
             .unwrap_or(DEFAULT_STEP_HOURS)
+    }
+
+    /// A step's pacing duration. Resolution order: the step's own
+    /// spec `duration_hours` — read from the Job's PINNED workflow
+    /// version — wins; the StepType kind's typical duration is the
+    /// fallback. This is what lets a `task`-kind fermentation hold
+    /// for the 168h its Workflow says instead of "completing" in the
+    /// kind's one-workday default.
+    fn step_duration_hours(&self, row: &Value, step: &Value, kind: &str) -> f64 {
+        self.spec_duration_hours(row, step)
+            .unwrap_or_else(|| self.duration_hours(kind))
+    }
+
+    /// The spec-authored duration for this row's step, if its pinned
+    /// Workflow version authors one. First sight of a (workflow,
+    /// version) pair fetches the version row and caches its slug →
+    /// hours map. A failed fetch resolves to `None` (kind-default
+    /// pacing for this pass) and is NOT cached, so a transient
+    /// registry error heals on the next check-in.
+    fn spec_duration_hours(&self, row: &Value, step: &Value) -> Option<f64> {
+        let workflow = row.get("workflow")?.as_str()?;
+        let version = i32::try_from(row.get("workflow_version")?.as_i64()?).ok()?;
+        let slug = step.get("spec_slug")?.as_str()?;
+        let key = (workflow.to_string(), version);
+        if let Ok(cache) = self.spec_durations.lock()
+            && let Some(by_slug) = cache.get(&key)
+        {
+            return by_slug.get(slug).copied();
+        }
+        match self.fetch_spec_durations(workflow, version) {
+            Ok(by_slug) => {
+                let hours = by_slug.get(slug).copied();
+                if let Ok(mut cache) = self.spec_durations.lock() {
+                    cache.insert(key, by_slug);
+                }
+                hours
+            }
+            Err(e) => {
+                warn!(
+                    workflow, version, error = %e,
+                    "spec-duration fetch failed; kind default paces this pass"
+                );
+                None
+            }
+        }
+    }
+
+    /// GET the pinned Workflow version row and index each step's
+    /// spec-authored `duration_hours` by its slug (`title`). 404 is
+    /// definitive — no such version row — and comes back as an empty
+    /// map so it caches; transport / 5xx errors bubble up so the
+    /// caller retries next pass.
+    fn fetch_spec_durations(&self, workflow: &str, version: i32) -> Result<HashMap<String, f64>> {
+        let url = service_url(
+            &self.api_base,
+            &format!("/api/workflows/{workflow}/versions/{version}"),
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .with_context(|| format!("GET {url}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(HashMap::new());
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            anyhow::bail!("GET {url} -> {status}");
+        }
+        let spec: Value = resp.json().with_context(|| format!("decode {url}"))?;
+        Ok(spec
+            .get("steps")
+            .and_then(|v| v.as_array())
+            .map(|steps| {
+                steps
+                    .iter()
+                    .filter_map(|s| {
+                        Some((
+                            s.get("title")?.as_str()?.to_string(),
+                            s.get("duration_hours")?.as_f64()?,
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// Read the freely-advancing sim clock. Returns `(now, epoch_end)`.
@@ -482,6 +582,10 @@ impl Workforce {
             }
         };
 
+        // Spec-authored duration (via the Job's pinned workflow
+        // version) wins; StepType kind default is the fallback.
+        let step_hours = self.step_duration_hours(row, step, kind);
+
         match status {
             "ready" => {
                 // Don't start a brew's consume without the ingredients —
@@ -498,7 +602,7 @@ impl Workforce {
                 // elsewhere: triggers are resolved at materialization, and
                 // outcome / milestone are completed by the dispatcher's
                 // marker handler — none are ever assigned to a worker.)
-                if self.duration_hours(kind) <= 0.0 {
+                if step_hours <= 0.0 {
                     self.complete(
                         job_id,
                         step_id,
@@ -519,7 +623,7 @@ impl Workforce {
                     .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                     .map(|d| d.with_timezone(&Utc));
                 let elapsed_enough = match started {
-                    Some(start) => now >= start + duration_from_hours(self.duration_hours(kind)),
+                    Some(start) => now >= start + duration_from_hours(step_hours),
                     // No stamp (claimed before this model / orphan) — let
                     // it complete rather than wedge forever.
                     None => true,
@@ -825,6 +929,63 @@ fn row_is_simulated(row: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    /// A Workforce whose kind-default map says `task` takes 8h, with a
+    /// primed spec-duration cache (no HTTP in tests — a cached
+    /// (workflow, version) entry short-circuits the registry fetch).
+    fn workforce_with_cache(cache: HashMap<String, f64>) -> super::Workforce {
+        let wf = super::Workforce::new(
+            "http://127.0.0.1:9", // never dialed: the cache is primed
+            HashMap::from([("task".to_string(), 8.0)]),
+            HashMap::new(),
+        );
+        wf.spec_durations
+            .lock()
+            .unwrap()
+            .insert(("morning-brew".to_string(), 3), cache);
+        wf
+    }
+
+    fn row_and_step() -> (serde_json::Value, serde_json::Value) {
+        let step = json!({ "kind": "task", "spec_slug": "fermentation-start" });
+        let row = json!({
+            "workflow": "morning-brew",
+            "workflow_version": 3,
+            "step": step,
+        });
+        (row.clone(), row["step"].clone())
+    }
+
+    #[test]
+    fn spec_duration_hours_beats_kind_default() {
+        // The step's own spec (via the Job's pinned workflow version)
+        // says fermentation takes 168h; the `task` kind default is 8h.
+        // The spec wins — this is the fidelity fix that stops a 7-day
+        // fermentation "completing" in one workday.
+        let wf = workforce_with_cache(HashMap::from([("fermentation-start".to_string(), 168.0)]));
+        let (row, step) = row_and_step();
+        assert_eq!(wf.step_duration_hours(&row, &step, "task"), 168.0);
+    }
+
+    #[test]
+    fn kind_default_when_spec_is_silent() {
+        // Known workflow version, but the spec authors no duration for
+        // this slug → the StepType kind default paces it, exactly as
+        // before this field existed.
+        let wf = workforce_with_cache(HashMap::new());
+        let (row, step) = row_and_step();
+        assert_eq!(wf.step_duration_hours(&row, &step, "task"), 8.0);
+        // And a kind the durations map doesn't know falls to the
+        // DEFAULT_STEP_HOURS floor.
+        assert_eq!(
+            wf.step_duration_hours(&row, &step, "some-unknown-kind"),
+            super::DEFAULT_STEP_HOURS
+        );
+    }
+
     #[test]
     fn the_boundary_fails_closed() {
         use serde_json::json;

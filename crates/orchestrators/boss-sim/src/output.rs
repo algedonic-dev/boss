@@ -1811,13 +1811,13 @@ pub mod live {
             const FALLBACK_START_SEC: i64 = 13 * 3600; // LA 06:00
             const FALLBACK_RANGE_SEC: i64 = 16 * 3600; // 16h business day
             // LA 08:00 = UTC 15:00 in PDT — start-of-work anchor
-            // for duration-based completions.
+            // for duration-based completions. Durations are NOT
+            // capped: with spec-authored step durations a
+            // fermentation genuinely runs for days (up to 336h for
+            // a lager), and clamping it to end-of-business-day
+            // would re-manufacture the fermentation-in-one-workday
+            // fiction the spec durations exist to kill.
             const DURATION_START_SEC: i64 = 15 * 3600;
-            // Cap completion at LA 22:00 (UTC 05:00 next day) so
-            // exceptionally long-duration steps (e.g., 24h
-            // fermentation) don't disappear into overnight hours
-            // — they land at end-of-business-day instead.
-            const DURATION_CAP_SEC: i64 = 29 * 3600;
 
             // Walk step_updates in INSERTION order — the engine
             // emits parent-tier transitions before child-tier and
@@ -1861,8 +1861,7 @@ pub mod live {
                             } else {
                                 hours
                             };
-                            let secs = DURATION_START_SEC + (jittered_hours * 3600.0) as i64;
-                            secs.min(DURATION_CAP_SEC)
+                            DURATION_START_SEC + (jittered_hours * 3600.0) as i64
                         }
                         None => {
                             if count > 0 {

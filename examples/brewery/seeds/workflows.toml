@@ -192,6 +192,10 @@ kind = "task"
 ready_when = "steps.whirlpool.done"
 authority_role = "brewer"
 title_template = "Fermentation start (pitch yeast)"
+# Honest fermentation time: a pale ale ferments ~7 days, not one
+# 8h kind-default workday. Spec-authored duration wins over the
+# StepType's typical_duration_hours.
+duration_hours = 168.0
 metadata_defaults = { ferm_temp_c = 19, yeast_strain = "", vessel = "" }
 
 # QC checkpoint between fermentation and packaging. Kept as a normal
@@ -1842,6 +1846,8 @@ kind = "task"
 ready_when = "steps.whirlpool.done"
 authority_role = "brewer"
 title_template = "Fermentation start (pitch yeast + dry hop schedule)"
+# Honest fermentation time: ~7 days for an IPA (primary + dry hop).
+duration_hours = 168.0
 metadata_defaults = { ferm_temp_c = 19, yeast_strain = "California Ale", vessel = "" }
 
 # PACKAGING ALLOCATION — one tank of fungible wort, split across formats by
@@ -2038,6 +2044,8 @@ kind = "task"
 ready_when = "steps.whirlpool.done"
 authority_role = "brewer"
 title_template = "Fermentation start (pitch yeast)"
+# Honest fermentation time: a stout conditions ~10 days.
+duration_hours = 240.0
 metadata_defaults = { ferm_temp_c = 18, yeast_strain = "English Ale", vessel = "" }
 
 # PACKAGING ALLOCATION — one tank of fungible wort, split across formats by
@@ -2229,6 +2237,8 @@ kind = "task"
 ready_when = "steps.whirlpool.done"
 authority_role = "brewer"
 title_template = "Fermentation start (pitch lager yeast)"
+# Honest fermentation time: cold lagering runs ~14 days.
+duration_hours = 336.0
 metadata_defaults = { ferm_temp_c = 11, yeast_strain = "German Lager", vessel = "" }
 
 # PACKAGING ALLOCATION — one tank of fungible wort, split across formats by
@@ -2423,6 +2433,8 @@ kind = "task"
 ready_when = "steps.whirlpool.done"
 authority_role = "brewer"
 title_template = "Fermentation start (pitch yeast + biotransformation dry hop)"
+# Honest fermentation time: a hazy turns around in ~6 days.
+duration_hours = 144.0
 metadata_defaults = { ferm_temp_c = 20, yeast_strain = "English Ale", vessel = "" }
 
 # PACKAGING ALLOCATION — one tank of fungible wort, split across formats by

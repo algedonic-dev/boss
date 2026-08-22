@@ -63,7 +63,7 @@ impl std::str::FromStr for WorkflowStatus {
 /// recovered from which titles each `ready_when` mentions. The
 /// human-facing label comes from `title_template` (or a humanized
 /// `title` when that's blank).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StepSpec {
     /// Stable slug + predicate identifier, unique within the
     /// Workflow. Kebab-case (`mash-in`, `cfo-approval`).
@@ -97,6 +97,16 @@ pub struct StepSpec {
     /// step to `presence` is a Workflow edit, not a deploy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assurance_required: Option<boss_core::job::Assurance>,
+    /// How long this step's work actually takes, in hours. Executors
+    /// pacing a step (the sim workforce's duration-gated completion)
+    /// prefer this over the StepType kind's `typical_duration_hours` —
+    /// a `task`-kind fermentation ferments for the 168h its Workflow
+    /// says, not the kind's one-workday default. `None` means "the
+    /// kind's typical duration", so every existing spec is unchanged.
+    /// Protocol data, not a code path (§9): correcting a duration is a
+    /// Workflow edit, not a deploy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_hours: Option<f64>,
     /// Step-authored completion-contract fields (inline
     /// authoring) — validated in union with the kind bundle's fields,
     /// so vocabulary that isn't shared needs no registry row.
@@ -180,7 +190,7 @@ fn default_subject_source() -> String {
 
 /// A full registry row. All fields serialize directly to the
 /// `workflows` JSONB columns with the same names.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowSpec {
     pub kind: String,
     pub version: i32,
