@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use boss_core::job::{Job, JobStatus, Step, StepStatus};
 use boss_core::port::EventBus;
@@ -148,6 +148,9 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         .route("/api/jobs", post(create_job::<R, B>))
         .route("/api/jobs/{id}", get(get_job::<R, B>))
         .route("/api/jobs/{id}", put(update_job::<R, B>))
+        // Top-level metadata merge — the atomic alternative to the
+        // GET → spread → full PUT read-modify-write. `null` removes.
+        .route("/api/jobs/{id}/metadata", patch(patch_job_metadata::<R, B>))
         .route("/api/jobs/{id}/stream", get(job_stream::<R, B>))
         .route("/api/jobs/step-types", get(list_step_types::<R, B>))
         // Station registry — data-defined priority queues over

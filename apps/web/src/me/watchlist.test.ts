@@ -1,5 +1,6 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 import {
+  dismissFromWatchlist,
   outcomeOf,
   watchlistPacket,
   watchlistStateFromResponse,
@@ -161,5 +162,41 @@ describe('windowNote', () => {
 
   test('a station with no window says nothing about closed packets', () => {
     expect(windowNote(null)).toBeNull();
+  });
+});
+
+describe('dismissFromWatchlist', () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  test('one PATCH to the metadata merge, carrying exactly the one key', async () => {
+    // The regression this pins (2026-08-21 UX audit): dismiss used to
+    // GET the whole job and PUT it back — a read-modify-write over the
+    // ENVELOPE that resurrected a concurrently-closed packet open with
+    // its outcome erased. The fix is structural: no read, no full-job
+    // write, just the server-side merge with the single key it means.
+    const calls: { url: string; method: string; body: string | null }[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({
+        url: String(input),
+        method: init?.method ?? 'GET',
+        body: typeof init?.body === 'string' ? init.body : null,
+      });
+      return new Response(null, { status: 204 });
+    }) as typeof fetch;
+
+    expect(await dismissFromWatchlist('job-1')).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe('PATCH');
+    expect(calls[0]?.url).toBe('/api/jobs/job-1/metadata');
+    expect(JSON.parse(calls[0]?.body ?? '{}')).toEqual({ watchlist_dismissed: 'true' });
+  });
+
+  test('a refused merge reports false rather than pretending', async () => {
+    globalThis.fetch = (async (_input: RequestInfo | URL) =>
+      new Response('forbidden', { status: 403 })) as typeof fetch;
+    expect(await dismissFromWatchlist('job-1')).toBe(false);
   });
 });

@@ -226,6 +226,15 @@ spec:
           # rebuild the problem this pod exists to solve.
           volumeMounts:
             - {name: pgdata, mountPath: /pgdata}
+            # Without this, /dev/shm is the container default 64Mi.
+            # Parallel pg-backed gate suites blow through that:
+            # "could not resize shared memory segment ... No space left
+            # on device", the backend dies, and the whole database drops
+            # into crash recovery MID-GATE — which read as three
+            # different cars failing on 2026-08-22 before the common
+            # cause surfaced. Memory-backed and capped at 1Gi, counted
+            # against this container's 4Gi limit.
+            - {name: pg-shm, mountPath: /dev/shm}
           resources:
             requests: {cpu: 250m, memory: 512Mi}
             limits: {cpu: "2", memory: 4Gi}
@@ -260,3 +269,5 @@ spec:
           emptyDir: {}
         - name: pgdata
           emptyDir: {}
+        - name: pg-shm
+          emptyDir: {medium: Memory, sizeLimit: 1Gi}

@@ -448,6 +448,75 @@ impl JobsRepository for PgJobs {
         Ok(())
     }
 
+    async fn merge_job_metadata_at(
+        &self,
+        id: &JobId,
+        patch: &serde_json::Map<String, serde_json::Value>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<Job, JobsError> {
+        // Split the overlay once: null values are removals, everything
+        // else upserts. Top-level only — that is the whole of the
+        // contract, matching the conductor's `overlay_metadata`.
+        let removals: Vec<String> = patch
+            .iter()
+            .filter(|(_, v)| v.is_null())
+            .map(|(k, _)| k.clone())
+            .collect();
+        let upserts: serde_json::Map<String, serde_json::Value> = patch
+            .iter()
+            .filter(|(_, v)| !v.is_null())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // ONE statement is the atomicity: the merge happens against
+        // the row as it stands at write time, never against a copy a
+        // caller fetched earlier. The CASE folds a non-object metadata
+        // (jsonb null, or a fresh row) to `{}` so `||` concatenates
+        // instead of erroring; `- text[]` is the null-removes half.
+        let row = sqlx::query_as::<_, JobRow>(
+            r#"
+            UPDATE jobs SET
+                metadata = (CASE WHEN jsonb_typeof(metadata) = 'object'
+                                 THEN metadata ELSE '{}'::jsonb END
+                            || $2::jsonb) - $3::text[],
+                updated_at = $4
+            WHERE id = $1
+            RETURNING id, kind, workflow_version, subject_kind, subject_id, title, owner_id,
+                      status, priority, opened_on, due_on, closed_on, metadata, tags, simulated
+            "#,
+        )
+        .bind(*id.inner().as_uuid())
+        .bind(serde_json::Value::Object(upserts))
+        .bind(&removals)
+        .bind(stamp.timestamp)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let Some(row) = row else {
+            return Err(JobsError::NotFound(*id));
+        };
+        let job = row_to_job(row);
+        // OUTBOX (phase 2): the JOB_UPDATED state event is built from
+        // the POST-merge row this transaction just produced — the
+        // rebuild consumes it as full row state, so it must be the
+        // row, not an optimistic copy — and records with it.
+        let event = stamp.event(
+            crate::events::JOB_UPDATED,
+            serde_json::to_value(&job).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(JobsError::Storage)?;
+        tx.commit()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        Ok(job)
+    }
+
     async fn list_jobs(
         &self,
         filter: &JobFilter,

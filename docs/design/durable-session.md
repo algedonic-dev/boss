@@ -19,6 +19,16 @@ runs on) · `the-three-layers.md`
 **The dev environment was designed, reviewed, and merged on 2026-08-15.
 It has never run.**
 
+> **Corrected 2026-08-22** (correct-the-record `fe70862a`). True when
+> written; false since. The pod was applied to the dev cluster and had
+> 25 hours of continuous uptime when the claim was first re-checked on
+> 2026-08-19, and as of 2026-08-21 it is the working gate host: full
+> gates run inside `boss-dev` (namespace `boss-dev`) in a tmux session,
+> against the Postgres 16 sidecar, with `CARGO_TARGET_DIR` on
+> `/scratch` — exactly the shape this doc designed. The paragraphs
+> below describe the 2026-08-16 state and stay as the record of what
+> the gap cost while it existed.
+
 `infra/cluster/manifests/boss-dev.yaml` landed on train 36. It is a
 careful piece of work: the CI image itself rather than a copy of its
 tool list, a Postgres 16 sidecar so `127.0.0.1:5432` cannot be

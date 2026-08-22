@@ -204,6 +204,42 @@ impl JobsRepository for InMemoryJobs {
         Ok(())
     }
 
+    async fn merge_job_metadata_at(
+        &self,
+        id: &JobId,
+        patch: &serde_json::Map<String, serde_json::Value>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<Job, JobsError> {
+        // Mirror the Pg adapter: merge under the lock against the row
+        // as it stands, null removes, no envelope field moves, and the
+        // JOB_UPDATED event is built from the post-merge row.
+        let merged = {
+            let mut state = self.inner.lock().expect("poisoned");
+            let Some(job) = state.jobs.get_mut(&job_key(id)) else {
+                return Err(JobsError::NotFound(*id));
+            };
+            let mut md = match &job.metadata {
+                serde_json::Value::Object(m) => m.clone(),
+                _ => serde_json::Map::new(),
+            };
+            for (k, v) in patch {
+                if v.is_null() {
+                    md.remove(k);
+                } else {
+                    md.insert(k.clone(), v.clone());
+                }
+            }
+            job.metadata = serde_json::Value::Object(md);
+            job.clone()
+        };
+        let event = stamp.event(
+            crate::events::JOB_UPDATED,
+            serde_json::to_value(&merged).unwrap_or_default(),
+        );
+        self.record_all(&[event]);
+        Ok(merged)
+    }
+
     async fn list_jobs(
         &self,
         filter: &JobFilter,

@@ -46,12 +46,23 @@
   let job = $state<{ title: string; metadata?: Record<string, unknown> } | null>(null);
   let step = $state<Step | null>(null);
   let error = $state<string | null>(null);
+  // A soft aside ("saved, but the re-read failed"), not an error: the
+  // render puts `error` before the step, so an error here would hide a
+  // surface that is busy showing its receipt.
+  let note = $state<string | null>(null);
 
   // The assignment row travels light; the surface needs the step's
   // full metadata. Fetch fresh rather than trusting a row that may be
   // a poll interval old — deciding on stale metadata is deciding on
   // evidence somebody since replaced.
-  async function load(): Promise<void> {
+  //
+  // Returns whether the load landed. Each entry clears the previous
+  // failure first: `error` renders INSTEAD of the surface, so a stale
+  // one would poison the modal until close+reopen (2026-08-21 UX
+  // audit) — a load that is about to succeed must not lose to a blip
+  // that already passed.
+  async function load(): Promise<boolean> {
+    error = null;
     try {
       const r = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
       if (!r.ok) throw new Error(`job: HTTP ${r.status}`);
@@ -64,8 +75,10 @@
       const found = (body.steps ?? []).find((s) => s.id === stepId) ?? null;
       if (!found) throw new Error('this step is no longer part of the packet');
       step = found;
+      return true;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
+      return false;
     }
   }
 
@@ -74,9 +87,24 @@
   // surfaces render their own receipt ("Answered — approved…"), and
   // yanking the panel mid-read would spend the trust the receipt buys.
   async function onSurfaceUpdate(): Promise<void> {
-    await load();
-    const s = step?.status;
-    if (s === 'completed' || s === 'skipped') onDecided();
+    if (await load()) {
+      note = null;
+      const s = step?.status;
+      if (s === 'completed' || s === 'skipped') onDecided();
+      return;
+    }
+    // The reload failed AFTER the surface reported a successful save.
+    // The old behaviour stranded the row: `step` kept its pre-save
+    // status, the completed-check never fired, onDecided never ran —
+    // so a SUCCESSFUL decide stayed in "Yours to decide" and deciding
+    // it again PUT completed over it (2026-08-21 UX audit). Be
+    // conservative the cheap way round: the surface said something
+    // changed, so tell the page to refetch its queues (correct even if
+    // the step did not complete), and say what happened as an aside
+    // rather than poisoning the modal that is showing its receipt.
+    error = null;
+    note = 'Saved — but the step could not be re-read. The queue is refreshing.';
+    onDecided();
   }
 
   void load();
@@ -132,6 +160,9 @@
     {/if}
 
     <div class="dm-body">
+      {#if note}
+        <p class="dm-note" role="status">{note}</p>
+      {/if}
       {#if error}
         <p class="dm-error">{error}</p>
       {:else if step}
@@ -231,5 +262,12 @@
     margin: 0;
     color: var(--stop, #eb5757);
     font-size: 0.85rem;
+  }
+  /* The soft aside for "saved, but the re-read failed" — quiet on
+     purpose: the surface below it is showing a successful receipt. */
+  .dm-note {
+    margin: 0 0 10px;
+    color: var(--fog, #8b97a3);
+    font-size: 0.8rem;
   }
 </style>

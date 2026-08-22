@@ -237,28 +237,25 @@ export async function fetchWatchlist(): Promise<WatchlistState> {
 /// given packet through this station, so one flag cannot leak one
 /// actor's dismissal into another's view (130-watchlist-dismiss.sql).
 ///
-/// It goes through the job PUT that already exists rather than a
-/// bespoke unwatch route. That PUT takes a whole job, so this reads the
-/// packet first and writes it back with the one key added. The
-/// read-modify-write is the honest cost of not inventing an endpoint;
-/// it is safe here because a filer dismissing their own packet is not
-/// racing anyone for that field.
+/// One call to the server-side metadata merge
+/// (`PATCH /api/jobs/{id}/metadata`), carrying exactly the key it
+/// means. This used to be a GET → spread → full-job PUT, argued safe
+/// because no one races a filer for this FIELD — but the race was over
+/// the ENVELOPE: when the board closed the packet (status closed,
+/// `metadata.outcome` stamped) between the read and the write, the
+/// dismiss resurrected it open with the outcome erased, on the system
+/// of record (2026-08-21 UX audit). The merge is atomic server-side
+/// now; status and every other envelope field are untouchable through
+/// this route.
 ///
 /// Not deletion: `submitted_by` stays, the packet keeps closing and
 /// notifying as before, and clearing the key puts it back on the list.
 export async function dismissFromWatchlist(jobId: string): Promise<boolean> {
   try {
-    const read = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
-    if (!read.ok) return false;
-    const job = (await read.json()) as Record<string, unknown>;
-    // The PUT rejects a body carrying steps; they are their own resource.
-    delete job.steps;
-    const metadata = (job.metadata ?? {}) as Record<string, unknown>;
-    job.metadata = { ...metadata, watchlist_dismissed: 'true' };
-    const write = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`, {
-      method: 'PUT',
+    const write = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/metadata`, {
+      method: 'PATCH',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(job),
+      body: JSON.stringify({ watchlist_dismissed: 'true' }),
     });
     return write.ok;
   } catch {

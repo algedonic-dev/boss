@@ -82,18 +82,49 @@
   //    Also used by post-action callbacks (StepSurface PUT → onStepUpdate)
   //    to refresh immediately rather than waiting for the next SSE
   //    poll tick on the server.
+  //
+  // The fallback fetches RACE: the 30s poll, a post-action refetch,
+  // and a fast A→B navigation can all have answers in flight at once,
+  // and without a guard the slowest one wins — packet A rendering
+  // under B's URL was the audit's worst case (2026-08-21). So every
+  // question carries a ticket: a monotonic sequence plus the jobId it
+  // was asked about, checked before ANY assignment. Plain variables,
+  // not $state — they gate writes, they never render.
+  let loadSeq = 0;
+  // False until the first answer (fetch or SSE frame) for the CURRENT
+  // jobId lands. Only that first wait blanks the page; a later
+  // refresh keeps the content it has — a 30s poll that blanked the
+  // whole page every cycle was the audit's other finding.
+  let firstAnswered = false;
+  let refreshing = $state(false);
+
   async function load() {
     const id = jobId;
-    loading = true;
+    const seq = ++loadSeq;
+    if (firstAnswered) {
+      refreshing = true;
+    } else {
+      loading = true;
+    }
     try {
       const resp = await fetch(`/api/jobs/${encodeURIComponent(id)}`);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      job = (await resp.json()) as Job;
+      const detail = (await resp.json()) as Job;
+      // The ticket check: a newer question has been asked, or the
+      // page has moved to a different packet. Either way this answer
+      // is history — drop it entirely.
+      if (seq !== loadSeq || id !== jobId) return;
+      job = detail;
       error = null;
     } catch (e) {
+      if (seq !== loadSeq || id !== jobId) return;
       error = e instanceof Error ? e.message : String(e);
     } finally {
-      loading = false;
+      if (seq === loadSeq && id === jobId) {
+        firstAnswered = true;
+        loading = false;
+        refreshing = false;
+      }
     }
   }
 
@@ -103,6 +134,16 @@
     let pollFallbackId: number | null = null;
     let cancelled = false;
 
+    // A different packet starts from scratch: A's content must not
+    // render under B's URL while B loads, and any answer still in
+    // flight about A is stranded by the seq bump.
+    loadSeq++;
+    firstAnswered = false;
+    job = null;
+    error = null;
+    loading = true;
+    refreshing = false;
+
     try {
       es = new EventSource(`/api/jobs/${encodeURIComponent(id)}/stream`);
       es.onmessage = (ev) => {
@@ -110,7 +151,9 @@
         try {
           const detail = JSON.parse(ev.data) as Job;
           job = detail;
+          firstAnswered = true;
           loading = false;
+          refreshing = false;
           error = null;
         } catch {
           // Drop malformed frame; next push will fix it.
@@ -153,9 +196,17 @@
   }
 </script>
 
-{#if loading}
+{#if loading && !job}
+  <!-- Only the FIRST wait for a packet blanks the page. Refreshes
+       (the 30s fallback poll, post-action refetches) keep the content
+       they have and mark themselves quietly below. -->
   <div class="catalog theme-exec"><p class="empty">Loading…</p></div>
-{:else if error || !job}
+{:else if !job}
+  <!-- No content to keep — the first load failed, so the error is the
+       page. Once content exists, a failed REFRESH keeps it instead
+       (the next poll tick or SSE frame corrects); swapping a rendered
+       packet for an error on one blip is the modal's poisoning bug at
+       page scale. -->
   <div class="catalog theme-exec">
     <p class="empty">Couldn't load job: {error ?? 'not found'}</p>
   </div>
@@ -163,7 +214,7 @@
   {@const j = job}
   <div class="catalog theme-exec">
     <PageHeader
-      eyebrow={`${j.kind} · ${j.status}`}
+      eyebrow={`${j.kind} · ${j.status}${refreshing ? ' · refreshing…' : ''}`}
       title={j.title}
       subtitle={`Opened ${j.opened_on}${j.due_on ? ` · due ${j.due_on}` : ''} · owner ${j.owner_id}`}
     />

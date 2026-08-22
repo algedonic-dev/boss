@@ -2394,6 +2394,9 @@ impl Conductor {
     /// tests: PUT replaces metadata wholesale, so clobbering here
     /// would silently eat another writer's keys. A `Value::Null`
     /// value removes the key.
+    /// The server now offers this merge atomically as
+    /// `PATCH /api/jobs/{id}/metadata` (same null-removes convention);
+    /// migrating the conductor off this client-side RMW is a follow-up.
     async fn merge_job_metadata(&self, jid: &str, kv: Vec<(&str, Value)>) -> Result<Value> {
         let mut job = self.get_job(jid).await?;
         let keys: Vec<&str> = kv.iter().map(|(k, _)| *k).collect();

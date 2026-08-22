@@ -1073,6 +1073,110 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// `PATCH /api/jobs/{id}/metadata` — merge top-level metadata keys
+/// into the Job, atomically, server-side.
+///
+/// Body: a JSON object of top-level metadata keys. A `null` value
+/// REMOVES the key — the conductor's `overlay_metadata` convention —
+/// and every other value replaces that key wholesale. Status, steps,
+/// and every other envelope field are untouchable through this route.
+///
+/// WHY IT EXISTS: with only the full-replacement PUT, every caller
+/// that wanted to set one metadata key ran GET → spread → PUT client-
+/// side. The 2026-08-21 UX audit caught what that costs: the board
+/// closes the packet (status closed + `metadata.outcome` stamped)
+/// between a dismisser's GET and PUT, and the dismiss resurrects it
+/// open with the outcome erased — on the system of record. The merge
+/// now happens inside one adapter transaction against the row as it
+/// stands, so the envelope a concurrent writer produced survives.
+///
+/// Policy: the same `Action::Update` gate + scope check as the job
+/// PUT. A metadata patch cannot transition status, so the PUT's
+/// stricter `Close` action never applies here.
+pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    Path(id): Path<String>,
+    CurrentUser(user): CurrentUser,
+    Json(patch): Json<serde_json::Value>,
+) -> Response {
+    let job_id = match parse_job_id(&id) {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, "invalid job id").into_response(),
+    };
+    let serde_json::Value::Object(patch) = patch else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "metadata patch must be a JSON object of top-level keys",
+        )
+            .into_response();
+    };
+
+    let existing = match state.jobs.get_job(&job_id).await {
+        Ok(Some(existing)) => existing,
+        Ok(None) => return (StatusCode::NOT_FOUND, "job not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    // Policy gate mirrors update_job's Update arm exactly.
+    let decision = match state
+        .policy
+        .check(&user, Action::Update, Resource::job())
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("policy check failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let scope = match decision {
+        Decision::Deny { reason } => {
+            return (StatusCode::FORBIDDEN, reason).into_response();
+        }
+        Decision::Allow { scope } => scope,
+    };
+    if !scope_matches(&user, &scope, &existing) {
+        return (StatusCode::FORBIDDEN, "job is outside your scope").into_response();
+    }
+
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let actor = user
+        .ambient_actor()
+        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+    // Same enrichment as the PUT path: the packet's admission-fixed
+    // flag — not the transport context — marks the event. The adapter
+    // builds JOB_UPDATED from the post-merge row with this stamp and
+    // records it in the same transaction as the write.
+    let stamp = state
+        .publisher
+        .stamp_with_actor_at(actor.clone(), now)
+        .await
+        .with_simulated(existing.simulated);
+    let merged = match state
+        .jobs
+        .merge_job_metadata_at(&job_id, &patch, &stamp)
+        .await
+    {
+        Ok(job) => job,
+        Err(crate::port::JobsError::NotFound(_)) => {
+            return (StatusCode::NOT_FOUND, "job not found").into_response();
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    // Same wake as the PUT: a metadata write can flip a metadata-gated
+    // `ready_when` (ship-a-change's Merged outcome waits on
+    // `job.metadata.merged`). Closed/cancelled Jobs stay untouched.
+    if merged.status == JobStatus::Open {
+        super::steps::reevaluate_and_persist(&state, &merged, &actor, now).await;
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::edge_guidance;

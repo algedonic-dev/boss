@@ -225,6 +225,34 @@ pub trait JobsRepository: Send + Sync {
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError>;
 
+    /// Merge `patch`'s top-level keys into the Job's `metadata`,
+    /// atomically, touching no envelope field. A `null` value REMOVES
+    /// the key (the conductor's `overlay_metadata` convention); any
+    /// other value replaces that key wholesale. Returns the post-merge
+    /// Job.
+    ///
+    /// This is the server-side home of the read-modify-write every
+    /// metadata-merging caller used to run client-side through the
+    /// full-replacement job PUT — a race over the ENVELOPE: a packet
+    /// closed (status + `metadata.outcome` stamped) between the GET
+    /// and the PUT came back open with its outcome erased, on the
+    /// system of record.
+    ///
+    /// Unlike the other `_at` mutations this takes the
+    /// [`boss_core::publisher::EventStamp`] rather than pre-built
+    /// events: the JOB_UPDATED payload is full
+    /// row state (what the rebuild consumes), so it must be built from
+    /// the POST-merge row, which only the adapter's transaction knows.
+    /// Same precedent as the workflow registry's `publish_authored`
+    /// recording WORKFLOW_PUBLISHED beside the row it describes. The
+    /// stamp's `timestamp` is the write's timestamp.
+    async fn merge_job_metadata_at(
+        &self,
+        id: &JobId,
+        patch: &serde_json::Map<String, serde_json::Value>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<Job, JobsError>;
+
     async fn list_jobs(
         &self,
         filter: &JobFilter,

@@ -80,6 +80,10 @@ name = "job_closed_payload"
 required-features = ["postgres"]
 
 [[test]]
+name = "job_metadata_patch_pg"
+required-features = ["postgres"]
+
+[[test]]
 name = "postgres_filter"
 required-features = ["postgres"]
 
