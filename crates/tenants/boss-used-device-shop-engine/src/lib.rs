@@ -205,16 +205,22 @@ pub fn run_used_device_shop_one_day(
 /// Advance the engine by exactly one tick. See
 /// `boss_brewery_engine::run_brewery_one_tick` for the contract;
 /// callers must pair with [`used_device_shop_end_of_day`].
+///
+/// `ticks_per_day` is the number of slices the CALLER is running
+/// this sim-day — the one clock, a parameter for the same reason
+/// as the brewery: a warp daemon that collapses a day to one slice
+/// must get a full-day tick, not a `1/ticks_per_day` sliver of one
+/// (`tests/one_clock_ticks_per_day.rs`).
 pub fn run_used_device_shop_one_tick(
     engine: &mut UsedDeviceShopEngineState,
     day: NaiveDate,
     tick_idx: u32,
+    ticks_per_day: u32,
     output: &mut dyn SimOutput,
 ) -> Result<()> {
     if !engine.tenant.meta.is_operating_day(day) {
         return Ok(());
     }
-    let ticks_per_day = engine.tenant.meta.ticks_per_day();
     run_one_tick_with_handlers(
         day,
         tick_idx,

@@ -12,6 +12,11 @@
 //! A tenant is described as data: a `tenant.toml`, a
 //! `workflows.toml`, and a per-tenant engine crate.
 
+/// Actor-coverage telemetry — is the sim driving the WHOLE roster?
+/// Pure computation of per-role roster vs acting vs completions,
+/// rendered by the simulator SPA so an under-simulated tenant is
+/// visible on its face.
+pub mod actor_coverage;
 /// Per-actor API-call tallies — the cockpit's "how the sim engages the
 /// API, by who's acting" telemetry. Shared between the workforce + the
 /// live output adapter.

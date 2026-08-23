@@ -3,11 +3,18 @@
 
   import Breadcrumb from '@boss/web-kit/ui/Breadcrumb.svelte';
   import Meta from '@boss/web-kit/ui/Meta.svelte';
+  import NotFound from '@boss/web-kit/ui/NotFound.svelte';
+  import SortHeader from '@boss/web-kit/ui/SortHeader.svelte';
+  import StatusChip from '@boss/web-kit/ui/StatusChip.svelte';
+  import { formatDate } from '@boss/web-kit/ui/date';
+  import { entityHref } from '@boss/web-kit/ui/entity-href';
   import { formatMoney } from '@boss/web-kit/ui/money';
+  import { rowLink } from '@boss/web-kit/ui/RowLink';
+  import { createSortState } from '@boss/web-kit/ui/sort-state.svelte';
   import { CATEGORY_LABEL } from './types';
   import { DeviceModelSchema, type DeviceModel } from './schemas';
   import { fetchValidated } from '../data/parseResponse';
-  import { href } from '../router';
+  import { href, navigate } from '../router';
 
   type Props = { sku: string };
   let { sku }: Props = $props();
@@ -90,6 +97,14 @@
     }
     return String(v);
   }
+
+  // Failure-modes table sort (web-kit sortState pilot). Frequency
+  // stays the landing order, descending — the previous hardcoded
+  // sort — but the columns are clickable now.
+  const fmSort = createSortState<'code' | 'name' | 'frequency'>(
+    { key: 'frequency', dir: 'desc' },
+    (k) => (k === 'frequency' ? 'desc' : 'asc'),
+  );
 </script>
 
 {#if loading}
@@ -98,23 +113,29 @@
   </div>
 {:else if parseError}
   <div class="catalog theme-exec">
-    <div class="exec-header">
-      <h1 class="exec-title">Server returned an unexpected payload shape</h1>
-    </div>
-    <p class="empty">
+    <NotFound
+      eyebrow="Knowledge Base"
+      title="Server returned an unexpected payload shape"
+      backHref={href('/ux/catalog')}
+      backLabel="All devices"
+    >
       The catalog API responded with a body that didn't match the
       expected schema for SKU <code>{sku}</code>. This is a
       server-side bug — the payload is likely missing a required
       field or has an unexpected type. Details:
-    </p>
+    </NotFound>
     <pre class="empty">{parseError}</pre>
   </div>
 {:else if !device}
   <div class="catalog theme-exec">
-    <div class="exec-header">
-      <h1 class="exec-title">Device not found</h1>
-    </div>
-    <p class="empty">No catalog entry with SKU <code>{sku}</code>.</p>
+    <NotFound
+      eyebrow="Knowledge Base"
+      title="Device not found"
+      backHref={href('/ux/catalog')}
+      backLabel="All devices"
+    >
+      No catalog entry with SKU <code>{sku}</code>.
+    </NotFound>
   </div>
 {:else}
   {@const d = device}
@@ -216,7 +237,8 @@
         <h3>Regulatory</h3>
         <dl class="kv">
           <dt>Clearance ID</dt><dd>{reg.clearance_id ?? '—'}</dd>
-          <dt>Clearance date</dt><dd>{reg.clearance_date ?? '—'}</dd>
+          <dt>Clearance date</dt>
+          <dd>{reg.clearance_date ? formatDate(reg.clearance_date) : '—'}</dd>
           <dt>Device class</dt><dd>Class {reg.regulator_device_class}</dd>
         </dl>
       </section>
@@ -247,10 +269,19 @@
         {#if s.common_failure_modes.length === 0}
           <p class="empty">No failure modes documented for this model.</p>
         {:else}
-          {@const sorted = [...s.common_failure_modes].sort((a, b) => b.frequency - a.frequency)}
+          {@const sorted = fmSort.sorted(s.common_failure_modes, {
+            code: (fm) => fm.code,
+            name: (fm) => fm.name,
+            frequency: (fm) => fm.frequency,
+          })}
           <table class="data-table">
             <thead>
-              <tr><th>Code</th><th>Symptom</th><th>Frequency</th><th>Typical fix</th></tr>
+              <tr>
+                <SortHeader sort={fmSort} key="code">Code</SortHeader>
+                <SortHeader sort={fmSort} key="name">Symptom</SortHeader>
+                <SortHeader sort={fmSort} key="frequency" num={true}>Frequency</SortHeader>
+                <th>Typical fix</th>
+              </tr>
             </thead>
             <tbody>
               {#each sorted as fm (fm.code)}
@@ -279,7 +310,15 @@
             </thead>
             <tbody>
               {#each d.spare_parts as p (p.part_sku)}
-                <tr>
+                <!-- rowLink pilot: the whole row opens the part's
+                     inventory page (same target PartsList rows use). -->
+                <tr
+                  class="data-table-row-link"
+                  use:rowLink={{
+                    onActivate: () => navigate(entityHref('part', p.part_sku)),
+                    label: `${p.name} (${p.part_sku})`,
+                  }}
+                >
                   <td class="mono">{p.part_sku}</td>
                   <td>{p.name}</td>
                   <td class="prose-cell">{p.description}</td>
@@ -287,9 +326,9 @@
                   <td class="num">{p.lead_time_days}d</td>
                   <td>
                     {#if p.high_usage}
-                      <span class="chip chip-warn">high</span>
+                      <StatusChip value="high" tone="warn" />
                     {:else}
-                      <span class="chip chip-muted">normal</span>
+                      <StatusChip value="normal" tone="muted" />
                     {/if}
                   </td>
                 </tr>
@@ -341,7 +380,7 @@
                   <td><a href={doc.url}>{doc.title}</a></td>
                   <td>{doc.audience}</td>
                   <td>{doc.version ?? '—'}</td>
-                  <td>{doc.published ?? '—'}</td>
+                  <td>{doc.published ? formatDate(doc.published) : '—'}</td>
                 </tr>
               {/each}
             </tbody>

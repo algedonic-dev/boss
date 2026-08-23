@@ -21,6 +21,7 @@ use axum::{
 };
 use serde::Serialize;
 
+use boss_sim::actor_coverage::ActorCoverage;
 use boss_sim::api_activity::ActorActivity;
 use boss_sim::output::live::LiveApiStats;
 use boss_sim::shape_driven::TenantConfig;
@@ -135,6 +136,15 @@ pub struct SimTelemetry {
     /// Sim-date at the first recorded tick — the rate denominator
     /// (calls/sim-day = calls ÷ (current sim-date − this)).
     pub started_sim_date: Option<String>,
+
+    // --- actor coverage (is the sim driving the WHOLE roster?) ---
+    /// Per-role roster vs distinct-actors-acting vs completions, plus
+    /// headline totals. The under-simulation signal: a role no live
+    /// workflow step ever routes to shows up DORMANT on the telemetry's
+    /// face instead of being rediscovered by SQL. Operator-held roles
+    /// (platform-admin — excluded from sim driving by design) are
+    /// labeled `operator`, never dormant.
+    pub actor_coverage: ActorCoverage,
 }
 
 impl SimTelemetry {
@@ -158,6 +168,7 @@ impl SimTelemetry {
         workforce: &WorkforceStats,
         api_writes: &LiveApiStats,
         actors: Vec<ActorActivity>,
+        actor_coverage: ActorCoverage,
     ) {
         // Deltas vs the previous cumulative snapshot (read before we
         // overwrite self.workforce below).
@@ -186,6 +197,7 @@ impl SimTelemetry {
         self.workforce = workforce.clone();
         self.api_writes = api_writes.clone();
         self.actors = actors;
+        self.actor_coverage = actor_coverage;
     }
 
     /// Update just the cadence (paused / restarting branches, where no
@@ -285,4 +297,53 @@ pub async fn serve(bind: String, telemetry: SharedTelemetry, seeds: PathBuf) -> 
     tracing::info!(%bind, "sim control + telemetry server listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+
+    use boss_sim::actor_coverage;
+
+    use super::*;
+
+    #[test]
+    fn record_tick_stores_actor_coverage_on_the_wire() {
+        let mut t = SimTelemetry::new(
+            "automation:sim".to_string(),
+            "system-sim".to_string(),
+            "direct://127.0.0.1".to_string(),
+        );
+        let emp_roles: HashMap<String, String> = HashMap::from([
+            ("emp-1".to_string(), "brewer".to_string()),
+            ("emp-2".to_string(), "cellar-hand".to_string()),
+        ]);
+        let completions: HashMap<String, u64> = HashMap::from([("emp-1".to_string(), 4)]);
+        let cov = actor_coverage::compute(&emp_roles, &completions, &HashSet::new());
+        t.record_tick(
+            1,
+            Cadence::default(),
+            &WorkforceStats::default(),
+            &LiveApiStats::default(),
+            Vec::new(),
+            cov,
+        );
+
+        // The stored block carries the dormancy verdict...
+        assert_eq!(t.actor_coverage.roles_total, 2);
+        assert_eq!(t.actor_coverage.roles_acting, 1);
+        assert_eq!(t.actor_coverage.roles_dormant, 1);
+
+        // ...and GET /telemetry serializes it under the key + shape the
+        // SPA reads (apps/simulator/src/types.ts `ActorCoverage`).
+        let v = serde_json::to_value(&t).unwrap();
+        let cov = v.get("actor_coverage").expect("actor_coverage block");
+        assert_eq!(cov["employees_total"], 2);
+        assert_eq!(cov["employees_acting"], 1);
+        assert_eq!(cov["roles"][0]["role"], "brewer");
+        assert_eq!(cov["roles"][0]["status"], "acting");
+        assert_eq!(cov["roles"][0]["completions"], 4);
+        assert_eq!(cov["roles"][1]["role"], "cellar-hand");
+        assert_eq!(cov["roles"][1]["status"], "dormant");
+    }
 }

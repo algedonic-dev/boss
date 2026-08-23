@@ -180,6 +180,30 @@ pub fn run_ticks_with_handlers(
     Ok(report)
 }
 
+/// The `Tick` the runner builds for slice `tick_idx` of a sim-day
+/// split into `ticks_per_day` equal slices.
+///
+/// This is the ONLY place a tick's duration is derived, and it is
+/// pure so the boundary invariant — one sim-day's ticks sum to 24.0
+/// hours for whatever `ticks_per_day` the caller runs — is testable
+/// against the exact constructor the runner uses. The caller's
+/// slicing is the clock: a daemon that runs N slices per sim-day
+/// must pass that same N here (via `run_one_tick_with_handlers` /
+/// the tenant-engine `*_one_tick` wrappers), or every per-day rate
+/// scales by the ratio of the two clocks. That ratio was the
+/// 2026-08 backfill bug: warp ran 1 slice/day while the engine
+/// re-derived 1440, so Poisson-sampled Jobs ran at 1/1440 strength.
+///
+/// start_hour_of_day = which sim-hour this tick starts at.
+/// tick_idx 0 with 1d ticks → 0.0 (covers full day).
+/// tick_idx 0..23 with hourly ticks → 0.0..23.0.
+/// tick_idx 0..95 with 15m ticks → 0.0, 0.25, 0.5, ..., 23.75.
+pub fn tick_for(tick_idx: u32, ticks_per_day: u32) -> Tick {
+    let tick_duration_hours = 24.0 / (ticks_per_day as f64);
+    let start_hour_of_day = (tick_idx as f64) * tick_duration_hours;
+    Tick::new(tick_duration_hours, start_hour_of_day, tick_idx == 0)
+}
+
 /// Reentrant single-tick advance — Phase C of the sub-day-tick
 /// rollout. The daemon path
 /// (`crates/boss-brewery-engine/src/bin/boss_brewery_sim.rs`)
@@ -214,14 +238,7 @@ pub fn run_one_tick_with_handlers(
     bus: &mut SimEventBus,
     report: &mut RunReport,
 ) -> Result<()> {
-    let tick_duration_hours = 24.0 / (ticks_per_day as f64);
-    let is_first_in_day = tick_idx == 0;
-    // start_hour_of_day = which sim-hour this tick starts at.
-    // tick_idx 0 with 1d ticks → 0.0 (covers full day).
-    // tick_idx 0..23 with hourly ticks → 0.0..23.0.
-    // tick_idx 0..95 with 15m ticks → 0.0, 0.25, 0.5, ..., 23.75.
-    let start_hour_of_day = (tick_idx as f64) * tick_duration_hours;
-    let tick = Tick::new(tick_duration_hours, start_hour_of_day, is_first_in_day);
+    let tick = tick_for(tick_idx, ticks_per_day);
 
     // 1. Periodic — calendar-driven cycles. Now tick-aware
     //    (Phase B-2 follow-up): the engine's `step()` consults
@@ -277,7 +294,7 @@ pub fn run_one_tick_with_handlers(
     //      request. Day-anchored — periodic + batch only fire on
     //      first-tick, so this drain only does work then; later
     //      ticks see an empty stream.
-    if is_first_in_day {
+    if tick.is_first_in_day {
         let requests: Vec<serde_json::Value> = bus
             .events_matching("periodic.job_requested")
             .map(|ev| ev.payload.clone())
@@ -358,6 +375,26 @@ mod tests {
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    /// The invariant `engines/tick.rs` documents, enforced against
+    /// the constructor the runner actually uses: however many slices
+    /// a caller splits a sim-day into, their durations sum to 24.0
+    /// hours. N=1 is the warp-backfill day-tick; N=1440 is the live
+    /// brewery (`tick_duration = "1m"`).
+    #[test]
+    fn a_days_ticks_sum_to_24_hours_at_any_granularity() {
+        for n in [1u32, 24, 96, 1440] {
+            let total: f64 = (0..n).map(|i| tick_for(i, n).duration_hours).sum();
+            assert!(
+                (total - 24.0).abs() < 1e-9,
+                "N={n}: a day's ticks sum to {total}h, want 24.0"
+            );
+            assert!(tick_for(0, n).is_first_in_day);
+            if n > 1 {
+                assert!(!tick_for(1, n).is_first_in_day);
+            }
+        }
     }
 
     /// v2 step chain: a trigger step (`ready_when="true"`, fires at Job

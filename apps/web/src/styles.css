@@ -3394,3 +3394,13 @@ button.manual-tree-node {
 .ni-btn-primary:disabled { background: var(--static); border-color: var(--static); cursor: not-allowed; }
 .ni-btn-remove { color: var(--err); border-color: var(--err); }
 .ni-actions { display: flex; gap: 8px; margin-top: 16px; }
+
+/* --- StatusChip tones (@boss/web-kit/ui/StatusChip.svelte) --- */
+/* The closed five-tone set for the generic chip; pairs with the
+   base .chip rule above. Domain chips (chip-stock-*, chip-cert-*,
+   …) predate this and migrate here as their pages get touched. */
+.chip-tone-ok     { background: var(--wash); color: var(--ok); border-color: var(--ok); }
+.chip-tone-warn   { background: var(--wash); color: var(--warn); border-color: var(--warn); }
+.chip-tone-err    { background: var(--wash); color: var(--err); border-color: var(--err); }
+.chip-tone-muted  { background: transparent; color: var(--text-faint); }
+.chip-tone-active { background: var(--wash); color: var(--signal); border-color: var(--signal); }

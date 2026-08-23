@@ -58,6 +58,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use crate::actor_coverage::ActorCoverage;
 use crate::api_activity::{self, ActorKind, ApiActivity};
 
 /// Default duration for step kinds with no `typical_duration_hours`
@@ -195,6 +196,11 @@ pub struct Workforce {
     /// the dispatcher routes to them stay Ready for the human; see
     /// `workable_assignee`.
     excluded_assignees: std::collections::HashSet<String>,
+    /// Employee id → steps completed this process lifetime. The input
+    /// to [`Self::actor_coverage`] — WHO acts, where `WorkforceStats`
+    /// only counts HOW MUCH. Mutex (not a plain field): `complete`
+    /// takes `&self` from the parallel step workers.
+    completions_by_actor: std::sync::Mutex<HashMap<String, u64>>,
     pub stats: WorkforceStats,
 }
 
@@ -244,6 +250,7 @@ impl Workforce {
             api_activity: api_activity::new_handle(),
             emp_roles: HashMap::new(),
             excluded_assignees: Default::default(),
+            completions_by_actor: std::sync::Mutex::new(HashMap::new()),
             stats: WorkforceStats::default(),
         }
     }
@@ -268,6 +275,29 @@ impl Workforce {
     pub fn with_excluded_assignees(mut self, ids: impl IntoIterator<Item = String>) -> Self {
         self.excluded_assignees.extend(ids);
         self
+    }
+
+    /// Count one completed step against `emp` — the actor-coverage
+    /// tally ([`Self::actor_coverage`]). A poisoned lock drops the
+    /// sample rather than panicking: telemetry never wedges the sim.
+    fn note_completion(&self, emp: &str) {
+        if let Ok(mut m) = self.completions_by_actor.lock() {
+            *m.entry(emp.to_string()).or_default() += 1;
+        }
+    }
+
+    /// Snapshot actor coverage: who on the roster this executor is
+    /// actually driving, per role, vs who has never completed a step.
+    /// Pure function of the emp→role map, the per-employee completion
+    /// tally, and the operator-exclusion set (operators are labeled,
+    /// never counted dormant). The daemon serves this in `/telemetry`.
+    pub fn actor_coverage(&self) -> ActorCoverage {
+        let completions = self
+            .completions_by_actor
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        crate::actor_coverage::compute(&self.emp_roles, &completions, &self.excluded_assignees)
     }
 
     /// The role to attribute an employee's API calls to (cockpit display).
@@ -713,7 +743,9 @@ impl Workforce {
         // only labor; see docs/architecture-decisions.md).
         obj.insert("metadata".to_string(), Value::Object(md.clone()));
         if sign_offs_required.is_empty() {
-            return self.put_step(job_id, step_id, &body, emp);
+            self.put_step(job_id, step_id, &body, emp)?;
+            self.note_completion(emp);
+            return Ok(());
         }
         // Sign-off contract: stamps attest the step's FINAL shape, so the
         // metadata the executor fills lands first, then the stamps,
@@ -734,7 +766,9 @@ impl Workforce {
             step_id,
             &json!({ "status": "completed", "completed_by": emp }),
             emp,
-        )
+        )?;
+        self.note_completion(emp);
+        Ok(())
     }
 
     /// Fill the kind's required-at-done fields the Workflow didn't default,
@@ -1068,6 +1102,48 @@ mod tests {
             workable_assignee(&json!({ "id": "s3", "assignee_id": null }), &excluded),
             None
         );
+    }
+
+    #[test]
+    fn completion_tally_feeds_actor_coverage() {
+        use crate::actor_coverage::RoleStatus;
+        let emp_roles: HashMap<String, String> = HashMap::from([
+            ("emp-1".to_string(), "brewer".to_string()),
+            ("emp-2".to_string(), "brewer".to_string()),
+            ("emp-3".to_string(), "shipping-clerk".to_string()),
+            ("emp-admin".to_string(), "platform-admin".to_string()),
+        ]);
+        let wf = Workforce::new("http://127.0.0.1:9", HashMap::new(), HashMap::new())
+            .with_actor_telemetry(crate::api_activity::new_handle(), emp_roles)
+            .with_excluded_assignees(["emp-admin".to_string()]);
+
+        // Before any completion: both simulatable roles are dormant and
+        // platform-admin reads operator — never dormant.
+        let cov = wf.actor_coverage();
+        assert_eq!(cov.roles_acting, 0);
+        assert_eq!(cov.roles_dormant, 2);
+        assert_eq!(cov.roles_operator, 1);
+        assert_eq!(cov.employees_total, 4);
+        assert_eq!(cov.employees_operator, 1);
+
+        // Two completions by emp-1 + one by emp-2 → brewer acts:
+        // 2 distinct people, 3 steps.
+        wf.note_completion("emp-1");
+        wf.note_completion("emp-1");
+        wf.note_completion("emp-2");
+        let cov = wf.actor_coverage();
+        assert_eq!(cov.employees_acting, 2);
+        let brewer = cov.roles.iter().find(|r| r.role == "brewer").unwrap();
+        assert_eq!(brewer.acting, 2);
+        assert_eq!(brewer.completions, 3);
+        assert_eq!(brewer.status, RoleStatus::Acting);
+        // The clerk roster still hasn't acted — visible dormant.
+        let clerk = cov
+            .roles
+            .iter()
+            .find(|r| r.role == "shipping-clerk")
+            .unwrap();
+        assert_eq!(clerk.status, RoleStatus::Dormant);
     }
 
     fn fixed_now() -> DateTime<Utc> {

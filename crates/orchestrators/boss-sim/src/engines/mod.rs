@@ -18,6 +18,7 @@ pub use counterparty::{
 };
 pub use day_runner::{
     RunReport, end_of_day_rollup, run_days, run_one_tick_with_handlers, run_ticks_with_handlers,
+    tick_for,
 };
 pub use periodic::{Cadence, PeriodicAction, PeriodicEngine, PeriodicSpec};
 pub use tick::{Tick, parse_hh_mm};
