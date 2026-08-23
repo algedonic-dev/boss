@@ -342,12 +342,7 @@ pub(super) async fn create_tax_filing(
         None => body.amount_cents,
     };
 
-    let stamp = super::event_stamp(
-        &state,
-        &user,
-        boss_clock_client::now_from(&state.clock).await,
-    )
-    .await;
+    let stamp = super::event_stamp(&state, &user).await;
 
     // The row and its creation event commit together. `tax_filings` is
     // a projection of `ledger.tax.filing.created` (+ `ledger.tax.remitted`
@@ -565,8 +560,7 @@ pub(super) async fn create_tax_accrual(
         return r;
     }
 
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     let mut tx = match state.pool.begin().await {
         Ok(t) => t,
         Err(e) => return storage_err(e),
@@ -818,8 +812,7 @@ pub(super) async fn upsert_excise_rate_schedule(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     let mut tx = match state.pool.begin().await {
         Ok(t) => t,
         Err(e) => return storage_err(e),
@@ -1034,8 +1027,7 @@ pub(super) async fn remit_tax_filing(
     }
 
     {
-        let now = boss_clock_client::now_from(&state.clock).await;
-        let stamp = super::event_stamp(&state, &user, now).await;
+        let stamp = super::event_stamp(&state, &user).await;
         if let Err(e) = crate::events::record_ledger_event_in_tx(
             &mut tx,
             &stamp,

@@ -73,17 +73,27 @@ async fn create_campaign<R: CampaignsRepository + 'static>(
     if body.id.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "id is required").into_response();
     }
-    let now = state.clock.now().await.now;
+    // `starts_on` is a business date — it defaults from the
+    // authoritative (sim-aware) clock. The record stamp + row
+    // created_at are wall time (sim time is retired from the record
+    // — David, 2026-08-22, packet a7a4cae5); the adapter builds the
+    // event from that same instant, so live row, event stamp, and
+    // rebuild agree.
+    let today = state.clock.now().await.now.date_naive();
     let campaign = Campaign {
         name: body.name.unwrap_or_else(|| body.id.clone()),
         id: body.id,
         status: body.status.unwrap_or_else(|| "active".to_string()),
-        starts_on: body.starts_on.or_else(|| Some(now.date_naive())),
+        starts_on: body.starts_on.or(Some(today)),
         ends_on: body.ends_on,
         metadata: body.metadata.unwrap_or_else(|| serde_json::json!({})),
         created_at: None,
     };
-    match state.campaigns.create_campaign_at(&campaign, now).await {
+    match state
+        .campaigns
+        .create_campaign_at(&campaign, boss_clock_client::wall_now())
+        .await
+    {
         // Idempotent re-POST reports 200 (nothing written, nothing
         // emitted); a fresh birth is 201.
         Ok(true) => (StatusCode::CREATED, Json(campaign)).into_response(),

@@ -69,16 +69,13 @@ fn build_auth_audit() -> boss_gateway::audit::AuthAudit {
             .connect_lazy(&url)
         {
             Ok(pool) => {
-                // Clock-as-service: the drain task stamps each event
-                // via the clock so the log's timeline stays coherent
-                // under sim warp; ReqwestClockClient already falls
-                // back to wall time on transport error.
-                let clock_url =
-                    std::env::var("BOSS_CLOCK_URL").unwrap_or_else(|_| boss_ports::url("clock"));
-                boss_gateway::audit::AuthAudit::spawn(
-                    Arc::new(boss_events::outbox::PgOutboxRecorder::new(pool)),
-                    Arc::new(boss_clock_client::ReqwestClockClient::new(clock_url)),
-                )
+                // The drain task stamps each event with wall time —
+                // sim time is retired from the record (David,
+                // 2026-08-22, packet a7a4cae5); an auth decision is
+                // real-world activity in any clock mode.
+                boss_gateway::audit::AuthAudit::spawn(Arc::new(
+                    boss_events::outbox::PgOutboxRecorder::new(pool),
+                ))
             }
             Err(e) => {
                 tracing::warn!(error = %e, "audit DB URL unusable — auth events degrade to warn lines");

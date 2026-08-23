@@ -157,8 +157,8 @@ async fn a_locked_years_close_does_not_re_project() {
     let stamp = boss_core::publisher::EventStamp::new(
         "ledger",
         boss_core::actor::ActorId::Automation("test".into()),
-        chrono::Utc::now(),
-    );
+    )
+    .with_timestamp(chrono::Utc::now());
     lock_period(&db.pool, year_id, "test", &stamp, "test")
         .await
         .expect("lock the year");

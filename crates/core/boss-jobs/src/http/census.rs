@@ -58,10 +58,10 @@ pub(super) async fn record_network_census<R: JobsRepository + 'static, B: EventB
     let actor = user
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-    // The authoritative clock, not process wall time — the series'
-    // timestamps must live on the same clock as the packets it counts.
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let event = events::network_census_event(&actor, now, counts);
+    // The census event stamps wall-clock time like every record (sim
+    // time is retired from the record); the counts payload is what
+    // carries the measured state.
+    let event = events::network_census_event(&actor, counts);
 
     match state.jobs.record_events(std::slice::from_ref(&event)).await {
         Ok(()) => (

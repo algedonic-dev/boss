@@ -25,8 +25,8 @@ fn stamp() -> boss_core::publisher::EventStamp {
     boss_core::publisher::EventStamp::new(
         "inventory-test",
         boss_core::actor::ActorId::Automation("test".into()),
-        Utc::now(),
     )
+    .with_timestamp(Utc::now())
 }
 
 fn item(sku: &str, on_hand: u32, unit_cost_cents: i64) -> InventoryItem {

@@ -470,7 +470,6 @@ impl StationRegistry for InMemoryStations {
         self.record(crate::events::station_registry_event(
             crate::events::STATION_DRAFT_SAVED,
             actor,
-            now,
             &spec,
         ));
         Ok(spec)
@@ -480,7 +479,7 @@ impl StationRegistry for InMemoryStations {
         &self,
         name: &str,
         actor: &boss_core::actor::ActorId,
-        now: DateTime<Utc>,
+        _now: DateTime<Utc>,
     ) -> Result<StationSpec, StationError> {
         let mut rows = self.rows.lock().unwrap();
         let latest_draft = rows
@@ -511,7 +510,6 @@ impl StationRegistry for InMemoryStations {
         self.record(crate::events::station_registry_event(
             crate::events::STATION_PUBLISHED,
             actor,
-            now,
             &promoted,
         ));
         Ok(promoted)
@@ -521,7 +519,7 @@ impl StationRegistry for InMemoryStations {
         &self,
         name: &str,
         actor: &boss_core::actor::ActorId,
-        now: DateTime<Utc>,
+        _now: DateTime<Utc>,
     ) -> Result<(), StationError> {
         let mut rows = self.rows.lock().unwrap();
         let any_active = rows
@@ -543,7 +541,6 @@ impl StationRegistry for InMemoryStations {
             self.record(crate::events::station_registry_event(
                 crate::events::STATION_RETIRED,
                 actor,
-                now,
                 &spec,
             ));
         }
@@ -752,7 +749,6 @@ mod pg {
             let event = crate::events::station_registry_event(
                 crate::events::STATION_DRAFT_SAVED,
                 actor,
-                now,
                 &spec,
             );
             boss_events::outbox::record_event_in_tx(&mut tx, &event)
@@ -769,7 +765,7 @@ mod pg {
             &self,
             name: &str,
             actor: &boss_core::actor::ActorId,
-            now: DateTime<Utc>,
+            _now: DateTime<Utc>,
         ) -> Result<StationSpec, StationError> {
             let mut tx = self
                 .pool
@@ -824,7 +820,6 @@ mod pg {
             let event = crate::events::station_registry_event(
                 crate::events::STATION_PUBLISHED,
                 actor,
-                now,
                 &promoted,
             );
             boss_events::outbox::record_event_in_tx(&mut tx, &event)
@@ -842,7 +837,7 @@ mod pg {
             &self,
             name: &str,
             actor: &boss_core::actor::ActorId,
-            now: DateTime<Utc>,
+            _now: DateTime<Utc>,
         ) -> Result<(), StationError> {
             let mut tx = self
                 .pool
@@ -877,12 +872,8 @@ mod pg {
             .map_err(|e| StationError::Storage(e.to_string()))?;
             spec.status = WorkflowStatus::Retired;
 
-            let event = crate::events::station_registry_event(
-                crate::events::STATION_RETIRED,
-                actor,
-                now,
-                &spec,
-            );
+            let event =
+                crate::events::station_registry_event(crate::events::STATION_RETIRED, actor, &spec);
             boss_events::outbox::record_event_in_tx(&mut tx, &event)
                 .await
                 .map_err(StationError::Storage)?;

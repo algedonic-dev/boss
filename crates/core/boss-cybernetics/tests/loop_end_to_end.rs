@@ -52,7 +52,6 @@ async fn boot(specs: Vec<AgentSpec>, synthetic_cost: Cost) -> Harness {
     let dispatcher = Arc::new(StubDispatcher::new(synthetic_cost));
     let registry = Arc::new(InMemoryAgentRegistry::new(specs));
 
-    let clock = Arc::new(boss_clock_client::WallClockClient);
     let publisher = Arc::new(boss_core::publisher::DomainPublisher::new(
         bus.clone(),
         format!("cybernetics/{}", vm),
@@ -68,7 +67,6 @@ async fn boot(specs: Vec<AgentSpec>, synthetic_cost: Cost) -> Harness {
         registry,
         publisher,
         recorder.clone() as Arc<dyn boss_core::port::EventRecorder>,
-        clock,
     ));
 
     let (cancel_tx, cancel_rx) = watch::channel(false);

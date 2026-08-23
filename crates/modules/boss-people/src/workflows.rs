@@ -142,11 +142,13 @@ async fn update_status(
 
     let now = boss_clock_client::now_from(&state.clock).await;
     // OUTBOX (phase 2): the adapter records people.employee.updated
-    // in the update transaction.
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    // in the update transaction. Row-touch columns bind the stamp's
+    // wall time; `effective_date` (the business day of the change)
+    // keeps the authoritative clock's date.
+    let stamp = crate::events::event_stamp(&state.publisher).await;
     if let Err(e) = state
         .people
-        .update_employee_at(&id, &emp, now, &stamp)
+        .update_employee_at(&id, &emp, stamp.timestamp, &stamp)
         .await
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -165,7 +167,6 @@ async fn update_status(
             notes: body.notes,
             initiated_by: body.initiated_by,
         },
-        now,
     )
     .await
     {
@@ -196,7 +197,6 @@ async fn record_change(
     _headers: axum::http::HeaderMap,
     Json(body): Json<RecordChange>,
 ) -> Response {
-    let now = boss_clock_client::now_from(&state.clock).await;
     if let Err(e) = record_change_inner(
         &state,
         EmployeeChangeRecord {
@@ -208,7 +208,6 @@ async fn record_change(
             notes: body.notes,
             initiated_by: body.initiated_by,
         },
-        now,
     )
     .await
     {
@@ -265,11 +264,12 @@ async fn update_employee_status(
     emp.status = Some(new_status.to_string());
 
     // OUTBOX (phase 2): the adapter records people.employee.updated
-    // in the update transaction.
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    // in the update transaction. Row-touch columns bind the stamp's
+    // wall time; `effective_date` keeps the caller's clock date.
+    let stamp = crate::events::event_stamp(&state.publisher).await;
     if let Err(e) = state
         .people
-        .update_employee_at(employee_id, &emp, now, &stamp)
+        .update_employee_at(employee_id, &emp, stamp.timestamp, &stamp)
         .await
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -286,7 +286,6 @@ async fn update_employee_status(
             notes: None,
             initiated_by: None,
         },
-        now,
     )
     .await
     {
@@ -306,8 +305,11 @@ async fn update_employee_status(
 async fn record_change_inner(
     state: &WorkflowState,
     rec: EmployeeChangeRecord,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Response> {
+    // Stamp first: the row's created_at binds the stamp's wall time,
+    // which is also the event's record stamp — the rebuild reproduces
+    // the column from audit_log.timestamp.
+    let stamp = crate::events::event_stamp(&state.publisher).await;
     let mut tx = state
         .pool
         .begin()
@@ -324,11 +326,10 @@ async fn record_change_inner(
     .bind(rec.effective_date)
     .bind(&rec.notes)
     .bind(&rec.initiated_by)
-    .bind(now)
+    .bind(stamp.timestamp)
     .execute(&mut *tx)
     .await
     .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response())?;
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
     let event = stamp.event(
         EMPLOYEE_CHANGE_RECORDED,
         serde_json::to_value(&rec).unwrap_or_default(),

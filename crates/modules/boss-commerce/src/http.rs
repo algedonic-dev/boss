@@ -296,14 +296,13 @@ async fn create_invoice<R: CommerceRepository + 'static>(
         }
     }
     let invoice_id = invoice.id.clone();
-    let now = boss_clock_client::now_from(&state.clock).await;
     // Outbox phase 2: the adapter records commerce.invoice.created
     // (the ENRICHED invoice — cost_basis populated in-tx) inside the
     // domain transaction; nothing publishes post-commit.
-    let stamp = event_stamp(&state, &user, now).await;
+    let stamp = event_stamp(&state, &user).await;
     match state
         .commerce
-        .create_invoice_at(&invoice, now, &stamp)
+        .create_invoice_at(&invoice, stamp.timestamp, &stamp)
         .await
     {
         Ok(_enriched) => (
@@ -325,14 +324,13 @@ async fn create_invoice<R: CommerceRepository + 'static>(
 async fn event_stamp<R: CommerceRepository>(
     state: &CommerceApiState<R>,
     user: &boss_policy_client::User,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> boss_core::publisher::EventStamp {
     let actor = user
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
     match &state.publisher {
-        Some(p) => p.stamp_with_actor_at(actor, now).await,
-        None => boss_core::publisher::EventStamp::new("commerce", actor, now),
+        Some(p) => p.stamp_with_actor(actor).await,
+        None => boss_core::publisher::EventStamp::new("commerce", actor),
     }
 }
 
@@ -343,10 +341,9 @@ async fn batch_invoices<R: CommerceRepository + 'static>(
 ) -> Response {
     let mut inserted = 0u64;
     let mut skipped: Vec<(String, String)> = Vec::new();
-    let batch_now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, &user, batch_now).await;
+    let stamp = event_stamp(&state, &user).await;
     for inv in &invoices {
-        let now = batch_now;
+        let now = stamp.timestamp;
         // Status registry gate — reject rows with an unregistered (or
         // unreachable-registry) status, matching this endpoint's
         // skip-and-report batch semantics. Permissive when no registry
@@ -475,7 +472,7 @@ async fn mark_invoice_paid<R: CommerceRepository + 'static>(
         .unwrap_or_else(|| now.date_naive());
     // Outbox phase 2: the adapter records commerce.invoice.paid (full
     // post-update row state, read back inside its own transaction).
-    let stamp = event_stamp(&state, &user, now).await;
+    let stamp = event_stamp(&state, &user).await;
     match state
         .commerce
         .mark_invoice_paid_at(&id, paid_on, &stamp)
@@ -491,9 +488,8 @@ async fn mark_invoice_past_due<R: CommerceRepository + 'static>(
     Path(id): Path<String>,
     CurrentUser(user): CurrentUser,
 ) -> Response {
-    let now = boss_clock_client::now_from(&state.clock).await;
     // Outbox phase 2: recorded in the adapter's transaction.
-    let stamp = event_stamp(&state, &user, now).await;
+    let stamp = event_stamp(&state, &user).await;
     match state.commerce.mark_invoice_past_due(&id, &stamp).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => error_response(e),
@@ -505,11 +501,10 @@ async fn mark_invoice_written_off<R: CommerceRepository + 'static>(
     Path(id): Path<String>,
     CurrentUser(user): CurrentUser,
 ) -> Response {
-    let now = boss_clock_client::now_from(&state.clock).await;
     // Outbox phase 2: the adapter records the event in the flip's own
     // transaction, structurally gated on the flip winning — the
     // emit-once-on-`newly` dance this handler used to do is gone.
-    let stamp = event_stamp(&state, &user, now).await;
+    let stamp = event_stamp(&state, &user).await;
     match state.commerce.mark_invoice_written_off(&id, &stamp).await {
         Ok(_newly) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => error_response(e),
@@ -561,10 +556,9 @@ async fn write_off_invoice_from_past_due<R: CommerceRepository + 'static>(
             .into_response();
     };
 
-    let now = boss_clock_client::now_from(&state.clock).await;
     // Outbox phase 2: emit-once is structural in the adapter's
     // transaction; `newly` stays in the response for the caller.
-    let stamp = event_stamp(&state, &user, now).await;
+    let stamp = event_stamp(&state, &user).await;
     match state
         .commerce
         .mark_invoice_written_off(&invoice_id, &stamp)

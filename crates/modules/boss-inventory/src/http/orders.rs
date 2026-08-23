@@ -66,7 +66,6 @@ pub(super) async fn create_order<R: InventoryRepository + 'static>(
     CurrentUser(user): CurrentUser,
     Json(body): Json<CreateOrderRequest>,
 ) -> Response {
-    let now = boss_clock_client::now_from(&state.clock).await;
     let po_id = format!(
         "PO-{}",
         uuid::Uuid::new_v4().as_simple().to_string()[..8].to_uppercase()
@@ -100,10 +99,10 @@ pub(super) async fn create_order<R: InventoryRepository + 'static>(
     }
     // Outbox phase 2: PO_UPSERTED records inside the repository
     // transaction (header + lines + identity + event, atomically).
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     match state
         .inventory
-        .create_purchase_order_at(&po, now, &stamp)
+        .create_purchase_order_at(&po, stamp.timestamp, &stamp)
         .await
     {
         Ok(()) => (
@@ -121,12 +120,12 @@ pub(super) async fn batch_create_orders<R: InventoryRepository + 'static>(
     Json(body): Json<Vec<PurchaseOrder>>,
 ) -> Response {
     let mut inserted = 0usize;
-    let batch_now = boss_clock_client::now_from(&state.clock).await;
     // Outbox phase 2: one stamp for the batch; PO_UPSERTED records
-    // inside each repository transaction.
-    let stamp = super::event_stamp(&state, &user, batch_now).await;
+    // inside each repository transaction, and every row-touch column
+    // binds the stamp's wall time so a rebuild reproduces it.
+    let stamp = super::event_stamp(&state, &user).await;
     for po in &body {
-        let now = batch_now;
+        let now = stamp.timestamp;
         // The closed enum used to reject unknown statuses at
         // deserialization; the registry gate is that check now.
         if let Err(resp) = check_po_status(state.classes_client.as_ref(), po.status.as_str()).await
@@ -201,11 +200,10 @@ pub(super) async fn update_order_status<R: InventoryRepository + 'static>(
     if let Err(resp) = check_po_status(state.classes_client.as_ref(), &body.status).await {
         return resp;
     }
-    let now = boss_clock_client::now_from(&state.clock).await;
     // Outbox phase 2: PO_UPSERTED (post-update row state, read back
     // in-tx) + the PO_STATUS_CHANGED marker record inside the
     // repository transaction.
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     match state
         .inventory
         .update_po_status(&id, &body.status, &stamp)

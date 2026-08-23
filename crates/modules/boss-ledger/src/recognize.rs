@@ -205,7 +205,7 @@ pub async fn run_tick(
     summary.schedules_considered = rows.len();
 
     for row in rows {
-        match advance_one_schedule(pool, publisher, &row, today).await {
+        match advance_one_schedule(pool, publisher, &row).await {
             Ok(Advance::Posted { closed }) => {
                 summary.periods_posted += 1;
                 if closed {
@@ -310,7 +310,6 @@ async fn advance_one_schedule(
     pool: &PgPool,
     publisher: &Option<std::sync::Arc<boss_core::publisher::DomainPublisher>>,
     row: &ScheduleRow,
-    today: NaiveDate,
 ) -> Result<Advance, LedgerError> {
     let total_periods = num_periods(row.start_date, row.end_date, row.frequency);
     let period_ix = current_period_index(row);
@@ -432,21 +431,17 @@ async fn advance_one_schedule(
     .map_err(|e| LedgerError::Storage(e.to_string()))?;
 
     // Record the event in the SAME tx as the post + advance (outbox
-    // phase 2). Stamp it with the clock-driven `today` instant the
-    // run_tick caller resolved, not chrono::Utc::now() — without
-    // this the sim writes wallclock-tagged ledger.revenue.recognized
-    // rows into a sim-time audit_log. The recognize timer has no
-    // request user, so the actor is the publisher's default.
-    let today_at = today
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is always valid")
-        .and_utc();
+    // phase 2). The record stamp is wall-clock — sim time is retired
+    // from the record (David, 2026-08-22, packet a7a4cae5). The
+    // business day the recognition covers is the schedule's own
+    // recognition date, which rides in the payload + the schedule
+    // row — never the stamp. The recognize timer has no request
+    // user, so the actor is the publisher's default.
     let stamp = match publisher {
-        Some(p) => p.stamp_with_actor_at(p.default_actor(), today_at).await,
+        Some(p) => p.stamp_with_actor(p.default_actor()).await,
         None => boss_core::publisher::EventStamp::new(
             "ledger",
             boss_core::actor::ActorId::Automation("platform".into()),
-            today_at,
         ),
     };
     crate::events::record_ledger_event_in_tx(&mut tx, &stamp, "ledger.revenue.recognized", payload)

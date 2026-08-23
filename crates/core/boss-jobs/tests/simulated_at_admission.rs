@@ -60,6 +60,12 @@ fn test_kind() -> WorkflowSpec {
 }
 
 fn app() -> (axum::Router, Arc<InMemoryJobs>) {
+    app_with_clock(Arc::new(boss_clock_client::WallClockClient))
+}
+
+fn app_with_clock(
+    clock: Arc<dyn boss_clock_client::ClockClient>,
+) -> (axum::Router, Arc<InMemoryJobs>) {
     let kinds = Arc::new(InMemoryWorkflows::new());
     kinds.seed(test_kind()).unwrap();
     let jobs = Arc::new(InMemoryJobs::new());
@@ -86,7 +92,7 @@ fn app() -> (axum::Router, Arc<InMemoryJobs>) {
         subject_kinds: None,
         subject_existence: None,
         roster: None,
-        clock: Arc::new(boss_clock_client::WallClockClient),
+        clock,
     };
     (router(state), jobs)
 }
@@ -297,4 +303,60 @@ async fn step_writes_inherit_the_packet_flag_not_the_chain() {
     for e in &job_updated {
         assert_eq!(e.payload["_simulated"], true);
     }
+}
+
+/// The sim-stamp retirement pin (David, 2026-08-22, packet a7a4cae5):
+/// an event emitted while the deploy's clock is skewed to sim time
+/// still carries WALL time on the record. Before this, every
+/// clock-routed writer stamped `audit_log.timestamp` with the sim
+/// instant while the allowlisted wall writers didn't, and one
+/// incident's rows read hours apart. The sim timeline still reaches
+/// the packet — as DATA: `opened_on` defaults from the sim-aware
+/// clock port. The stamp does not.
+#[tokio::test]
+async fn a_skewed_sim_clock_never_reaches_the_record_stamp() {
+    let sim_instant = chrono::DateTime::parse_from_rfc3339("2025-04-01T08:30:00Z")
+        .unwrap()
+        .to_utc();
+    let clock: Arc<dyn boss_clock_client::ClockClient> = Arc::new(
+        boss_clock_client::FixedClockClient::new(boss_clock_client::ClockNow {
+            now: sim_instant,
+            simulated: true,
+            epoch_start: None,
+            epoch_end: None,
+            paused: false,
+            restart_in_progress: false,
+            warp_factor: None,
+        }),
+    );
+    let (app, jobs) = app_with_clock(clock);
+
+    let before = chrono::Utc::now();
+    let id = post_job(&app, &job_body(None)).await;
+    let after = chrono::Utc::now();
+
+    // The business date follows the authoritative (sim) clock — the
+    // timeline lives in the payload.
+    let detail = get_job(&app, &id).await;
+    assert_eq!(
+        detail["opened_on"], "2025-04-01",
+        "opened_on defaults from the sim-aware clock port"
+    );
+
+    // The record stamp is wall-clock now, not the skewed sim instant.
+    let created: Vec<_> = jobs
+        .recorded_events()
+        .into_iter()
+        .filter(|e| e.kind == "jobs.job.created")
+        .collect();
+    assert_eq!(created.len(), 1);
+    let ts = created[0].timestamp;
+    assert!(
+        ts >= before && ts <= after,
+        "record stamp must be wall-clock now, got {ts} (sim clock was {sim_instant})"
+    );
+    assert!(
+        (ts - sim_instant).num_days().abs() > 300,
+        "sanity: the skew is wide enough that a sim-time leak would be unmistakable"
+    );
 }

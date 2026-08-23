@@ -175,8 +175,7 @@ pub(super) async fn create_payroll_run(
     // fact + JE, so a crash can no longer commit the run without its
     // rebuild source.
     {
-        let now = boss_clock_client::now_from(&state.clock).await;
-        let stamp = super::event_stamp(&state, &user, now).await;
+        let stamp = super::event_stamp(&state, &user).await;
         if let Err(e) = crate::events::record_ledger_event_in_tx(
             &mut tx,
             &stamp,
@@ -404,8 +403,7 @@ pub(super) async fn synthesize_payroll_run(
     // fact + JE, so a crash can no longer commit the run without its
     // rebuild source.
     {
-        let now = boss_clock_client::now_from(&state.clock).await;
-        let stamp = super::event_stamp(&state, &user, now).await;
+        let stamp = super::event_stamp(&state, &user).await;
         if let Err(e) = crate::events::record_ledger_event_in_tx(
             &mut tx,
             &stamp,

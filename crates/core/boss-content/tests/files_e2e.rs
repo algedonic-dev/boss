@@ -10,8 +10,8 @@ fn test_stamp() -> boss_core::publisher::EventStamp {
     boss_core::publisher::EventStamp::new(
         "content",
         boss_core::actor::ActorId::Automation("test".into()),
-        chrono::Utc::now(),
     )
+    .with_timestamp(chrono::Utc::now())
 }
 
 use std::sync::Arc;

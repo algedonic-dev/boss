@@ -114,15 +114,18 @@ pub fn step_state_payload(step: &boss_core::job::Step) -> serde_json::Value {
 /// which made "protocols as data the log witnesses" false. The actor
 /// rides as `_actor` exactly as EventStamp injects it, so consumers
 /// and the rebuild read one shape.
+///
+/// The stamp is wall-clock, minted here — sim time is retired from
+/// the record (David, 2026-08-22, packet a7a4cae5). Same for every
+/// builder below.
 pub fn workflow_registry_event(
     kind: &str,
     actor: &boss_core::actor::ActorId,
-    now: chrono::DateTime<chrono::Utc>,
     spec: &crate::registry::WorkflowSpec,
 ) -> boss_core::event::Event {
     let payload =
         boss_core::publisher::inject_actor(serde_json::to_value(spec).unwrap_or_default(), actor);
-    boss_core::event::Event::new("jobs", kind, payload, now)
+    boss_core::event::Event::new("jobs", kind, payload, boss_clock_client::wall_now())
 }
 
 /// The `jobs.kind.quarantined` marker: which Workflow row boot
@@ -133,7 +136,6 @@ pub fn workflow_registry_event(
 /// both. Actor rides as `_actor` exactly as EventStamp injects it.
 pub fn workflow_quarantined_event(
     actor: &boss_core::actor::ActorId,
-    now: chrono::DateTime<chrono::Utc>,
     spec: &crate::registry::WorkflowSpec,
     problems: &[crate::workflow_lint::WorkflowLintError],
 ) -> boss_core::event::Event {
@@ -146,7 +148,12 @@ pub fn workflow_quarantined_event(
         }),
         actor,
     );
-    boss_core::event::Event::new("jobs", WORKFLOW_QUARANTINED, payload, now)
+    boss_core::event::Event::new(
+        "jobs",
+        WORKFLOW_QUARANTINED,
+        payload,
+        boss_clock_client::wall_now(),
+    )
 }
 
 /// The loud marker for a station retired by the boot viability pass.
@@ -154,7 +161,6 @@ pub fn workflow_quarantined_event(
 /// "why did this queue disappear?" without a re-lint.
 pub fn station_quarantined_event(
     actor: &boss_core::actor::ActorId,
-    now: chrono::DateTime<chrono::Utc>,
     spec: &crate::stations::StationSpec,
     problems: &[crate::station_lint::StationLintError],
 ) -> boss_core::event::Event {
@@ -167,7 +173,12 @@ pub fn station_quarantined_event(
         }),
         actor,
     );
-    boss_core::event::Event::new("jobs", STATION_QUARANTINED, payload, now)
+    boss_core::event::Event::new(
+        "jobs",
+        STATION_QUARANTINED,
+        payload,
+        boss_clock_client::wall_now(),
+    )
 }
 
 /// One packet-loss census firing — same contract as the quarantine
@@ -178,11 +189,15 @@ pub fn station_quarantined_event(
 /// handler that measures — rather than being re-declared here.
 pub fn network_census_event(
     actor: &boss_core::actor::ActorId,
-    now: chrono::DateTime<chrono::Utc>,
     counts: serde_json::Value,
 ) -> boss_core::event::Event {
     let payload = boss_core::publisher::inject_actor(counts, actor);
-    boss_core::event::Event::new("jobs", NETWORK_CENSUS, payload, now)
+    boss_core::event::Event::new(
+        "jobs",
+        NETWORK_CENSUS,
+        payload,
+        boss_clock_client::wall_now(),
+    )
 }
 
 /// A step-plugin registry event — same contract as
@@ -193,12 +208,11 @@ pub fn network_census_event(
 pub fn step_plugin_registry_event(
     kind: &str,
     actor: &boss_core::actor::ActorId,
-    now: chrono::DateTime<chrono::Utc>,
     spec: &crate::step_plugins::StepPluginSpec,
 ) -> boss_core::event::Event {
     let payload =
         boss_core::publisher::inject_actor(serde_json::to_value(spec).unwrap_or_default(), actor);
-    boss_core::event::Event::new("jobs", kind, payload, now)
+    boss_core::event::Event::new("jobs", kind, payload, boss_clock_client::wall_now())
 }
 
 /// A station registry event — same contract as
@@ -209,12 +223,11 @@ pub fn step_plugin_registry_event(
 pub fn station_registry_event(
     kind: &str,
     actor: &boss_core::actor::ActorId,
-    now: chrono::DateTime<chrono::Utc>,
     spec: &crate::stations::StationSpec,
 ) -> boss_core::event::Event {
     let payload =
         boss_core::publisher::inject_actor(serde_json::to_value(spec).unwrap_or_default(), actor);
-    boss_core::event::Event::new("jobs", kind, payload, now)
+    boss_core::event::Event::new("jobs", kind, payload, boss_clock_client::wall_now())
 }
 
 #[cfg(test)]

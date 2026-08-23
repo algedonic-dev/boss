@@ -509,10 +509,11 @@ async fn post_event<R: AssetsRepository + 'static, B: EventBus + 'static>(
     if let Err(e) = state.assets.append(event.clone()).await {
         return (StatusCode::CONFLICT, e.to_string()).into_response();
     }
-    // The definitive event time comes from the clock service (sim-time
-    // in a regen, wall-time in prod) — never the client. The
-    // AssetEvent's `ts` stays in the payload as the business date.
-    let event_time = boss_clock_client::now_from(&state.clock).await;
+    // The record stamp is wall time — sim time is retired from the
+    // record (David, 2026-08-22, packet a7a4cae5). The AssetEvent's
+    // `ts` stays in the payload as the business date, which is where
+    // the sim timeline lives.
+    let event_time = boss_clock_client::wall_now();
     let core_event = asset_event_to_core(&event, event_time);
     state.publisher.publish(core_event).await;
     (StatusCode::CREATED, Json(serde_json::json!({"ok": true}))).into_response()
@@ -545,10 +546,9 @@ async fn batch_events<R: AssetsRepository + 'static, B: EventBus + 'static>(
                 .into_response();
         }
     };
-    // Clock-authoritative event time for every row in the batch (see
-    // post_event) — one clock read; the client's per-event `ts` stays
-    // payload data.
-    let event_time = boss_clock_client::now_from(&state.clock).await;
+    // One wall-clock record stamp for the whole batch (see
+    // post_event); the client's per-event `ts` stays payload data.
+    let event_time = boss_clock_client::wall_now();
     let core_events: Vec<_> = to_publish
         .iter()
         .map(|e| asset_event_to_core(e, event_time))

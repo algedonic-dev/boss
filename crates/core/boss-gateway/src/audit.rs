@@ -29,15 +29,13 @@
 //! degrade to the structured `tracing::warn!` that was the record
 //! before this module existed — never to silence.
 //!
-//! Timestamps route through the clock service (clock-as-service —
-//! anything that stamps an `audit_log` row does), applied by the
-//! drain task at staging time so the handler never awaits the clock.
-//! `ReqwestClockClient` already degrades to wall time on transport
-//! error, which matches this module's whole failure posture.
+//! Timestamps are wall-clock, minted at staging time — sim time is
+//! retired from the record (David, 2026-08-22, packet a7a4cae5), and
+//! an auth decision is real-world activity in any clock mode. The
+//! handler never awaits anything to stamp.
 
 use std::sync::Arc;
 
-use boss_clock_client::ClockClient;
 use boss_core::event::Event;
 use boss_core::port::EventRecorder;
 use serde_json::json;
@@ -109,14 +107,13 @@ impl AuthAudit {
         Self { tx: None }
     }
 
-    /// Spawn the drain task over a recorder + clock. The task owns
-    /// both and runs until the last `AuthAudit` clone drops.
-    pub fn spawn(recorder: Arc<dyn EventRecorder>, clock: Arc<dyn ClockClient>) -> Self {
+    /// Spawn the drain task over a recorder. The task owns it and
+    /// runs until the last `AuthAudit` clone drops.
+    pub fn spawn(recorder: Arc<dyn EventRecorder>) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Staged>(QUEUE_DEPTH);
         tokio::spawn(async move {
             while let Some((kind, payload)) = rx.recv().await {
-                let now = boss_clock_client::now_from(&clock).await;
-                let event = Event::new("gateway", kind, payload, now);
+                let event = Event::new("gateway", kind, payload, boss_clock_client::wall_now());
                 if let Err(e) = recorder.record(&event).await {
                     warn_unrecorded(
                         event.kind.as_str(),
@@ -238,7 +235,7 @@ mod tests {
     #[tokio::test]
     async fn denied_carries_reason_and_no_subject_reference() {
         let cap = Arc::new(Captured::default());
-        let audit = AuthAudit::spawn(cap.clone(), Arc::new(boss_clock_client::WallClockClient));
+        let audit = AuthAudit::spawn(cap.clone());
         audit.login_denied(
             Some("who@example.com"),
             AuthMethod::Oidc,
@@ -262,7 +259,7 @@ mod tests {
     #[tokio::test]
     async fn idp_refusal_needs_no_claimed_email() {
         let cap = Arc::new(Captured::default());
-        let audit = AuthAudit::spawn(cap.clone(), Arc::new(boss_clock_client::WallClockClient));
+        let audit = AuthAudit::spawn(cap.clone());
         audit.login_denied(None, AuthMethod::Oidc, DeniedReason::IdpDenied, None);
         let events = drain(&cap, 1).await;
         assert_eq!(events[0].payload["reason"], "idp_denied");
@@ -272,7 +269,7 @@ mod tests {
     #[tokio::test]
     async fn succeeded_names_the_method_for_the_passkey_future() {
         let cap = Arc::new(Captured::default());
-        let audit = AuthAudit::spawn(cap.clone(), Arc::new(boss_clock_client::WallClockClient));
+        let audit = AuthAudit::spawn(cap.clone());
         audit.login_succeeded("op@example.com", Some("emp-1"), AuthMethod::Password);
         let events = drain(&cap, 1).await;
         let e = &events[0];
@@ -284,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn guest_mint_is_counted_under_its_own_kind() {
         let cap = Arc::new(Captured::default());
-        let audit = AuthAudit::spawn(cap.clone(), Arc::new(boss_clock_client::WallClockClient));
+        let audit = AuthAudit::spawn(cap.clone());
         audit.guest_session("guest@algedonic.dev");
         let events = drain(&cap, 1).await;
         assert_eq!(events[0].kind, "auth.session.guest");
@@ -316,10 +313,7 @@ mod tests {
                 Err("db down".into())
             }
         }
-        let audit = AuthAudit::spawn(
-            Arc::new(Failing),
-            Arc::new(boss_clock_client::WallClockClient),
-        );
+        let audit = AuthAudit::spawn(Arc::new(Failing));
         // Emit must not error or panic; the drain task warns.
         audit.login_succeeded("op@example.com", None, AuthMethod::Password);
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;

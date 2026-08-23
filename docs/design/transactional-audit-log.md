@@ -76,9 +76,11 @@ commit.
 **1. Per-kind stamp (the default).** Port mutations take
 `stamp: &EventStamp`; the Pg adapter builds the payload (it owns
 the row) and records the kind it knows. Handlers resolve one stamp
-per request — `publisher.stamp_with_actor_at(actor, now)` when a
+per request — `publisher.stamp_with_actor(actor)` when a
 publisher is wired (its sim probe settles `_simulated`), else
-`EventStamp::new(source, actor, now)`. Most domain crates
+`EventStamp::new(source, actor)`; either way the stamp mints its
+own wall-clock `timestamp` (sim time is retired from the record —
+David, 2026-08-22, packet a7a4cae5). Most domain crates
 (commerce, products, inventory, ledger, shipping, catalog,
 messages, calendar, accounts, people, content) use this shape.
 

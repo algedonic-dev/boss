@@ -198,16 +198,21 @@ async fn create_employee<R: PeopleRepository + 'static>(
     if let Err(msg) = validate_email(emp.email.as_deref()) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
-    let now = boss_clock_client::now_from(&state.clock).await;
     // OUTBOX (phase 2): the adapter records people.employee.created
     // (full row state — what the rebuilder consumes) inside the
-    // domain transaction; nothing publishes post-commit.
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
-    let id = match state.people.create_employee_at(&emp, now, &stamp).await {
+    // domain transaction; nothing publishes post-commit. Row-touch
+    // columns bind the stamp's wall time so a rebuild reproduces
+    // them from audit_log.timestamp.
+    let stamp = crate::events::event_stamp(&state.publisher).await;
+    let id = match state
+        .people
+        .create_employee_at(&emp, stamp.timestamp, &stamp)
+        .await
+    {
         Ok(id) => id,
         Err(e) => return people_error_response(e),
     };
-    retire_bootstrap_identity_if_superseded(&state, &emp, now).await;
+    retire_bootstrap_identity_if_superseded(&state, &emp).await;
     (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response()
 }
 
@@ -230,7 +235,6 @@ async fn create_employee<R: PeopleRepository + 'static>(
 async fn retire_bootstrap_identity_if_superseded<R: PeopleRepository + 'static>(
     state: &Arc<PeopleApiState<R>>,
     hired: &Employee,
-    now: chrono::DateTime<chrono::Utc>,
 ) {
     if hired.id == BOOTSTRAP_IDENTITY
         || hired.role.as_deref() != Some(BOOTSTRAP_ROLE)
@@ -245,10 +249,10 @@ async fn retire_bootstrap_identity_if_superseded<R: PeopleRepository + 'static>(
         return;
     }
     boot.status = Some("terminated".to_string());
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let stamp = crate::events::event_stamp(&state.publisher).await;
     match state
         .people
-        .update_employee_at(BOOTSTRAP_IDENTITY, &boot, now, &stamp)
+        .update_employee_at(BOOTSTRAP_IDENTITY, &boot, stamp.timestamp, &stamp)
         .await
     {
         Ok(()) => tracing::info!(
@@ -293,11 +297,10 @@ async fn update_employee<R: PeopleRepository + 'static>(
     if let Err(msg) = validate_email(emp.email.as_deref()) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let stamp = crate::events::event_stamp(&state.publisher).await;
     match state
         .people
-        .update_employee_at(&id, &emp, now, &stamp)
+        .update_employee_at(&id, &emp, stamp.timestamp, &stamp)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -309,9 +312,12 @@ async fn delete_employee<R: PeopleRepository + 'static>(
     State(state): State<Arc<PeopleApiState<R>>>,
     Path(id): Path<String>,
 ) -> Response {
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
-    match state.people.delete_employee_at(&id, now, &stamp).await {
+    let stamp = crate::events::event_stamp(&state.publisher).await;
+    match state
+        .people
+        .delete_employee_at(&id, stamp.timestamp, &stamp)
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => people_error_response(e),
     }

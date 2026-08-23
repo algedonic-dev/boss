@@ -277,7 +277,6 @@ impl StepPluginRegistry for InMemoryStepPlugins {
         self.record(crate::events::step_plugin_registry_event(
             crate::events::STEP_PLUGIN_DRAFT_SAVED,
             actor,
-            now,
             &spec,
         ));
         Ok(spec)
@@ -287,7 +286,7 @@ impl StepPluginRegistry for InMemoryStepPlugins {
         &self,
         kind: &str,
         actor: &boss_core::actor::ActorId,
-        now: DateTime<Utc>,
+        _now: DateTime<Utc>,
     ) -> Result<StepPluginSpec, StepPluginError> {
         let mut rows = self.rows.lock().unwrap();
         let latest_draft = rows
@@ -312,7 +311,6 @@ impl StepPluginRegistry for InMemoryStepPlugins {
         self.record(crate::events::step_plugin_registry_event(
             crate::events::STEP_PLUGIN_PUBLISHED,
             actor,
-            now,
             &promoted,
         ));
         Ok(promoted)
@@ -322,7 +320,7 @@ impl StepPluginRegistry for InMemoryStepPlugins {
         &self,
         kind: &str,
         actor: &boss_core::actor::ActorId,
-        now: DateTime<Utc>,
+        _now: DateTime<Utc>,
     ) -> Result<(), StepPluginError> {
         let mut rows = self.rows.lock().unwrap();
         let any_active = rows
@@ -344,7 +342,6 @@ impl StepPluginRegistry for InMemoryStepPlugins {
             self.record(crate::events::step_plugin_registry_event(
                 crate::events::STEP_PLUGIN_RETIRED,
                 actor,
-                now,
                 &spec,
             ));
         }
@@ -519,7 +516,6 @@ mod pg {
             let event = crate::events::step_plugin_registry_event(
                 crate::events::STEP_PLUGIN_DRAFT_SAVED,
                 actor,
-                now,
                 &spec,
             );
             boss_events::outbox::record_event_in_tx(&mut tx, &event)
@@ -536,7 +532,7 @@ mod pg {
             &self,
             kind: &str,
             actor: &boss_core::actor::ActorId,
-            now: DateTime<Utc>,
+            _now: DateTime<Utc>,
         ) -> Result<StepPluginSpec, StepPluginError> {
             let mut tx = self
                 .pool
@@ -585,7 +581,6 @@ mod pg {
             let event = crate::events::step_plugin_registry_event(
                 crate::events::STEP_PLUGIN_PUBLISHED,
                 actor,
-                now,
                 &promoted,
             );
             boss_events::outbox::record_event_in_tx(&mut tx, &event)
@@ -603,7 +598,7 @@ mod pg {
             &self,
             kind: &str,
             actor: &boss_core::actor::ActorId,
-            now: DateTime<Utc>,
+            _now: DateTime<Utc>,
         ) -> Result<(), StepPluginError> {
             let mut tx = self
                 .pool
@@ -641,7 +636,6 @@ mod pg {
             let event = crate::events::step_plugin_registry_event(
                 crate::events::STEP_PLUGIN_RETIRED,
                 actor,
-                now,
                 &spec,
             );
             boss_events::outbox::record_event_in_tx(&mut tx, &event)

@@ -96,16 +96,14 @@ fn resolve_range(q: &RangeQuery) -> (DateTime<Utc>, DateTime<Utc>) {
 /// `default_actor` resolves the request identity from the task-local
 /// context, and its clock probe settles `_simulated` — the same
 /// envelope the retired post-commit emits carried (outbox phase 2).
-async fn event_stamp(
-    state: &SchedulingApiState,
-    now: DateTime<Utc>,
-) -> boss_core::publisher::EventStamp {
+/// The stamp mints wall-clock time itself: sim time is retired from
+/// the record (David, 2026-08-22, packet a7a4cae5).
+async fn event_stamp(state: &SchedulingApiState) -> boss_core::publisher::EventStamp {
     match &state.publisher {
-        Some(p) => p.stamp_with_actor_at(p.default_actor(), now).await,
+        Some(p) => p.stamp_with_actor(p.default_actor()).await,
         None => boss_core::publisher::EventStamp::new(
             "jobs",
             boss_core::actor::ActorId::Automation("scheduling".into()),
-            now,
         ),
     }
 }
@@ -131,8 +129,7 @@ async fn create_avail(
 ) -> Response {
     // OUTBOX (phase 2): the adapter records the scheduling events
     // inside the domain transaction; nothing publishes post-commit.
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match state.repo.create_availability(body, &stamp).await {
         Ok(row) => (StatusCode::CREATED, Json(row)).into_response(),
         Err(e) => err(e),
@@ -144,7 +141,7 @@ async fn delete_avail(
     Path(id): Path<Uuid>,
 ) -> Response {
     let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match state.repo.delete_availability(id, now, &stamp).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err(e),
@@ -183,8 +180,7 @@ async fn create_assign(
     State(state): State<Arc<SchedulingApiState>>,
     Json(body): Json<NewScheduledAssignment>,
 ) -> Response {
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match state.repo.create_assignment(body, &stamp).await {
         Ok(row) => (StatusCode::CREATED, Json(row)).into_response(),
         Err(e) => err(e),
@@ -207,7 +203,7 @@ async fn delete_assign(
     Path(id): Path<Uuid>,
 ) -> Response {
     let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match state.repo.delete_assignment(id, now, &stamp).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err(e),
@@ -225,7 +221,7 @@ async fn update_assign_status(
     Json(body): Json<StatusBody>,
 ) -> Response {
     let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match state
         .repo
         .update_assignment_status(id, body.status, now, &stamp)
@@ -281,8 +277,7 @@ async fn upsert_shift(
     let eff = body
         .effective_from
         .unwrap_or_else(|| Utc::now().date_naive());
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match state
         .repo
         .upsert_shift_pattern(
@@ -371,7 +366,7 @@ async fn rotate_calendar_token(
     // URL-safe string.
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match state
         .repo
         .rotate_calendar_token(&emp_id, &token, now, &stamp)

@@ -56,9 +56,8 @@ pub trait CalendarClient: Send + Sync {
     /// audit_log → projection rebuild path. See
     /// `docs/design/projection-rebuilders.md`.
     async fn reserve(&self, req: ReservationRequest) -> Result<ReservationId, CalendarError> {
-        let now = Utc::now();
-        let stamp = EventStamp::new("calendar", ActorId::Automation("platform".into()), now);
-        self.reserve_at(req, now, &stamp).await
+        let stamp = EventStamp::new("calendar", ActorId::Automation("platform".into()));
+        self.reserve_at(req, stamp.timestamp, &stamp).await
     }
     /// Records `calendar.reservation.reserved` (the full post-INSERT
     /// row state) in-tx.
@@ -87,9 +86,8 @@ pub trait CalendarClient: Send + Sync {
     /// same as calling once. `actor` is recorded for the audit trail
     /// but has no effect on the row's `created_by`.
     async fn cancel(&self, id: ReservationId, actor: &str) -> Result<(), CalendarError> {
-        let now = Utc::now();
-        let stamp = EventStamp::new("calendar", ActorId::Automation("platform".into()), now);
-        self.cancel_at(id, actor, now, &stamp).await
+        let stamp = EventStamp::new("calendar", ActorId::Automation("platform".into()));
+        self.cancel_at(id, actor, stamp.timestamp, &stamp).await
     }
     /// Records `calendar.reservation.cancelled` (the full post-cancel
     /// row state) in-tx — and ONLY when the cancel actually flipped
@@ -117,9 +115,8 @@ pub trait CalendarClient: Send + Sync {
         reason_ref_id: &str,
         actor: &str,
     ) -> Result<usize, CalendarError> {
-        let now = Utc::now();
-        let stamp = EventStamp::new("calendar", ActorId::Automation("platform".into()), now);
-        self.cancel_by_reason_at(reason_kind, reason_ref_id, actor, now, &stamp)
+        let stamp = EventStamp::new("calendar", ActorId::Automation("platform".into()));
+        self.cancel_by_reason_at(reason_kind, reason_ref_id, actor, stamp.timestamp, &stamp)
             .await
     }
     /// Records one `calendar.reservation.cancelled` (full post-cancel

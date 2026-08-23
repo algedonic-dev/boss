@@ -71,13 +71,12 @@ async fn batch_messages<R: MessageRepository + 'static>(
     State(state): State<Arc<MessageApiState<R>>>,
     Json(body): Json<Vec<Message>>,
 ) -> Response {
-    let now = boss_clock_client::now_from(&state.clock).await;
     // OUTBOX (phase 2): the adapter records MESSAGE_SENT per row in
     // the domain transaction, so the messages rebuilder can reproduce
     // the projection from audit_log alone — otherwise sim-seeded
     // chatter and bulk imports would be wiped on the next
     // boss-rebuild-all cycle.
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     let mut inserted = 0usize;
     for msg in &body {
         if let Err(e) = state.messages.send(msg, &stamp).await {
@@ -113,14 +112,12 @@ async fn health() -> Json<boss_core::startup::HealthResponse> {
 /// carried (outbox phase 2).
 async fn event_stamp<R: MessageRepository>(
     state: &MessageApiState<R>,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> boss_core::publisher::EventStamp {
     match &state.publisher {
-        Some(p) => p.stamp_with_actor_at(p.default_actor(), now).await,
+        Some(p) => p.stamp_with_actor(p.default_actor()).await,
         None => boss_core::publisher::EventStamp::new(
             "messages",
             boss_core::actor::ActorId::Automation("messages".into()),
-            now,
         ),
     }
 }
@@ -213,7 +210,7 @@ async fn expire_signals<R: MessageRepository + 'static>(
             .into_response();
     }
     let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match state
         .messages
         .expire_signals_under(&body.entity_path_prefix, now, &stamp)
@@ -253,7 +250,7 @@ async fn mark_read<R: MessageRepository + 'static>(
     // write and the event payload, so a rebuild from audit_log
     // produces an identical `read_at` value.
     let read_at = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, read_at).await;
+    let stamp = event_stamp(&state).await;
     match state.messages.mark_read(&id, read_at, &stamp).await {
         Ok(()) => Json(OkResponse { ok: true }).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -265,7 +262,7 @@ async fn delete_message<R: MessageRepository + 'static>(
     Path(id): Path<String>,
 ) -> Response {
     let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match state.messages.delete_message(&id, now, &stamp).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(MessageError::NotFound(msg)) => (StatusCode::NOT_FOUND, msg).into_response(),
@@ -278,7 +275,7 @@ async fn archive_message<R: MessageRepository + 'static>(
     Path(id): Path<String>,
 ) -> Response {
     let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match state.messages.archive_message(&id, now, &stamp).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(MessageError::NotFound(msg)) => (StatusCode::NOT_FOUND, msg).into_response(),
@@ -387,7 +384,7 @@ async fn send_message<R: MessageRepository + 'static>(
     // OUTBOX (phase 2): the adapter records MESSAGE_SENT (full row
     // state, so the rebuilder can reconstruct the projection from
     // this event alone) inside the domain transaction.
-    let stamp = event_stamp(&state, msg.sent_at).await;
+    let stamp = event_stamp(&state).await;
     match state.messages.send(&msg, &stamp).await {
         Ok(()) => (
             StatusCode::CREATED,

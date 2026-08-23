@@ -115,13 +115,21 @@ async fn rebuild_reproduces_invoices_and_line_items() {
     // each event on the outbox INSIDE its transaction (phase 2); no
     // hand-emitted events anywhere in this test.
     commerce
-        .create_invoice_at(&i1, now, &EventStamp::new("commerce", actor.clone(), now))
+        .create_invoice_at(
+            &i1,
+            now,
+            &EventStamp::new("commerce", actor.clone()).with_timestamp(now),
+        )
         .await
         .unwrap();
 
     let now2 = Utc::now();
     commerce
-        .create_invoice_at(&i2, now2, &EventStamp::new("commerce", actor.clone(), now2))
+        .create_invoice_at(
+            &i2,
+            now2,
+            &EventStamp::new("commerce", actor.clone()).with_timestamp(now2),
+        )
         .await
         .unwrap();
 
@@ -129,7 +137,11 @@ async fn rebuild_reproduces_invoices_and_line_items() {
     let now3 = Utc::now();
     let paid_on = now3.date_naive();
     commerce
-        .mark_invoice_paid_at(&i1.id, paid_on, &EventStamp::new("commerce", actor, now3))
+        .mark_invoice_paid_at(
+            &i1.id,
+            paid_on,
+            &EventStamp::new("commerce", actor).with_timestamp(now3),
+        )
         .await
         .unwrap();
 

@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use boss_clock_client::ClockClient;
 use boss_core::agent::{AgentId, BudgetDecision, Message, MessageId, Outcome, RunCompletion};
 use boss_core::port::{AgentDispatcher, AgentRegistry, CostLedger, DispatchError, MessageQueue};
 use serde_json::json;
@@ -45,10 +44,6 @@ pub struct Cybernetics {
     /// delivers to audit_log + NATS with the same guarantees as
     /// every domain write.
     recorder: Arc<dyn boss_core::port::EventRecorder>,
-    /// Authoritative clock — every telemetry event stamps its
-    /// timestamp from here (sim or wall depending on clock-api
-    /// mode). See `boss-clock-client`.
-    clock: Arc<dyn ClockClient>,
 }
 
 impl Cybernetics {
@@ -60,7 +55,6 @@ impl Cybernetics {
         registry: Arc<dyn AgentRegistry>,
         publisher: Arc<boss_core::publisher::DomainPublisher>,
         recorder: Arc<dyn boss_core::port::EventRecorder>,
-        clock: Arc<dyn ClockClient>,
     ) -> Self {
         Self {
             vm_id: vm_id.into(),
@@ -70,7 +64,6 @@ impl Cybernetics {
             registry,
             publisher,
             recorder,
-            clock,
         }
     }
 
@@ -305,7 +298,6 @@ impl Cybernetics {
         // identity) so cross-VM rollups can attribute later. Source
         // is the canonical "cybernetics" string the audit log
         // already filters on for these events.
-        let now = self.clock.now().await.now;
         let mut payload = payload;
         if let Some(obj) = payload.as_object_mut() {
             obj.insert(
@@ -314,7 +306,12 @@ impl Cybernetics {
             );
         }
         let actor = boss_core::actor::ActorId::Automation("cybernetics".to_string());
-        let stamp = self.publisher.stamp_with_actor_at(actor, now).await;
+        // The stamp mints wall time — cluster telemetry was the worst
+        // victim of the mixed-clock log (agent activity stamped on the
+        // sim calendar next to wall-stamped queue accounting); sim
+        // time is retired from the record (David, 2026-08-22, packet
+        // a7a4cae5).
+        let stamp = self.publisher.stamp_with_actor(actor).await;
         let event = stamp.event(kind, payload);
         if let Err(e) = self.recorder.record(&event).await {
             warn!(kind, error = %e, "cybernetics telemetry record failed");

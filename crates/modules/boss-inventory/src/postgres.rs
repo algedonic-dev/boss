@@ -229,7 +229,12 @@ impl InventoryRepository for PgInventory {
         .bind(part_sku)
         .bind(qty as i32)
         .bind(drained_cents)
-        .bind(now)
+        // Row-touch column: binds the record stamp's wall time so a
+        // rebuild (which reproduces updated_at from
+        // audit_log.timestamp) lands the identical value. The
+        // business dates below (`consumed_on`, fact happened_on)
+        // stay on the caller's authoritative-clock `now`.
+        .bind(stamp.timestamp)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| InventoryError::Storage(e.to_string()))?;
@@ -673,7 +678,9 @@ impl InventoryRepository for PgInventory {
             .bind(part_sku)
             .bind(qty as i32)
             .bind(unit_cost)
-            .bind(now)
+            // Row-touch column — record-stamp wall time (see
+            // consume_part_at); `received_on` below stays on `now`.
+            .bind(stamp.timestamp)
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?,
@@ -683,7 +690,7 @@ impl InventoryRepository for PgInventory {
             )
             .bind(part_sku)
             .bind(qty as i32)
-            .bind(now)
+            .bind(stamp.timestamp)
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| InventoryError::Storage(e.to_string()))?,

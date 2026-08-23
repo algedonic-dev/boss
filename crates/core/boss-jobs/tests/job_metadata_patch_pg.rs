@@ -36,11 +36,7 @@ fn job(id: &str, metadata: serde_json::Value) -> Job {
 }
 
 fn stamp() -> EventStamp {
-    EventStamp::new(
-        "jobs",
-        ActorId::Automation("test".into()),
-        chrono::Utc::now(),
-    )
+    EventStamp::new("jobs", ActorId::Automation("test".into()))
 }
 
 fn patch(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {

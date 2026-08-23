@@ -91,8 +91,7 @@ async fn create_requisition(
     // OUTBOX (phase 2): the opened event (full row state; status
     // transitions ride the same kind via the ON CONFLICT DO UPDATE
     // path) records with the row.
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let stamp = crate::events::event_stamp(&state.publisher).await;
     let event = stamp.event(
         REQUISITION_OPENED,
         serde_json::to_value(&req).unwrap_or_default(),

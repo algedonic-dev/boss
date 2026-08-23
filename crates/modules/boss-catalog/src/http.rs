@@ -219,12 +219,15 @@ async fn create_model<R: KbRepository + 'static>(
     if let Err(resp) = check_document_kinds(state.classes_client.as_ref(), &model.documents).await {
         return resp;
     }
-    let now = boss_clock_client::now_from(&state.clock).await;
     // OUTBOX (phase 2): the adapter records kb.model.created (full
     // row state) inside the domain transaction; nothing publishes
     // post-commit.
-    let stamp = event_stamp(&state, now).await;
-    match state.catalog.create_model_at(&model, now, &stamp).await {
+    let stamp = event_stamp(&state).await;
+    match state
+        .catalog
+        .create_model_at(&model, stamp.timestamp, &stamp)
+        .await
+    {
         Ok(sku) => (StatusCode::CREATED, Json(serde_json::json!({ "sku": sku }))).into_response(),
         Err(e) => kb_error_response(e),
     }
@@ -236,16 +239,12 @@ async fn create_model<R: KbRepository + 'static>(
 /// `automation:kb`), and its clock probe settles `_simulated` — the
 /// same envelope the retired post-commit emits carried (outbox
 /// phase 2).
-async fn event_stamp<R: KbRepository>(
-    state: &KbApiState<R>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> boss_core::publisher::EventStamp {
+async fn event_stamp<R: KbRepository>(state: &KbApiState<R>) -> boss_core::publisher::EventStamp {
     match &state.publisher {
-        Some(p) => p.stamp_with_actor_at(p.default_actor(), now).await,
+        Some(p) => p.stamp_with_actor(p.default_actor()).await,
         None => boss_core::publisher::EventStamp::new(
             "kb",
             boss_core::actor::ActorId::Automation("kb".into()),
-            now,
         ),
     }
 }
@@ -261,11 +260,10 @@ async fn update_model<R: KbRepository + 'static>(
     if let Err(resp) = check_document_kinds(state.classes_client.as_ref(), &model.documents).await {
         return resp;
     }
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match state
         .catalog
-        .update_model_at(&sku, &model, now, &stamp)
+        .update_model_at(&sku, &model, stamp.timestamp, &stamp)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -310,9 +308,12 @@ async fn delete_model<R: KbRepository + 'static>(
         }
     }
 
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
-    match state.catalog.delete_model_at(&sku, now, &stamp).await {
+    let stamp = event_stamp(&state).await;
+    match state
+        .catalog
+        .delete_model_at(&sku, stamp.timestamp, &stamp)
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => kb_error_response(e),
     }

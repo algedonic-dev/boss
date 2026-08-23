@@ -13,8 +13,8 @@ fn stamp() -> boss_core::publisher::EventStamp {
     boss_core::publisher::EventStamp::new(
         "ledger",
         boss_core::actor::ActorId::Automation("test".into()),
-        chrono::Utc::now(),
     )
+    .with_timestamp(chrono::Utc::now())
 }
 
 async fn seed_fact_and_post(

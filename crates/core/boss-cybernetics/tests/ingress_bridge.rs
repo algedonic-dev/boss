@@ -55,7 +55,6 @@ async fn envelope_published_to_bus_reaches_submit() {
     let ledger = Arc::new(InMemoryCostLedger::new());
     let dispatcher = Arc::new(StubDispatcher::default());
     let registry = Arc::new(InMemoryAgentRegistry::new([planner()]));
-    let clock = Arc::new(boss_clock_client::WallClockClient);
     let publisher = Arc::new(boss_core::publisher::DomainPublisher::new(
         bus.clone(),
         format!("cybernetics/{}", vm),
@@ -69,7 +68,6 @@ async fn envelope_published_to_bus_reaches_submit() {
         registry,
         publisher.clone(),
         recorder.clone() as Arc<dyn boss_core::port::EventRecorder>,
-        clock,
     ));
 
     // Start both the Cybernetics loop and the ingress bridge.
@@ -120,7 +118,6 @@ async fn malformed_envelope_is_dropped_not_fatal() {
     let ledger = Arc::new(InMemoryCostLedger::new());
     let dispatcher = Arc::new(StubDispatcher::default());
     let registry = Arc::new(InMemoryAgentRegistry::new([planner()]));
-    let clock = Arc::new(boss_clock_client::WallClockClient);
     let publisher = Arc::new(boss_core::publisher::DomainPublisher::new(
         bus.clone(),
         format!("cybernetics/{}", vm),
@@ -134,7 +131,6 @@ async fn malformed_envelope_is_dropped_not_fatal() {
         registry,
         publisher.clone(),
         recorder.clone() as Arc<dyn boss_core::port::EventRecorder>,
-        clock,
     ));
 
     let (cancel_tx, cancel_rx) = watch::channel(false);

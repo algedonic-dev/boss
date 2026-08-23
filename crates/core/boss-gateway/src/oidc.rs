@@ -574,13 +574,7 @@ mod tests {
         let people = mock_people().await;
         unsafe { std::env::set_var("BOSS_PEOPLE_UPSTREAM", &people) };
         let cap = std::sync::Arc::new(crate::audit::testing::Captured::default());
-        let st = oidc_state_with_audit(
-            &idp,
-            crate::audit::AuthAudit::spawn(
-                cap.clone(),
-                std::sync::Arc::new(boss_clock_client::WallClockClient),
-            ),
-        );
+        let st = oidc_state_with_audit(&idp, crate::audit::AuthAudit::spawn(cap.clone()));
 
         let cookie = encode_state_cookie(&st.session_key, "st-9", "ver-9");
         let resp = callback(
@@ -676,13 +670,7 @@ mod tests {
         let people = mock_people().await;
         unsafe { std::env::set_var("BOSS_PEOPLE_UPSTREAM", &people) };
         let cap = std::sync::Arc::new(crate::audit::testing::Captured::default());
-        let st = oidc_state_with_audit(
-            &base,
-            crate::audit::AuthAudit::spawn(
-                cap.clone(),
-                std::sync::Arc::new(boss_clock_client::WallClockClient),
-            ),
-        );
+        let st = oidc_state_with_audit(&base, crate::audit::AuthAudit::spawn(cap.clone()));
 
         let cookie = encode_state_cookie(&st.session_key, "st-x", "ver-x");
         let resp = callback(

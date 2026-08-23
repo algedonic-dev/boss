@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
     );
     info!(%clock_url, "clock client wired");
 
-    // Wire the sim-mode probe into the publisher so every emit_at
+    // Wire the sim-mode probe into the publisher so every stamp
     // injects `_simulated: bool` into the audit_log payload without
     // per-handler changes.
     let publisher = publisher.map(|p| {

@@ -45,13 +45,12 @@ pub trait CommerceRepository: Send + Sync {
     /// write and the audit_log event share one timestamp AND the
     /// caller's actor. See `docs/design/projection-rebuilders.md`.
     async fn create_invoice(&self, invoice: &Invoice) -> Result<Invoice, CommerceError> {
-        let now = Utc::now();
         let stamp = EventStamp::new(
             "commerce",
             boss_core::actor::ActorId::Automation("platform".into()),
-            now,
         );
-        self.create_invoice_at(invoice, now, &stamp).await
+        self.create_invoice_at(invoice, stamp.timestamp, &stamp)
+            .await
     }
     /// Persists the invoice and returns the same invoice with
     /// `line_items[].cost_basis_cents` enriched from the FG
@@ -74,13 +73,11 @@ pub trait CommerceRepository: Send + Sync {
     /// Mark an invoice as paid (sets status='paid', paid_on=today).
     /// Convenience overload uses `Utc::now().date_naive()`.
     async fn mark_invoice_paid(&self, id: &str) -> Result<(), CommerceError> {
-        let now = Utc::now();
         let stamp = EventStamp::new(
             "commerce",
             boss_core::actor::ActorId::Automation("platform".into()),
-            now,
         );
-        self.mark_invoice_paid_at(id, now.date_naive(), &stamp)
+        self.mark_invoice_paid_at(id, stamp.timestamp.date_naive(), &stamp)
             .await
     }
     /// Records `commerce.invoice.paid` (full post-update row state)

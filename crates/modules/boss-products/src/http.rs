@@ -134,14 +134,12 @@ async fn get_product_detail<R: ProductsRepository + 'static>(
 /// carried (outbox phase 2).
 async fn event_stamp<R: ProductsRepository>(
     state: &ProductsApiState<R>,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> boss_core::publisher::EventStamp {
     match &state.publisher {
-        Some(p) => p.stamp_with_actor_at(p.default_actor(), now).await,
+        Some(p) => p.stamp_with_actor(p.default_actor()).await,
         None => boss_core::publisher::EventStamp::new(
             "products",
             boss_core::actor::ActorId::Automation("products".into()),
-            now,
         ),
     }
 }
@@ -200,8 +198,7 @@ async fn upsert_product<R: ProductsRepository + 'static>(
     if let Err(resp) = check_product_taxonomy(state.classes_client.as_ref(), &product).await {
         return resp;
     }
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match state.products.upsert_product(&product, &stamp).await {
         Ok(()) => (StatusCode::CREATED, Json(product)).into_response(),
         Err(e) => error_response(e),
@@ -220,8 +217,7 @@ async fn upsert_products_batch<R: ProductsRepository + 'static>(
             return resp;
         }
     }
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     let mut inserted = 0u64;
     for p in &products {
         if state.products.upsert_product(p, &stamp).await.is_ok() {
@@ -238,8 +234,7 @@ async fn put_inventory<R: ProductsRepository + 'static>(
 ) -> Response {
     // The path SKU is authoritative; ignore any mismatched body field.
     row.product_sku = sku;
-    let stamp_now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, stamp_now).await;
+    let stamp = event_stamp(&state).await;
     match state.products.upsert_inventory(&row, &stamp).await {
         Ok(()) => {
             // Atomic opening-balance JE. When PUT lands a row
@@ -336,7 +331,7 @@ async fn post_produce<R: ProductsRepository + 'static>(
         Some(key) => format!("produce:{key}"),
         None => format!("produce:{sku}:{}", uuid::Uuid::new_v4()),
     };
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match state
         .products
         .produce(
@@ -365,7 +360,7 @@ async fn post_consume<R: ProductsRepository + 'static>(
         Some(key) => format!("consume:{key}"),
         None => format!("consume:{sku}:{}", uuid::Uuid::new_v4()),
     };
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match state
         .products
         .consume(

@@ -73,7 +73,12 @@ async fn create_customer<R: CustomersRepository + 'static>(
             return (StatusCode::BAD_REQUEST, "id or email is required").into_response();
         }
     };
-    let now = state.clock.now().await.now;
+    // Record stamp + row created_at: wall time (sim time is retired
+    // from the record — David, 2026-08-22, packet a7a4cae5). The
+    // adapter builds the event from this same instant, so live row,
+    // event stamp, and rebuild (which reads audit_log.timestamp)
+    // agree.
+    let now = boss_clock_client::wall_now();
     let customer = Customer {
         name: body
             .name

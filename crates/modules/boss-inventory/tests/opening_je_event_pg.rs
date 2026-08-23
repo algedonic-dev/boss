@@ -15,8 +15,8 @@ fn stamp() -> boss_core::publisher::EventStamp {
     boss_core::publisher::EventStamp::new(
         "inventory-test",
         boss_core::actor::ActorId::Automation("test".into()),
-        chrono::Utc::now(),
     )
+    .with_timestamp(chrono::Utc::now())
 }
 
 async fn outbox_je_events(pool: &sqlx::PgPool) -> i64 {

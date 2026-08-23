@@ -228,7 +228,6 @@ mod tests {
         boss_core::publisher::EventStamp::new(
             "messages",
             boss_core::actor::ActorId::Automation("test".into()),
-            Utc::now(),
         )
     }
 
@@ -384,7 +383,6 @@ mod expiry_tests {
         boss_core::publisher::EventStamp::new(
             "messages",
             boss_core::actor::ActorId::Automation("test".into()),
-            Utc::now(),
         )
     }
 

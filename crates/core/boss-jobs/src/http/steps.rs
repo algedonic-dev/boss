@@ -127,7 +127,6 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
             .into_response();
     }
 
-    let now = boss_clock_client::now_from(&state.clock).await;
     // OUTBOX (phase 2): STEP_CREATED (full row state, what the
     // rebuild consumes) records in the SAME transaction as the row.
     // The actor is stamped from the authenticated session per the
@@ -161,7 +160,7 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
             .ambient_actor()
             .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into())),
     };
-    let mut stamp = state.publisher.stamp_with_actor_at(actor, now).await;
+    let mut stamp = state.publisher.stamp_with_actor(actor).await;
     // Step events inherit the parent packet's admission-fixed
     // `simulated` flag (the packet, not the request's transport
     // context, is the source of truth). A step posted against a
@@ -171,7 +170,11 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
         stamp = stamp.with_simulated(job.simulated);
     }
     let step_event = stamp.event(events::STEP_CREATED, events::step_state_payload(&step));
-    if let Err(e) = state.jobs.add_step_at(&step, now, &[step_event]).await {
+    if let Err(e) = state
+        .jobs
+        .add_step_at(&step, stamp.timestamp, &[step_event])
+        .await
+    {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
@@ -584,10 +587,7 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         }
     }
 
-    let mut stamp = state
-        .publisher
-        .stamp_with_actor_at(actor.clone(), now)
-        .await;
+    let mut stamp = state.publisher.stamp_with_actor(actor.clone()).await;
     // Step events inherit the packet's admission-fixed flag — a real
     // operator completing a step on a simulated Job records a
     // simulated event, and a sim-chain write to a real Job stays
@@ -740,7 +740,11 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
             .into_response();
     }
 
-    if let Err(e) = state.jobs.update_step_at(&step, now, &step_events).await {
+    if let Err(e) = state
+        .jobs
+        .update_step_at(&step, stamp.timestamp, &step_events)
+        .await
+    {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
@@ -752,7 +756,7 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     if let Some(reg) = &state.kind_registry
         && let Some(job) = parent_job
     {
-        reevaluate_and_persist(&state, &job, &actor, now).await;
+        reevaluate_and_persist(&state, &job, &actor).await;
 
         // If the step we just completed is a declared terminal,
         // close the Job with that outcome and skip every
@@ -793,17 +797,15 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
             let old_status = job.status;
             job.status = new_status;
             if new_status == JobStatus::Closed {
-                // Same sim-day-vs-wall-clock contract as step.completed_on:
-                // the closing transition is the step we just wrote, so its
-                // completed_on (sim-day when the LiveApiOutput sent it,
-                // wall-clock-NOW filled in above otherwise) is the right
-                // anchor for the Job's closed_on too. Falls through to
-                // wall-clock only if the step somehow lacks a date.
+                // Same business-date contract as step.completed_on:
+                // the closing transition is the step we just wrote, so
+                // its completed_on (a date on the authoritative — sim-
+                // aware — calendar) is the right anchor for the Job's
+                // closed_on too. Falls through to the authoritative
+                // clock's date only if the step somehow lacks one.
                 let job_now = boss_clock_client::now_from(&state.clock).await;
                 job.closed_on = step.completed_on.or(Some(job_now.date_naive()));
-                let _ = (job_now,); // keep job_now hoisted for the update_job_at call below
             }
-            let job_now = boss_clock_client::now_from(&state.clock).await;
             // OUTBOX (phase 2): the state event (full row state for
             // the rebuild) + status markers record in the SAME
             // transaction as the auto-transition. The actor is
@@ -813,7 +815,7 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
             // state change too.
             let close_stamp = state
                 .publisher
-                .stamp_with_actor_at(actor.clone(), job_now)
+                .stamp_with_actor(actor.clone())
                 .await
                 .with_simulated(job.simulated);
             let mut close_events = vec![
@@ -880,7 +882,10 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                     }),
                 ));
             }
-            let _ = state.jobs.update_job_at(&job, job_now, &close_events).await;
+            let _ = state
+                .jobs
+                .update_job_at(&job, close_stamp.timestamp, &close_events)
+                .await;
         }
     }
 
@@ -955,7 +960,6 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
         return (StatusCode::NOT_FOUND, "step not on this job").into_response();
     }
 
-    let now = boss_clock_client::now_from(&state.clock).await;
     let actor = user
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
@@ -1030,7 +1034,7 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
         }
     }
 
-    let mut stamp = state.publisher.stamp_with_actor_at(actor, now).await;
+    let mut stamp = state.publisher.stamp_with_actor(actor).await;
     if let Some(j) = &parent_job {
         stamp = stamp.with_simulated(j.simulated);
     }
@@ -1074,7 +1078,7 @@ pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'stati
 
     match state
         .jobs
-        .claim_step_at(&step_id, &user.id, now, &claim_events)
+        .claim_step_at(&step_id, &user.id, stamp.timestamp, &claim_events)
         .await
     {
         Ok(step) => Json(step).into_response(),
@@ -1232,7 +1236,7 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
     // OUTBOX (phase 2): the signed-off marker records in the SAME
     // transaction as the stamp append.
     let actor = boss_core::actor::ActorId::human(&user.id);
-    let mut event_stamp = state.publisher.stamp_with_actor_at(actor, now).await;
+    let mut event_stamp = state.publisher.stamp_with_actor(actor).await;
     // The signed-off marker inherits the packet's admission-fixed
     // flag, like every other event about the Job.
     if let Ok(Some(job)) = state.jobs.get_job(&job_id).await {
@@ -1252,7 +1256,7 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
     );
     if let Err(e) = state
         .jobs
-        .append_sign_off(&step_id, &stamp, now, &[signed_off_event])
+        .append_sign_off(&step_id, &stamp, event_stamp.timestamp, &[signed_off_event])
         .await
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -1289,7 +1293,7 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
 
     let terminal_stamp = state
         .publisher
-        .stamp_with_actor_at(actor.clone(), now)
+        .stamp_with_actor(actor.clone())
         .await
         .with_simulated(job.simulated);
 
@@ -1306,7 +1310,11 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
                 // the SAME transaction as the row.
                 let skip_event =
                     terminal_stamp.event(events::STEP_UPDATED, events::step_state_payload(&s));
-                if let Err(e) = state.jobs.update_step_at(&s, now, &[skip_event]).await {
+                if let Err(e) = state
+                    .jobs
+                    .update_step_at(&s, terminal_stamp.timestamp, &[skip_event])
+                    .await
+                {
                     tracing::warn!(
                         job_id = %job_id,
                         step_id = %s.id,
@@ -1376,7 +1384,11 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
             }),
         ),
     ];
-    if let Err(e) = state.jobs.update_job_at(&job, now, &close_events).await {
+    if let Err(e) = state
+        .jobs
+        .update_job_at(&job, terminal_stamp.timestamp, &close_events)
+        .await
+    {
         tracing::warn!(job_id = %job_id, error = %e, "terminal close: failed to persist closed Job");
     }
 }
@@ -1415,7 +1427,6 @@ pub(super) async fn reevaluate_and_persist<R: JobsRepository + 'static, B: Event
     state: &Arc<JobsApiState<R, B>>,
     job: &Job,
     actor: &boss_core::actor::ActorId,
-    now: chrono::DateTime<chrono::Utc>,
 ) {
     let Some(reg) = &state.kind_registry else {
         return;
@@ -1449,7 +1460,7 @@ pub(super) async fn reevaluate_and_persist<R: JobsRepository + 'static, B: Event
                 crate::registry::reevaluate(&spec, &mut steps, &job.subject, &job.metadata);
             let stamp = state
                 .publisher
-                .stamp_with_actor_at(actor.clone(), now)
+                .stamp_with_actor(actor.clone())
                 .await
                 .with_simulated(job.simulated);
             for idx in changed {
@@ -1465,11 +1476,11 @@ pub(super) async fn reevaluate_and_persist<R: JobsRepository + 'static, B: Event
                 )];
                 if changed_step.status == StepStatus::Ready && !changed_step.kind.is_empty() {
                     reeval_events
-                        .push(build_step_ready_event(state, job, changed_step, actor, now).await);
+                        .push(build_step_ready_event(state, job, changed_step, actor).await);
                 }
                 if let Err(e) = state
                     .jobs
-                    .update_step_at(changed_step, now, &reeval_events)
+                    .update_step_at(changed_step, stamp.timestamp, &reeval_events)
                     .await
                 {
                     tracing::warn!(
@@ -1498,13 +1509,12 @@ pub(super) async fn build_step_ready_event<R: JobsRepository + 'static, B: Event
     job: &Job,
     step: &Step,
     actor: &boss_core::actor::ActorId,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> boss_core::event::Event {
     let subject_kind = boss_core::primitives::Subject::kind(&job.subject).to_string();
     let subject_id = boss_core::primitives::Subject::id(&job.subject).to_string();
     let stamp = state
         .publisher
-        .stamp_with_actor_at(actor.clone(), now)
+        .stamp_with_actor(actor.clone())
         .await
         .with_simulated(job.simulated);
     stamp.event(

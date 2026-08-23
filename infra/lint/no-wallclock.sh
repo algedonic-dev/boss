@@ -7,20 +7,35 @@
 # invoked with no args later) and previously slipped past a
 # parens-requiring regex into a projection rebuilder.
 #
-# Why this exists: every other "now" in BOSS must route through
-# `state.clock.now().await.now` so the receiving service stamps
-# audit_log via clock-api (sim or wall depending on deploy mode).
-# A stray Utc::now() in a handler stamps audit_log with wallclock
-# regardless of clock-api mode — the silent-wallclock-leak class
-# that surfaced 116k mis-stamped rows in regen 18 (closed by
-# v1.0.5 #68). This lint keeps the leak class from recurring.
+# Why this exists — updated for the sim-stamp retirement (David,
+# 2026-08-22, packet a7a4cae5). Two rules now share this gate:
+#
+#   1. RECORD STAMPS ARE WALL TIME, minted centrally. `EventStamp`
+#      (crates/core/boss-core/src/publisher.rs) and
+#      `boss_clock_client::wall_now()` are the only sanctioned
+#      sources of an `Event.timestamp` / `audit_log.timestamp`.
+#      Handlers do not mint their own second wall reading — the row
+#      bind and the record must share ONE instant (`stamp.timestamp`)
+#      or replay-diff reproduces a different row than the live write.
+#   2. BUSINESS DATES ROUTE THROUGH THE CLOCK PORT. "What day is it
+#      in this company's timeline" (`happened_on`, `issued_on`,
+#      `completed_on` defaults, aging buckets, `{day}` tokens) still
+#      reads `state.clock.now().await.now` — sim-aware by design.
+#      A stray Utc::now() in domain-date logic desyncs the demo's
+#      business timeline the same way it always did (the class that
+#      surfaced 116k mis-dated rows in regen 18, closed by v1.0.5
+#      #68). This lint keeps that leak class from recurring.
 #
 # Allowlist: only these paths may call Utc::now()
 #   * crates/core/boss-clock/         (the clock-api itself —
 #                                      wall-mode IS Utc::now())
-#   * crates/core/boss-clock-client/  (the WallClockClient fallback +
-#                                      ReqwestClockClient's transport-
-#                                      error fallback)
+#   * crates/core/boss-clock-client/  (WallClockClient, the transport-
+#                                      error fallback, and `wall_now()`
+#                                      — THE sanctioned record-stamp
+#                                      source outside EventStamp)
+#   * crates/core/boss-core/src/publisher.rs
+#                                     (EventStamp mints the record
+#                                      stamp — wall by decision)
 #   * **/tests/                       (test files; no production
 #                                      runtime)
 #   * #[cfg(test)] mod tests          (inline test blocks — handled
@@ -55,8 +70,14 @@ cd "$(dirname "$0")/../.."
 ALLOWED_PREFIXES=(
   # The clock-api itself, the wall-mode path that IS Utc::now()
   "crates/core/boss-clock/"
-  # WallClockClient + ReqwestClockClient's transport-error fallback
+  # WallClockClient + ReqwestClockClient's transport-error fallback +
+  # wall_now(), the sanctioned record-stamp source.
   "crates/core/boss-clock-client/"
+  # EventStamp mints the record stamp — wall-clock by decision
+  # (sim time retired from the record, David 2026-08-22, packet
+  # a7a4cae5). The one place Event timestamps are born for live
+  # emits.
+  "crates/core/boss-core/src/publisher.rs"
   # Auth tokens — wallclock IS the right semantic for token
   # freshness checks (jwt-style "now > exp"). Doesn't emit
   # audit_log; manages local in-process auth state only.

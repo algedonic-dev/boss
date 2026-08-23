@@ -51,8 +51,8 @@ fn stamp() -> EventStamp {
     EventStamp::new(
         "commerce",
         boss_core::actor::ActorId::Automation("test".into()),
-        Utc::now(),
     )
+    .with_timestamp(Utc::now())
 }
 
 /// TestDb disables ref-checks database-wide; this suite is ABOUT the

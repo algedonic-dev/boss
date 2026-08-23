@@ -985,10 +985,7 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
-            audit: crate::audit::AuthAudit::spawn(
-                cap.clone(),
-                std::sync::Arc::new(boss_clock_client::WallClockClient),
-            ),
+            audit: crate::audit::AuthAudit::spawn(cap.clone()),
             guest_access: false,
             oidc: None,
             mail: Arc::new(crate::mail::LogTransport),
@@ -1028,10 +1025,7 @@ mod tests {
             store,
             session_key: vec![7u8; 32],
             http: reqwest::Client::new(),
-            audit: crate::audit::AuthAudit::spawn(
-                cap.clone(),
-                std::sync::Arc::new(boss_clock_client::WallClockClient),
-            ),
+            audit: crate::audit::AuthAudit::spawn(cap.clone()),
             guest_access: true,
             oidc: None,
             mail: Arc::new(crate::mail::LogTransport),

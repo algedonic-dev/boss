@@ -127,7 +127,6 @@ async fn main() -> Result<()> {
         registry.clone(),
         publisher,
         recorder,
-        clock.clone(),
     ));
 
     let (cancel_tx, cancel_rx) = watch::channel(false);

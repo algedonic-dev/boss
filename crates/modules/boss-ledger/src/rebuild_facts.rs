@@ -246,11 +246,19 @@ pub async fn rebuild_facts_in_tx(
         .await
         .map_err(|e| LedgerError::Storage(e.to_string()))?;
 
+    // `ORDER BY id` — audit_log id order IS commit order (the chain
+    // trigger allocates ids under the advisory lock), which is the
+    // order the live path recorded facts in. Ordering by `timestamp`
+    // stopped being meaningful when sim time was retired from the
+    // record (David, 2026-08-22, packet a7a4cae5): a log holding
+    // old sim-stamped rows next to new wall-stamped rows has no
+    // coherent timestamp order, and the old tiebreak (`event_id`, a
+    // random UUID) never matched commit order on equal stamps anyway.
     let event_rows = sqlx::query(
         "SELECT event_id, timestamp, source, kind, payload \
          FROM audit_log \
          WHERE kind = ANY($1) \
-         ORDER BY timestamp, event_id",
+         ORDER BY id",
     )
     .bind(&event_kinds)
     .fetch_all(&mut **tx)
@@ -339,11 +347,14 @@ const RECEIVE_SOURCE_TABLE: &str = "inventory_receipt";
 async fn rebuild_inert_received_facts_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<u64, LedgerError> {
+    // `ORDER BY id` = commit order — same reasoning as the registry
+    // pass above; timestamp order is incoherent across the sim-to-
+    // wall stamp transition.
     let rows = sqlx::query(
         "SELECT event_id, timestamp, payload \
          FROM audit_log \
          WHERE kind = $1 \
-         ORDER BY timestamp, event_id",
+         ORDER BY id",
     )
     .bind(RECEIVE_EVENT_KIND)
     .fetch_all(&mut **tx)
@@ -420,7 +431,7 @@ async fn load_rules_in_tx(
 
 /// Strip the publisher-injected event-envelope keys (`_actor`,
 /// `_simulated`) from a payload so a rebuilt fact matches the live in-tx
-/// fact, which never carries them. `DomainPublisher::emit_with_actor_at`
+/// fact, which never carries them. The `EventStamp` envelope
 /// stamps `_actor` onto every event payload (and `_simulated` under a
 /// SimulatedProbe) for provenance and sim-filtering — that is envelope
 /// metadata, not domain-fact data, so it must not leak into

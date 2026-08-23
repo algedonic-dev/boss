@@ -88,12 +88,17 @@ async fn create_reservation(
     State(state): State<CalendarApiState>,
     Json(req): Json<ReservationRequest>,
 ) -> Response {
-    let now = boss_clock_client::now_from(&state.clock).await;
     // OUTBOX (phase 2): the adapter records the reserved event (full
     // post-INSERT row state) inside the domain transaction; nothing
-    // publishes post-commit and no fetch-back read is needed.
-    let stamp = event_stamp(&state, now).await;
-    match state.calendar.reserve_at(req, now, &stamp).await {
+    // publishes post-commit and no fetch-back read is needed. The
+    // stamp mints wall time; the row binds the same instant so live,
+    // payload, and replay agree.
+    let stamp = event_stamp(&state).await;
+    match state
+        .calendar
+        .reserve_at(req, stamp.timestamp, &stamp)
+        .await
+    {
         Ok(id) => (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response(),
         Err(e) => calendar_error_response(e),
     }
@@ -105,16 +110,12 @@ async fn create_reservation(
 /// context (else `automation:calendar`), and its clock probe settles
 /// `_simulated` — the same envelope the retired post-commit emits
 /// carried (outbox phase 2).
-async fn event_stamp(
-    state: &CalendarApiState,
-    now: DateTime<Utc>,
-) -> boss_core::publisher::EventStamp {
+async fn event_stamp(state: &CalendarApiState) -> boss_core::publisher::EventStamp {
     match &state.publisher {
-        Some(p) => p.stamp_with_actor_at(p.default_actor(), now).await,
+        Some(p) => p.stamp_with_actor(p.default_actor()).await,
         None => boss_core::publisher::EventStamp::new(
             "calendar",
             boss_core::actor::ActorId::Automation("calendar".into()),
-            now,
         ),
     }
 }
@@ -170,14 +171,13 @@ async fn cancel_reservation(
         }
     };
     let res_id = ReservationId::from_uuid(uuid);
-    let now = boss_clock_client::now_from(&state.clock).await;
     // OUTBOX (phase 2): the adapter records the cancelled event (full
     // post-cancel row state) with the flip — and only on an actual
     // flip, so a repeat cancel no longer publishes a duplicate event.
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match state
         .calendar
-        .cancel_at(res_id, &q.actor, now, &stamp)
+        .cancel_at(res_id, &q.actor, stamp.timestamp, &stamp)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -197,15 +197,20 @@ async fn cancel_by_reason(
     State(state): State<CalendarApiState>,
     Json(body): Json<CancelByReasonBody>,
 ) -> Response {
-    let now = boss_clock_client::now_from(&state.clock).await;
     // OUTBOX (phase 2): the adapter enumerates the flipped rows via
     // UPDATE ... RETURNING and records one cancelled event per row in
     // the SAME transaction — the racy list-then-emit snapshot this
     // handler used to take around the UPDATE is gone.
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match state
         .calendar
-        .cancel_by_reason_at(&body.kind, &body.ref_id, &body.actor, now, &stamp)
+        .cancel_by_reason_at(
+            &body.kind,
+            &body.ref_id,
+            &body.actor,
+            stamp.timestamp,
+            &stamp,
+        )
         .await
     {
         Ok(n) => Json(serde_json::json!({ "cancelled": n })).into_response(),

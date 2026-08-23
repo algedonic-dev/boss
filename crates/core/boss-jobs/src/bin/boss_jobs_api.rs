@@ -297,7 +297,7 @@ async fn run_server<R: JobsRepository + 'static>(
             boss_policy_client::ReqwestPolicyClient::new(policy_url),
         )));
 
-    // Wire the sim-mode probe into the publisher so every emit_at
+    // Wire the sim-mode probe into the publisher so every stamp
     // injects `_simulated: bool` into the audit_log payload without
     // per-handler changes. `publisher` here is `DomainPublisher`
     // (not Option) — wire directly.

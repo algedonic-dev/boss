@@ -15,8 +15,8 @@ fn stamp() -> boss_core::publisher::EventStamp {
     boss_core::publisher::EventStamp::new(
         "products",
         boss_core::actor::ActorId::Automation("test".into()),
-        chrono::Utc::now(),
     )
+    .with_timestamp(chrono::Utc::now())
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {

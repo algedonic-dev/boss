@@ -71,7 +71,10 @@ async fn create_change(
     State(state): State<EmployeeChangesState>,
     Json(req): Json<EmployeeChange>,
 ) -> Response {
-    let now = state.clock.now().await.now;
+    // The row's created_at binds the stamp's wall time (the rebuild
+    // reproduces it from audit_log.timestamp); the change's business
+    // date is `effective_date`, carried on the request.
+    let stamp = crate::events::event_stamp(&state.publisher).await;
     let rec = EmployeeChangeRecord {
         employee_id: req.employee_id,
         kind: req.kind,
@@ -98,7 +101,7 @@ async fn create_change(
     .bind(rec.effective_date)
     .bind(&rec.notes)
     .bind(&rec.initiated_by)
-    .bind(now)
+    .bind(stamp.timestamp)
     .execute(&mut *tx)
     .await;
     let inserted = match result {
@@ -111,7 +114,6 @@ async fn create_change(
     // INSERT still shipped an event (an event with no fact), the
     // inverse of the swallowed-write class this arc closes.
     if inserted {
-        let stamp = crate::events::event_stamp(&state.publisher, now).await;
         let event = stamp.event(
             EMPLOYEE_CHANGE_RECORDED,
             serde_json::to_value(&rec).unwrap_or_default(),

@@ -100,7 +100,7 @@ async fn deep_check_passes_when_audit_log_facts_and_entries_agree() {
 #[tokio::test(flavor = "multi_thread")]
 async fn deep_check_passes_when_audit_event_carries_publisher_envelope() {
     // Regression guard for the fact-payload divergence class. The
-    // publisher (`DomainPublisher::emit_with_actor_at`) stamps `_actor`
+    // publisher envelope (`EventStamp`) stamps `_actor`
     // (always) and `_simulated` (sim runs) onto EVERY event payload; the
     // live in-tx fact never carries them. `rebuild_facts` must strip those
     // envelope keys (see `rebuild_facts::strip_envelope`) so the rebuilt

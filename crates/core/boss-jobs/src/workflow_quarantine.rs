@@ -204,7 +204,7 @@ async fn retire_and_mark<R: JobsRepository + ?Sized>(
         .await
         .map_err(|e| format!("could not quarantine `{}`: {e}", spec.kind))?;
 
-    let event = crate::events::workflow_quarantined_event(actor, now, spec, problems);
+    let event = crate::events::workflow_quarantined_event(actor, spec, problems);
     jobs.record_events(std::slice::from_ref(&event))
         .await
         .map_err(|e| {

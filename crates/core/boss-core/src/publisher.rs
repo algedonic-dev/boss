@@ -1,8 +1,19 @@
-//! Fire-and-forget domain event publisher.
+//! Fire-and-forget domain event publisher + the [`EventStamp`]
+//! envelope every outbox-recorded event is built from.
 //!
-//! Wraps an `EventBus` and optionally an `AuditWriter`. On error,
-//! returns false but never propagates — write operations must not
-//! fail because the event bus or audit log is unavailable.
+//! **Record stamps are wall-clock.** Sim time is fully retired from
+//! `Event.timestamp` / `audit_log.timestamp` (David, 2026-08-22,
+//! packet a7a4cae5): a deployment whose clock-api runs in sim mode
+//! still stamps every record with real time, so one incident's rows
+//! read as one timeline. Sim time survives only as **payload data**
+//! (business dates a handler reads from the clock port) and inside
+//! the sim's own scheduling — never on the record. If a record ever
+//! needs a sim-timeline annotation again, that returns as a protocol
+//! field (explicitly deferred).
+//!
+//! The publisher wraps an `EventBus` and optionally an `AuditWriter`.
+//! On error, returns false but never propagates — write operations
+//! must not fail because the event bus or audit log is unavailable.
 //!
 //! "Never propagates" is NOT "silent": every bus or audit failure
 //! logs at ERROR with the event identity. The audit log is the
@@ -38,10 +49,10 @@ pub struct DomainPublisher {
     bus: Arc<dyn EventBus>,
     audit: Option<Arc<dyn AuditWriter>>,
     source: String,
-    /// Optional sim-mode probe. When set, every emit stamps
+    /// Optional sim-mode probe. When set, every stamp carries
     /// `_simulated: bool` on the audit_log payload centrally, so no
-    /// handler has to thread the bit through its emit call sites.
-    /// When unset, emits don't carry `_simulated`.
+    /// handler has to thread the bit through its call sites. When
+    /// unset, stamps outside a sim chain don't carry `_simulated`.
     sim_probe: Option<Arc<dyn SimulatedProbe>>,
 }
 
@@ -62,44 +73,14 @@ impl DomainPublisher {
         self
     }
 
-    /// Attach a sim-mode probe. Every subsequent emit (via
-    /// `emit_at` or `emit_with_actor_at`) auto-fetches the probe
-    /// and stamps `_simulated: <bool>` on the audit_log payload.
-    /// Service binaries wire this at startup using their
-    /// ClockClient (which exposes `now().simulated`); handlers
-    /// don't have to thread the bit through their emit call sites.
+    /// Attach a sim-mode probe. Every subsequent
+    /// [`Self::stamp_with_actor`] carries `_simulated: <bool>` on the
+    /// payload it builds. Service binaries wire this at startup using
+    /// their ClockClient (which exposes `now().simulated`); handlers
+    /// don't have to thread the bit through their call sites.
     pub fn with_sim_probe(mut self, probe: Arc<dyn SimulatedProbe>) -> Self {
         self.sim_probe = Some(probe);
         self
-    }
-
-    /// Publish a domain event with a caller-supplied timestamp.
-    /// Returns true on success, false on error. Never panics or
-    /// propagates errors. The actor defaults to [`Self::default_actor`]
-    /// — the current request's authenticated identity if we're inside a
-    /// request, otherwise this service's own automation identity
-    /// (`automation:<source>`); never an anonymous "system". Callers
-    /// that know a more specific actor should use
-    /// [`Self::emit_with_actor_at`] (Level-B actor-stamping invariant:
-    /// every transition has a named CPU).
-    ///
-    /// `timestamp` MUST come from your authoritative clock
-    /// (`state.clock.now().await.now`). Making it a required arg
-    /// keeps the stamped time aligned with whichever clock the rest
-    /// of the system is running on (sim or wall) — there is no
-    /// `Utc::now()` fallback to drift to.
-    ///
-    /// When a `SimulatedProbe` is wired (via `with_sim_probe`)
-    /// the published payload also gains `_simulated: bool`, stamped
-    /// centrally rather than via per-handler edits.
-    pub async fn emit_at(
-        &self,
-        kind: &str,
-        payload: serde_json::Value,
-        timestamp: chrono::DateTime<chrono::Utc>,
-    ) -> bool {
-        self.emit_with_actor_at(kind, self.default_actor(), payload, timestamp)
-            .await
     }
 
     /// The actor for an emit that didn't name one explicitly: the
@@ -113,100 +94,29 @@ impl DomainPublisher {
             .unwrap_or_else(|| ActorId::Automation(self.source.clone()))
     }
 
-    /// Publish with an explicit actor + a caller-supplied
-    /// timestamp. Injects `_actor` into the event payload before
-    /// publishing so the audit_log row carries the named CPU.
-    /// ActorId serializes to a string (`emp-032` for humans,
-    /// `automation:<slug>` for named automations) per `crate::actor`'s
-    /// wire format.
-    ///
-    /// Also injects `_simulated: bool` when a SimulatedProbe is
-    /// wired (see `with_sim_probe`).
-    pub async fn emit_with_actor_at(
-        &self,
-        kind: &str,
-        actor: ActorId,
-        payload: serde_json::Value,
-        timestamp: chrono::DateTime<chrono::Utc>,
-    ) -> bool {
-        let mut payload = inject_actor(payload, &actor);
-        // `_simulated` describes THIS event's origin, not the
-        // deployment's clock. An event is simulated when the task is
-        // part of a sim chain — the request carried `x-sim-origin`, or
-        // the dispatcher inherited it from the event it is reacting to.
-        //
-        // This used to fall back to the clock-mode probe when the
-        // task-local was unset, and that conflated "the clock is
-        // running simulated time" with "this activity is synthetic".
-        // On a deployment whose clock is always simulated — every demo
-        // — it marked EVERYTHING simulated, including a person filing
-        // feedback through the browser. That made the flag useless for
-        // the one job it has: telling real operator input apart from
-        // the sim, so the epoch reset can delete one and keep the
-        // other.
-        let simulated = crate::sim_origin::is_in_sim_chain();
-        if simulated || self.sim_probe.is_some() {
-            payload = inject_simulated(payload, simulated);
-        }
-        let event = Event::new(&self.source, kind, payload, timestamp);
-        self.publish(event).await
-    }
-
-    /// Emit with actor + timestamp + the SIM marker. Injects
-    /// `_simulated: bool` into the payload alongside `_actor`, so
-    /// the audit_log row carries the sim-vs-real distinction
-    /// forever. Handlers pass `ctx.simulated` from their
-    /// `state.clock.now().await` result.
-    ///
-    /// Future queries filter via `payload->>'_simulated' = 'true'`
-    /// to scope a report to sim activity or real activity alone.
-    pub async fn emit_with_actor_simulated_at(
-        &self,
-        kind: &str,
-        actor: ActorId,
-        payload: serde_json::Value,
-        timestamp: chrono::DateTime<chrono::Utc>,
-        simulated: bool,
-    ) -> bool {
-        let payload = inject_simulated(inject_actor(payload, &actor), simulated);
-        let event = Event::new(&self.source, kind, payload, timestamp);
-        self.publish(event).await
-    }
-
-    /// Emit with the SIM marker but no explicit actor — defaults to
-    /// [`Self::default_actor`] (the request's identity, else this
-    /// service's `automation:<source>`). Convenience wrapper around
-    /// `emit_with_actor_simulated_at`.
-    pub async fn emit_simulated_at(
-        &self,
-        kind: &str,
-        payload: serde_json::Value,
-        timestamp: chrono::DateTime<chrono::Utc>,
-        simulated: bool,
-    ) -> bool {
-        self.emit_with_actor_simulated_at(kind, self.default_actor(), payload, timestamp, simulated)
-            .await
-    }
-
     /// Resolve the enrichment envelope for IN-TRANSACTION (outbox)
-    /// event recording — the same `_actor` / `_simulated` semantics
-    /// [`Self::emit_with_actor_at`] applies at publish time, captured
+    /// event recording — `_actor` / `_simulated` semantics captured
     /// as a value a domain repository can apply INSIDE its own
     /// transaction via [`EventStamp::event`] +
-    /// `boss_events::outbox::record_event_in_tx`. This is how an
-    /// outbox-migrated emitter keeps byte-identical payload
-    /// enrichment with the publisher path it replaces: one resolution
-    /// (task-local sim chain OR the clock probe), two delivery
-    /// mechanisms.
-    pub async fn stamp_with_actor_at(
-        &self,
-        actor: ActorId,
-        timestamp: chrono::DateTime<chrono::Utc>,
-    ) -> EventStamp {
-        // Origin, not clock mode — same rule as `emit_with_actor_at`.
-        // The outbox path has to agree with the publisher path byte for
-        // byte, so a divergence here would make a rebuild disagree with
-        // the live write about what was simulated.
+    /// `boss_events::outbox::record_event_in_tx`.
+    ///
+    /// The stamp's `timestamp` is **wall-clock now**, minted here.
+    /// Sim time is retired from the record (David, 2026-08-22, packet
+    /// a7a4cae5): `audit_log.timestamp` says when the fact was
+    /// recorded, on the one real clock, regardless of the deploy's
+    /// clock mode. Business dates that follow the sim timeline are
+    /// payload fields, read from the clock port by the handler —
+    /// never the stamp. Handlers that bind a row column the rebuilder
+    /// reproduces from `audit_log.timestamp` (`created_at` /
+    /// `updated_at`) must bind [`EventStamp::timestamp`], not their
+    /// own clock read, so live row and replayed row stay identical.
+    pub async fn stamp_with_actor(&self, actor: ActorId) -> EventStamp {
+        // Origin, not clock mode: `_simulated` describes THIS event's
+        // origin. An event is simulated when the task is part of a sim
+        // chain — the request carried `x-sim-origin`, or the
+        // dispatcher inherited it from the event it is reacting to.
+        // The clock-mode probe only controls whether the key appears
+        // at all when the chain is real.
         let simulated = crate::sim_origin::is_in_sim_chain();
         EventStamp {
             source: self.source.clone(),
@@ -216,7 +126,7 @@ impl DomainPublisher {
             } else {
                 None
             },
-            timestamp,
+            timestamp: chrono::Utc::now(),
         }
     }
 
@@ -351,39 +261,54 @@ pub fn inject_actor(mut payload: serde_json::Value, actor: &ActorId) -> serde_js
 
 /// The enrichment envelope for in-transaction (outbox) event
 /// recording. Resolved once per request — via
-/// [`DomainPublisher::stamp_with_actor_at`] when a publisher (and
+/// [`DomainPublisher::stamp_with_actor`] when a publisher (and
 /// its sim probe) is wired, or [`EventStamp::new`] when not — and
 /// handed into the domain repository, which applies it to each
-/// payload it builds INSIDE its transaction. Keeps the outbox path's
-/// `_actor` / `_simulated` semantics byte-identical with
-/// `emit_with_actor_at`, from one resolution.
+/// payload it builds INSIDE its transaction.
+///
+/// `timestamp` is **wall-clock now**, minted at construction — the
+/// one place a record's stamp comes from. Sim time is retired from
+/// the record (David, 2026-08-22, packet a7a4cae5); the timeline a
+/// forensic read walks is the real one. `timestamp` stays `pub` so
+/// row binds reproduce it exactly (and so a deterministic test can
+/// overwrite it on a stamp it built itself).
 #[derive(Debug, Clone)]
 pub struct EventStamp {
     source: String,
     actor: ActorId,
     /// `Some(flag)` injects `_simulated: flag`; `None` leaves the key
-    /// off entirely (mirrors emit: the key appears when the chain is
-    /// simulated or a probe is wired at all).
+    /// off entirely (the key appears when the chain is simulated or a
+    /// probe is wired at all).
     simulated: Option<bool>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 impl EventStamp {
-    /// Publisher-less construction (test paths, adapters without a
-    /// clock probe). Still honors the task-local sim chain, so a
-    /// sim-originated request stamps `_simulated: true` even here.
-    pub fn new(
-        source: impl Into<String>,
-        actor: ActorId,
-        timestamp: chrono::DateTime<chrono::Utc>,
-    ) -> Self {
+    /// Publisher-less construction (adapters without a publisher,
+    /// trait-default overloads, CLI boundary tools). Still honors the
+    /// task-local sim chain, so a sim-originated request stamps
+    /// `_simulated: true` even here — and stamps wall-clock time,
+    /// same as [`DomainPublisher::stamp_with_actor`].
+    pub fn new(source: impl Into<String>, actor: ActorId) -> Self {
         let in_chain = crate::sim_origin::is_in_sim_chain();
         Self {
             source: source.into(),
             actor,
             simulated: in_chain.then_some(true),
-            timestamp,
+            timestamp: chrono::Utc::now(),
         }
+    }
+
+    /// Override the minted wall timestamp. For deterministic tests
+    /// and replay-shaped fixtures ONLY — production write paths never
+    /// call this: the record stamp is wall time by decision (David,
+    /// 2026-08-22, packet a7a4cae5), and threading a deploy-clock
+    /// reading back in here would resurrect the mixed-clock log this
+    /// API retires. (`timestamp` is a `pub` field; this builder just
+    /// keeps fixture construction a single expression.)
+    pub fn with_timestamp(mut self, timestamp: chrono::DateTime<chrono::Utc>) -> Self {
+        self.timestamp = timestamp;
+        self
     }
 
     /// Override the `_simulated` marker for every event this stamp
@@ -399,7 +324,7 @@ impl EventStamp {
     }
 
     /// Build the enriched `Event` for `kind` + `payload` — the in-tx
-    /// analogue of `emit_with_actor_at`'s construction.
+    /// analogue of the retired publisher emit path's construction.
     pub fn event(&self, kind: &str, payload: serde_json::Value) -> Event {
         let mut payload = inject_actor(payload, &self.actor);
         if let Some(simulated) = self.simulated {
@@ -671,13 +596,7 @@ mod inject_tests {
         // A stamp built outside any sim chain carries no _simulated;
         // the job write paths override it from the packet's
         // admission-fixed flag, in both directions.
-        let stamp = EventStamp::new(
-            "jobs",
-            ActorId::Human("emp-1".into()),
-            chrono::DateTime::parse_from_rfc3339("2026-08-12T00:00:00Z")
-                .unwrap()
-                .to_utc(),
-        );
+        let stamp = EventStamp::new("jobs", ActorId::Human("emp-1".into()));
         let bare = stamp
             .clone()
             .event("jobs.job.updated", serde_json::json!({}));
@@ -694,5 +613,77 @@ mod inject_tests {
             .with_simulated(false)
             .event("jobs.job.updated", serde_json::json!({}));
         assert_eq!(real.payload["_simulated"], false);
+    }
+}
+
+#[cfg(test)]
+mod wall_stamp_tests {
+    use super::*;
+
+    /// Sim time is retired from the record (David, 2026-08-22, packet
+    /// a7a4cae5). A stamp minted inside a sim chain — the exact
+    /// condition under which the old API was handed a skewed sim
+    /// instant — still carries wall time; the chain reaches the
+    /// payload as `_simulated`, never the timestamp.
+    #[tokio::test]
+    async fn a_stamp_minted_inside_a_sim_chain_carries_wall_time() {
+        let (event, before, after) = crate::sim_origin::with_sim_chain(true, async {
+            let before = chrono::Utc::now();
+            let stamp = EventStamp::new("jobs", ActorId::Human("emp-1".into()));
+            let event = stamp.event("jobs.job.updated", serde_json::json!({}));
+            (event, before, chrono::Utc::now())
+        })
+        .await;
+        assert!(
+            event.timestamp >= before && event.timestamp <= after,
+            "the record stamp must be wall-clock now, got {}",
+            event.timestamp
+        );
+        assert_eq!(
+            event.payload["_simulated"], true,
+            "the sim chain still marks origin — just not the clock"
+        );
+    }
+
+    /// Same invariant through the publisher path (the sim probe says
+    /// the deploy's clock runs simulated — the stamp is wall anyway).
+    #[tokio::test]
+    async fn publisher_stamp_is_wall_time_even_when_the_deploy_clock_is_simulated() {
+        struct AlwaysSim;
+        #[async_trait::async_trait]
+        impl SimulatedProbe for AlwaysSim {
+            async fn simulated(&self) -> bool {
+                true
+            }
+        }
+        struct NullBus;
+        #[async_trait::async_trait]
+        impl crate::port::EventBus for NullBus {
+            async fn publish(&self, _e: Event) -> Result<(), crate::port::EventBusError> {
+                Ok(())
+            }
+            async fn subscribe(
+                &self,
+                _p: &str,
+            ) -> Result<Box<dyn crate::port::EventStream>, crate::port::EventBusError> {
+                Err(crate::port::EventBusError::SubscribeFailed("stub".into()))
+            }
+        }
+        let publisher =
+            DomainPublisher::new(Arc::new(NullBus), "jobs").with_sim_probe(Arc::new(AlwaysSim));
+        let before = chrono::Utc::now();
+        let stamp = publisher
+            .stamp_with_actor(ActorId::Human("emp-1".into()))
+            .await;
+        let after = chrono::Utc::now();
+        assert!(
+            stamp.timestamp >= before && stamp.timestamp <= after,
+            "stamp must be wall-clock now, got {}",
+            stamp.timestamp
+        );
+        // Outside a sim chain the probe only makes the key appear —
+        // with the honest value: this activity is not synthetic.
+        let event = stamp.event("jobs.job.updated", serde_json::json!({}));
+        assert_eq!(event.payload["_simulated"], false);
     }
 }

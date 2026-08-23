@@ -145,14 +145,13 @@ async fn require_ledger_read(
 pub(crate) async fn event_stamp(
     state: &LedgerApiState,
     user: &boss_policy_client::User,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> boss_core::publisher::EventStamp {
     let actor = user
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
     match &state.publisher {
-        Some(p) => p.stamp_with_actor_at(actor, now).await,
-        None => boss_core::publisher::EventStamp::new("ledger", actor, now),
+        Some(p) => p.stamp_with_actor(actor).await,
+        None => boss_core::publisher::EventStamp::new("ledger", actor),
     }
 }
 

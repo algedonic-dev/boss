@@ -8,8 +8,8 @@ fn test_stamp(now: chrono::DateTime<Utc>) -> boss_core::publisher::EventStamp {
     boss_core::publisher::EventStamp::new(
         "content",
         boss_core::actor::ActorId::Automation("test".into()),
-        now,
     )
+    .with_timestamp(now)
 }
 
 /// Drain the outbox through the relay pipeline into audit_log.

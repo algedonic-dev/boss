@@ -674,14 +674,22 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
     // of the write, is the source of truth for sim-vs-real.
     let job_stamp = state
         .publisher
-        .stamp_with_actor_at(actor, now)
+        .stamp_with_actor(actor)
         .await
         .with_simulated(job.simulated);
     let job_event = job_stamp.event(
         events::JOB_CREATED,
         serde_json::to_value(&job).unwrap_or_default(),
     );
-    if let Err(e) = state.jobs.create_job_at(&job, now, &[job_event]).await {
+    // Row-touch columns bind the stamp's wall time — the rebuilder
+    // reproduces them from audit_log.timestamp, so live and replay
+    // must read the same instant. Business dates (opened_on, `{day}`
+    // tokens below) keep the authoritative clock's `now`.
+    if let Err(e) = state
+        .jobs
+        .create_job_at(&job, job_stamp.timestamp, &[job_event])
+        .await
+    {
         return persist_error_response(e);
     }
 
@@ -732,12 +740,16 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
                 .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
             let step_stamp = state
                 .publisher
-                .stamp_with_actor_at(step_actor, now)
+                .stamp_with_actor(step_actor)
                 .await
                 .with_simulated(job.simulated);
             let step_event =
                 step_stamp.event(events::STEP_CREATED, events::step_state_payload(step));
-            if let Err(e) = state.jobs.add_step_at(step, now, &[step_event]).await {
+            if let Err(e) = state
+                .jobs
+                .add_step_at(step, step_stamp.timestamp, &[step_event])
+                .await
+            {
                 tracing::warn!(
                     job_id = %job_id,
                     step_id = %step.id,
@@ -759,8 +771,7 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
                 let ready_actor = user
                     .ambient_actor()
                     .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                ready_events
-                    .push(build_step_ready_event(&state, &job, step, &ready_actor, now).await);
+                ready_events.push(build_step_ready_event(&state, &job, step, &ready_actor).await);
             }
         }
         if !ready_events.is_empty()
@@ -998,7 +1009,6 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
         return resp;
     }
 
-    let now = boss_clock_client::now_from(&state.clock).await;
     // OUTBOX (phase 2): the state event (full row state, what the
     // rebuild consumes) + the status-transition markers (topic-only
     // duplicates for downstream consumers; rebuild ignores them)
@@ -1008,7 +1018,7 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
     let stamp = state
         .publisher
-        .stamp_with_actor_at(actor, now)
+        .stamp_with_actor(actor)
         .await
         .with_simulated(job.simulated);
     let mut job_events = vec![stamp.event(
@@ -1054,7 +1064,11 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
             ));
         }
     }
-    if let Err(e) = state.jobs.update_job_at(&job, now, &job_events).await {
+    if let Err(e) = state
+        .jobs
+        .update_job_at(&job, stamp.timestamp, &job_events)
+        .await
+    {
         return persist_error_response(e);
     }
 
@@ -1067,7 +1081,7 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
         let actor = user
             .ambient_actor()
             .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-        super::steps::reevaluate_and_persist(&state, &job, &actor, now).await;
+        super::steps::reevaluate_and_persist(&state, &job, &actor).await;
     }
 
     StatusCode::NO_CONTENT.into_response()
@@ -1142,7 +1156,6 @@ pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus 
         return (StatusCode::FORBIDDEN, "job is outside your scope").into_response();
     }
 
-    let now = boss_clock_client::now_from(&state.clock).await;
     let actor = user
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
@@ -1152,7 +1165,7 @@ pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus 
     // records it in the same transaction as the write.
     let stamp = state
         .publisher
-        .stamp_with_actor_at(actor.clone(), now)
+        .stamp_with_actor(actor.clone())
         .await
         .with_simulated(existing.simulated);
     let merged = match state
@@ -1171,7 +1184,7 @@ pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus 
     // `ready_when` (ship-a-change's Merged outcome waits on
     // `job.metadata.merged`). Closed/cancelled Jobs stay untouched.
     if merged.status == JobStatus::Open {
-        super::steps::reevaluate_and_persist(&state, &merged, &actor, now).await;
+        super::steps::reevaluate_and_persist(&state, &merged, &actor).await;
     }
 
     StatusCode::NO_CONTENT.into_response()

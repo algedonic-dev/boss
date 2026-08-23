@@ -213,7 +213,7 @@ async fn batch_assign_account_team(
         if let Err(e) = upsert_team_member(&mut *tx, &evt).await {
             return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response();
         }
-        let stamp = crate::events::event_stamp(&state.publisher, now).await;
+        let stamp = crate::events::event_stamp(&state.publisher).await;
         let event = stamp.event(
             ACCOUNT_TEAM_ASSIGNED,
             serde_json::to_value(&evt).unwrap_or_default(),
@@ -358,7 +358,7 @@ async fn assign_account_team(
     // OUTBOX (phase 2): the assignment + its auto-posted note record
     // in the SAME transaction as their rows — team change, audit
     // note, and both events succeed or fail together.
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let stamp = crate::events::event_stamp(&state.publisher).await;
     for (kind, payload) in [
         (
             ACCOUNT_TEAM_ASSIGNED,
@@ -448,7 +448,7 @@ async fn unassign_account_team(
         employee_id: removed_employee,
         unassigned_at: now,
     };
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let stamp = crate::events::event_stamp(&state.publisher).await;
     for (kind, payload) in [
         (
             ACCOUNT_TEAM_UNASSIGNED,

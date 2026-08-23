@@ -23,8 +23,8 @@ fn stamp() -> EventStamp {
     EventStamp::new(
         "commerce",
         boss_core::actor::ActorId::Automation("test".into()),
-        chrono::Utc::now(),
     )
+    .with_timestamp(chrono::Utc::now())
 }
 
 fn invoice(id: &str, status: &str) -> Invoice {

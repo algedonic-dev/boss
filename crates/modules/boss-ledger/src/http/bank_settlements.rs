@@ -174,8 +174,7 @@ pub(super) async fn create_bank_settlement(
 
     // Outbox phase 2: the audit event commits with the fact + JE.
     {
-        let now = boss_clock_client::now_from(&state.clock).await;
-        let stamp = super::event_stamp(&state, &user, now).await;
+        let stamp = super::event_stamp(&state, &user).await;
         if let Err(e) = crate::events::record_ledger_event_in_tx(
             &mut tx,
             &stamp,
@@ -336,12 +335,7 @@ pub(super) async fn settle_bank_settlement(
     if let Some(r) = reject_if_auditor(&user) {
         return r;
     }
-    let stamp = super::event_stamp(
-        &state,
-        &user,
-        boss_clock_client::now_from(&state.clock).await,
-    )
-    .await;
+    let stamp = super::event_stamp(&state, &user).await;
     match settle_one(&state.pool, &stamp, &id, body.settled_on).await {
         Ok(view) => Json(view).into_response(),
         Err(SettleFailure::NotFound) => {
@@ -385,12 +379,7 @@ pub(super) async fn sweep_bank_settlements(
         Ok(v) => v,
         Err(e) => return ledger_err(e),
     };
-    let stamp = super::event_stamp(
-        &state,
-        &user,
-        boss_clock_client::now_from(&state.clock).await,
-    )
-    .await;
+    let stamp = super::event_stamp(&state, &user).await;
     let mut swept = Vec::with_capacity(due.len());
     for row in due {
         match settle_one(&state.pool, &stamp, &row.id, Some(as_of)).await {

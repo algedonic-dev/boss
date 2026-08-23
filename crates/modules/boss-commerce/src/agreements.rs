@@ -121,16 +121,15 @@ async fn create_agreement(
     State(state): State<AgreementsState>,
     Json(req): Json<ServiceAgreement>,
 ) -> Response {
-    let now = state.clock.now().await.now;
     // Outbox phase 2: the state event records in the SAME tx as the
     // upsert. This surface carries no CurrentUser extractor, so the
-    // actor is the publisher's default.
+    // actor is the publisher's default. The stamp mints wall time —
+    // sim time is retired from the record.
     let stamp = match &state.publisher {
-        Some(p) => p.stamp_with_actor_at(p.default_actor(), now).await,
+        Some(p) => p.stamp_with_actor(p.default_actor()).await,
         None => boss_core::publisher::EventStamp::new(
             "commerce",
             boss_core::actor::ActorId::Automation("platform".into()),
-            now,
         ),
     };
     let mut tx = match state.pool.begin().await {

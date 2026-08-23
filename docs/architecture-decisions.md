@@ -495,9 +495,23 @@ reference: `docs/design/correctness-protocol.md`). The audit log
 is the system of record; projections are pure functions of it;
 rebuilders reproduce truth from it
 (`docs/design/projection-rebuilders.md` is the living contract);
-the system contributes zero error of its own. Every projection row
-representing a sim-time event stamps **the sim-day the engine
-emitted**, never wall-clock `NOW()`.
+the system contributes zero error of its own.
+
+**Sim time is retired from the record** (David, 2026-08-22, packet
+a7a4cae5 — superseding the earlier "every projection row
+representing a sim-time event stamps the sim-day the engine
+emitted" rule). `Event.timestamp` / `audit_log.timestamp` is
+wall-clock, minted by `EventStamp` at emit, whatever mode the
+deploy's clock-api runs in — one incident reads as one timeline
+(the mixed-clock log had a 19:25 arrival stamped ~03:00 because
+clock-routed writers stamped sim while allowlisted writers stamped
+wall). The sim timeline survives where it is data, not clock:
+**business dates in payloads** (`happened_on`, `issued_on`,
+`completed_on`, `{day}` tokens) still read the sim-aware clock
+port, and the sim's own scheduling (day cursor, warp, epoch,
+`clock.day` rules) is untouched. If a record ever needs a
+sim-timeline annotation again, it returns as a protocol field —
+explicitly deferred.
 
 **Events become durable atomically with the state they describe**
 (the transactional-outbox decision, arc completed 2026-07-29;

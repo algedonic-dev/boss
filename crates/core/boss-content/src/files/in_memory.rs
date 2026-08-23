@@ -208,7 +208,6 @@ mod tests {
         boss_core::publisher::EventStamp::new(
             "content",
             boss_core::actor::ActorId::Automation("test".into()),
-            chrono::Utc::now(),
         )
     }
 
