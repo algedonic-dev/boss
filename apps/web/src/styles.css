@@ -2990,6 +2990,19 @@ button.manual-tree-node {
 .step-kb-checklist-item { font-size: 13px; padding: 4px 0; }
 .step-kb-check { margin-right: 6px; }
 
+/* Refused writes + degraded registry (packet cc9d7fc6). Every step
+   surface renders a rejected write inline via .step-write-error; the
+   dispatcher renders a failed registry read as .step-registry-error
+   with a Retry beside the still-usable generic fallback. */
+.step-write-error { color: var(--err); font-size: 12px; margin: 8px 0 0; }
+.step-registry-error {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 10px; margin-bottom: 10px;
+  border: 1px solid var(--err); border-radius: var(--radius);
+  color: var(--err); font-size: 12px;
+}
+.step-registry-error span { flex: 1 1 auto; }
+
 /* Action buttons */
 .step-actions { display: flex; gap: 8px; margin-top: 8px; }
 .step-btn {

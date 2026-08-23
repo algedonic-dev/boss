@@ -61,28 +61,58 @@ const inflight: Map<string, Promise<StepPluginMountFn | null>> = new Map();
 // from `GET /api/jobs/step-plugins` so we don't hit the per-kind
 // endpoint (and log a 404) for the common case of "no plugin
 // registered, render the default surface."
+//
+// Only SUCCESSFUL loads are cached. A failed fetch used to be cached
+// as an empty map — one transient blip pinned every plugin-backed
+// step to the generic fallback for the whole session (the one-fetch
+// downgrade, packet cc9d7fc6). Now a failure clears the cache so the
+// next probe retries, and probeActivePlugin reports it as a failure
+// rather than as "no plugin".
 let activeSpecsPromise: Promise<Map<string, StepPluginSpec>> | null = null;
+
+async function fetchActiveSpecs(): Promise<Map<string, StepPluginSpec>> {
+  const resp = await fetch('/api/jobs/step-plugins');
+  if (!resp.ok) throw new Error(`step-plugin registry: HTTP ${resp.status}`);
+  const list = (await resp.json()) as StepPluginSpec[];
+  return new Map(list.map((s) => [s.kind, s]));
+}
 
 function loadActiveSpecs(): Promise<Map<string, StepPluginSpec>> {
   if (!activeSpecsPromise) {
-    activeSpecsPromise = (async () => {
-      const resp = await fetch('/api/jobs/step-plugins');
-      if (!resp.ok) return new Map<string, StepPluginSpec>();
-      const list = (await resp.json()) as StepPluginSpec[];
-      return new Map(list.map((s) => [s.kind, s]));
-    })().catch(() => new Map<string, StepPluginSpec>());
+    activeSpecsPromise = fetchActiveSpecs().catch((e: unknown) => {
+      activeSpecsPromise = null;
+      throw e;
+    });
   }
   return activeSpecsPromise;
 }
 
-/// True iff the boss-jobs step-plugin registry has an active row
-/// for `kind`. The dispatcher uses this to decide between mounting
-/// a real plugin (tier 2) and falling back to GenericSurface
-/// (tier 3). Cached after the first call so re-checking on every
-/// step render is free.
+export type PluginProbe =
+  | { kind: 'ok'; active: boolean }
+  | { kind: 'failed'; error: string };
+
+/// Whether the boss-jobs step-plugin registry has an active row for
+/// `kind` — with "the registry could not be read" as its own state,
+/// so the dispatcher can say the surface is degraded instead of
+/// silently rendering the fallback as if no plugin existed.
+export async function probeActivePlugin(kind: string): Promise<PluginProbe> {
+  try {
+    const specs = await loadActiveSpecs();
+    return { kind: 'ok', active: specs.has(kind) };
+  } catch (e) {
+    return {
+      kind: 'failed',
+      error: e instanceof Error ? e.message : String(e),
+    };
+  }
+}
+
+/// Boolean view of probeActivePlugin for callers that only branch;
+/// a registry failure reads as "no plugin" here, so anything that
+/// should DISPLAY the failure must use probeActivePlugin instead.
 export async function hasActivePluginFor(kind: string): Promise<boolean> {
-  const specs = await loadActiveSpecs();
-  return specs.has(kind);
+  const probe = await probeActivePlugin(kind);
+  return probe.kind === 'ok' && probe.active;
 }
 
 export function installStepPluginHost(): void {
@@ -111,7 +141,12 @@ export async function getStepPluginMount(
 }
 
 async function loadPlugin(kind: string): Promise<StepPluginMountFn | null> {
-  const specs = await loadActiveSpecs();
+  // A registry failure resolves to "no mount" — the callers here
+  // (mount hosts) fall back to the platform surface, and the failed
+  // load is not cached, so the next mount attempt retries.
+  const specs = await loadActiveSpecs().catch(
+    () => new Map<string, StepPluginSpec>(),
+  );
   const spec = specs.get(kind);
   if (!spec) return null;
   const url = `/plugins/${spec.frontend_url.replace(/^\//, '')}`;

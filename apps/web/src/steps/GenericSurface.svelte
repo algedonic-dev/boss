@@ -11,6 +11,7 @@
     type StepField,
   } from '../jobs/types';
   import type { Employee } from '../people/types';
+  import { putStep } from './stepWrite';
 
   type StepData = {
     id: string;
@@ -69,6 +70,16 @@
   let assigneeId = $state(step.assignee_id ?? '');
   let dueOn = $state(initialDueOn);
   let saving = $state(false);
+  /// A refused write, rendered inline. The surface keeps its state
+  /// exactly as the user left it so the same click can retry; it
+  /// never pretends the write landed (packet cc9d7fc6).
+  let writeError = $state<string | null>(null);
+  $effect(() => {
+    // The surface instance is reused when the rail switches steps —
+    // an error from step A must not render under step B.
+    void step.id;
+    writeError = null;
+  });
   let terminal = $derived(_isTerminal(step.status));
 
   let employees = $state<Employee[]>([]);
@@ -125,6 +136,7 @@
     notes?: string;
   }): Promise<void> {
     saving = true;
+    writeError = null;
     try {
       const body = {
         ...step,
@@ -146,11 +158,11 @@
             ),
           },
       };
-      await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+      const res = await putStep(jobId, step.id, body);
+      if (res.kind === 'failed') {
+        writeError = res.error;
+        return;
+      }
       onUpdate();
     } finally {
       saving = false;
@@ -302,6 +314,10 @@
       disabled={terminal}
     ></textarea>
   </div>
+
+  {#if writeError}
+    <p class="step-write-error" role="alert">{writeError}</p>
+  {/if}
 
   <div class="step-actions">
     {#if dirty && !terminal}

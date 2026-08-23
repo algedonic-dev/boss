@@ -12,6 +12,7 @@
   import { subjectLabel, subjectPath, type Job } from './types';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import { session } from '@boss/web-kit/session/session.svelte';
+  import WriteGate from '@boss/web-kit/ui/WriteGate.svelte';
   import { appToday } from '@boss/web-kit/sim-clock';
 
   let userId = $derived(
@@ -481,12 +482,16 @@
   </div>
 
   <div class="job-actions">
-    <button type="button" class="btn-primary" onclick={() => openNewJob()}>
-      Start a new Job
-    </button>
-    <button type="button" class="btn-secondary" onclick={() => openNewJob({ kind: 'ad-hoc' })}>
-      Create Ad Hoc Job
-    </button>
+    <!-- Admission is a write: a guest sees the entry buttons disabled
+         (readonly gate) rather than a composer whose POST 403s. -->
+    <WriteGate>
+      <button type="button" class="btn-primary" onclick={() => openNewJob()}>
+        Start a new Job
+      </button>
+      <button type="button" class="btn-secondary" onclick={() => openNewJob({ kind: 'ad-hoc' })}>
+        Create Ad Hoc Job
+      </button>
+    </WriteGate>
   </div>
 
   {#if newJobOpen}
@@ -769,6 +774,13 @@
     display: flex;
     gap: 12px;
     margin-bottom: 16px;
+  }
+  /* The readonly gate is a mechanism, not a layout box — hand the
+     action row's flex layout down to it so the two buttons keep
+     their gap whether or not the gate is disabling them. */
+  .job-actions :global(.write-gate) {
+    display: flex;
+    gap: 12px;
   }
   .btn-primary,
   .btn-secondary {

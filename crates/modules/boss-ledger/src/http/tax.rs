@@ -224,8 +224,12 @@ pub(super) async fn create_tax_filing(
             // Federal beer excise tax filed for a period = the net
             // credit balance in 2320 Excise Tax Payable as of period
             // close. Each brew batch accrues a 2320 credit at production
-            // time (DR 6550 / CR 2320 = excise_bbl × $3.50); the filing
-            // drains that balance to 1000 Cash.
+            // time (DR 6550 / CR 2320, graduated over YTD barrels via
+            // the excise_rate_schedules registry — see
+            // `create_tax_accrual` below); the filing drains that
+            // balance to 1000 Cash. Deriving from the 2320 balance means
+            // this arm needs NO knowledge of the rate curve: whatever
+            // the graduated accruals credited is what gets filed.
             //
             // Derive from the GL balance through `period_end`, no lower
             // bound — same as the period-sales-tax (2300) and
@@ -500,14 +504,38 @@ async fn post_accrual_entry(
 /// invoice. `id` is the idempotency key (e.g. `excise-<step_id>`): it
 /// feeds the financial_facts `(kind, source_table, source_id)` unique
 /// index, so a duplicate POST is a no-op.
+///
+/// Two amount bases, quantity preferred:
+/// - `excise_bbl` — the taxed barrels. The ledger resolves the rate
+///   from the `excise_rate_schedules` registry (graduated tiers over
+///   the jurisdiction's year-to-date taxed barrels); a jurisdiction
+///   with no registry row falls back to the caller's
+///   `fallback_rate_cents_per_bbl` flat rate, loudly.
+/// - `amount_cents` — a caller-computed amount, taken verbatim
+///   (pre-registry contract; still valid).
 #[derive(Deserialize)]
 pub(super) struct CreateTaxAccrualBody {
     id: String,
     expense_account: String,
     liability_account: String,
-    amount_cents: i64,
+    #[serde(default)]
+    amount_cents: Option<i64>,
     posted_on: NaiveDate,
     jurisdiction: String,
+    #[serde(default)]
+    excise_bbl: Option<i64>,
+    #[serde(default)]
+    fallback_rate_cents_per_bbl: Option<i64>,
+}
+
+/// How an accrual's amount was resolved — recorded in the fact payload
+/// so the books say not just what was accrued but under which rate
+/// mechanism.
+struct ResolvedAmount {
+    amount_cents: i64,
+    rate_source: &'static str,
+    excise_bbl: Option<i64>,
+    ytd_bbl_before: Option<i64>,
 }
 
 /// Post a standalone `finance.tax.accrued` fact (DR expense / CR
@@ -515,7 +543,19 @@ pub(super) struct CreateTaxAccrualBody {
 /// `record_fact_in_tx` resolves a duplicate `(kind, source_table,
 /// source_id)` to the existing fact and `post_fact_in_tx` short-circuits
 /// on the already-posted JE, so a repeat POST returns 200 without
-/// double-booking the liability.
+/// double-booking the liability. The audit event is gated on the fact
+/// insert, so a redelivery appends nothing to the log — which also
+/// keeps the graduated recompute (below) from minting a divergent
+/// second event.
+///
+/// Graduated resolution runs INSIDE the write transaction: the
+/// schedule row is read `FOR UPDATE` (serializing concurrent accruals
+/// per jurisdiction so two same-moment batches can't both claim the
+/// same cheap-tier barrels), and the year-to-date taxed barrels are
+/// summed from prior `finance.tax.accrued` facts — the projection that
+/// survives a TRUNCATE-then-replay rebuild, which is what makes the
+/// amount a pure function of the log. The sum excludes this accrual's
+/// own id so a NAK redelivery recomputes the identical amount.
 pub(super) async fn create_tax_accrual(
     State(state): State<Arc<LedgerApiState>>,
     CurrentUser(user): CurrentUser,
@@ -524,32 +564,163 @@ pub(super) async fn create_tax_accrual(
     if let Some(r) = reject_if_auditor(&user) {
         return r;
     }
-    if body.amount_cents <= 0 {
-        return (StatusCode::BAD_REQUEST, "amount_cents must be positive").into_response();
-    }
 
     let now = boss_clock_client::now_from(&state.clock).await;
-
-    // `accrual_id` is the idempotency key — it doubles as the source_id
-    // on the financial_facts `(kind, source_table, source_id)` index AND
-    // the `source_id_path` the `ledger.tax.accrual.recorded` projection
-    // rule extracts on rebuild, so live + rebuild agree on fact identity.
-    let payload = serde_json::json!({
-        "accrual_id": body.id,
-        "expense_account": body.expense_account,
-        "liability_account": body.liability_account,
-        "amount_cents": body.amount_cents,
-        "posted_on": body.posted_on,
-        "jurisdiction": body.jurisdiction,
-    });
-
     let stamp = super::event_stamp(&state, &user, now).await;
     let mut tx = match state.pool.begin().await {
         Ok(t) => t,
         Err(e) => return storage_err(e),
     };
 
-    let live_fact_id = match crate::events::record_fact_in_tx(
+    let resolved = match (body.excise_bbl, body.amount_cents) {
+        (Some(bbl), _) => {
+            if bbl <= 0 {
+                return (StatusCode::BAD_REQUEST, "excise_bbl must be positive").into_response();
+            }
+            // Newest schedule version effective on or before posted_on.
+            let schedule: Option<(serde_json::Value,)> = match sqlx::query_as(
+                "SELECT tiers FROM excise_rate_schedules \
+                 WHERE jurisdiction = $1 AND effective_from <= $2 \
+                 ORDER BY effective_from DESC LIMIT 1 \
+                 FOR UPDATE",
+            )
+            .bind(&body.jurisdiction)
+            .bind(body.posted_on)
+            .fetch_optional(&mut *tx)
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => return storage_err(e),
+            };
+            match schedule {
+                Some((tiers_json,)) => {
+                    let tiers: Vec<crate::excise::RateTier> =
+                        match serde_json::from_value(tiers_json) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!(
+                                        "excise_rate_schedules row for {} has malformed tiers: {e}",
+                                        body.jurisdiction
+                                    ),
+                                )
+                                    .into_response();
+                            }
+                        };
+                    // YTD taxed barrels: the calendar-year sum of
+                    // `excise_bbl` over prior accrual facts in this
+                    // jurisdiction. Facts are the rebuild-stable
+                    // quantity source — the payload rides through
+                    // audit_log replay verbatim. Pre-registry facts
+                    // carry no excise_bbl and count 0, which is
+                    // consistent: they were accrued flat, outside the
+                    // graduated curve.
+                    let jan1 =
+                        NaiveDate::from_ymd_opt(chrono::Datelike::year(&body.posted_on), 1, 1)
+                            .unwrap_or(body.posted_on);
+                    let ytd: (i64,) = match sqlx::query_as(
+                        "SELECT COALESCE(SUM((payload->>'excise_bbl')::bigint), 0)::bigint \
+                         FROM financial_facts \
+                         WHERE kind = 'finance.tax.accrued' \
+                           AND payload->>'jurisdiction' = $1 \
+                           AND payload ? 'excise_bbl' \
+                           AND happened_on >= $2 AND happened_on <= $3 \
+                           AND NOT (source_table = 'tax_accruals' AND source_id = $4)",
+                    )
+                    .bind(&body.jurisdiction)
+                    .bind(jan1)
+                    .bind(body.posted_on)
+                    .bind(&body.id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => return storage_err(e),
+                    };
+                    let amount_cents = crate::excise::graduated_amount_cents(&tiers, ytd.0, bbl);
+                    ResolvedAmount {
+                        amount_cents,
+                        rate_source: "registry",
+                        excise_bbl: Some(bbl),
+                        ytd_bbl_before: Some(ytd.0),
+                    }
+                }
+                None => {
+                    let Some(rate) = body.fallback_rate_cents_per_bbl.filter(|r| *r > 0) else {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            format!(
+                                "no excise_rate_schedules row for {} and no positive \
+                                 fallback_rate_cents_per_bbl — seed the registry or pass a flat rate",
+                                body.jurisdiction
+                            ),
+                        )
+                            .into_response();
+                    };
+                    // Loud on purpose: the flat rate is the pre-registry
+                    // behavior kept alive for compatibility, and for the
+                    // brewery it understates TTB liability ~3.7×.
+                    tracing::warn!(
+                        jurisdiction = %body.jurisdiction,
+                        fallback_rate_cents_per_bbl = rate,
+                        excise_bbl = bbl,
+                        "no excise_rate_schedules row — accruing at the rule's FLAT \
+                         fallback rate; seed the graduated schedule to fix the curve"
+                    );
+                    ResolvedAmount {
+                        amount_cents: bbl * rate,
+                        rate_source: "flat-fallback",
+                        excise_bbl: Some(bbl),
+                        ytd_bbl_before: None,
+                    }
+                }
+            }
+        }
+        (None, Some(amount_cents)) => {
+            if amount_cents <= 0 {
+                return (StatusCode::BAD_REQUEST, "amount_cents must be positive").into_response();
+            }
+            ResolvedAmount {
+                amount_cents,
+                rate_source: "direct",
+                excise_bbl: None,
+                ytd_bbl_before: None,
+            }
+        }
+        (None, None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "provide excise_bbl (quantity basis) or amount_cents",
+            )
+                .into_response();
+        }
+    };
+
+    // `accrual_id` is the idempotency key — it doubles as the source_id
+    // on the financial_facts `(kind, source_table, source_id)` index AND
+    // the `source_id_path` the `ledger.tax.accrual.recorded` projection
+    // rule extracts on rebuild, so live + rebuild agree on fact identity.
+    // The quantity fields ride in the payload: `excise_bbl` is what the
+    // YTD tier sum reads back, `rate_source` + `ytd_bbl_before` are the
+    // provenance of the amount.
+    let mut payload = serde_json::json!({
+        "accrual_id": body.id,
+        "expense_account": body.expense_account,
+        "liability_account": body.liability_account,
+        "amount_cents": resolved.amount_cents,
+        "posted_on": body.posted_on,
+        "jurisdiction": body.jurisdiction,
+    });
+    if let Some(bbl) = resolved.excise_bbl {
+        payload["excise_bbl"] = serde_json::json!(bbl);
+        payload["rate_source"] = serde_json::json!(resolved.rate_source);
+    }
+    if let Some(ytd) = resolved.ytd_bbl_before {
+        payload["ytd_bbl_before"] = serde_json::json!(ytd);
+    }
+
+    let recorded = match crate::events::record_fact_in_tx(
         &mut tx,
         crate::events::FactWrite {
             kind: "finance.tax.accrued",
@@ -562,12 +733,12 @@ pub(super) async fn create_tax_accrual(
     )
     .await
     {
-        Ok(rec) => rec.id,
+        Ok(rec) => rec,
         Err(e) => return ledger_err(e),
     };
 
     let fact = crate::types::FactRef {
-        id: live_fact_id,
+        id: recorded.id,
         kind: "finance.tax.accrued",
         happened_on: body.posted_on,
         payload: &payload,
@@ -583,14 +754,16 @@ pub(super) async fn create_tax_accrual(
     // `finance.tax.accrued` fact from audit_log alone. Sharing the
     // income-tax kind would route the rebuild through the
     // `/filing_id`-keyed rule, which extracts a NULL source_id here and
-    // silently drops the fact. Recorded in the SAME tx (outbox phase 2).
-    if let Err(e) = crate::events::record_ledger_event_in_tx(
-        &mut tx,
-        &stamp,
-        "ledger.tax.accrual.recorded",
-        payload,
-    )
-    .await
+    // silently drops the fact. Recorded in the SAME tx (outbox phase 2),
+    // gated on the fact insert so a redelivery appends nothing.
+    if recorded.inserted
+        && let Err(e) = crate::events::record_ledger_event_in_tx(
+            &mut tx,
+            &stamp,
+            "ledger.tax.accrual.recorded",
+            payload,
+        )
+        .await
     {
         return ledger_err(e);
     }
@@ -599,7 +772,137 @@ pub(super) async fn create_tax_accrual(
         return storage_err(e);
     }
 
-    (StatusCode::OK, Json(serde_json::json!({ "id": body.id }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "id": body.id,
+            "amount_cents": resolved.amount_cents,
+            "rate_source": resolved.rate_source,
+            "ytd_bbl_before": resolved.ytd_bbl_before,
+        })),
+    )
+        .into_response()
+}
+
+// --- excise rate schedules (registry) --------------------------------------
+
+/// Body for `PUT /api/ledger/excise-rate-schedules` — upsert one
+/// schedule version. Versioning is by row: a rate change is a NEW row
+/// with a later `effective_from` (registry convention — append, don't
+/// mutate history); the upsert-on-conflict exists so seeds re-run
+/// idempotently and a mis-typed row can be corrected in place before
+/// it has accrued anything.
+#[derive(Deserialize)]
+pub(super) struct UpsertExciseRateScheduleBody {
+    jurisdiction: String,
+    effective_from: NaiveDate,
+    tiers: Vec<crate::excise::RateTier>,
+}
+
+pub(super) async fn upsert_excise_rate_schedule(
+    State(state): State<Arc<LedgerApiState>>,
+    CurrentUser(user): CurrentUser,
+    Json(body): Json<UpsertExciseRateScheduleBody>,
+) -> Response {
+    if let Some(r) = reject_if_auditor(&user) {
+        return r;
+    }
+    if body.jurisdiction.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "jurisdiction must be non-empty").into_response();
+    }
+    if let Err(e) = crate::excise::validate_tiers(&body.tiers) {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    let tiers_json = match serde_json::to_value(&body.tiers) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    let now = boss_clock_client::now_from(&state.clock).await;
+    let stamp = super::event_stamp(&state, &user, now).await;
+    let mut tx = match state.pool.begin().await {
+        Ok(t) => t,
+        Err(e) => return storage_err(e),
+    };
+    if let Err(e) = sqlx::query(
+        "INSERT INTO excise_rate_schedules (jurisdiction, effective_from, tiers) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (jurisdiction, effective_from) \
+         DO UPDATE SET tiers = EXCLUDED.tiers, updated_at = NOW()",
+    )
+    .bind(&body.jurisdiction)
+    .bind(body.effective_from)
+    .bind(&tiers_json)
+    .execute(&mut *tx)
+    .await
+    {
+        return storage_err(e);
+    }
+    // Control-plane audit trail (same posture as period lock/unlock +
+    // revenue-schedule create): the registry row is system-of-record,
+    // so the "who changed the tax curve and when" record rides the
+    // outbox in the same tx. Not a projection source — no rebuilder
+    // reads it.
+    if let Err(e) = crate::events::record_ledger_event_in_tx(
+        &mut tx,
+        &stamp,
+        "ledger.excise_rate_schedule.upserted",
+        serde_json::json!({
+            "jurisdiction": body.jurisdiction,
+            "effective_from": body.effective_from,
+            "tiers": tiers_json,
+        }),
+    )
+    .await
+    {
+        return ledger_err(e);
+    }
+    if let Err(e) = tx.commit().await {
+        return storage_err(e);
+    }
+
+    Json(serde_json::json!({
+        "jurisdiction": body.jurisdiction,
+        "effective_from": body.effective_from,
+        "tiers": body.tiers,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+pub(super) struct ListExciseRateSchedulesQuery {
+    #[serde(default)]
+    jurisdiction: Option<String>,
+}
+
+pub(super) async fn list_excise_rate_schedules(
+    State(state): State<Arc<LedgerApiState>>,
+    Query(q): Query<ListExciseRateSchedulesQuery>,
+) -> Response {
+    let rows: Result<Vec<(String, NaiveDate, serde_json::Value)>, _> = sqlx::query_as(
+        "SELECT jurisdiction, effective_from, tiers FROM excise_rate_schedules \
+         WHERE $1::text IS NULL OR jurisdiction = $1 \
+         ORDER BY jurisdiction, effective_from DESC",
+    )
+    .bind(q.jurisdiction.as_deref())
+    .fetch_all(&state.pool)
+    .await;
+    match rows {
+        Ok(rows) => {
+            let views: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|(jurisdiction, effective_from, tiers)| {
+                    serde_json::json!({
+                        "jurisdiction": jurisdiction,
+                        "effective_from": effective_from,
+                        "tiers": tiers,
+                    })
+                })
+                .collect();
+            Json(views).into_response()
+        }
+        Err(e) => storage_err(e),
+    }
 }
 
 #[derive(Deserialize)]

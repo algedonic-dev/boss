@@ -233,6 +233,13 @@ pub fn router(state: LedgerApiState) -> Router {
             "/api/ledger/tax-accruals",
             axum::routing::post(create_tax_accrual),
         )
+        // Graduated excise rates as registry data (brewery-fidelity Q4):
+        // jurisdiction-keyed, effective-dated tier schedules the accrual
+        // endpoint resolves instead of trusting a flat rule arg.
+        .route(
+            "/api/ledger/excise-rate-schedules",
+            get(list_excise_rate_schedules).put(upsert_excise_rate_schedule),
+        )
         .route("/api/ledger/tax-liability", get(tax_liability_summary))
         .route(
             "/api/ledger/revenue-schedules",

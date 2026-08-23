@@ -5,6 +5,7 @@
   import { session } from '@boss/web-kit/session/session.svelte';
   import { appNow, appToday } from '@boss/web-kit/sim-clock';
   import { needsPresence, performPresenceCeremony } from './presence';
+  import { describeWriteFailure, putStep } from './stepWrite';
 
   type StepData = {
     id: string;
@@ -35,9 +36,16 @@
     session.value.kind === 'ready' ? session.value.user.role : '',
   );
   let signError = $state('');
+  $effect(() => {
+    // The surface instance is reused when the rail switches steps —
+    // an error from step A must not render under step B.
+    void step.id;
+    signError = '';
+  });
 
   async function decide(d: string): Promise<void> {
     saving = true;
+    signError = '';
     try {
       const body: Record<string, unknown> = {
         ...step,
@@ -55,17 +63,17 @@
       };
       // Sign-off contract: a stamp attests the step's current shape, so the
       // decision lands first, then the stamp, then the completion.
-      // The server 409s a completion whose required stamps are
-      // missing or stale — surfaced inline below.
-      signError = '';
-      await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+      // Each leg is checked: a refused decision aborts the chain —
+      // stamping and completing a step whose decision the server
+      // rejected is how phantom approvals happen (packet cc9d7fc6).
+      const decided = await putStep(jobId, step.id, body);
+      if (decided.kind === 'failed') {
+        signError = decided.error;
+        return;
+      }
       const required = step.sign_offs_required ?? [];
       if (required.includes(userRole)) {
-        const stamp = await fetch(`/api/jobs/${jobId}/steps/${step.id}/sign-offs`, {
+        let stamp = await fetch(`/api/jobs/${jobId}/steps/${step.id}/sign-offs`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ role: userRole }),
@@ -77,7 +85,7 @@
         if (await needsPresence(stamp)) {
           try {
             const ticket = await performPresenceCeremony(jobId, step.id);
-            await fetch(`/api/jobs/${jobId}/steps/${step.id}/sign-offs`, {
+            stamp = await fetch(`/api/jobs/${jobId}/steps/${step.id}/sign-offs`, {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
@@ -87,20 +95,27 @@
             });
           } catch (e) {
             signError = e instanceof Error ? e.message : String(e);
+            // The decision DID land — refresh so the surface renders
+            // the recorded state, with the refusal beside it.
+            onUpdate();
+            return;
           }
+        }
+        if (!stamp.ok) {
+          signError = describeWriteFailure(
+            stamp.status,
+            await stamp.text().catch(() => ''),
+          );
+          onUpdate();
+          return;
         }
       }
       if (d === 'approved' || d === 'rejected') {
-        const done = await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ status: 'completed' }),
-        });
-        if (done.status === 409) {
-          const conflict = await done.json().catch(() => null);
-          const missing = conflict?.missing_or_stale_roles ?? [];
-          signError = `sign-offs outstanding: ${missing.join(', ')}`;
-        }
+        const done = await putStep(jobId, step.id, { status: 'completed' });
+        // 409 (stamps missing or stale) renders as the same
+        // "sign-offs outstanding: …" line as before — describeWriteFailure
+        // names the roles from the conflict body.
+        if (done.kind === 'failed') signError = done.error;
       }
       onUpdate();
     } finally {
@@ -116,7 +131,7 @@
   </div>
 
   {#if signError}
-    <p class="step-approval-error">{signError}</p>
+    <p class="step-write-error" role="alert">{signError}</p>
   {/if}
   {#if decision !== 'pending' && decision !== ''}
     <div class="step-approval-result step-approval-{decision}">

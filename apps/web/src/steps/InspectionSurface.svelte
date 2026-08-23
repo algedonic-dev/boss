@@ -13,6 +13,7 @@
   import Section from '@boss/web-kit/ui/Section.svelte';
   import { session } from '@boss/web-kit/session/session.svelte';
   import { appToday } from '@boss/web-kit/sim-clock';
+  import { describeWriteFailure, putStep } from './stepWrite';
 
   type StepData = {
     id: string;
@@ -47,6 +48,13 @@
   let result = $state<string>(String(step.metadata.overall_result ?? ''));
   let notes = $state<string>(String(step.metadata.inspector_notes ?? ''));
   let saving = $state(false);
+  let writeError = $state<string | null>(null);
+  $effect(() => {
+    // The surface instance is reused when the rail switches steps —
+    // an error from step A must not render under step B.
+    void step.id;
+    writeError = null;
+  });
 
   let sku = $state<string | null>(null);
   let model = $state<CatalogModel | null>(null);
@@ -96,6 +104,7 @@
 
   async function save(newStatus?: string): Promise<void> {
     saving = true;
+    writeError = null;
     try {
       const body: Record<string, unknown> = {
         ...step,
@@ -110,27 +119,36 @@
       const completing = newStatus === 'completed' && required.length > 0;
       if (newStatus && !completing) body.status = newStatus;
       // Metadata first, then stamps attesting the final shape, then
-      // the status flip. Server gates the completion.
-      await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+      // the status flip. Server gates the completion. Every leg is
+      // checked — a refused write aborts the chain and renders inline
+      // instead of stamping/completing on top of it (packet cc9d7fc6).
+      const wrote = await putStep(jobId, step.id, body);
+      if (wrote.kind === 'failed') {
+        writeError = wrote.error;
+        return;
+      }
       if (completing) {
         const myRole =
           session.value.kind === 'ready' ? session.value.user.role : '';
         if (required.includes(myRole)) {
-          await fetch(`/api/jobs/${jobId}/steps/${step.id}/sign-offs`, {
+          const stamp = await fetch(`/api/jobs/${jobId}/steps/${step.id}/sign-offs`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ role: myRole }),
           });
+          if (!stamp.ok) {
+            writeError = describeWriteFailure(
+              stamp.status,
+              await stamp.text().catch(() => ''),
+            );
+            // The metadata write DID land — refresh so the surface
+            // renders the recorded state, with the refusal beside it.
+            onUpdate();
+            return;
+          }
         }
-        await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ status: 'completed' }),
-        });
+        const done = await putStep(jobId, step.id, { status: 'completed' });
+        if (done.kind === 'failed') writeError = done.error;
       }
       onUpdate();
     } finally {
@@ -180,6 +198,10 @@
             ></textarea>
           </div>
       </Section>
+
+      {#if writeError}
+        <p class="step-write-error" role="alert">{writeError}</p>
+      {/if}
 
       <div class="step-actions">
         {#if isPending(step.status)}

@@ -142,7 +142,18 @@
   // it they keep browsing a shell that looks signed in while every
   // request fails, which is precisely how the expiry that killed
   // demo mode presented.
+  //
+  // Identity PROBES are exempt. `/api/session` and `/api/auth/*` are
+  // the questions "who am I" — a 401 there is the ANSWER (nobody),
+  // consumed by the session state machine, not an expiry mid-browse.
+  // Redirecting on the probe made `session.value = unauthenticated`
+  // unreachable: loadSession's own fetch bounced the visitor before
+  // the state could ever render, so MePage's advice for that state
+  // ("reload to log in") described a loop, not a way in. Data reads
+  // and writes still redirect — that is the interceptor's real job.
   {
+    const isIdentityProbe = (url: string): boolean =>
+      url.startsWith('/api/session') || url.startsWith('/api/auth/');
     const _origFetch = window.fetch;
     window.fetch = (async (
       input: RequestInfo | URL,
@@ -155,7 +166,7 @@
           : input instanceof URL ? input.href : input.url;
         // Only redirect on /api/* — let app-internal 401 handling
         // for non-API resources stay where the call was made.
-        if (url.startsWith('/api/')) {
+        if (url.startsWith('/api/') && !isIdentityProbe(url)) {
           const next = encodeURIComponent(window.location.pathname + window.location.search);
           window.location.href = `/login?next=${next}`;
         }

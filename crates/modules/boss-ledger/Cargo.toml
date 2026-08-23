@@ -77,6 +77,10 @@ name = "control_plane_audit_trail"
 required-features = ["postgres"]
 
 [[test]]
+name = "excise_rates_e2e"
+required-features = ["postgres"]
+
+[[test]]
 name = "from_paid_invoice_shapes_pg"
 required-features = ["postgres"]
 

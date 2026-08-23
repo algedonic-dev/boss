@@ -1570,7 +1570,9 @@ metadata_defaults = { kind = "income", jurisdiction = "US-FEDERAL" }
 # `[periodic.quarterly-excise]`. Same three-step shape as the other
 # tax filings; metadata kind="excise" routes to the 2320 Excise Tax
 # Payable liability account at remit time. The liability is accrued
-# per brew batch (DR 6550 / CR 2320 = excise_bbl × $3.50/bbl) by the
+# per brew batch (DR 6550 / CR 2320, rate graduated over the year's
+# taxed barrels via the excise_rate_schedules registry — see
+# seeds/excise_rates.toml for the TTB curve) by the
 # `excise-accrue-on-production-produce-step-done` dispatcher rule, so
 # this filing's `period-excise` derive_basis sums the 2320 credit
 # balance for the quarter and the terminal step drains it to Cash.

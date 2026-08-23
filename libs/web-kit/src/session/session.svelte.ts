@@ -196,6 +196,11 @@ export function setPersona(id: string): void {
   const emp = session.roster.find((e) => e.id === id);
   if (emp) {
     session.fromGateway = false;
+    // A persona switch is a full identity change. `readonly` belongs
+    // to the guest identity, not to the tab — leaving it set kept a
+    // once-guest session rendering GuestHome and inert write surfaces
+    // after it became a real operator.
+    session.readonly = false;
     session.value = { kind: 'ready', user: emp };
   }
 }

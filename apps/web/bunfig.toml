@@ -6,3 +6,11 @@
 
 [serve.static]
 plugins = ["bun-plugin-svelte"]
+
+# `bun test` has no Svelte pass, so `*.svelte.ts` modules (session
+# envelope et al.) would throw on their module-level rune calls the
+# moment a unit test imports them. The preload shims those runes as
+# identity functions — values and transitions stay assertable; the
+# mocked suite owns everything reactive.
+[test]
+preload = ["./tests/rune-preload.ts"]

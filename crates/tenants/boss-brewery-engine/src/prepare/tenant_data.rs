@@ -419,6 +419,17 @@ pub fn seed_tenant_data(
         info!(base = %bases.ledger, "ledger base unreachable — skipping raw-material opening JEs");
     }
 
+    // Graduated excise rate schedules (brewery-fidelity Q4): the
+    // US-FEDERAL TTB curve lands as registry rows so accruals run the
+    // real graduated math instead of the dispatcher rule's flat
+    // fallback. Ledger-only — independent of the inventory-gated
+    // opening-JE block above.
+    if base_reachable(&client, &bases.ledger, "/api/ledger/health") {
+        ensure_excise_rate_schedules(&client, &bases.ledger, &headers, seeds_dir)?;
+    } else {
+        info!(base = %bases.ledger, "ledger base unreachable — skipping excise rate schedules");
+    }
+
     if base_reachable(&client, &bases.catalog, "/api/catalog/health") {
         ensure_equipment_catalog(&client, &bases.catalog, &headers, seeds_dir)?;
         ensure_marketing_assets(&client, &bases.catalog, &headers, seeds_dir)?;
@@ -2000,6 +2011,72 @@ fn ensure_cash_opening_balance(
         total_cost_cents = CASH_OPENING_BALANCE_CENTS,
         "cash opening-balance JE posted (DR 1000 / CR 3000 Retained Earnings)"
     );
+    Ok(())
+}
+
+/// Seed the excise-tax rate schedules from
+/// `seeds/excise_rates.toml` into the ledger's
+/// `excise_rate_schedules` registry (brewery-fidelity Q4: rates are
+/// registry data, not rule args). PUT is an upsert on
+/// `(jurisdiction, effective_from)`, so re-running prepare converges
+/// instead of duplicating; tier-shape validation happens ledger-side
+/// so the constraint has one home. Without these rows the accrual
+/// endpoint falls back — loudly — to the dispatcher rule's flat
+/// $3.50/bbl, which understates real TTB liability ~3.7× at the
+/// tenant's stated volume.
+fn ensure_excise_rate_schedules(
+    client: &Client,
+    ledger_base: &str,
+    headers: &reqwest::header::HeaderMap,
+    seeds_dir: &Path,
+) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct ExciseRatesSeed {
+        #[serde(default)]
+        schedule: Vec<ExciseScheduleSeed>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ExciseScheduleSeed {
+        jurisdiction: String,
+        effective_from: String,
+        tiers: Vec<serde_json::Value>,
+    }
+
+    let path = seeds_dir.join("excise_rates.toml");
+    let seed: ExciseRatesSeed = toml::from_str(
+        &std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("parse {}", path.display()))?;
+
+    let url = format!("{ledger_base}/api/ledger/excise-rate-schedules");
+    for schedule in &seed.schedule {
+        let body = json!({
+            "jurisdiction": schedule.jurisdiction,
+            "effective_from": schedule.effective_from,
+            "tiers": schedule.tiers,
+        });
+        let resp = client
+            .put(&url)
+            .headers(headers.clone())
+            .json(&body)
+            .send()
+            .with_context(|| format!("PUT {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().unwrap_or_default();
+            anyhow::bail!(
+                "PUT {url} for {} @ {} returned {status}: {text}",
+                schedule.jurisdiction,
+                schedule.effective_from
+            );
+        }
+        info!(
+            jurisdiction = %schedule.jurisdiction,
+            effective_from = %schedule.effective_from,
+            tiers = schedule.tiers.len(),
+            "excise rate schedule seeded"
+        );
+    }
     Ok(())
 }
 

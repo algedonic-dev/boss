@@ -244,8 +244,12 @@
   <div class="theme-exec" style="padding: 32px">Loading session…</div>
 {:else if session.value.kind === 'unauthenticated'}
   <div class="theme-exec" style="padding: 32px">
+    <!-- True copy for a reachable state: the way in is the login
+         page, linked. The old line said "reload the page to log in"
+         — a reload only re-ran the session probe and landed back
+         here. After sign-in, / renders this person's day. -->
     <p class="empty">
-      Not signed in. Reload the page to log in.
+      Not signed in. <a href="/login">Sign in</a> to see your day.
     </p>
   </div>
 {:else if session.value.kind === 'unrecognized'}

@@ -54,10 +54,23 @@ const JOB = {
   steps: [STEP],
 };
 
+// The spec drives the surface's write controls, so it must BE someone
+// who may write. Unmocked, /api/session falls through to the
+// dev-server's default — the audit-readonly guest — and the readonly
+// gate (correctly) renders every control disabled.
+const EMP = {
+  id: 'emp-bootstrap-admin', name: 'Bootstrap Admin', email: 'admin@boss',
+  role: 'platform-admin', department: 'it', hire_date: '2023-01-01',
+  status: 'active', location: 'hq', employment_type: 'full-time',
+  skills: [], certifications: [],
+};
+
 test.describe('full-page step route without a plugin', () => {
   test.beforeEach(async ({ page }) => {
     await page.route(/\/api\/tenant\/manifest$/, (r) => r.fulfill({ json: MANIFEST }));
-    await page.route(/\/api\/people$/, (r) => r.fulfill({ json: [] }));
+    await page.route(/\/api\/people$/, (r) => r.fulfill({ json: [EMP] }));
+    await page.route(/\/api\/session$/, (r) =>
+      r.fulfill({ json: { username: EMP.email, employee_id: EMP.id, role: EMP.role } }));
     await page.route(new RegExp(`/api/jobs/${JOB_ID}$`), (r) => r.fulfill({ json: JOB }));
     await page.route(new RegExp(`/api/jobs/${JOB_ID}/steps/${STEP_ID}$`), async (route) => {
       if (route.request().method() === 'GET') return route.fulfill({ json: STEP });

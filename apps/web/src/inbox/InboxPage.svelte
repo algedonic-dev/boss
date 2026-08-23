@@ -6,6 +6,7 @@
   import FilterGroup from '@boss/web-kit/ui/FilterGroup.svelte';
   import FilterButton from '@boss/web-kit/ui/FilterButton.svelte';
   import SearchInput from '@boss/web-kit/ui/SearchInput.svelte';
+  import WriteGate from '@boss/web-kit/ui/WriteGate.svelte';
   import type { Message, MessageKind } from './types';
   import type { Employee } from '../people/types';
   import { href, navigate } from '../router';
@@ -176,7 +177,12 @@
   />
 
   <div style="padding:0 32px 12px">
-    <button class="hr-action-btn" onclick={() => (composing = true)}>Compose</button>
+    <!-- The composer's entry stands behind the readonly gate: a guest
+         sees Compose disabled with the sign-in note, not a live modal
+         whose Send 403s. -->
+    <WriteGate>
+      <button class="hr-action-btn" onclick={() => (composing = true)}>Compose</button>
+    </WriteGate>
   </div>
 
   {#if composing}

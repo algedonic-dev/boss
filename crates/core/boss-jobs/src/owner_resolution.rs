@@ -201,10 +201,21 @@ impl RosterLookup for ReqwestRosterLookup {
             return Ok(holders.clone());
         }
         let holders = self.holders_uncached(role).await?;
-        self.cache
-            .lock()
-            .unwrap()
-            .insert(role.to_string(), (Instant::now(), holders.clone()));
+        // Absence is not a fact worth remembering. At bootstrap an
+        // empty roster for a role is exactly the state about to change
+        // — the baseline seed races the first spawn rules — and caching
+        // it for the full TTL converted that one-second race into a
+        // fatal minute: the brewery prepare's Q7 resolution failed
+        // against a poisoned entry while the just-seeded admin sat
+        // invisible, aborting the whole fresh install (2026-08-22).
+        // Populated rosters keep the cache that shields people-api
+        // from sim bursts; emptiness gets re-asked.
+        if !holders.is_empty() {
+            self.cache
+                .lock()
+                .unwrap()
+                .insert(role.to_string(), (Instant::now(), holders.clone()));
+        }
         Ok(holders)
     }
 
@@ -309,5 +320,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(owner, "emp-lead-1");
+    }
+
+    /// The 2026-08-22 fresh-install abort: docs indexing fired a spawn
+    /// rule before the baseline seed ran, the resulting empty
+    /// platform-admin lookup was cached for the full TTL, and the
+    /// brewery prepare's morning-brew bootstrap then failed Q7 against
+    /// the poisoned cache while the just-seeded admin sat invisible —
+    /// aborting the install. Absence at bootstrap is exactly the state
+    /// about to change; it must be re-asked, while populated rosters
+    /// keep the cache that protects people-api from sim bursts.
+    #[tokio::test]
+    async fn an_empty_holder_list_is_not_cached() {
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+
+        let people: Arc<StdMutex<Vec<serde_json::Value>>> = Arc::new(StdMutex::new(vec![]));
+        let served = people.clone();
+        let app = axum::Router::new().route(
+            "/api/people",
+            axum::routing::get(move || {
+                let rows = served.lock().unwrap().clone();
+                async move { axum::Json(serde_json::Value::Array(rows)) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let roster = ReqwestRosterLookup::new(base);
+        assert_eq!(
+            roster.active_holders("platform-admin").await.unwrap(),
+            Vec::<String>::new(),
+            "roster starts empty"
+        );
+
+        // The baseline seed lands one second later.
+        people.lock().unwrap().push(serde_json::json!({
+            "id": "emp-admin", "role": "platform-admin", "status": "active"
+        }));
+        assert_eq!(
+            roster.active_holders("platform-admin").await.unwrap(),
+            vec!["emp-admin".to_string()],
+            "the just-seeded admin must be visible immediately — empty is not a fact"
+        );
+
+        // A populated roster IS cached: a second holder appearing does
+        // not show up until the TTL expires.
+        people.lock().unwrap().push(serde_json::json!({
+            "id": "emp-admin-2", "role": "platform-admin", "status": "active"
+        }));
+        assert_eq!(
+            roster.active_holders("platform-admin").await.unwrap(),
+            vec!["emp-admin".to_string()],
+            "populated results keep the TTL cache"
+        );
     }
 }

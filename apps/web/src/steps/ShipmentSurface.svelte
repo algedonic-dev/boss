@@ -1,5 +1,6 @@
 <script lang="ts">
   import { isPending, isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
+  import { putStep } from './stepWrite';
   // Shipment step surface — wholesale-keg-order's last tier and
   // the equipment-preventive-maintenance depot-return path. Captures carrier +
   // tracking + ETA so the wholesale-courier counterparty's scan
@@ -45,6 +46,13 @@
   let deliveredDate = $state(pickStr('delivered_date'));
   let notes = $state(step.notes ?? '');
   let saving = $state(false);
+  let writeError = $state<string | null>(null);
+  $effect(() => {
+    // The surface instance is reused when the rail switches steps —
+    // an error from step A must not render under step B.
+    void step.id;
+    writeError = null;
+  });
   let terminal = $derived(_isTerminal(step.status));
 
 
@@ -66,6 +74,7 @@
 
   async function persist(status?: string): Promise<void> {
     saving = true;
+    writeError = null;
     try {
       const body = {
         ...step,
@@ -81,11 +90,11 @@
           delivered_date: deliveredDate || undefined,
         },
       };
-      await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+      const res = await putStep(jobId, step.id, body);
+      if (res.kind === 'failed') {
+        writeError = res.error;
+        return;
+      }
       onUpdate();
     } finally {
       saving = false;
@@ -191,6 +200,10 @@
       disabled={terminal}
     ></textarea>
   </div>
+
+  {#if writeError}
+    <p class="step-write-error" role="alert">{writeError}</p>
+  {/if}
 
   <div class="step-actions">
     {#if !terminal && isPending(step.status)}
