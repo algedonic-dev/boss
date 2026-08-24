@@ -20,8 +20,12 @@ cd "$(dirname "$0")/../.."
 
 # --line-number over tracked files only; the pattern catches macOS
 # home paths and agent scratch dirs in one pass.
-hits=$(git grep -nE '/Users/[a-z]+/|\.claude/jobs/' -- 'apps/' 'crates/' 'infra/' \
-    ':!infra/lint/no-session-paths.sh' || true)
+# The scan body is shared (lib/pattern-scan.sh): it excludes this file
+# and any test that must name the pattern to prove the rule. The docs/
+# exemption below is this lint's own judgement and stays visible here —
+# runbooks legitimately TELL the story of a machine-local path.
+. "$(dirname "$0")/lib/pattern-scan.sh"
+hits=$(pattern_scan '/Users/[a-z]+/|\.claude/jobs/' -- 'apps/' 'crates/' 'infra/')
 if [ -n "$hits" ]; then
     echo "no-session-paths: tracked source names a machine-local or session path:" >&2
     echo "$hits" >&2
