@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 # migrate.sh — the only path schema takes into a database.
 #
-# The ordered migration list IS schema/*.sql, sorted by its NNN- prefix.
+# The ordered migration list IS schema/*.sql, sorted by its numeric
+# prefix. NEW migrations take a UTC `YYYYMMDDHHMM-` prefix; the legacy
+# `NNN-` files keep theirs forever (renaming an applied migration
+# changes its checksum, which is the 2026-08-13 outage). Both sort
+# correctly together because every timestamp exceeds every legacy
+# number under `sort -t- -k1,1n`. A timestamp is not allocated from a
+# shared counter, so two branches cannot collide on one — which the
+# `NNN-` scheme could not promise and twice did not.
 # Files not yet recorded in schema_migrations are applied in order, each
 # in one transaction WITH its bookkeeping row — so a re-run never
 # re-applies, and a failed migration leaves nothing behind. A schema
