@@ -11,7 +11,6 @@
 // ignores it entirely.
 
 const STORAGE_KEY = 'boss.persona.empId';
-const DEFAULT_EMP_ID = 'emp-001'; // CEO
 
 /// Name of the cookie that tells the dev-server / gateway which
 /// persona the user is currently viewing as (demo mode only). The
@@ -125,16 +124,6 @@ export function classifyProbe(
   return null;
 }
 
-function readStoredPersona(byId: Map<string, Employee>): string {
-  try {
-    const s = localStorage.getItem(STORAGE_KEY);
-    if (s && byId.has(s)) return s;
-  } catch {
-    // localStorage unavailable — fall through
-  }
-  return DEFAULT_EMP_ID;
-}
-
 export async function loadSession(): Promise<void> {
   // 1. Fetch the roster first — it's the universe for every lookup.
   let roster: Employee[] = [];
@@ -149,7 +138,6 @@ export async function loadSession(): Promise<void> {
 
   // 2. Gateway session probe — a successful hit with a resolved
   //    employee_id wins.
-  const storedPersona = readStoredPersona(byId);
   try {
     const r = await fetch('/api/session', { credentials: 'same-origin' });
     if (r.ok) {

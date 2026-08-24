@@ -38,16 +38,21 @@
 #                                      stamp — wall by decision)
 #   * **/tests/                       (test files; no production
 #                                      runtime)
-#   * #[cfg(test)] mod tests          (inline test blocks — handled
-#                                      via tests/ path filter +
-#                                      explicit `mod tests` skipping)
+#   * #[cfg(test)] items              (inline test blocks — the
+#                                      exemption is the attributed
+#                                      item's BODY, brace-counted; it
+#                                      used to run to end-of-file and
+#                                      swallowed three production
+#                                      callsites, see
+#                                      `in_cfg_test_item` below)
 #   * cli boundary tools (e.g. boss-cli emit) — call with the path
 #     argument to the lint when extending
 #
-# Exit 0 = clean, 1 = violations.
-#
 # Usage:
-#   ./infra/lint/no-wallclock.sh
+#   ./infra/lint/no-wallclock.sh              # scan the tree
+#   ./infra/lint/no-wallclock.sh --self-test  # pin the cfg(test) rule
+#
+# Exit 0 = clean, 1 = violations.
 #
 # Wire into CI by adding to the PR-time check matrix.
 
@@ -181,6 +186,24 @@ ALLOWED_FILES=(
   "crates/orchestrators/boss-cli/src/main.rs"
   # docs_flush is a CLI snapshot tool, runs at operator request
   "crates/orchestrators/boss-cli/src/docs_flush.rs"
+  # The train conductor, same class as its two siblings above and
+  # adjudicated on the heuristic repair that first made it visible
+  # (packet 5cccfbee, 2026-08-23). It stamps `completed_at` into a
+  # step's metadata payload because a step carries only a completion
+  # DATE and the arrival report's timings are real durations of real
+  # CI runs. Wall is the only reading that means anything there: a
+  # conductor run is IT-department work in the real world, not a date
+  # in the brewery's simulated calendar, and the Job it writes to is
+  # non-simulated. Rule 1 is untouched — this is a payload field, and
+  # the record stamp is still minted by EventStamp.
+  "crates/orchestrators/boss-cli/src/train.rs"
+  # The sim binary's `went_live=` marker on the regenerate-deployment
+  # backfill step: when did this regen actually go live, in real time.
+  # Deployment bookkeeping on a real Job, not a brewery business date
+  # — the same reason this file is already allowed by the SQL pass
+  # below. Surfaced by the same heuristic repair; its mid-file
+  # `mod day_cursor_tests` was what hid it.
+  "crates/tenants/boss-brewery-engine/src/bin/boss_brewery_sim.rs"
   # Operator-baseline seed: stamps via BOSS_EPOCH_START now
   # (v1.0.5 fix), but the binary's own clock fallback is OK
   "crates/modules/boss-people/src/bin/boss_operator_baseline_seed.rs"
@@ -240,6 +263,132 @@ else
   }
 fi
 
+# Is FILE:LINE inside the body of a `#[cfg(test)]` item? Prints
+# "test" or "prod".
+#
+# THE BUG THIS REPLACES (packet 5cccfbee). The old rule was "find the
+# nearest preceding `#[cfg(test)]`; if there is one, the hit is test
+# code." A `#[cfg(test)]` attribute applies to ONE item, but that rule
+# never closed the region, so the first one in a file exempted every
+# line after it — silently, with the lint still printing "clean".
+# Three production callsites were swallowed that way, and none of them
+# was in a test:
+#
+#   boss-cli/src/train.rs:465        #[cfg(test)] on a const fn
+#                                    → hid line 2376, 1900 lines later
+#   boss-cli/src/docs_flush.rs:790   #[cfg(test)] on a fn
+#                                    → hid `today()` six lines later
+#   boss_brewery_sim.rs:1226         a MID-FILE `mod day_cursor_tests`
+#                                    → hid line 1563
+#
+# A lint whose exemption has no end is not an allowlist, it is a
+# silence, and this one grew every time somebody added an inline test
+# helper high in a file. All three are adjudicated below now — two as
+# explicit ALLOWED_FILES entries with a reason, one already allowed —
+# which is the mechanism the header promises.
+#
+# THE RULE NOW: the exemption is exactly the attributed item's body,
+# found by counting braces from the item header to its match. Nothing
+# outside a `#[cfg(test)]` item can be exempted by this pass, so a new
+# leak anywhere else is loud on the run that introduces it. Bodiless
+# items (`#[cfg(test)] use ...;`) end at their semicolon. Pinned by
+# `--self-test`.
+in_cfg_test_item() {
+  awk -v target="$2" '
+    function braces(s,   t, o, c) {
+      t = s; o = gsub(/\{/, "", t)
+      t = s; c = gsub(/\}/, "", t)
+      return o - c
+    }
+    {
+      seg = $0
+      if (state == "" || state == "out") {
+        if ($0 ~ /^[[:space:]]*#\[cfg\(test\)\]/) {
+          state = "pending"
+          # Anything trailing on the attribute line is the item start
+          # (`#[cfg(test)] mod tests {` on one line).
+          sub(/^[[:space:]]*#\[cfg\(test\)\]/, "", seg)
+        } else {
+          seg = ""
+        }
+      } else if (state == "pending") {
+        # Stacked attributes, doc comments and blanks sit between the
+        # attribute and the item it applies to.
+        if ($0 ~ /^[[:space:]]*(#\[|\/\/|$)/) {
+          seg = ""
+        } else {
+          state = "item"; depth = 0; opened = 0
+        }
+      }
+      if (state == "pending" && seg ~ /[^[:space:]]/) {
+        state = "item"; depth = 0; opened = 0
+      }
+      if (state == "item") {
+        depth += braces(seg)
+        if (seg ~ /\{/) { opened = 1 }
+        if (opened && depth <= 0) { ending = 1 }
+        else if (!opened && seg ~ /;[[:space:]]*$/) { ending = 1 }
+        else { ending = 0 }
+      }
+      if (NR == target) { print (state == "item" ? "test" : "prod"); exit }
+      if (state == "item" && ending) { state = "out"; ending = 0 }
+    }
+  ' "$1" 2>/dev/null || echo "prod"
+}
+
+# --self-test: the classifier against a fixture carrying both shapes
+# that used to swallow a file. Runs without touching the tree.
+if [ "${1:-}" = "--self-test" ]; then
+  fixture=$(mktemp -t no-wallclock-selftest.XXXXXX)
+  trap 'rm -f "$fixture"' EXIT
+  cat >"$fixture" <<'FIXTURE'
+use chrono::Utc;
+
+impl Policy {
+    /// A test-only constructor. FUNCTION-level `#[cfg(test)]`, not a
+    /// module — the item ends at its closing brace.
+    #[cfg(test)]
+    pub(crate) const fn immediate() -> Self {
+        Policy
+    }
+}
+
+fn production_leak() -> String {
+    Utc::now().to_rfc3339()
+}
+
+#[cfg(test)]
+mod mid_file_tests {
+    use super::*;
+    #[test]
+    fn t() {
+        let _ = Utc::now();
+    }
+}
+
+fn second_production_leak() -> String {
+    Utc::now().to_rfc3339()
+}
+FIXTURE
+  # line 13 production, line 21 inside the test mod, line 26 production
+  # again — the case a never-closing exemption gets wrong.
+  st_fail=0
+  for probe in "13:prod" "21:test" "26:prod"; do
+    ln="${probe%%:*}"; want="${probe##*:}"
+    got=$(in_cfg_test_item "$fixture" "$ln")
+    if [ "$got" != "$want" ]; then
+      echo "self-test FAIL: line $ln classified '$got', expected '$want'"
+      st_fail=1
+    fi
+  done
+  if [ "$st_fail" -eq 0 ]; then
+    echo "no-wallclock --self-test: ok (cfg(test) exemption is bounded to the item)"
+    exit 0
+  fi
+  echo "no-wallclock --self-test: FAILED — the cfg(test) exemption is leaking past the item it applies to."
+  exit 1
+fi
+
 # Drop doc-comment lines (`///` or `//` with Utc::now in prose).
 # Match `Utc::now` on a word boundary: catches `chrono::Utc::now()`,
 # bare `Utc::now()` (after `use chrono::Utc;`), and the
@@ -247,26 +396,13 @@ fi
 # excludes identifiers like `now_from`. All leak the same way.
 raw_hits=$(search | grep -v '^[^:]*:\s*[0-9]*:\s*//' || true)
 
-# Filter out lines that fall inside an inline `mod tests` block.
-# The cheap heuristic: for each hit, find the nearest preceding
-# `#[cfg(test)] mod tests` or `#[test]` marker in the same file.
-# If the hit's line number > that marker's line number, the hit
-# is test code → drop. Awk does this in one pass per file.
 hits=""
 while IFS= read -r line; do
   [ -z "$line" ] && continue
   file="${line%%:*}"
   rest="${line#*:}"
   lineno="${rest%%:*}"
-  # Find last marker line number at or before this hit's line.
-  marker_lineno=$(awk -v target="$lineno" '
-    /^#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(test\)\]/ { mark = NR }
-    /^[[:space:]]*mod tests/ && prev_cfg { mark = NR; prev_cfg = 0 }
-    /^#\[cfg\(test\)\]/ { prev_cfg = 1; next }
-    NR == target { print mark; exit }
-  ' "$file" 2>/dev/null || echo "")
-  if [ -n "$marker_lineno" ] && [ "$marker_lineno" -gt 0 ]; then
-    # Hit is after the test-mod marker → skip
+  if [ "$(in_cfg_test_item "$file" "$lineno")" = "test" ]; then
     continue
   fi
   hits+="$line"$'\n'

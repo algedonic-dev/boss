@@ -727,12 +727,15 @@ impl Workforce {
         // existing keys, then fill any required field the Workflow didn't
         // already default.
         let mut md = metadata.as_object().cloned().unwrap_or_default();
-        self.fill_required_fields(kind, &mut md, now);
+        self.fill_required_fields(kind, &mut md, step_id, now);
         // Inline authoring: the step's own required fields
         // are part of the completion contract too.
         for (name, field_type) in authored_fields {
             if !md.contains_key(name) {
-                md.insert(name.clone(), synth_field_value(field_type, name, now));
+                md.insert(
+                    name.clone(),
+                    synth_field_value(field_type, name, step_id, now),
+                );
             }
         }
         // Gates (demand-gate / availability-gate) are agent-executed: the
@@ -775,11 +778,13 @@ impl Workforce {
     /// with type-appropriate values — the simulated executor supplying the
     /// inputs a human would type before marking the step done. Existing
     /// keys (Workflow defaults, values set on an earlier transition) are
-    /// never overwritten.
+    /// never overwritten. `step_id` is the spread key for enum-typed
+    /// fields: stable per step, varied across the population.
     fn fill_required_fields(
         &self,
         kind: &str,
         md: &mut serde_json::Map<String, Value>,
+        step_id: &str,
         now: DateTime<Utc>,
     ) {
         let Some(fields) = self.required_fields.get(kind) else {
@@ -791,7 +796,7 @@ impl Workforce {
             }
             md.insert(
                 f.name.clone(),
-                synth_field_value(&f.field_type, &f.name, now),
+                synth_field_value(&f.field_type, &f.name, step_id, now),
             );
         }
     }
@@ -922,10 +927,10 @@ fn workable_assignee<'a>(
 /// A reasonable value for a required field, by its StepType `field_type` —
 /// what a human executor would put in the box. Type-valid against
 /// `boss_jobs::step_registry::validate_field_type`: dates/times get a real
-/// instant, enums (pipe-joined) pick the leading variant (the happy-path
-/// outcome for most: `pass`, `completed`, …), and free text gets a
-/// readable label derived from the field name.
-fn synth_field_value(field_type: &str, name: &str, now: DateTime<Utc>) -> Value {
+/// instant, enums (pipe-joined) spread deterministically over ALL their
+/// variants (see `enum_variant`), and free text gets a readable label
+/// derived from the field name.
+fn synth_field_value(field_type: &str, name: &str, step_id: &str, now: DateTime<Utc>) -> Value {
     match field_type {
         "number" | "integer" => json!(1),
         "boolean" => json!(true),
@@ -934,12 +939,48 @@ fn synth_field_value(field_type: &str, name: &str, now: DateTime<Utc>) -> Value 
         "date" => json!(now.date_naive().to_string()), // YYYY-MM-DD (len 10)
         "date-time" => json!(now.to_rfc3339()),        // len ≥ 19
         "uri" => json!("https://docs.example.internal/sop"),
-        // Enum types are pipe-joined; the first variant is the conventional
-        // happy-path value.
-        s if s.contains('|') => json!(s.split('|').next().unwrap_or("")),
+        // Enum types are pipe-joined.
+        s if s.contains('|') => json!(enum_variant(s, name, step_id)),
         // "string" / "id-ref" / anything else accepts any string.
         _ => json!(humanize(name)),
     }
+}
+
+/// Pick one variant of a pipe-joined enum by hash-spreading over the
+/// step's identity.
+///
+/// Always taking the leading variant made every synthesized outcome a
+/// constant — all ten closed `tasting-panel` packets carried
+/// `verdict: "release"`, so the hold rate read 0% by construction and
+/// any outcome-distribution measured over sim traffic measured nothing.
+/// Spreading over `(step_id, field)` gives the same step the same answer
+/// on every replay while the population visits every variant. The field
+/// name is in the key so two enums on one step draw independently.
+/// Unweighted and uniform: the sim has no ground truth about how often a
+/// real panel holds a batch, and inventing weights would dress a guess
+/// up as data.
+fn enum_variant<'a>(field_type: &'a str, name: &str, step_id: &str) -> &'a str {
+    let variants: Vec<&str> = field_type.split('|').collect();
+    let h = fxhash(&format!("{step_id}\u{1f}{name}"));
+    // Fold the high half down before the modulus. FNV-1a's low bits are
+    // weak — bit 0 is just the parity of the input bytes — so a two-value
+    // enum keyed on the raw hash makes every field on a step agree.
+    // `split` always yields at least one item, so the modulus is safe.
+    let idx = ((h ^ (h >> 32)) as usize) % variants.len();
+    variants[idx]
+}
+
+/// Small stable string hash (FNV-1a) — NOT `DefaultHasher`, whose seed
+/// varies per process and would make a replayed run pick different
+/// values than the run it replays. Same shape as the owner-resolution
+/// spread in `boss-jobs`.
+fn fxhash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 /// `"document_title"` → `"Document title"`: a readable label for a synthetic
@@ -1155,14 +1196,15 @@ mod tests {
     #[test]
     fn synth_field_value_is_type_valid_per_kind() {
         let now = fixed_now();
+        let step = "step-1";
         // Free text -> a readable label derived from the field name.
         assert_eq!(
-            synth_field_value("string", "document_title", now),
+            synth_field_value("string", "document_title", step, now),
             json!("Document title")
         );
         // date-time -> RFC3339 (the validator requires len >= 19).
         assert!(
-            synth_field_value("date-time", "scheduled_at", now)
+            synth_field_value("date-time", "scheduled_at", step, now)
                 .as_str()
                 .unwrap()
                 .len()
@@ -1170,23 +1212,103 @@ mod tests {
         );
         // date -> YYYY-MM-DD (the validator requires len == 10).
         assert_eq!(
-            synth_field_value("date", "due", now)
+            synth_field_value("date", "due", step, now)
                 .as_str()
                 .unwrap()
                 .len(),
             10
         );
-        // enum -> leading variant.
-        assert_eq!(
-            synth_field_value("pass|fail|conditional", "result", now),
-            json!("pass")
-        );
+        // enum -> one of the declared variants (which one is the step's
+        // own deterministic draw; see enum_choice_* below).
+        let picked = synth_field_value("pass|fail|conditional", "result", step, now);
+        assert!(matches!(
+            picked.as_str(),
+            Some("pass" | "fail" | "conditional")
+        ));
         // scalars are the right JSON shape.
-        assert!(synth_field_value("integer", "n", now).is_i64());
-        assert!(synth_field_value("boolean", "b", now).is_boolean());
-        assert!(synth_field_value("array", "xs", now).is_array());
-        assert!(synth_field_value("object", "o", now).is_object());
-        assert!(synth_field_value("uri", "u", now).is_string());
+        assert!(synth_field_value("integer", "n", step, now).is_i64());
+        assert!(synth_field_value("boolean", "b", step, now).is_boolean());
+        assert!(synth_field_value("array", "xs", step, now).is_array());
+        assert!(synth_field_value("object", "o", step, now).is_object());
+        assert!(synth_field_value("uri", "u", step, now).is_string());
+    }
+
+    /// Replay determinism: the same step always synthesizes the same
+    /// enum value, on any process and at any clock reading. The choice
+    /// is a function of the step's identity, nothing else.
+    #[test]
+    fn enum_choice_is_stable_for_a_step_id() {
+        let now = fixed_now();
+        let first = synth_field_value("release|hold", "verdict", "step-7f3a2b", now);
+        assert!(matches!(first.as_str(), Some("release" | "hold")));
+        for _ in 0..64 {
+            assert_eq!(
+                synth_field_value("release|hold", "verdict", "step-7f3a2b", now),
+                first,
+                "same step id must always yield the same choice"
+            );
+        }
+        // The clock is not part of the key — a replay that lands on a
+        // different sim instant must still make the same choice.
+        assert_eq!(
+            synth_field_value(
+                "release|hold",
+                "verdict",
+                "step-7f3a2b",
+                now + Duration::hours(37)
+            ),
+            first
+        );
+    }
+
+    /// The defect this fixes: ten closed `tasting-panel` packets all
+    /// carried `verdict: "release"`, so the hold rate read 0% by
+    /// construction. A spread that never leaves the first variant is
+    /// the same constant with extra steps.
+    #[test]
+    fn enum_choice_visits_every_variant_across_step_ids() {
+        let now = fixed_now();
+        for field_type in ["release|hold", "pass|fail|conditional", "a|b|c|d"] {
+            let variants: Vec<&str> = field_type.split('|').collect();
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for i in 0..400 {
+                let step_id = format!("01994a7f-{i:04}-7c1e-9d2b-6f0a1c3d5e7{}", i % 10);
+                let v = synth_field_value(field_type, "verdict", &step_id, now);
+                let s = v.as_str().expect("enum synthesizes a string").to_string();
+                assert!(
+                    variants.contains(&s.as_str()),
+                    "{s} is not a declared variant"
+                );
+                *counts.entry(s).or_default() += 1;
+            }
+            assert_eq!(
+                counts.len(),
+                variants.len(),
+                "{field_type}: only visited {:?}",
+                counts.keys().collect::<Vec<_>>()
+            );
+            // Not merely surjective — a variant that shows up twice in
+            // 400 draws still makes a rate measurement noise. Each must
+            // carry at least half its uniform share.
+            let floor = 400 / (variants.len() * 2);
+            for (value, n) in &counts {
+                assert!(*n >= floor, "{field_type}: {value} drew {n} of 400");
+            }
+        }
+    }
+
+    /// Two enum fields on one step must not move in lockstep — the field
+    /// name is part of the key, so a step's `verdict` and its `route`
+    /// are independent draws.
+    #[test]
+    fn enum_choice_is_per_field_not_only_per_step() {
+        let now = fixed_now();
+        let differ = (0..64).any(|i| {
+            let step_id = format!("step-{i:03}");
+            synth_field_value("release|hold", "verdict", &step_id, now)
+                != synth_field_value("release|hold", "route", &step_id, now)
+        });
+        assert!(differ, "every step drew the same value for both fields");
     }
 
     #[test]
@@ -1210,7 +1332,7 @@ mod tests {
 
         let mut md = serde_json::Map::new();
         md.insert("document_title".to_string(), json!("Q2 Safety Policy"));
-        wf.fill_required_fields("acknowledgment", &mut md, now);
+        wf.fill_required_fields("acknowledgment", &mut md, "step-1", now);
         // Pre-set key is preserved (the Workflow's default wins).
         assert_eq!(
             md.get("document_title").unwrap(),
@@ -1221,7 +1343,7 @@ mod tests {
 
         // Unknown kind -> no-op.
         let mut empty = serde_json::Map::new();
-        wf.fill_required_fields("not-a-kind", &mut empty, now);
+        wf.fill_required_fields("not-a-kind", &mut empty, "step-2", now);
         assert!(empty.is_empty());
     }
 }

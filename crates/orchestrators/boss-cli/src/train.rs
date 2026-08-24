@@ -28,10 +28,14 @@
 //!  2. BOARD — open this window's train Job, collect the ship-a-change
 //!     Jobs that are ready (review step ready/active, a branch pushed to
 //!     the fork, not already on a train), assemble one train branch by
-//!     merging each on top of origin/main, push it, open ONE batched PR.
+//!     merging each on top of origin/main, run the CONSIST CHECK over
+//!     the assembled tree (`consist_check` — seconds of cheap text lints,
+//!     because a per-branch gate cannot see a failure that exists only in
+//!     the combination), push it, open ONE batched PR.
 //!     A branch that does not merge cleanly is skipped, named on the Job,
-//!     and left for the next train. An empty window cancels the train via
-//!     the `job.metadata.empty` marker rather than pretending.
+//!     and left for the next train. An empty window — or a consist the
+//!     check refused — cancels the train via the `job.metadata.empty`
+//!     marker rather than pretending, and a refusal strikes no car.
 //!
 //! Two trees, deliberately:
 //!   - assembly happens in a dedicated clone (BOSS_TRAIN_HOME/repo) —
@@ -350,6 +354,369 @@ fn preflight(cfg: &Config) -> Result<Vec<String>> {
         }
     }
     Ok(problems)
+}
+
+// ---------------------------------------------------------------------------
+// The consist check — proving the ASSEMBLED tree before spending CI on it
+//
+// Pre-flight above checks the LOCOMOTIVE. This checks the CONSIST, and
+// it exists because of a number: train arrival went 100% (08-20) → 40%
+// (08-23) → 0% (08-24) as cars-per-train rose. Every failure in the last
+// two days was a COMBINATION failure — invisible to a per-branch gate,
+// because on each branch alone there was nothing wrong:
+//
+//   - two cars each added `infra/postgres/schema/153-*.sql`. Unique on
+//     either branch; a duplicate the moment they were assembled.
+//   - a new lint (`infra/lint/one-palette.sh`) and the mocked spec that
+//     has to NAME the forbidden pattern in order to test it rode the
+//     same train. The lint failed on the spec.
+//
+// Each cost roughly 90 minutes of CI to learn ONE bit, plus a cancel,
+// plus a strike on every innocent car aboard. So the conductor asks the
+// cheap questions itself, against the tree it just assembled, before it
+// spends anything. Three rules keep it from becoming the thing it is
+// meant to save:
+//
+//   - CHEAP ONLY. Text lints, run out of the assembled `infra/lint/`.
+//     No cargo, no bun, no database. Measured: the 23 included scripts
+//     total ~9 seconds. The full gate is what CI is for; this is not a
+//     second gate and must never grow into one.
+//   - DISCOVERED, NOT LISTED. Every `infra/lint/*.sh` in the ASSEMBLED
+//     tree runs, minus a named exclusion set — which is the whole point
+//     of the second failure above: the lint that catches the next
+//     combination failure may be arriving ON THE TRAIN, and no
+//     hand-picked pair in this file could have seen it.
+//   - TAME WHEN IT BREAKS ITSELF. Missing, unrunnable, or over budget
+//     is a logged warning and the train departs. A preflight that
+//     becomes a new way to block every train costs more than it saves.
+//
+// What it deliberately does NOT do is decide whose fault the failure
+// was. Nobody's: each car was green alone. So a refusal opens no PR,
+// strikes no car, and leaves every one of them boardable carrying a
+// reason that names the lint and the files.
+// ---------------------------------------------------------------------------
+
+/// The lints the consist check does not run, each with its reason.
+/// All four need something the assembled TREE does not contain — a
+/// cargo build, a package manager, or a live database — and a question
+/// the tree cannot answer is not a question that can be answered in
+/// seconds. Everything else in `infra/lint/` runs, including lints
+/// that do not exist yet. Pinned by a test: an exemption naming a
+/// script that is gone is an exemption covering nothing.
+const CONSIST_CHECK_EXCLUDED: &[(&str, &str)] = &[
+    (
+        "svelte-check.sh",
+        "runs `bun install --frozen-lockfile` and a typecheck — minutes, plus a network fetch, \
+         and it exits 1 outright on a box without bun",
+    ),
+    (
+        "no-snapshot-arrays.sh",
+        "reads the built `boss-ports-list` binary; with no target/ it can only report \
+         'not found', and building it is exactly what CI is for",
+    ),
+    (
+        "conservation-invariants.sh",
+        "psql + curl against a LIVE deployment — an invariant on the running system, which a \
+         tree cannot answer (it has its own systemd timer)",
+    ),
+    (
+        "audit-ordering.sh",
+        "psql against a live database — same: not a question about a tree",
+    ),
+];
+
+/// Wall clock the whole check may spend before it stops asking and
+/// lets the train go. The measured set costs ~9 seconds, so this is
+/// roughly six times headroom — wide enough that a slow box never
+/// trips it, narrow enough that "seconds, not minutes" stays true if
+/// something expensive lands in `infra/lint/` unannounced.
+const CONSIST_CHECK_BUDGET: Duration = Duration::from_secs(60);
+
+/// How much of a failing lint's output goes on the record. Same
+/// reasoning as `BLIP_CAUSE_BUDGET`: enough to act on, bounded so a
+/// chatty check cannot bloat a Job's metadata.
+const CONSIST_OUTPUT_BUDGET: usize = 1200;
+
+/// How many files a refusal names. The reason string is read on a chip
+/// in the yard; past a handful it stops being a hint.
+const CONSIST_FILES_NAMED: usize = 6;
+
+/// What one cheap lint said about the assembled tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LintResult {
+    Passed,
+    /// Non-zero exit: the tree is bad. Carries the combined
+    /// stdout+stderr, because half these scripts report on stderr.
+    Failed(String),
+    /// The check itself could not run. Never a refusal — see the
+    /// third rule above.
+    Unrunnable(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LintRun {
+    pub(crate) name: String,
+    pub(crate) result: LintResult,
+}
+
+/// A lint that disagreed with the assembled tree, with the files its
+/// own output named (best effort — a hint on the car, not a claim).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LintFailure {
+    pub(crate) name: String,
+    pub(crate) output: String,
+    pub(crate) files: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConsistVerdict {
+    Proceed {
+        ran: usize,
+        warnings: Vec<String>,
+    },
+    Refuse {
+        failed: Vec<LintFailure>,
+        ran: usize,
+        warnings: Vec<String>,
+    },
+}
+
+impl ConsistVerdict {
+    pub(crate) fn ran(&self) -> usize {
+        match self {
+            ConsistVerdict::Proceed { ran, .. } | ConsistVerdict::Refuse { ran, .. } => *ran,
+        }
+    }
+
+    pub(crate) fn warnings(&self) -> &[String] {
+        match self {
+            ConsistVerdict::Proceed { warnings, .. } | ConsistVerdict::Refuse { warnings, .. } => {
+                warnings
+            }
+        }
+    }
+}
+
+/// The files a lint's output names, so a refusal can say WHICH files
+/// collided rather than only which check complained. Deliberately a
+/// text heuristic over every lint's output rather than a parser per
+/// lint: the checks are free to say whatever they say, and a hint that
+/// is occasionally empty is worth more than a parser that must be
+/// extended for every new script.
+///
+/// A token counts as a filename when it ends in a short alphabetic
+/// extension — which keeps `Cargo.toml` and `153-a.sql` and drops
+/// `v1.2`, `0.8`, and sentences ending in a full stop.
+pub(crate) fn files_named_in(output: &str) -> Vec<String> {
+    let mut named: Vec<String> = Vec::new();
+    for token in output.split_whitespace() {
+        let token =
+            token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '/' && c != '.');
+        let Some((stem, ext)) = token.rsplit_once('.') else {
+            continue;
+        };
+        let looks_like_a_file = !stem.is_empty()
+            && (1..=6).contains(&ext.len())
+            && ext.starts_with(|c: char| c.is_ascii_alphabetic())
+            && ext.chars().all(|c| c.is_ascii_alphanumeric());
+        if !looks_like_a_file {
+            continue;
+        }
+        if !named.iter().any(|f| f == token) {
+            named.push(token.to_string());
+        }
+        if named.len() == CONSIST_FILES_NAMED {
+            break;
+        }
+    }
+    named
+}
+
+/// ONE reason string, journal and Job alike — the chip the yard
+/// renders and the line the operator greps must never tell different
+/// stories (the rule `skip_reason_conflict` already follows, down to
+/// the file budget: this lands on `metadata.skip_reason`, which
+/// PacketCard renders as "LEFT BEHIND — <reason>", so the reason does
+/// not repeat the words the chip already says).
+///
+/// The last clause is the point of the whole car. A car that reads
+/// this did nothing wrong, and must not be treated — by a person or by
+/// the boarding rules — as if it had.
+pub(crate) fn consist_refusal_reason(failed: &[LintFailure]) -> String {
+    let Some(first) = failed.first() else {
+        return "consist check refused, no failing check named".to_string();
+    };
+    let mut files = first.files.join(", ");
+    if files.len() > SKIP_REASON_FILE_BUDGET {
+        files = format!("{} files", first.files.len());
+    }
+    let named = if files.is_empty() {
+        String::new()
+    } else {
+        format!(" ({files})")
+    };
+    let others = match failed.len() {
+        0 | 1 => String::new(),
+        n => format!(" +{} more check(s)", n - 1),
+    };
+    format!(
+        "consist check: {} failed on the assembled tree{named}{others} — a combination failure, \
+         not this car's fault",
+        first.name
+    )
+}
+
+/// Which `infra/lint/*.sh` of the assembled tree this check runs, in
+/// a deterministic order (sorted, so two runs over one tree ask the
+/// same questions in the same sequence). The roster is the directory
+/// minus `CONSIST_CHECK_EXCLUDED` — nothing here to edit when a lint
+/// lands.
+fn cheap_lints(tree: &Path) -> Result<Vec<PathBuf>> {
+    let dir = tree.join("infra/lint");
+    let mut scripts: Vec<PathBuf> = fs::read_dir(&dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "sh"))
+        .filter(|p| {
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            !CONSIST_CHECK_EXCLUDED.iter().any(|(ex, _)| *ex == name)
+        })
+        .collect();
+    scripts.sort();
+    Ok(scripts)
+}
+
+/// Run one lint against `tree`. `bash <script>` rather than executing
+/// it directly: the checkout may not carry the executable bit, and
+/// every one of these scripts is a bash script that locates the repo
+/// root from its own path.
+fn run_one_lint(tree: &Path, script: &Path) -> LintResult {
+    if !script.is_file() {
+        return LintResult::Unrunnable("not a readable file".to_string());
+    }
+    let out = Command::new("bash").arg(script).current_dir(tree).output();
+    let out = match out {
+        Ok(out) => out,
+        Err(e) => return LintResult::Unrunnable(format!("could not spawn bash: {e}")),
+    };
+    match out.status.code() {
+        Some(0) => LintResult::Passed,
+        // The shell's own "I could not run that" codes. 127 is what a
+        // dangling script name produces, and reading that as "the tree
+        // is bad" would turn a deleted file into a stopped railway.
+        Some(126) => LintResult::Unrunnable("not executable by the shell (126)".to_string()),
+        Some(127) => LintResult::Unrunnable("command not found (127)".to_string()),
+        _ => {
+            let mut text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            text.truncate(
+                text.char_indices()
+                    .nth(CONSIST_OUTPUT_BUDGET)
+                    .map_or(text.len(), |(i, _)| i),
+            );
+            LintResult::Failed(text.trim().to_string())
+        }
+    }
+}
+
+/// The decision. Pure over what the lints said, so the verdict is
+/// testable without a tree and the tree-walking stays in one place.
+pub(crate) fn consist_verdict(runs: &[LintRun]) -> ConsistVerdict {
+    let mut warnings = Vec::new();
+    let mut failed = Vec::new();
+    let mut ran = 0;
+    for run in runs {
+        match &run.result {
+            LintResult::Passed => ran += 1,
+            LintResult::Failed(output) => {
+                ran += 1;
+                failed.push(LintFailure {
+                    name: run.name.clone(),
+                    output: output.clone(),
+                    files: files_named_in(output),
+                });
+            }
+            // Named with the `.sh` back on: what could not run is a
+            // FILE, and the operator's next move is to look for it.
+            LintResult::Unrunnable(why) => {
+                warnings.push(format!("{}.sh could not run ({why})", run.name));
+            }
+        }
+    }
+    if failed.is_empty() {
+        ConsistVerdict::Proceed { ran, warnings }
+    } else {
+        ConsistVerdict::Refuse {
+            failed,
+            ran,
+            warnings,
+        }
+    }
+}
+
+/// Ask every cheap lint in the assembled tree what it thinks, then
+/// decide. Every failure mode of this function itself lands as a
+/// warning on a `Proceed`.
+///
+/// All the checks run, not just up to the first failure: they are
+/// seconds each, and learning ONE bit per attempt is precisely the
+/// cost this exists to stop paying.
+pub(crate) fn consist_check(tree: &Path) -> ConsistVerdict {
+    let scripts = match cheap_lints(tree) {
+        Ok(s) if s.is_empty() => {
+            return ConsistVerdict::Proceed {
+                ran: 0,
+                warnings: vec![
+                    "no lint scripts in the assembled tree — nothing cheap to ask".to_string(),
+                ],
+            };
+        }
+        Ok(s) => s,
+        Err(e) => {
+            return ConsistVerdict::Proceed {
+                ran: 0,
+                warnings: vec![format!("could not list the tree's lints ({e})")],
+            };
+        }
+    };
+
+    let started = std::time::Instant::now();
+    let total = scripts.len();
+    let mut runs = Vec::with_capacity(total);
+    for (done, script) in scripts.iter().enumerate() {
+        let name = script
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .trim_end_matches(".sh")
+            .to_string();
+        runs.push(LintRun {
+            name,
+            result: run_one_lint(tree, script),
+        });
+        if started.elapsed() > CONSIST_CHECK_BUDGET && done + 1 < total {
+            let mut verdict = consist_verdict(&runs);
+            let spent = started.elapsed().as_secs();
+            let note = format!(
+                "budget spent ({spent}s) after {} of {total} checks — going on what ran",
+                done + 1
+            );
+            match &mut verdict {
+                ConsistVerdict::Proceed { warnings, .. }
+                | ConsistVerdict::Refuse { warnings, .. } => warnings.push(note),
+            }
+            return verdict;
+        }
+    }
+    consist_verdict(&runs)
 }
 
 // ---------------------------------------------------------------------------
@@ -1387,24 +1754,93 @@ pub(crate) fn releasable_cars(cars: &[Value]) -> Vec<&Value> {
 /// pushed and gone green — the exact case this is meant to rescue. A
 /// re-running check reads `pending`, which is not `failing`, so a train
 /// under repair is left alone.
+///
+/// A STALLED TRAIN IS RELEASED THE SAME WAY, AND FOR THE SAME REASON: a
+/// run that was killed before it judged anything will never answer, and
+/// its cars are no less hostage than a red train's. What differs is
+/// whether the cancel counts against them — see `verdict_strikes_cars`.
 pub(crate) fn auto_cancel_reason(
     train: &Value,
     live_verdict: &str,
     now: DateTime<Utc>,
     stall_hours: i64,
 ) -> Option<String> {
-    if live_verdict != "failing" {
-        return None;
-    }
+    let judged = match live_verdict {
+        "failing" => true,
+        "aborted" => false,
+        _ => return None,
+    };
     // A merged train is not a candidate whatever its checks say — the
     // content landed and the remaining steps are bookkeeping.
     if step_done(find_step(train, "merged", "Merged into main")) {
         return None;
     }
     let age = stall_age_hours(train, now, stall_hours)?;
-    Some(format!(
-        "CI red and no progress for {age}h (threshold {stall_hours}h) — cars released to board a later train"
-    ))
+    Some(if judged {
+        format!(
+            "CI red and no progress for {age}h (threshold {stall_hours}h) — cars released to board a later train"
+        )
+    } else {
+        format!(
+            "CI run aborted with no verdict and no progress for {age}h (threshold {stall_hours}h) — cars released unstruck to board a later train"
+        )
+    })
+}
+
+/// Does this train's cancellation count against the cars aboard?
+///
+/// ONLY A RETURNED FAILING VERDICT. A strike is a claim that CI looked
+/// at this consist and found it broken; two of them hold a car out of
+/// the queue until a human looks (`car_hold_reason`). A run killed by an
+/// infrastructure incident makes no such claim, and treating it as one
+/// is how 2026-08-22 went: two trains stalled, their runs were cancelled
+/// mid-flight, and the four cars aboard — every one of which test-merged
+/// clean — took a strike on each train, hit the hold, and sat through
+/// five departures before a human noticed.
+///
+/// The distinction lives on the release itself, not in a second counter:
+/// the cars are released with the stall named in their `skip_reason`, so
+/// the record says which question to ask without inventing a strike
+/// nothing reads.
+pub(crate) fn verdict_strikes_cars(verdict: &str) -> bool {
+    verdict == "failing"
+}
+
+/// The metadata a released car carries away from a cancelled train.
+///
+/// `train`/`boarded_head` cleared so the dock counts it again, why it
+/// came back, and — only when the train's CI actually judged it —
+/// one more red against its record.
+pub(crate) fn release_stamps(
+    car: &Value,
+    reason: &str,
+    strike: bool,
+) -> Vec<(&'static str, Value)> {
+    // The boarded head goes with the train stamp: this car boarded
+    // nothing now, and a stale head is not evidence about whatever it
+    // boards next.
+    let mut stamps = vec![
+        ("train", Value::Null),
+        ("boarded_head", Value::Null),
+        (
+            "skip_reason",
+            json!(format!("returned to dock: train cancelled ({reason})")),
+        ),
+    ];
+    // Every car aboard a red train is counted, not just the guilty one —
+    // which car turned the consist red is exactly what nobody knows yet.
+    // One red is survivable (see `car_hold_reason`); it takes a second,
+    // aboard a DIFFERENT consist, before boarding holds it.
+    if strike {
+        let reds = car
+            .get("metadata")
+            .and_then(|m| m.get("red_trains"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            + 1;
+        stamps.push(("red_trains", json!(reds)));
+    }
+    stamps
 }
 
 /// Has the CI verdict MOVED since it was last recorded?
@@ -2215,6 +2651,8 @@ fn ci_check_summary(rollup: Option<&Value>) -> String {
         .join(", ")
 }
 
+/// The rollup read down to one word: `green`, `failing`, `aborted`
+/// (a run was killed before it judged anything) or `pending`.
 fn ci_verdict(rollup: Option<&Value>) -> &'static str {
     let Some(items) = rollup.and_then(Value::as_array).filter(|a| !a.is_empty()) else {
         return "pending";
@@ -2234,13 +2672,28 @@ fn ci_verdict(rollup: Option<&Value>) -> &'static str {
                 .to_uppercase()
         })
         .collect();
-    const FAILING: [&str; 4] = ["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"];
+    const FAILING: [&str; 3] = ["FAILURE", "TIMED_OUT", "ACTION_REQUIRED"];
     if states.iter().any(|s| FAILING.contains(&s.as_str())) {
         return "failing";
     }
+    // A KILLED RUN JUDGED NOTHING. `CANCELLED` used to sit in FAILING,
+    // which made an infrastructure incident indistinguishable from a
+    // broken consist: on 2026-08-22 two runs died mid-flight, the
+    // conductor read red, and four innocent cars took the strikes (see
+    // `verdict_strikes_cars`). Ordered after the failing check on
+    // purpose — a genuine failure beside a cancelled sibling is still a
+    // real verdict, and the aborted sibling does not soften it.
     const SETTLED: [&str; 4] = ["SUCCESS", "NEUTRAL", "SKIPPED", "COMPLETED"];
-    if states.iter().any(|s| !SETTLED.contains(&s.as_str())) {
+    // A still-running sibling means the rollup has not settled — the
+    // train may yet get an answer from it, cancelled neighbour or not.
+    if states
+        .iter()
+        .any(|s| !SETTLED.contains(&s.as_str()) && s != "CANCELLED")
+    {
         return "pending";
+    }
+    if states.iter().any(|s| s == "CANCELLED") {
+        return "aborted";
     }
     "green"
 }
@@ -2754,9 +3207,13 @@ impl Conductor {
             }
 
             // The overnight rule, before the merge check: a train that
-            // is red AND has stopped moving releases its consist so the
-            // next window can board without it. Decided on the LIVE
-            // verdict just read, never on the `ci` step's first stamp.
+            // is red — or whose run was killed without judging anything
+            // — AND has stopped moving releases its consist so the next
+            // window can board without it. Decided on the LIVE verdict
+            // just read, never on the `ci` step's first stamp. Whether
+            // the release counts against the cars is a separate
+            // question, and only a returned failing verdict answers it
+            // yes (`verdict_strikes_cars`).
             if self.cfg.auto_cancel
                 && info.get("state").and_then(Value::as_str) == Some("OPEN")
                 && let Some(reason) = auto_cancel_reason(&t, verdict, now, self.cfg.stall_hours)
@@ -2765,7 +3222,8 @@ impl Conductor {
                 if self.cfg.dry {
                     log(format!("DRY: would cancel {} ({reason})", id8(&tid)));
                 } else {
-                    self.cancel_train(&tid, &reason, true).await?;
+                    self.cancel_train(&tid, &reason, verdict_strikes_cars(verdict))
+                        .await?;
                 }
                 continue;
             }
@@ -3516,6 +3974,105 @@ impl Conductor {
             return Ok(());
         }
 
+        // THE CONSIST CHECK — the assembled tree answers the cheap
+        // questions before the train spends anything on the expensive
+        // ones. See the section comment above `consist_check` for the
+        // arrival-rate numbers that bought it; the short version is
+        // that a per-branch gate cannot see a failure that exists only
+        // in the combination, and every failure of the last two days
+        // was one of those.
+        //
+        // Placed BEFORE the push, not merely before the PR: a refused
+        // consist should leave nothing behind on the forge to clean up
+        // later (the 62 stale `train/*` branches of ab3fa473 are what
+        // that debt looks like when nobody owns it).
+        let verdict = consist_check(Path::new(clone));
+        for w in verdict.warnings() {
+            log(format!(
+                "consist check: {w} — skipping it, a broken check must not hold a train"
+            ));
+        }
+        if let ConsistVerdict::Refuse { failed, ran, .. } = &verdict {
+            let reason = consist_refusal_reason(failed);
+            log(format!(
+                "consist check: {} of {ran} checks disagree with the assembled tree",
+                failed.len()
+            ));
+            // The output goes in the journal in full, not just the
+            // name: what cost 90 minutes was learning ONE bit per
+            // attempt, and the bit is in what the check SAID.
+            for f in failed {
+                log(format!("consist check: {} said —", f.name));
+                for line in f.output.lines() {
+                    log(format!("consist check:   {line}"));
+                }
+            }
+            // NOBODY'S CAR IS AT FAULT. Each one was green on its own
+            // branch; the tree only broke once they were merged
+            // together. So: no PR, no push, no CI spent — and every car
+            // keeps `metadata.train` unset (never boarded, so still
+            // `parked_ready`) and `red_trains` untouched. Striking cars
+            // for a combination failure is the bug we already know
+            // about; the only thing they carry away is the reason,
+            // which names the check and the files it complained about.
+            let mut left_boardable = Vec::with_capacity(boarded.len());
+            for (j, _branch, _head) in &boarded {
+                let cid = job_id(j)?;
+                left_behind.push(json!({
+                    "car_id_short": id8(cid),
+                    "reason": reason.as_str(),
+                }));
+                left_boardable.push(id8(cid));
+                self.merge_job_metadata(cid, vec![("skip_reason", json!(reason))])
+                    .await?;
+            }
+            // The train's own record of what it refused and why. The
+            // `empty` marker is what fires the `cancelled` terminal
+            // (its predicate is collect.done AND metadata.empty) —
+            // the same abandonment path an empty window takes, and
+            // honest here: nothing boarded, because nothing could.
+            self.merge_job_metadata(
+                &train_id,
+                vec![
+                    ("empty", json!("true")),
+                    (
+                        "consist_check",
+                        json!({
+                            "verdict": "refused",
+                            "checks_run": ran,
+                            "failed": failed
+                                .iter()
+                                .map(|f| json!({
+                                    "lint": f.name,
+                                    "files": f.files,
+                                    "output": f.output,
+                                }))
+                                .collect::<Vec<_>>(),
+                            "cars_left_boardable": left_boardable,
+                        }),
+                    ),
+                    ("left_behind", json!(left_behind)),
+                ],
+            )
+            .await?;
+            self.complete_step(
+                &train,
+                collect,
+                &[("boarded", Some(format!("nothing — {reason}")))],
+            )
+            .await?;
+            log(format!(
+                "consist check refused the consist: no PR opened, no CI spent — {} car(s) stay \
+                 boardable and unstruck",
+                boarded.len()
+            ));
+            return Ok(());
+        }
+        log(format!(
+            "consist check: {} cheap lint(s) clean on the assembled tree",
+            verdict.ran()
+        ));
+
         sh(&["git", "-C", clone, "push", "fork", &train_branch])?;
         let train_ref_out = sh(&["git", "-C", clone, "rev-parse", "--short", "HEAD"])?;
         let train_ref = stdout_str(&train_ref_out).trim().to_string();
@@ -3770,33 +4327,8 @@ impl Conductor {
             // that predates this change still carries a completed review
             // and cannot be released; those were translated into fresh
             // packets by hand on 2026-08-15 rather than reversed.
-            //
-            // The boarded head goes with the train stamp: this car
-            // boarded nothing now, and a stale head is not evidence
-            // about whatever it boards next.
-            let mut stamps = vec![
-                ("train", Value::Null),
-                ("boarded_head", Value::Null),
-                (
-                    "skip_reason",
-                    json!(format!("returned to dock: train cancelled ({reason})")),
-                ),
-            ];
-            // A red release counts against the car. Every car aboard is
-            // counted, not just the guilty one — which car turned the
-            // consist red is exactly what nobody knows yet. One red is
-            // survivable (see `car_hold_reason`); it takes a second,
-            // aboard a DIFFERENT consist, before boarding holds it.
-            if count_red {
-                let reds = car
-                    .get("metadata")
-                    .and_then(|m| m.get("red_trains"))
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0)
-                    + 1;
-                stamps.push(("red_trains", json!(reds)));
-            }
-            self.merge_job_metadata(cid, stamps).await?;
+            self.merge_job_metadata(cid, release_stamps(car, reason, count_red))
+                .await?;
             log(format!("released car {} back to the dock", id8(cid)));
         }
 
@@ -4872,6 +5404,69 @@ mod tests {
             auto_cancel_reason(&t, "failing", ts("2026-08-13T09:00:00Z"), 6),
             None
         );
+    }
+
+    // -- a stall is not a red train ----------------------------------------
+    //
+    // 2026-08-22: two trains stalled through infrastructure incidents.
+    // Their runs were cancelled mid-flight, never judging anything, and
+    // the conductor read that as red — four innocent cars took a strike
+    // each aboard both trains, hit the two-strike hold, and sat through
+    // five departures until a human noticed. All four test-merged clean.
+
+    #[test]
+    fn a_train_whose_run_was_aborted_still_releases_its_consist() {
+        // The release is right — the cars should not be held hostage
+        // overnight by a run that will never answer.
+        let t = red_train(&["2026-08-13T00:00:00Z"], false);
+        let r = auto_cancel_reason(&t, "aborted", ts("2026-08-13T08:00:00Z"), 6)
+            .expect("aborted and 8h stalled should release the consist");
+        assert!(r.contains("8h"), "the reason carries the age: {r}");
+        assert!(
+            r.contains("no verdict"),
+            "the reason must name the stall, not imply a judgment: {r}"
+        );
+    }
+
+    #[test]
+    fn an_aborted_train_leaves_its_cars_unstruck() {
+        // The strike is what was wrong. Nothing judged these cars.
+        assert!(!verdict_strikes_cars("aborted"));
+        let car = json!({"id": "car-1", "metadata": {"red_trains": 1}});
+        let stamps = release_stamps(&car, "CI aborted without a verdict", false);
+        assert!(
+            !stamps.iter().any(|(k, _)| *k == "red_trains"),
+            "a stalled train must not touch the strike count"
+        );
+        // Released all the same: the train marker goes, so it boards again.
+        assert_eq!(
+            stamps.iter().find(|(k, _)| *k == "train").map(|(_, v)| v),
+            Some(&Value::Null)
+        );
+    }
+
+    #[test]
+    fn a_genuinely_red_train_still_strikes_its_cars() {
+        // The two-strike hold has to keep working — without it the
+        // auto-cancel is a loop that burns CI all night.
+        assert!(verdict_strikes_cars("failing"));
+        let car = json!({"id": "car-1", "metadata": {"red_trains": 1}});
+        let stamps = release_stamps(&car, "CI red", true);
+        assert_eq!(
+            stamps
+                .iter()
+                .find(|(k, _)| *k == "red_trains")
+                .map(|(_, v)| v),
+            Some(&json!(2)),
+            "a red release counts against every car aboard"
+        );
+    }
+
+    #[test]
+    fn only_a_failing_verdict_strikes() {
+        // Neither silence nor success is a strike.
+        assert!(!verdict_strikes_cars("pending"));
+        assert!(!verdict_strikes_cars("green"));
     }
 
     // -- the CI verdict blind spot -----------------------------------------
@@ -5952,6 +6547,34 @@ mod tests {
         assert!(ci_check_summary(Some(&rollup)).contains("b:failure"));
     }
 
+    /// A run that was cancelled judged nothing. Reading it as `failing`
+    /// is what struck four innocent cars on 2026-08-22 — the verdict is
+    /// the one fact that decides whether a cancel counts against a car,
+    /// so it has to distinguish "we looked and it is broken" from "the
+    /// run was killed before it could look".
+    #[test]
+    fn a_cancelled_run_is_not_a_failing_verdict() {
+        // Forgejo reports state in `status` with a null `conclusion`.
+        let killed = json!([
+            {"context": "CI / fast", "status": "success", "conclusion": Value::Null},
+            {"context": "CI / test", "status": "cancelled", "conclusion": Value::Null},
+        ]);
+        assert_eq!(ci_verdict(Some(&killed)), "aborted");
+        // A real failure alongside a cancelled sibling is still red —
+        // something DID judge the consist and found it wanting.
+        let judged = json!([
+            {"context": "CI / fast", "status": "failure", "conclusion": Value::Null},
+            {"context": "CI / test", "status": "cancelled", "conclusion": Value::Null},
+        ]);
+        assert_eq!(ci_verdict(Some(&judged)), "failing");
+        // A cancelled run alongside one still going has not settled.
+        let mid_flight = json!([
+            {"context": "CI / fast", "status": "running", "conclusion": Value::Null},
+            {"context": "CI / test", "status": "cancelled", "conclusion": Value::Null},
+        ]);
+        assert_eq!(ci_verdict(Some(&mid_flight)), "pending");
+    }
+
     /// No rollup is not an empty rollup: pending CI has nothing to
     /// report and must not stamp a misleading empty summary as if it
     /// had looked and found nothing.
@@ -6022,5 +6645,208 @@ mod tests {
             "a second publish of an unchanged branch must still report success"
         );
         assert!(on_fork(&clone, "feat/twice"));
+    }
+
+    // ---- the consist check --------------------------------------
+    //
+    // The combination failures of 2026-08-22..24, reproduced. These
+    // drive the REAL lint script out of `infra/lint/`, for the same
+    // reason the publish_car_branch fixtures drive real git: the whole
+    // claim is "the conductor can answer this question from the
+    // assembled tree in seconds", and a faked lint would only prove
+    // this file agrees with itself.
+
+    /// Twelve numbered migrations — one over the scrape guard
+    /// `migration-numbers-unique.sh` uses to refuse to report on a
+    /// directory it clearly failed to read.
+    fn twelve_migrations() -> Vec<String> {
+        (140..152).map(|n| format!("{n}-thing.sql")).collect()
+    }
+
+    /// An assembled tree as the consist check meets it: `infra/lint/`
+    /// carrying the real migration-numbers lint, and whatever the cars
+    /// dropped into `infra/postgres/schema/`.
+    fn consist_fixture(name: &str, migrations: &[String]) -> (Scratch, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("boss-consist-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let guard = Scratch(root.clone());
+        let lint = root.join("infra/lint");
+        let schema = root.join("infra/postgres/schema");
+        std::fs::create_dir_all(&lint).expect("mkdir infra/lint");
+        std::fs::create_dir_all(&schema).expect("mkdir schema");
+        let real = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../infra/lint/migration-numbers-unique.sh");
+        std::fs::copy(&real, lint.join("migration-numbers-unique.sh"))
+            .unwrap_or_else(|e| panic!("copy {}: {e}", real.display()));
+        for m in migrations {
+            std::fs::write(schema.join(m), "-- fixture\n").expect("write migration");
+        }
+        (guard, root)
+    }
+
+    #[test]
+    fn a_clean_consist_lets_the_train_go_on_to_the_pr() {
+        let (_g, tree) = consist_fixture("clean", &twelve_migrations());
+        let verdict = consist_check(&tree);
+        assert!(
+            matches!(verdict, ConsistVerdict::Proceed { .. }),
+            "a tree with no duplicate numbers must not stop a train: {verdict:?}"
+        );
+        assert_eq!(verdict.ran(), 1, "the one lint in the fixture tree ran");
+        assert!(
+            verdict.warnings().is_empty(),
+            "nothing to warn about: {verdict:?}"
+        );
+    }
+
+    /// THE FAILURE THAT COST 90 MINUTES OF CI TO LEARN ONE BIT. Two
+    /// cars each added `infra/postgres/schema/153-*.sql`. Unique on
+    /// each branch, so both passed their own gate; a duplicate the
+    /// moment the conductor merged them together.
+    #[test]
+    fn two_cars_that_both_took_number_153_are_refused_before_the_pr() {
+        let mut migrations = twelve_migrations();
+        migrations.push("153-dispatcher-rule-cluster-conformance.sql".to_string());
+        migrations.push("153-estate-subjects.sql".to_string());
+        let (_g, tree) = consist_fixture("dupe-153", &migrations);
+
+        let verdict = consist_check(&tree);
+        let ConsistVerdict::Refuse { failed, .. } = &verdict else {
+            panic!("a duplicated migration number must refuse the consist: {verdict:?}");
+        };
+        assert_eq!(
+            failed.len(),
+            1,
+            "one lint disagreed with this tree: {verdict:?}"
+        );
+        assert_eq!(
+            failed[0].name, "migration-numbers-unique",
+            "the refusal names the check, so nobody has to guess"
+        );
+        // The valuable half: the reason names the lint AND the files,
+        // because a combination failure is nobody's car's fault and the
+        // cars stay boardable carrying only this string.
+        let reason = consist_refusal_reason(failed);
+        assert!(
+            reason.contains("migration-numbers-unique"),
+            "reason names the lint: {reason}"
+        );
+        assert!(
+            reason.contains("153-estate-subjects.sql"),
+            "reason names a file the lint's own output named: {reason}"
+        );
+        assert!(
+            failed[0]
+                .files
+                .contains(&"153-dispatcher-rule-cluster-conformance.sql".to_string()),
+            "both colliding files are derivable from the output: {:?}",
+            failed[0].files
+        );
+    }
+
+    /// A broken preflight must not become a new way to block every
+    /// train. A lint that cannot be run is a logged warning and the
+    /// train departs — the check is an accelerant, never a gate.
+    #[test]
+    fn a_lint_that_cannot_run_warns_and_the_train_still_departs() {
+        let (_g, tree) = consist_fixture("ghost", &twelve_migrations());
+        // A dangling symlink: the name is in the directory, the script
+        // is not on disk. `bash` would exit 127 on it, which must read
+        // as "could not run", never as "the tree is bad".
+        std::os::unix::fs::symlink(
+            tree.join("infra/lint/deleted-by-some-car.sh"),
+            tree.join("infra/lint/ghost.sh"),
+        )
+        .expect("symlink");
+
+        let verdict = consist_check(&tree);
+        assert!(
+            matches!(verdict, ConsistVerdict::Proceed { .. }),
+            "an unrunnable check must not refuse a consist: {verdict:?}"
+        );
+        assert!(
+            verdict.warnings().iter().any(|w| w.contains("ghost.sh")),
+            "and it must say so by name: {:?}",
+            verdict.warnings()
+        );
+        assert_eq!(verdict.ran(), 1, "the runnable lint still ran");
+    }
+
+    /// The tamest failure mode of all: a tree with no lints in it.
+    #[test]
+    fn a_tree_with_no_lint_directory_proceeds_with_a_warning() {
+        let root = std::env::temp_dir().join(format!("boss-consist-{}-bare", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _g = Scratch(root.clone());
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let verdict = consist_check(&root);
+        assert!(
+            matches!(verdict, ConsistVerdict::Proceed { ran: 0, .. }),
+            "no lints is not a reason to hold a train: {verdict:?}"
+        );
+        assert!(!verdict.warnings().is_empty(), "but it is worth a line");
+    }
+
+    /// Discovery over the REAL `infra/lint/`, which is the claim that
+    /// matters: the roster is the directory, so a lint arriving ON a
+    /// train is asked without anyone editing this file. Only the
+    /// listing is exercised here — running the set costs ~9 seconds
+    /// and its verdict depends on the working tree, neither of which
+    /// belongs in a unit test.
+    ///
+    /// The exclusions are pinned in both directions: each must be out
+    /// of the roster AND still be a real script, because an exemption
+    /// naming a file that is gone covers nothing and only misleads the
+    /// next reader.
+    #[test]
+    fn the_roster_is_the_lint_directory_itself() {
+        let lint_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../infra/lint");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let names: Vec<String> = cheap_lints(&root)
+            .expect("the tree has an infra/lint")
+            .iter()
+            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into())
+            .collect();
+        assert!(
+            names.len() > 15,
+            "the whole cheap set runs, not a hand-picked pair: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "migration-numbers-unique.sh"),
+            "the lint that catches duplicate migration numbers is in: {names:?}"
+        );
+        for (excluded, why) in CONSIST_CHECK_EXCLUDED {
+            assert!(
+                !names.iter().any(|n| n == excluded),
+                "{excluded} needs more than a tree ({why}) and must stay out: {names:?}"
+            );
+            assert!(
+                lint_dir.join(excluded).is_file(),
+                "{excluded} is excluded ({why}) but is no longer in infra/lint/ — drop the \
+                 exemption rather than leaving it to mislead"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lints_output_gives_up_the_files_it_names() {
+        assert_eq!(
+            files_named_in("  153:\n    153-a.sql\n    153-b.sql\n"),
+            vec!["153-a.sql", "153-b.sql"]
+        );
+        assert_eq!(
+            files_named_in("VIOLATION: infra/postgres/schema/100-a.sql was M-changed"),
+            vec!["infra/postgres/schema/100-a.sql"]
+        );
+        assert!(
+            files_named_in("one-palette: 3 offences found, see above. e.g. below").is_empty(),
+            "prose is not a file list"
+        );
+        assert!(
+            files_named_in("bumped to v1.2 in Cargo.toml 0.8")
+                .iter()
+                .all(|f| f == "Cargo.toml"),
+            "version numbers are not filenames"
+        );
     }
 }

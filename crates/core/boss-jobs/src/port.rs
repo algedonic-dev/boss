@@ -143,6 +143,150 @@ pub struct LaunchCalendarRow {
     pub launch_channel: Option<String>,
 }
 
+/// One version's block in the per-kind terminal report — Tier 1 of
+/// the experiments program (docs/design/network-experiments.md):
+/// measure what version pinning already records. The version
+/// dimension is the packet's PINNED `workflow_version`, so the report
+/// compares protocol variants by what actually ran each packet.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VersionTerminalReport {
+    pub version: i32,
+    /// Every packet pinned to this version (any status).
+    pub total: i64,
+    /// Packet count per status — the six job statuses, zero-count
+    /// statuses omitted.
+    pub by_status: std::collections::BTreeMap<String, i64>,
+    /// Outcome distribution over CLOSED packets: `metadata.outcome`
+    /// value → count. Cancelled packets are terminal but not closed,
+    /// so they stay out of the measurement.
+    pub outcomes: std::collections::BTreeMap<String, i64>,
+    /// Closed packets that declared no outcome (the catch-all close).
+    /// Counted separately rather than under a sentinel key so a
+    /// machine reading `outcomes` only ever sees real outcome values.
+    pub closed_without_outcome: i64,
+    /// Open→close cycle time over closed packets, in days, from the
+    /// dates the jobs row itself carries (`opened_on` / `closed_on` —
+    /// both reproduced by the rebuilder).
+    pub cycle_time_days: CycleTimeDays,
+}
+
+/// Median + p90 with the sample count they were computed over. A
+/// closed packet without a `closed_on` date is not a sample, which is
+/// why `samples` can undercut `by_status["closed"]`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CycleTimeDays {
+    pub samples: i64,
+    pub median: Option<f64>,
+    pub p90: Option<f64>,
+}
+
+/// `percentile_cont` over an already-sorted slice — the same
+/// continuous-percentile arithmetic Postgres runs, mirrored here so
+/// the default (in-memory) report and the SQL override agree to the
+/// bit-level formula, not just approximately.
+fn percentile_cont(sorted: &[f64], p: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let rn = p * (sorted.len() - 1) as f64;
+    let frn = rn.floor();
+    let crn = rn.ceil();
+    let lo = sorted[frn as usize];
+    if frn == crn {
+        return Some(lo);
+    }
+    let hi = sorted[crn as usize];
+    Some((crn - rn) * lo + (rn - frn) * hi)
+}
+
+/// The status's public wire string — derived from the one serde
+/// definition on [`JobStatus`] rather than a third hand-written
+/// match (postgres.rs and http/jobs.rs already carry two).
+fn job_status_key(status: JobStatus) -> String {
+    match serde_json::to_value(status) {
+        Ok(serde_json::Value::String(s)) => s,
+        _ => format!("{status:?}"),
+    }
+}
+
+/// The outcome as `metadata->>'outcome'` would read it: absent or
+/// JSON null is no outcome; a string is itself; any other JSON value
+/// is its text.
+fn outcome_key(metadata: &serde_json::Value) -> Option<String> {
+    match metadata.get("outcome") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(other) => Some(other.to_string()),
+    }
+}
+
+/// Pure aggregation behind [`JobsRepository::workflow_terminal_report`]
+/// — a function of the packets, so any adapter's answer is checkable
+/// against it. Versions sort newest first.
+pub fn terminal_report_from_jobs(
+    jobs: &[Job],
+    since: Option<chrono::NaiveDate>,
+) -> Vec<VersionTerminalReport> {
+    use std::collections::BTreeMap;
+
+    struct Acc {
+        total: i64,
+        by_status: BTreeMap<String, i64>,
+        outcomes: BTreeMap<String, i64>,
+        closed_without_outcome: i64,
+        cycle_days: Vec<f64>,
+    }
+
+    let mut per_version: BTreeMap<i32, Acc> = BTreeMap::new();
+    for job in jobs {
+        if let Some(since) = since
+            && job.opened_on < since
+        {
+            continue;
+        }
+        let acc = per_version.entry(job.workflow_version).or_insert(Acc {
+            total: 0,
+            by_status: BTreeMap::new(),
+            outcomes: BTreeMap::new(),
+            closed_without_outcome: 0,
+            cycle_days: Vec::new(),
+        });
+        acc.total += 1;
+        *acc.by_status.entry(job_status_key(job.status)).or_insert(0) += 1;
+        if job.status == JobStatus::Closed {
+            match outcome_key(&job.metadata) {
+                Some(outcome) => *acc.outcomes.entry(outcome).or_insert(0) += 1,
+                None => acc.closed_without_outcome += 1,
+            }
+            if let Some(closed_on) = job.closed_on {
+                acc.cycle_days
+                    .push((closed_on - job.opened_on).num_days() as f64);
+            }
+        }
+    }
+
+    per_version
+        .into_iter()
+        .rev()
+        .map(|(version, mut acc)| {
+            acc.cycle_days
+                .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            VersionTerminalReport {
+                version,
+                total: acc.total,
+                by_status: acc.by_status,
+                outcomes: acc.outcomes,
+                closed_without_outcome: acc.closed_without_outcome,
+                cycle_time_days: CycleTimeDays {
+                    samples: acc.cycle_days.len() as i64,
+                    median: percentile_cont(&acc.cycle_days, 0.5),
+                    p90: percentile_cont(&acc.cycle_days, 0.9),
+                },
+            }
+        })
+        .collect()
+}
+
 /// One open, workable step surfaced to an executor's "My Day" pull
 /// query — the step plus the minimum Job context the caller needs to
 /// act on it without a second fetch. Returned by
@@ -452,6 +596,36 @@ pub trait JobsRepository: Send + Sync {
             }
         }
         Ok(out)
+    }
+
+    /// Per-version terminal report for one workflow kind — Tier 1 of
+    /// the experiments program (docs/design/network-experiments.md):
+    /// the read surface that replaces the ad-hoc SQL the brewery
+    /// protocol iterations were measured with. Groups every packet of
+    /// `kind` by its PINNED `workflow_version` and reports counts,
+    /// closed-outcome distribution, and open→close cycle-time stats.
+    ///
+    /// `since` keeps packets opened on/after that date; `simulated`
+    /// partitions like [`JobFilter::simulated`] (`None` is every
+    /// packet). A kind with no packets reports an empty Vec — absence
+    /// is a fact, not an error.
+    ///
+    /// The default impl is the pure [`terminal_report_from_jobs`]
+    /// over `list_jobs` — honest but O(packets of the kind) in Rust;
+    /// the Postgres adapter overrides it with one SQL statement.
+    async fn workflow_terminal_report(
+        &self,
+        kind: &str,
+        since: Option<chrono::NaiveDate>,
+        simulated: Option<bool>,
+    ) -> Result<Vec<VersionTerminalReport>, JobsError> {
+        let filter = JobFilter {
+            kind: Some(kind.to_string()),
+            simulated,
+            ..Default::default()
+        };
+        let (jobs, _total) = self.list_jobs(&filter, i64::MAX, 0).await?;
+        Ok(terminal_report_from_jobs(&jobs, since))
     }
 
     /// Count steps whose kind matches `step_kind` and whose status is

@@ -1098,6 +1098,143 @@ impl JobsRepository for PgJobs {
         Ok(n)
     }
 
+    async fn workflow_terminal_report(
+        &self,
+        kind: &str,
+        since: Option<chrono::NaiveDate>,
+        simulated: Option<bool>,
+    ) -> Result<Vec<crate::port::VersionTerminalReport>, JobsError> {
+        // One statement for the whole report — the version dimension
+        // is the PINNED `workflow_version`, served by the
+        // `jobs_kind_version` index, so there is no per-version
+        // fan-out. Contract pinned against the port's pure
+        // `terminal_report_from_jobs` by tests/terminal_report_pg.rs:
+        // outcomes read `metadata->>'outcome'` over closed rows only,
+        // cycle days are `(closed_on - opened_on)` — the dates the
+        // row carries and the rebuilder reproduces — and the
+        // percentiles are `percentile_cont`, which the port helper
+        // mirrors formula-for-formula.
+        let rows: Vec<(
+            i32,
+            i64,
+            serde_json::Value,
+            serde_json::Value,
+            i64,
+            i64,
+            Option<f64>,
+            Option<f64>,
+        )> = sqlx::query_as(
+            r#"
+            WITH base AS (
+              SELECT workflow_version,
+                     status,
+                     metadata->>'outcome' AS outcome,
+                     (closed_on - opened_on)::float8 AS cycle_days
+              FROM jobs
+              WHERE kind = $1
+                AND ($2::date IS NULL OR opened_on >= $2)
+                AND ($3::bool IS NULL OR simulated = $3)
+            ),
+            statuses AS (
+              SELECT workflow_version,
+                     jsonb_object_agg(status, n) AS by_status,
+                     SUM(n)::BIGINT AS total
+              FROM (
+                SELECT workflow_version, status, COUNT(*) AS n
+                FROM base GROUP BY workflow_version, status
+              ) t
+              GROUP BY workflow_version
+            ),
+            outcomes AS (
+              SELECT workflow_version,
+                     jsonb_object_agg(outcome, n)
+                       FILTER (WHERE outcome IS NOT NULL) AS outcomes,
+                     COALESCE(SUM(n) FILTER (WHERE outcome IS NULL), 0)::BIGINT
+                       AS closed_without_outcome
+              FROM (
+                SELECT workflow_version, outcome, COUNT(*) AS n
+                FROM base WHERE status = 'closed'
+                GROUP BY workflow_version, outcome
+              ) t
+              GROUP BY workflow_version
+            ),
+            cycles AS (
+              SELECT workflow_version,
+                     COUNT(*)::BIGINT AS samples,
+                     percentile_cont(0.5) WITHIN GROUP (ORDER BY cycle_days) AS median,
+                     percentile_cont(0.9) WITHIN GROUP (ORDER BY cycle_days) AS p90
+              FROM base
+              WHERE status = 'closed' AND cycle_days IS NOT NULL
+              GROUP BY workflow_version
+            )
+            SELECT s.workflow_version,
+                   s.total,
+                   s.by_status,
+                   COALESCE(o.outcomes, '{}'::jsonb) AS outcomes,
+                   COALESCE(o.closed_without_outcome, 0) AS closed_without_outcome,
+                   COALESCE(c.samples, 0) AS samples,
+                   c.median,
+                   c.p90
+            FROM statuses s
+            LEFT JOIN outcomes o USING (workflow_version)
+            LEFT JOIN cycles c USING (workflow_version)
+            ORDER BY s.workflow_version DESC
+            "#,
+        )
+        .bind(kind)
+        .bind(since)
+        .bind(simulated)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+
+        fn counts_map(
+            v: serde_json::Value,
+        ) -> Result<std::collections::BTreeMap<String, i64>, JobsError> {
+            match v {
+                serde_json::Value::Object(map) => map
+                    .into_iter()
+                    .map(|(k, n)| {
+                        n.as_i64().map(|n| (k, n)).ok_or_else(|| {
+                            JobsError::Storage(format!("non-integer count in report: {n}"))
+                        })
+                    })
+                    .collect(),
+                other => Err(JobsError::Storage(format!(
+                    "report expected a JSON object of counts, got: {other}"
+                ))),
+            }
+        }
+
+        rows.into_iter()
+            .map(
+                |(
+                    version,
+                    total,
+                    by_status,
+                    outcomes,
+                    closed_without_outcome,
+                    samples,
+                    median,
+                    p90,
+                )| {
+                    Ok(crate::port::VersionTerminalReport {
+                        version,
+                        total,
+                        by_status: counts_map(by_status)?,
+                        outcomes: counts_map(outcomes)?,
+                        closed_without_outcome,
+                        cycle_time_days: crate::port::CycleTimeDays {
+                            samples,
+                            median,
+                            p90,
+                        },
+                    })
+                },
+            )
+            .collect()
+    }
+
     async fn count_jobs_by_kind(
         &self,
         status: Option<JobStatus>,

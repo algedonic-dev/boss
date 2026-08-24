@@ -36,6 +36,7 @@ mod plugins;
 mod sim_clock;
 mod stations;
 mod steps;
+mod terminal_report;
 
 use census::*;
 use jobs::*;
@@ -44,6 +45,7 @@ use plugins::*;
 use sim_clock::*;
 use stations::*;
 use steps::*;
+use terminal_report::*;
 
 const DEFAULT_LIMIT: i64 = 100;
 const MAX_LIMIT: i64 = 1000;
@@ -219,6 +221,13 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         .route(
             "/api/workflows/{kind}/versions/{version}",
             get(get_kind_version::<R, B>),
+        )
+        // Experiments Tier 1 (docs/design/network-experiments.md):
+        // the per-version terminal report — measurement of what
+        // version pinning already records.
+        .route(
+            "/api/workflows/{kind}/terminal-report",
+            get(workflow_terminal_report::<R, B>),
         )
         .route("/api/workflows/{kind}/publish", post(publish_kind::<R, B>))
         .route("/api/workflows/{kind}/retire", post(retire_kind::<R, B>))

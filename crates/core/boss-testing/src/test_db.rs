@@ -229,6 +229,10 @@ fn schema_sql(without: &[&str]) -> String {
         .join("\n")
 }
 
+/// Serializes the schema load across concurrent test databases, because
+/// the schema creates a cluster-global role. See the load site below.
+const SCHEMA_LOAD_LOCK: i64 = 0x_b055_10ad;
+
 pub struct TestDb {
     pub pool: PgPool,
     db_name: String,
@@ -336,10 +340,44 @@ impl TestDb {
             .unwrap_or_else(|e| panic!("connecting to test db {db_name}: {e}"));
 
         let schema = schema_sql(without);
-        sqlx::raw_sql(&schema)
-            .execute(&pool)
+        // ROLES ARE CLUSTER-GLOBAL, AND THE SCHEMA CREATES ONE.
+        //
+        // `111-gateway-audit-events.sql` creates the `boss_gateway_audit`
+        // login role inside a DO block that swallows `duplicate_object`.
+        // That is the right guard for a re-run, and the wrong one for a
+        // RACE: when two per-test databases apply the schema at the same
+        // moment, both see no such role, both issue CREATE ROLE, and the
+        // loser is refused by the shared catalog index with
+        // `unique_violation` (pg_authid_rolname_index) — a different
+        // SQLSTATE, so the DO block does not catch it and the whole load
+        // panics. It surfaced as `test` failing on train after train in
+        // August 2026 while every car passed alone, because parallelism
+        // decides whether it fires.
+        //
+        // The migration itself cannot be fixed: applied migrations are
+        // hashed, and editing one takes production down at the next
+        // deploy (2026-08-13, an hour of no system of record, over a
+        // COMMENT in this very file). So the harness serializes the one
+        // cluster-global step. The advisory lock is held on the ADMIN
+        // connection for the length of the load and released with it;
+        // the key is arbitrary but stable.
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
             .await
-            .unwrap_or_else(|e| panic!("loading schema into {db_name}: {e}"));
+            .unwrap_or_else(|e| panic!("connecting for the schema lock: {e}"));
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(SCHEMA_LOAD_LOCK)
+            .execute(&admin)
+            .await
+            .unwrap_or_else(|e| panic!("taking the schema-load lock: {e}"));
+        let loaded = sqlx::raw_sql(&schema).execute(&pool).await;
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(SCHEMA_LOAD_LOCK)
+            .execute(&admin)
+            .await;
+        admin.close().await;
+        loaded.unwrap_or_else(|e| panic!("loading schema into {db_name}: {e}"));
 
         Self {
             pool,

@@ -84,6 +84,10 @@ name = "job_metadata_patch_pg"
 required-features = ["postgres"]
 
 [[test]]
+name = "platform_seed_loader"
+required-features = ["postgres"]
+
+[[test]]
 name = "postgres_filter"
 required-features = ["postgres"]
 
@@ -129,6 +133,10 @@ required-features = ["postgres"]
 
 [[test]]
 name = "subject_existence_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "terminal_report_pg"
 required-features = ["postgres"]
 
 [[test]]
