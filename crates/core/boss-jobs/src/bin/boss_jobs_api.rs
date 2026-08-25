@@ -179,6 +179,11 @@ async fn main() -> Result<()> {
             Arc::new(boss_jobs::scheduling::PgScheduling::new(pool.clone()));
         let cadence: Arc<dyn boss_jobs::cadence::CadenceRepository> =
             Arc::new(boss_jobs::cadence::PgCadence::new(pool.clone()));
+        // The delivery pipeline's policy content, served to the train
+        // conductor through the same door as everything else it reads
+        // (docs/design/delivery-as-protocol.md).
+        let delivery: Arc<dyn boss_jobs::delivery::DeliveryPolicyRepository> =
+            Arc::new(boss_jobs::delivery::PgDeliveryPolicy::new(pool.clone()));
         // Q7: human job-owner resolution over the people roster.
         let people_url =
             std::env::var("BOSS_PEOPLE_URL").unwrap_or_else(|_| boss_ports::url("people"));
@@ -202,6 +207,7 @@ async fn main() -> Result<()> {
             Some(plugin_registry),
             Some(scheduling),
             Some(cadence),
+            Some(delivery),
             calendar,
             subject_kinds,
             subject_existence,
@@ -237,6 +243,7 @@ async fn main() -> Result<()> {
         Some(plugin_registry),
         None,
         None,
+        None,
         calendar,
         subject_kinds,
         subject_existence,
@@ -261,6 +268,7 @@ async fn run_server<R: JobsRepository + 'static>(
     plugin_registry: Option<Arc<dyn boss_jobs::StepPluginRegistry>>,
     scheduling: Option<Arc<dyn boss_jobs::scheduling::SchedulingRepository>>,
     cadence: Option<Arc<dyn boss_jobs::cadence::CadenceRepository>>,
+    delivery: Option<Arc<dyn boss_jobs::delivery::DeliveryPolicyRepository>>,
     calendar: Option<Arc<dyn boss_calendar_client::CalendarClient>>,
     subject_kinds: Option<Arc<dyn boss_subject_kinds_client::SubjectKindsClient>>,
     subject_existence: Option<Arc<dyn boss_jobs::subject_existence::SubjectExistenceCheck>>,
@@ -337,6 +345,12 @@ async fn run_server<R: JobsRepository + 'static>(
         info!("cadence routes mounted at /api/cadence/*");
         app = app.merge(boss_jobs::cadence::http::router(
             boss_jobs::cadence::http::CadenceApiState { repo },
+        ));
+    }
+    if let Some(repo) = delivery {
+        info!("delivery policy routes mounted at /api/delivery/policy/*");
+        app = app.merge(boss_jobs::delivery::http::router(
+            boss_jobs::delivery::http::DeliveryPolicyApiState { repo },
         ));
     }
     // Sim-origin middleware: extract x-sim-origin header and set the

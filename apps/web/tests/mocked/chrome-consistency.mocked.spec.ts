@@ -12,6 +12,7 @@
 
 import { test, expect } from '@playwright/test';
 import { mountPage } from '../smoke/_helpers';
+import { AA_FLOOR, describeUnreadable, measureContrast } from './_contrast';
 
 /// Surfaces that render the chrome through different code paths:
 /// a normal AppShell route, the full-page step route (rendered
@@ -58,72 +59,19 @@ test.describe('chrome bar', () => {
     await page.emulateMedia({ colorScheme: 'light' });
     await mountPage(page, '/ux/jobs');
 
-    const measured = await page.locator('.perspective-tabs').first().evaluate((bar) => {
-      const channels = (c: string) => (c.match(/[\d.]+/g) ?? []).map(Number);
-      const luminance = (c: string) => {
-        const [r, g, b] = channels(c)
-          .slice(0, 3)
-          .map((v) => {
-            const s = v / 255;
-            return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
-          });
-        return 0.2126 * (r ?? 0) + 0.7152 * (g ?? 0) + 0.0722 * (b ?? 0);
-      };
-      /// The surface a control actually sits on. Two things make this
-      /// more than "read the parent's background": a control may
-      /// paint its own (the search field does, so comparing it to the
-      /// bar would fail it wrongly), and a background may be
-      /// TRANSLUCENT — the active tab's amber is 18% over near-black,
-      /// which reads as a light colour if taken at face value and
-      /// would fail white text that is in fact perfectly legible.
-      /// So collect the stack down to the first opaque layer and
-      /// composite it.
-      const surface = (el: Element): string => {
-        const layers: number[][] = [];
-        let node: Element | null = el;
-        while (node) {
-          const ch = channels(getComputedStyle(node).backgroundColor);
-          const alpha = ch.length > 3 ? (ch[3] ?? 1) : 1;
-          if (alpha > 0) layers.push([ch[0] ?? 0, ch[1] ?? 0, ch[2] ?? 0, alpha]);
-          if (alpha === 1) break;
-          node = node.parentElement;
-        }
-        // Bottom-most opaque layer is the canvas; paint upward.
-        let [r, g, b] = (layers[layers.length - 1] ?? [255, 255, 255]).slice(0, 3);
-        for (let i = layers.length - 2; i >= 0; i--) {
-          const [sr = 0, sg = 0, sb = 0, sa = 1] = layers[i] ?? [];
-          r = sr * sa + (r ?? 0) * (1 - sa);
-          g = sg * sa + (g ?? 0) * (1 - sa);
-          b = sb * sa + (b ?? 0) * (1 - sa);
-        }
-        return `rgb(${Math.round(r ?? 0)}, ${Math.round(g ?? 0)}, ${Math.round(b ?? 0)})`;
-      };
-
-      return Array.from(bar.querySelectorAll('button, a'))
-        .filter((el) => (el.textContent ?? '').trim().length > 0)
-        .map((el) => {
-          const fg = getComputedStyle(el).color;
-          const bg = surface(el);
-          const [lo, hi] = [luminance(fg), luminance(bg)].sort((a, b) => a - b);
-          return {
-            label: (el.textContent ?? '').trim().slice(0, 24),
-            fg,
-            bg,
-            ratio: Math.round((((hi ?? 0) + 0.05) / ((lo ?? 0) + 0.05)) * 100) / 100,
-          };
-        });
-    });
+    const measured = await measureContrast(
+      page.locator('.perspective-tabs').first(),
+      'button, a',
+    );
 
     expect(measured.length, 'no labelled controls found in the chrome bar').toBeGreaterThan(3);
 
-    // 4.5:1 is the WCAG AA floor for normal-size text, which every
-    // one of these is.
-    const unreadable = measured.filter((m) => m.ratio < 4.5);
+    const unreadable = measured.filter((m) => m.ratio < AA_FLOOR);
     expect(
       unreadable,
-      `chrome controls below 4.5:1 contrast in light theme:\n${unreadable
-        .map((m) => `  "${m.label}" ${m.fg} on ${m.bg} = ${m.ratio}:1`)
-        .join('\n')}`,
+      `chrome controls below ${AA_FLOOR}:1 contrast in light theme:\n${describeUnreadable(
+        unreadable,
+      )}`,
     ).toEqual([]);
   });
 

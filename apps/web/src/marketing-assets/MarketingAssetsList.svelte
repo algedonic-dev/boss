@@ -153,27 +153,25 @@
                     {a.title}
                   </a>
                   {#if retired}
-                    <span style="margin-left:6px; font-size:10px; padding:1px 6px; border-radius:3px; background:#e7e5e4; color:#57534e">
-                      RETIRED
-                    </span>
+                    <span class="chip" style="margin-left:6px">RETIRED</span>
                   {/if}
                 </td>
                 <td>{a.kind ? (kindLabel.get(a.kind) ?? a.kind) : '—'}</td>
-                <td style="color:#78716c; font-size:12px">
+                <td style="color:var(--static); font-size:12px">
                   {a.tags.length > 0 ? a.tags.slice(0, 4).join(', ') : '—'}
                   {#if a.tags.length > 4} +{a.tags.length - 4}{/if}
                 </td>
-                <td style="color:#78716c; font-size:12px">
+                <td style="color:var(--static); font-size:12px">
                   {linkedCount > 0 ? `${linkedCount} ${linkedCount === 1 ? 'link' : 'links'}` : '—'}
                 </td>
                 <td>
                   {#if a.owner_id}
                     <EntityLink kind="employee" id={a.owner_id} />
                   {:else}
-                    <span style="color:#a8a29e">—</span>
+                    <span style="color:var(--static)">—</span>
                   {/if}
                 </td>
-                <td style="color:#78716c; font-size:12px">{a.updated_at.slice(0, 10)}</td>
+                <td style="color:var(--static); font-size:12px">{a.updated_at.slice(0, 10)}</td>
               </tr>
             {/each}
           </tbody>

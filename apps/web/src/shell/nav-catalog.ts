@@ -56,7 +56,16 @@ export type NavItem = Readonly<{
 
 export type NavGroup = Readonly<{ label: string; items: ReadonlyArray<NavItem> }>;
 
-export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
+/// Catalog keys that are surfaces without a permission key of their
+/// own. `RouteName` (libs/web-kit) is the role-gating vocabulary;
+/// these entries are visible to every role by construction (like the
+/// permKey-less Audit Log / Atlas rows), so they extend the CATALOG
+/// without widening the PERMISSION vocabulary — the catalog still
+/// answers "which app owns this surface" and "which sidebar row
+/// highlights" for them.
+export type UngatedSurfaceId = 'system-incidents';
+
+export const ROUTE_CATALOG: Readonly<Record<RouteName | UngatedSurfaceId, NavItem>> = {
   jobs:      { id: 'jobs',      label: 'All jobs',         path: '/ux/jobs',      permKey: 'jobs',      app: 'home' },
   sales:     { id: 'sales',     label: 'Sales pipeline',   path: '/ux/sales',     permKey: 'sales',     app: 'sales' },
   service:   { id: 'service',   label: 'Service queue',    path: '/ux/service',   permKey: 'service',   module: 'support', app: 'service' },
@@ -111,6 +120,12 @@ export const ROUTE_CATALOG: Readonly<Record<RouteName, NavItem>> = {
   'system-flow':             { id: 'system-flow',             label: 'Flow',                path: '/it/flow',         permKey: 'system-flow',             app: 'it' },
   'system-fleet':            { id: 'system-fleet',            label: 'Bottlenecks',               path: '/it/fleet',        permKey: 'system-fleet',            app: 'it' },
   'system-feedback':         { id: 'system-feedback',         label: 'Feedback triage',     path: '/it/feedback',     permKey: 'system-feedback',         app: 'it' },
+  // The incidents surface — active incident-post-mortem packets plus
+  // the closed ones as a durable archive (David: "both where we
+  // respond to active incidents and document post mortems for
+  // posterity"). PermKey-less: readable by any operator, like the
+  // feedback board; the Job/step writes behind it stay policy-gated.
+  'system-incidents':        { id: 'system-incidents',        label: 'Incidents',           path: '/it/incidents',    app: 'it' },
   // The "Evolve" surface — controlled, sandboxed model modifications
   // (placeholder for now; visible to every role via canSeeRoute).
   'system-experiments':      { id: 'system-experiments',      label: 'Experiments',         path: '/it/experiments',  permKey: 'system-experiments',      app: 'it' },

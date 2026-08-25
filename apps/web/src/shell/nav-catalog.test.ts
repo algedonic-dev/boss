@@ -89,6 +89,11 @@ describe('nav catalog — app assignment', () => {
     // (stations.md: priority queues, stations, and network nodes are
     // one concept). No edges until motion is evented.
     'system-map',
+    // Incidents — active incident-post-mortem packets to respond to,
+    // plus the closed ones rendered as a durable archive (David:
+    // "both where we respond to active incidents and document post
+    // mortems for posterity").
+    'system-incidents',
   ];
 
   it('the IT app contains the System Model set plus what we added deliberately', () => {

@@ -163,6 +163,10 @@
         ROUTE_CATALOG['system-fleet'],
         ROUTE_CATALOG['system-model'],
         ROUTE_CATALOG['system-monitoring'],
+        // Incidents beside Monitoring: monitoring is what the machine
+        // is doing, incidents are what went wrong and what we learned.
+        // Active packets to respond to + the post-mortem archive.
+        ROUTE_CATALOG['system-incidents'],
         // Audit Log + Atlas are sub-pages of monitoring with no
         // distinct permKey — plain NavItems (permKey-less ⇒ always
         // visible + always in-perspective; see visible()/inPerspective()).

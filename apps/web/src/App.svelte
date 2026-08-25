@@ -89,6 +89,7 @@
   import SearchResultsPage from './search/SearchResultsPage.svelte';
   import ViewsPage from './views/ViewsPage.svelte';
   import FeedbackTriagePage from './it/feedback/FeedbackTriagePage.svelte';
+  import IncidentsPage from './it/incidents/IncidentsPage.svelte';
   import LoginPage from './auth/LoginPage.svelte';
   import AuthAdminPage from './auth/AuthAdminPage.svelte';
   import ModuleDisabled from './shell/ModuleDisabled.svelte';
@@ -395,6 +396,8 @@
       <VendorInvoicePage vendorInvoiceId={route.vendorInvoiceId} />
     {:else if route.kind === 'watchlist'}
       <WatchlistPage />
+    {:else if route.kind === 'incidents'}
+      <IncidentsPage />
     {:else if route.kind === 'shop'}
       <ShopHome />
     {:else if route.kind === 'shopProduct'}

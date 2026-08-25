@@ -491,6 +491,12 @@ async fn get_json(http: &reqwest::Client, base: &str, path: &str) -> Result<Opti
     train::retrying(
         &train::JOBS_API_RETRY,
         &reqwest::Method::GET,
+        // The cadence loop is not a train and resolves no delivery
+        // policy — it decides only WHEN to spawn a verb. Its journal
+        // keeps the compiled cause budget, which is the same number the
+        // registry seeds; if the loop ever needs to read policy, this is
+        // the line that changes.
+        crate::delivery_policy::COMPILED_BLIP_CAUSE_BUDGET,
         &|m| log(m),
         || get_json_once(http, base, path),
     )

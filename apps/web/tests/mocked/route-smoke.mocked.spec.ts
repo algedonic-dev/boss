@@ -51,6 +51,10 @@ const ROUTES: ReadonlyArray<string> = [
   // drift test at the bottom of this file for why that can no longer
   // happen quietly.
   '/it/feedback', '/it/flow', '/it/yard',
+  // Incidents renders both panels' empty states under the mock's `[]`
+  // catch-all (an array where the {data} envelope should be reads as
+  // zero packets) — chrome + empty states, no crash.
+  '/it/incidents',
   // The network map under the mock's `[]` catch-all: an array where
   // the {data} envelope should be reads as zero stations — chrome +
   // empty state, no crash.

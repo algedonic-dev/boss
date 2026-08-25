@@ -48,6 +48,15 @@
 //! Talks to jobs-api directly with an actor header (the gateway strips
 //! inbound identity, same as boss-step.sh). Steps are addressed by
 //! `spec_slug` with a title fallback for steps that predate the column.
+//!
+//! THIS FILE EXECUTES. IT DOES NOT DECIDE.
+//! The thresholds, budgets and rosters the conductor works to are
+//! registry data, read once per invocation and threaded through
+//! `Conductor::policy` — see `crate::delivery_policy`, which is the only
+//! place a policy number is written down in Rust (and only as the
+//! fallback for a registry that cannot be reached). If you are looking
+//! for "how many strikes hold a car" or "which lints run on a consist",
+//! it is a row, not a constant (docs/design/delivery-as-protocol.md).
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, TryLockError};
@@ -58,11 +67,26 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use boss_jobs::delivery::DeliveryPolicyRow;
 use chrono::{DateTime, Timelike, Utc};
 use reqwest::Method;
 use serde_json::{Map, Value, json};
 
+use crate::delivery_policy::{self, DeliveryPolicy};
+
 const ACTOR: &str = "automation:train-conductor";
+
+/// The registry row an `/api/delivery/policy/*` response carries. Both
+/// endpoints answer `null` for "no such policy" — an ANSWER, not an
+/// error, so it arrives here as `Ok(None)` and the caller falls back.
+fn row_of_policy(body: Option<Value>) -> Result<Option<DeliveryPolicyRow>> {
+    match body {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => serde_json::from_value(v)
+            .map(Some)
+            .context("parsing the delivery policy row"),
+    }
+}
 
 pub(crate) fn boss_user() -> String {
     json!({
@@ -115,11 +139,6 @@ struct Config {
     /// Test harnesses and demo boxes only — on a real box the jobs
     /// system of record lives elsewhere (incident c4b4a6b0).
     allow_local_jobs: bool,
-    /// Hours without a step completion before an open train counts
-    /// stalled (BOSS_TRAIN_STALL_HOURS, default 6). An env knob for
-    /// now — this threshold belongs in the cadence_rules registry as
-    /// protocol data; follow-up, not this change.
-    stall_hours: i64,
     /// Hours the PR may sit without CI producing ANY verdict before the
     /// conductor says so (BOSS_TRAIN_CI_HOURS, default 2). David's
     /// number, 2026-08-15: roughly twice the measured p90 of pr->ci.
@@ -160,7 +179,6 @@ impl Config {
             forge_kind: env_or("BOSS_TRAIN_FORGE", "github"),
             auto_merge: std::env::var("BOSS_TRAIN_AUTO_MERGE").as_deref() == Ok("1"),
             allow_local_jobs: std::env::var("BOSS_TRAIN_ALLOW_LOCAL_JOBS").as_deref() == Ok("1"),
-            stall_hours: env_or("BOSS_TRAIN_STALL_HOURS", "6").parse().unwrap_or(6),
             ci_hours: env_or("BOSS_TRAIN_CI_HOURS", "2").parse().unwrap_or(2),
             converge_alarm_mins: env_or("BOSS_TRAIN_CONVERGE_ALARM_MINS", "30")
                 .parse()
@@ -396,50 +414,12 @@ fn preflight(cfg: &Config) -> Result<Vec<String>> {
 // reason that names the lint and the files.
 // ---------------------------------------------------------------------------
 
-/// The lints the consist check does not run, each with its reason.
-/// All four need something the assembled TREE does not contain — a
-/// cargo build, a package manager, or a live database — and a question
-/// the tree cannot answer is not a question that can be answered in
-/// seconds. Everything else in `infra/lint/` runs, including lints
-/// that do not exist yet. Pinned by a test: an exemption naming a
-/// script that is gone is an exemption covering nothing.
-const CONSIST_CHECK_EXCLUDED: &[(&str, &str)] = &[
-    (
-        "svelte-check.sh",
-        "runs `bun install --frozen-lockfile` and a typecheck — minutes, plus a network fetch, \
-         and it exits 1 outright on a box without bun",
-    ),
-    (
-        "no-snapshot-arrays.sh",
-        "reads the built `boss-ports-list` binary; with no target/ it can only report \
-         'not found', and building it is exactly what CI is for",
-    ),
-    (
-        "conservation-invariants.sh",
-        "psql + curl against a LIVE deployment — an invariant on the running system, which a \
-         tree cannot answer (it has its own systemd timer)",
-    ),
-    (
-        "audit-ordering.sh",
-        "psql against a live database — same: not a question about a tree",
-    ),
-];
-
-/// Wall clock the whole check may spend before it stops asking and
-/// lets the train go. The measured set costs ~9 seconds, so this is
-/// roughly six times headroom — wide enough that a slow box never
-/// trips it, narrow enough that "seconds, not minutes" stays true if
-/// something expensive lands in `infra/lint/` unannounced.
-const CONSIST_CHECK_BUDGET: Duration = Duration::from_secs(60);
-
-/// How much of a failing lint's output goes on the record. Same
-/// reasoning as `BLIP_CAUSE_BUDGET`: enough to act on, bounded so a
-/// chatty check cannot bloat a Job's metadata.
-const CONSIST_OUTPUT_BUDGET: usize = 1200;
-
-/// How many files a refusal names. The reason string is read on a chip
-/// in the yard; past a handful it stops being a hint.
-const CONSIST_FILES_NAMED: usize = 6;
+// The roster, the exclusions and the three budgets used to be four
+// constants here. They are policy — every one of them is a question
+// somebody could reasonably answer differently tomorrow — and they now
+// arrive as a `DeliveryPolicy` resolved once per invocation from the
+// registry (`crate::delivery_policy`). What stayed here is the
+// mechanism: walk the tree, run bash, read exit codes, decide.
 
 /// What one cheap lint said about the assembled tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -507,7 +487,7 @@ impl ConsistVerdict {
 /// A token counts as a filename when it ends in a short alphabetic
 /// extension — which keeps `Cargo.toml` and `153-a.sql` and drops
 /// `v1.2`, `0.8`, and sentences ending in a full stop.
-pub(crate) fn files_named_in(output: &str) -> Vec<String> {
+pub(crate) fn files_named_in(output: &str, budget: usize) -> Vec<String> {
     let mut named: Vec<String> = Vec::new();
     for token in output.split_whitespace() {
         let token =
@@ -525,7 +505,7 @@ pub(crate) fn files_named_in(output: &str) -> Vec<String> {
         if !named.iter().any(|f| f == token) {
             named.push(token.to_string());
         }
-        if named.len() == CONSIST_FILES_NAMED {
+        if named.len() == budget {
             break;
         }
     }
@@ -542,12 +522,12 @@ pub(crate) fn files_named_in(output: &str) -> Vec<String> {
 /// The last clause is the point of the whole car. A car that reads
 /// this did nothing wrong, and must not be treated — by a person or by
 /// the boarding rules — as if it had.
-pub(crate) fn consist_refusal_reason(failed: &[LintFailure]) -> String {
+pub(crate) fn consist_refusal_reason(failed: &[LintFailure], file_budget: usize) -> String {
     let Some(first) = failed.first() else {
         return "consist check refused, no failing check named".to_string();
     };
     let mut files = first.files.join(", ");
-    if files.len() > SKIP_REASON_FILE_BUDGET {
+    if files.len() > file_budget {
         files = format!("{} files", first.files.len());
     }
     let named = if files.is_empty() {
@@ -569,9 +549,9 @@ pub(crate) fn consist_refusal_reason(failed: &[LintFailure]) -> String {
 /// Which `infra/lint/*.sh` of the assembled tree this check runs, in
 /// a deterministic order (sorted, so two runs over one tree ask the
 /// same questions in the same sequence). The roster is the directory
-/// minus `CONSIST_CHECK_EXCLUDED` — nothing here to edit when a lint
-/// lands.
-fn cheap_lints(tree: &Path) -> Result<Vec<PathBuf>> {
+/// minus the policy's exclusions — nothing in code to edit when a lint
+/// lands, and nothing in code to edit when an exclusion changes either.
+fn cheap_lints(tree: &Path, policy: &DeliveryPolicy) -> Result<Vec<PathBuf>> {
     let dir = tree.join("infra/lint");
     let mut scripts: Vec<PathBuf> = fs::read_dir(&dir)
         .with_context(|| format!("reading {}", dir.display()))?
@@ -584,7 +564,7 @@ fn cheap_lints(tree: &Path) -> Result<Vec<PathBuf>> {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            !CONSIST_CHECK_EXCLUDED.iter().any(|(ex, _)| *ex == name)
+            !policy.excludes(&name)
         })
         .collect();
     scripts.sort();
@@ -595,7 +575,7 @@ fn cheap_lints(tree: &Path) -> Result<Vec<PathBuf>> {
 /// it directly: the checkout may not carry the executable bit, and
 /// every one of these scripts is a bash script that locates the repo
 /// root from its own path.
-fn run_one_lint(tree: &Path, script: &Path) -> LintResult {
+fn run_one_lint(tree: &Path, script: &Path, output_budget: usize) -> LintResult {
     if !script.is_file() {
         return LintResult::Unrunnable("not a readable file".to_string());
     }
@@ -619,7 +599,7 @@ fn run_one_lint(tree: &Path, script: &Path) -> LintResult {
             );
             text.truncate(
                 text.char_indices()
-                    .nth(CONSIST_OUTPUT_BUDGET)
+                    .nth(output_budget)
                     .map_or(text.len(), |(i, _)| i),
             );
             LintResult::Failed(text.trim().to_string())
@@ -629,7 +609,7 @@ fn run_one_lint(tree: &Path, script: &Path) -> LintResult {
 
 /// The decision. Pure over what the lints said, so the verdict is
 /// testable without a tree and the tree-walking stays in one place.
-pub(crate) fn consist_verdict(runs: &[LintRun]) -> ConsistVerdict {
+pub(crate) fn consist_verdict(runs: &[LintRun], files_named: usize) -> ConsistVerdict {
     let mut warnings = Vec::new();
     let mut failed = Vec::new();
     let mut ran = 0;
@@ -641,7 +621,7 @@ pub(crate) fn consist_verdict(runs: &[LintRun]) -> ConsistVerdict {
                 failed.push(LintFailure {
                     name: run.name.clone(),
                     output: output.clone(),
-                    files: files_named_in(output),
+                    files: files_named_in(output, files_named),
                 });
             }
             // Named with the `.sh` back on: what could not run is a
@@ -669,8 +649,8 @@ pub(crate) fn consist_verdict(runs: &[LintRun]) -> ConsistVerdict {
 /// All the checks run, not just up to the first failure: they are
 /// seconds each, and learning ONE bit per attempt is precisely the
 /// cost this exists to stop paying.
-pub(crate) fn consist_check(tree: &Path) -> ConsistVerdict {
-    let scripts = match cheap_lints(tree) {
+pub(crate) fn consist_check(tree: &Path, policy: &DeliveryPolicy) -> ConsistVerdict {
+    let scripts = match cheap_lints(tree, policy) {
         Ok(s) if s.is_empty() => {
             return ConsistVerdict::Proceed {
                 ran: 0,
@@ -700,10 +680,10 @@ pub(crate) fn consist_check(tree: &Path) -> ConsistVerdict {
             .to_string();
         runs.push(LintRun {
             name,
-            result: run_one_lint(tree, script),
+            result: run_one_lint(tree, script, policy.consist_output_budget),
         });
-        if started.elapsed() > CONSIST_CHECK_BUDGET && done + 1 < total {
-            let mut verdict = consist_verdict(&runs);
+        if started.elapsed() > policy.consist_budget && done + 1 < total {
+            let mut verdict = consist_verdict(&runs, policy.consist_files_named);
             let spent = started.elapsed().as_secs();
             let note = format!(
                 "budget spent ({spent}s) after {} of {total} checks — going on what ran",
@@ -716,7 +696,7 @@ pub(crate) fn consist_check(tree: &Path) -> ConsistVerdict {
             return verdict;
         }
     }
-    consist_verdict(&runs)
+    consist_verdict(&runs, policy.consist_files_named)
 }
 
 // ---------------------------------------------------------------------------
@@ -838,26 +818,23 @@ impl RetryPolicy {
     }
 }
 
-/// Character budget for a blip's cause in the journal.
-const BLIP_CAUSE_BUDGET: usize = 80;
-
 /// The one-line cause of a blip: the INNERMOST error, which is where
 /// the fact lives ("Connection refused (os error 61)") — the layers
 /// above it just repeat the url the journal line already implies.
-pub(crate) fn short_cause(err: &anyhow::Error) -> String {
+///
+/// `budget` is policy (`delivery_policy.blip_cause_budget`); the
+/// truncation is mechanism.
+pub(crate) fn short_cause(err: &anyhow::Error, budget: usize) -> String {
     let innermost = err
         .chain()
         .last()
         .map(|c| c.to_string())
         .unwrap_or_default();
     let line = innermost.lines().next().unwrap_or_default().trim();
-    if line.chars().count() <= BLIP_CAUSE_BUDGET {
+    if line.chars().count() <= budget {
         return line.to_string();
     }
-    format!(
-        "{}…",
-        line.chars().take(BLIP_CAUSE_BUDGET).collect::<String>()
-    )
+    format!("{}…", line.chars().take(budget).collect::<String>())
 }
 
 /// Run `op` until it succeeds, its failure turns out to be an answer
@@ -868,6 +845,7 @@ pub(crate) fn short_cause(err: &anyhow::Error) -> String {
 pub(crate) async fn retrying<T, F, Fut>(
     policy: &RetryPolicy,
     method: &Method,
+    cause_budget: usize,
     journal: &dyn Fn(&str),
     mut op: F,
 ) -> Result<T>
@@ -887,7 +865,7 @@ where
         journal(&format!(
             "jobs API blip ({attempt}/{}): {}",
             policy.attempts,
-            short_cause(&failure.cause)
+            short_cause(&failure.cause, cause_budget)
         ));
         tokio::time::sleep(policy.backoff(attempt)).await;
         attempt += 1;
@@ -990,12 +968,6 @@ pub(crate) fn overlay_metadata(container: &Value, kv: Vec<(&str, Value)>) -> Map
     md
 }
 
-/// Character budget for the file list in a conflict skip reason. The
-/// reason lands on the car Job's `metadata.skip_reason`, which the
-/// yard's PacketCard renders as a chip ("LEFT BEHIND — <reason>") —
-/// past this budget the list truncates to a count.
-const SKIP_REASON_FILE_BUDGET: usize = 96;
-
 /// The skip reason for a car whose branch would not merge onto this
 /// window's train: names the conflicted files, truncated to stay
 /// chip-sized. At least one file always shows.
@@ -1043,7 +1015,7 @@ fn rerail_onto_consist(clone: &str, train_branch: &str, branch: &str) -> Result<
     Ok(Some(scratch.to_string()))
 }
 
-pub(crate) fn skip_reason_conflict(conflicted: &[String]) -> String {
+pub(crate) fn skip_reason_conflict(conflicted: &[String], file_budget: usize) -> String {
     if conflicted.is_empty() {
         return "conflict: unresolved (merge died before conflict markers)".to_string();
     }
@@ -1051,7 +1023,7 @@ pub(crate) fn skip_reason_conflict(conflicted: &[String]) -> String {
     let mut len = 0usize;
     for f in conflicted {
         let add = f.len() + if shown == 0 { 0 } else { 2 };
-        if shown > 0 && len + add > SKIP_REASON_FILE_BUDGET {
+        if shown > 0 && len + add > file_budget {
             break;
         }
         shown += 1;
@@ -1916,11 +1888,6 @@ pub(crate) fn ci_overdue(
     })
 }
 
-/// How many red trains a car may ride before boarding leaves it behind.
-/// Two: one red is bad luck — the fault is usually a neighbour's — and
-/// a second aboard a different consist is the car itself.
-pub(crate) const MAX_RED_TRAINS: i64 = 2;
-
 /// The boarding hold, pure: a car released from that many red trains
 /// stops boarding until someone looks at it. Without this the auto
 /// cancel above is a loop — the same consist re-boards, goes red, and
@@ -2706,6 +2673,11 @@ struct Conductor {
     cfg: Config,
     http: reqwest::Client,
     forge: Box<dyn Forge>,
+    /// THE RULES THIS INVOCATION DECIDES BY — resolved once, from the
+    /// registry, and threaded to every decision point below. Nothing in
+    /// this file reaches for a policy constant any more; if a threshold
+    /// appears in a decision here, it arrived on this field.
+    policy: DeliveryPolicy,
 }
 
 impl Conductor {
@@ -2721,7 +2693,84 @@ impl Conductor {
                 h
             })
             .build()?;
-        Ok(Conductor { cfg, http, forge })
+        // Built on the compiled fallback so the conductor can make the
+        // very API call that resolves the real one; `with_policy`
+        // replaces it before any decision is taken.
+        Ok(Conductor {
+            cfg,
+            http,
+            forge,
+            policy: DeliveryPolicy::compiled(),
+        })
+    }
+
+    fn with_policy(mut self, policy: DeliveryPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Read the delivery policy in force. Never fails — an unreachable
+    /// or unusable registry lands on the compiled fallback with one loud
+    /// journal line (`delivery_policy::resolve_from`), because a policy
+    /// registry must not become a new way to wedge every train.
+    async fn resolve_policy(&self) -> DeliveryPolicy {
+        let fetched = self
+            .api(
+                Method::GET,
+                &format!("/api/delivery/policy/{}", delivery_policy::POLICY_NAME),
+                None,
+            )
+            .await
+            .and_then(row_of_policy);
+        let policy = delivery_policy::resolve_from(fetched, &|m| log(m));
+        if policy.is_from_registry() {
+            log(format!(
+                "delivery policy v{} in force (hold {}, stall {}h, {} lint exclusions)",
+                policy.version,
+                policy.max_red_trains,
+                policy.stall_hours,
+                policy.excluded_lints.len()
+            ));
+        }
+        policy
+    }
+
+    /// The policy a train in flight is judged by: the version it
+    /// DEPARTED under, not the one in force now. A mid-flight registry
+    /// edit changes the next train, never this one — the same promise a
+    /// packet gets from its pinned workflow version.
+    async fn policy_for(&self, train: &Value) -> DeliveryPolicy {
+        let Some(version) = delivery_policy::version_to_fetch(train, &self.policy) else {
+            return self.policy.clone();
+        };
+        let fetched = self
+            .api(
+                Method::GET,
+                &format!(
+                    "/api/delivery/policy/{}/versions/{version}",
+                    delivery_policy::POLICY_NAME
+                ),
+                None,
+            )
+            .await
+            .and_then(row_of_policy);
+        match fetched.and_then(|row| {
+            row.ok_or_else(|| anyhow!("policy v{version} is not in the registry"))
+                .and_then(delivery_policy::parse)
+        }) {
+            Ok(pinned) => pinned,
+            Err(e) => {
+                // Loud, and then carry on under the active policy: a
+                // train whose pin cannot be read still has to be
+                // reconciled, and refusing would strand its consist.
+                log(format!(
+                    "delivery policy: train pinned v{version} but it could not be read ({e}) — \
+                     judging it under v{} instead",
+                    self.policy.version
+                ));
+                self.policy.clone()
+            }
+        }
     }
 
     /// Every jobs-API call the conductor makes, under the blip guard:
@@ -2732,11 +2781,17 @@ impl Conductor {
         path: &str,
         payload: Option<Value>,
     ) -> Result<Option<Value>> {
-        retrying(&JOBS_API_RETRY, &method, &|m| log(m), || {
-            let method = method.clone();
-            let payload = payload.clone();
-            async move { self.api_once(method, path, payload).await }
-        })
+        retrying(
+            &JOBS_API_RETRY,
+            &method,
+            self.policy.blip_cause_budget,
+            &|m| log(m),
+            || {
+                let method = method.clone();
+                let payload = payload.clone();
+                async move { self.api_once(method, path, payload).await }
+            },
+        )
         .await
     }
 
@@ -3124,10 +3179,13 @@ impl Conductor {
         for t0 in trains {
             let tid = job_id(&t0)?.to_string();
             let mut t = self.get_job(&tid).await?;
+            // The rules THIS train departed under, which may not be the
+            // ones in force now.
+            let policy = self.policy_for(&t).await;
             // The stall sentinel first — a train stuck BEFORE its PR
             // (assembly died, push hung) would slip past the
             // pr-step early-continues below and stall invisibly.
-            self.note_stall(&t, now).await?;
+            self.note_stall(&t, now, &policy).await?;
             let pr_step = find_step(&t, "pr", "Open the batched PR");
             if !step_done(pr_step) {
                 continue; // this window's board phase, or a stalled assembly
@@ -3216,7 +3274,7 @@ impl Conductor {
             // yes (`verdict_strikes_cars`).
             if self.cfg.auto_cancel
                 && info.get("state").and_then(Value::as_str) == Some("OPEN")
-                && let Some(reason) = auto_cancel_reason(&t, verdict, now, self.cfg.stall_hours)
+                && let Some(reason) = auto_cancel_reason(&t, verdict, now, policy.stall_hours)
             {
                 log(format!("train {} auto-cancelling: {reason}", id8(&tid)));
                 if self.cfg.dry {
@@ -3347,15 +3405,20 @@ impl Conductor {
     /// the stamp when the train advances. Raising is protocol,
     /// cancelling is judgment — nothing here auto-cancels; the
     /// operator's verb for that is `boss train cancel`.
-    async fn note_stall(&self, t: &Value, now: DateTime<Utc>) -> Result<()> {
+    async fn note_stall(
+        &self,
+        t: &Value,
+        now: DateTime<Utc>,
+        policy: &DeliveryPolicy,
+    ) -> Result<()> {
         let tid = job_id(t)?;
         let stamped = truthy(t.get("metadata").and_then(|m| m.get("stalled_since")));
-        match stall_age_hours(t, now, self.cfg.stall_hours) {
+        match stall_age_hours(t, now, policy.stall_hours) {
             Some(age) if !stamped => {
                 log(format!(
                     "train {} stalled ({age}h, threshold {}h)",
                     id8(tid),
-                    self.cfg.stall_hours
+                    policy.stall_hours
                 ));
                 // Since WHEN: the newest completion — the moment
                 // progress provably stopped, not the moment the
@@ -3660,7 +3723,7 @@ impl Conductor {
             // The two-strike hold. Without it the auto-cancel above is
             // a loop: the same consist re-boards, goes red, cancels,
             // and burns the night landing nothing.
-            if let Some(reason) = car_hold_reason(&j, MAX_RED_TRAINS) {
+            if let Some(reason) = car_hold_reason(&j, self.policy.max_red_trains) {
                 log(format!("{}: {reason} — leaving behind", id8(&jid)));
                 left_behind.push(json!({"car_id_short": id8(&jid), "reason": reason.as_str()}));
                 if !self.cfg.dry {
@@ -3762,6 +3825,17 @@ impl Conductor {
     }
 
     async fn open_train_job(&self, train_branch: &str, window: &str) -> Result<Option<Value>> {
+        // THE PIN. The train records the policy version it is departing
+        // under, so an edit made while it is in flight cannot rewrite
+        // the rules it left on — the same promise a packet gets from the
+        // workflow version it was admitted under. Nothing is stamped
+        // when the conductor fell back to compiled values: there is no
+        // version, and a record that claimed one would be lying.
+        let mut metadata = Map::new();
+        metadata.insert("actor".to_string(), json!(ACTOR));
+        for (k, v) in delivery_policy::pin_stamps(&self.policy) {
+            metadata.insert(k.to_string(), v);
+        }
         let payload = json!({
             "kind": "pr-train",
             "subject": {"subject_kind": "custom", "id": train_branch},
@@ -3781,7 +3855,7 @@ impl Conductor {
             "owner_id": ACTOR,
             "status": "open",
             "priority": "standard",
-            "metadata": {"actor": ACTOR},
+            "metadata": metadata,
             "tags": ["train"],
         });
         if self.cfg.dry {
@@ -3939,7 +4013,7 @@ impl Conductor {
                 // ONE reason string, journal and Job alike — the chip
                 // the yard renders and the line the operator greps
                 // must never tell different stories.
-                let reason = skip_reason_conflict(&conflicted);
+                let reason = skip_reason_conflict(&conflicted, self.policy.skip_reason_file_budget);
                 log(format!("{branch}: {reason} — left for the next train"));
                 left_behind.push(json!({
                     "car_id_short": id8(job_id(&j)?),
@@ -3986,14 +4060,14 @@ impl Conductor {
         // consist should leave nothing behind on the forge to clean up
         // later (the 62 stale `train/*` branches of ab3fa473 are what
         // that debt looks like when nobody owns it).
-        let verdict = consist_check(Path::new(clone));
+        let verdict = consist_check(Path::new(clone), &self.policy);
         for w in verdict.warnings() {
             log(format!(
                 "consist check: {w} — skipping it, a broken check must not hold a train"
             ));
         }
         if let ConsistVerdict::Refuse { failed, ran, .. } = &verdict {
-            let reason = consist_refusal_reason(failed);
+            let reason = consist_refusal_reason(failed, self.policy.skip_reason_file_budget);
             log(format!(
                 "consist check: {} of {ran} checks disagree with the assembled tree",
                 failed.len()
@@ -4457,7 +4531,13 @@ pub async fn run(phase: Phase, dry: bool, now: DateTime<Utc>) -> Result<()> {
     if matches!(phase, Phase::Preflight) {
         return Ok(());
     }
+    // POLICY IS RESOLVED ONCE, HERE, and threaded from this point on.
+    // One read per invocation means every decision in this run is taken
+    // against one coherent set of rules, and the version is a fact the
+    // journal and the train's own record can both name.
     let conductor = Conductor::new(cfg, forge)?;
+    let policy = conductor.resolve_policy().await;
+    let conductor = conductor.with_policy(policy);
     match phase {
         Phase::Preflight => {} // returned above; the arm keeps the match total
         Phase::Reconcile => conductor.reconcile(now).await?,
@@ -4626,14 +4706,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
     use super::{
-        ApiFailure, ConvergenceVerdict, Failure, JOBS_API_RETRY, MAX_RED_TRAINS, RetryPolicy,
-        SweepGuard, arrival_report, arrival_summary, auto_cancel_reason, boarded_head,
-        branch_moved_line, car_hold_reason, ci_overdue, classify_transport, commits_match,
-        convergence_verdict, deletable_branches, deploy_needed, local_jobs_problem,
-        overlay_metadata, parked_ready, releasable_cars, repo_path, resolve_train, retryable,
-        retrying, short_cause, skip_reason_branch_missing, skip_reason_conflict, stall_age_hours,
-        sweep_guard, sweep_note, sweep_settled, train_branch_to_delete, verdict_drift,
+        ApiFailure, ConvergenceVerdict, Failure, JOBS_API_RETRY, RetryPolicy, SweepGuard,
+        arrival_report, arrival_summary, auto_cancel_reason, boarded_head, branch_moved_line,
+        car_hold_reason, ci_overdue, classify_transport, commits_match, convergence_verdict,
+        deletable_branches, deploy_needed, local_jobs_problem, overlay_metadata, parked_ready,
+        releasable_cars, repo_path, resolve_train, retryable, retrying, short_cause,
+        skip_reason_branch_missing, skip_reason_conflict, stall_age_hours, sweep_guard, sweep_note,
+        sweep_settled, train_branch_to_delete, verdict_drift,
     };
+    use crate::delivery_policy::DeliveryPolicy;
     use anyhow::{Result, anyhow};
     use chrono::{DateTime, Utc};
     use reqwest::Method;
@@ -4641,6 +4722,16 @@ mod tests {
     use std::cell::Cell;
     use std::collections::BTreeSet;
     use std::time::Duration;
+
+    /// THE POLICY EVERY TEST BELOW DECIDES BY, unless it is deliberately
+    /// exercising a different one. It is the compiled fallback, which is
+    /// exactly what the seeded registry row parses to
+    /// (`delivery_policy::db_tests::the_seeded_policy_equals_the_compiled_fallback`)
+    /// — so these tests pin the same behaviour they pinned before the
+    /// numbers moved.
+    fn policy() -> DeliveryPolicy {
+        DeliveryPolicy::compiled()
+    }
 
     /// A car parked at review, branch pushed, not on a train.
     fn ready_car() -> serde_json::Value {
@@ -4953,7 +5044,10 @@ mod tests {
     #[test]
     fn a_conflict_skip_reason_names_the_files() {
         let files = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
-        assert_eq!(skip_reason_conflict(&files), "conflict: src/a.rs, src/b.rs");
+        assert_eq!(
+            skip_reason_conflict(&files, policy().skip_reason_file_budget),
+            "conflict: src/a.rs, src/b.rs"
+        );
     }
 
     #[test]
@@ -4961,7 +5055,7 @@ mod tests {
         let files: Vec<String> = (0..20)
             .map(|i| format!("crates/core/boss-jobs/src/file_{i:02}.rs"))
             .collect();
-        let reason = skip_reason_conflict(&files);
+        let reason = skip_reason_conflict(&files, policy().skip_reason_file_budget);
         assert!(
             reason.starts_with("conflict: crates/core/boss-jobs/src/file_00.rs"),
             "leads with the first file: {reason}"
@@ -4979,14 +5073,17 @@ mod tests {
         // Truncation drops files, never the whole answer: at least one
         // file always shows.
         let long = format!("crates/{}.rs", "x".repeat(150));
-        let reason = skip_reason_conflict(std::slice::from_ref(&long));
+        let reason = skip_reason_conflict(
+            std::slice::from_ref(&long),
+            policy().skip_reason_file_budget,
+        );
         assert_eq!(reason, format!("conflict: {long}"));
     }
 
     #[test]
     fn a_merge_that_died_before_markers_says_so() {
         assert_eq!(
-            skip_reason_conflict(&[]),
+            skip_reason_conflict(&[], policy().skip_reason_file_budget),
             "conflict: unresolved (merge died before conflict markers)"
         );
     }
@@ -5545,7 +5642,7 @@ mod tests {
     #[test]
     fn a_car_that_took_two_trains_red_is_held() {
         let car = json!({"id": "car-1", "metadata": {"red_trains": 2}});
-        assert!(car_hold_reason(&car, MAX_RED_TRAINS).is_some());
+        assert!(car_hold_reason(&car, policy().max_red_trains).is_some());
     }
 
     #[test]
@@ -5553,9 +5650,31 @@ mod tests {
         // One red is usually a neighbour's fault — holding on the first
         // would quarantine innocent cars and stall the queue.
         let car = json!({"id": "car-1", "metadata": {"red_trains": 1}});
-        assert_eq!(car_hold_reason(&car, MAX_RED_TRAINS), None);
+        assert_eq!(car_hold_reason(&car, policy().max_red_trains), None);
         let fresh = json!({"id": "car-2", "metadata": {}});
-        assert_eq!(car_hold_reason(&fresh, MAX_RED_TRAINS), None);
+        assert_eq!(car_hold_reason(&fresh, policy().max_red_trains), None);
+    }
+
+    /// The hold count is DATA now, and this is what that buys: raising
+    /// it in the registry lets a car that two reds would have held keep
+    /// boarding, with no code change and no train. The decision function
+    /// itself never changed — it always took the threshold as an
+    /// argument; what changed is where the argument comes from.
+    #[test]
+    fn the_hold_moves_when_the_policy_says_a_different_number() {
+        let lenient = DeliveryPolicy {
+            max_red_trains: 3,
+            ..policy()
+        };
+        let two_reds = json!({"id": "car-1", "metadata": {"red_trains": 2}});
+        assert_eq!(car_hold_reason(&two_reds, lenient.max_red_trains), None);
+
+        let strict = DeliveryPolicy {
+            max_red_trains: 1,
+            ..policy()
+        };
+        let one_red = json!({"id": "car-2", "metadata": {"red_trains": 1}});
+        assert!(car_hold_reason(&one_red, strict.max_red_trains).is_some());
     }
 
     // -- cancelling a train ------------------------------------------------
@@ -5667,7 +5786,6 @@ mod tests {
                 forge_kind: forge_kind.into(),
                 auto_merge: false,
                 allow_local_jobs: true,
-                stall_hours: 6,
                 ci_hours: 2,
                 converge_alarm_mins: 30,
                 auto_cancel: false,
@@ -5675,6 +5793,7 @@ mod tests {
             },
             http: reqwest::Client::new(),
             forge,
+            policy: policy(),
         }
     }
 
@@ -6063,11 +6182,17 @@ mod tests {
         let e = anyhow!("Connection refused (os error 61)")
             .context("error sending request for url (http://10.20.0.34:7900/api/jobs)")
             .context("GET /api/jobs?kind=pr-train");
-        assert_eq!(short_cause(&e), "Connection refused (os error 61)");
+        assert_eq!(
+            short_cause(&e, policy().blip_cause_budget),
+            "Connection refused (os error 61)"
+        );
         // A bare error is its own innermost cause.
-        assert_eq!(short_cause(&anyhow!("HTTP 503")), "HTTP 503");
+        assert_eq!(
+            short_cause(&anyhow!("HTTP 503"), policy().blip_cause_budget),
+            "HTTP 503"
+        );
         // And it stays journal-sized.
-        let long = short_cause(&anyhow!("{}", "x".repeat(500)));
+        let long = short_cause(&anyhow!("{}", "x".repeat(500)), policy().blip_cause_budget);
         assert!(long.chars().count() <= 81, "{} chars", long.chars().count());
         assert!(long.ends_with('…'), "says it truncated: {long}");
     }
@@ -6122,6 +6247,7 @@ mod tests {
         let out: Result<()> = retrying(
             &RetryPolicy::immediate(3),
             &Method::GET,
+            policy().blip_cause_budget,
             &counting_journal(&lines),
             || {
                 calls += 1;
@@ -6141,6 +6267,7 @@ mod tests {
         let out: Result<u8> = retrying(
             &RetryPolicy::immediate(3),
             &Method::PUT,
+            policy().blip_cause_budget,
             &counting_journal(&lines),
             || {
                 calls += 1;
@@ -6167,6 +6294,7 @@ mod tests {
         let out: Result<()> = retrying(
             &RetryPolicy::immediate(3),
             &Method::PUT,
+            policy().blip_cause_budget,
             &counting_journal(&lines),
             || {
                 calls += 1;
@@ -6687,7 +6815,7 @@ mod tests {
     #[test]
     fn a_clean_consist_lets_the_train_go_on_to_the_pr() {
         let (_g, tree) = consist_fixture("clean", &twelve_migrations());
-        let verdict = consist_check(&tree);
+        let verdict = consist_check(&tree, &policy());
         assert!(
             matches!(verdict, ConsistVerdict::Proceed { .. }),
             "a tree with no duplicate numbers must not stop a train: {verdict:?}"
@@ -6710,7 +6838,7 @@ mod tests {
         migrations.push("153-estate-subjects.sql".to_string());
         let (_g, tree) = consist_fixture("dupe-153", &migrations);
 
-        let verdict = consist_check(&tree);
+        let verdict = consist_check(&tree, &policy());
         let ConsistVerdict::Refuse { failed, .. } = &verdict else {
             panic!("a duplicated migration number must refuse the consist: {verdict:?}");
         };
@@ -6726,7 +6854,7 @@ mod tests {
         // The valuable half: the reason names the lint AND the files,
         // because a combination failure is nobody's car's fault and the
         // cars stay boardable carrying only this string.
-        let reason = consist_refusal_reason(failed);
+        let reason = consist_refusal_reason(failed, policy().skip_reason_file_budget);
         assert!(
             reason.contains("migration-numbers-unique"),
             "reason names the lint: {reason}"
@@ -6759,7 +6887,7 @@ mod tests {
         )
         .expect("symlink");
 
-        let verdict = consist_check(&tree);
+        let verdict = consist_check(&tree, &policy());
         assert!(
             matches!(verdict, ConsistVerdict::Proceed { .. }),
             "an unrunnable check must not refuse a consist: {verdict:?}"
@@ -6779,7 +6907,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _g = Scratch(root.clone());
         std::fs::create_dir_all(&root).expect("mkdir");
-        let verdict = consist_check(&root);
+        let verdict = consist_check(&root, &policy());
         assert!(
             matches!(verdict, ConsistVerdict::Proceed { ran: 0, .. }),
             "no lints is not a reason to hold a train: {verdict:?}"
@@ -6802,7 +6930,7 @@ mod tests {
     fn the_roster_is_the_lint_directory_itself() {
         let lint_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../infra/lint");
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        let names: Vec<String> = cheap_lints(&root)
+        let names: Vec<String> = cheap_lints(&root, &policy())
             .expect("the tree has an infra/lint")
             .iter()
             .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into())
@@ -6815,37 +6943,76 @@ mod tests {
             names.iter().any(|n| n == "migration-numbers-unique.sh"),
             "the lint that catches duplicate migration numbers is in: {names:?}"
         );
-        for (excluded, why) in CONSIST_CHECK_EXCLUDED {
+        for excluded in &policy().excluded_lints {
+            let (script, why) = (&excluded.script, &excluded.reason);
             assert!(
-                !names.iter().any(|n| n == excluded),
-                "{excluded} needs more than a tree ({why}) and must stay out: {names:?}"
+                !names.iter().any(|n| n == script),
+                "{script} needs more than a tree ({why}) and must stay out: {names:?}"
             );
             assert!(
-                lint_dir.join(excluded).is_file(),
-                "{excluded} is excluded ({why}) but is no longer in infra/lint/ — drop the \
+                lint_dir.join(script).is_file(),
+                "{script} is excluded ({why}) but is no longer in infra/lint/ — drop the \
                  exemption rather than leaving it to mislead"
             );
         }
     }
 
+    /// The exclusion roster is DATA now: a policy that excuses one more
+    /// lint excuses it on the next boarding, with no code change and no
+    /// train. This is the property the design was bought for, exercised
+    /// against the real `infra/lint/` directory.
+    #[test]
+    fn an_exclusion_added_to_the_policy_takes_a_lint_out_of_the_roster() {
+        use crate::delivery_policy::ExcludedLint;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let victim = "migration-numbers-unique.sh";
+        let mut excused = policy();
+        excused.excluded_lints.push(ExcludedLint {
+            script: victim.to_string(),
+            reason: "excused by this test, not by the registry".to_string(),
+        });
+        let names: Vec<String> = cheap_lints(&root, &excused)
+            .expect("the tree has an infra/lint")
+            .iter()
+            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n == victim),
+            "the roster is the directory MINUS the policy's exclusions: {names:?}"
+        );
+    }
+
     #[test]
     fn a_lints_output_gives_up_the_files_it_names() {
         assert_eq!(
-            files_named_in("  153:\n    153-a.sql\n    153-b.sql\n"),
+            files_named_in(
+                "  153:\n    153-a.sql\n    153-b.sql\n",
+                policy().consist_files_named
+            ),
             vec!["153-a.sql", "153-b.sql"]
         );
         assert_eq!(
-            files_named_in("VIOLATION: infra/postgres/schema/100-a.sql was M-changed"),
+            files_named_in(
+                "VIOLATION: infra/postgres/schema/100-a.sql was M-changed",
+                policy().consist_files_named
+            ),
             vec!["infra/postgres/schema/100-a.sql"]
         );
         assert!(
-            files_named_in("one-palette: 3 offences found, see above. e.g. below").is_empty(),
+            files_named_in(
+                "one-palette: 3 offences found, see above. e.g. below",
+                policy().consist_files_named
+            )
+            .is_empty(),
             "prose is not a file list"
         );
         assert!(
-            files_named_in("bumped to v1.2 in Cargo.toml 0.8")
-                .iter()
-                .all(|f| f == "Cargo.toml"),
+            files_named_in(
+                "bumped to v1.2 in Cargo.toml 0.8",
+                policy().consist_files_named
+            )
+            .iter()
+            .all(|f| f == "Cargo.toml"),
             "version numbers are not filenames"
         );
     }

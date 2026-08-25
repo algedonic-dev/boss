@@ -4,6 +4,7 @@ use tracing_subscriber::EnvFilter;
 
 mod cadence;
 mod census;
+mod delivery_policy;
 mod deploy;
 mod docs;
 mod docs_flush;

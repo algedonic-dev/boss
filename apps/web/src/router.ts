@@ -95,6 +95,9 @@ export type Route =
   | { kind: 'systemMap' }
   | { kind: 'systemFlow' }
   | { kind: 'systemFleet' }
+  /// The IT incidents surface — active incident-post-mortem packets +
+  /// the closed ones rendered as a durable archive.
+  | { kind: 'incidents' }
   | { kind: 'systemSubjects' }
   | { kind: 'systemModel' }
   | { kind: 'experiments' }
@@ -155,6 +158,7 @@ export function parseRoute(pathname: string): Route {
     if (p === '/map') return { kind: 'systemMap' };
     if (p === '/flow') return { kind: 'systemFlow' };
     if (p === '/fleet') return { kind: 'systemFleet' };
+    if (p === '/incidents') return { kind: 'incidents' };
     if (p === '/feedback') return { kind: 'systemFeedback' };
     if (p === '/experiments') return { kind: 'experiments' };
     if (p === '/subjects') return { kind: 'systemSubjects' };

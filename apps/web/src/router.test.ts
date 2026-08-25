@@ -71,6 +71,8 @@ describe('parseRoute — every specific path matches its specific case', () => {
     // registry's upstream hrefs and the docs all still use them.
     ['/it/design', { kind: 'systemDesign' }],
     ['/it/yard', { kind: 'systemYard' }],
+    ['/it/incidents', { kind: 'incidents' }],
+    ['/system/incidents', { kind: 'incidents' }],
     ['/it/monitoring/events', { kind: 'systemMonitoringEvents' }],
     ['/it', { kind: 'systemModel' }],
     ['/system/step-plugins', { kind: 'systemStepPlugins' }],
