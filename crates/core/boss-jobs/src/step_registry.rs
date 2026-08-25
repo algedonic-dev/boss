@@ -77,35 +77,17 @@ pub enum Completion {
 }
 
 /// A metadata field descriptor.
+///
+/// `field_type` carries the whole value shape, including the variants
+/// of an enum (pipe-joined, e.g. `"pass|fail|conditional"`). Consumers
+/// that need to synthesize or validate a value read it directly —
+/// there is no second hint field to keep in sync with it.
 #[derive(Debug, Clone, Serialize)]
 pub struct FieldSpec {
     pub name: &'static str,
     pub field_type: &'static str,
     pub required: bool,
     pub description: &'static str,
-    /// The value shape of this field — what kind of value real
-    /// instances carry (short text, a money amount, a date, an enum).
-    /// A property of the work, derivable from the distribution of
-    /// values seen in real metadata; the simulator reads it to
-    /// synthesize a realistic value when an actor fills the field at
-    /// completion. `None` → consumers fall back to interpreting
-    /// `field_type` ("string" → short text, "integer" → 0..100, etc.).
-    ///
-    /// Recognised shapes (extend as cases land): `text-short`,
-    /// `text-long`, `int`, `int:lo..hi`, `float`, `money-cents`,
-    /// `iso-date`, `iso-date-time`, `boolean`, `enum:a|b|c`,
-    /// `id-ref:<subject_kind>`, `uri`, `email`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub faker_hint: Option<&'static str>,
-}
-
-impl FieldSpec {
-    /// Builder: attach a faker hint for the sim. Most fields don't
-    /// need one — the sim derives a default from `field_type`.
-    pub fn with_hint(mut self, hint: &'static str) -> Self {
-        self.faker_hint = Some(hint);
-        self
-    }
 }
 
 /// A registered step type — the schema, UX treatment, and **observed
@@ -459,8 +441,6 @@ struct LoadedFieldSpec {
     field_type: String,
     required: bool,
     description: String,
-    #[serde(default)]
-    faker_hint: Option<String>,
 }
 
 impl LoadedFieldSpec {
@@ -470,7 +450,6 @@ impl LoadedFieldSpec {
             field_type: String::leak(self.field_type),
             required: self.required,
             description: String::leak(self.description),
-            faker_hint: self.faker_hint.map(|s| -> &'static str { String::leak(s) }),
         }
     }
 }
@@ -767,38 +746,6 @@ mod tests {
         assert!(categories.contains(&StepCategory::Commercial));
         assert!(categories.contains(&StepCategory::Logistics));
         assert!(categories.contains(&StepCategory::Admin));
-    }
-
-    // Every pipe-shaped field type (e.g. "email|phone|meeting") must
-    // carry an `enum:` faker hint. Without it the sim's faker emits
-    // a generic string the validator rejects with 400 — the regen
-    // hard-fails and the seed bundle can't be cut. This lint catches
-    // a missing hint up front rather than one offender at a time.
-    #[test]
-    fn every_pipe_shaped_type_has_an_enum_faker_hint() {
-        let mut missing: Vec<String> = Vec::new();
-        for ty in all_v1_types() {
-            for f in &ty.fields {
-                if !f.field_type.contains('|') {
-                    continue;
-                }
-                let hint_ok = f
-                    .faker_hint
-                    .map(|h| h.starts_with("enum:"))
-                    .unwrap_or(false);
-                if !hint_ok {
-                    missing.push(format!(
-                        "{}.{} (type {:?}) is missing .with_hint(\"enum:...\")",
-                        ty.kind, f.name, f.field_type
-                    ));
-                }
-            }
-        }
-        assert!(
-            missing.is_empty(),
-            "pipe-shaped fields without enum: faker hint:\n  - {}",
-            missing.join("\n  - ")
-        );
     }
 
     #[test]

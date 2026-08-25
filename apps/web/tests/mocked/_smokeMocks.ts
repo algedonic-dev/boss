@@ -54,16 +54,10 @@ const SHIPMENT = {
 };
 
 export async function installSmokeMocks(page: Page): Promise<void> {
-  // Strip the bun dev-server HMR overlay; pin the demo persona.
+  // Strip the bun dev-server HMR overlay. Identity comes from the
+  // mocked `/api/session` below, not from anything stored client-side.
   await page.addInitScript(() => {
     setInterval(() => document.querySelector('bun-hmr')?.remove(), 200);
-  });
-  await page.addInitScript(() => {
-    try {
-      localStorage.setItem('boss.persona.empId', 'emp-001');
-    } catch {
-      /* localStorage unavailable */
-    }
   });
 
   // Catch-all FIRST (lowest priority): unknown endpoints → empty list, 200,

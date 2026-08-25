@@ -10,8 +10,6 @@
 // cookie it writes and synthesises `x-boss-user` from it. The gateway
 // ignores it entirely.
 
-const STORAGE_KEY = 'boss.persona.empId';
-
 /// Name of the cookie that tells the dev-server / gateway which
 /// persona the user is currently viewing as (demo mode only). The
 /// dev-server looks this up in the roster and synthesises
@@ -164,15 +162,18 @@ export async function loadSession(): Promise<void> {
   session.value = { kind: 'unauthenticated' };
 }
 
+/// Switch the viewed-as persona. The cookie is the ONLY thing that
+/// persists: the dev-server reads it off every proxied request to
+/// synthesise `x-boss-user`, so after a reload the SPA learns the
+/// persona back from `/api/session` — the server's answer, not a
+/// copy the client kept. There used to be a `boss.persona.empId`
+/// localStorage write beside this; its reader died with the demo
+/// fallback and it was never restored, because a client-side
+/// identity that can disagree with the server's is the exact defect
+/// the fallback caused.
 export function setPersona(id: string): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, id);
-  } catch {
-    // localStorage unavailable — persona change still works for
-    // the current tab, just doesn't persist.
-  }
-  // Also write a cookie so the dev-server + gateway can synthesise
-  // the right x-boss-user header on API requests. Without this the
+  // Write the cookie so the dev-server + gateway can synthesise the
+  // right x-boss-user header on API requests. Without this the
   // backend still saw the default (emp-001 CEO) and returned
   // unscoped data.
   try {

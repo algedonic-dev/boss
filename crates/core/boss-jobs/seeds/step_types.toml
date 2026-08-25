@@ -23,10 +23,11 @@
 #    flipping to `done` without it; the step can still exist on
 #    a Job with that field empty.
 #
-#  - **Pipe-shaped `field_type` strings must carry a `faker_hint`
-#    of the form `enum:a|b|c`.** Without it the sim's faker emits
-#    a generic string the validator rejects with 400. The lint
-#    `every_pipe_shaped_type_has_an_enum_faker_hint` enforces this.
+#  - **`field_type` is the whole value shape.** A pipe-shaped
+#    string (`a|b|c`) declares an enum, and its variants are read
+#    straight off that string by both the validator and the sim's
+#    faker. There is no second hint field describing the same
+#    values — nothing to keep in sync, nothing to forget.
 
 # =============================================================
 # Coordination
@@ -55,7 +56,6 @@ required_roles = ["qa-supervisor", "service-mgr", "controller", "production-lead
   field_type = "pending|approved|rejected|changes-requested"
   required = false
   description = "The decision this sign-off records"
-  faker_hint = "enum:pending|approved|rejected|changes-requested"
 
   [[step_type.fields]]
   name = "decided_at"
@@ -163,7 +163,6 @@ required_roles = []
   field_type = "periodic|event|operator|counterparty"
   required = false
   description = "How the Job opened — automation, external event, human, or another Job"
-  faker_hint = "enum:periodic|event|operator|counterparty"
 
   [[step_type.fields]]
   name = "trigger_name"
@@ -200,7 +199,6 @@ completion = "agent"
   field_type = "brew|oversupply"
   required = true
   description = "Brew-today decision — the outcome the Workflow forks on."
-  faker_hint = "enum:brew|oversupply"
 
 [[step_type]]
 kind = "availability-gate"
@@ -226,7 +224,6 @@ completion = "agent"
   field_type = "fulfill|backorder"
   required = true
   description = "Fulfillment decision the Workflow forks on."
-  faker_hint = "enum:fulfill|backorder"
 
   [[step_type.fields]]
   name = "line_items"
@@ -294,7 +291,6 @@ required_roles = []
   field_type = "completed|skipped|aborted|withdrawn"
   required = false
   description = "Which terminal state this outcome represents"
-  faker_hint = "enum:completed|skipped|aborted|withdrawn"
 
   [[step_type.fields]]
   name = "milestone_name"
@@ -469,7 +465,6 @@ required_roles = ["qa-tech", "lab-tech", "qa-supervisor"]
   field_type = "pass|fail|conditional"
   required = false
   description = "Overall inspection result"
-  faker_hint = "enum:pass|fail|conditional"
 
   [[step_type.fields]]
   name = "certificate_id"
@@ -559,7 +554,6 @@ required_roles = ["inventory-clerk", "service-tech", "shipping-clerk"]
   field_type = "used-trade-in|buyback|returned-lease|oem-new"
   required = false
   description = "How the unit arrived"
-  faker_hint = "enum:used-trade-in|buyback|returned-lease|oem-new"
 
   [[step_type.fields]]
   name = "condition_notes"
@@ -595,7 +589,6 @@ required_roles = ["sales-rep", "account-manager", "sales-lead"]
   field_type = "email|phone|meeting|demo|other"
   required = true
   description = "Communication channel"
-  faker_hint = "enum:email|phone|meeting|demo|other"
 
   [[step_type.fields]]
   name = "recipient_id"
@@ -608,7 +601,6 @@ required_roles = ["sales-rep", "account-manager", "sales-lead"]
   field_type = "account|vendor|contact"
   required = false
   description = "Recipient entity type"
-  faker_hint = "enum:account|vendor|contact"
 
   [[step_type.fields]]
   name = "subject"
@@ -760,7 +752,6 @@ completion = "agent"
   field_type = "string"
   required = false
   description = "Linked invoice"
-  faker_hint = "id-ref:invoice"
 
   [[step_type.fields]]
   name = "account_id"
@@ -785,14 +776,12 @@ completion = "agent"
   field_type = "new-sales|used-sales|service|parts|contracts"
   required = false
   description = "Revenue category"
-  faker_hint = "enum:new-sales|used-sales|service|parts|contracts"
 
   [[step_type.fields]]
   name = "reference_id"
   field_type = "string"
   required = false
   description = "Reference (PO, ticket, agreement)"
-  faker_hint = "id-ref:ref"
 
   [[step_type.fields]]
   name = "issued_at"
@@ -972,7 +961,6 @@ required_roles = ["bookkeeper"]
   field_type = "sales|income|payroll_941|payroll_940|excise"
   required = true
   description = "Tax kind"
-  faker_hint = "enum:sales|income|payroll_941|payroll_940|excise"
 
   [[step_type.fields]]
   name = "jurisdiction"
@@ -1179,7 +1167,6 @@ required_roles = ["inventory-clerk", "warehouse-lead", "controller"]
   field_type = "routine|expedite|emergency"
   required = false
   description = "Procurement urgency"
-  faker_hint = "enum:routine|expedite|emergency"
 
 [[step_type]]
 kind = "shipment"
@@ -1201,7 +1188,6 @@ required_roles = ["shipping-clerk", "warehouse-lead", "distribution-lead"]
   field_type = "inbound|outbound"
   required = true
   description = "Shipment direction"
-  faker_hint = "enum:inbound|outbound"
 
   [[step_type.fields]]
   name = "origin"
@@ -1223,7 +1209,6 @@ required_roles = ["shipping-clerk", "warehouse-lead", "distribution-lead"]
   field_type = "fedex|ups|freight|local-pickup"
   required = false
   description = "Carrier"
-  faker_hint = "enum:fedex|ups|freight|local-pickup"
 
   [[step_type.fields]]
   name = "tracking_number"
@@ -1443,7 +1428,6 @@ required_roles = ["service-mgr", "qa-supervisor"]
   field_type = "phone|email|web|walk-in"
   required = false
   description = "Intake channel"
-  faker_hint = "enum:phone|email|web|walk-in"
 
   [[step_type.fields]]
   name = "requester_contact_id"
@@ -1462,7 +1446,6 @@ required_roles = ["service-mgr", "qa-supervisor"]
   field_type = "dispatch|remote|parts-only"
   required = false
   description = "Triage decision"
-  faker_hint = "enum:dispatch|remote|parts-only"
 
 [[step_type]]
 kind = "diagnostic-call"
@@ -1486,7 +1469,6 @@ required_roles = ["service-tech", "service-mgr"]
   field_type = "zoom|teams|meet|phone|other"
   required = false
   description = "Call channel"
-  faker_hint = "enum:zoom|teams|meet|phone|other"
 
   [[step_type.fields]]
   name = "join_url"
