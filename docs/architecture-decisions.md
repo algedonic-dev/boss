@@ -1029,7 +1029,7 @@ retired the *train's* timers, not systemd itself; the remaining
 timers are a rollout list, not a claim.
 
 **The cluster reaches the hub over bare WireGuard.** The GCP box is
-the hub — stable public IP, overlay `10.99.0.0/24` — and cluster
+the hub — stable public IP, overlay `<overlay>/24` — and cluster
 nodes are spokes that dial *out*, so no inbound hole is opened in
 the home router and a keepalive holds the NAT mapping; node-to-node
 traffic inside the cluster stays on its own mesh. Kanidm and the

@@ -26,7 +26,15 @@ describe('canSeeRoute — platform-admin is the super-admin and sees every surfa
 
 describe('canSeeRoute — unknown roles fall through safely', () => {
   test('an unrecognized role sees only the always-on routes', () => {
-    expect(canSeeRoute('totally-made-up-role', 'workflows')).toBe(false);
+    // The defensive default, which is the point of this test: a role
+    // with no ROUTE_ACCESS entry gets nothing it was not explicitly
+    // given. `exec` is gated, so it must be refused.
+    expect(canSeeRoute('totally-made-up-role', 'exec')).toBe(false);
+    expect(canSeeRoute('totally-made-up-role', 'finance')).toBe(false);
+
+    // The always-on routes stay visible to everyone by design - they
+    // are ungated at the top of canSeeRoute, and what they can READ is
+    // policed by the endpoints behind them, not here.
     expect(canSeeRoute('totally-made-up-role', 'workflows')).toBe(true);
     expect(canSeeRoute('totally-made-up-role', 'inbox')).toBe(true);
   });

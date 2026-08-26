@@ -72,7 +72,7 @@ implementation.
 
 Resolved 2026-08-12 — accept.
 
-Forgejo — decided de facto and running (10.20.0.15:3000: git, the OCI registry the CI image pulls from, and a registered Actions runner; fa7191b is the adoption act). Placement in two stages: the interim LAN box is legitimate for CI-shadowing, and its Forgejo data dir enters the backup set now — until then the GitHub mirror is its only off-host copy. Cluster placement lands per dev-cluster topology, now schedulable: the cluster is up and running BOSS, Kanidm, and Longhorn.
+Forgejo — decided de facto and running (<forge-host>:3000: git, the OCI registry the CI image pulls from, and a registered Actions runner; fa7191b is the adoption act). Placement in two stages: the interim LAN box is legitimate for CI-shadowing, and its Forgejo data dir enters the backup set now — until then the GitHub mirror is its only off-host copy. Cluster placement lands per dev-cluster topology, now schedulable: the cluster is up and running BOSS, Kanidm, and Longhorn.
 
 **Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
 

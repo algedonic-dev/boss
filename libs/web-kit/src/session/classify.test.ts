@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { classifyProbe, type Employee } from './session.svelte';
+import { classifyProbe, type Employee } from './classify';
 
 const emp: Employee = {
   id: 'emp-1', name: 'Ada', email: 'ada@x', role: 'platform-admin',

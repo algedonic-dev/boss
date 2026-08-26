@@ -37,9 +37,9 @@ cluster of three whose pods float.
 
 | node | address | cpu | ram | disk | free | role |
 |---|---|---|---|---|---|---|
-| boss-gcp | 34.45.110.40 | 4 | 15 GB | **48 GB** | **20 GB (59% used)** | full BOSS stack, 32 services, own Postgres + NATS; the train conductor |
-| forge host | 10.20.0.15 | 16 | 30 GB | 228 GB | 136 GB (37% used) | Forgejo, container registry, CI runner |
-| Talos cp-1/2/3 | 10.20.0.11–13, VIP .10 | — | — | — | — | the cluster; the `boss` pod, Postgres, NATS |
+| boss-gcp | <cloud-host> | 4 | 15 GB | **48 GB** | **20 GB (59% used)** | full BOSS stack, 32 services, own Postgres + NATS; the train conductor |
+| forge host | <forge-host> | 16 | 30 GB | 228 GB | 136 GB (37% used) | Forgejo, container registry, CI runner |
+| Talos cp-1/2/3 | <cp-1..3>, VIP <api-vip> | — | — | — | — | the cluster; the `boss` pod, Postgres, NATS |
 
 The cluster's declared shape, from `infra/cluster/manifests/`:
 
@@ -62,7 +62,7 @@ data.** Not a replica pair — two independent systems:
 | | user-feedback packets | employees | roster contains |
 |---|---|---|---|
 | boss-gcp local Postgres | **66** | 411 | `emp-bootstrap-admin` only |
-| cluster (`10.20.0.34:7900`) | **168** | not reachable | unknown |
+| cluster (`<jobs-vip>:7900`) | **168** | not reachable | unknown |
 
 boss-gcp's `jobs-api` reads `postgres://boss:boss@127.0.0.1/boss` and
 holds 3124 wholesale-keg-orders of its own. The cluster holds the
@@ -161,7 +161,7 @@ Resolved 2026-08-18 — accept.
 
 > Nothing in BOSS reaches the nodes today, and the cluster's services
 > are not reachable from boss-gcp at all — during this investigation
-> `10.20.0.34` answered on 7900 and nothing else, no `kubectl` exists on
+> `<jobs-vip>` answered on 7900 and nothing else, no `kubectl` exists on
 > either reachable host, and the cluster's people API could not be read.
 > So an agent cannot currently gather what this design wants to store.
 >
@@ -270,7 +270,7 @@ Resolved 2026-08-18 — override.
 > different and much smaller thing.
 >
 > The network path is fine. boss-gcp reaches the LAN over WireGuard,
-> and the Kubernetes API on the VIP `10.20.0.10:6443` answers — a clean
+> and the Kubernetes API on the VIP `<api-vip>:6443` answers — a clean
 > `401 Unauthorized`, so the cluster is listening and simply does not
 > know the caller. What was missing on boss-gcp was a credential: no
 > kubeconfig in `~/.kube`, `~/.talos` or `/etc/kubernetes`, and no
@@ -295,14 +295,14 @@ Resolved 2026-08-18 — override.
 > > `/etc/boss-dev/kubeconfig`
 > > (`infra/cluster/manifests/boss-dev-access.yaml`). The admin config
 > > stays on the laptop. Of the cluster's
-> service ports only `7900` is exposed on `10.20.0.34`; 4443, 8080, 443
+> service ports only `7900` is exposed on `<jobs-vip>`; 4443, 8080, 443
 > and 80 are closed, as is 443/4443 on the VIP.
 >
 > So the fix is one of two small things rather than a networking
 > project. A read-only kubeconfig plus `kubectl` on boss-gcp is the
 > general answer and is what Q3's reporters would verify themselves
 > against. Extending the existing SSH tunnel is the narrow one — it is
-> already `-L 7900:10.20.0.34:7900`, so another service is one more
+> already `-L 7900:<jobs-vip>:7900`, so another service is one more
 > `-L` and no new credential exists to leak.
 >
 > The concrete thing this blocked: whether an `emp-david` employee

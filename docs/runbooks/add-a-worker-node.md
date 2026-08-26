@@ -36,7 +36,7 @@ Nothing here is blocked on hardware:
    ```
 
    (`--insecure` is correct exactly once: the node has no PKI yet.)
-3. Watch it register against the VIP (10.20.0.10) and go Ready:
+3. Watch it register against the VIP (<api-vip>) and go Ready:
 
    ```
    kubectl --kubeconfig ~/talos-homelab/v2/kubeconfig get nodes -w
@@ -53,6 +53,67 @@ Nothing here is blocked on hardware:
    so the label survives a wipe-and-reinstall and arrives with the
    node rather than after it. `kubectl label node ...` would work and
    would be gone the next time the machine is rebuilt.
+## Two things that make a node look joined when it is not
+
+Both of these produce a node that reports `Ready`, passes every
+Kubernetes health check, and is broken. Neither is visible to
+`kubectl`. Check both before you move work onto it.
+
+### The registry mirror
+
+The forge registry speaks plain **HTTP**. A node without a mirror
+declaration tries HTTPS, gets a plaintext response, and fails every
+internal image pull with `server gave HTTP response to HTTPS client`.
+The node still joins and still says `Ready`. w-1 sat like that for two
+hours on 2026-08-25 while its `ImagePullBackOff` pods were read as
+unrelated noise.
+
+The declaration belongs in the node patch so one apply is a complete
+node:
+
+```yaml
+machine:
+  registries:
+    mirrors:
+      10.20.0.15:3000:
+        endpoints:
+          - http://10.20.0.15:3000
+```
+
+### The GPU driver, if the machine has one
+
+**Installing the NVIDIA extensions is not enough. They ship the driver;
+nothing loads it.** The machine config must declare the kernel modules:
+
+```yaml
+machine:
+  kernel:
+    modules:
+      - name: nvidia
+      - name: nvidia_uvm
+      - name: nvidia_drm
+      - name: nvidia_modeset
+```
+
+Without them `ext-nvidia-persistenced` waits forever on
+`/sys/bus/pci/drivers/nvidia`, `ext-nvidia-cdi-gen` waits on that, and
+**the machine never finishes booting** — `MachineStatus` stays
+`STAGE=booting READY=false` for the life of the node.
+
+A node that never completes boot **is reset on a timer**. w-1 reset
+three times at 69-70 minutes of uptime, once while completely idle
+(load 0.36, CPU 40C). That cost most of a day chasing a thermal fault
+that did not exist, because the resets happened to land inside 40-minute
+gates and looked like load. The tell was in the logs the whole time: the
+uptime at each reset was identical.
+
+Applying the modules needs a reboot. Afterwards the services read
+`Finished` and `Running`, and the stage reads `running`.
+
+Making the GPU **schedulable** is a further step and not covered here:
+Kubernetes also needs the NVIDIA device plugin DaemonSet and a
+`RuntimeClass`. Neither existed in this cluster as of 2026-08-26, and
+nothing in BOSS uses a GPU yet.
 
 ## Moving the work onto it
 
@@ -86,6 +147,18 @@ hand-apply). Two consequences worth knowing before you do:
 The point of the node is that heavy work stops touching the control
 plane. Verify exactly that, not just that pods moved:
 
+0. **Check the machine actually finished booting**, before anything
+   else and again an hour later:
+
+   ```
+   talosctl -n <node> get machinestatus     # must read STAGE=running
+   talosctl -n <node> services              # nothing left in Waiting
+   talosctl -n <node> read /proc/uptime     # must exceed ~70 minutes
+   ```
+
+   `Ready` in `kubectl` does not imply this. Compare against a node
+   known good: on 2026-08-26, w-2 read `running` with 401 minutes while
+   w-1 read `booting` and had never survived 70.
 1. Start a full gate on the new node (`infra/gate-runner/`, with its
    `gate-run` packet registered first).
 2. While it runs, poll `kubectl get --raw /readyz?verbose` on a

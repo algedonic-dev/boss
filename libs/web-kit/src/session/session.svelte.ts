@@ -27,43 +27,14 @@ function writePersonaCookie(id: string): void {
   document.cookie = `${PERSONA_COOKIE}=${encodeURIComponent(id)}; path=/; max-age=2592000; SameSite=Lax`;
 }
 
-export type Certification = {
-  name: string;
-  issuing_body: string;
-  issued_on: string;
-  expires_on: string | null;
-};
 
-export type Employee = {
-  id: string;
-  name: string;
-  email: string;
-  role: string;
-  department: string;
-  hire_date: string;
-  status: string;
-  location: string;
-  employment_type: string;
-  skill_level?: number | null;
-  skills: string[];
-  certifications: Certification[];
-  manager_id?: string | null;
-};
-
-export type SessionState =
-  | { kind: 'loading' }
-  | { kind: 'ready'; user: Employee }
-  | { kind: 'unauthenticated' }
-  | { kind: 'unrecognized'; username: string };
-
-type SessionEnvelope = {
-  value: SessionState;
-  roster: ReadonlyArray<Employee>;
-  fromGateway: boolean;
-  /// True for the audit-readonly guest: every read surface renders,
-  /// and surfaces that offer writes may hide or soften them.
-  readonly: boolean;
-};
+// The pure half lives in ./classify so it can be tested without the
+// Svelte compiler; re-exported here so existing importers are
+// unaffected.
+import type { Certification, Employee, SessionState, SessionEnvelope, ProbeBody } from './classify';
+import { guestEmployee, classifyProbe } from './classify';
+export type { Certification, Employee, SessionState, SessionEnvelope, ProbeBody };
+export { guestEmployee, classifyProbe };
 
 export const session = $state<SessionEnvelope>({
   value: { kind: 'loading' },
@@ -78,50 +49,6 @@ export const session = $state<SessionEnvelope>({
 /// renderable identity, it is to give them their own: named Guest,
 /// carrying the audit-readonly role they actually hold, colliding
 /// with no roster id, assignable to nothing.
-export function guestEmployee(username: string): Employee {
-  return {
-    id: username,
-    name: 'Guest',
-    email: username,
-    role: 'audit-readonly',
-    department: 'visitor',
-    hire_date: new Date().toISOString().slice(0, 10),
-    status: 'active',
-    location: '—',
-    employment_type: 'guest',
-    skills: [],
-    certifications: [],
-  };
-}
-
-export type ProbeBody = {
-  username?: string;
-  employee_id?: string;
-  role?: string;
-};
-
-/// Pure classification of the gateway probe — extracted so the
-/// guest/unrecognized boundary is a tested decision, not a branch
-/// buried in a fetch handler.
-export function classifyProbe(
-  body: ProbeBody,
-  byId: Map<string, Employee>,
-): { value: SessionState; readonly: boolean } | null {
-  const username = body.username ?? '';
-  const emp = body.employee_id ? (byId.get(body.employee_id) ?? null) : null;
-  if (emp) return { value: { kind: 'ready', user: emp }, readonly: false };
-  // A session with no employee and the audit-readonly role is the
-  // guest — a first-class read-only persona, not a broken login.
-  if (username && body.role === 'audit-readonly') {
-    return {
-      value: { kind: 'ready', user: guestEmployee(username) },
-      readonly: true,
-    };
-  }
-  if (username) return { value: { kind: 'unrecognized', username }, readonly: false };
-  return null;
-}
-
 export async function loadSession(): Promise<void> {
   // 1. Fetch the roster first — it's the universe for every lookup.
   let roster: Employee[] = [];

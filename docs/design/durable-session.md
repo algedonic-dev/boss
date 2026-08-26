@@ -134,7 +134,7 @@ Resolved 2026-08-16 — accept.
 kubectl on boss-gcp plus a kubeconfig scoped to the boss-dev namespace
 only. Today there is no kubectl on boss-gcp or the forge host, the
 Kubernetes API on the VIP answers a clean 401, only port 7900 is
-exposed on 10.20.0.34, and boss-dev deliberately has no Service — it
+exposed on <jobs-vip>, and boss-dev deliberately has no Service — it
 is kubectl exec only. So even applied, nothing could reach it.
 Namespace-scoping is the point: a development credential that can also
 reach the `boss` namespace recreates the blast radius the Postgres
@@ -145,7 +145,7 @@ reaches through.
 
 There is no `kubectl` on boss-gcp or the forge host. The Kubernetes
 API on the VIP answers a clean `401` — reachable, no credential. Of
-the cluster's ports only `7900` is exposed on `10.20.0.34`. And
+the cluster's ports only `7900` is exposed on `<jobs-vip>`. And
 `boss-dev` deliberately has no Service: it is `kubectl exec` only.
 
 So even applied, today nothing could reach it.
@@ -284,7 +284,7 @@ question that should not be answered by trying it.
 kubectl on boss-gcp plus a kubeconfig scoped to the boss-dev namespace
 only. Today there is no kubectl on boss-gcp or the forge host, the
 Kubernetes API on the VIP answers a clean 401, only port 7900 is
-exposed on 10.20.0.34, and boss-dev deliberately has no Service — it
+exposed on <jobs-vip>, and boss-dev deliberately has no Service — it
 is kubectl exec only. So even applied, nothing could reach it.
 Namespace-scoping is the point: a development credential that can also
 reach the `boss` namespace recreates the blast radius the Postgres

@@ -41,7 +41,7 @@ drift.
 ## What is missing
 
 **One credential.** The pod cannot clone a private repo —
-`could not read Username for 'http://10.20.0.15:3000'`. It was
+`could not read Username for 'http://<forge-host>:3000'`. It was
 bootstrapped tonight with a `git bundle` over `kubectl cp`, which
 proves the environment and leaves it unable to fetch.
 
@@ -194,7 +194,7 @@ car branches itself from its own clone, so a workspace has no reason
 to hold write access to the forge - the thing it would have been for
 is already solved. A read-scoped token is the smallest grant that
 makes the pod useful at all (it currently cannot clone: 'could not
-read Username for http://10.20.0.15:3000'), and it is the last blocker
+read Username for http://<forge-host>:3000'), and it is the last blocker
 to development leaving personal machines. If a checkout ever needs
 more, that is a presence-gated step on the checkout packet rather than
 a standing capability of the pool.
@@ -267,7 +267,7 @@ car branches itself from its own clone, so a workspace has no reason
 to hold write access to the forge - the thing it would have been for
 is already solved. A read-scoped token is the smallest grant that
 makes the pod useful at all (it currently cannot clone: 'could not
-read Username for http://10.20.0.15:3000'), and it is the last blocker
+read Username for http://<forge-host>:3000'), and it is the last blocker
 to development leaving personal machines. If a checkout ever needs
 more, that is a presence-gated step on the checkout packet rather than
 a standing capability of the pool.

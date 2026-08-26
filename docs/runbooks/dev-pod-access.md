@@ -49,7 +49,7 @@ kubectl --kubeconfig ~/talos-homelab/v2/kubeconfig \
 the forge host and use its dockerized kubectl —
 
 ```
-ssh -J boss-gcp david@10.20.0.15
+ssh -J boss-gcp david@<forge-host>
 sudo docker run --rm -it --network host \
   -v /home/david/kc.yaml:/kc:ro alpine/k8s:1.33.3 \
   kubectl --kubeconfig=/kc -n boss-dev exec -it deploy/boss-dev -c dev -- \

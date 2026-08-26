@@ -90,6 +90,34 @@ spec:
       securityContext:
         fsGroup: 1500
         seccompProfile: {type: RuntimeDefault}
+      initContainers:
+        # Postgres as a NATIVE SIDECAR (initContainer + restartPolicy
+        # Always), not an ordinary container. As an ordinary container
+        # it never exits, so a Job whose gate container terminated 0
+        # sat forever reporting neither succeeded nor failed and had to
+        # be deleted by hand - `kubectl get job` lied about a gate that
+        # had passed. A native sidecar starts before the gate, runs
+        # beside it, and the kubelet tears it down when the gate exits.
+        - name: postgres
+          image: postgres:16
+          restartPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["NET_RAW"]}
+          env:
+            - {name: POSTGRES_USER, value: boss}
+            - {name: POSTGRES_PASSWORD, value: boss}
+            - {name: POSTGRES_DB, value: postgres}
+            - {name: PGDATA, value: /pgdata/data}
+          volumeMounts:
+            - {name: pgdata, mountPath: /pgdata}
+            # The 64Mi container default dies under parallel pg suites
+            # ("could not resize shared memory segment"); same fix the
+            # dev pod's sidecar carries.
+            - {name: pg-shm, mountPath: /dev/shm}
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "2", memory: 4Gi}
       containers:
         - name: gate
           image: 10.20.0.15:3000/david/boss-ci:rust1.96
@@ -110,25 +138,6 @@ spec:
             - {name: gate-runner-disk, mountPath: /gate-target}
             - {name: run-script, mountPath: /repo-script}
             - {name: forge-token, mountPath: /etc/forge, readOnly: true}
-        - name: postgres
-          image: postgres:16
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: {drop: ["NET_RAW"]}
-          env:
-            - {name: POSTGRES_USER, value: boss}
-            - {name: POSTGRES_PASSWORD, value: boss}
-            - {name: POSTGRES_DB, value: postgres}
-            - {name: PGDATA, value: /pgdata/data}
-          volumeMounts:
-            - {name: pgdata, mountPath: /pgdata}
-            # The 64Mi container default dies under parallel pg suites
-            # ("could not resize shared memory segment"); same fix the
-            # dev pod's sidecar carries.
-            - {name: pg-shm, mountPath: /dev/shm}
-          resources:
-            requests: {cpu: 250m, memory: 512Mi}
-            limits: {cpu: "2", memory: 4Gi}
       volumes:
         - name: gate-runner-disk
           persistentVolumeClaim: {claimName: gate-runner-disk}

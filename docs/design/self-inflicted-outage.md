@@ -46,7 +46,7 @@ Each link is necessary; removing any one of them prevents the outage.
    nonzero rather than run services against a database it could not
    converge. **This guard behaved perfectly.** It is the only
    component in this story that did its job.
-7. **CrashLoopBackOff.** No pod served. `10.20.0.34:7900` went dark.
+7. **CrashLoopBackOff.** No pod served. `<jobs-vip>:7900` went dark.
 8. **The system of record was the casualty.** Job bookkeeping stopped,
    so the incident could not be filed, the repair could not be
    tracked, and the audit log gained no record of the event that

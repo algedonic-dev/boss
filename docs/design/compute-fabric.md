@@ -27,7 +27,7 @@ between the two instances)
 |---|---|---|---|
 | Talos cluster (cp-1/2/3) | the system of record: BOSS pod, Postgres, Kanidm, Longhorn, dev pods | kubelet / Talos | fully — it IS the SoR |
 | boss-gcp | train conductor, public demo instance, Caddy/Cloudflare edge | systemd | not at all — its role lives in env drop-ins and memory files |
-| minipc (`david-asus-minipc`) | Forgejo forge, CI runner, cluster-deploy-runner | systemd + docker | not at all — not even reachable from boss-gcp (Mac jump only) |
+| minipc (the forge host) | Forgejo forge, CI runner, cluster-deploy-runner | systemd + docker | not at all — not even reachable from boss-gcp (Mac jump only) |
 | David's Mac | agent sessions, gates | nothing | not at all |
 
 Four machines, and the only one the system itself can see is the
@@ -67,7 +67,7 @@ the network framing wins.
 ## How much of (b) already exists or is already decided
 
 - **Job writes converged 2026-08-13**: every pipeline write from
-  boss-gcp goes to the cluster SoR (`BOSS_JOBS_URL=10.20.0.34:7900`)
+  boss-gcp goes to the cluster SoR (`BOSS_JOBS_URL=<jobs-vip>:7900`)
   since the split-brain incident `c4b4a6b0`.
 - **The cadence fold is decided** (protocol-cadence Q1/Q4,
   2026-08-15): cadence rows fold into the dispatcher rules registry

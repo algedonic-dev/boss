@@ -10,7 +10,7 @@ where each door's out-of-band path is and what it requires.
 |---|---|---|
 | Google account (GCP console) | boss-gcp SSH (new key via metadata / OS Login; serial console) | Google 2FA |
 | Physical access (home) | minipc login; Talos nodes via console (maintenance-mode re-bootstrap) | being there |
-| boss-gcp SSH | forge token file, WireGuard into 10.20.0.0/24, pipeline | the key or the GCP path above |
+| boss-gcp SSH | forge token file, WireGuard into <lan>/24, pipeline | the key or the GCP path above |
 | minipc (physical or SSH-via-jump) | forge admin CLI, dockerized kubectl (`/tmp/kc.yaml`), registry | boss-gcp jump or physical |
 | Kanidm `idm_admin` (`kanidmd recover-account`, password in cluster secret `kanidm/kanidm-idm-admin`) | the human door (playground OIDC/passkeys) | kubectl → the chain above |
 | Cloudflare account | CF Access + tunnel for playground | CF credentials |

@@ -17,5 +17,8 @@
   },
   "peerDependencies": {
     "svelte": "^5.55.9"
+  },
+  "scripts": {
+    "test:unit": "bun test src/"
   }
 }

@@ -15,9 +15,9 @@ fixable today.
 
 | probe | result |
 |---|---|
-| `10.20.0.10:6443` (k8s API, VIP) | **answers** — clean `401 Unauthorized` |
-| `10.20.0.34:7900` (jobs API) | open; this is how every packet read tonight was done |
-| `10.20.0.34` ports 4443 / 8080 / 443 / 80 | closed |
+| `<api-vip>:6443` (k8s API, VIP) | **answers** — clean `401 Unauthorized` |
+| `<jobs-vip>:7900` (jobs API) | open; this is how every packet read tonight was done |
+| `<jobs-vip>` ports 4443 / 8080 / 443 / 80 | closed |
 | VIP 443 / 4443 | closed |
 | kubeconfig on boss-gcp (`~/.kube`, `~/.talos`, `/etc/kubernetes`) | none |
 | `kubectl` on boss-gcp or the forge host | not installed |
@@ -40,7 +40,7 @@ can say whether David's board renders.
 
 ## The exposure this would touch
 
-boss-gcp is internet-facing: public IP `34.45.110.40`, host firewall
+boss-gcp is internet-facing: public IP `<cloud-host>`, host firewall
 `INPUT policy ACCEPT`, and services bound to `*:443`, `*:4222`
 (NATS), `*:8222`. Measured from outside, only port 22 is reachable —
 the GCP firewall is the real perimeter, and the host's open policy is

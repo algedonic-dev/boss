@@ -170,7 +170,7 @@ Resolved 2026-08-16 — override.
 > reached today. This gates everything; the design assumes only "Linux,
 > 4–8 cores, one LAN".
 
-Answered by the build rather than by choosing. The cluster runs three Talos control-plane nodes (cp-1/2/3 at 10.20.0.11-13 behind API VIP 10.20.0.10), the mini PC `david-asus-minipc` at 10.20.0.15 hosting Forgejo, its OCI registry, the CI runner and cluster-deploy-runner, and boss-gcp (34.45.110.40) which still carries the train pipeline and the public demo. The question asked what to build; this is what runs.
+Answered by the build rather than by choosing. The cluster runs three Talos control-plane nodes (cp-1/2/3 at <cp-1..3> behind API VIP <api-vip>), the mini PC at <forge-host> hosting Forgejo, its OCI registry, the CI runner and cluster-deploy-runner, and boss-gcp (<cloud-host>) which still carries the train pipeline and the public demo. The question asked what to build; this is what runs.
 
 
 ### Q4: When does the playground move? (resolved)
@@ -194,8 +194,8 @@ Resolved 2026-08-18 — override.
 
 > Resolved 2026-08-10 — David: **bare WireGuard from the GCP box to the
 > cluster** (node↔node inside the cluster stays KubeSpan). The GCP box
-> is the hub — stable public IP, UDP 51820, overlay `10.99.0.0/24`,
-> hub at `10.99.0.1`; cluster nodes are spokes that dial OUT (no
+> is the hub — stable public IP, UDP 51820, overlay `<overlay>/24`,
+> hub at `<overlay-hub>`; cluster nodes are spokes that dial OUT (no
 > inbound hole in the home router; `PersistentKeepalive` holds the NAT
 > mapping). **The hub is already live**: `infra/cluster/wireguard/`
 > holds `setup-hub.sh` (ran 2026-08-10; key generated, `wg-quick@wg0`
@@ -204,7 +204,7 @@ Resolved 2026-08-18 — override.
 > and `add-peer.sh` (append + hot-add; re-running setup cannot drop
 > peers). Registering a node is: generate a spoke key on the node, fill
 > the template with the hub pubkey + endpoint, `add-peer.sh <name>
-> <pubkey> <10.99.0.N>` on the hub. Kanidm and the log-copy migration
+> <pubkey> <overlay-peer>` on the hub. Kanidm and the log-copy migration
 > both ride this wire: the cluster reaches `id.algedonic.dev` and the
 > export tarball over the overlay if the public path is ever down.
 
@@ -244,8 +244,8 @@ Resolved 2026-08-18 — accept.
 >
 > *"Under Talos the containment question becomes pod-shaped"* is not
 > true either. The runner is not on Talos. It is a Docker runner on
-> the forge host (10.20.0.15), `runs-on: docker`, pulling
-> `10.20.0.15:3000/david/boss-ci:rust1.96` from the registry beside
+> the forge host (<forge-host>), `runs-on: docker`, pulling
+> `<forge-host>:3000/david/boss-ci:rust1.96` from the registry beside
 > it. The only cluster-touching automation is
 > `infra/forge/cluster-deploy-runner.sh`, which is a systemd unit on
 > that same host, not a workflow job — and it is deliberately

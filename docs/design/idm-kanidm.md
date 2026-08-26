@@ -18,7 +18,7 @@ single binary, passkey-first, a real OIDC provider, and its own
 state — no external database.
 
 Topology: Kanidm runs **in-cluster** — StatefulSet `kanidm-0` in
-namespace `kanidm`, served at `10.20.0.31`, terminating its own TLS
+namespace `kanidm`, served at `<idm-vip>`, terminating its own TLS
 (ratified under Q5 below; corrected here from the original "GCP box"
 plan via correct-the-record `4c8259ea`). The original invariant —
 rebuilding the cluster must not lose the company's logins — is now
@@ -135,7 +135,7 @@ Resolved 2026-08-16 — override.
 >
 > **Amended 2026-08-13 — the host moved, and this is the ratification.**
 > What shipped on 2026-08-11 is not what the paragraph above proposes.
-> Kanidm runs **in-cluster** as a StatefulSet at `10.20.0.31`, with an
+> Kanidm runs **in-cluster** as a StatefulSet at `<idm-vip>`, with an
 > online-backup sidecar shipping to GCP hourly over a forced-command
 > SSH key, reached from outside through the WireGuard hub. The
 > TLS reasoning is unchanged and still correct — Kanidm terminates its
@@ -149,7 +149,7 @@ Resolved 2026-08-16 — override.
 > carries the train conductor, the backups, and the public front door.
 > A compromise of `boss-gcp` no longer reaches the IdP.
 >
-> Verified before writing this: `10.20.0.31:443` answers, and
+> Verified before writing this: `<idm-vip>:443` answers, and
 > `/var/backups/kanidm` on boss-gcp is receiving the sidecar's shipments.
 
 Sounds good

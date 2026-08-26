@@ -554,6 +554,12 @@ web_touched() {
     if changed_paths | grep -qE '^(apps/web|apps/simulator|libs/web-kit)/'; then echo yes; else echo no; fi
 }
 if [ "$AUTO" -eq 1 ] && [ "$(web_touched)" = "yes" ]; then
+    # web-kit FIRST: its 7 test files existed for weeks and ran in no
+    # job at all - not here, not in ci.yml. One of them could not even
+    # load, because it imported a module whose top-level `$state` made
+    # it unloadable outside the Svelte compiler; the rest silently
+    # protected nothing. A test nothing runs is not a test.
+    check "web-kit unit" bash -c 'cd libs/web-kit && bun run test:unit'
     check "web-suite (unit+build+mocked)" bash -c 'cd apps/web && bun run test:unit && bun run build && bun run test:mocked'
 fi
 
