@@ -1242,7 +1242,30 @@ pub(crate) fn parked_ready(job: &Value) -> bool {
         .and_then(|s| s.get("status"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    review_status == "ready" || review_status == "active"
+    if !(review_status == "ready" || review_status == "active") {
+        return false;
+    }
+    // A HELD car does not board. `metadata.hold` on the review step is
+    // set by whoever parked it, and says "this is gated green and still
+    // must not ride yet" - a car whose branch is correct but whose
+    // WORLD is not. The case that forced this: a car repointing the
+    // gate rig at a node label was parked green, and hours later the
+    // only node carrying that label was cordoned for a hardware fault.
+    // Landing it would have left the rig unschedulable and stopped
+    // gating entirely. A note was written on the review step and the
+    // conductor could not read it, because this predicate asked only
+    // about status - documentation standing where a mechanism belonged.
+    //
+    // It lives HERE rather than in the boarding collector because the
+    // cadence loop shares this predicate for dock depth: a held car
+    // must not count toward the threshold either, or it would fire a
+    // train it then declines to join, producing the empty windows that
+    // made arrival rate unreadable (feedback f4baea39).
+    !truthy(
+        review
+            .and_then(|s| s.get("metadata"))
+            .and_then(|m| m.get("hold")),
+    )
 }
 
 /// The branch-sweep decision at arrival (protocol decision, David):
@@ -4827,6 +4850,35 @@ mod tests {
         let mut active = ready_car();
         active["steps"][0]["status"] = json!("active");
         assert!(parked_ready(&active));
+    }
+
+    #[test]
+    fn a_held_car_does_not_board_and_does_not_count() {
+        // The hold is the whole point: this car is at review, has a
+        // branch, and is gated green. It still must not ride, because
+        // something about the WORLD is wrong - on 2026-08-26, the only
+        // node carrying the label a car repointed the gate rig at had
+        // been cordoned for a hardware fault.
+        let mut held = ready_car();
+        held["steps"][0]["metadata"] = json!({"hold": "w-1 is cordoned"});
+        assert!(!parked_ready(&held));
+
+        // `active` is boardable too, so it must honour the hold as well.
+        let mut held_active = ready_car();
+        held_active["steps"][0]["status"] = json!("active");
+        held_active["steps"][0]["metadata"] = json!({"hold": "not yet"});
+        assert!(!parked_ready(&held_active));
+
+        // An EMPTY hold is not a hold. `truthy` treats "" as false, so
+        // clearing the field releases the car without deleting the key.
+        let mut released = ready_car();
+        released["steps"][0]["metadata"] = json!({"hold": ""});
+        assert!(parked_ready(&released));
+
+        // Metadata that says nothing about holding leaves it boardable.
+        let mut other = ready_car();
+        other["steps"][0]["metadata"] = json!({"note": "looks fine"});
+        assert!(parked_ready(&other));
     }
 
     #[test]
