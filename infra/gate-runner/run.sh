@@ -51,12 +51,41 @@ trap 'fail_lost "line $LINENO"' ERR
 # disk mid-run and manufactured failures.
 rm -rf /gate-target/target
 mkdir -p /gate-target/target
+# The disk is a PVC and outlives the Job. The clone below refuses a
+# non-empty destination, so a second run on the same disk died with
+# "destination path already exists" - the third reason this rig had
+# never completed a run. "Wiped per run" has to include the clone.
+rm -rf /gate-target/repo
+# And the previous run's receipt. It is written only at the END of a
+# run, so if this one dies partway the old verdict is still sitting
+# there - with a different head - looking exactly like this run's
+# result. That nearly credited one branch with another branch's pass
+# on 2026-08-25 when w-1 reset mid-gate.
+rm -f /gate-target/receipt.json
+
+# Forge auth. The repo is not anonymously clonable: a bare clone dies
+# with "could not read Username for http://...", which is the error
+# dev-node-checkout.md called the last blocker. The token arrives as a
+# FILE (secret forge-read, key token, mounted at /etc/forge) and is
+# read by a credential helper rather than interpolated into the URL —
+# argv is world-readable to anything sharing the pid namespace, and a
+# token in the clone URL also lands in .git/config on the disk.
+if [ -r /etc/forge/token ]; then
+    git config --global credential.helper \
+        '!f() { echo username=x-access-token; echo "password=$(cat /etc/forge/token)"; }; f'
+else
+    echo "gate-runner: /etc/forge/token missing - the clone will fail" >&2
+fi
 
 # Own clone: no dependency on the dev pod's PVC, so this Job schedules
 # wherever its nodeSelector says — deliberately NOT the etcd node.
 git clone --depth 50 "$FORGE_URL" /gate-target/repo
 cd /gate-target/repo
-git fetch origin "$GATE_BRANCH"
+# Explicit refspec. `git fetch origin <branch>` on a shallow clone
+# updates FETCH_HEAD but creates no remote-tracking ref, so the
+# checkout below died with "origin/<branch> is not a commit" - the
+# second reason this rig had never completed a run.
+git fetch origin "$GATE_BRANCH:refs/remotes/origin/$GATE_BRANCH"
 git checkout -B "$GATE_BRANCH" "origin/$GATE_BRANCH"
 HEAD_SHA=$(git rev-parse HEAD)
 

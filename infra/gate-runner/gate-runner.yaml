@@ -8,8 +8,13 @@
 #   - OWN CLONE from the forge — no dependency on the boss-dev
 #     workspace PVC, and therefore no requirement to run on cp-2,
 #     the node that also carries etcd and the SoR's Longhorn
-#     replicas. Pinned to cp-3 (417Gi ephemeral allocatable, the
-#     roomiest node).
+#     replicas. Selected by boss.dev/purpose=build, not by hostname:
+#     the gate belongs to whichever machine holds the build role, so
+#     replacing that machine is a label move rather than a car. Today
+#     that is w-1 - 32 cores and 64Gi, more CPU than all three control
+#     planes together, and not a control plane at all, so a gate
+#     cannot starve etcd however hard it runs. The ceiling below is
+#     sized for that box.
 #   - OWN DISK, wiped per run. One job gates one branch; a cold
 #     workspace build needs ~74G and two branches' targets do not
 #     fit in one 100Gi volume (measured the hard way, twice).
@@ -66,8 +71,19 @@ spec:
       # The roomiest node, and deliberately not the one carrying etcd
       # and the system of record's replicas — post-mortem #2's open
       # question (b), answered for gates.
-      nodeSelector:
-        kubernetes.io/hostname: cp-3
+      # PREFER the build node, do not require it. A hard nodeSelector
+      # here means the build role is a single point of failure: when
+      # w-1 was cordoned for an NVMe thermal fault, a hard pin would
+      # have left this with no schedulable node and stopped gating
+      # entirely. Preferred affinity degrades to a slower build on a
+      # control plane instead of no build at all.
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - {key: boss.dev/purpose, operator: In, values: ["build"]}
       imagePullSecrets:
         - {name: forgejo-registry}
       automountServiceAccountToken: false
@@ -88,11 +104,12 @@ spec:
             allowPrivilegeEscalation: false
             capabilities: {drop: ["ALL"]}
           resources:
-            requests: {cpu: "2", memory: 4Gi}
-            limits: {cpu: "6", memory: 12Gi}
+            requests: {cpu: "4", memory: 8Gi}
+            limits: {cpu: "20", memory: 32Gi}
           volumeMounts:
             - {name: gate-runner-disk, mountPath: /gate-target}
             - {name: run-script, mountPath: /repo-script}
+            - {name: forge-token, mountPath: /etc/forge, readOnly: true}
         - name: postgres
           image: postgres:16
           securityContext:
@@ -126,3 +143,9 @@ spec:
         #     --dry-run=client -o yaml | kubectl apply -f -
         - name: run-script
           configMap: {name: gate-runner-script, defaultMode: 0755}
+        # Read-only forge credential. NOT optional: without it the clone
+        # prompts for a username and the Job fails before it gates
+        # anything, which is how this rig sat broken while every gate
+        # ran in the dev pod instead.
+        - name: forge-token
+          secret: {secretName: forge-read, defaultMode: 0400}

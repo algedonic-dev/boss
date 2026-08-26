@@ -115,12 +115,24 @@ spec:
       #
       # Pinned anyway, because "there is room on all three" and "this
       # build has room" are different claims once the system of record's
-      # Longhorn replicas share the disk. cp-2 is the choice: 12 cores
+      # Longhorn replicas share the disk. The build node is the
+      # choice, selected by role label rather than hostname: 12 cores
       # against 8, and the workspace PVC's single replica already has
       # dataLocality best-effort to wherever the pod runs — so pinning
       # to where it already is costs no rebuild, and moving would.
-      nodeSelector:
-        kubernetes.io/hostname: cp-2
+      # PREFER the build node, do not require it. A hard nodeSelector
+      # here means the build role is a single point of failure: when
+      # w-1 was cordoned for an NVMe thermal fault, a hard pin would
+      # have left this with no schedulable node and stopped gating
+      # entirely. Preferred affinity degrades to a slower build on a
+      # control plane instead of no build at all.
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - {key: boss.dev/purpose, operator: In, values: ["build"]}
       imagePullSecrets:
         - {name: forgejo-registry}
       # No ServiceAccount token: nothing in here talks to the Kubernetes

@@ -10,10 +10,12 @@
 //!
 //! Two signals:
 //!
-//! - **`id` gaps** — `audit_log.id` is a `BIGSERIAL`. Sequence values
-//!   that never landed as a row (rolled-back transactions) also show
-//!   up as gaps, so a gap is *suspicious* not *proof of tampering*.
-//!   The integrity report surfaces them for human review.
+//! - **`id` gaps** — `audit_log.id` comes from a sequence the BEFORE
+//!   INSERT trigger draws from inside the transaction, so a
+//!   transaction that reaches the trigger and then aborts burns its id
+//!   permanently. A gap is therefore *suspicious*, not *proof of
+//!   tampering* — and which of the two it is, is a question the hash
+//!   chain answers rather than the id arithmetic. See [`GapReading`].
 //! - **`created_at` regressions** — `created_at` defaults to `NOW()`,
 //!   which is monotonic non-decreasing in transaction-start order on
 //!   a single primary. A row whose `created_at` is earlier than the
@@ -101,15 +103,91 @@ pub struct IntegrityReport {
     pub sanctioned_trim_gap: Option<IdGap>,
 }
 
+/// What the id gaps in a report mean, once the hash chain has had its
+/// say. The two readings look identical in id arithmetic and are not
+/// remotely the same event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapReading {
+    /// No unsanctioned gaps.
+    NoGaps,
+    /// Gaps, and the chain verified across every one of them: the
+    /// missing ids were burned by transactions that reached the
+    /// id-allocating trigger and then aborted. Nothing that committed
+    /// is missing.
+    SequenceBurn,
+    /// Gaps AND a chain that failed to verify. Now the missing ids are
+    /// evidence, because a deleted row is exactly what breaks the
+    /// chain at its successor.
+    PossibleDeletion,
+}
+
+impl GapReading {
+    /// Stable wire spelling, for the `--json` report.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoGaps => "none",
+            Self::SequenceBurn => "sequence-burn",
+            Self::PossibleDeletion => "possible-deletion",
+        }
+    }
+}
+
 impl IntegrityReport {
     /// True when no gaps, regressions, chain breaks, or dangling
     /// foreign refs were observed. A `sanctioned_trim_gap` does not
     /// dirty the report — it is the epoch trim working as designed.
+    ///
+    /// "Clean" means nothing to say. It is NOT the exit-code question:
+    /// a run can have something to report and still hold. See
+    /// [`Self::has_errors`].
     pub fn is_clean(&self) -> bool {
         self.gaps.is_empty()
             && self.regressions.is_empty()
             && self.chain_breaks.is_empty()
             && self.dangling_refs.is_empty()
+    }
+
+    /// True when the hash chain verified end to end.
+    pub fn chain_intact(&self) -> bool {
+        self.chain_breaks.is_empty()
+    }
+
+    /// How to read this report's id gaps.
+    pub fn gap_reading(&self) -> GapReading {
+        if self.gaps.is_empty() {
+            GapReading::NoGaps
+        } else if self.chain_intact() {
+            GapReading::SequenceBurn
+        } else {
+            GapReading::PossibleDeletion
+        }
+    }
+
+    /// How many ids the gaps account for. The census a summarising run
+    /// reports, and the number that moving would mean something.
+    pub fn missing_ids(&self) -> i64 {
+        self.gaps.iter().map(IdGap::missing_count).sum()
+    }
+
+    /// True when this run found evidence of tampering — the question
+    /// the exit code answers.
+    ///
+    /// Id gaps are deliberately absent from this list. A gap only
+    /// becomes evidence when the chain fails to verify across it, and a
+    /// failed chain is already `chain_breaks` — so
+    /// `gap_reading() == PossibleDeletion` implies `has_errors()` by
+    /// construction, rather than by a second rule that could drift from
+    /// the first.
+    ///
+    /// What the chain does NOT cover: a trim of the log's tail, where
+    /// no surviving row was hashed against what was removed. That case
+    /// is the chain-head checkpoint's, not this scan's — each run logs
+    /// the head id and row count so an operator comparing consecutive
+    /// runs sees a head that moved backwards.
+    pub fn has_errors(&self) -> bool {
+        !self.regressions.is_empty()
+            || !self.chain_breaks.is_empty()
+            || !self.dangling_refs.is_empty()
     }
 }
 

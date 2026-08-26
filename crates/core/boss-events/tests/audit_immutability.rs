@@ -7,7 +7,9 @@
 
 use boss_core::audit::AuditWriter;
 use boss_core::event::Event;
-use boss_events::{PgAuditWriter, check_audit_log_integrity};
+use boss_events::{
+    ChainBreak, GapReading, IdGap, IntegrityReport, PgAuditWriter, check_audit_log_integrity,
+};
 use boss_testing::TestDb;
 use chrono::{Duration, Utc};
 
@@ -203,12 +205,17 @@ async fn gap_elsewhere_stays_an_anomaly_even_with_a_baseline() {
     assert_eq!(report.gaps[0].prev_id, 3);
     assert!(report.sanctioned_trim_gap.is_none());
     assert!(!report.is_clean());
+    // Deleting a committed row is what makes this one an error; the
+    // baseline only ever sanctioned the gap that starts at it.
+    assert!(report.has_errors(), "{report:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn integrity_scan_detects_an_id_gap() {
     // Simulate the trigger-bypass attack: disable the trigger,
-    // delete a row, re-enable. The scan must surface the gap.
+    // delete a row, re-enable. The scan must surface the gap — and,
+    // because the deleted row's successor was hashed against it, the
+    // chain break that makes the gap an ERROR rather than a warning.
     let db = TestDb::new().await;
     let writer = PgAuditWriter::new(db.pool.clone());
     seed_events(&writer, 5).await;
@@ -234,6 +241,8 @@ async fn integrity_scan_detects_an_id_gap() {
     assert_eq!(report.gaps[0].id, 4);
     assert_eq!(report.gaps[0].missing_count(), 1);
     assert!(report.regressions.is_empty());
+    assert!(!report.chain_intact(), "{report:?}");
+    assert!(report.has_errors(), "a deleted row must still fail the run");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -658,4 +667,196 @@ async fn vendor_invoice_with_seeded_vendor_is_clean() {
         "expected clean log: {:?}",
         report.dangling_refs
     );
+}
+
+// =========================================================================
+// An id gap is not an integrity failure — the chain decides.
+//
+// `audit_log.id` comes from a sequence the BEFORE INSERT trigger draws
+// from INSIDE the transaction, so any transaction that reaches the
+// trigger and then aborts burns its id permanently. Those burns are
+// indistinguishable from deletions by id arithmetic alone, which is why
+// the nightly chore sat red for days over two of them.
+//
+// The hash chain is what tells them apart: `row_hash = sha256(prev_row_hash
+// || canonical)`, so removing a committed row that a surviving row was
+// hashed against breaks verification at that successor.
+// =========================================================================
+
+/// Burn `count` sequence values the way production does: a transaction
+/// that reaches the trigger (which allocates the id) and then aborts.
+/// The row never lands; the id is spent.
+async fn burn_sequence_values(pool: &sqlx::PgPool, count: usize) {
+    for _ in 0..count {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO audit_log (event_id, timestamp, source, kind, payload) \
+             VALUES ($1, NOW(), 'test', 'test.aborted', '{}'::jsonb)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gap_from_burned_sequence_values_keeps_the_chain_intact() {
+    // The production shape. Five aborted transactions between two runs
+    // of real writes leave one gap of five missing ids and a chain that
+    // still verifies end to end — which is what says no committed row
+    // left.
+    let db = TestDb::new().await;
+    let writer = PgAuditWriter::new(db.pool.clone());
+    seed_events(&writer, 3).await;
+    burn_sequence_values(&db.pool, 5).await;
+    seed_events(&writer, 2).await;
+
+    let report = check_audit_log_integrity(&db.pool).await.unwrap();
+    assert_eq!(report.total_rows, 5, "no row was deleted: {report:?}");
+    assert_eq!(report.gaps.len(), 1, "{report:?}");
+    assert_eq!(report.gaps[0].prev_id, 3);
+    assert_eq!(report.gaps[0].missing_count(), 5);
+    assert!(
+        report.chain_breaks.is_empty(),
+        "burning ids must not break the chain: {report:?}"
+    );
+
+    assert_eq!(report.gap_reading(), GapReading::SequenceBurn);
+    assert_eq!(report.missing_ids(), 5);
+    assert!(
+        !report.has_errors(),
+        "a gap the chain vouches for is a warning, not a failure: {report:?}"
+    );
+    // Still reported. Warning-not-error must not become silence.
+    assert!(!report.is_clean(), "the gap must still be visible");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gap_from_a_deleted_row_breaks_the_chain_and_stays_an_error() {
+    // The signal the check exists for: a committed row removed by an
+    // operator who dropped the trigger first. The successor was hashed
+    // against the row that is now gone, so verification fails there.
+    let db = TestDb::new().await;
+    let writer = PgAuditWriter::new(db.pool.clone());
+    seed_events(&writer, 5).await;
+
+    sqlx::query("ALTER TABLE audit_log DISABLE TRIGGER audit_log_reject_row_mutation_trg")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM audit_log WHERE id = 3")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE audit_log ENABLE TRIGGER audit_log_reject_row_mutation_trg")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let report = check_audit_log_integrity(&db.pool).await.unwrap();
+    assert_eq!(report.gaps.len(), 1, "{report:?}");
+    assert!(
+        !report.chain_breaks.is_empty(),
+        "deleting a committed row must break the chain: {report:?}"
+    );
+    assert_eq!(report.gap_reading(), GapReading::PossibleDeletion);
+    assert!(report.has_errors(), "{report:?}");
+}
+
+#[test]
+fn a_possible_deletion_reading_can_never_be_a_passing_run() {
+    // "A gap with a broken chain stays an error" is not a second rule
+    // that could drift from the first — it holds because the broken
+    // chain is itself an error. This pins that reasoning so a later
+    // edit to `has_errors` cannot quietly break it.
+    let report = IntegrityReport {
+        total_rows: 4,
+        gaps: vec![IdGap { prev_id: 2, id: 4 }],
+        regressions: vec![],
+        chain_breaks: vec![ChainBreak {
+            id: 4,
+            stored_hash: vec![1; 32],
+            computed_hash: vec![2; 32],
+        }],
+        dangling_refs: vec![],
+        sanctioned_trim_gap: None,
+    };
+    assert_eq!(report.gap_reading(), GapReading::PossibleDeletion);
+    assert!(report.has_errors());
+
+    let burn = IntegrityReport {
+        chain_breaks: vec![],
+        ..report
+    };
+    assert_eq!(burn.gap_reading(), GapReading::SequenceBurn);
+    assert!(!burn.has_errors());
+    assert_eq!(burn.missing_ids(), 1);
+}
+
+// =========================================================================
+// The binary's exit code — the surface the nightly timer actually reads.
+// `systemctl is-failed` flips on 2, and that is what fires the alert.
+// =========================================================================
+
+/// Run `boss-audit-integrity-check` against a scratch database and
+/// return its exit code. Blocking, so callers hand it to
+/// `spawn_blocking` rather than stalling the test runtime.
+#[cfg(feature = "bin")]
+fn checker_exit_code(url: String) -> i32 {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_boss-audit-integrity-check"))
+        .arg("--database-url")
+        .arg(url)
+        .output()
+        .expect("running boss-audit-integrity-check");
+    out.status.code().expect("checker exited via a signal")
+}
+
+#[cfg(feature = "bin")]
+#[tokio::test(flavor = "multi_thread")]
+async fn checker_exits_0_on_a_gap_the_chain_vouches_for() {
+    let db = TestDb::new().await;
+    let writer = PgAuditWriter::new(db.pool.clone());
+    seed_events(&writer, 3).await;
+    burn_sequence_values(&db.pool, 5).await;
+    seed_events(&writer, 2).await;
+
+    let url = db.url();
+    let code = tokio::task::spawn_blocking(move || checker_exit_code(url))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        code, 0,
+        "an alarm that is permanently red trains people to ignore it"
+    );
+}
+
+#[cfg(feature = "bin")]
+#[tokio::test(flavor = "multi_thread")]
+async fn checker_exits_2_when_the_gap_comes_with_a_chain_break() {
+    let db = TestDb::new().await;
+    let writer = PgAuditWriter::new(db.pool.clone());
+    seed_events(&writer, 5).await;
+
+    sqlx::query("ALTER TABLE audit_log DISABLE TRIGGER audit_log_reject_row_mutation_trg")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM audit_log WHERE id = 3")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE audit_log ENABLE TRIGGER audit_log_reject_row_mutation_trg")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let url = db.url();
+    let code = tokio::task::spawn_blocking(move || checker_exit_code(url))
+        .await
+        .unwrap();
+
+    assert_eq!(code, 2, "a deletion signal must still fire the alert");
 }

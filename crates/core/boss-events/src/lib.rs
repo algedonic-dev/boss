@@ -24,7 +24,7 @@ pub mod tail_http;
 pub use audit_pg::PgAuditWriter;
 #[cfg(feature = "postgres")]
 pub use integrity::{
-    ChainBreak, CreatedAtRegression, IdGap, IntegrityReport, check_audit_log_integrity,
+    ChainBreak, CreatedAtRegression, GapReading, IdGap, IntegrityReport, check_audit_log_integrity,
 };
 #[cfg(feature = "postgres")]
 pub use messages_events_pg::PgMessagesEventWriter;

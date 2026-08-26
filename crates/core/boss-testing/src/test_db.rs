@@ -390,6 +390,43 @@ impl TestDb {
     pub fn name(&self) -> &str {
         &self.db_name
     }
+
+    /// Connection URL for this scratch database.
+    ///
+    /// `pool` covers everything in-process; this exists for the tests
+    /// that need to hand the database to a SUBPROCESS — a binary whose
+    /// exit code is the behaviour under test can only be checked by
+    /// running it.
+    ///
+    /// Derived from the admin URL with the database segment swapped, so
+    /// host, port, credentials and query parameters are whatever the
+    /// harness itself connected with. Never a second source of truth.
+    pub fn url(&self) -> String {
+        with_database(&self.admin_url, &self.db_name)
+    }
+}
+
+/// `admin_url` pointed at `db_name` instead of whatever database it
+/// named. Everything else — scheme, credentials, host, port, query
+/// parameters — is carried through untouched.
+pub(crate) fn with_database(admin_url: &str, db_name: &str) -> String {
+    let (scheme, rest) = admin_url
+        .split_once("://")
+        .unwrap_or(("postgres", admin_url));
+    let (authority_and_path, query) = match rest.split_once('?') {
+        Some((a, q)) => (a, Some(q)),
+        None => (rest, None),
+    };
+    // Split at the FIRST '/', which ends the authority. An admin URL
+    // that names no database has none, and then the authority is the
+    // whole of it.
+    let authority = authority_and_path
+        .split_once('/')
+        .map_or(authority_and_path, |(a, _)| a);
+    match query {
+        Some(q) => format!("{scheme}://{authority}/{db_name}?{q}"),
+        None => format!("{scheme}://{authority}/{db_name}"),
+    }
 }
 
 impl Drop for TestDb {
@@ -605,6 +642,44 @@ mod orphan_sweep {
     fn only_scratch_databases_are_candidates() {
         assert_eq!(stamp_of("boss"), None);
         assert_eq!(stamp_of("postgres"), None);
+    }
+}
+
+#[cfg(test)]
+mod scratch_url {
+    use super::{DEFAULT_ADMIN_URL, with_database};
+
+    #[test]
+    fn swaps_the_database_and_keeps_everything_else() {
+        assert_eq!(
+            with_database(DEFAULT_ADMIN_URL, "test_boss_1"),
+            "postgres://boss:boss@127.0.0.1/test_boss_1"
+        );
+        assert_eq!(
+            with_database("postgres://u:p@db.internal:15432/postgres", "test_boss_1"),
+            "postgres://u:p@db.internal:15432/test_boss_1"
+        );
+    }
+
+    #[test]
+    fn keeps_query_parameters() {
+        // sslmode and friends decide whether the subprocess can connect
+        // at all — dropping them would fail somewhere far from here.
+        assert_eq!(
+            with_database(
+                "postgres://boss@host/postgres?sslmode=require",
+                "test_boss_1"
+            ),
+            "postgres://boss@host/test_boss_1?sslmode=require"
+        );
+    }
+
+    #[test]
+    fn an_admin_url_naming_no_database_still_yields_one() {
+        assert_eq!(
+            with_database("postgres://boss:boss@127.0.0.1", "test_boss_1"),
+            "postgres://boss:boss@127.0.0.1/test_boss_1"
+        );
     }
 }
 

@@ -10,18 +10,30 @@
 //! Wired up via a systemd timer (`infra/boss-audit-integrity-check.timer`),
 //! cron, or any scheduler. Exit codes:
 //!
-//! - `0` — clean, no anomalies
-//! - `2` — anomalies found (id gaps or created_at regressions)
+//! - `0` — the log holds. Warnings may still have been logged.
+//! - `2` — evidence of tampering: a chain break, a `created_at`
+//!   regression, or a dangling foreign ref.
 //! - other — operational error (DB unreachable, bad config)
 //!
 //! `systemctl is-failed` flips on exit code 2, so the timer's
 //! `OnFailure=` hook fires the alert.
+//!
+//! **An id gap on its own is not exit 2.** It used to be, and the
+//! result was a nightly chore that stayed red for days over two gaps
+//! that were aborted-transaction sequence burns — 56 ids, one of them
+//! sitting exactly in the 2026-08-14 production-crash window. An alarm
+//! that is permanently red trains people to ignore it, which is the
+//! worst property an integrity alarm can have; it costs more than the
+//! signal is worth. Deletion of a committed row is caught by the hash
+//! chain, which was intact across both gaps. So a gap with an intact
+//! chain is a WARNING that explains itself, and a gap with a broken
+//! chain is an error — because the break is.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use boss_core::rebuild::resolve_database_url;
-use boss_events::check_audit_log_integrity;
+use boss_events::{GapReading, IntegrityReport, check_audit_log_integrity};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use sqlx::PgPool;
@@ -88,6 +100,49 @@ fn config_database_url(cli: &Cli) -> Result<Option<String>> {
     Ok(Some(cfg.database_url))
 }
 
+/// Log the run's id gaps at the level the hash chain earns them.
+///
+/// A gap the chain vouches for is reported with its explanation
+/// attached, every run. That is the point: an operator reading the
+/// journal should not have to remember which gaps are known, and a
+/// warning that says only "id gap" is what made the old alarm
+/// unreadable.
+fn log_gaps(report: &IntegrityReport) {
+    match report.gap_reading() {
+        GapReading::NoGaps => {}
+        GapReading::SequenceBurn => {
+            warn!(
+                gaps = report.gaps.len(),
+                missing_ids = report.missing_ids(),
+                "id gaps with an INTACT hash chain: sequence values burned by \
+                 transactions that reached the id-allocating trigger and then \
+                 aborted. Every committed row is still present and verified — \
+                 a deletion would have broken the chain at the deleted row's \
+                 successor. Not an integrity failure."
+            );
+            for gap in &report.gaps {
+                warn!(
+                    prev_id = gap.prev_id,
+                    id = gap.id,
+                    missing = gap.missing_count(),
+                    "id gap (burned sequence values)"
+                );
+            }
+        }
+        GapReading::PossibleDeletion => {
+            for gap in &report.gaps {
+                error!(
+                    prev_id = gap.prev_id,
+                    id = gap.id,
+                    missing = gap.missing_count(),
+                    "id gap — and the hash chain did NOT verify. These ids may be \
+                     deleted rows, not burned sequence values."
+                );
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -137,6 +192,15 @@ async fn main() -> Result<()> {
     // each run leaves a journal entry an auditor can compare against
     // on a future DB snapshot. Cheap, no external service. Empty log
     // (fresh deployment) just logs an empty checkpoint.
+    //
+    // The gap census rides on this line rather than in an allowlist
+    // file. Known gaps do get re-reported every night, deliberately:
+    // the census is a MEASUREMENT, and one that moves — a third gap, a
+    // wider one — is the thing worth seeing. An allowlist would hide
+    // exactly that, would be a second mutable record of an immutable
+    // log, and would hand an operator who deleted a row the one edit
+    // that silences the alarm. Two consecutive checkpoints answer
+    // "same gaps as yesterday?" without any of that.
     match current_chain_head(&pool).await? {
         Some((id, row_hash, prev_hash, created_at)) => info!(
             chain_head_id = id,
@@ -144,6 +208,10 @@ async fn main() -> Result<()> {
             chain_head_prev_hash = %hex::encode(&prev_hash),
             chain_head_created_at = %created_at,
             total_rows = report.total_rows,
+            gap_count = report.gaps.len(),
+            missing_ids = report.missing_ids(),
+            gap_reading = report.gap_reading().as_str(),
+            chain_intact = report.chain_intact(),
             checkpoint_at = %Utc::now(),
             "audit_log checkpoint"
         ),
@@ -154,6 +222,10 @@ async fn main() -> Result<()> {
         let body = serde_json::json!({
             "total_rows": report.total_rows,
             "gap_count": report.gaps.len(),
+            "missing_ids": report.missing_ids(),
+            "gap_reading": report.gap_reading().as_str(),
+            "chain_intact": report.chain_intact(),
+            "exit_code": if report.has_errors() { 2 } else { 0 },
             "regression_count": report.regressions.len(),
             "chain_break_count": report.chain_breaks.len(),
             "gaps": report.gaps.iter().map(|g| serde_json::json!({
@@ -206,6 +278,20 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Gaps are logged before the verdict because they are the one
+    // signal whose severity is decided by another signal.
+    log_gaps(&report);
+
+    if !report.has_errors() {
+        info!(
+            total_rows = report.total_rows,
+            gaps = report.gaps.len(),
+            missing_ids = report.missing_ids(),
+            "audit_log integrity holds — id gaps only, and the chain verified across them"
+        );
+        return Ok(());
+    }
+
     warn!(
         total_rows = report.total_rows,
         gaps = report.gaps.len(),
@@ -214,14 +300,6 @@ async fn main() -> Result<()> {
         dangling_refs = report.dangling_refs.len(),
         "audit_log integrity anomalies"
     );
-    for gap in &report.gaps {
-        error!(
-            prev_id = gap.prev_id,
-            id = gap.id,
-            missing = gap.missing_count(),
-            "id gap"
-        );
-    }
     for r in &report.regressions {
         error!(
             prev_id = r.prev_id,

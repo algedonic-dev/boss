@@ -41,11 +41,18 @@ Nothing here is blocked on hardware:
    ```
    kubectl --kubeconfig ~/talos-homelab/v2/kubeconfig get nodes -w
    ```
-4. Label it for the work it exists to do:
+4. The role label is declared in the machine config, not applied by
+   hand. The patch carries:
 
    ```
-   kubectl label node w-1 boss.dev/purpose=build
+   machine:
+     nodeLabels:
+       boss.dev/purpose: build
    ```
+
+   so the label survives a wipe-and-reinstall and arrives with the
+   node rather than after it. `kubectl label node ...` would work and
+   would be gone the next time the machine is rebuilt.
 
 ## Moving the work onto it
 
@@ -56,6 +63,10 @@ control-plane node:
 |---|---|---|
 | `infra/gate-runner/gate-runner.yaml` | `kubernetes.io/hostname: cp-3` | `boss.dev/purpose: build` |
 | `infra/cluster/manifests/boss-dev.yaml` | `kubernetes.io/hostname: cp-2` | `boss.dev/purpose: build` |
+
+Both were made on 2026-08-25 when w-1 joined; the table stays because
+the next worker inherits the role by wearing the label, and these two
+files should not need editing again.
 
 Ship them as a car (the deploy runner converges manifests; do not
 hand-apply). Two consequences worth knowing before you do:

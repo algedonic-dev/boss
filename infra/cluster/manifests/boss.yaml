@@ -53,6 +53,16 @@ spec:
     metadata:
       labels: {app: postgres}
     spec:
+      # The system of record does not share a machine with builds.
+      # Neither StatefulSet had any scheduling constraint, so both went
+      # wherever capacity happened to be: postgres ran on w-1 (which
+      # resets under sustained build load - NVMe thermal, 2026-08-25),
+      # then w-2, and reached a control plane only by being moved by
+      # hand. The split lived in the design docs and nowhere the
+      # scheduler could read it. Control planes are untainted here, so
+      # a plain nodeSelector is enough.
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
       containers:
         - name: postgres
           image: postgres:16
@@ -106,6 +116,16 @@ spec:
     metadata:
       labels: {app: nats}
     spec:
+      # The system of record does not share a machine with builds.
+      # Neither StatefulSet had any scheduling constraint, so both went
+      # wherever capacity happened to be: postgres ran on w-1 (which
+      # resets under sustained build load - NVMe thermal, 2026-08-25),
+      # then w-2, and reached a control plane only by being moved by
+      # hand. The split lived in the design docs and nowhere the
+      # scheduler could read it. Control planes are untainted here, so
+      # a plain nodeSelector is enough.
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
       containers:
         - name: nats
           image: nats:2.10-alpine
