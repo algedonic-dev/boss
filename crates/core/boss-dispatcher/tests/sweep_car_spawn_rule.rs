@@ -81,7 +81,7 @@ fn a_remediated_sweep_with_no_open_car_spawns_one() {
         &closed_sweep("remediated"),
         &StubCars::new(false),
     )
-    .expect("eval");
+    .matched;
     assert_eq!(hits.len(), 1, "remediated + no open car → spawn");
 
     let args = &hits[0].invocations[0].args;
@@ -114,7 +114,7 @@ fn a_second_firing_for_the_same_finding_does_not_spawn() {
         &closed_sweep("remediated"),
         &StubCars::new(true),
     )
-    .expect("eval");
+    .matched;
     assert!(
         hits.is_empty(),
         "a car for this target is already open — this is the defect: \
@@ -131,7 +131,7 @@ fn a_sweep_that_found_nothing_never_spawns() {
         &closed_sweep("clear"),
         &StubCars::new(false),
     )
-    .expect("eval");
+    .matched;
     assert!(hits.is_empty(), "only `remediated` spawns a car");
 }
 
@@ -140,7 +140,7 @@ fn some_other_packet_closing_is_not_a_sweep() {
     let reg = Registry::from_toml(RULE).expect("rule parses");
     let mut payload = closed_sweep("remediated");
     payload["kind"] = serde_json::json!("ship-a-change");
-    let hits = match_event(&reg, "jobs.job.closed", &payload, &StubCars::new(false)).expect("eval");
+    let hits = match_event(&reg, "jobs.job.closed", &payload, &StubCars::new(false)).matched;
     assert!(hits.is_empty(), "the rule is scoped to maintenance-sweep");
 }
 
@@ -151,7 +151,17 @@ fn the_dedup_asks_about_the_target_not_the_id_or_the_title() {
     // cannot tell one finding from another (templated per target).
     let reg = Registry::from_toml(RULE).expect("rule parses");
     let stub = StubCars::new(false);
-    match_event(&reg, "jobs.job.closed", &closed_sweep("remediated"), &stub).expect("eval");
+    // Called for its effect on the stub; the assertion below reads
+    // what it asked about. The skipped check keeps the guarantee the
+    // old .expect("eval") gave - that the predicates actually
+    // evaluated - which is easy to lose now that a failure is a
+    // quiet skip rather than an error.
+    let outcome = match_event(&reg, "jobs.job.closed", &closed_sweep("remediated"), &stub);
+    assert!(
+        outcome.skipped.is_empty(),
+        "predicates must evaluate: {:?}",
+        outcome.skipped
+    );
     assert_eq!(
         stub.asked_about(),
         vec!["stale-build-caches".to_string()],

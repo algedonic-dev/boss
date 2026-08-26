@@ -49,7 +49,7 @@ async fn step_ready_delegate_subjob_fires_spawn_with_resolved_args() {
         "metadata": { "subworkflow": "equipment-repair" }
     });
 
-    let matched = match_event(&reg, "step.ready.delegate-subjob", &payload, &NoHelpers).unwrap();
+    let matched = match_event(&reg, "step.ready.delegate-subjob", &payload, &NoHelpers).matched;
     assert_eq!(matched.len(), 1, "exactly the spawn rule should match");
 
     let spawn = RecordingHandler::new("jobs.spawn");
@@ -103,7 +103,7 @@ async fn job_closed_for_delegated_child_fires_subjob_resolve() {
         "parent_step_id": "parent-step-1"
     });
 
-    let matched = match_event(&reg, "jobs.job.closed", &payload, &NoHelpers).unwrap();
+    let matched = match_event(&reg, "jobs.job.closed", &payload, &NoHelpers).matched;
     assert_eq!(
         matched.len(),
         1,
@@ -140,7 +140,7 @@ async fn job_closed_for_ordinary_job_does_not_fire_resolve() {
         "parent_step_id": null
     });
 
-    let matched = match_event(&reg, "jobs.job.closed", &payload, &NoHelpers).unwrap();
+    let matched = match_event(&reg, "jobs.job.closed", &payload, &NoHelpers).matched;
     assert!(
         matched.is_empty(),
         "resolve must not fire for a non-delegated Job close"

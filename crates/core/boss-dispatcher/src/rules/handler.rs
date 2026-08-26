@@ -327,7 +327,7 @@ mod tests {
     use serde_json::json;
 
     fn run(reg: &Registry, topic: &str, payload: &serde_json::Value) -> Vec<MatchedRule> {
-        registry::match_event(reg, topic, payload, &NoHelpers).unwrap()
+        registry::match_event(reg, topic, payload, &NoHelpers).matched
     }
 
     fn run_with_helpers(
@@ -336,7 +336,7 @@ mod tests {
         payload: &serde_json::Value,
         h: &dyn HelperResolver,
     ) -> Vec<MatchedRule> {
-        registry::match_event(reg, topic, payload, h).unwrap()
+        registry::match_event(reg, topic, payload, h).matched
     }
 
     // ----- registry mechanics -----

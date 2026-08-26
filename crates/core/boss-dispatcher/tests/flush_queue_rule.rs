@@ -26,8 +26,7 @@ fn every_decision_event_queues_a_flush() {
         "resolution": "Table is good",
         "decided_by": "emp-bootstrap-admin",
     });
-    let hits =
-        match_event(&reg, "docs.design.decision_recorded", &payload, &NoHelpers).expect("eval");
+    let hits = match_event(&reg, "docs.design.decision_recorded", &payload, &NoHelpers).matched;
     assert_eq!(hits.len(), 1, "unconditional: every decision fires it");
     assert_eq!(hits[0].invocations[0].handler, "docs.flush_queue");
 }
