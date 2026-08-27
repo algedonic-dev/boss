@@ -3,8 +3,6 @@
 //! to catch any divergence between the test-double and production
 //! adapter (e.g. dedup constraint behavior, soft-delete idempotence).
 
-#![cfg(feature = "postgres")]
-
 use chrono::{DateTime, TimeZone, Utc};
 use uuid::Uuid;
 
@@ -12,8 +10,8 @@ fn test_stamp() -> boss_core::publisher::EventStamp {
     boss_core::publisher::EventStamp::new(
         "content",
         boss_core::actor::ActorId::Automation("test".into()),
-        chrono::Utc::now(),
     )
+    .with_timestamp(chrono::Utc::now())
 }
 
 use std::sync::Arc;

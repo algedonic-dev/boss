@@ -67,6 +67,7 @@ pub fn publish_workflows(
         "x-boss-user",
         reqwest::header::HeaderValue::from_str(&user_header).context("x-boss-user header value")?,
     );
+    boss_core::machine_token::attach(&mut headers);
     headers.insert(
         reqwest::header::CONTENT_TYPE,
         reqwest::header::HeaderValue::from_static("application/json"),

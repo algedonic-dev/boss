@@ -1,34 +1,39 @@
 # BOSS OSS quickstart
 
-Two install paths from a fresh clone to a BOSS SPA running
-locally. Pick whichever matches your environment:
+The supported clean-install path is **Docker compose**: three
+long-running containers (Postgres, NATS, and `boss-services`
+running every BOSS binary) plus a one-shot `boss-init`. No local
+Rust / Bun / Postgres / NATS install needed — the image carries
+everything. **Expect ~20–25 min on a 2-vCPU VM** for the first
+`docker compose up` (the Rust image build dominates); subsequent
+runs start in seconds because the image cache and Postgres volume
+persist.
 
-- **[Docker compose](#path-1-docker-compose)** — fastest if you
-  already have Docker. No local Rust / Bun / Postgres / NATS
-  install needed; the image carries everything. **Expect ~20–25
-  min on a 2-vCPU VM** (the Rust image build dominates).
-- **[Bare-metal local](#path-2-bare-metal-local-bootstrap)** —
-  for operators who want to develop against the source tree.
-  **Expect ~60–80 min on a 2-vCPU VM** (cold cargo build of 49
-  Rust crates dominates); ~10–15 min on an 8-vCPU dev workstation
-  with cached dependencies.
+Working on BOSS itself? See
+[Developing against the source tree](#developing-against-the-source-tree)
+below — a host-native script that runs each service as a plain
+process you can rebuild one crate at a time. That is a development
+convenience, not a second supported install.
 
-> ⚠  **Not production-ready.** Both paths run the whole platform
-> on one machine in **demo mode**: anonymous visitors are minted
-> a synthetic `audit-readonly` session at the gateway, so the
-> SPA renders the live brewery immediately without forcing a
-> login. The file-backed local-auth provider (real Argon2id-hashed
-> credentials + signed session cookies + admin-issued password
-> reset tokens) is still wired — log in at `/login` with the
-> bootstrap-admin email + `change-me` to upgrade your session to
-> `platform-admin` (full write access). No SSO, no MFA, no account
-> lockout, no rate limiting, no edge-tier hardening. For production
-> deployments see the **Post-release** section in
-> [`TODO.md`](../../TODO.md) — Production Infrastructure Template,
-> Integrated IAM (Authelia / OIDC), and Workflow modeling UX are
-> queued there.
+> **Verified on:** the compose path first passed end-to-end on
+> 2026-08-22, on an image built from train #94 plus the
+> `fix/empty-roster-is-not-a-fact` roster-cache fix. That fix is
+> **not yet on `main`** (checked at train #98, `ab19b988`) —
+> until it lands, a fresh install from pure `main` still aborts
+> at brewery prepare, on Q7 owner resolution.
 
-## Path 1: Docker compose
+> ⚠  **Not production-ready.** The stack runs the whole platform
+> on one machine. Auth is the file-backed local-auth provider —
+> real Argon2id-hashed credentials, signed session cookies,
+> admin-issued password reset tokens; see
+> [Authentication](#authentication) — but there is no SSO, no
+> MFA, no account lockout, no rate limiting, no edge-tier
+> hardening. For production deployments see the **Post-release**
+> section in [`TODO.md`](../../TODO.md) — **Production
+> infrastructure template**, **Integrated IAM** (Authelia /
+> OIDC), and Workflow modeling UX are queued there.
+
+## Install
 
 Needs Docker Engine + the Compose v2 plugin (`docker compose`, not
 the legacy `docker-compose`). On a fresh Ubuntu/Debian VM:
@@ -55,32 +60,92 @@ or a busy host port 4443/5432 from a previous run — each with the exact
 that catches "I ran it before and now `boss-init` errors with *relation
 already exists*."
 
-Three containers come up: `postgres:16`, `nats:2.10`, and a
-`boss-services` container that runs every BOSS API binary plus the
-gateway (which serves the SPA at `/`). A one-shot `boss-init`
-container applies the schema and seeds your bootstrap-admin Employee
-with role `platform-admin`; `boss-services` then publishes the
-brewery tenant (Workflows, accounts, vendors) and starts the sim,
-which builds the demo live from an empty log.
-
 When `boss-services` logs `all services up`, open
-**http://localhost:4443**. The SPA lands you in `audit-readonly`
-demo mode immediately — every projection renders, every write
-returns 403. To get write access, click **Log in** (or hit
-`/login` directly) and authenticate with the email you set in
-`.env` + the default password `change-me`. That upgrades your
-session to `platform-admin`. Rotate the password right after —
-see [Authentication](#authentication) below.
-
-The first `docker compose up` takes ~20-25 minutes on a 2-vCPU VM
-(the Docker image build of the Rust workspace dominates). The SPA
-starts sparse and fills in as the sim ticks. Subsequent runs start
-in seconds because the image cache and Postgres volume persist.
+**http://localhost:4443**. Every visitor signs in: use the
+bootstrap-admin email you set in `.env` + the default password
+`change-me` for a `platform-admin` session (full write access), or
+click **Browse as a guest** for a read-only look around. Rotate
+the password right after — see [Authentication](#authentication).
 
 Stop the stack with `docker compose down`. Add `-v` to wipe the
-Postgres volume — the next `up` re-runs init and re-seeds.
+Postgres volume — the next `up` re-runs the first-start init steps
+and re-seeds.
 
-## Path 2: Bare-metal local bootstrap
+## What a healthy install logs
+
+`boss-init` runs a four-step chain on every start and prints a
+numbered checkpoint per step — these are the lines to grep for
+when an install misbehaves:
+
+1. `==> [1/4] converging per-module schema` — `migrate.sh` applies
+   whatever the database is missing and summarizes with
+   `applied N, already recorded M, of K manifest entries`. A
+   migration failure fails the container loudly rather than
+   starting services against a half-migrated database.
+2. `==> [2/4] seeding the platform Workflow bundle (insert-if-missing)`
+   — `boss-platform-workflow-seed` loads the protocol kinds
+   shipped as data in `infra/platform/workflows.toml` and reports
+   `platform-workflow-seed: 15 inserted, 0 already present` on a
+   fresh database. If this step fails, services still start, but
+   tenant prepare will name the first missing kind it hits.
+3. `==> [3/4] provisioning bootstrap-admin credential` — writes
+   the local-auth credential file and prints
+   `✓ Credential set for <your email>`. (First start only.)
+4. `==> [4/4] priming sim_clock to 2025-04-01` — primes the
+   formula clock and prints
+   `✓ formula clock primed to 2025-04-01 @ 1000x warp`. At warp
+   1000 the playground advances **~1 sim-day per 86 wall-seconds**.
+   The epoch and warp numbers live in [`init.sh`](init.sh) (step
+   [4/4], override via `BOSS_DEMO_EPOCH_START`) — if this page and
+   `init.sh` ever disagree, `init.sh` is right. (First start only;
+   re-priming would drag a running playground's epoch backwards.)
+
+Then ends with `==> boss-init done.` and `boss-services` takes
+over:
+
+- `==> boss-launch starting 31 services` — the launcher walks its
+  roster. **A binary missing from the image is logged
+  `SKIP: <name> (binary not in image)` and the stack continues
+  without it** — a SKIP is never fatal, so if a page 502s, check
+  the launcher log for a SKIP of the service behind it. (The
+  verified 2026-08-22 run started 26 of the 31 listed.)
+- `waiting for dispatcher readyz` — the launcher gates the sim on
+  the dispatcher's consumer loops being live, so side effects
+  (invoices, COGS, shipping) fire from the first sim tick.
+- `seed-operator-baseline` then the brewery tenant seed run
+  through the public API, and `boss-brewery-sim prepare` builds
+  the 411-person roster (`roster ready — opening design Jobs`).
+- `==> all services up — pid count: N` — the SPA is live at
+  **http://localhost:4443**.
+
+## What you're looking at
+
+The brewery (Algedonic Ales) is the public OSS demo tenant. The
+install seeds the reference data — employees, accounts, vendors,
+recipes, equipment, the Workflow catalog — then starts the brewery
+sim, which ticks sim-days forward at the primed warp (the [4/4]
+clock note above) and builds the rest live: orders, work,
+invoices, ledger entries, projections. The SPA is sparse on first
+load and fills in as the sim runs.
+
+Try:
+
+- `/ux/exec` — the executive dashboard.
+- `/system/monitoring` — service health, deployment topology, ML
+  oversight.
+- `/system/kb` — architecture diagrams, ADRs, hardware/software
+  reference.
+- `/ux/jobs` — every Job in flight.
+- `/system/workflows` — the Workflow catalog + authoring (writes
+  need your platform-admin role).
+
+## Developing against the source tree
+
+For working on BOSS itself, `quickstart.sh` builds the workspace
+on the host and runs each service as a plain background process —
+so you can rebuild a single crate and restart one service instead
+of rebuilding the Docker image. This is the dev-mode path; the
+compose stack above is the supported install.
 
 ### Prerequisites
 
@@ -109,8 +174,8 @@ so `bun` lands on your `PATH` — the installer modifies your shell
 rc but it doesn't take effect in the current process.
 
 The Postgres role `boss` (password `boss`) must exist as a
-superuser — `bootstrap-boss.sh` creates the database but **not** the
-role. Create it once before running the quickstart:
+superuser — the bootstrap scripts create the database but **not**
+the role. Create it once before running the quickstart:
 
 ```sh
 sudo -u postgres psql -c "CREATE ROLE boss WITH LOGIN SUPERUSER PASSWORD 'boss';"
@@ -134,56 +199,32 @@ The script will:
 2. Prompt for your **bootstrap-admin email** — the seed Employee
    record that owns the platform-admin role. (Or pass
    `--email=you@example.com`.)
-3. Build the workspace (~40 min cold on a 2-vCPU VM, ~10 min on
-   an 8-vCPU dev workstation, ~30 s warm), then drop and recreate
-   an empty local `boss` Postgres database. The first cold build
-   dominates wall-clock; subsequent runs reuse `target/` and finish
-   in seconds.
+3. Build the workspace via `infra/bootstrap-local.sh` (~40–60 min
+   cold on a 2-vCPU VM, ~10 min on an 8-vCPU dev workstation,
+   ~30 s warm), then drop and recreate an empty local `boss`
+   Postgres database. The first cold build dominates wall-clock —
+   expect **~60–80 min clone-to-SPA total on a 2-vCPU VM**;
+   subsequent runs reuse `target/` and finish in seconds.
 4. Build the SPA via Bun.
-5. Insert your bootstrap-admin Employee into the live DB +
-   audit_log so a future rebuild reproduces the row, and seed
-   their `change-me` credential in
+5. Seed your bootstrap-admin's `change-me` credential in
    `/var/lib/boss/auth/credentials.toml`.
 6. Start every service as a background process (PIDs in
-   `~/.boss-pids`) — including the brewery tenant seed (Workflows,
-   accounts, vendors) and the sim that builds the demo live, and the
-   gateway on `127.0.0.1:4443`.
+   `~/.boss-pids`) — including the operator-baseline + brewery
+   tenant seed through the public API and the sim that builds the
+   demo live, and the gateway on `127.0.0.1:4443`.
 
 When it prints `Quickstart complete.`, open
-**http://127.0.0.1:4443** — you should see Algedonic Ales' landing
-page with the simulator clock ticking in the lower-right badge.
-The gateway runs in demo mode (anonymous = `audit-readonly`), so
-the SPA renders without a login. Click **Log in** to upgrade to
-`platform-admin` using the bootstrap-admin email + `change-me`.
+**http://127.0.0.1:4443** and sign in — bootstrap-admin email +
+`change-me`, or the guest button for read-only (see
+[Authentication](#authentication)).
 
-## What you're looking at
-
-The brewery (Algedonic Ales) is the public OSS demo tenant. The
-install seeds the reference data — employees, accounts, vendors,
-recipes, equipment, the Workflow catalog — then starts the brewery
-sim, which ticks ~1 sim-day per 86 wall-seconds and builds the rest
-live: orders, work, invoices, ledger entries, projections. The SPA
-is sparse on first load and fills in as the sim runs.
-
-Try:
-
-- `/ux/exec` — the executive dashboard.
-- `/system/monitoring` — service health, deployment topology, ML
-  oversight.
-- `/system/kb` — architecture diagrams, ADRs, hardware/software
-  reference.
-- `/ux/jobs` — every Job in flight.
-- `/system/workflows` — the Workflow catalog (read-only).
-- `/system/workflows` — Workflow authoring (visible to your platform-admin
-  role).
-
-## Stop it
+Stop it:
 
 ```sh
 kill $(cat ~/.boss-pids)
 ```
 
-## Re-run it
+Re-run it:
 
 ```sh
 ./infra/oss-quickstart/quickstart.sh --email=you@example.com
@@ -204,9 +245,10 @@ The bootstrap-admin email upserts in either path.
 
 ## Exposing the stack to a public hostname
 
-Both install paths land you on `127.0.0.1:4443`. The gateway
-is HTTP-only — it does NOT terminate TLS, validate hostnames,
-or rewrite the SPA's fetch origin. For a public deployment:
+Both the compose stack and the dev-mode script land you on
+`127.0.0.1:4443`. The gateway is HTTP-only — it does NOT
+terminate TLS, validate hostnames, or rewrite the SPA's fetch
+origin. For a public deployment:
 
 1. **Run a TLS-terminating reverse proxy in front** — Caddy,
    nginx, an ALB, a Cloudflare Tunnel — pointing at
@@ -232,9 +274,9 @@ or rewrite the SPA's fetch origin. For a public deployment:
 
 The Docker compose stack does not bundle Caddy; bringing it up
 is a separate concern outside the container. v1's framing is
-"two installs that run on a single VM"; multi-tier production
+"an install that runs on a single VM"; multi-tier production
 deploys (HA gateway, separate TLS terminator, dedicated DB)
-are tracked under the **Production Infrastructure Template**
+are tracked under the **Production infrastructure template**
 TODO.
 
 ## Authentication
@@ -268,7 +310,7 @@ laptop:
 # Docker:
 docker compose exec boss-services boss-auth set you@example.com
 
-# Bare-metal:
+# Source-tree dev mode:
 BOSS_AUTH_FILE=/var/lib/boss/auth/credentials.toml \
     target/release/boss-auth set you@example.com
 ```
@@ -285,14 +327,14 @@ boss-auth verify alice@example.com  # exit 0 on match, 1 on miss
 ```
 
 Set a **strong** `BOSS_SESSION_KEY` (Docker: in `.env`;
-bare-metal: in your shell env before running `quickstart.sh`)
+dev mode: in your shell env before running `quickstart.sh`)
 before deploying anywhere reachable — it's the HMAC key the
 gateway uses to sign session cookies. The default value
 (`please-rotate-me-in-prod-do-not-leak`) is correctly named.
 
 To withdraw the guest button, unset `BOSS_GUEST_ACCESS`
 (Docker: remove the line from
-`docker-compose.yml`; bare-metal: edit
+`docker-compose.yml`; dev mode: edit
 `infra/bootstrap-local.sh`'s gateway env). A login is then the
 only way in.
 
@@ -305,23 +347,6 @@ only way in.
 
 ## Troubleshooting
 
-**`pg_isready` fails.** Postgres isn't listening on
-`127.0.0.1:5432`. Start it: `brew services start postgresql@16`
-or `sudo systemctl start postgresql`.
-
-**`could not connect to server: Connection refused` on NATS.**
-Start `nats-server` on port 4222: `nats-server -js`.
-
-**`error: linker 'cc' not found`.** Install `build-essential`
-(Linux) or `xcode-select --install` (macOS).
-
-**Bootstrap takes much longer than expected.** The first cargo
-build does cold compile of ~150 crates (49 boss-* + their
-transitive deps). On a 2-vCPU VM this is 40-50 minutes; on an
-8-vCPU dev workstation closer to 10. Subsequent runs reuse
-`target/` and finish in seconds. If you're evaluating on cloud
-VMs, a 4+ vCPU instance halves the wait.
-
 **`relation "..." already exists` / `boss-init exited with code 3`.**
 A previous (often failed) install left an already-initialized Postgres
 volume, or a cached `boss:latest` image is running older code against it.
@@ -332,6 +357,28 @@ clear it for a clean slate:
 docker compose -f infra/oss-quickstart/docker-compose.yml down -v   # wipe the volume
 docker compose -f infra/oss-quickstart/docker-compose.yml up --build # rebuild from current source
 ```
+
+**A page 502s in a fresh install.** Check the `boss-services` log
+for `SKIP: <name> (binary not in image)` — the launcher skips
+missing binaries and keeps going, so a stale or partial image
+surfaces as a missing service rather than a failed start.
+
+**`pg_isready` fails** (dev mode). Postgres isn't listening on
+`127.0.0.1:5432`. Start it: `brew services start postgresql@16`
+or `sudo systemctl start postgresql`.
+
+**`could not connect to server: Connection refused` on NATS**
+(dev mode). Start `nats-server` on port 4222: `nats-server -js`.
+
+**`error: linker 'cc' not found`** (dev mode). Install
+`build-essential` (Linux) or `xcode-select --install` (macOS).
+
+**Build takes much longer than expected** (dev mode). The first
+cargo build does cold compile of ~150 crates (49 boss-* + their
+transitive deps). On a 2-vCPU VM this is 40-50 minutes; on an
+8-vCPU dev workstation closer to 10. Subsequent runs reuse
+`target/` and finish in seconds. If you're evaluating on cloud
+VMs, a 4+ vCPU instance halves the wait.
 
 ## Validating the brewery sim (maintainers)
 

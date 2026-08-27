@@ -2,8 +2,6 @@
 //! the projection can be dropped and recomputed from facts, deterministically,
 //! without touching the underlying facts.
 
-#![cfg(feature = "postgres")]
-
 use boss_ledger::rebuild;
 use boss_testing::TestDb;
 use chrono::NaiveDate;

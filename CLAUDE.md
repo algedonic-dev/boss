@@ -88,23 +88,50 @@ All three converge: the company *is* its event log + its current state
 + the rules connecting them. Design choices that respect that
 convergence land cleanly; ones that don't accumulate fragility.
 
-### Reading frame: BOSS is a human-powered state machine
+### Reading frame: the three layers
 
-BOSS is the software layer of a state machine whose executors are humans
-(and, increasingly, agents). The software does not *run* the business;
-it *describes* it as a state machine and gives the executors
-instrumentation to run it safely. Concretely: the event log + projections
-are the machine's memory; the StepType registry is the alphabet of legal
-transitions; Workflow is the program written in that alphabet; a Step's
-`status` is the program counter; Messages + My Day are the work-routing
-surface (not to be confused with the `boss-dispatcher` core service,
-which runs step side-effect rules off `step.done.<kind>` topics);
-policy is the privilege model on CPUs. Agents are additional CPUs in
-the same machine, not a separate system. This framing is load-bearing
-for design review — if you're about to add a new workflow, a new page,
-or a new abstraction, read it against the invariants in
-[docs/design/human-powered-state-machine.md](docs/design/human-powered-state-machine.md)
-first.
+**The network is the substrate. The fat protocols dictate the current
+operating model. The actors run it.** (David, 2026-08-13.) Three layers,
+each replaceable without disturbing the others — which is what lets a
+company change how it works without rebuilding what it works *on*:
+
+- **The network is the substrate.** Packets (a Job is an immutable
+  envelope + a protocol set fixed at admission), stations (data-defined
+  priority queues that route or hold packets until there is bandwidth or
+  capability), routes, the log, and the one admission edge. This layer is
+  physics — it has no opinion about what the work *means*.
+- **The fat protocols dictate the current operating model.** Workflows
+  are protocols, and the meaning lives in the protocol row, not in the
+  endpoints: steps, the predicates that order them, the evidence each
+  requires, the terminals, the obligations. That is why protocols are
+  **registry data** — versioned, append-only, in-flight packets pinned to
+  the version they were admitted under. "The **current** operating model"
+  is load-bearing: a protocol that cannot be replaced without a deploy
+  has leaked into the substrate, and that leak is the defect to hunt.
+- **The actors run it.** Humans and registered agents are the CPUs —
+  nothing moves without an actor claiming a step and doing it. Capability
+  is enforced at the claim; bandwidth is finite, which is why stations
+  hold rather than drop. Actors are not users of the system; they are the
+  part of it that executes.
+
+Canonical statement:
+[docs/design/the-three-layers.md](docs/design/the-three-layers.md).
+
+**The "human-powered state machine" reading is the execution lens over
+this, not the foundation.** It answers "how does one packet get
+executed": the event log + projections are the machine's memory; the
+StepType registry is the alphabet of legal transitions; Workflow is the
+program written in that alphabet; a Step's `status` is the program
+counter; My Day / assignments is an actor's station rendered (not to be
+confused with the `boss-dispatcher` core service, which runs step
+side-effect rules off `step.done.<kind>` topics); policy is the privilege
+model on CPUs. Its invariants still hold — human and agent executors are
+CPUs in the same machine, not a separate system, and new work types are
+registry rows, never bespoke core code paths. Read a new workflow, page,
+or abstraction against both frames; when they disagree, **the network
+framing wins**, because it is the one that survives changing the
+operating model. The lens and its invariants:
+[docs/design/human-powered-state-machine.md](docs/design/human-powered-state-machine.md).
 
 The five-property correctness protocol (provenance, conservation,
 closure, idempotence, determinism) named in §Founding ideas above is
@@ -180,20 +207,43 @@ next person to keep two lists in sync is not a mechanism.
 This is not theoretical. Three such pairs drifted and each caused a
 real failure:
 
-| pair | what broke |
-|---|---|
-| `boss-ports` ↔ `deploy-services.sh` fallback arrays | two services silently absent from a deploy |
-| `manifest.txt` ↔ `boss-testing::SCHEMA_FILES` | every DB-backed test ran without two tables |
-| `MODEL_ROUTES` ↔ `MODEL_KINDS` | pages rendered under the wrong tab, silently |
+| pair | what broke | now |
+|---|---|---|
+| `boss-ports` ↔ `deploy-services.sh` fallback arrays | two services silently absent from a deploy | pinned by a test — the fallback must stand alone when the binary is unbuilt |
+| `manifest.txt` ↔ `boss-testing::SCHEMA_FILES` | every DB-backed test ran without two tables | **collapsed twice** — `build.rs` generated the list from the manifest, then the manifest itself was deleted and the schema directory became the definition |
+| `MODEL_ROUTES` ↔ `MODEL_KINDS` | pages rendered under the wrong tab, silently | **collapsed** — one `nav-catalog.ts` answers both questions |
 
-All three now either collapsed to one definition or pinned by a test
-that names the offending entry when it drifts. Prefer collapsing:
+All three are now either collapsed to one definition or pinned by a
+test that names the offending entry when it drifts. Prefer collapsing:
 `VENDOR_COUNT` was two hardcoded `13`s under a sync comment and is now
 one `pub const`, because one constant cannot drift from itself.
 
+**A pin is a holding action, not a destination.** The equality test is
+what you write when you cannot collapse *today*; it stops the drift
+but keeps the duplication, and duplication has a running cost the test
+does not pay off. `manifest.txt` ↔ `SCHEMA_FILES` is the worked
+example, and it took two passes. The pin held for months, then every
+new migration had to edit the tail line of both files, and on
+2026-08-13 four cars in one day collided there — each collision
+costing a re-rail. That bought the first collapse: `build.rs` generates
+the Rust list from the manifest, so it cannot drift, and
+`include_str!` needing compile-time literals is what a build script is
+for.
+
+**That was half a fix, and the half it left was still expensive.** One
+file still had a contended tail line, so any two cars carrying a
+migration still conflicted on merge — two more were stranded on
+2026-08-14 ("left for the next train"). The second collapse deleted
+`manifest.txt` outright: the ordered list is `schema/*.sql` sorted by
+the `NNN-` prefix, which every reader derives independently. Adding a
+migration is now dropping a file in a directory, touching no shared
+line at all. The lesson to carry: when a collapse leaves one
+authoritative copy that everyone still has to *edit*, ask whether that
+copy holds any information its source does not. This one held none.
+
 ### 10. Core vs. Example Tenant
-The core state-machine OS lives under `crates/core/` (27 crates —
-`boss-core`, `boss-events`, `boss-jobs`, `boss-policy`,
+The core state-machine OS lives under `crates/core/` (
+among them `boss-core`, `boss-events`, `boss-jobs`, `boss-policy`,
 `boss-gateway`, `boss-observability`, `boss-cybernetics`,
 `boss-docs`, `boss-ml`, `boss-content`, `boss-testing`,
 `boss-dispatcher`, `boss-clock`, `boss-expr`, `boss-locations`, the
@@ -272,7 +322,7 @@ Four tier directories, each with a hard rule about what the tier
 can depend on. **Every PR is judged against the audit bar of
 the tier it touches.**
 
-- **`crates/core/` — Tier 1: Core state-machine OS** (27 crates).
+- **`crates/core/` — Tier 1: Core state-machine OS**.
   The generic state-machine modeling toolkit. Every BOSS
   deployment ships these regardless of what the tenant models.
   A non-company tenant (research lab, robot fleet, city
@@ -287,8 +337,8 @@ the tier it touches.**
   `boss-testing`, `boss-ports`, `boss-docs`, plus matching
   `*-client` crates.
 
-- **`crates/modules/` — Tier 2: Company-modeling layer**
-  (16 crates). Useful for modeling a company on top of the
+- **`crates/modules/` — Tier 2: Company-modeling layer**.
+  Useful for modeling a company on top of the
   core. A non-company tenant can deploy without these. Same
   hexagonal shape as Tier 1 (domain types + port + HTTP surface
   + projection rebuilder) but the *concepts* are business-shaped,
@@ -300,7 +350,7 @@ the tier it touches.**
   `boss-assets`, plus matching `*-client` HTTP-contract crates and
   `boss-ml-plugins`.
 
-- **`crates/orchestrators/` — Cross-tier orchestrators** (5).
+- **`crates/orchestrators/` — Cross-tier orchestrators**.
   Binaries that fan out across both tiers by design. The
   Tier-1-must-not-depend-on-Tier-2 rule applies to **libraries**,
   not orchestrators. An orchestrator's purpose IS to wire core
@@ -316,7 +366,7 @@ the tier it touches.**
   owned by the core `boss-dispatcher` crate, which subscribes to
   `step.done.<kind>` topics and runs data-driven rules.
 
-- **`crates/tenants/` — Tier 3: Tenants** (2). Tenant-specific
+- **`crates/tenants/` — Tier 3: Tenants**. Tenant-specific
   binaries. Crates: `boss-brewery-engine` (Algedonic Ales public
   demo) and `boss-used-device-shop-engine` (used-device-shop).
   Data-side seeds + Workflows for the brewery tenant live under
@@ -324,7 +374,7 @@ the tier it touches.**
 
 The `infra/lint/tier-import-audit.sh` script enforces the
 Tier-1-can't-depend-on-Tier-2 rule (orchestrators excluded);
-runs cleanly today (0 violations across 27 core crates).
+runs cleanly today (0 violations across 29 core crates).
 
 Each domain crate has a matching `*-client` for cross-service
 HTTP calls + a `Pg*` adapter behind the `postgres` feature.

@@ -7,8 +7,12 @@
 import { mount } from 'svelte';
 import App from './App.svelte';
 import { installStepPluginHost } from './steps/pluginHost';
+import { installMarkdownForPlugins } from '@boss/web-kit/markdown';
 
 installStepPluginHost();
+// One markdown renderer, host-installed, so framework-free plugin
+// bundles render prose without each carrying a copy that drifts.
+installMarkdownForPlugins();
 
 const target = document.getElementById('app');
 if (!target) throw new Error('#app element missing from index.html');

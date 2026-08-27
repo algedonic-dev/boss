@@ -1,0 +1,8 @@
+[[invariant]]
+id = "tier-1-does-not-depend-on-tier-2"
+claim = "Tier-1 (core) library crates must NOT depend on Tier-2 (modules) or Tier-3 (tenants) crates."
+source = "infra/lint/tier-import-audit.sh; CLAUDE.md §Rust Conventions/Structure; docs/architecture-decisions.md"
+enforcement = "enforced"
+mechanism = "infra/lint/tier-import-audit.sh"
+last_verified = ""
+note = "The same script carries the DB analogue: a core schema file (00-09) must not hard-FK a table owned by a Tier-2 module file (10-40). Orchestrators are explicitly exempt — fanning out across tiers is their purpose."

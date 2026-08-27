@@ -64,6 +64,14 @@
   let facts = $state<Fact[]>([]);
   let jobs = $state<Job[]>([]);
   let docs = $state<KBDocument[]>([]);
+  /// Non-null when the timeline (facts) fetch failed — rendered
+  /// instead of "No recorded activity yet", which is a claim only a
+  /// successful read gets to make (packet 3fba9c35). Jobs/documents
+  /// sections normally hide when empty, so a failed fetch gets its
+  /// own visible notice instead of a silent absence.
+  let factsFailed = $state<string | null>(null);
+  let jobsFailed = $state<string | null>(null);
+  let docsFailed = $state<string | null>(null);
   let empNames = $state<Map<string, string>>(new Map());
   let workflowLabels = $state<Map<string, string>>(new Map());
 
@@ -83,7 +91,11 @@
       if (!url) return;
       try {
         const r = await fetch(url);
-        if (!r.ok || cancelled) return;
+        if (cancelled) return;
+        if (!r.ok) {
+          factsFailed = `HTTP ${r.status}`;
+          return;
+        }
         const data = await r.json();
         const normalized = Array.isArray(data)
           ? (data as Fact[])
@@ -92,9 +104,12 @@
             : Array.isArray(data?.data)
               ? (data.data as Fact[])
               : [];
-        if (!cancelled) facts = normalized;
-      } catch {
-        /* ignore */
+        if (!cancelled) {
+          facts = normalized;
+          factsFailed = null;
+        }
+      } catch (e) {
+        if (!cancelled) factsFailed = e instanceof Error ? e.message : String(e);
       }
     })();
     return () => {
@@ -114,12 +129,19 @@
         const r = await fetch(
           `/api/jobs?${param}=${encodeURIComponent(id)}&limit=50`,
         );
-        if (!r.ok || cancelled) return;
+        if (cancelled) return;
+        if (!r.ok) {
+          jobsFailed = `HTTP ${r.status}`;
+          return;
+        }
         const data = await r.json();
         const rows: Job[] = Array.isArray(data?.data) ? data.data : [];
-        if (!cancelled) jobs = rows;
-      } catch {
-        /* ignore */
+        if (!cancelled) {
+          jobs = rows;
+          jobsFailed = null;
+        }
+      } catch (e) {
+        if (!cancelled) jobsFailed = e instanceof Error ? e.message : String(e);
       }
     })();
     return () => {
@@ -138,11 +160,18 @@
         const r = await fetch(
           `/api/catalog/documents?entity_kind=${encodeURIComponent(kind)}&entity_id=${encodeURIComponent(id)}`,
         );
-        if (!r.ok || cancelled) return;
+        if (cancelled) return;
+        if (!r.ok) {
+          docsFailed = `HTTP ${r.status}`;
+          return;
+        }
         const data = await r.json();
-        if (!cancelled) docs = Array.isArray(data) ? (data as KBDocument[]) : [];
-      } catch {
-        /* ignore */
+        if (!cancelled) {
+          docs = Array.isArray(data) ? (data as KBDocument[]) : [];
+          docsFailed = null;
+        }
+      } catch (e) {
+        if (!cancelled) docsFailed = e instanceof Error ? e.message : String(e);
       }
     })();
     return () => {
@@ -252,7 +281,11 @@
 
 <div class="kb-view">
   <Section title={`Timeline (${facts.length})`} wide>
-      {#if facts.length === 0}
+      {#if factsFailed}
+        <div class="kb-empty load-failed" role="alert">
+          Couldn't load the timeline — {factsFailed}
+        </div>
+      {:else if facts.length === 0}
         <div class="kb-empty">No recorded activity yet.</div>
       {:else}
         <div class="kb-timeline">
@@ -287,6 +320,21 @@
         </div>
       {/if}
   </Section>
+
+  {#if jobsFailed}
+    <Section title="Related jobs" wide>
+        <div class="kb-empty load-failed" role="alert">
+          Couldn't load related jobs — {jobsFailed}
+        </div>
+    </Section>
+  {/if}
+  {#if docsFailed}
+    <Section title="Documents">
+        <div class="kb-empty load-failed" role="alert">
+          Couldn't load documents — {docsFailed}
+        </div>
+    </Section>
+  {/if}
 
   {#if openJobs.length > 0}
     <Section title={`Active jobs (${openJobs.length})`} wide>

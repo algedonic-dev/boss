@@ -132,14 +132,13 @@ pub(super) async fn upsert_vendor_invoice<R: InventoryRepository + 'static>(
     {
         return resp;
     }
-    let now = boss_clock_client::now_from(&state.clock).await;
     // Outbox phase 2: the full-row UPSERTED event + the approved/paid
     // transition events record inside the repository transaction
     // (transitions gated on their fact actually inserting).
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     match state
         .inventory
-        .upsert_vendor_invoice_at(&invoice, now, &stamp)
+        .upsert_vendor_invoice_at(&invoice, stamp.timestamp, &stamp)
         .await
     {
         Ok(()) => (StatusCode::CREATED, Json(invoice)).into_response(),
@@ -249,10 +248,10 @@ pub(super) async fn create_vendor_invoice_from_po<R: InventoryRepository + 'stat
     // Received state → the repository records only the full-row
     // UPSERTED event in-tx (no approved/paid transition yet; that's
     // the human step).
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     match state
         .inventory
-        .upsert_vendor_invoice_at(&invoice, now, &stamp)
+        .upsert_vendor_invoice_at(&invoice, stamp.timestamp, &stamp)
         .await
     {
         Ok(()) => (StatusCode::CREATED, Json(invoice)).into_response(),
@@ -293,13 +292,12 @@ pub(super) async fn batch_pay_vendor_invoices<R: InventoryRepository + 'static>(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    let now = boss_clock_client::now_from(&state.clock).await;
     // Outbox phase 2: each iteration's UPSERTED (full row at its new
     // state — what the rebuild path reads to re-derive vendor_invoices)
     // + PAID transition (drives the finance.bill.paid ledger
     // projection; payload identical to the old inline shape via
     // `bill_paid_payload`) record inside that upsert's transaction.
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     let mut paid_ids = Vec::with_capacity(approved.len());
     let mut total: i64 = 0;
     for mut invoice in approved {
@@ -307,7 +305,7 @@ pub(super) async fn batch_pay_vendor_invoices<R: InventoryRepository + 'static>(
         invoice.paid_on = Some(req.paid_on);
         if let Err(e) = state
             .inventory
-            .upsert_vendor_invoice_at(&invoice, now, &stamp)
+            .upsert_vendor_invoice_at(&invoice, stamp.timestamp, &stamp)
             .await
         {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();

@@ -1,0 +1,8 @@
+[[invariant]]
+id = "protocol-data-agrees-between-record-and-runtime"
+claim = "The registry an operator can read is the registry the runtime obeys: protocol rows in the system of record and the rows the executing process evaluates are the same rows."
+source = "docs/design/protocol-cadence.md; packet c7775816; infra/postgres/schema/123-cadence-registry-reconcile.sql"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "VIOLATED TODAY, AND THE VIOLATION IS STILL LIVE. The cadence loop reads `cadence_rules` from boss-gcp's local Postgres while the packets it schedules live on the cluster: on 2026-08-14 the cluster said the boarding threshold was 4 and the running rule was 8, and cadence_firings held 0 rows on the cluster against 244 locally. The cost is not abstract — an agent read the system of record, concluded a four-car dock would board, and reported that to David. It did not. This is the sharpest possible version of the failure, because the whole architecture bets on protocols being editable registry data, and an edit made where the operator can reach had NO effect on the runtime. Migration 123 reconciles the rows so the record stops lying; it does not close this. What would enforce it: a BOSS_POSTGRES_URL drop-in pointing boss-train at the cluster (David's call, must land after 123 or it silently halves the threshold), and then a check that the two agree — the same shape as the schema-converge gate, one registry over."

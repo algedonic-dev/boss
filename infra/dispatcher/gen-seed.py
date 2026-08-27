@@ -7,7 +7,7 @@ migrations are history: editing 41 trips migrate.sh's checksum guard on
 every live database. A rule added or changed after the runner landed
 gets its OWN manifest entry — a new NNN-dispatcher-rule-*.sql with an
 ON CONFLICT-safe INSERT (see 101-dispatcher-rule-step-assigned.sql),
-appended to manifest.txt and boss-testing's SCHEMA_FILES.
+dropped into infra/postgres/schema/; there is no list to append to.
 
 The `dispatcher_rules_seed_matches_toml` test still guards the union of
 all seed migrations against rules.toml, so drift still fails CI.

@@ -164,6 +164,19 @@ pub struct Job {
     pub closed_on: Option<NaiveDate>,
     pub metadata: serde_json::Value,
     pub tags: Vec<String>,
+    /// Whether this Job belongs to the simulated company. Decided ONCE
+    /// at admission (`POST /api/jobs`) — from an explicit body flag or
+    /// the sim-chain origin of the creating request — and immutable
+    /// thereafter: a real operator can click around a simulated Job
+    /// all day without making it real. Every event about the Job (job
+    /// + step state events and markers) inherits this flag as its
+    /// `_simulated` payload marker, so the flag on the packet — not
+    /// the transport context of any later write — is the source of
+    /// truth for sim-vs-real. `#[serde(default)]` keeps pre-flag
+    /// payloads (old audit_log events, old clients) deserializing as
+    /// real.
+    #[serde(default)]
+    pub simulated: bool,
 }
 
 impl Job {
@@ -189,6 +202,7 @@ impl Job {
             closed_on: None,
             metadata: serde_json::Value::Object(serde_json::Map::new()),
             tags: Vec::new(),
+            simulated: false,
         }
     }
 
@@ -226,6 +240,14 @@ impl Job {
         self.tags = tags;
         self
     }
+
+    /// Mark the Job as belonging to the simulated company. Sim
+    /// engines set this at construction so admission fixes the flag
+    /// from the packet itself, not from per-event stamping.
+    pub fn with_simulated(mut self, simulated: bool) -> Self {
+        self.simulated = simulated;
+        self
+    }
 }
 
 /// A step-authored completion-contract field (inline authoring —
@@ -246,6 +268,39 @@ pub struct StepField {
 /// attestation of a step *in its current shape*. Policy-checked at
 /// stamp time and recorded as its own audit event; `shape_hash`
 /// binds the stamp to the content it attested.
+/// How hard a stamp was to produce.
+///
+/// A stamp already answers WHO attested and WHAT they attested
+/// (`shape_hash`). It never answered how strong the evidence was, so
+/// "David clicked approve" and "David logged in this morning and
+/// something clicked approve" were the same fact.
+///
+/// David, 2026-08-16: *"Passkey authorization as actor-auth feature
+/// for job packets is broadly useful. Let's make sure we design and
+/// build it that way."* — so this is a property of a STAMP, not a
+/// feature of one workflow. Elevation, a payment release, a deploy
+/// sign-off and an incident's closure all want it and none should
+/// invent it.
+///
+/// ORDERED, and the order is the whole contract: a step declares the
+/// minimum it will accept and the endpoint refuses anything weaker.
+/// Adding a variant means deciding where it sits on that scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Assurance {
+    /// An authenticated session said yes. Today's behaviour, and the
+    /// default so that every existing stamp and every existing
+    /// protocol keeps its current meaning.
+    #[default]
+    Session,
+    /// A fresh WebAuthn assertion proved the actor was present, over a
+    /// challenge bound to this step's `shape_hash`. The signature is
+    /// itself the binding: it cannot be replayed against a different
+    /// step (different challenge) or against an edited one (the hash
+    /// moved).
+    Presence,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SignOffStamp {
     /// Who stamped — an employee id (stamping is a human act; the
@@ -256,6 +311,18 @@ pub struct SignOffStamp {
     pub stamped_at: chrono::DateTime<chrono::Utc>,
     /// `step_shape_hash` of the step when stamped.
     pub shape_hash: String,
+    /// How strong the evidence was. `serde(default)` so every stamp
+    /// written before this field existed reads as `Session`, which is
+    /// exactly what it was.
+    #[serde(default)]
+    pub assurance: Assurance,
+    /// Presence stamps only: the server nonce folded into the WebAuthn
+    /// challenge (`sha256(shape_hash || ":" || nonce)`). Recorded so a
+    /// stamp names the exact single-use challenge that produced it —
+    /// the audit trail from stamp back to ceremony. Absent on Session
+    /// stamps and on every stamp written before presence existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_nonce: Option<String>,
 }
 
 /// Hash of a step's completion-relevant content — what a sign-off
@@ -335,6 +402,16 @@ pub struct Step {
     /// step's authority_role). Empty = no sign-offs required.
     #[serde(default)]
     pub sign_offs_required: Vec<String>,
+    /// The weakest stamp this step will accept. `None` means "whatever
+    /// the StepType's floor says", which is `Session` unless the kind
+    /// raises it — so an unset field changes nothing.
+    ///
+    /// Declared on the step rather than only on the kind because two
+    /// `sign-off` steps can want different strengths depending on what
+    /// they gate: the same kind approves a stationery order and a
+    /// production deploy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assurance_required: Option<Assurance>,
     /// Step-authored completion-contract fields (inline authoring): validated
     /// at completion in union with the step type's bundle fields.
     #[serde(default)]
@@ -402,6 +479,7 @@ impl Step {
             sort_order,
             blocked_by: Vec::new(),
             sign_offs_required: Vec::new(),
+            assurance_required: None,
             sign_offs: Vec::new(),
             fields: Vec::new(),
             completed_on: None,
@@ -478,6 +556,29 @@ mod tests {
         let json = serde_json::to_string(&job).unwrap();
         let back: Job = serde_json::from_str(&json).unwrap();
         assert_eq!(job, back);
+    }
+
+    #[test]
+    fn job_simulated_defaults_false_for_pre_flag_payloads() {
+        // Old audit_log payloads (and old clients) predate the
+        // `simulated` field. serde(default) must admit them as real
+        // Jobs — a rebuild over a pre-flag slice must not fail, and
+        // must not invent a simulated company.
+        let job = Job::new(
+            "test-kind",
+            Subject::new("asset", "sys-001"),
+            "Test job",
+            "emp-42",
+            Priority::Standard,
+            NaiveDate::from_ymd_opt(2026, 4, 16).unwrap(),
+        );
+        let mut v = serde_json::to_value(&job).unwrap();
+        v.as_object_mut().unwrap().remove("simulated");
+        let back: Job = serde_json::from_value(v).unwrap();
+        assert!(!back.simulated);
+
+        // And the builder fixes it at construction for sim engines.
+        assert!(job.with_simulated(true).simulated);
     }
 
     #[test]

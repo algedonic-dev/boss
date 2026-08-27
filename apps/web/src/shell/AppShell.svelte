@@ -51,6 +51,51 @@
   );
   let role = $derived((user?.role ?? null) as Role | null);
 
+  // Unread badge on Inbox (David, feedback 8c020e6d: "I can't see new
+  // inbox messages").
+  //
+  // Counts `kind=direct` only, which is the same set the inbox itself
+  // opens on. The unfiltered count for the platform admin is ~1,980
+  // against 3 directs, so a badge wired to every kind would render the
+  // noise as a number and be ignored within a day — the exact failure
+  // the needs-you filter already exists to avoid. A number here has to
+  // mean "somebody asked you something".
+  //
+  // Polls rather than subscribes: the SSE marker stream is not wired
+  // to this shell, and 30s is well inside the latency that matters for
+  // a question waiting in a queue. `?kind=direct` is counted
+  // server-side, so this is one small JSON response, not the inbox.
+  let unreadDirect = $state(0);
+
+  $effect(() => {
+    const id = user?.id;
+    if (!id) return;
+    // Bound to a local so the narrowing survives into the closure —
+    // `user?.id` is `string | undefined` and TS re-widens it there.
+    const uid: string = id;
+    let cancelled = false;
+    async function poll() {
+      try {
+        const r = await fetch(
+          `/api/messages/unread/${encodeURIComponent(uid)}?kind=direct`,
+        );
+        if (!r.ok) return;
+        const body = (await r.json()) as { count?: number };
+        if (!cancelled) unreadDirect = body.count ?? 0;
+      } catch {
+        // A failed poll leaves the last known count rather than
+        // zeroing it: showing "nothing waiting" because the network
+        // blinked is the one wrong answer this badge can give.
+      }
+    }
+    void poll();
+    const t = setInterval(poll, 30_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  });
+
   // Per-department surface order. Each department app owns one group;
   // the order is how someone in that department would scan it, not
   // alphabetical. `visible()` then drops whatever the role or the
@@ -118,6 +163,10 @@
         ROUTE_CATALOG['system-fleet'],
         ROUTE_CATALOG['system-model'],
         ROUTE_CATALOG['system-monitoring'],
+        // Incidents beside Monitoring: monitoring is what the machine
+        // is doing, incidents are what went wrong and what we learned.
+        // Active packets to respond to + the post-mortem archive.
+        ROUTE_CATALOG['system-incidents'],
         // Audit Log + Atlas are sub-pages of monitoring with no
         // distinct permKey — plain NavItems (permKey-less ⇒ always
         // visible + always in-perspective; see visible()/inPerspective()).
@@ -126,7 +175,12 @@
         // The executor network — who moves work and where it goes.
         // Belongs with the other live instruments rather than under
         // Define: it shows the system RUNNING, not how it is authored.
-        ROUTE_CATALOG['system-os-map'],
+        // The yard is one batch station rendered deep (the pipeline's
+        // queues); the map is every registry station rendered wide.
+        // The yard row was missing since its car landed — repaired
+        // here alongside the map's addition.
+        ROUTE_CATALOG['system-yard'],
+        ROUTE_CATALOG['system-map'],
       ],
     },
     {
@@ -240,6 +294,13 @@
             onclick={(e) => onLinkClick(e, '/ux/inbox')}
           >
             Inbox
+            {#if unreadDirect > 0}
+              <span
+                class="shell-nav-badge"
+                title="{unreadDirect} message{unreadDirect === 1 ? '' : 's'} addressed to you"
+                aria-label="{unreadDirect} unread message{unreadDirect === 1 ? '' : 's'} addressed to you"
+              >{unreadDirect}</span>
+            {/if}
           </a>
           <a
             href="/ux/shop"

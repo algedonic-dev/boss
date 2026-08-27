@@ -23,13 +23,56 @@ export default defineConfig({
   },
   // No globalSetup — these specs mock the backend, so there is nothing
   // to seed.
+  //
+  // THE MASS-FAIL SIGNATURE, AND HOW TO TELL THE TWO CAUSES APART.
+  // Three times in the week of 2026-08-17 this suite reported 60-70
+  // failures in about 20 seconds — every spec dead on connect. That
+  // number reads like the app collapsed; it never is. Nothing was
+  // serving 127.0.0.1:5174, and there are exactly two ways for that to
+  // happen here:
+  //
+  //   1. THE BOOT RAN OUT OF TIME. Playwright aborts the whole run with
+  //      "Timed out waiting 60000ms from config.webServer" and no spec
+  //      gets to fail — so if you see that line, this is your cause.
+  //      The wait is not a health ping: `bun src/dev-server.ts` bundles
+  //      136 .svelte components and 114 .ts modules through
+  //      bun-plugin-svelte before / answers 200 at all. Measured on an
+  //      M-series laptop, first boot in a fresh checkout: 5.1-6.0s from
+  //      process start to that first 200, nearly all of it the bundle
+  //      (the server's own line reads `Bundled page in 5966ms`). A
+  //      shared, throttled CI container starting from a cold page cache
+  //      is a large multiple of that, and 60s was only ~10x the laptop
+  //      figure — close enough to lose the race under load. 180s is
+  //      ~30x it. The asymmetry is why it is set high rather than
+  //      tuned: a too-generous timeout costs wall-clock only in a run
+  //      that is already failing, while a too-tight one costs a whole
+  //      suite of false red that reads as an app regression.
+  //
+  //   2. NOTHING WAS EVER STARTED. If instead the specs DO run and each
+  //      fails fast on connect, the webServer block was skipped or its
+  //      process exited immediately — check PWTEST_SKIP_DEVSERVER in
+  //      the environment first (it is honoured just below, and a stale
+  //      export from a debugging session survives in a tmux shell), and
+  //      read the [WebServer] lines for a port already in use.
+  //
+  // stdout is piped for that reason: the default swallows the dev
+  // server's output, so a boot that fails or crawls leaves no evidence
+  // and the only visible artefact is the pile of dead specs. Piped, the
+  // run carries its own measurement —
+  //
+  //   [WebServer] Bundled page in 5966ms: index.html
+  //
+  // — which is the number to compare when a container looks slow, and
+  // the line that is missing entirely when cause 2 is what happened.
   webServer: skipDevServer
     ? undefined
     : {
         command: 'bun src/dev-server.ts',
         url: 'http://127.0.0.1:5174/',
         reuseExistingServer: true,
-        timeout: 60_000,
+        timeout: 180_000,
+        stdout: 'pipe',
+        stderr: 'pipe',
         // BOSS_SCRATCH is irrelevant (every /api call is mocked), but
         // 0 avoids the dev-server trying to reach scratch services.
         env: { BOSS_SCRATCH: '0' },

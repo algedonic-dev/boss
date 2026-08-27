@@ -145,14 +145,13 @@ async fn require_ledger_read(
 pub(crate) async fn event_stamp(
     state: &LedgerApiState,
     user: &boss_policy_client::User,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> boss_core::publisher::EventStamp {
     let actor = user
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
     match &state.publisher {
-        Some(p) => p.stamp_with_actor_at(actor, now).await,
-        None => boss_core::publisher::EventStamp::new("ledger", actor, now),
+        Some(p) => p.stamp_with_actor(actor).await,
+        None => boss_core::publisher::EventStamp::new("ledger", actor),
     }
 }
 
@@ -232,6 +231,13 @@ pub fn router(state: LedgerApiState) -> Router {
         .route(
             "/api/ledger/tax-accruals",
             axum::routing::post(create_tax_accrual),
+        )
+        // Graduated excise rates as registry data (brewery-fidelity Q4):
+        // jurisdiction-keyed, effective-dated tier schedules the accrual
+        // endpoint resolves instead of trusting a flat rule arg.
+        .route(
+            "/api/ledger/excise-rate-schedules",
+            get(list_excise_rate_schedules).put(upsert_excise_rate_schedule),
         )
         .route("/api/ledger/tax-liability", get(tax_liability_summary))
         .route(

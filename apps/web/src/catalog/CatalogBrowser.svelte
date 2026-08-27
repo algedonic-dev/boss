@@ -16,6 +16,10 @@
   import { getLabel } from '@boss/web-kit/session/manifest.svelte';
 
   let catalog = $state<DeviceModel[]>([]);
+  /// Non-null when the load failed — rendered instead of the empty
+  /// state, so an outage never reads as an empty catalog (packet
+  /// 3fba9c35, the false-empty sweep).
+  let loadFailed = $state<string | null>(null);
   let loading = $state(true);
   let categoryFilter = $state<DeviceCategory | 'all'>('all');
   let useCaseFilter = $state<string | 'all'>('all');
@@ -31,10 +35,13 @@
           const body = await r.json();
           if (!cancelled) {
             catalog = Array.isArray(body) ? body : (body.data ?? []);
+            loadFailed = null;
           }
+        } else {
+          if (!cancelled) loadFailed = `HTTP ${r.status}`;
         }
-      } catch {
-        // ignore
+      } catch (e) {
+        if (!cancelled) loadFailed = e instanceof Error ? e.message : String(e);
       }
       if (!cancelled) loading = false;
     })();
@@ -118,6 +125,10 @@
     <section class="catalog-grid">
       {#if loading && catalog.length === 0}
         <p class="empty">Loading catalog…</p>
+      {:else if loadFailed}
+        <p class="empty load-failed" role="alert">
+          Couldn't load the catalog — {loadFailed}
+        </p>
       {:else if visible.length === 0}
         <p class="empty">{getLabel('catalog.empty_state', 'No devices match those filters.')}</p>
       {:else}

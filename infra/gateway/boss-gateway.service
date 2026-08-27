@@ -7,8 +7,13 @@ Wants=network-online.target
 Type=simple
 Environment=RUST_LOG=info
 Environment=BOSS_LISTEN=127.0.0.1:4443
-Environment=BOSS_STATIC_DIR=/var/lib/boss-web/dist
-ExecStart=/usr/local/bin/boss-gateway
+# SPA + step-plugins come from the live deploy generation
+# (deployment-as-network Q1/Q2; layout in infra/generation.sh): one
+# `current` symlink flip rolls binaries, web dist and plugins
+# together, so a revert rolls the UI too.
+Environment=BOSS_STATIC_DIR=/usr/local/boss/current/web-dist
+Environment=BOSS_PLUGINS_DIR=/usr/local/boss/current/step-plugins
+ExecStart=/usr/local/boss/current/bin/boss-gateway
 Restart=on-failure
 RestartSec=5
 

@@ -192,13 +192,24 @@ impl crate::os_map::OsMapRepo for PgViewsRepo {
                  LEFT JOIN jobs j ON j.id::text = r.job_id
              ),
              resolved AS (
+                 -- Actor → node, mirroring `ActorId::from_str`'s branch
+                 -- order: `automation:` first (its slug may itself carry
+                 -- colons, e.g. `automation:rule:bill-approve`), then any
+                 -- remaining colon-bearing id, which is an agent session
+                 -- (`<mode>:<model>`). No employee id carries a colon, so
+                 -- an agent can never be mistaken for staff — nor left in
+                 -- `unresolved`, where it used to land.
                  SELECT
                      COALESCE(ep.department,
                               CASE WHEN p.prev_actor LIKE 'automation:%'
-                                   THEN 'dispatcher' ELSE 'unresolved' END) AS src,
+                                   THEN 'dispatcher'
+                                   WHEN p.prev_actor LIKE '%:%'
+                                   THEN 'agent' ELSE 'unresolved' END) AS src,
                      COALESCE(ea.department,
                               CASE WHEN p.actor LIKE 'automation:%'
-                                   THEN 'dispatcher' ELSE 'unresolved' END) AS dst,
+                                   THEN 'dispatcher'
+                                   WHEN p.actor LIKE '%:%'
+                                   THEN 'agent' ELSE 'unresolved' END) AS dst,
                      p.simulated
                  FROM paired p
                  LEFT JOIN employees ep ON ep.id = p.prev_actor

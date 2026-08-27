@@ -5,8 +5,6 @@
 //! delivery) must not double-apply. The guard keys on the deterministic
 //! `source_id`: replaying the same call is a no-op on `on_hand`.
 
-#![cfg(feature = "postgres")]
-
 use boss_products::ProductsRepository;
 use boss_products::postgres::PgProducts;
 use boss_products::types::Product;
@@ -17,8 +15,8 @@ fn stamp() -> boss_core::publisher::EventStamp {
     boss_core::publisher::EventStamp::new(
         "products",
         boss_core::actor::ActorId::Automation("test".into()),
-        Utc::now(),
     )
+    .with_timestamp(Utc::now())
 }
 
 fn product(sku: &str) -> Product {

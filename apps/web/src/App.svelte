@@ -13,6 +13,7 @@
   import { loadStepTypeRegistry } from './steps/surfaceRegistry.svelte';
   import { loadClasses } from '@boss/web-kit/session/classes.svelte';
   import AppShell from './shell/AppShell.svelte';
+  import UpdateBar from './shell/UpdateBar.svelte';
   import { APPS, appForSection, APP_SUBJECT_KINDS, type AppId } from './shell/nav-catalog';
   import { SECTION_FOR_ROUTE } from './shell/sections';
   import StepFocusPage from './steps/StepFocusPage.svelte';
@@ -58,8 +59,9 @@
   import DispatcherRuleEditPage from './dispatcher/DispatcherRuleEditPage.svelte';
   import SubjectsClassesPage from './it/subjects/SubjectsClassesPage.svelte';
   import SystemModelPage from './it/system/SystemModelPage.svelte';
-  import OsMapPage from './it/osmap/OsMapPage.svelte';
   import FlowPage from './it/flow/FlowPage.svelte';
+  import YardPage from './it/yard/YardPage.svelte';
+  import StationMapPage from './it/map/StationMapPage.svelte';
   import FleetPage from './it/fleet/FleetPage.svelte';
   import DesignReviewPage from './it/design/DesignReviewPage.svelte';
   import ExperimentsPage from './it/experiments/ExperimentsPage.svelte';
@@ -87,6 +89,7 @@
   import SearchResultsPage from './search/SearchResultsPage.svelte';
   import ViewsPage from './views/ViewsPage.svelte';
   import FeedbackTriagePage from './it/feedback/FeedbackTriagePage.svelte';
+  import IncidentsPage from './it/incidents/IncidentsPage.svelte';
   import LoginPage from './auth/LoginPage.svelte';
   import AuthAdminPage from './auth/AuthAdminPage.svelte';
   import ModuleDisabled from './shell/ModuleDisabled.svelte';
@@ -140,7 +143,18 @@
   // it they keep browsing a shell that looks signed in while every
   // request fails, which is precisely how the expiry that killed
   // demo mode presented.
+  //
+  // Identity PROBES are exempt. `/api/session` and `/api/auth/*` are
+  // the questions "who am I" — a 401 there is the ANSWER (nobody),
+  // consumed by the session state machine, not an expiry mid-browse.
+  // Redirecting on the probe made `session.value = unauthenticated`
+  // unreachable: loadSession's own fetch bounced the visitor before
+  // the state could ever render, so MePage's advice for that state
+  // ("reload to log in") described a loop, not a way in. Data reads
+  // and writes still redirect — that is the interceptor's real job.
   {
+    const isIdentityProbe = (url: string): boolean =>
+      url.startsWith('/api/session') || url.startsWith('/api/auth/');
     const _origFetch = window.fetch;
     window.fetch = (async (
       input: RequestInfo | URL,
@@ -153,7 +167,7 @@
           : input instanceof URL ? input.href : input.url;
         // Only redirect on /api/* — let app-internal 401 handling
         // for non-API resources stay where the call was made.
-        if (url.startsWith('/api/')) {
+        if (url.startsWith('/api/') && !isIdentityProbe(url)) {
           const next = encodeURIComponent(window.location.pathname + window.location.search);
           window.location.href = `/login?next=${next}`;
         }
@@ -197,6 +211,11 @@
   let appKinds: ReadonlyArray<string> = $derived(APP_SUBJECT_KINDS[perspective] ?? []);
 </script>
 
+<!-- Every route, every state: a stale tab is stale regardless of
+     where it is parked (72c7c36e). Renders nothing until a deploy
+     actually lands. -->
+<UpdateBar />
+
 {#if route.kind === 'login'}
   <LoginPage />
 {:else if route.kind === 'stepFocus'}
@@ -204,7 +223,7 @@
        sidebar. The chrome bar stays — you can still switch apps —
        but everything below it belongs to the step. -->
   <PerspectiveTabs active={perspective} apps={APPS} searchAppKinds={appKinds} />
-  <StepFocusPage jobId={route.jobId} stepId={route.stepId} />
+  <StepFocusPage jobId={route.jobId} stepId={route.stepId} from={route.from} fromLabel={route.fromLabel} />
 {:else}
   <PerspectiveTabs active={perspective} apps={APPS} searchAppKinds={appKinds} />
 <AppShell {activeSection} {perspective}>
@@ -317,8 +336,10 @@
       <StepPluginDetailPage pluginSlug={route.pluginSlug} />
     {:else if route.kind === 'systemDesign'}
       <DesignReviewPage />
-    {:else if route.kind === 'systemOsMap'}
-      <OsMapPage />
+    {:else if route.kind === 'systemYard'}
+      <YardPage />
+    {:else if route.kind === 'systemMap'}
+      <StationMapPage />
     {:else if route.kind === 'systemFlow'}
       <FlowPage />
     {:else if route.kind === 'systemFleet'}
@@ -375,6 +396,8 @@
       <VendorInvoicePage vendorInvoiceId={route.vendorInvoiceId} />
     {:else if route.kind === 'watchlist'}
       <WatchlistPage />
+    {:else if route.kind === 'incidents'}
+      <IncidentsPage />
     {:else if route.kind === 'shop'}
       <ShopHome />
     {:else if route.kind === 'shopProduct'}

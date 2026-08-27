@@ -18,7 +18,7 @@ pub struct LedgerTaxRemit {
 impl LedgerTaxRemit {
     pub fn new(ledger_base: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: crate::handlers::common::api_client(),
             ledger_base: ledger_base.into(),
         })
     }

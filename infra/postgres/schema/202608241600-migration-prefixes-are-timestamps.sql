@@ -1,0 +1,23 @@
+-- The first timestamp-prefixed migration, and a no-op on purpose.
+--
+-- WHY THE PREFIX CHANGED. `NNN-` was a shared counter that every
+-- branch extended by picking "the next free number" against its own
+-- tree. Two cars did exactly that on 2026-08-23 and both were right;
+-- the collision existed only once a train assembled them, where it
+-- cost a red CI run, a cancelled train, nine released cars and about
+-- ninety minutes to learn one bit. The uniqueness lint could not see
+-- it either: it reads one tree.
+--
+-- A UTC `YYYYMMDDHHMM-` prefix is not allocated from anything, so two
+-- authors cannot take the same one unless they write in the same
+-- minute — and the lint still catches that.
+--
+-- COEXISTENCE IS FREE, and this file proves it: the ordering rule is
+-- a NUMERIC sort on the prefix (`sort -t- -k1,1n` in migrate.sh, the
+-- matching sort_by_key in boss-testing's build.rs), and every
+-- timestamp is larger than every legacy number, so old files keep
+-- their order and new ones follow in the order they were written.
+-- Existing migrations are NEVER renamed: migrate.sh records a
+-- checksum per file, and editing an applied one is what took the
+-- system of record down for an hour on 2026-08-13.
+SELECT 1;

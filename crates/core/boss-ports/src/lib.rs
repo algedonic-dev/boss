@@ -359,7 +359,7 @@ mod deploy_fallback_agreement {
     /// binary would silently skip two services with nothing to say so.
     ///
     /// This is the third instance of the pattern found in one session
-    /// (the others: `manifest.txt` vs `SCHEMA_FILES`, and
+    /// (the others: the schema list vs `SCHEMA_FILES`, and
     /// `MODEL_ROUTES` vs `MODEL_KINDS`). A fact that lives twice gets
     /// an equality test; that is the convention this encodes.
     ///

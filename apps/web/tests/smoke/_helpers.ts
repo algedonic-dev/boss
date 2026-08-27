@@ -7,20 +7,18 @@ import type { Locator, Page } from '@playwright/test';
 import { expect } from '@playwright/test';
 
 /**
- * Pin the dev-server's persona to a specific employee. Two layers:
+ * Pin the dev-server's persona to a specific employee.
  *
- *  1. `boss-persona` cookie — the dev-server's API proxy reads it
- *     to synthesise the `x-boss-user` header for every backend
- *     hit, so the API responses are scoped to that employee.
- *  2. `boss.persona.empId` localStorage value — the SPA's
- *     the dev-server reads this to synthesise x-boss-user for the rendered
- *     `session.value.user`. Without it the SPA still falls back
- *     to `roster[0]` (or `emp-001`), so any UI gated on
- *     `session.value.user.id` keeps showing the wrong employee.
+ * One layer: the `boss-persona` cookie. The dev-server's API proxy
+ * reads it to synthesise the `x-boss-user` header for every backend
+ * hit, so API responses — including `/api/session` — are scoped to
+ * that employee. The SPA takes its identity from that session probe
+ * and from nothing else: there is no client-side fallback that
+ * invents a user, so an unpinned page renders unauthenticated rather
+ * than quietly showing `roster[0]`.
  *
- * Both are wired here. Call before any `page.goto(...)` so the
- * first request lands with the cookie + the SPA hydrates with the
- * right session.
+ * Call before any `page.goto(...)` so the first request already
+ * carries the cookie.
  */
 export async function pinPersona(page: Page, employeeId: string): Promise<void> {
   await page.context().addCookies([
@@ -31,13 +29,6 @@ export async function pinPersona(page: Page, employeeId: string): Promise<void> 
       path: '/',
     },
   ]);
-  await page.addInitScript((empId) => {
-    try {
-      localStorage.setItem('boss.persona.empId', empId);
-    } catch {
-      // No-op when localStorage isn't available (extension contexts etc.)
-    }
-  }, employeeId);
 }
 
 /**

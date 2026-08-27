@@ -358,7 +358,13 @@ fn create_job_with_steps(
         priority,
         day,
     )
-    .with_id(job_id);
+    .with_id(job_id)
+    // The packet is born simulated — declared on the envelope, not
+    // inferred from transport. Admission would also derive this from
+    // the `x-sim-origin` header the LiveApiOutput stamps, but the
+    // engine says it explicitly so the wire body carries the truth
+    // even through a path that drops the header.
+    .with_simulated(true);
     job.status = JobStatus::Open;
 
     // Post the Job and let the SERVER materialize its steps from the

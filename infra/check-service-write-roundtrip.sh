@@ -72,11 +72,14 @@ check_read_consistency() {
     local table="$3"
     local where="${4:-1=1}"
     local http_count body
-    # Capture the response first, then parse — avoids a `curl … | python3`
-    # pipe (an unpinned download-then-run pattern to static scanners) when
-    # all we're doing is counting rows in a local service's JSON reply.
+    # Capture the response first, then parse — keeps the fetch and the
+    # parse as two visibly separate motions (this used to be a
+    # `curl … | python3` pipe, which static scanners read as an
+    # unpinned download-then-run).
     body=$(curl -sS "$url" 2>/dev/null) || body=""
-    http_count=$(printf '%s' "$body" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
+    http_count=$(printf '%s' "$body" \
+        | jq -e 'if type == "array" then length else error("expected a JSON array") end' \
+        2>/dev/null || echo "?")
     if [[ "$http_count" == "?" ]]; then
         FAILURES+=("$service: GET $url failed or returned non-JSON")
         return
@@ -110,7 +113,7 @@ check_capability() {
     local url="$2"
     local storage
     storage=$(curl -sS -m 3 "$url" 2>/dev/null \
-        | python3 -c "import sys,json; print(json.load(sys.stdin).get('capabilities',{}).get('storage','?'))" 2>/dev/null \
+        | jq -re '.capabilities.storage // "?"' 2>/dev/null \
         || echo "?")
     if [[ "$storage" != "postgres" ]]; then
         FAILURES+=("$service: /health.capabilities.storage is '$storage' (expected 'postgres')")

@@ -59,13 +59,33 @@ fn matches_filter(job: &Job, filter: &JobFilter) -> bool {
     {
         return false;
     }
-    if let Some(status) = filter.status
-        && job.status != status
-    {
-        return false;
+    // The retention window replaces the status equality when set:
+    // "live OR closed on/after this date". Same contract as the SQL
+    // adapter, which expresses it as a CASE over the same two columns
+    // — two implementations of one rule, so the behaviour is pinned by
+    // a test rather than trusted.
+    match filter.closed_since {
+        Some(since) => {
+            let terminal = matches!(job.status, JobStatus::Closed | JobStatus::Cancelled);
+            if terminal && job.closed_on.is_none_or(|c| c < since) {
+                return false;
+            }
+        }
+        None => {
+            if let Some(status) = filter.status
+                && job.status != status
+            {
+                return false;
+            }
+        }
     }
     if let Some(priority) = filter.priority
         && job.priority != priority
+    {
+        return false;
+    }
+    if let Some(simulated) = filter.simulated
+        && job.simulated != simulated
     {
         return false;
     }
@@ -90,6 +110,15 @@ fn matches_filter(job: &Job, filter: &JobFilter) -> bool {
         let matches = wrote == blocker.as_str() || (wrote.len() >= 8 && blocker.starts_with(wrote));
         if !matches {
             return false;
+        }
+    }
+    if let Some(serde_json::Value::Object(wanted)) = &filter.metadata_contains {
+        // The in-memory stand-in for Postgres `metadata @> $1` over the
+        // flat string-valued documents this filter accepts.
+        for (key, value) in wanted {
+            if job.metadata.get(key) != Some(value) {
+                return false;
+            }
         }
     }
     match &filter.scope {
@@ -160,13 +189,55 @@ impl JobsRepository for InMemoryJobs {
         {
             let mut state = self.inner.lock().expect("poisoned");
             let key = job_key(&job.id);
-            if !state.jobs.contains_key(&key) {
+            let Some(existing) = state.jobs.get(&key) else {
                 return Err(JobsError::NotFound(job.id));
-            }
-            state.jobs.insert(key, job.clone());
+            };
+            // Mirror the Pg adapter: `simulated` is decided at
+            // admission and immutable — an update carries no
+            // authority over it. The storage enforces this rather
+            // than trusting every caller to.
+            let mut next = job.clone();
+            next.simulated = existing.simulated;
+            state.jobs.insert(key, next);
         }
         self.record_all(events);
         Ok(())
+    }
+
+    async fn merge_job_metadata_at(
+        &self,
+        id: &JobId,
+        patch: &serde_json::Map<String, serde_json::Value>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<Job, JobsError> {
+        // Mirror the Pg adapter: merge under the lock against the row
+        // as it stands, null removes, no envelope field moves, and the
+        // JOB_UPDATED event is built from the post-merge row.
+        let merged = {
+            let mut state = self.inner.lock().expect("poisoned");
+            let Some(job) = state.jobs.get_mut(&job_key(id)) else {
+                return Err(JobsError::NotFound(*id));
+            };
+            let mut md = match &job.metadata {
+                serde_json::Value::Object(m) => m.clone(),
+                _ => serde_json::Map::new(),
+            };
+            for (k, v) in patch {
+                if v.is_null() {
+                    md.remove(k);
+                } else {
+                    md.insert(k.clone(), v.clone());
+                }
+            }
+            job.metadata = serde_json::Value::Object(md);
+            job.clone()
+        };
+        let event = stamp.event(
+            crate::events::JOB_UPDATED,
+            serde_json::to_value(&merged).unwrap_or_default(),
+        );
+        self.record_all(&[event]);
+        Ok(merged)
     }
 
     async fn list_jobs(
@@ -252,6 +323,37 @@ impl JobsRepository for InMemoryJobs {
         Ok(())
     }
 
+    async fn claim_step_at(
+        &self,
+        step_id: &StepId,
+        actor: &str,
+        _now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<Step, JobsError> {
+        let claimed = {
+            let mut state = self.inner.lock().expect("poisoned");
+            let key = step_key(step_id);
+            let Some(existing) = state.steps.get_mut(&key) else {
+                return Err(JobsError::StepNotFound(*step_id));
+            };
+            let held_by_actor = existing.assignee_id.as_deref() == Some(actor);
+            let claimable = existing.status == StepStatus::Ready
+                && (existing.assignee_id.is_none() || held_by_actor);
+            let idempotent = existing.status == StepStatus::Active && held_by_actor;
+            if !claimable && !idempotent {
+                return Err(JobsError::ClaimConflict {
+                    holder: existing.assignee_id.clone(),
+                    status: format!("{:?}", existing.status).to_lowercase(),
+                });
+            }
+            existing.assignee_id = Some(actor.to_string());
+            existing.status = StepStatus::Active;
+            existing.clone()
+        };
+        self.record_all(events);
+        Ok(claimed)
+    }
+
     async fn append_sign_off(
         &self,
         step_id: &StepId,
@@ -304,6 +406,23 @@ impl JobsRepository for InMemoryJobs {
                     StepStatus::Pending | StepStatus::Ready | StepStatus::Active,
                 )
             })
+            .count();
+        Ok(n as i64)
+    }
+
+    async fn count_open_jobs_for_workflow(
+        &self,
+        kind: &str,
+        version: i32,
+    ) -> Result<i64, JobsError> {
+        let state = self.inner.lock().expect("poisoned");
+        let n = state
+            .jobs
+            .values()
+            .filter(|j| j.kind == kind && j.workflow_version == version)
+            // Same predicate as the Pg adapter's
+            // `status NOT IN ('closed','cancelled')`.
+            .filter(|j| !matches!(j.status, JobStatus::Closed | JobStatus::Cancelled))
             .count();
         Ok(n as i64)
     }
@@ -506,6 +625,58 @@ mod tests {
         NaiveDate::from_ymd_opt(2026, 4, 16).unwrap()
     }
 
+    /// THE PARTITION HAS TO HAPPEN IN THE QUERY, not on the page.
+    ///
+    /// Measured on the live system 2026-08-17: 5,201 of 5,964 packets
+    /// (87%) are simulated. A surface that fetches a page and then
+    /// drops the simulated rows shows a nearly empty list AND a
+    /// `total` that disagrees with it — the same failure the retention
+    /// window exists to prevent, an order of magnitude worse. So the
+    /// filter is asserted through `list_jobs`, including its total.
+    #[tokio::test]
+    async fn simulated_partitions_both_the_rows_and_the_total() {
+        let repo = InMemoryJobs::default();
+        for i in 0..3 {
+            let mut j = make_job("wholesale-keg-order");
+            j.simulated = true;
+            j.title = format!("sim {i}");
+            repo.create_job(&j).await.expect("create sim");
+        }
+        let mut real = make_job("ship-a-change");
+        real.title = "real one".into();
+        repo.create_job(&real).await.expect("create real");
+
+        let only_real = JobFilter {
+            simulated: Some(false),
+            ..Default::default()
+        };
+        let (rows, total) = repo.list_jobs(&only_real, 50, 0).await.expect("list");
+        assert_eq!(rows.len(), 1, "one real packet");
+        assert_eq!(
+            total, 1,
+            "the total must agree with the rows, not count the sim ones"
+        );
+        assert_eq!(rows[0].title, "real one");
+
+        let only_sim = JobFilter {
+            simulated: Some(true),
+            ..Default::default()
+        };
+        let (rows, total) = repo.list_jobs(&only_sim, 50, 0).await.expect("list");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(total, 3);
+
+        // Absent means everything — every existing caller keeps its
+        // answer, which is what makes this safe to land before any
+        // surface opts in.
+        let (rows, total) = repo
+            .list_jobs(&JobFilter::default(), 50, 0)
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(total, 4);
+    }
+
     fn make_job(kind: &str) -> Job {
         Job::new(
             kind,
@@ -585,7 +756,7 @@ mod tests {
     #[tokio::test]
     async fn list_assigned_workable_returns_only_assigned_open_workable() {
         let repo = InMemoryJobs::new();
-        let mut job = make_job("ingredient-restock");
+        let mut job = make_job("ingredient-restock").with_workflow_version(3);
         job.status = JobStatus::Open;
         repo.create_job(&job).await.unwrap();
 
@@ -622,6 +793,11 @@ mod tests {
         assert_eq!(titles.len(), 2, "only assigned+open+workable: {titles:?}");
         assert!(titles.contains(&"Place PO"));
         assert!(titles.contains(&"Send bill"));
+        // The row names the protocol version the packet is pinned to,
+        // so an executor can resolve the step's spec (e.g. its
+        // spec-authored duration) against the exact Workflow row the
+        // Job was admitted under.
+        assert!(rows.iter().all(|r| r.workflow_version == 3));
     }
 
     #[tokio::test]
@@ -709,6 +885,49 @@ mod tests {
         assert!(!titles.contains(&"Stale bill"), "closed-job step excluded");
         assert_eq!(rows.len(), 4);
         assert!(rows.iter().all(|r| r.workflow == "ingredient-restock"));
+    }
+
+    #[tokio::test]
+    async fn assignment_rows_carry_the_jobs_sim_facts() {
+        // A simulated packet must read as simulated in every queue lens,
+        // My Day included — the row is the only thing that lens sees.
+        let repo = InMemoryJobs::new();
+        let mut sim = make_job("ingredient-restock");
+        sim.status = JobStatus::Open;
+        sim.simulated = true;
+        sim.tags = vec!["nightly".to_string()];
+        repo.create_job(&sim).await.unwrap();
+        let mut s = Step::new(sim.id, "procurement", "Place PO", 0).with_assignee("emp-1");
+        s.status = StepStatus::Ready;
+        repo.add_step(&s).await.unwrap();
+
+        let mut real = make_job("ingredient-restock");
+        real.status = JobStatus::Open;
+        repo.create_job(&real).await.unwrap();
+        let mut r = Step::new(real.id, "procurement", "Place real PO", 0).with_assignee("emp-1");
+        r.status = StepStatus::Ready;
+        repo.add_step(&r).await.unwrap();
+
+        let rows = repo
+            .list_assignments(Some("emp-1"), &[], 100)
+            .await
+            .unwrap();
+        let sim_row = rows.iter().find(|row| row.job_id == sim.id).unwrap();
+        assert!(sim_row.simulated, "simulated job's row reports it");
+        assert_eq!(sim_row.tags, vec!["nightly".to_string()]);
+        let real_row = rows.iter().find(|row| row.job_id == real.id).unwrap();
+        assert!(!real_row.simulated, "a real job's row stays real");
+        assert!(real_row.tags.is_empty());
+
+        // The sim workforce's bulk pull reads the same row shape.
+        let bulk = repo.list_assigned_workable(100).await.unwrap();
+        assert!(
+            bulk.iter()
+                .find(|row| row.job_id == sim.id)
+                .unwrap()
+                .simulated,
+            "bulk backlog rows carry the flag too"
+        );
     }
 
     #[tokio::test]
@@ -819,5 +1038,125 @@ mod tests {
         s1.status = StepStatus::Completed;
         let s2 = Step::new(job_id, "generic", "B", 1); // Pending
         assert_eq!(compute_job_status(&[s1, s2]), JobStatus::Open);
+    }
+
+    /// The terminal retention window, in-memory half.
+    ///
+    /// The Postgres adapter expresses this rule as a CASE over
+    /// `status` and `closed_on`; this adapter expresses it as Rust.
+    /// Two implementations of one contract, so the contract is pinned
+    /// here as well as in `tests/postgres_filter.rs` — the sibling
+    /// there carries the full reasoning for why the window exists.
+    #[tokio::test]
+    async fn closed_since_keeps_live_and_recent_and_drops_the_rest() {
+        let repo = InMemoryJobs::new();
+        let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
+
+        let mut live = make_job("user-feedback");
+        // Blocked, not Open: live is live regardless of age, and this
+        // is the half of the rule a bare `closed_on >= x` deletes.
+        live.status = JobStatus::Blocked;
+        let mut recent = make_job("user-feedback");
+        recent.status = JobStatus::Closed;
+        recent.closed_on = Some(d(8, 14));
+        let mut old = make_job("user-feedback");
+        old.status = JobStatus::Closed;
+        old.closed_on = Some(d(1, 5));
+        let mut cancelled = make_job("user-feedback");
+        cancelled.status = JobStatus::Cancelled;
+        cancelled.closed_on = Some(d(1, 6));
+        // Terminal with no close date recorded. Postgres drops it
+        // (`NULL >= date` is NULL, not true); this must agree.
+        let mut undated = make_job("user-feedback");
+        undated.status = JobStatus::Closed;
+
+        for j in [&live, &recent, &old, &cancelled, &undated] {
+            repo.create_job(j).await.unwrap();
+        }
+
+        let filter = JobFilter {
+            kind: Some("user-feedback".into()),
+            closed_since: Some(d(8, 1)),
+            ..Default::default()
+        };
+        let (rows, total) = repo.list_jobs(&filter, 100, 0).await.unwrap();
+        assert_eq!(total, 2, "count must apply the same window as the page");
+        assert!(
+            rows.iter().any(|j| j.id == live.id),
+            "live packets always survive"
+        );
+        assert!(rows.iter().any(|j| j.id == recent.id));
+        assert!(!rows.iter().any(|j| j.id == old.id));
+        assert!(
+            !rows.iter().any(|j| j.id == cancelled.id),
+            "cancelled is terminal too — an old cancellation is not recent work"
+        );
+        assert!(
+            !rows.iter().any(|j| j.id == undated.id),
+            "a terminal packet with no closed_on cannot prove it is recent"
+        );
+    }
+
+    /// `closed_since` wins over `status` rather than intersecting it.
+    ///
+    /// If they combined as AND, `status=open&closed_within=14` would
+    /// return open packets only and the terminal columns would be
+    /// empty again — the exact bug the window exists to fix.
+    #[tokio::test]
+    async fn closed_since_overrides_status_rather_than_intersecting_it() {
+        let repo = InMemoryJobs::new();
+        let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
+
+        // Job::new starts a packet at Draft, so say Open out loud —
+        // otherwise the status filter below is testing nothing.
+        let mut open = make_job("user-feedback");
+        open.status = JobStatus::Open;
+        let mut recent = make_job("user-feedback");
+        recent.status = JobStatus::Closed;
+        recent.closed_on = Some(d(8, 14));
+        repo.create_job(&open).await.unwrap();
+        repo.create_job(&recent).await.unwrap();
+
+        let filter = JobFilter {
+            kind: Some("user-feedback".into()),
+            status: Some(JobStatus::Open),
+            closed_since: Some(d(8, 1)),
+            ..Default::default()
+        };
+        let (rows, total) = repo.list_jobs(&filter, 100, 0).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "the recently-closed packet survives status=open"
+        );
+        assert_eq!(total, 2);
+    }
+
+    /// With no window, `status` behaves exactly as it always has.
+    #[tokio::test]
+    async fn no_window_means_the_old_status_behaviour() {
+        let repo = InMemoryJobs::new();
+        let mut open = make_job("user-feedback");
+        open.status = JobStatus::Open;
+        let mut closed = make_job("user-feedback");
+        closed.status = JobStatus::Closed;
+        closed.closed_on = NaiveDate::from_ymd_opt(2026, 1, 5);
+        repo.create_job(&open).await.unwrap();
+        repo.create_job(&closed).await.unwrap();
+
+        let all = JobFilter {
+            kind: Some("user-feedback".into()),
+            ..Default::default()
+        };
+        assert_eq!(repo.list_jobs(&all, 100, 0).await.unwrap().1, 2);
+
+        let only_open = JobFilter {
+            kind: Some("user-feedback".into()),
+            status: Some(JobStatus::Open),
+            ..Default::default()
+        };
+        let (rows, _) = repo.list_jobs(&only_open, 100, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, open.id);
     }
 }

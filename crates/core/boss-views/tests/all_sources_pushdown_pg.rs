@@ -9,8 +9,6 @@
 //! wrong rows. These tests exist for that failure, not for the happy
 //! path.
 
-#![cfg(feature = "postgres")]
-
 use boss_policy_client::{
     AccessTier, Action, FakePolicyClient, PolicyClient, Resource, Scope, User,
 };

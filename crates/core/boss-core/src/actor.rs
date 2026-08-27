@@ -6,12 +6,33 @@
 //! write needs an actor, full stop. Before this type existed, event
 //! authors reached for `actor_id: None` when no human was involved.
 //!
-//! Every transition is one of exactly two kinds:
+//! Every transition is fired by one of exactly three classes of CPU:
 //!
-//!   - **Human** — an employee took the action (a human CPU).
+//!   - **Human** — an employee took the action (a human CPU). Wire
+//!     form is the bare `employees.id` (`emp-032`).
 //!   - **Automation** — a *named* authority fired it: a dispatch rule
-//!     (`automation:rule:<name>`), a scheduler/agent, or the emitting
+//!     (`automation:rule:<name>`), a scheduler, or the emitting
 //!     service itself (`automation:<service>`).
+//!   - **Agent** — an LLM session executed the transition. Wire form
+//!     is `<agent-mode>:<model>` (`claude:opus-5`, `claude:fable`),
+//!     per David's directive of 2026-08-13: *"I like
+//!     [agent-mode]:[model] as the actor_id config and agent mode can
+//!     be claude for interactive Claude sessions like Claude Code."*
+//!     `claude` is the mode for an interactive Claude session (Claude
+//!     Code); the model half is the vendor's model string, kept whole.
+//!
+//! Agents are CPUs in the same machine, not a separate system — but
+//! they are not *people*. Before this variant existed, an agent
+//! stamping `claude:fable` parsed as `Human("claude:fable")`: the SPA
+//! rendered it as an unknown employee and every human-vs-automation
+//! census counted agent work as staff work. Ask "is this a person?"
+//! with [`ActorId::is_human`], which is false for both non-human
+//! classes; ask "which class" by matching the variant.
+//!
+//! **Retro consequence of the directive:** the model is now a
+//! groupable dimension of `actor_id` *alone*. "How much work did
+//! opus-5 do this week" is a group-by on the parsed actor — there is
+//! no separate `_model` payload key to add, and none should be added.
 //!
 //! There is deliberately no anonymous "system" actor. A system has no
 //! inherent autonomy to do anything; attributing a transition to a
@@ -29,6 +50,7 @@
 //!   - `actor_id` — the serialized field on SQL columns, HTTP
 //!     bodies, and TS types (the dominant spelling at boundaries).
 
+use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
 
@@ -40,6 +62,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 ///   - `ActorId::Human("emp-032")` → `"emp-032"` (bare; the SPA
 ///     consumes `actor_id` as an employee id when present).
 ///   - `ActorId::Automation("shipping-agent")` → `"automation:shipping-agent"`
+///   - `ActorId::agent("claude", "opus-5")` → `"claude:opus-5"`
 ///
 /// The Human case serializes as a bare string (no `human:` prefix)
 /// because the SPA treats `actor_id` as an opaque employee-id lookup
@@ -51,13 +74,20 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub enum ActorId {
     /// An Boss employee. The string is the `employees.id` foreign key.
     Human(String),
-    /// A named automated process — agents, schedulers, cron jobs,
-    /// bus subscribers. The string is a stable slug for the program
-    /// (e.g. `"shipping-agent"`, `"escalation-router"`,
-    /// `"warranty-expiry-scheduler"`). These slugs are free-form for
+    /// A named automated process — schedulers, cron jobs, dispatch
+    /// rules, bus subscribers. The string is a stable slug for the
+    /// program (e.g. `"shipping-agent"`, `"escalation-router"`,
+    /// `"rule:bill-approve"`). These slugs are free-form for
     /// now; if we need a registry of known automations later, that's
     /// a separate design.
     Automation(String),
+    /// An LLM session. `mode` is the agent harness (`claude` for an
+    /// interactive Claude session such as Claude Code); `model` is the
+    /// vendor's model string (`opus-5`, `fable`, `claude-opus-5.1`),
+    /// kept whole so the model stays a groupable dimension of the
+    /// actor id itself. Neither half is validated against a registry —
+    /// same free-form stance as automation slugs.
+    Agent { mode: String, model: String },
 }
 
 impl ActorId {
@@ -71,15 +101,35 @@ impl ActorId {
         Self::Automation(name.into())
     }
 
-    /// True if a human was the CPU on this transition.
+    /// Short-hand for an agent session — `agent("claude", "opus-5")`.
+    pub fn agent(mode: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::Agent {
+            mode: mode.into(),
+            model: model.into(),
+        }
+    }
+
+    /// True if a *person* was the CPU on this transition. False for
+    /// both machine classes — an agent is a CPU, not staff.
     pub fn is_human(&self) -> bool {
         matches!(self, Self::Human(_))
     }
 
-    /// Returns the underlying id / slug for display.
-    pub fn as_slug(&self) -> &str {
+    /// True if an LLM session was the CPU on this transition.
+    pub fn is_agent(&self) -> bool {
+        matches!(self, Self::Agent { .. })
+    }
+
+    /// The underlying id / slug for display. Human and Automation
+    /// return their inner string (`emp-032`, `rule:bill-approve` —
+    /// note the automation slug *without* its `automation:` prefix);
+    /// Agent returns the full `<mode>:<model>`, because neither half
+    /// alone identifies the CPU. Use [`Display`](fmt::Display) when
+    /// you want the wire form for every variant.
+    pub fn as_slug(&self) -> Cow<'_, str> {
         match self {
-            Self::Human(id) | Self::Automation(id) => id.as_str(),
+            Self::Human(id) | Self::Automation(id) => Cow::Borrowed(id.as_str()),
+            Self::Agent { mode, model } => Cow::Owned(format!("{mode}:{model}")),
         }
     }
 }
@@ -87,16 +137,31 @@ impl ActorId {
 impl fmt::Display for ActorId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Mirrors the Serialize impl: Human is bare; Automation uses
-        // the `automation:` prefix.
+        // the `automation:` prefix; Agent is `<mode>:<model>`.
         match self {
             Self::Human(id) => f.write_str(id),
             Self::Automation(name) => write!(f, "automation:{name}"),
+            Self::Agent { mode, model } => write!(f, "{mode}:{model}"),
         }
     }
 }
 
 impl FromStr for ActorId {
     type Err = std::convert::Infallible;
+
+    /// Branch order is the contract, and the tests pin it:
+    ///
+    /// 1. `automation:` prefix → [`Self::Automation`] with everything
+    ///    after the prefix kept whole. FIRST, because the rest may
+    ///    itself contain colons (`automation:rule:bill-approve` is the
+    ///    dispatcher's stamp on every side-effect) and the agent split
+    ///    below would otherwise claim it.
+    /// 2. Literal `system` → the named `platform` automation.
+    /// 3. Contains a `:` → [`Self::Agent`], split on the FIRST colon.
+    ///    Safe as a catch-all because no employee id carries a colon —
+    ///    verified across the seeds and fixtures (`emp-aa-001`,
+    ///    `emp-bootstrap-admin`).
+    /// 4. Otherwise → [`Self::Human`].
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(if let Some(rest) = s.strip_prefix("automation:") {
             Self::Automation(rest.to_string())
@@ -105,6 +170,14 @@ impl FromStr for ActorId {
             // rather than a fake human, so every transition is
             // attributed to a real CPU.
             Self::Automation("platform".to_string())
+        } else if let Some((mode, model)) = s.split_once(':') {
+            // `split_once` keeps the model half whole: a model string
+            // may carry dots and further colons, and all of it names
+            // the model.
+            Self::Agent {
+                mode: mode.to_string(),
+                model: model.to_string(),
+            }
         } else {
             Self::Human(s.to_string())
         })
@@ -116,6 +189,7 @@ impl Serialize for ActorId {
         match self {
             Self::Human(id) => s.serialize_str(id),
             Self::Automation(name) => s.serialize_str(&format!("automation:{name}")),
+            Self::Agent { mode, model } => s.serialize_str(&format!("{mode}:{model}")),
         }
     }
 }
@@ -170,5 +244,102 @@ mod tests {
     fn null_deserializes_to_platform_automation() {
         let a: ActorId = serde_json::from_str("null").unwrap();
         assert_eq!(a, ActorId::Automation("platform".into()));
+    }
+
+    // -- Agent (the third CPU class) ------------------------------------
+
+    /// The four `FromStr` branches, in the order they are tried. The
+    /// order is the contract, not an implementation detail: `automation:`
+    /// must win before the colon-split, or `automation:rule:bill-approve`
+    /// (which exists in the wild) would read as an agent in `automation`
+    /// mode running the `rule:bill-approve` model.
+    #[test]
+    fn parse_order_is_automation_then_system_then_agent_then_human() {
+        let cases = [
+            (
+                "automation:rule:bill-approve",
+                ActorId::Automation("rule:bill-approve".into()),
+            ),
+            (
+                "automation:dispatcher",
+                ActorId::Automation("dispatcher".into()),
+            ),
+            ("system", ActorId::Automation("platform".into())),
+            ("claude:fable", ActorId::agent("claude", "fable")),
+            ("emp-032", ActorId::Human("emp-032".into())),
+        ];
+        for (wire, want) in cases {
+            assert_eq!(wire.parse::<ActorId>().unwrap(), want, "parsing {wire}");
+        }
+    }
+
+    #[test]
+    fn agent_roundtrips_through_the_wire_form() {
+        for (mode, model) in [("claude", "fable"), ("claude", "opus-5")] {
+            let a = ActorId::agent(mode, model);
+            let j = serde_json::to_string(&a).unwrap();
+            assert_eq!(j, format!("\"{mode}:{model}\""));
+            assert_eq!(a.to_string(), format!("{mode}:{model}"));
+            assert_eq!(serde_json::from_str::<ActorId>(&j).unwrap(), a);
+        }
+    }
+
+    /// The model half is kept whole — it is a vendor string, not a
+    /// path. Dots and further colons belong to the model.
+    #[test]
+    fn agent_model_keeps_dots_and_further_colons() {
+        assert_eq!(
+            "claude:claude-opus-5".parse::<ActorId>().unwrap(),
+            ActorId::agent("claude", "claude-opus-5")
+        );
+        assert_eq!(
+            "claude:claude-opus-5.1".parse::<ActorId>().unwrap(),
+            ActorId::agent("claude", "claude-opus-5.1")
+        );
+        let nested = ActorId::agent("claude", "opus-5:1m");
+        assert_eq!("claude:opus-5:1m".parse::<ActorId>().unwrap(), nested);
+        assert_eq!(nested.to_string(), "claude:opus-5:1m");
+    }
+
+    /// `automation:rule:<name>` must survive the round trip untouched —
+    /// the dispatcher stamps every side-effect with one of these.
+    #[test]
+    fn automation_with_colons_in_the_slug_roundtrips() {
+        let a = ActorId::Automation("rule:bill-approve".into());
+        let j = serde_json::to_string(&a).unwrap();
+        assert_eq!(j, "\"automation:rule:bill-approve\"");
+        assert_eq!(serde_json::from_str::<ActorId>(&j).unwrap(), a);
+    }
+
+    #[test]
+    fn is_human_and_is_agent_truth_table() {
+        let human = ActorId::human("emp-032");
+        let automation = ActorId::automation("dispatcher");
+        let agent = ActorId::agent("claude", "opus-5");
+        assert!(human.is_human() && !human.is_agent());
+        assert!(!automation.is_human() && !automation.is_agent());
+        // An agent is a CPU, but not a person: it must never be
+        // counted as staff by a human-vs-machine census.
+        assert!(!agent.is_human() && agent.is_agent());
+    }
+
+    #[test]
+    fn as_slug_is_the_id_for_humans_and_automations_and_mode_model_for_agents() {
+        assert_eq!(ActorId::human("emp-032").as_slug(), "emp-032");
+        assert_eq!(
+            ActorId::automation("rule:bill-approve").as_slug(),
+            "rule:bill-approve"
+        );
+        assert_eq!(ActorId::agent("claude", "fable").as_slug(), "claude:fable");
+    }
+
+    /// Model is a groupable dimension off `actor_id` alone — the retro
+    /// consequence of the directive. No `_model` payload key needed.
+    #[test]
+    fn model_is_recoverable_from_the_actor_id_alone() {
+        let ActorId::Agent { mode, model } = "claude:opus-5".parse::<ActorId>().unwrap() else {
+            panic!("expected an agent");
+        };
+        assert_eq!((mode.as_str(), model.as_str()), ("claude", "opus-5"));
     }
 }

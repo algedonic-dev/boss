@@ -28,8 +28,6 @@
 //! the one flow where the answer is "nothing", which is exactly why
 //! it is the one that broke.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -39,7 +37,7 @@ use boss_core::port::EventBus;
 use boss_core::publisher::DomainPublisher;
 use boss_jobs::http::{JobsApiState, router};
 use boss_jobs::owner_resolution::RosterLookup;
-use boss_jobs::registry::platform_workflows;
+use boss_jobs::registry::seedable_platform_workflows;
 use boss_jobs::step_registry::StepRegistry;
 use boss_jobs::{InMemoryJobs, InMemoryWorkflows, WorkflowRegistry};
 use boss_policy_client::{Action, FakePolicyClient, PolicyClient, Resource, Scope};
@@ -82,7 +80,7 @@ fn app() -> axum::Router {
     // Seeded from the real platform registry, not a hand-built spec —
     // a fixture copy would have kept passing while the shipped kind
     // was broken.
-    for spec in platform_workflows() {
+    for spec in seedable_platform_workflows() {
         kinds.seed(spec).expect("seed platform kind");
     }
     let jobs = Arc::new(InMemoryJobs::new());
@@ -107,6 +105,7 @@ fn app() -> axum::Router {
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let state = JobsApiState {
         job_edges: None,
+        stations: None,
         jobs,
         bus,
         publisher: DomainPublisher::new(bus_dyn, "jobs"),
@@ -243,6 +242,22 @@ async fn every_disposition_drives_the_job_to_closed() {
                     };
                     metadata[name] = serde_json::Value::String(value.to_string());
                 }
+                // …and the KIND's own required fields, exactly as the
+                // kind's surface collects them (v11's design-review is
+                // `answer-question`: its plugin's form is what asks
+                // for verdict + answer, so the operator's completion
+                // carries them). Filled from the StepType registry —
+                // the same union the API validates against.
+                if let Some(st) = boss_jobs::step_registry::StepRegistry::v1()
+                    .get(step["kind"].as_str().unwrap_or_default())
+                {
+                    for f in st.fields.iter().filter(|f| f.required) {
+                        if metadata.get(f.name).is_none() {
+                            let sample = f.field_type.split('|').next().unwrap_or("x");
+                            metadata[f.name] = serde_json::Value::String(sample.to_string());
+                        }
+                    }
+                }
 
                 let (status, body) = send(
                     &app,
@@ -274,4 +289,127 @@ async fn every_disposition_drives_the_job_to_closed() {
              ready step"
         );
     }
+}
+
+/// An investigation that finds the item needs a DESIGN DECISION routes
+/// it there, and the packet stays open until that decision is made.
+///
+/// This is the defect a001c78a reported, driven through the real
+/// router. In v9 every branch predicate read
+/// `steps.triage.metadata.disposition` and nothing else, so the packet
+/// was routed once — before the investigation that produces the
+/// evidence — and `closed` fired on `steps.investigate.done`. An
+/// investigator who discovered a design question had no move:
+/// recording it on the investigate step was decorative, and completing
+/// the step ended the item. Observed live on `3f5f7f63`, whose
+/// recommendation is stranded on a closed packet.
+///
+/// The two assertions are the two halves of the fix, and BOTH failed
+/// before it: `design-review` must become actionable, and the Job must
+/// NOT be closed.
+#[tokio::test]
+async fn an_investigation_can_route_the_packet_onward_instead_of_ending_it() {
+    let app = app();
+
+    let (status, job) = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/api/jobs")
+            .header("content-type", "application/json")
+            .header("x-boss-user", admin_header())
+            .body(Body::from(submit_feedback_body()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create rejected: {job}");
+    let job_id = job["id"].as_str().expect("job id").to_string();
+
+    async fn read(app: &axum::Router, job_id: &str) -> serde_json::Value {
+        let (status, body) = send(
+            app,
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/jobs/{job_id}"))
+                .header("x-boss-user", admin_header())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "read failed: {body}");
+        body
+    }
+
+    async fn complete(
+        app: &axum::Router,
+        job_id: &str,
+        current: &serde_json::Value,
+        slug: &str,
+        disposition: &str,
+    ) {
+        let step = current["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|s| s["spec_slug"] == slug)
+            .unwrap_or_else(|| panic!("no step `{slug}` on the packet: {current:#?}"));
+        assert!(
+            step["status"] == "ready" || step["status"] == "active",
+            "step `{slug}` is `{}`, not actionable",
+            step["status"]
+        );
+        // Merge, never replace: `authority_role` shares this object.
+        let mut metadata = step["metadata"].clone();
+        metadata["disposition"] = serde_json::Value::String(disposition.to_string());
+        let (status, body) = send(
+            app,
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/api/jobs/{job_id}/steps/{}",
+                    step["id"].as_str().expect("step id")
+                ))
+                .header("content-type", "application/json")
+                .header("x-boss-user", admin_header())
+                .body(Body::from(
+                    serde_json::json!({ "status": "completed", "metadata": metadata }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "completing `{slug}` failed {status}: {body}"
+        );
+    }
+
+    // Triage can only see a bug report, so it asks for a reproduction.
+    let current = read(&app, &job_id).await;
+    complete(&app, &job_id, &current, "triage", "reproduce").await;
+
+    // The investigation finds the real answer is a design decision.
+    let current = read(&app, &job_id).await;
+    complete(&app, &job_id, &current, "investigate", "design").await;
+
+    let after = read(&app, &job_id).await;
+    let by_slug: std::collections::HashMap<&str, &serde_json::Value> = after["steps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s["spec_slug"].as_str().map(|slug| (slug, s)))
+        .collect();
+
+    let review = by_slug["design-review"];
+    assert!(
+        review["status"] == "ready" || review["status"] == "active",
+        "the investigation routed to `design`, so design-review must be actionable — \
+         it is `{}`. Steps: {:#?}",
+        review["status"],
+        after["steps"]
+    );
+    assert_ne!(
+        after["status"], "closed",
+        "finishing an investigation that routed onward must NOT close the packet — \
+         that is how 3f5f7f63's recommendation was lost"
+    );
 }

@@ -351,8 +351,10 @@ async fn validate_actor_ids(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for event in events {
         // Only Human actors need existence-checking against the
-        // employees table. Automation actors are named but not
-        // FK-backed (their slugs are free-form for now).
+        // employees table. The machine classes — Automation and Agent
+        // — are named but not FK-backed (automation slugs and
+        // `<mode>:<model>` agent ids are both free-form for now), so
+        // they skip the check rather than 422 as an unknown employee.
         let boss_core::actor::ActorId::Human(id) = &event.actor_id else {
             continue;
         };
@@ -507,10 +509,11 @@ async fn post_event<R: AssetsRepository + 'static, B: EventBus + 'static>(
     if let Err(e) = state.assets.append(event.clone()).await {
         return (StatusCode::CONFLICT, e.to_string()).into_response();
     }
-    // The definitive event time comes from the clock service (sim-time
-    // in a regen, wall-time in prod) — never the client. The
-    // AssetEvent's `ts` stays in the payload as the business date.
-    let event_time = boss_clock_client::now_from(&state.clock).await;
+    // The record stamp is wall time — sim time is retired from the
+    // record (David, 2026-08-22, packet a7a4cae5). The AssetEvent's
+    // `ts` stays in the payload as the business date, which is where
+    // the sim timeline lives.
+    let event_time = boss_clock_client::wall_now();
     let core_event = asset_event_to_core(&event, event_time);
     state.publisher.publish(core_event).await;
     (StatusCode::CREATED, Json(serde_json::json!({"ok": true}))).into_response()
@@ -543,10 +546,9 @@ async fn batch_events<R: AssetsRepository + 'static, B: EventBus + 'static>(
                 .into_response();
         }
     };
-    // Clock-authoritative event time for every row in the batch (see
-    // post_event) — one clock read; the client's per-event `ts` stays
-    // payload data.
-    let event_time = boss_clock_client::now_from(&state.clock).await;
+    // One wall-clock record stamp for the whole batch (see
+    // post_event); the client's per-event `ts` stays payload data.
+    let event_time = boss_clock_client::wall_now();
     let core_events: Vec<_> = to_publish
         .iter()
         .map(|e| asset_event_to_core(e, event_time))
@@ -575,7 +577,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use boss_classes_client::FakeClassesClient;
-    use boss_people_client::AlwaysExistsPeople;
+    use boss_people_client::{AlwaysExistsPeople, FakePeopleClient};
     use boss_testing::RecordingEventBus;
     use chrono::NaiveDate;
     use tower::ServiceExt;
@@ -584,6 +586,13 @@ mod tests {
     /// No policy (None → allow), permissive people client, recording
     /// bus, wall clock. Exercises the `check_asset_classes` ingest gate.
     fn app_with_classes(classes_client: Option<Arc<dyn ClassesClient>>) -> Router {
+        app_with(classes_client, Arc::new(AlwaysExistsPeople))
+    }
+
+    fn app_with(
+        classes_client: Option<Arc<dyn ClassesClient>>,
+        people_client: Arc<dyn PeopleClient>,
+    ) -> Router {
         let assets = Arc::new(InMemoryAssets::new());
         let bus = RecordingEventBus::new();
         let publisher =
@@ -592,7 +601,7 @@ mod tests {
             assets,
             bus,
             publisher,
-            people_client: Arc::new(AlwaysExistsPeople),
+            people_client,
             classes_client,
             hub: SseHub::new(),
             policy: None,
@@ -673,6 +682,61 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// The actor guard existence-checks Humans against the employees
+    /// table. An agent id (`claude:fable`) used to parse as a Human
+    /// and get 422'd as an "unknown actor"; as the third CPU class it
+    /// is not FK-backed and must pass, exactly like an automation.
+    #[tokio::test]
+    async fn agent_and_automation_actors_are_exempt_from_the_employee_guard() {
+        for (id, actor, wire) in [
+            (
+                "evt-agent",
+                boss_core::actor::ActorId::agent("claude", "fable"),
+                "claude:fable",
+            ),
+            (
+                "evt-agent-2",
+                boss_core::actor::ActorId::agent("claude", "opus-5"),
+                "claude:opus-5",
+            ),
+            (
+                "evt-automation",
+                boss_core::actor::ActorId::automation("asset-intake"),
+                "automation:asset-intake",
+            ),
+        ] {
+            let event = AssetEvent {
+                id: AssetEventId::new(id),
+                asset_id: AssetId::new("SN-AGENT-1"),
+                ts: NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
+                actor_id: actor,
+                kind: AssetEventKind::PutAway { bin: "A-1".into() },
+            };
+            // The guard reads what came off the wire, so pin the wire
+            // form too: the agent arrives as a bare `<mode>:<model>`.
+            assert_eq!(serde_json::to_value(&event).unwrap()["actor_id"], wire);
+            // Empty roster: any id the guard actually looks up 422s.
+            let app = app_with(None, Arc::new(FakePeopleClient::new()));
+            let resp = post_event_req(app, &event).await;
+            assert_eq!(resp.status(), StatusCode::CREATED, "actor {wire}");
+        }
+    }
+
+    /// The guard still bites for a human id that is not on the roster.
+    #[tokio::test]
+    async fn an_unknown_employee_actor_is_still_rejected() {
+        let app = app_with(None, Arc::new(FakePeopleClient::new()));
+        let event = AssetEvent {
+            id: AssetEventId::new("evt-ghost"),
+            asset_id: AssetId::new("SN-AGENT-2"),
+            ts: NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
+            actor_id: boss_core::actor::ActorId::human("emp-ghost"),
+            kind: AssetEventKind::PutAway { bin: "A-1".into() },
+        };
+        let resp = post_event_req(app, &event).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

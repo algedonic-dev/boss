@@ -15,8 +15,6 @@
 //! `rebuild_inventory`, and asserts every row reappears from
 //! `audit_log` alone.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::Router;

@@ -1,22 +1,31 @@
 <script lang="ts">
-  // /it/design — design-doc review surface.
+  // /system/design — the design-review station, rendered.
   //
-  // Lists every design doc indexed by boss-docs-api with its live
-  // open-question count + pending (recorded-but-unflushed) decisions
-  // + the in-flight design-doc-review Job if one exists. Opens a fresh
-  // design-doc-review Job on demand for any doc that doesn't already
-  // have an open one.
+  // This page is a LENS: the packets are the `design-review` station's
+  // evaluated queue, and the page's own identity (header, panel set)
+  // is the `lens` its registry row declares. It used to define the
+  // queue itself — `/api/jobs?kind=design-doc-review&status=open`
+  // filtered in the browser — which is two definitions of one queue,
+  // drifting silently. See `designLens.ts` for the full reasoning.
   //
-  // Replaces the in-app decision-tracker surface retired
-  // 2026-05-03 — instead of bespoke decision-tracker tables, the
-  // workflow is a Job whose review-design step (custom plugin) gates
-  // on every open question having a recorded resolution. The Job
-  // itself is the durable record; pending-decisions / ADR-extraction
-  // continue to use the existing /api/design endpoints unchanged.
+  // The doc corpus and the indexer's rejections stay their own reads:
+  // they describe docs that have NO packet yet, which is exactly the
+  // set you need in order to START a review, and they are
+  // boss-docs-api's to serve. The station registry's business is the
+  // queue and how it is framed.
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
-  import Link from '@boss/web-kit/ui/Link.svelte';
-  import { navigate } from '../../router';
+  import { href, navigate } from '../../router';
+  import { groupDocs, openWeight } from './designGroups';
+  import {
+    pageHeader,
+    panelsFor,
+    reviewHref,
+    reviewsByDocPath,
+    REVIEW_STEP_KIND,
+    type DesignQueueEnvelope,
+    type ReviewPacket,
+  } from './designLens';
 
   type DesignDoc = {
     path: string;
@@ -30,40 +39,18 @@
     last_modified: string;
   };
 
-  type OpenReviewJob = {
-    id: string;
-    status: string;
-    opened_on: string;
-    title: string;
-    /// The `review-design` step, when the Job has materialized one.
-    /// Reading a design doc is the whole point of this Job, and the
-    /// job page renders the doc in a panel beside a sidebar, a job
-    /// header and a step list — so the link below goes straight to
-    /// the full-page step surface instead. Optional because a Job
-    /// caught mid-materialization has no steps yet; the link falls
-    /// back to the job page rather than 404ing on a step id we made
-    /// up.
-    reviewStepId?: string;
-  };
-
-  /// Step kind backing the review surface (`step_plugins` row
-  /// 'review-design', tier 0 of the design-doc-review Workflow).
-  const REVIEW_STEP_KIND = 'review-design';
-
-  /// Where a review Job should open. The focused step route renders
-  /// outside AppShell — chrome bar on top, the whole panel below it
-  /// for the document.
-  function reviewHref(job: OpenReviewJob): string {
-    return job.reviewStepId
-      ? `/jobs/${job.id}/steps/${job.reviewStepId}`
-      : `/service/${job.id}`;
-  }
-
   type Rejection = {
     path: string;
     reason: string;
     first_seen_at: string;
     last_seen_at: string;
+  };
+
+  type StaleStatus = {
+    path: string;
+    title: string;
+    status: string;
+    reason: string;
   };
 
   let docs = $state<ReadonlyArray<DesignDoc>>([]);
@@ -73,9 +60,19 @@
   // as "nobody wrote it" — which is how transactional-audit-log.md
   // stayed invisible for six days.
   let rejections = $state<ReadonlyArray<Rejection>>([]);
-  let openReviewsByPath = $state<Record<string, OpenReviewJob | undefined>>({});
+  // The quieter sibling of a rejection. A rejected doc is missing; a
+  // doc whose status drifted is present and lying — it says "in
+  // review" with nothing left to review. Eleven of the twenty docs
+  // claiming to be live were in that state on 2026-08-15, every one
+  // wrong in the same direction, and nothing surfaced it (0b8ae875).
+  let staleStatuses = $state<ReadonlyArray<StaleStatus>>([]);
+  let queue = $state<DesignQueueEnvelope | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
+
+  const header = $derived(pageHeader(queue?.lens));
+  const panels = $derived(panelsFor(queue?.lens));
+  const openReviewsByPath = $derived(reviewsByDocPath(queue?.data ?? []));
 
   // System actor for opening review Jobs — same shape inventory-api
   // uses for its system-initiated Job opens.
@@ -101,6 +98,12 @@
     loading = true;
     error = null;
     try {
+      // The queue IS the page — if this read fails the surface has
+      // nothing honest to show, so it is the one that throws.
+      const queueResp = await fetch('/api/stations/design-review/queue');
+      if (!queueResp.ok) throw new Error(`queue: HTTP ${queueResp.status}`);
+      queue = (await queueResp.json()) as DesignQueueEnvelope;
+
       const docsResp = await fetch('/api/design/docs');
       if (!docsResp.ok) throw new Error(`docs: HTTP ${docsResp.status}`);
       docs = (await docsResp.json()) as DesignDoc[];
@@ -114,39 +117,11 @@
       rejections = await fetch('/api/design/rejections')
         .then((r) => (r.ok ? (r.json() as Promise<Rejection[]>) : []))
         .catch(() => []);
-
-      // Look up open design-doc-review Jobs. Subject is the
-      // identity-first {subject_kind: 'custom', id: <doc-path>};
-      // jobs-api supports ?kind= + ?status= filters.
-      const jobsResp = await fetch(
-        '/api/jobs?kind=design-doc-review&status=open&limit=200',
-      );
-      if (!jobsResp.ok) throw new Error(`jobs: HTTP ${jobsResp.status}`);
-      const jobsBody = await jobsResp.json();
-      // The list endpoint enriches each Job with its steps
-      // (boss-jobs http/jobs.rs), so the review step is already here —
-      // no per-Job follow-up fetch to find it.
-      const jobs: Array<{
-        id: string;
-        title: string;
-        status: string;
-        opened_on: string;
-        subject: { id?: string };
-        steps?: Array<{ id: string; kind: string }>;
-      }> = Array.isArray(jobsBody) ? jobsBody : (jobsBody.data ?? []);
-      const byPath: Record<string, OpenReviewJob> = {};
-      for (const j of jobs) {
-        const p = j.subject?.id;
-        if (!p) continue;
-        byPath[p] = {
-          id: j.id,
-          status: j.status,
-          opened_on: j.opened_on,
-          title: j.title,
-          reviewStepId: j.steps?.find((s) => s.kind === REVIEW_STEP_KIND)?.id,
-        };
-      }
-      openReviewsByPath = byPath;
+      // Same degrade-to-empty contract as rejections above: a report
+      // about the corpus must never be able to blank the corpus.
+      staleStatuses = await fetch('/api/design/stale-statuses')
+        .then((r) => (r.ok ? (r.json() as Promise<StaleStatus[]>) : []))
+        .catch(() => []);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -154,7 +129,46 @@
     }
   }
 
+  /// The `review-design` step of an open packet, resolved on demand.
+  ///
+  /// The station queue serves packets without steps (it fetches them
+  /// only when the predicate reads step state, and this station's
+  /// predicate is a kind match), so the step id is one read at click
+  /// time for the ONE packet being opened. The page used to enrich
+  /// every packet with its steps on load to find the same id.
+  ///
+  /// A failure here is not an error state: `reviewHref` falls back to
+  /// the job page, which is a worse door but a real one.
+  async function reviewStepId(jobId: string): Promise<string | null> {
+    try {
+      const r = await fetch(`/api/jobs/${jobId}`);
+      if (!r.ok) return null;
+      const job = (await r.json()) as { steps?: Array<{ id: string; kind: string }> };
+      return job.steps?.find((s) => s.kind === REVIEW_STEP_KIND)?.id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function enterReview(packet: ReviewPacket): Promise<void> {
+    navigate(reviewHref(packet.id, await reviewStepId(packet.id)));
+  }
+
+  /// One action, one destination: the review surface. Whether a review
+  /// Job already exists is an implementation detail, and surfacing it
+  /// as the difference between a link and a button made the Review
+  /// column read as a status field that sometimes happened to be
+  /// clickable (David, 2026-08-14: "that link should just consistently
+  /// launch the review UX"). Creating the Job when there isn't one is
+  /// a step on the way, not a different outcome.
   async function openReview(doc: DesignDoc): Promise<void> {
+    // Already in the station's queue — go straight in. Posting again
+    // would open a second packet for the same doc.
+    const existing = openReviewsByPath[doc.path];
+    if (existing) {
+      await enterReview(existing);
+      return;
+    }
     const body = {
       kind: 'design-doc-review',
       // Identity-first Subject: the doc path IS the subject id. The
@@ -185,6 +199,7 @@
         body: JSON.stringify(body),
       });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+      const created: { id?: string } = await resp.json().catch(() => ({}));
       // doc_path is stamped at materialization from the Job's subject
       // (the Workflow's metadata_defaults template `{subject.id}`) — no
       // follow-up PUT. The old fill-in write lost read-overlay-write
@@ -196,10 +211,19 @@
       // dropping the operator back on a table row means the next
       // click lands on the job page, which renders the document in a
       // panel beside the sidebar and step list — the reason reviewing
-      // a doc in-app felt cramped. If the Job has not materialized
-      // its steps yet, reviewHref falls back to the job page.
+      // a doc in-app felt cramped.
       const opened = openReviewsByPath[doc.path];
-      if (opened) navigate(reviewHref(opened));
+      if (opened) {
+        await enterReview(opened);
+        return;
+      }
+      // The reload did not see the new packet yet (steps materialize
+      // asynchronously, and the station evaluates over what exists
+      // when it is asked). Use the id the POST just returned rather
+      // than leaving the operator on the table wondering whether the
+      // click worked — a click that creates a Job and goes nowhere is
+      // the inconsistency this function exists to remove.
+      if (created.id) navigate(reviewHref(created.id, await reviewStepId(created.id)));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
@@ -209,25 +233,16 @@
     void load();
   });
 
-  // David's distinction (2026-07-08): a doc is "in review & discussion"
-  // when its status says so OR anything actionable is attached (parsed
-  // open questions, unflushed decisions, an open review Job). Everything
-  // else — living references, approved/shipped/superseded designs — is
-  // settled: nobody is acting on it, and showing it as in-review was a
-  // lie the old status parser told (living → in-review collapse).
-  function underReview(doc: DesignDoc): boolean {
-    return (
-      doc.status === 'draft' ||
-      doc.status === 'in-review' ||
-      doc.status === 'reopened' ||
-      doc.open_questions > 0 ||
-      doc.pending_count > 0 ||
-      openReviewsByPath[doc.path] !== undefined
-    );
-  }
-
-  const reviewing = $derived(docs.filter(underReview));
-  const settled = $derived(docs.filter((d) => !underReview(d)));
+  // What is actually asking for something, versus what merely claims
+  // to be. See designGroups.ts — the short version is that a doc's
+  // `**Status**:` line is the one input nobody updates when the last
+  // question closes, so it drifts stale in one direction and eleven
+  // settled docs had accumulated in the top section (David, bedda461:
+  // "This page is full of stale info").
+  const grouped = $derived(
+    groupDocs(docs, (path) => openReviewsByPath[path] !== undefined),
+  );
+  const waiting = $derived(openWeight(grouped.needsYou));
 
   function relTime(iso: string): string {
     const d = new Date(iso);
@@ -241,55 +256,120 @@
   }
 </script>
 
-<PageHeader title="Design review" subtitle="Open questions, pending decisions, ADRs" />
+<PageHeader eyebrow={header.eyebrow} title={header.title} subtitle={header.subtitle} />
 
 {#if loading}
-  <p class="empty">Loading design docs…</p>
+  <p class="empty">Loading the review queue…</p>
 {:else if error}
-  <p class="empty">Error: {error}</p>
+  <p class="design-error">Error: {error}</p>
 {:else}
-  {#if rejections.length > 0}
-    <Section title={`Not indexed (${rejections.length})`} wide>
-      <p class="empty reject-lede">
-        These files are in <code>docs/design/</code> but are <strong>not</strong>
-        in the lists below — the reindexer refused them. Until each is
-        fixed, this panel is showing an incomplete corpus.
-      </p>
-      <table class="design-table">
-        <thead>
-          <tr><th>Doc</th><th>Invisible for</th><th>Why</th></tr>
-        </thead>
-        <tbody>
-          {#each rejections as r (r.path)}
-            <tr>
-              <td><code>{r.path}</code></td>
-              <td class="reject-age">
-                {daysSince(r.first_seen_at)}
-                {daysSince(r.first_seen_at) === 1 ? 'day' : 'days'}
-              </td>
-              <td class="reject-reason">{r.reason}</td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    </Section>
-  {/if}
-
-  <Section title={`In review & discussion (${reviewing.length})`} wide>
-    {#if reviewing.length === 0}
-      <p class="empty">
-        Nothing under discussion — every design doc is a settled
-        reference. New questions land here when a doc adds
-        <code>### Qn:</code> headings (status → reopened).
-      </p>
-    {:else}
-      {@render docTable(reviewing, 'Open review Job')}
+  {#each panels as panel (panel)}
+    {#if panel === 'rejections' && staleStatuses.length > 0}
+      <Section title={`Status drifted (${staleStatuses.length})`} wide>
+        <p class="reject-lede">
+          These docs say they are under discussion but have no open
+          questions. The status line is hand-written and almost
+          nothing updates it, so it goes stale by default — a doc that
+          reads <code>in-review</code> here may simply be finished.
+          Not an error: a doc can legitimately wait on a person with
+          nothing registered. It is a prompt to check.
+        </p>
+        <table class="design-table">
+          <thead>
+            <tr><th>Doc</th><th>Says</th><th>Why it looks wrong</th></tr>
+          </thead>
+          <tbody>
+            {#each staleStatuses as d (d.path)}
+              <tr>
+                <td><code>{d.path}</code></td>
+                <td class="reject-age">{d.status}</td>
+                <td class="reject-reason">{d.reason}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </Section>
     {/if}
-  </Section>
+    {#if panel === 'rejections' && rejections.length > 0}
+      <Section title={`Not indexed (${rejections.length})`} wide>
+        <p class="reject-lede">
+          These files are in <code>docs/design/</code> but are <strong>not</strong>
+          in the lists below — the reindexer refused them. Until each is
+          fixed, this panel is showing an incomplete corpus.
+        </p>
+        <table class="design-table">
+          <thead>
+            <tr><th>Doc</th><th>Invisible for</th><th>Why</th></tr>
+          </thead>
+          <tbody>
+            {#each rejections as r (r.path)}
+              <tr>
+                <td><code>{r.path}</code></td>
+                <td class="reject-age">
+                  {daysSince(r.first_seen_at)}
+                  {daysSince(r.first_seen_at) === 1 ? 'day' : 'days'}
+                </td>
+                <td class="reject-reason">{r.reason}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </Section>
+    {:else if panel === 'corpus'}
+      <Section
+        title={`Needs you (${grouped.needsYou.length})`}
+        wide
+      >
+        {#if grouped.needsYou.length === 0}
+          <p class="empty">
+            Nothing is waiting on a decision. New questions land here
+            when a doc adds <code>### Qn:</code> headings, and recorded
+            answers land here until they are flushed into the doc.
+          </p>
+        {:else}
+          <p class="design-lede">
+            {waiting.questions}
+            {waiting.questions === 1 ? 'open question' : 'open questions'}{#if waiting.pending > 0},
+              and {waiting.pending} recorded
+              {waiting.pending === 1 ? 'answer' : 'answers'} not yet flushed into
+              {waiting.pending === 1 ? 'its doc' : 'their docs'}{/if}. Deepest first.
+          </p>
+          {@render docTable(grouped.needsYou, 'Start review')}
+        {/if}
+      </Section>
 
-  <Section title={`Living references & settled (${settled.length})`} wide>
-    {@render docTable(settled, 'Reopen discussion')}
-  </Section>
+      {#if grouped.drafts.length > 0}
+        <Section title={`Being written (${grouped.drafts.length})`} wide>
+          <p class="design-lede">
+            Drafts with nothing to decide yet. They are not settled —
+            they just have not asked anything.
+          </p>
+          {@render docTable(grouped.drafts, 'Start review')}
+        </Section>
+      {/if}
+
+      <Section title={`Design library (${grouped.library.length})`} wide>
+        <!-- The settled corpus, and the pointer David asked for. The
+             flattened record is NOT served in-app: it folds into
+             docs/architecture-decisions.md each release, and the IT
+             Knowledge Base is where that is explained. Linking to the
+             page that tells the truth about where it lives beats
+             inventing a URL for a file the SPA does not serve. -->
+        <p class="design-lede">
+          Living references and finished discussions — nothing here is
+          waiting on anyone. Settled decisions fold into
+          <code>docs/architecture-decisions.md</code>, the one
+          current-truth record;
+          <a
+            href={href('/system/kb')}
+            onclick={(e) => { e.preventDefault(); navigate(href('/system/kb')); }}
+          >the IT Knowledge Base</a>
+          is the in-app entry point.
+        </p>
+        {@render docTable(grouped.library, 'Reopen discussion')}
+      </Section>
+    {/if}
+  {/each}
 {/if}
 
 {#snippet docTable(rows: ReadonlyArray<DesignDoc>, buttonLabel: string)}
@@ -312,19 +392,24 @@
             <strong>{doc.title}</strong>
             <div class="design-path">{doc.path}</div>
           </td>
-          <td>{doc.status}</td>
+          <td class="design-status">{doc.status}</td>
           <td>{doc.open_questions}</td>
           <td>{doc.pending_count}</td>
-          <td>{relTime(doc.last_modified)}</td>
+          <td class="design-when">{relTime(doc.last_modified)}</td>
           <td>
+            <!-- One affordance, one destination. This column used to
+                 fork: a doc with a Job rendered a text link labelled
+                 "In review — open", and one without rendered a button
+                 — so the same column carried what looked like a status
+                 in some rows and an action in others, and only one of
+                 them reliably navigated. Both go to the review surface
+                 now; the packet's state is reported below the control
+                 instead of impersonating it. -->
+            <button class="wb-btn" type="button" onclick={() => openReview(doc)}>
+              {review ? 'Review' : buttonLabel}
+            </button>
             {#if review}
-              <Link to={reviewHref(review)}>
-                In review — {review.status}
-              </Link>
-            {:else}
-              <button class="wb-btn" type="button" onclick={() => openReview(doc)}>
-                {buttonLabel}
-              </button>
+              <div class="design-when">In queue · {review.status}</div>
             {/if}
           </td>
         </tr>
@@ -334,16 +419,25 @@
 {/snippet}
 
 <style>
+  /* Warning prose, not an empty-state: FOG at reading line-height. It was
+     STATIC via `.empty`, which buried the one paragraph explaining why the
+     corpus above is incomplete. */
   .reject-lede {
-    margin-bottom: 0.75rem;
+    color: var(--fog, #E8ECEF);
+    line-height: 1.6;
+    max-width: 720px;
+    margin: 0 0 12px;
   }
   .reject-age {
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
   }
+  /* Body prose in a cell. 0.85rem was 11.9px at the 14px root — below the
+     13px body floor — with cramped leading. */
   .reject-reason {
-    font-size: 0.85rem;
-    line-height: 1.4;
+    font-size: 13px;
+    line-height: 1.6;
+    max-width: 60ch;
   }
   .design-table {
     width: 100%;
@@ -353,16 +447,56 @@
   .design-table td {
     text-align: left;
     padding: 8px 12px;
-    border-bottom: 1px solid var(--color-border, #e0e0e0);
+    border-bottom: 1px solid var(--hairline, #2A3138);
     vertical-align: top;
+    font-variant-numeric: tabular-nums;
+  }
+  /* Column labels are instrument text: DM Mono caps in STATIC, not bold
+     browser-default headers competing with the rows. Yard-board idiom. */
+  .design-table th {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11px;
+    font-weight: 400;
+    letter-spacing: var(--ls-nav, 0.14em);
+    text-transform: uppercase;
+    color: var(--static, #7A838C);
+  }
+  .design-table tr:last-child td {
+    border-bottom: none;
+  }
+  .design-status {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11px;
+    letter-spacing: var(--ls-label, 0.1em);
+    text-transform: uppercase;
+    color: var(--static, #7A838C);
+    white-space: nowrap;
+  }
+  .design-when {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 12px;
+    color: var(--static, #7A838C);
+    white-space: nowrap;
   }
   .design-path {
-    color: var(--color-fg-muted, #666);
+    color: var(--static, #7A838C);
     font-size: 12px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    margin-top: 2px;
+  }
+  /* Inline literals (paths, `### Qn:` markers) in the system mono, pinned
+     to 12px — bare <code> falls into the browser's monospace-shrink. */
+  code {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 12px;
   }
   .empty {
-    color: var(--color-fg-muted, #666);
+    color: var(--static, #7A838C);
+    margin: 12px 0;
+    line-height: 1.5;
+  }
+  .design-error {
+    color: var(--err, #e2685c);
     margin: 12px 0;
   }
 </style>

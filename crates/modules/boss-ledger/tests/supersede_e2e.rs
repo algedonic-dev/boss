@@ -10,8 +10,6 @@
 //!    the supersede markers — no false-positive divergences from
 //!    `replay_check_from_audit_log`.
 
-#![cfg(feature = "postgres")]
-
 use boss_ledger::supersede::{SupersedeOutcome, SupersedeRequest, apply_supersede_in_tx};
 use boss_ledger::{rebuild, rebuild_facts};
 use boss_testing::TestDb;

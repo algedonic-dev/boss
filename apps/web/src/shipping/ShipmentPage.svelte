@@ -19,6 +19,10 @@
 
   let shipment = $state<Shipment | null>(null);
   let accounts = $state<Account[]>([]);
+  /// Non-null when the record fetch FAILED (5xx / network) — rendered
+  /// instead of "Shipment not found", which is a claim only a
+  /// successful lookup gets to make (packet 3fba9c35).
+  let loadFailed = $state<string | null>(null);
   let loading = $state(true);
 
   let id = $derived(decodeURIComponent(shipmentId));
@@ -37,11 +41,16 @@
         const pBody = pResp.ok ? await pResp.json() : [];
         if (!cancelled) {
           shipment = sBody;
+          loadFailed =
+            sResp.ok || sResp.status === 404 ? null : `HTTP ${sResp.status}`;
           accounts = Array.isArray(pBody) ? pBody : (pBody.data ?? []);
           loading = false;
         }
-      } catch {
-        if (!cancelled) loading = false;
+      } catch (e) {
+        if (!cancelled) {
+          loadFailed = e instanceof Error ? e.message : String(e);
+          loading = false;
+        }
       }
     })();
     return () => {
@@ -59,6 +68,15 @@
 {#if loading}
   <div class="catalog theme-exec">
     <p class="empty">Loading shipment…</p>
+  </div>
+{:else if loadFailed}
+  <div class="catalog theme-exec">
+    <Breadcrumb to={href('/ux/shipping')}>
+      ← Shipping
+    </Breadcrumb>
+    <p class="empty load-failed" role="alert">
+      Couldn't load this shipment — {loadFailed}
+    </p>
   </div>
 {:else if !shipment}
   <div class="catalog theme-exec">

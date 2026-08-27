@@ -46,7 +46,7 @@ impl GateResolve {
         registry: Arc<StepRegistry>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: crate::handlers::common::api_client(),
             jobs_base: jobs_base.into(),
             products_base: products_base.into(),
             registry,

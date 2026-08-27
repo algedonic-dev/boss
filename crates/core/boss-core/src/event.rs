@@ -7,20 +7,21 @@ use uuid::Uuid;
 /// Events are the fundamental communication unit in Boss.
 /// They are never modified after creation — they are facts.
 ///
-/// **`timestamp` is required at construction.** There is no
-/// `Utc::now()` default: a silent default lets the audit log wander
-/// off-clock (wallclock-stamped rows in a sim-dated log) with no
-/// visible breakage. Forcing `timestamp` as an argument means every
-/// caller sources it — from `state.clock.now().await.now` in handlers,
-/// from a fixture in tests, from `Utc::now()` only at the boundary
-/// where truly-current wall-clock is the intent.
+/// **`timestamp` is wall-clock time.** Sim time is retired from the
+/// record (David, 2026-08-22, packet a7a4cae5): whatever mode the
+/// deploy's clock-api runs in, the stamp says when the fact was
+/// recorded on the one real clock. Live emitters get it minted by
+/// [`crate::publisher::EventStamp`] (or `boss_clock_client::wall_now`
+/// on the few non-stamp paths); the constructor still takes it as an
+/// argument because replay, the outbox relay, and tests must carry a
+/// **recorded** timestamp through unchanged. Sim-timeline dates are
+/// payload data, never the stamp.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     /// Unique event identifier
     pub id: Uuid,
-    /// When this event occurred. **Caller-supplied**; route it
-    /// from your authoritative clock (the boss-clock-api response,
-    /// via `state.clock.now().await.now`).
+    /// When this event was recorded — wall clock for live emits,
+    /// the recorded value verbatim for replayed/relayed events.
     pub timestamp: DateTime<Utc>,
     /// Which service/module produced this event
     pub source: String,

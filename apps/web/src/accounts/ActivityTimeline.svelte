@@ -12,6 +12,10 @@
   let { accountId } = $props<{ accountId: string }>();
 
   let entries = $state<TimelineEntry[]>([]);
+  /// A failed leg of the merge, rendered instead of the empty state —
+  /// a partial or unreachable history must not read as "no activity"
+  /// (packet 3fba9c35).
+  let loadFailed = $state<string | null>(null);
   let loading = $state(true);
   // Default window must cover seeded-bundle data: brewery seed
   // is a 12-month sim ending up to a year before the install
@@ -29,9 +33,15 @@
     let cancelled = false;
     loading = true;
     (async () => {
-      const rows = await loadTimeline(pid, days);
+      const result = await loadTimeline(pid, days);
       if (!cancelled) {
-        entries = rows;
+        if (result.kind === 'ready') {
+          entries = result.entries;
+          loadFailed = null;
+        } else {
+          entries = [];
+          loadFailed = result.error;
+        }
         loading = false;
       }
     })();
@@ -63,6 +73,10 @@
 <Section title={entries.length > 20 ? `Activity timeline (20 of ${entries.length})` : `Activity timeline (${entries.length})`} wide>
     {#if loading && entries.length === 0}
       <p class="empty">Loading timeline…</p>
+    {:else if loadFailed}
+      <p class="empty load-failed" role="alert">
+        Couldn't load the timeline — {loadFailed}
+      </p>
     {:else if entries.length === 0}
       <p class="empty">No recent activity for this account.</p>
     {:else}

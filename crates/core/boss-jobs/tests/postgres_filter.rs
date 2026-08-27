@@ -14,8 +14,6 @@
 //! `InMemoryJobs`) wouldn't catch a Postgres-only gap. This file runs
 //! the same shape against `PgJobs`.
 
-#![cfg(feature = "postgres")]
-
 use boss_core::job::{Job, JobId, JobStatus, Priority, Subject};
 use boss_jobs::port::{JobFilter, JobScope, JobsRepository};
 use boss_testing::TestDb;
@@ -37,6 +35,7 @@ fn job(id: &str, kind: &str, subject: Subject) -> Job {
         closed_on: None,
         metadata: serde_json::Value::Null,
         tags: vec![],
+        simulated: false,
     }
 }
 
@@ -138,4 +137,260 @@ async fn list_jobs_filters_by_subject_id_in_postgres() {
         .await
         .unwrap();
     assert_eq!(total, 0);
+}
+
+/// The terminal retention window: everything live, plus what closed
+/// recently.
+///
+/// THE PROBLEM IT SOLVES. A board renders each card in the column of
+/// its current step, so terminal packets have to be fetched for the
+/// terminal columns to have anything in them. The feedback board
+/// therefore asked for `kind=user-feedback&limit=200` with no status
+/// filter and got all 173 packets in order to show 14 live ones — 92%
+/// finished work, and 27 short of silently truncating at its own
+/// limit. Filtering after the fetch does not fix the truncation; the
+/// window has to be in the query.
+///
+/// This runs against Postgres because the rule there is a CASE over
+/// two columns while the in-memory adapter expresses it as Rust: two
+/// implementations of one contract.
+#[tokio::test(flavor = "multi_thread")]
+async fn closed_since_keeps_live_and_recent_and_drops_the_rest() {
+    let db = TestDb::new().await;
+    let repo = boss_jobs::PgJobs::new(db.pool.clone());
+    let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
+    let board = Subject::new("account", "board");
+
+    let mut open = job(
+        "00000000-0000-0000-0000-0000000000a1",
+        "user-feedback",
+        board.clone(),
+    );
+    let mut recent = job(
+        "00000000-0000-0000-0000-0000000000a2",
+        "user-feedback",
+        board.clone(),
+    );
+    recent.status = JobStatus::Closed;
+    recent.closed_on = Some(d(8, 14));
+    let mut old = job(
+        "00000000-0000-0000-0000-0000000000a3",
+        "user-feedback",
+        board.clone(),
+    );
+    old.status = JobStatus::Closed;
+    old.closed_on = Some(d(1, 5));
+    let mut cancelled = job(
+        "00000000-0000-0000-0000-0000000000a4",
+        "user-feedback",
+        board.clone(),
+    );
+    cancelled.status = JobStatus::Cancelled;
+    cancelled.closed_on = Some(d(1, 6));
+    // A blocked packet with no close date: live is live regardless of
+    // how long ago it opened, and it is the half of the rule that a
+    // naive `closed_on >= $x` would silently delete. Blocked rather
+    // than Open so the assertion cannot pass by accident on a default.
+    open.status = JobStatus::Blocked;
+
+    for j in [&open, &recent, &old, &cancelled] {
+        repo.create_job(j).await.unwrap();
+    }
+
+    let filter = JobFilter {
+        kind: Some("user-feedback".into()),
+        closed_since: Some(d(8, 1)),
+        ..Default::default()
+    };
+    let (rows, total) = repo.list_jobs(&filter, 100, 0).await.unwrap();
+    let got: Vec<String> = rows.iter().map(|j| j.id.to_string()).collect();
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected the in-progress packet and the one closed in August, got {got:?}"
+    );
+    assert_eq!(
+        total, 2,
+        "the COUNT query must apply the same window as the page"
+    );
+    assert!(
+        rows.iter().any(|j| j.id == open.id),
+        "live packets always survive"
+    );
+    assert!(rows.iter().any(|j| j.id == recent.id));
+    assert!(
+        !rows.iter().any(|j| j.id == cancelled.id),
+        "cancelled is terminal too — an old cancellation is not recent work"
+    );
+}
+
+/// Without the window, every existing caller behaves exactly as before.
+///
+/// This is why the window is a new optional field rather than a change
+/// to how `status` is interpreted.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_window_means_the_old_status_behaviour() {
+    let db = TestDb::new().await;
+    let repo = boss_jobs::PgJobs::new(db.pool.clone());
+    let board = Subject::new("account", "board");
+
+    let mut closed = job(
+        "00000000-0000-0000-0000-0000000000b1",
+        "user-feedback",
+        board.clone(),
+    );
+    closed.status = JobStatus::Closed;
+    closed.closed_on = NaiveDate::from_ymd_opt(2026, 1, 5);
+    let open = job(
+        "00000000-0000-0000-0000-0000000000b2",
+        "user-feedback",
+        board,
+    );
+    repo.create_job(&closed).await.unwrap();
+    repo.create_job(&open).await.unwrap();
+
+    let all = JobFilter {
+        kind: Some("user-feedback".into()),
+        ..Default::default()
+    };
+    let (rows, total) = repo.list_jobs(&all, 100, 0).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "an unfiltered list still returns closed packets"
+    );
+    assert_eq!(total, 2);
+
+    let only_open = JobFilter {
+        kind: Some("user-feedback".into()),
+        status: Some(JobStatus::Open),
+        ..Default::default()
+    };
+    let (rows, _) = repo.list_jobs(&only_open, 100, 0).await.unwrap();
+    assert_eq!(rows.len(), 1, "status=open still means open only");
+    assert_eq!(rows[0].id, open.id);
+}
+
+/// `closed_since` and `status` are OR, not AND.
+///
+/// The board's whole purpose is showing live work next to what just
+/// finished. If the two combined as AND, `status=open&closed_within=14`
+/// would return only open packets and the terminal columns would be
+/// empty again — the bug this window exists to fix. The documented
+/// rule is that `closed_since` WINS: it already means "everything
+/// live", so a status filter alongside it is redundant at best.
+#[tokio::test(flavor = "multi_thread")]
+async fn closed_since_overrides_status_rather_than_intersecting_it() {
+    let db = TestDb::new().await;
+    let repo = boss_jobs::PgJobs::new(db.pool.clone());
+    let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
+    let board = Subject::new("account", "board");
+
+    let open = job(
+        "00000000-0000-0000-0000-0000000000c1",
+        "user-feedback",
+        board.clone(),
+    );
+    let mut recent = job(
+        "00000000-0000-0000-0000-0000000000c2",
+        "user-feedback",
+        board,
+    );
+    recent.status = JobStatus::Closed;
+    recent.closed_on = Some(d(8, 14));
+    repo.create_job(&open).await.unwrap();
+    repo.create_job(&recent).await.unwrap();
+
+    let filter = JobFilter {
+        kind: Some("user-feedback".into()),
+        status: Some(JobStatus::Open),
+        closed_since: Some(d(8, 1)),
+        ..Default::default()
+    };
+    let (rows, total) = repo.list_jobs(&filter, 100, 0).await.unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "the recently-closed packet must survive a status=open filter"
+    );
+    assert_eq!(total, 2);
+}
+
+/// `simulated` partitions the packet population, and BOTH the rows
+/// and the `total` have to obey it.
+///
+/// WHY THIS IS A REAL FILTER AND NOT A CLIENT CONCERN. Measured on the
+/// live system 2026-08-17: **5,201 of 5,964 packets (87%) are
+/// simulated**, and of 39 kinds **zero are mixed** — a kind is either
+/// entirely the demo tenant's or entirely real. A surface that fetched
+/// a page and dropped the simulated rows would draw roughly 26 real
+/// packets from a page of 200, report a `total` of 200, and truncate
+/// without saying so. That is the failure `closed_since` above was
+/// added to prevent, one order of magnitude worse.
+///
+/// Runs against Postgres because the list and the count are two
+/// separate SQL statements with independently numbered binds, and the
+/// way this breaks is that one of them gets the clause and the other
+/// does not — which no in-memory test can see.
+#[tokio::test(flavor = "multi_thread")]
+async fn simulated_partitions_the_rows_and_the_total() {
+    let db = TestDb::new().await;
+    let repo = boss_jobs::PgJobs::new(db.pool.clone());
+    let board = Subject::new("account", "board");
+
+    let mut real = job(
+        "00000000-0000-0000-0000-0000000000b1",
+        "ship-a-change",
+        board.clone(),
+    );
+    real.title = "real work".into();
+    let mut sim_a = job(
+        "00000000-0000-0000-0000-0000000000b2",
+        "ship-a-change",
+        board.clone(),
+    );
+    sim_a.simulated = true;
+    let mut sim_b = job(
+        "00000000-0000-0000-0000-0000000000b3",
+        "ship-a-change",
+        board.clone(),
+    );
+    sim_b.simulated = true;
+
+    for j in [&real, &sim_a, &sim_b] {
+        repo.create_job(j).await.unwrap();
+    }
+
+    let only_real = JobFilter {
+        kind: Some("ship-a-change".into()),
+        simulated: Some(false),
+        ..Default::default()
+    };
+    let (rows, total) = repo.list_jobs(&only_real, 100, 0).await.unwrap();
+    assert_eq!(rows.len(), 1, "one real packet");
+    assert_eq!(
+        total, 1,
+        "the count query must carry the same clause as the list query — \
+         a total that disagrees with the rows is how this breaks"
+    );
+    assert_eq!(rows[0].title, "real work");
+
+    let only_sim = JobFilter {
+        kind: Some("ship-a-change".into()),
+        simulated: Some(true),
+        ..Default::default()
+    };
+    let (rows, total) = repo.list_jobs(&only_sim, 100, 0).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(total, 2);
+
+    // Absent means everything, so nothing that exists today moves.
+    let all = JobFilter {
+        kind: Some("ship-a-change".into()),
+        ..Default::default()
+    };
+    let (rows, total) = repo.list_jobs(&all, 100, 0).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(total, 3);
 }

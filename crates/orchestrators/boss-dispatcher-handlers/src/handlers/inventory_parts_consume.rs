@@ -34,7 +34,7 @@ pub struct InventoryPartsConsume {
 impl InventoryPartsConsume {
     pub fn new(inventory_base: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: crate::handlers::common::api_client(),
             inventory_base: inventory_base.into(),
         })
     }

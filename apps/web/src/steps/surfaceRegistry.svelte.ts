@@ -5,10 +5,13 @@
 // mapping from a step KIND to its surface is registry DATA, never a
 // kind match in code (enforced by infra/lint/no-step-kind-match.sh).
 //
-// Loaded once per session, same pattern as the tenant manifest.
+// Loaded at app start, same pattern as the tenant manifest.
 // While loading (or if the registry is unreachable) every kind maps
 // to 'generic', which renders the universal fields/notes surface —
-// a degraded-but-usable state, not a blank.
+// a degraded-but-usable state, not a blank. The 'error' state is NOT
+// terminal: StepSurface renders it as an inline notice with a Retry
+// that calls loadStepTypeRegistry again — one failed fetch must not
+// downgrade every surface for the whole session (packet cc9d7fc6).
 
 type RegistryState =
   | { kind: 'loading' }
@@ -20,6 +23,9 @@ export const stepTypeRegistry = $state<{ value: RegistryState }>({
 });
 
 export async function loadStepTypeRegistry(): Promise<void> {
+  if (stepTypeRegistry.value.kind === 'error') {
+    stepTypeRegistry.value = { kind: 'loading' };
+  }
   try {
     const r = await fetch('/api/jobs/step-types');
     if (!r.ok) {

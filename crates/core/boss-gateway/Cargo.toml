@@ -10,7 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 boss-core = { path = "../boss-core" }
-# The auth-event staging path (gateway-audit-events.md Q1): the
+# The auth-event staging path (docs/architecture-decisions.md
+# §Policy & auth): the
 # gateway's one database dependency, scoped to PgOutboxRecorder +
 # a 2-connection lazy pool. Pool only — no macros, no migrations.
 boss-clock-client = { path = "../boss-clock-client" }
@@ -25,6 +26,8 @@ rand = "0.10"
 chrono = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 base64 = "0.22"
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+webauthn-rs-core = "0.5"
 hmac = "0.13"
 sha2 = "0.11"
 subtle = "2"

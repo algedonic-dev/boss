@@ -22,6 +22,10 @@
   };
 
   let orders = $state<PurchaseOrder[]>([]);
+  /// Non-null when the load failed — rendered instead of the empty
+  /// state, so an outage never reads as "nothing awaiting approval"
+  /// (packet 3fba9c35, the false-empty sweep).
+  let loadFailed = $state<string | null>(null);
   let loading = $state(true);
   let actionStatus = $state<Record<string, string>>({});
 
@@ -33,10 +37,15 @@
         const r = await fetch('/api/inventory/orders');
         if (r.ok) {
           const all = (await r.json()) as PurchaseOrder[];
-          if (!cancelled) orders = all;
+          if (!cancelled) {
+            orders = all;
+            loadFailed = null;
+          }
+        } else {
+          if (!cancelled) loadFailed = `HTTP ${r.status}`;
         }
-      } catch {
-        // API unavailable; fall through to empty state.
+      } catch (e) {
+        if (!cancelled) loadFailed = e instanceof Error ? e.message : String(e);
       }
       if (!cancelled) loading = false;
     })();
@@ -80,6 +89,10 @@
 
 {#if loading}
   <p style="padding:16px; color:#78716c">Loading purchase orders...</p>
+{:else if loadFailed}
+  <p class="empty load-failed" role="alert" style="padding:16px">
+    Couldn't load purchase orders — {loadFailed}
+  </p>
 {:else}
   <div style="padding:0 0 32px">
     <Section title={`Pending approval (${draftOrders.length})`}>

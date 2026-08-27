@@ -56,3 +56,8 @@ docs/formal/*.toolbox/
 # start from a known-fresh artifact rather than a stale snapshot.
 infra/postgres/seed-brewery-audit-log.sql.gz
 infra/postgres/seed-brewery-audit-log.meta.json
+
+# The gate writes its own account of each run (infra/gate.sh
+# write_receipt). It is evidence to paste onto a car, not a
+# tracked artifact.
+.gate-receipt.json

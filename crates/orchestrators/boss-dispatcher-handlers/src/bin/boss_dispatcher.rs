@@ -20,15 +20,17 @@ use boss_dispatcher::rules::runner::RulesRunner;
 use boss_dispatcher::rules::schedule_runner::{DEFAULT_CATCHUP_CAP, ScheduleRunner};
 use boss_dispatcher_handlers::handlers::{
     bill_payment_batch::BillPaymentBatch, commerce_invoice_issue::CommerceInvoiceIssue,
-    docs_flush_queue::DocsFlushQueue, gate_resolve::GateResolve,
-    inventory_bill_approve::InventoryBillApprove,
+    docs_design_sweep::DocsDesignSweep, docs_flush_queue::DocsFlushQueue,
+    gate_resolve::GateResolve, inventory_bill_approve::InventoryBillApprove,
     inventory_overhead_absorb::InventoryOverheadAbsorb,
     inventory_parts_consume::InventoryPartsConsume, inventory_parts_produce::InventoryPartsProduce,
     inventory_po_place::InventoryPoPlace, inventory_receive::InventoryReceive,
-    jobs_clear_waiting::JobsClearWaiting, jobs_complete_step::JobsCompleteStep,
-    jobs_subjob_resolve::JobsSubjobResolve, ledger_bill_approve::LedgerBillApprove,
-    ledger_payroll_run_submit::LedgerPayrollRunSubmit, ledger_tax_accrue::LedgerTaxAccrue,
-    ledger_tax_remit::LedgerTaxRemit, messages_notify::MessagesNotify,
+    jobs_clear_waiting::JobsClearWaiting, jobs_complete_linked_step::JobsCompleteLinkedStep,
+    jobs_complete_step::JobsCompleteStep, jobs_subjob_resolve::JobsSubjobResolve,
+    ledger_bill_approve::LedgerBillApprove, ledger_payroll_run_submit::LedgerPayrollRunSubmit,
+    ledger_tax_accrue::LedgerTaxAccrue, ledger_tax_remit::LedgerTaxRemit,
+    messages_expire_for_job::MessagesExpireForJob, messages_notify::MessagesNotify,
+    messages_notify_job_terminal::MessagesNotifyJobTerminal, network_census::NetworkCensus,
     packaging_allocate::PackagingAllocate, people_hire::PeopleHire,
     people_terminate::PeopleTerminate, products_consume::ProductsConsume,
     products_consume_from_invoice::ProductsConsumeFromInvoice, products_produce::ProductsProduce,
@@ -134,6 +136,11 @@ async fn main() -> Result<()> {
             // A closed Job wakes its waiters: clears metadata.waiting_on
             // (the '*' job edge) so blocked steps re-evaluate (e9291570).
             handlers.register(JobsClearWaiting::new(cfg.jobs_api_url.clone()));
+            // A closing Job completes the open step it was authorized
+            // by, on the Job its declared edge names — the merged car
+            // → feedback-packet obligation (2c4ae549). Generic: which
+            // edge and which steps ride the rule row.
+            handlers.register(JobsCompleteLinkedStep::new(cfg.jobs_api_url.clone()));
             // System-completes zero-duration, no-role markers
             // (trigger / outcome / milestone) the moment they go
             // Ready, so a Job flows past its structural checkpoints
@@ -234,10 +241,36 @@ async fn main() -> Result<()> {
             // (cea82de0 link 1; the worker stays operator-run until
             // its tree/remote question is decided).
             handlers.register(DocsFlushQueue::new(cfg.docs_api_url.clone()));
+            // Reads the docs corpus AND the jobs board: the level
+            // question spans both, which is why it is a sweep rather
+            // than anything either service could answer alone.
+            handlers.register(DocsDesignSweep::new(
+                cfg.docs_api_url.clone(),
+                cfg.jobs_api_url.clone(),
+            ));
+            // The packet-loss census (packet-loss.md, 9fb9904f): count
+            // the network's conservation invariant on a clock and land
+            // the counts as one jobs.network.census event per firing.
+            // Report first — no raiser, no threshold; the series this
+            // accumulates is what calibrates one later.
+            handlers.register(NetworkCensus::new(cfg.jobs_api_url.clone()));
             handlers.register(MessagesNotify::new(
                 cfg.people_api_url.clone(),
                 cfg.messages_api_url.clone(),
             ));
+            // The filer hears how their packet ended, on ANY terminal
+            // (David, 2026-08-11: the system may close feedback
+            // without the filer approving, but must always tell them
+            // the terminal state). Same messages surface, so the
+            // deterministic id dedupes on redelivery.
+            handlers.register(MessagesNotifyJobTerminal::new(
+                cfg.jobs_api_url.clone(),
+                cfg.messages_api_url.clone(),
+            ));
+            // Retire the notifications about a job once it closes
+            // (David, 2026-08-14). Unread signals only — the port
+            // carries why a direct never expires with the job.
+            handlers.register(MessagesExpireForJob::new(cfg.messages_api_url.clone()));
             let helpers = Arc::new(InventoryHelpers::new(
                 cfg.inventory_api_url.clone(),
                 cfg.jobs_api_url.clone(),
@@ -310,6 +343,7 @@ async fn main() -> Result<()> {
                     let schedule_runner = Arc::new(ScheduleRunner {
                         registry: registry.clone(),
                         handlers: handlers.clone(),
+                        helpers: helpers.clone(),
                         clock_url: clock_url.clone(),
                         pool: pool_rules.clone(),
                         calendar: calendar.clone(),

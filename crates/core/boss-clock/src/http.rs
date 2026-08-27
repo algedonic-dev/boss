@@ -523,6 +523,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+        let wall_anchor = std::time::Instant::now();
         let (_, before) = get_json(app.clone(), "/api/clock/now").await;
         let sim_before = before["now"].as_str().expect("now").to_string();
         assert_ne!(
@@ -545,14 +546,38 @@ mod tests {
         );
 
         // And the point of the re-anchor still holds: sim-time must
-        // not jump. Compared to the second, since the formula is
-        // millisecond-quantised and a teleport would be days.
+        // not jump. The first version asserted second-level string
+        // equality, which at day-per-millisecond warp requires the
+        // before-read and the configure to land in the SAME wall
+        // millisecond — free on an idle laptop, hopeless on a loaded
+        // runner (flaked on forge train #1, 2026-08-12, in a crate no
+        // car touched). The second version bounded drift by the
+        // MEASURED wall gap times the old warp — and flaked on forge
+        // train #4 with drift exactly 86400s between two midnight
+        // stamps: at this warp the sim clock only EXISTS in whole-day
+        // quanta (1 wall ms = 1 sim day), so two reads a hair apart
+        // in wall time can still straddle a millisecond boundary and
+        // legitimately differ by a full quantum the wall gap does not
+        // predict. The bound therefore carries one quantum on both
+        // sides — while the bug this test exists to catch re-derives
+        // sim-time from today and jumps ~half a year, far beyond a
+        // day.
         let (_, after) = get_json(app, "/api/clock/now").await;
         let sim_after = after["now"].as_str().expect("now");
-        assert_eq!(
-            &sim_before[..19],
-            &sim_after[..19],
-            "sim-time teleported across the warp change: {sim_before} -> {sim_after}"
+        let parse = |t: &str| {
+            chrono::DateTime::parse_from_rfc3339(t)
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .expect("clock timestamps parse")
+        };
+        const QUANTUM_SECS: f64 = 86_400.0; // one sim-day per wall ms
+        let drift = parse(sim_after) - parse(&sim_before);
+        let drift_secs = drift.num_seconds() as f64;
+        let allowed_secs = wall_anchor.elapsed().as_secs_f64() * 86_400_000.0 + QUANTUM_SECS + 60.0;
+        assert!(
+            drift_secs >= -QUANTUM_SECS && drift_secs <= allowed_secs,
+            "sim-time teleported across the warp change: {sim_before} -> {sim_after} \
+             (drift {drift_secs:.0}s, quantized jitter allows [-{QUANTUM_SECS:.0}, \
+             {allowed_secs:.0}]s)"
         );
     }
 

@@ -5,8 +5,6 @@
 //! `vendor_category`. The match is fully generic — no SKU knowledge in
 //! code; the mapping is data on the item (from the tenant's parts.toml).
 
-#![cfg(feature = "postgres")]
-
 use boss_inventory::PgInventory;
 use boss_inventory::port::InventoryRepository;
 use boss_inventory::types::InventoryItem;
@@ -17,8 +15,8 @@ fn stamp() -> boss_core::publisher::EventStamp {
     boss_core::publisher::EventStamp::new(
         "inventory-test",
         boss_core::actor::ActorId::Automation("test".into()),
-        chrono::Utc::now(),
     )
+    .with_timestamp(chrono::Utc::now())
 }
 
 async fn insert_vendor(db: &TestDb, id: &str, category: &str) {

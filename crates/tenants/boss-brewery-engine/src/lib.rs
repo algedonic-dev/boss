@@ -658,6 +658,17 @@ pub fn calendars_from_seeds(seeds: &Path) -> Vec<BusinessCalendar> {
 /// callers MUST invoke [`brewery_end_of_day`] to flush per-day
 /// counters + the SimOutput's per-day buffer + clear the bus.
 ///
+/// `ticks_per_day` is the number of slices the CALLER is running
+/// this sim-day — the one clock. The engine sizes this tick as
+/// `1/ticks_per_day` of a day, so the N slices a daemon runs
+/// always sum to 24 hours and per-day expected volume is invariant
+/// of granularity. This is deliberately a parameter rather than a
+/// re-derivation from `tenant.meta.ticks_per_day()`: the daemon
+/// collapses backfill days to ONE slice under warp, and when the
+/// engine re-derived 1440 here instead, every Poisson job rate and
+/// subject-birth rate ran at 1/1440 strength for the whole
+/// fabricated year (`tests/one_clock_ticks_per_day.rs` pins this).
+///
 /// Operating-day skip: this returns `Ok(())` without doing work
 /// when the day isn't an operating day per `tenant.meta`. Daemons
 /// can advance the calendar regardless; the engine just no-ops
@@ -666,12 +677,12 @@ pub fn run_brewery_one_tick(
     engine: &mut BreweryEngineState,
     day: NaiveDate,
     tick_idx: u32,
+    ticks_per_day: u32,
     output: &mut dyn SimOutput,
 ) -> Result<()> {
     if !engine.tenant.meta.is_operating_day(day) {
         return Ok(());
     }
-    let ticks_per_day = engine.tenant.meta.ticks_per_day();
     run_one_tick_with_handlers(
         day,
         tick_idx,

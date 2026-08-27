@@ -33,7 +33,7 @@ fn marked_step_done_matches_and_unmarked_does_not() {
         "job_id": "j1", "step_id": "s1", "kind": "task", "notify_on_done": true,
         "metadata": { "authority_role": "platform-admin", "notify_on_done": true }
     });
-    let hits = match_event(&reg, "step.done.task", &marked, &NoHelpers).expect("eval");
+    let hits = match_event(&reg, "step.done.task", &marked, &NoHelpers).matched;
     assert_eq!(hits.len(), 1, "opted-in step notifies");
     let (k, v) = &hits[0].invocations[0].args[0];
     assert_eq!(k, "id_prefix");
@@ -47,6 +47,6 @@ fn marked_step_done_matches_and_unmarked_does_not() {
         "job_id": "j1", "step_id": "s2", "kind": "task", "notify_on_done": false,
         "metadata": { "authority_role": "platform-admin" }
     });
-    let hits = match_event(&reg, "step.done.task", &unmarked, &NoHelpers).expect("eval");
+    let hits = match_event(&reg, "step.done.task", &unmarked, &NoHelpers).matched;
     assert!(hits.is_empty(), "the unmarked majority stays silent");
 }

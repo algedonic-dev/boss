@@ -34,7 +34,7 @@ pub struct InventoryReceive {
 impl InventoryReceive {
     pub fn new(inventory_base: impl Into<String>, ledger_base: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: crate::handlers::common::api_client(),
             inventory_base: inventory_base.into(),
             ledger_base: ledger_base.into(),
         })

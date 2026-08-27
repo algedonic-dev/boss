@@ -12,6 +12,7 @@
   // no-step-kind-match lint fails the build if one returns.
 
   import GenericSurface from './GenericSurface.svelte';
+  import DecisionContext from './DecisionContext.svelte';
   import ApprovalSurface from './ApprovalSurface.svelte';
   import RepairSurface from './RepairSurface.svelte';
   import InspectionSurface from './InspectionSurface.svelte';
@@ -24,9 +25,14 @@
   import ReceivingSurface from './ReceivingSurface.svelte';
   import ProcurementSurface from './ProcurementSurface.svelte';
   import StepPluginMount from './StepPluginMount.svelte';
-  import { hasActivePluginFor } from './pluginHost';
-  import { surfaceOf } from './surfaceRegistry.svelte';
+  import { probeActivePlugin } from './pluginHost';
+  import {
+    loadStepTypeRegistry,
+    stepTypeRegistry,
+    surfaceOf,
+  } from './surfaceRegistry.svelte';
   import { session } from '@boss/web-kit/session/session.svelte';
+  import WriteGate from '@boss/web-kit/ui/WriteGate.svelte';
   import FileAttachments from '../content/FileAttachments.svelte';
   import type { StepStatus } from '../jobs/types';
 
@@ -58,18 +64,46 @@
   // Async-resolved: does the boss-jobs step-plugin registry have
   // an active row for this kind? Until the fetch returns we
   // render GenericSurface; if a plugin IS registered, we swap to
-  // StepPluginMount once the result lands.
+  // StepPluginMount once the result lands. A FAILED probe is its
+  // own state — it renders the degraded-registry notice below, it
+  // is not silently "no plugin".
   let pluginAvailable = $state<boolean | null>(null);
+  let pluginProbeFailed = $state(false);
+  // Bumped by the Retry affordance so the probe effect re-runs.
+  let retryNonce = $state(0);
   $effect(() => {
+    void retryNonce;
     pluginAvailable = null;
     let cancelled = false;
-    hasActivePluginFor(step.kind).then((avail) => {
-      if (!cancelled) pluginAvailable = avail;
+    probeActivePlugin(step.kind).then((probe) => {
+      if (cancelled) return;
+      if (probe.kind === 'failed') {
+        pluginProbeFailed = true;
+        pluginAvailable = false;
+      } else {
+        pluginProbeFailed = false;
+        pluginAvailable = probe.active;
+      }
     });
     return () => {
       cancelled = true;
     };
   });
+
+  // The one-fetch downgrade (packet cc9d7fc6): when either registry
+  // read failed, every step silently rendered the generic fallback
+  // for the rest of the session. The fallback stays (degraded but
+  // usable) — the failure just becomes visible and retryable.
+  let registryDegraded = $derived(
+    stepTypeRegistry.value.kind === 'error' || pluginProbeFailed,
+  );
+
+  function retryRegistries(): void {
+    if (stepTypeRegistry.value.kind === 'error') {
+      void loadStepTypeRegistry();
+    }
+    retryNonce += 1;
+  }
 
   let user = $derived(
     session.value.kind === 'ready'
@@ -78,6 +112,12 @@
   );
 </script>
 
+<!-- Every step surface — platform, generic fallback, and mounted
+     plugins alike — stands behind the readonly gate. This dispatcher
+     is the shared write path for step work (JobDetailPage,
+     StepFocusPage, DecideModal all mount it), so gating HERE is the
+     one edit instead of one per surface. -->
+<WriteGate>
 {#if pluginAvailable === true}
   <!-- Plugin-backed steps can also take the whole viewport. Reading
        tasks (a design review is a document plus decisions) compete
@@ -94,30 +134,48 @@
     {onUpdate}
     currentUser={user}
   />
-{:else if surfaceOf(step.kind) === 'approval'}
-  <ApprovalSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'repair'}
-  <RepairSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'inspection'}
-  <InspectionSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'billing'}
-  <BillingSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'intake'}
-  <IntakeSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'shipment'}
-  <ShipmentSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'scheduling'}
-  <SchedulingSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'production-consume'}
-  <ProductionConsumeSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'handoff'}
-  <HandoffSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'receiving'}
-  <ReceivingSurface {step} {jobId} {onUpdate} />
-{:else if surfaceOf(step.kind) === 'procurement'}
-  <ProcurementSurface {step} {jobId} {onUpdate} />
 {:else}
-  <GenericSurface {step} {jobId} {onUpdate} />
+  {#if registryDegraded}
+    <div class="step-registry-error" role="alert">
+      <span>
+        Couldn't load the step-surface registry — showing the generic
+        surface for now.
+      </span>
+      <button class="step-btn" onclick={retryRegistries}>Retry</button>
+    </div>
+  {/if}
+  <!-- Non-plugin surfaces get the packet's case rendered above the
+       action (19db52de: "there is just a sign and complete button,
+       which doesn't seem like much of a choice"). A mounted plugin is
+       its own presentation, so the panel lives on this side of the
+       fork — once, for every platform surface and the generic
+       fallback alike. -->
+  <DecisionContext {step} {jobId} />
+  {#if surfaceOf(step.kind) === 'approval'}
+    <ApprovalSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'repair'}
+    <RepairSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'inspection'}
+    <InspectionSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'billing'}
+    <BillingSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'intake'}
+    <IntakeSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'shipment'}
+    <ShipmentSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'scheduling'}
+    <SchedulingSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'production-consume'}
+    <ProductionConsumeSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'handoff'}
+    <HandoffSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'receiving'}
+    <ReceivingSurface {step} {jobId} {onUpdate} />
+  {:else if surfaceOf(step.kind) === 'procurement'}
+    <ProcurementSurface {step} {jobId} {onUpdate} />
+  {:else}
+    <GenericSurface {step} {jobId} {onUpdate} />
+  {/if}
 {/if}
 
 <!--
@@ -131,6 +189,7 @@
 <div class="step-attachments">
   <FileAttachments targetKind="step" targetId={step.id} />
 </div>
+</WriteGate>
 
 <style>
   .step-surface-expand { display: flex; justify-content: flex-end; }

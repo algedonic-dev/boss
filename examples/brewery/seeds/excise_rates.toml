@@ -1,0 +1,27 @@
+# Excise-tax rate schedules — registry rows the ledger's accrual
+# endpoint resolves (excise_rate_schedules; brewery-fidelity Q4,
+# decided 2026-08-22). Seeded by `boss-brewery-sim prepare` via
+# PUT /api/ledger/excise-rate-schedules; idempotent, safe to re-run.
+#
+# Rates are regulator data, so they live in tenant seeds, not the
+# platform schema. Tiers are graduated over the jurisdiction's
+# year-to-date taxed barrels: `up_to_bbl` is the inclusive cumulative
+# calendar-year bound; only the last tier may omit it. A rate change
+# is a NEW [[schedule]] block with a later effective_from (registry
+# convention — append, don't mutate history).
+#
+# US-FEDERAL is the real TTB small-domestic-brewer curve (26 USC
+# 5051): $3.50/bbl on the first 60,000 bbl of the calendar year,
+# $16.00/bbl from there to the 6,000,000-bbl band. At Algedonic
+# Ales' stated ~262k bbl/yr this accrues ≈ $3.44M/yr — the flat
+# $3.50 fallback the dispatcher rule carries understates that ~3.7×,
+# which is the audit finding this row closes. State excise rows
+# (e.g. US-OR) land here the same way when the model grows them.
+
+[[schedule]]
+jurisdiction = "US-FEDERAL"
+effective_from = "2025-01-01"
+tiers = [
+    { up_to_bbl = 60000, rate_cents_per_bbl = 350 },
+    { up_to_bbl = 6000000, rate_cents_per_bbl = 1600 },
+]

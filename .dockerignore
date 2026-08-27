@@ -8,6 +8,7 @@ target/
 **/node_modules/
 apps/web/dist/
 apps/web/.svelte-kit/
+apps/simulator/dist/
 
 # Local-dev artifacts — never used by the image.
 .git/

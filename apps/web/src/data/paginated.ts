@@ -24,14 +24,23 @@ export type Paged<T> = Readonly<{
   offset: number;
 }>;
 
-export async function fetchPaged<T>(url: string): Promise<Paged<T> | null> {
+/// The result of fetching one page — a discriminated union, because a
+/// failed fetch is NOT an empty page (packet 3fba9c35). The old
+/// `Paged<T> | null` contract let every caller `?? []` an outage into
+/// the page's normal empty state.
+export type PagedResult<T> =
+  | { kind: 'ready'; page: Paged<T> }
+  | { kind: 'failed'; error: string };
+
+export async function fetchPaged<T>(url: string): Promise<PagedResult<T>> {
   try {
     const resp = await fetch(url);
-    if (!resp.ok) return null;
+    if (!resp.ok) return { kind: 'failed', error: `${url}: HTTP ${resp.status}` };
     const body = (await resp.json()) as unknown;
-    return normalise<T>(body);
-  } catch {
-    return null;
+    return { kind: 'ready', page: normalise<T>(body) };
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    return { kind: 'failed', error: detail };
   }
 }
 

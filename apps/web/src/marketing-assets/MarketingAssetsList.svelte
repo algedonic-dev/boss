@@ -29,6 +29,10 @@
   let includeRetired = $state(false);
   let query = $state('');
   let assets = $state<MarketingAsset[]>([]);
+  /// Non-null when the load failed — rendered instead of the empty
+  /// state, so an outage never reads as "no marketing assets yet"
+  /// (packet 3fba9c35, the false-empty sweep).
+  let loadFailed = $state<string | null>(null);
   let loading = $state(true);
 
   $effect(() => {
@@ -45,10 +49,15 @@
         const resp = await fetch(`/api/catalog/marketing-assets?${qs.toString()}`);
         if (resp.ok) {
           const body = (await resp.json()) as MarketingAsset[];
-          if (!cancelled) assets = Array.isArray(body) ? body : [];
+          if (!cancelled) {
+            assets = Array.isArray(body) ? body : [];
+            loadFailed = null;
+          }
+        } else {
+          if (!cancelled) loadFailed = `HTTP ${resp.status}`;
         }
-      } catch {
-        // ignore
+      } catch (e) {
+        if (!cancelled) loadFailed = e instanceof Error ? e.message : String(e);
       }
       if (!cancelled) loading = false;
     })();
@@ -108,6 +117,10 @@
     <section class="list-section">
       {#if loading && assets.length === 0}
         <p class="empty">Loading…</p>
+      {:else if loadFailed}
+        <p class="empty load-failed" role="alert">
+          Couldn't load marketing assets — {loadFailed}
+        </p>
       {:else if visible.length === 0}
         <p class="empty">
           {assets.length === 0 ? 'No marketing assets yet.' : 'No assets match those filters.'}
@@ -140,27 +153,25 @@
                     {a.title}
                   </a>
                   {#if retired}
-                    <span style="margin-left:6px; font-size:10px; padding:1px 6px; border-radius:3px; background:#e7e5e4; color:#57534e">
-                      RETIRED
-                    </span>
+                    <span class="chip" style="margin-left:6px">RETIRED</span>
                   {/if}
                 </td>
                 <td>{a.kind ? (kindLabel.get(a.kind) ?? a.kind) : '—'}</td>
-                <td style="color:#78716c; font-size:12px">
+                <td style="color:var(--static); font-size:12px">
                   {a.tags.length > 0 ? a.tags.slice(0, 4).join(', ') : '—'}
                   {#if a.tags.length > 4} +{a.tags.length - 4}{/if}
                 </td>
-                <td style="color:#78716c; font-size:12px">
+                <td style="color:var(--static); font-size:12px">
                   {linkedCount > 0 ? `${linkedCount} ${linkedCount === 1 ? 'link' : 'links'}` : '—'}
                 </td>
                 <td>
                   {#if a.owner_id}
                     <EntityLink kind="employee" id={a.owner_id} />
                   {:else}
-                    <span style="color:#a8a29e">—</span>
+                    <span style="color:var(--static)">—</span>
                   {/if}
                 </td>
-                <td style="color:#78716c; font-size:12px">{a.updated_at.slice(0, 10)}</td>
+                <td style="color:var(--static); font-size:12px">{a.updated_at.slice(0, 10)}</td>
               </tr>
             {/each}
           </tbody>

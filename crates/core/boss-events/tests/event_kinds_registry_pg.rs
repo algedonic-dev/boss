@@ -6,8 +6,6 @@
 //! returned by name; the seeded registry covers a representative
 //! sample of the live vocabulary.
 
-#![cfg(feature = "postgres")]
-
 use boss_events::integrity::unregistered_kinds;
 use boss_testing::TestDb;
 

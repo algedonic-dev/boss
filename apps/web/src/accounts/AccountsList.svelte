@@ -73,9 +73,12 @@
         const pBody = await pResp.json();
         if (!cancelled) {
           accounts = Array.isArray(pBody) ? pBody : (pBody.data ?? []);
-          devicesPage = dPaged;
-          jobsPage = jPaged;
-          invoicesPage = iPaged;
+          // Device/ticket/AR columns are secondary joins — a failed
+          // side-load degrades those columns, it does not fail the
+          // account list itself.
+          devicesPage = dPaged.kind === 'ready' ? dPaged.page : null;
+          jobsPage = jPaged && jPaged.kind === 'ready' ? jPaged.page : null;
+          invoicesPage = iPaged.kind === 'ready' ? iPaged.page : null;
           loading = false;
         }
       } catch (e) {

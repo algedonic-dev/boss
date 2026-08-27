@@ -4,6 +4,7 @@
   import Section from '@boss/web-kit/ui/Section.svelte';
   import { appNow } from '@boss/web-kit/sim-clock';
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
+  import { formatActor, isHumanActor } from '../data/actor';
   import { createAccountNote } from './api';
   import type { AccountNote } from './types';
   import { session } from '@boss/web-kit/session/session.svelte';
@@ -116,12 +117,19 @@
             <div class="pp-note-item-header">
               <span class="pp-note-kind-chip">{n.kind}</span>
               <span class="pp-note-item-author">
-                <EntityLink
-                  kind="employee"
-                  id={n.actor_id}
-                  label={empNames.get(n.actor_id)}
-                  mono={false}
-                />
+                {#if isHumanActor(n.actor_id)}
+                  <EntityLink
+                    kind="employee"
+                    id={n.actor_id}
+                    label={empNames.get(n.actor_id)}
+                    mono={false}
+                  />
+                {:else}
+                  <!-- A machine CPU (automation or `<mode>:<model>` agent) has
+                       no employee page; linking one produced a dead link
+                       labelled with the raw actor id. -->
+                  {formatActor(n.actor_id)}
+                {/if}
               </span>
               <span class="pp-note-item-when">{daysAgo(n.created_at)} ago</span>
             </div>

@@ -180,6 +180,9 @@
 
   let launches = $state<LaunchCalendarRow[]>([]);
   let launchesLoading = $state(true);
+  /// Non-null when the panel's load failed — rendered instead of the
+  /// empty state (packet 3fba9c35, the false-empty sweep).
+  let launchesFailed = $state<string | null>(null);
 
   $effect(() => {
     let cancelled = false;
@@ -194,10 +197,15 @@
         const r = await fetch(`/api/jobs/launch-calendar?${qs.toString()}`);
         if (r.ok) {
           const body = (await r.json()) as { data?: LaunchCalendarRow[] };
-          if (!cancelled) launches = Array.isArray(body?.data) ? body.data : [];
+          if (!cancelled) {
+            launches = Array.isArray(body?.data) ? body.data : [];
+            launchesFailed = null;
+          }
+        } else {
+          if (!cancelled) launchesFailed = `HTTP ${r.status}`;
         }
-      } catch {
-        // ignore
+      } catch (e) {
+        if (!cancelled) launchesFailed = e instanceof Error ? e.message : String(e);
       }
       if (!cancelled) launchesLoading = false;
     })();
@@ -224,6 +232,9 @@
   };
   let products = $state<ProductRow[]>([]);
   let productsLoading = $state(true);
+  /// Non-null when the panel's load failed — rendered instead of the
+  /// empty state (packet 3fba9c35, the false-empty sweep).
+  let productsFailed = $state<string | null>(null);
 
   $effect(() => {
     let cancelled = false;
@@ -232,10 +243,15 @@
         const r = await fetch('/api/products');
         if (r.ok) {
           const list = (await r.json()) as ProductRow[];
-          if (!cancelled) products = list;
+          if (!cancelled) {
+            products = list;
+            productsFailed = null;
+          }
+        } else {
+          if (!cancelled) productsFailed = `HTTP ${r.status}`;
         }
-      } catch {
-        // ignore — the panel renders an empty state
+      } catch (e) {
+        if (!cancelled) productsFailed = e instanceof Error ? e.message : String(e);
       }
       if (!cancelled) productsLoading = false;
     })();
@@ -386,6 +402,10 @@
       <h2>Launches — next 30 days</h2>
       {#if launchesLoading && launches.length === 0}
         <p class="empty">Loading…</p>
+      {:else if launchesFailed}
+        <p class="empty load-failed" role="alert">
+          Couldn't load launches — {launchesFailed}
+        </p>
       {:else if launches.length === 0}
         <p class="empty">No marketing motions launching in the next 30 days.</p>
       {:else}
@@ -431,6 +451,10 @@
       <h2>Finished goods on hand</h2>
       {#if productsLoading && products.length === 0}
         <p class="empty">Loading inventory…</p>
+      {:else if productsFailed}
+        <p class="empty load-failed" role="alert">
+          Couldn't load inventory — {productsFailed}
+        </p>
       {:else if topProducts.length === 0}
         <p class="empty">No finished products in inventory.</p>
       {:else}

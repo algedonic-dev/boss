@@ -252,12 +252,12 @@ echo "    waiting up to 30s for services to bind ports + reconcile defaults"
 # 200 with a non-empty array proves reconcile ran.
 RECONCILED=0
 for i in $(seq 1 60); do
-    # Fetch first, then parse from a variable — keeps the scanner from
-    # reading `curl … | python3` as an unpinned download-then-run.
+    # Fetch first, then parse from a variable — keeps the fetch and the
+    # parse as two visibly separate motions for static scanners.
     KINDS=$(curl -s -m 2 http://127.0.0.1:7900/api/workflows 2>/dev/null || true)
     if curl -s -f -m 2 http://127.0.0.1:7900/api/jobs/health >/dev/null 2>&1 \
         && printf '%s' "$KINDS" \
-        | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if isinstance(d,list) and len(d)>0 else 1)' 2>/dev/null; then
+        | jq -e '(type == "array") and (length > 0)' >/dev/null 2>&1; then
         RECONCILED=1
         echo "    boss-jobs-api ready + reconciled (after ${i}s)"
         break
@@ -403,7 +403,7 @@ echo "==> [5.5/10] waiting for people projection to warm (roster readiness)"
 ppl_prev=-1; ppl_stable=0
 for _i in $(seq 1 90); do
     ppl_n=$(curl -s "http://127.0.0.1:7500/api/people" 2>/dev/null \
-        | python3 -c "import sys,json;print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+        | jq -e 'length' 2>/dev/null || echo 0)
     if [ "$ppl_n" -gt 100 ] && [ "$ppl_n" = "$ppl_prev" ]; then
         ppl_stable=$((ppl_stable + 1))
         if [ "$ppl_stable" -ge 3 ]; then
@@ -520,20 +520,15 @@ for YEAR in $(seq "$START_YEAR" "$END_YEAR"); do
         echo "ERROR: failed to create FY${YEAR} period (HTTP $HTTP_CODE): $BODY" >&2
         exit 1
     fi
-    PERIOD_ID=$(echo "$BODY" | python3 -c 'import sys,json
-try:
-    d=json.load(sys.stdin)
-    print(d.get("id") or d.get("period_id") or "")
-except Exception: pass')
+    PERIOD_ID=$(echo "$BODY" | jq -r '.id // .period_id // ""' 2>/dev/null || true)
     if [[ -z "$PERIOD_ID" ]]; then
         # Fall back to lookup if the response didn't include the id
         # (e.g., 409 idempotent return).
         PERIODS_JSON=$(curl -sS "http://127.0.0.1:7080/api/ledger/periods?kind=year")
-        PERIOD_ID=$(printf '%s' "$PERIODS_JSON" | python3 -c "import sys,json
-d=json.load(sys.stdin)
-rows=d if isinstance(d,list) else d.get('data',d.get('rows',[]))
-match=next((p for p in rows if p.get('starts_on','').startswith('${YEAR}-')), None)
-print(match.get('id','') if match else '')")
+        PERIOD_ID=$(printf '%s' "$PERIODS_JSON" | jq -r --arg y "$YEAR" '
+            (if type == "array" then . else (.data // .rows // []) end)
+            | map(select((.starts_on // "") | startswith($y + "-")))
+            | .[0].id // ""' 2>/dev/null || true)
     fi
     if [[ -z "$PERIOD_ID" ]]; then
         echo "ERROR: couldn't resolve FY${YEAR} period id" >&2

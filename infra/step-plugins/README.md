@@ -262,6 +262,10 @@ via `BOSS_PLUGINS_DIR`). No restart required.
 | `sr-triage.js` | `sr-triage` | Mandatory intake fields (account, device, failure, priority) + optional Jira key + triage decision (dispatch / remote / parts-only). |
 | `diagnostic-call.js` | `diagnostic-call` | Call log: schedule, channel, join URL, attendees, notes, optional recording URL. |
 | `review-design.js` | `review-design` | Design-doc-review surface: per-`### Qn:` resolution textareas; gates completion on every open question having a recorded resolution, saved as pending-decisions. |
+| `answer-question.js` | `answer-question` | Question-and-response decision surface: the brief from the step's own metadata (falling back to the Job's filed message), then the answer. |
+| `sign-off.js` | `sign-off` | The case being decided, the roster of roles that must stamp, and the stamp ceremony — so a sign-off is a choice rather than a button. |
+| `correction-verdict.js` | `correction-verdict` | The correct-the-record gate: the false claim beside the measurement that contradicts it, each verdict labelled with what it causes. |
+| `scope-declaration.js` | `scope-declaration` | The ship-a-change boundary declaration: asks what the car DOES and what it deliberately does NOT do (and why), with the branch, the packet it answers, and the gate receipt when there is one. |
 
 ---
 

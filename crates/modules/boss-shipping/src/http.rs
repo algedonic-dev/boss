@@ -262,14 +262,13 @@ async fn create_shipment<R: ShippingRepository + 'static>(
     {
         return resp;
     }
-    let now = boss_clock_client::now_from(&state.clock).await;
     // OUTBOX (phase 2): the adapter records shipping.shipment.created
     // (full row state) inside the domain transaction; nothing
     // publishes post-commit.
-    let stamp = event_stamp(&state, &user, now).await;
+    let stamp = event_stamp(&state, &user).await;
     match state
         .shipping
-        .create_shipment_at(&shipment, now, &stamp)
+        .create_shipment_at(&shipment, stamp.timestamp, &stamp)
         .await
     {
         Ok(id) => (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response(),
@@ -286,14 +285,13 @@ async fn create_shipment<R: ShippingRepository + 'static>(
 async fn event_stamp<R: ShippingRepository>(
     state: &ShippingApiState<R>,
     user: &boss_policy_client::User,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> boss_core::publisher::EventStamp {
     let actor = user
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
     match &state.publisher {
-        Some(p) => p.stamp_with_actor_at(actor, now).await,
-        None => boss_core::publisher::EventStamp::new("shipping", actor, now),
+        Some(p) => p.stamp_with_actor(actor).await,
+        None => boss_core::publisher::EventStamp::new("shipping", actor),
     }
 }
 
@@ -303,10 +301,9 @@ async fn batch_shipments<R: ShippingRepository + 'static>(
     Json(shipments): Json<Vec<Shipment>>,
 ) -> Response {
     let mut inserted = 0u64;
-    let batch_now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, &user, batch_now).await;
+    let stamp = event_stamp(&state, &user).await;
     for s in &shipments {
-        let now = batch_now;
+        let now = stamp.timestamp;
         // Status + carrier registry gates — skip rows with an
         // unregistered (or unreachable-registry) code, matching this
         // endpoint's existing skip-on-failure batch semantics.
@@ -358,11 +355,10 @@ async fn update_shipment<R: ShippingRepository + 'static>(
     {
         return resp;
     }
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, &user, now).await;
+    let stamp = event_stamp(&state, &user).await;
     match state
         .shipping
-        .update_shipment_at(&id, &shipment, now, &stamp)
+        .update_shipment_at(&id, &shipment, stamp.timestamp, &stamp)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -375,9 +371,12 @@ async fn delete_shipment<R: ShippingRepository + 'static>(
     Path(id): Path<String>,
     CurrentUser(user): CurrentUser,
 ) -> Response {
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, &user, now).await;
-    match state.shipping.delete_shipment_at(&id, now, &stamp).await {
+    let stamp = event_stamp(&state, &user).await;
+    match state
+        .shipping
+        .delete_shipment_at(&id, stamp.timestamp, &stamp)
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => shipping_error_response(e),
     }
@@ -450,7 +449,7 @@ async fn record_tracking_scan<R: ShippingRepository + 'static>(
     }
     let now = boss_clock_client::now_from(&state.clock).await;
     let occurred_on = body.day.unwrap_or(now.date_naive());
-    let stamp = event_stamp(&state, &user, now).await;
+    let stamp = event_stamp(&state, &user).await;
 
     match state
         .shipping

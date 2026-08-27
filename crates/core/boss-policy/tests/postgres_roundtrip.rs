@@ -1,7 +1,5 @@
 //! Postgres adapter round-trip: rule CRUD + audit log integrity.
 
-#![cfg(feature = "postgres")]
-
 use boss_policy::port::PolicyRepository;
 use boss_policy::postgres::PgPolicy;
 use boss_policy::{Action, PolicyRule, Resource, Scope, UserOverride};

@@ -131,6 +131,39 @@ export type ActorActivity = Readonly<{
   endpoints: ReadonlyArray<EndpointCount>;
 }>;
 
+// --- Actor coverage (telemetry.actor_coverage): is the sim driving the
+// WHOLE roster? Mirrors boss-sim's actor_coverage::ActorCoverage. A role
+// no live workflow step routes to never acts — this block makes that
+// dormancy visible on the cockpit's face. Operator-held roles
+// (platform-admin) are excluded from sim driving by design and labeled
+// `operator`, never dormant. ---
+
+export type RoleStatus = 'acting' | 'dormant' | 'operator';
+
+export type RoleCoverage = Readonly<{
+  role: string;
+  // Employees holding this role on the roster.
+  roster: number;
+  // Of roster, how many are operator-excluded (not simulatable).
+  operator_holders: number;
+  // Distinct holders that completed ≥ 1 step this daemon lifetime.
+  acting: number;
+  // Steps completed by this role this daemon lifetime.
+  completions: number;
+  status: RoleStatus;
+}>;
+
+export type ActorCoverage = Readonly<{
+  roles_total: number;
+  roles_acting: number;
+  roles_dormant: number;
+  roles_operator: number;
+  employees_total: number;
+  employees_acting: number;
+  employees_operator: number;
+  roles: ReadonlyArray<RoleCoverage>;
+}>;
+
 export type SimTelemetry = Readonly<{
   actor: string;
   role: string;
@@ -146,6 +179,9 @@ export type SimTelemetry = Readonly<{
   actors: ReadonlyArray<ActorActivity>;
   // Sim-date at the first tick — the calls/sim-day rate denominator.
   started_sim_date: string | null;
+  // Roster coverage (optional: absent on a daemon predating it, so a
+  // version skew degrades to a hidden panel rather than a throw).
+  actor_coverage?: ActorCoverage;
 }>;
 
 // --- Simulator behavior config (GET/POST /simulator/api/config). The

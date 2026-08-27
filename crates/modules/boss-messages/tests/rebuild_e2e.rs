@@ -6,8 +6,6 @@
 //! Pilot validation for the "events are canonical, projections are
 //! derived" architecture.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::Router;

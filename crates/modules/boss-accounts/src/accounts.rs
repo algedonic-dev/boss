@@ -375,8 +375,7 @@ async fn create_account(
     // plus the territory-rep mirror so rebuild_accounts can
     // repopulate `account_team_members` — only when a rep was
     // actually assigned at create.
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let stamp = crate::events::event_stamp(&state.publisher).await;
     let event = stamp.event(
         crate::events::ACCOUNT_CREATED,
         serde_json::to_value(&body).unwrap_or_default(),
@@ -525,8 +524,7 @@ async fn update_account(
     // treats UPDATED the same as CREATED — UPSERT both projections),
     // plus the territory-rep mirror when assigned. Records with the
     // rows.
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let stamp = crate::events::event_stamp(&state.publisher).await;
     let event = stamp.event(
         crate::events::ACCOUNT_UPDATED,
         serde_json::to_value(&body).unwrap_or_default(),
@@ -623,8 +621,7 @@ async fn replace_contacts(
         Ok(a) => a,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let stamp = crate::events::event_stamp(&state.publisher).await;
     let payload = AccountWithContacts { account, contacts };
     let event = stamp.event(
         crate::events::ACCOUNT_UPDATED,
@@ -700,7 +697,7 @@ async fn delete_account(
     // actually deleted (the rows_affected NotFound above returns
     // pre-recording).
     let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let stamp = crate::events::event_stamp(&state.publisher).await;
     let event = stamp.event(
         crate::events::ACCOUNT_DELETED,
         serde_json::json!({ "id": id, "deleted_at": now }),

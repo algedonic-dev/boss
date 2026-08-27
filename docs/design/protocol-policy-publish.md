@@ -124,70 +124,66 @@ mold, so the count only goes down.
 
 ## Open questions
 
-### Q1: New service, or boss-jobs promoted?
+All 6 open questions were resolved 2026-08-12 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-Proposed: promote in place. The write path already owns policy,
-evaluation, and staging; a separate 3P binary would put a network hop
-inside the one transaction that must stay atomic. "The network's API"
-is a *named role* — the port and its contract — not necessarily a new
-process. Extract a `boss-admission` crate boundary (hexagonal, like
-every domain) so a future second writer (the sim, an agent gateway)
-speaks the same contract, and revisit a standalone service only when
-one exists.
+---
 
-### Q2: Where do consequences live in the protocol definition?
 
-Proposed: an `on` block per step transition in the WorkflowSpec —
-declarative consequence rows (`notify`, `spawn`, `assign`,
-`obligation:<handler>`) with optional `when` conditions, versioned
-with the workflow like everything else in it. Seed by migrating the
-seven jobs-internal rules and the spawn rules verbatim;
-`workflow_lint` grows a pass proving every declared consequence
-resolvable (handler exists, target kind exists) at authoring time —
-the viability proof extended from steps to consequences.
+## Decisions
 
-### Q3: Are consequences computed sync and delivered async?
+### Q1: New service, or boss-jobs promoted? (resolved)
 
-Proposed: yes — decision and delivery split. Admission computes the
-consequence set synchronously and stages it transactionally (the
-decision is the fact); jobs-internal consequences apply in the same
-transaction; obligation events for other domains deliver through the
-existing handler machinery, now draining declared obligations instead
-of interpreting rules. Latency for the packet's own state: zero. For
-cross-domain effects: unchanged from today, minus the rule
-indirection.
+Resolved 2026-08-12 — accept.
 
-### Q4: What does the queue-placement half publish?
+Promote in place: the admission edge is a named role - extract a boss-admission crate boundary; no network hop inside the write transaction; a standalone service waits for a real second writer.
 
-"Publish to the proper queue" — under the packet model a queue is a
-predicate, so placement is not a row write. Proposed: admission
-resolves the packet's next station (authority-role or address
-predicate), records the resolved pool as an event when it is
-requirement-addressed (requirements-based-addressing Q3's
-determinism rule), and emits the ready/assigned markers it already
-emits. The queue lens then *reads* what admission *published* — no
-new placement state, one more reason the lens stays the one read
-surface.
+**Rationale:** David reviewed and accepted 2026-08-12; recorded by claude:fable.
 
-### Q5: What is the migration path — and its ratchet?
 
-Proposed: three stages, each shippable. (1) Name the edge: extract
-the admission crate, no behavior change. (2) Move the seven
-jobs-internal rules into WorkflowSpec `on` blocks, one car each,
-deleting each rule as its consequence lands — the ratchet counts
-`rules.toml` entries and fails CI on growth. (3) Convert the domain
-handlers to obligation-drainers kind by kind, starting with the
-inventory chain that already has idempotency guards. External glue
-and timers never migrate — the ratchet's allowlist names them with
-their reasons.
+### Q2: Where do consequences live in the protocol definition? (resolved)
 
-### Q6: Does 3P admit non-Job writes?
+Resolved 2026-08-12 — accept.
 
-The claim says "the API for the network," and the packet doc says all
-work is packet writes — but messages, docs decisions, and people
-changes write through their own services today. Proposed: scope 3P to
-packet admission (jobs) in v1 and state plainly that other domains
-keep their write paths until the "everything is a packet" question
-(job-packet-network's own horizon) is decided. A network API that
-quietly annexes every domain's front door is the second-gateway
-anti-pattern this repo already rejected once.
+Consequences live in WorkflowSpec on-blocks per step transition (notify/spawn/assign/obligation rows, optional when), versioned with the workflow; seed by migrating the seven jobs-internal rules; workflow_lint proves every consequence resolvable at authoring time.
+
+**Rationale:** David reviewed and accepted 2026-08-12; recorded by claude:fable.
+
+
+### Q3: Are consequences computed sync and delivered async? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+Sync decide, async deliver: admission computes and stages the consequence set transactionally; jobs-internal consequences apply in the same tx; cross-domain effects become obligation events drained by the existing handler machinery.
+
+**Rationale:** David reviewed and accepted 2026-08-12; recorded by claude:fable.
+
+
+### Q4: What does the queue-placement half publish? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+Admission resolves the next station, records requirement-addressed pools as events (determinism rule), and emits the existing ready/assigned markers; the queue lens reads what admission published - no new placement state.
+
+**Rationale:** David reviewed and accepted 2026-08-12; recorded by claude:fable.
+
+
+### Q5: What is the migration path — and its ratchet? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+Three shippable stages: (1) extract the admission crate, no behavior change; (2) migrate the seven jobs-internal rules one car each, ratchet tightening with each (ratchet shipped 2026-08-12, baseline 38); (3) convert domain handlers to obligation-drainers kind by kind, inventory first. External glue and timers never migrate - the ratchet allowlist names them.
+
+**Rationale:** David reviewed and accepted 2026-08-12; recorded by claude:fable.
+
+
+### Q6: Does 3P admit non-Job writes? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+Scope 3P to packet admission (jobs) in v1; other domains keep their write paths until the everything-is-a-packet horizon is decided. No quiet annexation of other front doors.
+
+**Rationale:** David reviewed and accepted 2026-08-12; recorded by claude:fable.

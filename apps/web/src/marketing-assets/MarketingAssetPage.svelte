@@ -14,6 +14,10 @@
 
   let asset = $state<MarketingAsset | null>(null);
   let history = $state<MarketingAsset[]>([]);
+  /// Non-null when the record fetch FAILED (5xx / network) — rendered
+  /// instead of "Asset not found", which is a claim only a successful
+  /// lookup gets to make (packet 3fba9c35).
+  let loadFailed = $state<string | null>(null);
   let loading = $state(true);
   let empNames = $state<Map<string, string>>(new Map());
 
@@ -43,10 +47,21 @@
           fetch('/api/people'),
         ]);
         if (aResp.status === 404) {
-          if (!cancelled) asset = null;
+          if (!cancelled) {
+            asset = null;
+            loadFailed = null;
+          }
         } else if (aResp.ok) {
           const body = (await aResp.json()) as MarketingAsset;
-          if (!cancelled) asset = body;
+          if (!cancelled) {
+            asset = body;
+            loadFailed = null;
+          }
+        } else {
+          if (!cancelled) {
+            asset = null;
+            loadFailed = `HTTP ${aResp.status}`;
+          }
         }
         if (hResp.ok) {
           const body = (await hResp.json()) as MarketingAsset[];
@@ -58,8 +73,11 @@
           for (const e of people) m.set(e.id, e.name);
           if (!cancelled) empNames = m;
         }
-      } catch {
-        if (!cancelled) asset = null;
+      } catch (e) {
+        if (!cancelled) {
+          asset = null;
+          loadFailed = e instanceof Error ? e.message : String(e);
+        }
       }
       if (!cancelled) loading = false;
     })();
@@ -85,6 +103,10 @@
 
   {#if loading && !asset}
     <p class="empty">Loading…</p>
+  {:else if loadFailed}
+    <p class="empty load-failed" role="alert">
+      Couldn't load this asset — {loadFailed}
+    </p>
   {:else if !asset}
     <header class="detail-hero">
       <h1 class="detail-title">Asset not found</h1>
@@ -98,14 +120,10 @@
           <EntityLink kind="marketing-asset" id={a.id} /> ·
           {a.kind ? (kindLabel.get(a.kind) ?? a.kind) : '—'}
           {#if retired}
-            <span style="margin-left:8px; padding:1px 8px; border-radius:3px; background:#e7e5e4; color:#57534e; font-size:11px">
-              RETIRED
-            </span>
+            <span class="chip" style="margin-left:8px">RETIRED</span>
           {/if}
           {#if hasSuccessor && !retired}
-            <span style="margin-left:8px; padding:1px 8px; border-radius:3px; background:#fef3c7; color:#92400e; font-size:11px">
-              SUPERSEDED
-            </span>
+            <span class="chip chip-warn" style="margin-left:8px">SUPERSEDED</span>
           {/if}
         </div>
         <h1 class="detail-title">{a.title}</h1>
@@ -155,12 +173,12 @@
                   label={empNames.get(a.brand_reviewed_by)}
                 />
                 {#if a.brand_reviewed_at}
-                  <span style="color:#78716c; margin-left:8px">
+                  <span style="color:var(--static); margin-left:8px">
                     · {a.brand_reviewed_at.slice(0, 10)}
                   </span>
                 {/if}
               {:else}
-                <span style="color:#a8a29e">not reviewed</span>
+                <span style="color:var(--static)">not reviewed</span>
               {/if}
             </dd>
             <dt>Created</dt><dd>{a.created_at.slice(0, 10)}</dd>
@@ -171,7 +189,7 @@
                   {a.supersedes_id}
                 </a>
               {:else}
-                <span style="color:#a8a29e">(original)</span>
+                <span style="color:var(--static)">(original)</span>
               {/if}
             </dd>
           </dl>
@@ -181,11 +199,9 @@
           {#if a.tags.length === 0}
             <p class="empty">No tags yet.</p>
           {:else}
-            <div style="display:flex; flex-wrap:wrap; gap:6px">
+            <div class="chips">
               {#each a.tags as t (t)}
-                <span style="padding:2px 8px; background:#e7e5e4; border-radius:3px; font-size:12px">
-                  {t}
-                </span>
+                <span class="chip">{t}</span>
               {/each}
             </div>
           {/if}
@@ -194,7 +210,7 @@
       <Section title="Linked entities" wide>
           <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px">
             <div>
-              <h4 style="font-size:12px; color:#78716c; margin-bottom:6px">
+              <h4 style="font-size:12px; color:var(--static); margin-bottom:6px">
                 Device SKUs ({a.linked_device_skus.length})
               </h4>
               {#if a.linked_device_skus.length === 0}
@@ -211,7 +227,7 @@
               {/if}
             </div>
             <div>
-              <h4 style="font-size:12px; color:#78716c; margin-bottom:6px">
+              <h4 style="font-size:12px; color:var(--static); margin-bottom:6px">
                 Accounts ({a.linked_account_ids.length})
               </h4>
               {#if a.linked_account_ids.length === 0}
@@ -227,7 +243,7 @@
               {/if}
             </div>
             <div>
-              <h4 style="font-size:12px; color:#78716c; margin-bottom:6px">
+              <h4 style="font-size:12px; color:var(--static); margin-bottom:6px">
                 Campaigns ({a.linked_campaign_ids.length})
               </h4>
               {#if a.linked_campaign_ids.length === 0}

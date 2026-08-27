@@ -1,0 +1,8 @@
+[[invariant]]
+id = "the-gate-has-one-definition"
+claim = "The rust gate has ONE definition: infra/gate.sh."
+source = "infra/gate.sh; CLAUDE.md §9a; crates/core/boss-testing/tests/gate_sh.rs"
+enforcement = "enforced"
+mechanism = "crates/core/boss-testing/tests/gate_sh.rs"
+last_verified = ""
+note = "Two of the three tests hold this half: ci.yml's rust job must invoke the script, and must not grow a second inline definition (`run: cargo clippy` / `run: cargo test` / `run: cargo fmt` / `run: infra/lint/`) beside it. The roster-coverage half is a separate entry — see `gate-roster-is-complete`."

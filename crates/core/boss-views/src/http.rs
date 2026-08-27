@@ -52,7 +52,7 @@ pub struct OsMapQuery {
 /// `GET /api/views/os-map` — the executor network.
 ///
 /// A read of who is moving work and where it goes, per
-/// `docs/design/operating-system-view.md`. Cheap enough to poll,
+/// `docs/architecture-decisions.md`. Cheap enough to poll,
 /// which is what makes it a live instrument rather than a snapshot.
 async fn os_map(State(state): State<Arc<ViewsApiState>>, Query(q): Query<OsMapQuery>) -> Response {
     let Some(repo) = state.os_map.as_ref() else {

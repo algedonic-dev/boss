@@ -125,7 +125,7 @@ pub(super) async fn consume_part<R: InventoryRepository + 'static>(
         .unwrap_or_else(|| format!("{}@{}", part_sku, uuid::Uuid::new_v4()));
     // Outbox phase 2: ITEM_CONSUMED + INVENTORY_TRANSFERRED record
     // inside the repository transaction via the stamp.
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     let applied = match state
         .inventory
         .consume_part_at(&part_sku, body.qty, now, &consume_source_id, &stamp)
@@ -261,10 +261,15 @@ pub(super) async fn batch_upsert_items<R: InventoryRepository + 'static>(
     let batch_now = boss_clock_client::now_from(&state.clock).await;
     // Outbox phase 2: one stamp for the whole batch; ITEM_UPSERTED and
     // the opening-JE event record inside each repository transaction.
-    let stamp = super::event_stamp(&state, &user, batch_now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     for item in &body {
-        let now = batch_now;
-        if let Err(e) = state.inventory.upsert_item_at(item, now, &stamp).await {
+        // Row-touch column binds the stamp's wall time; the opening-JE
+        // happened_on below stays on the authoritative clock's date.
+        if let Err(e) = state
+            .inventory
+            .upsert_item_at(item, stamp.timestamp, &stamp)
+            .await
+        {
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
         // Atomic opening-balance JE. When a batch upsert lands a row
@@ -292,7 +297,7 @@ pub(super) async fn batch_upsert_items<R: InventoryRepository + 'static>(
                     &memo,
                     "brewery_seed_opening_balance",
                     &source_id,
-                    now.date_naive(),
+                    batch_now.date_naive(),
                     &stamp,
                 )
                 .await
@@ -378,7 +383,7 @@ pub(super) async fn receive_part_handler<R: InventoryRepository + 'static>(
     // Outbox phase 2: ITEM_UPSERTED (post-receive row state) +
     // ITEM_RECEIVED (the exact proof-fact payload) record inside the
     // repository transaction; a redelivered receive records nothing.
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     let applied = match state
         .inventory
         .receive_part_at(
@@ -507,7 +512,7 @@ pub(super) async fn overhead_absorbed_handler<R: InventoryRepository + 'static>(
     // payload field: it is already encoded in `source_id`) and records
     // `inventory.overhead.absorbed` gated on the fact being newly
     // inserted, so an idempotent replay records nothing.
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     let canonical_fact_id = match state
         .inventory
         .record_overhead_absorbed(

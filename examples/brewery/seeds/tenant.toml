@@ -702,7 +702,7 @@ post_offer_decline_probability = 0.10
 # GAP 4: StepType registry doesn't carry sim-affordance fields.
 #   RESOLVED — `crates/core/boss-jobs/src/step_registry.rs` StepType
 #   gained `typical_duration_hours`, `typical_duration_jitter`,
-#   `required_roles`; FieldSpec gained `faker_hint`. All 31 step
+#   `required_roles`. All 31 step
 #   types in the v1() registry carry per-kind durations + jitter
 #   tuned to wall-clock work shape (e.g. repair 8h, approval 4h,
 #   milestone 0h-instant). The shape-driven sim reads these

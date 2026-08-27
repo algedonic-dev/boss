@@ -26,7 +26,7 @@ pub struct BillPaymentBatch {
 impl BillPaymentBatch {
     pub fn new(topic: &'static str, base: impl Into<String>, path: &'static str) -> Arc<Self> {
         Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: crate::handlers::common::api_client(),
             topic,
             base: base.into(),
             path,

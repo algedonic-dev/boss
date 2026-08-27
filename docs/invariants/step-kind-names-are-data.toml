@@ -1,0 +1,8 @@
+[[invariant]]
+id = "step-kind-names-are-data"
+claim = "No core code may match on a step-kind name — code dispatches on properties and mechanism enums; kind names are data (registry rows + rule topics + seeds)."
+source = "infra/lint/no-step-kind-match.sh; docs/architecture-decisions.md §Step types are property bundles"
+enforcement = "enforced"
+mechanism = "infra/lint/no-step-kind-match.sh"
+last_verified = ""
+note = "The kind vocabulary is read live from crates/core/boss-jobs/seeds/step_types.toml, so the lint tracks the catalog without a second hand-maintained list. Allow-list is a ratchet holding two permanent platform pins. Requires bash 4 (associative arrays) — it cannot run on macOS's bash 3.2."

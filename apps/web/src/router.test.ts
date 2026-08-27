@@ -66,6 +66,15 @@ describe('parseRoute — every specific path matches its specific case', () => {
     ['/system', { kind: 'systemModel' }],
     ['/system/subjects', { kind: 'systemSubjects' }],
     ['/system/design', { kind: 'systemDesign' }],
+    // /it/* is the canonical spelling for IT surfaces (0fc8b216); the
+    // /system/* rows above stay because bookmarks, the station
+    // registry's upstream hrefs and the docs all still use them.
+    ['/it/design', { kind: 'systemDesign' }],
+    ['/it/yard', { kind: 'systemYard' }],
+    ['/it/incidents', { kind: 'incidents' }],
+    ['/system/incidents', { kind: 'incidents' }],
+    ['/it/monitoring/events', { kind: 'systemMonitoringEvents' }],
+    ['/it', { kind: 'systemModel' }],
     ['/system/step-plugins', { kind: 'systemStepPlugins' }],
     ['/system/step-plugins/pour-quality-check', { kind: 'systemStepPluginDetail', pluginSlug: 'pour-quality-check' }],
     ['/system/dispatcher', { kind: 'dispatcherRules' }],
@@ -171,6 +180,39 @@ describe('full-page step route', () => {
     expect(r.kind).toBe('stepFocus');
     expect((r as { jobId: string }).jobId).toBe('job-123');
     expect((r as { stepId: string }).stepId).toBe('step-456');
+  });
+
+  test('carries the lens Back target through, with its label', () => {
+    // David, 40fe7291: Back from a design review landed on the job
+    // page instead of the queue he came from. Only the lens knows
+    // where back is, so it says so on the URL.
+    (globalThis as { window?: { location: { search: string } } }).window = {
+      location: { search: '?from=%2Fsystem%2Fdesign&from_label=Design%20Review' },
+    };
+    const r = parseRoute('/ux/jobs/job-123/steps/step-456');
+    expect(r.kind).toBe('stepFocus');
+    expect((r as { from?: string }).from).toBe('/system/design');
+    expect((r as { fromLabel?: string }).fromLabel).toBe('Design Review');
+    (globalThis as { window: { location: { search: string } } }).window = {
+      location: { search: '' },
+    };
+  });
+
+  test('refuses a Back target that leaves the app', () => {
+    // A `from` naming another origin would turn the Back button into
+    // an open redirect. Protocol-relative `//host` is the one that
+    // looks in-app at a glance, which is why it is tested by name.
+    for (const hostile of ['//evil.example', 'https://evil.example', 'evil']) {
+      (globalThis as { window?: { location: { search: string } } }).window = {
+        location: { search: `?from=${encodeURIComponent(hostile)}` },
+      };
+      const r = parseRoute('/ux/jobs/job-123/steps/step-456');
+      expect(r.kind).toBe('stepFocus');
+      expect((r as { from?: string }).from).toBeUndefined();
+    }
+    (globalThis as { window: { location: { search: string } } }).window = {
+      location: { search: '' },
+    };
   });
 
   test('does not steal the plain job-detail route', () => {

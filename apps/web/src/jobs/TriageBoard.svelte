@@ -28,11 +28,13 @@
   import type { Snippet } from 'svelte';
   import { onMount } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
+  import PacketModal from '@boss/web-kit/ui/PacketModal.svelte';
   import { session } from '@boss/web-kit/session/session.svelte';
   import type { Job, Step } from './types';
   // The fork rule lives in one module — it drifted once between this
   // board and the terminal queue reader. See jobs/fork.ts.
   import { type Fork, forkStep as forkStepOf, gatedStep, readFork } from './fork';
+  import { formatActor } from '../data/actor';
 
   type Props = Readonly<{
     /// Which queue this board shows. One Workflow today because that is
@@ -43,6 +45,20 @@
     title: string;
     subtitle?: string;
     emptyMessage?: string;
+    /// How many days of FINISHED work the terminal columns keep.
+    ///
+    /// A board renders each card in the column of its current step, so
+    /// terminal packets have to be fetched or the terminal columns are
+    /// empty — which is why this board originally asked for the whole
+    /// history and got it. On the feedback queue that meant 173 rows
+    /// fetched to show 14 live ones, 27 short of silently truncating at
+    /// its own limit, and a board that read as an enormous backlog when
+    /// the backlog was fourteen.
+    ///
+    /// A board is a working surface, not an archive. Everything live is
+    /// always here regardless of age; finished work ages out and stays
+    /// one click away in the list below.
+    terminalWindowDays?: number;
     /// The card body. Defaults to the Job title; callers whose Jobs
     /// carry a better headline supply their own.
     card?: Snippet<[Job]>;
@@ -53,11 +69,21 @@
     title,
     subtitle = 'Routing an item completes its triage step, which opens the next one — so a card cannot disagree with the Job behind it.',
     emptyMessage = 'Nothing is waiting on a person right now.',
+    terminalWindowDays = 14,
     card,
   }: Props = $props();
 
   let jobs = $state<ReadonlyArray<Job>>([]);
   let fork = $state<Fork | null>(null);
+
+  /// Finished packets older than the window — the ones the board is
+  /// deliberately not showing.
+  ///
+  /// Named rather than merely omitted. A board that quietly drops
+  /// history teaches the next person that the history is gone, which
+  /// is the same confusion in the opposite direction. `null` means not
+  /// counted yet, and renders nothing.
+  let archived = $state<number | null>(null);
 
   /// The Job shown in the detail modal, or null when it is closed.
   ///
@@ -91,6 +117,13 @@
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   });
+  // Employee id -> name, so a card says "David Hauld" rather than
+  // `emp-bootstrap-admin` (feedback 19896c17). formatActor already
+  // knows how to spell every actor kind — machines, agents, humans —
+  // and falls back to the raw id when the roster has not arrived or
+  // does not contain the id, so a slow or failed fetch degrades to
+  // exactly the old behaviour rather than to a blank.
+  let empNames = $state<Map<string, string>>(new Map());
   let loading = $state(true);
   let error = $state<string | null>(null);
   let busy = $state<Record<string, boolean>>({});
@@ -142,6 +175,13 @@
   /// no disposition at all, and a route the registry later drops would
   /// otherwise take its cards off the board with it.
   function columnOf(j: Job): string {
+    // A closed packet is not queue contents, whatever its triage step
+    // says. Placing by fork-step state alone put every closed packet
+    // under the route it was once sent to, indistinguishable from live
+    // work — measured 2026-08-19: the board showed 198 cards of which
+    // 16 were open, and read as "150+ still open" (David). The Job's
+    // own status outranks the program counter of one of its steps.
+    if (j.status === 'closed' || j.status === 'cancelled') return CLOSED;
     const s = forkStep(j);
     if (!isTerminal(s)) return WAITING;
     const chosen = fork ? s?.metadata?.[fork.field] : undefined;
@@ -160,7 +200,7 @@
     // Only shown when something is in it — an always-empty trailing
     // column is noise on a board that already scrolls.
     const closed = jobs.some((j) => columnOf(j) === CLOSED)
-      ? [{ id: CLOSED, label: 'Closed', hint: 'Triaged before these routes existed, or closed outright.' }]
+      ? [{ id: CLOSED, label: 'Closed', hint: 'Closed packets (any route), and items triaged before these routes existed.' }]
       : [];
     return [...head, ...routes, ...closed];
   });
@@ -176,6 +216,29 @@
   });
 
 
+  /// How much finished work the window is holding back.
+  ///
+  /// One extra request, and only on a foreground load — the 15s poll
+  /// skips it. The count moves when something closes, which is rare on
+  /// the timescale of a poll tick, and the alternative is doubling the
+  /// board's request rate forever to keep a footnote current.
+  ///
+  /// `limit=1` because only `total` is wanted; the rows are discarded.
+  /// A failure here is silent: the count is a footnote, and a board
+  /// that shows an error because its footnote did not load is worse
+  /// than a board with no footnote.
+  async function countArchived(shown: number, background: boolean): Promise<void> {
+    if (background && archived !== null) return;
+    try {
+      const res = await fetch(`/api/jobs?kind=${encodeURIComponent(kind)}&limit=1`);
+      if (!res.ok) return;
+      const total = (await res.json())?.total;
+      if (typeof total === 'number') archived = Math.max(0, total - shown);
+    } catch {
+      // Footnote only — leave it as it was.
+    }
+  }
+
   async function load(background = false): Promise<void> {
     // Background refreshes are silent (feedback 15c6004e): flipping
     // `loading` re-renders the whole board into its spinner every
@@ -184,23 +247,37 @@
     if (!background) loading = true;
     error = null;
     try {
+      const q = new URLSearchParams({
+        kind,
+        limit: '200',
+        // The retention window, applied SERVER-side. Filtering after
+        // the fetch would not help: the limit truncates first, so a
+        // board with more history than its limit silently loses live
+        // cards off the end and looks fine doing it.
+        closed_within: String(terminalWindowDays),
+      });
       const [jobsRes, kindsRes] = await Promise.all([
         // The list endpoint enriches each Job with its steps, so the
         // board needs one request rather than one per card.
-        fetch(`/api/jobs?kind=${encodeURIComponent(kind)}&limit=200`),
+        fetch(`/api/jobs?${q}`),
         fetch('/api/workflows'),
       ]);
       if (!jobsRes.ok) throw new Error(`${kind} jobs: HTTP ${jobsRes.status}`);
+      // The registry read is part of the board's truth, not an
+      // enhancement. Placement derives from the fork, so "no fork"
+      // (null) files every routed card under WAITING — a column whose
+      // hint says nobody has routed them. When the registry genuinely
+      // has no fork for this kind that is the right render; when the
+      // FETCH failed it is a false statement, so the failure is the
+      // board's failure (packet 3fba9c35, the false-empty sweep).
+      if (!kindsRes.ok) throw new Error(`workflows registry: HTTP ${kindsRes.status}`);
       const body = await jobsRes.json();
       jobs = Array.isArray(body) ? body : (body.data ?? []);
+      countArchived(typeof body.total === 'number' ? body.total : jobs.length, background);
 
-      // A missing registry costs the columns, not the board — the
-      // cards still render and the fallback is waiting/done.
-      if (kindsRes.ok) {
-        const kinds = await kindsRes.json();
-        const rows: unknown[] = Array.isArray(kinds) ? kinds : (kinds.data ?? []);
-        fork = readFork(rows.find((k) => (k as { kind?: string }).kind === kind));
-      }
+      const kinds = await kindsRes.json();
+      const rows: unknown[] = Array.isArray(kinds) ? kinds : (kinds.data ?? []);
+      fork = readFork(rows.find((k) => (k as { kind?: string }).kind === kind));
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -357,7 +434,25 @@
     if (j) void route(j, col);
   }
 
+  // The roster is decoration, not data the board depends on: it is
+  // fetched alongside `load` rather than inside it, and a failure is
+  // swallowed. formatActor falls back to the raw id, so the worst
+  // case is the ids we were already showing — a board that refuses to
+  // render because /api/people is down would be a strictly worse
+  // trade than a card that says `emp-bootstrap-admin`.
+  async function loadRoster() {
+    try {
+      const r = await fetch('/api/people');
+      if (!r.ok) return;
+      const roster = (await r.json()) as ReadonlyArray<{ id: string; name?: string }>;
+      empNames = new Map(roster.map((e) => [e.id, e.name ?? '']));
+    } catch {
+      /* names stay ids */
+    }
+  }
+
   onMount(load);
+  onMount(loadRoster);
 </script>
 
 <PageHeader {title} {subtitle} />
@@ -368,6 +463,7 @@
   <p class="tb-msg tb-err">{error}</p>
 {:else if jobs.length === 0}
   <p class="tb-msg">{emptyMessage}</p>
+  {@render archiveNote()}
 {:else}
   <div class="tb-board">
     {#each columns as col (col.id)}
@@ -412,7 +508,7 @@
             {/if}
 
             <div class="tb-card-meta">
-              <span class="tb-by">{j.owner_id || 'unassigned'}</span>
+              <span class="tb-by">{j.owner_id ? formatActor(j.owner_id, empNames) : 'unassigned'}</span>
             </div>
 
             <!-- The finding renders on EVERY card, routed or not. A
@@ -514,88 +610,40 @@
       </section>
     {/each}
   </div>
+  {@render archiveNote()}
 {/if}
 
+<!-- What the retention window is holding back, said out loud with a
+     way through to it.
+
+     The board is a working surface: everything live plus a recent tail
+     of finished work. The rest is not gone, and a person who has just
+     noticed the board is shorter than they remember should not have to
+     ask where it went — that question is exactly what this window was
+     built in response to. -->
+{#snippet archiveNote()}
+  {#if archived !== null && archived > 0}
+    <p class="tb-note">
+      Showing all live work plus {terminalWindowDays} days of finished items.
+      <a href="/jobs?kind={encodeURIComponent(kind)}&status=closed">
+        {archived} older {archived === 1 ? 'item' : 'items'}
+      </a>
+      have closed and aged off the board.
+    </p>
+  {/if}
+{/snippet}
+
+<!-- The shared packet panel (PacketModal, web-kit). This board used to
+     carry its own copy — same header, facts list, steps and metadata
+     dump — written before the component existed. Two definitions of
+     "the condensed view of a packet" is the duplication CLAUDE.md 9a
+     is about, so the local one is gone rather than kept beside it. -->
 {#if detail}
-  <!-- Backdrop. Escape closes it too (window handler above), so the
-       click target here is a convenience rather than the only way
-       out — which is what keeps this reachable without a mouse. -->
-  <div
-    class="tb-modal-back"
-    role="presentation"
-    onclick={(e) => {
-      // Only a click on the backdrop itself closes. Testing the target
-      // rather than stopping propagation on the panel means the panel
-      // carries no click handler at all, so it needs no keyboard
-      // equivalent to match it.
-      if (e.target === e.currentTarget) detailId = null;
-    }}
-  >
-    <div class="tb-modal" role="dialog" aria-modal="true" aria-label={detail.title}>
-      <header class="tb-modal-head">
-        <div>
-          <h2 class="tb-modal-title">{detail.title}</h2>
-          <p class="tb-modal-sub">
-            {detail.kind} · {detail.status} · opened {detail.opened_on}
-            {#if detail.closed_on}· closed {detail.closed_on}{/if}
-          </p>
-        </div>
-        <button
-          class="tb-btn"
-          type="button"
-          onclick={() => (detailId = null)}
-          aria-label="Close">Close</button
-        >
-      </header>
-
-      <!-- The reason the modal exists: a feedback Job's `message` is
-           the whole content of the item and the card only had room for
-           a title derived from the route. -->
-      {#if typeof detail.metadata?.message === 'string'}
-        <p class="tb-modal-message">{detail.metadata.message}</p>
-      {/if}
-
-      <dl class="tb-modal-facts">
-        <dt>Job</dt>
-        <dd class="tb-mono">{detail.id}</dd>
-        <dt>Subject</dt>
-        <dd class="tb-mono">{detail.subject.subject_kind} / {detail.subject.id}</dd>
-        <dt>Owner</dt>
-        <dd>{detail.owner_id || 'unassigned'}</dd>
-        {#if detail.tags.length}
-          <dt>Tags</dt>
-          <dd>{detail.tags.join(', ')}</dd>
-        {/if}
-      </dl>
-
-      <!-- Steps are the program counter, so showing them is showing
-           where the Job actually is — not a restatement of the column
-           it was dragged into. -->
-      {#if detail.steps?.length}
-        <h3 class="tb-modal-h">Steps</h3>
-        <ol class="tb-modal-steps">
-          {#each detail.steps as s (s.id)}
-            <li class="tb-modal-step">
-              <span class="tb-modal-step-status tb-modal-step-{s.status}">{s.status}</span>
-              <span class="tb-modal-step-title">{s.title}</span>
-              {#if s.assignee_id}<span class="tb-modal-step-who">{s.assignee_id}</span>{/if}
-            </li>
-          {/each}
-        </ol>
-      {/if}
-
-      {#if Object.keys(detail.metadata ?? {}).filter((k) => k !== 'message').length}
-        <h3 class="tb-modal-h">Metadata</h3>
-        <pre class="tb-modal-json">{JSON.stringify(
-            Object.fromEntries(
-              Object.entries(detail.metadata).filter(([k]) => k !== 'message'),
-            ),
-            null,
-            2,
-          )}</pre>
-      {/if}
-    </div>
-  </div>
+  <PacketModal
+    job={detail}
+    onClose={() => (detailId = null)}
+    formatActor={(id) => formatActor(id, empNames)}
+  />
 {/if}
 
 <style>
@@ -675,133 +723,6 @@
     background: var(--card, #fff);
   }
 
-  /* Detail modal — opened by double-clicking a card. */
-  .tb-modal-back {
-    position: fixed;
-    inset: 0;
-    z-index: 100;
-    background: rgba(28, 25, 23, 0.45);
-    display: flex;
-    align-items: flex-start;
-    justify-content: center;
-    padding: 60px 20px 20px;
-    overflow-y: auto;
-  }
-  .tb-modal {
-    background: var(--card, #fff);
-    border: 1px solid var(--border, #e7e5e4);
-    border-radius: 10px;
-    padding: 20px 22px;
-    width: min(680px, 100%);
-    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
-  }
-  .tb-modal-head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 16px;
-    margin-bottom: 14px;
-  }
-  .tb-modal-title {
-    font-size: 17px;
-    margin: 0 0 2px;
-    text-wrap: balance;
-  }
-  .tb-modal-sub {
-    margin: 0;
-    font-size: 12px;
-    color: var(--text-dim, #78716c);
-  }
-  .tb-modal-message {
-    margin: 0 0 16px;
-    padding: 12px 14px;
-    background: var(--bg, #f5f5f4);
-    border-radius: 6px;
-    border-left: 3px solid #0f766e;
-    font-size: 14px;
-    line-height: 1.55;
-    white-space: pre-wrap;
-  }
-  .tb-modal-facts {
-    display: grid;
-    grid-template-columns: max-content 1fr;
-    gap: 4px 14px;
-    margin: 0 0 16px;
-    font-size: 12px;
-  }
-  .tb-modal-facts dt {
-    color: var(--text-dim, #78716c);
-  }
-  .tb-modal-facts dd {
-    margin: 0;
-  }
-  .tb-mono {
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 11px;
-  }
-  .tb-modal-h {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--text-dim, #78716c);
-    margin: 0 0 8px;
-  }
-  .tb-modal-steps {
-    list-style: none;
-    margin: 0 0 16px;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-  .tb-modal-step {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    font-size: 13px;
-    padding: 3px 0;
-    border-bottom: 1px solid var(--bg, #f5f5f4);
-  }
-  .tb-modal-step-status {
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.4px;
-    padding: 1px 6px;
-    border-radius: 3px;
-    background: var(--bg, #f5f5f4);
-    color: var(--text-dim, #78716c);
-    flex: 0 0 auto;
-    min-width: 72px;
-    text-align: center;
-  }
-  .tb-modal-step-completed {
-    background: #ecfdf5;
-    color: #047857;
-  }
-  .tb-modal-step-ready,
-  .tb-modal-step-active {
-    background: #eff6ff;
-    color: #1d4ed8;
-  }
-  .tb-modal-step-skipped {
-    text-decoration: line-through;
-  }
-  .tb-modal-step-title {
-    flex: 1 1 auto;
-  }
-  .tb-modal-step-who {
-    font-size: 11px;
-    color: var(--text-dim, #78716c);
-  }
-  .tb-modal-json {
-    margin: 0;
-    padding: 10px 12px;
-    background: var(--bg, #f5f5f4);
-    border-radius: 6px;
-    font-size: 11px;
-    line-height: 1.5;
-    overflow-x: auto;
-  }
   .tb-card {
     background: var(--card, #fff);
     border: 1px solid var(--border, #e7e5e4);
@@ -923,5 +844,15 @@
   }
   .tb-err {
     color: #b91c1c;
+  }
+  /* A footnote, not a banner. It answers a question someone might
+     have; it is not news. */
+  .tb-note {
+    margin: 12px 2px 0;
+    color: var(--text-dim, #78716c);
+    font-size: 12px;
+  }
+  .tb-note a {
+    color: inherit;
   }
 </style>

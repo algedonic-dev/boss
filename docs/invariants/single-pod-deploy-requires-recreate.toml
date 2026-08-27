@@ -1,0 +1,8 @@
+[[invariant]]
+id = "single-pod-deploy-requires-recreate"
+claim = "The `boss` Deployment's strategy stays `Recreate` for as long as `boss-auth` is a ReadWriteOnce volume and infra/postgres/migrate.sh takes no advisory lock."
+source = "infra/cluster/manifests/boss.yaml; packet b392d199"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "Nothing stops the obvious fix, and the obvious fix is worse than the bug. Every deploy takes the system of record dark for the length of a pod roll, so `RollingUpdate` with maxSurge=1/maxUnavailable=0 is the natural reach — and it DEADLOCKS this Deployment: boss-auth is a ReadWriteOnce Longhorn PVC (verified against the live cluster), so the surge pod blocks in ContainerCreating on multi-attach while maxUnavailable=0 forbids retiring the pod holding the volume. A stuck rollout beats a two-minute outage only in that it lasts longer. Recorded because the reasoning lives in a manifest comment, and CLAUDE.md 9a is explicit that a comment is not a mechanism. Not a gate: duplicate dispatch — boss-dispatcher binds durable PULL consumers, which compete rather than duplicate. What would enforce it: move boss-auth off RWO (a Secret, or RWX) and give migrate.sh an advisory lock, at which point this entry is retired rather than enforced."

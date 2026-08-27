@@ -49,7 +49,7 @@ section() { printf "\n%s%s%s\n" "$BOLD" "$1" "$RESET"; }
 BOSS_USER='{"id":"verify-replay","role":"platform-admin","access_tier":"operator","territory_account_ids":[],"direct_report_ids":[],"department":"platform"}'
 
 # Per-tenant HTTP API endpoint check. Reads the live API, extracts a
-# count via the python expression, fails if the count is below floor.
+# count via the jq expression, fails if the count is below floor.
 # Floors are brewery-scale (365-day sim, ~700-person roster, ~50
 # accounts, ~10 vendors, ~600K audit_log rows).
 check_api_count() {
@@ -60,14 +60,7 @@ check_api_count() {
         fail "$name: query failed ($url)"
         return
     fi
-    actual=$(printf '%s' "$body" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    print($jq_expr)
-except Exception:
-    print('')
-" 2>/dev/null)
+    actual=$(printf '%s' "$body" | jq -r "$jq_expr" 2>/dev/null)
     if [[ -z "$actual" ]]; then
         fail "$name: parse failed ($url)"
         return
@@ -89,12 +82,11 @@ else
     if [[ -z "$status_json" ]]; then
         fail "boss status --json returned nothing"
     else
-        bad=$(echo "$status_json" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-bad = [s for s in d.get('services', []) if s.get('systemd') != 'active' or s.get('health') != 'ok']
-print('\n'.join(f\"{s['name']}: systemd={s.get('systemd')} health={s.get('health')}\" for s in bad))
-" 2>/dev/null || echo "parse-error")
+        bad=$(echo "$status_json" | jq -r '
+            (.services // [])[]
+            | select(.systemd != "active" or .health != "ok")
+            | "\(.name): systemd=\(.systemd) health=\(.health)"
+        ' 2>/dev/null || echo "parse-error")
         if [[ -z "$bad" ]]; then
             ok "every service is active + healthy"
         else
@@ -111,16 +103,16 @@ section "2. Core API endpoints return projected data"
 # These are the HTTP surfaces that should respond 200 + carry at
 # least one projected row after rebuild. Tenant-neutral floors
 # (1 row each) so any deployment with seeded data passes.
-check_api_count "kb models"        "http://127.0.0.1:7750/api/catalog/models"           "len(d)"     1
-check_api_count "employees"        "http://127.0.0.1:7500/api/people"                   "len(d) if isinstance(d, list) else d.get('total', 0)" 1
+check_api_count "kb models"        "http://127.0.0.1:7750/api/catalog/models"           "length"     1
+check_api_count "employees"        "http://127.0.0.1:7500/api/people"                   'if type == "array" then length else (.total // 0) end' 1
 # NB: /api/people/accounts is served by accounts-api (7550), NOT
 # people-api (7500) — 7500 reads "accounts" as an employee id and
 # 404s, which failed this gate on every box after the accounts split.
-check_api_count "accounts"         "http://127.0.0.1:7550/api/people/accounts"          "len(d) if isinstance(d, list) else d.get('total', 0)" 1
-check_api_count "vendors"          "http://127.0.0.1:7300/api/inventory/vendors"        "len(d)"     1
-check_api_count "assets"    "http://127.0.0.1:7600/api/assets?limit=1"    "d.get('total', 0)"      1
-check_api_count "jobs"             "http://127.0.0.1:7900/api/jobs?limit=1"             "d.get('total', 0)"      1
-check_api_count "Workflows"         "http://127.0.0.1:7900/api/workflows"               "len(d)"     1
+check_api_count "accounts"         "http://127.0.0.1:7550/api/people/accounts"          'if type == "array" then length else (.total // 0) end' 1
+check_api_count "vendors"          "http://127.0.0.1:7300/api/inventory/vendors"        "length"     1
+check_api_count "assets"    "http://127.0.0.1:7600/api/assets?limit=1"    ".total // 0"      1
+check_api_count "jobs"             "http://127.0.0.1:7900/api/jobs?limit=1"             ".total // 0"      1
+check_api_count "Workflows"         "http://127.0.0.1:7900/api/workflows"               "length"     1
 
 # ---------------------------------------------------------------------------
 if (( STRICT )); then
@@ -131,11 +123,11 @@ if (( STRICT )); then
     # Floors set well below the baseline so a healthy regen clears
     # them with margin; a regression that drops the count by an
     # order of magnitude trips the gate.
-    check_api_count "brewery employees"    "http://127.0.0.1:7500/api/people"                  "len(d) if isinstance(d, list) else d.get('total', 0)"  300
-    check_api_count "brewery accounts"     "http://127.0.0.1:7550/api/people/accounts"         "len(d) if isinstance(d, list) else d.get('total', 0)"   30
-    check_api_count "brewery vendors"      "http://127.0.0.1:7300/api/inventory/vendors"        "len(d)"               5
-    check_api_count "brewery jobs"         "http://127.0.0.1:7900/api/jobs?limit=1"             "d.get('total', 0)"  500
-    check_api_count "brewery invoices"     "http://127.0.0.1:7400/api/commerce/invoices?limit=1" "d.get('total', 0)" 100
+    check_api_count "brewery employees"    "http://127.0.0.1:7500/api/people"                  'if type == "array" then length else (.total // 0) end'  300
+    check_api_count "brewery accounts"     "http://127.0.0.1:7550/api/people/accounts"         'if type == "array" then length else (.total // 0) end'   30
+    check_api_count "brewery vendors"      "http://127.0.0.1:7300/api/inventory/vendors"        "length"               5
+    check_api_count "brewery jobs"         "http://127.0.0.1:7900/api/jobs?limit=1"             ".total // 0"  500
+    check_api_count "brewery invoices"     "http://127.0.0.1:7400/api/commerce/invoices?limit=1" ".total // 0" 100
 
     # COGS floor + gross-margin sanity band. The 2026-07-10 year run
     # passed EVERY structural gate (conservation exact, determinism,
@@ -162,12 +154,10 @@ if (( STRICT )); then
     if [[ -z "$IS_JSON" ]]; then
         fail "income statement unreachable (ledger 7080)"
     else
-        COGS_CENTS=$(printf '%s' "$IS_JSON" | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-print(sum(r.get('amount_cents',0) for r in d.get('cogs',[])))" 2>/dev/null || echo 0)
-        REV_CENTS=$(printf '%s' "$IS_JSON" | python3 -c "
-import json,sys; print(json.load(sys.stdin).get('total_revenue_cents',0))" 2>/dev/null || echo 0)
+        COGS_CENTS=$(printf '%s' "$IS_JSON" | jq -r \
+            '([(.cogs // [])[] | (.amount_cents // 0)] | add) // 0' 2>/dev/null || echo 0)
+        REV_CENTS=$(printf '%s' "$IS_JSON" | jq -r \
+            '.total_revenue_cents // 0' 2>/dev/null || echo 0)
         if (( COGS_CENTS >= 50000000 )); then
             ok "open-period COGS: \$$((COGS_CENTS / 100)) (>= \$500,000 floor)"
         else
@@ -215,15 +205,11 @@ else
         else
             fail "/plugins/${url}: $status (bundle missing from /var/lib/boss/step-plugins?)"
         fi
-    done < <(printf '%s' "$plugins_json" | python3 -c "
-import sys, json
-try:
-    for p in json.load(sys.stdin):
-        if p.get('status') == 'active':
-            print(p.get('frontend_url', ''))
-except Exception:
-    pass
-")
+    done < <(printf '%s' "$plugins_json" | jq -r '
+        .[]?
+        | select(.status == "active")
+        | .frontend_url // ""
+    ' 2>/dev/null)
 fi
 
 # ---------------------------------------------------------------------------
@@ -233,13 +219,11 @@ perf=$(curl -sf -m 3 "http://127.0.0.1:4443/api/gateway/perf" 2>/dev/null || ech
 if [[ -z "$perf" ]]; then
     warn "gateway /api/gateway/perf unreachable — skip"
 else
-    slow=$(echo "$perf" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-for e in d.get('endpoints', []):
-    if e.get('p95_ms', 0) > 500:
-        print(f\"{e.get('method','?')} {e.get('path','?')}: p95={e['p95_ms']:.0f}ms count={e.get('count',0)}\")
-" 2>/dev/null || echo "")
+    slow=$(echo "$perf" | jq -r '
+        (.endpoints // [])[]
+        | select((.p95_ms // 0) > 500)
+        | "\(.method // "?") \(.path // "?"): p95=\(.p95_ms | round)ms count=\(.count // 0)"
+    ' 2>/dev/null || echo "")
     if [[ -z "$slow" ]]; then
         ok "no endpoints with p95 > 500ms in recorded traffic"
     else

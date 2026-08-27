@@ -8,7 +8,9 @@ Wants=network-online.target
 Type=oneshot
 Environment=RUST_LOG=info
 Environment=BOSS_POSTGRES_URL=postgres://boss:boss@127.0.0.1/boss
+ExecStartPre=/opt/boss/infra/boss-maintenance-wrap.sh maintenance-search-reindex "search_index rebuild"
 ExecStart=/usr/local/bin/boss-search-reindex
+ExecStartPost=/opt/boss/infra/boss-step.sh maintenance-search-reindex run result=ok
 User=david
 
 [Install]

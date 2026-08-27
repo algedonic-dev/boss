@@ -38,7 +38,7 @@ pub struct PeopleHire {
 impl PeopleHire {
     pub fn new(people_base: impl Into<String>) -> Arc<Self> {
         Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: crate::handlers::common::api_client(),
             people_base: people_base.into(),
         })
     }

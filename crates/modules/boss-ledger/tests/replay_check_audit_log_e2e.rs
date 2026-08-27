@@ -6,8 +6,6 @@
 //! replay-check inside an aborted transaction and asserts no
 //! divergences. Live state is unchanged after the check completes.
 
-#![cfg(feature = "postgres")]
-
 use boss_ledger::{rebuild, rebuild_facts, replay_check_from_audit_log};
 use boss_testing::TestDb;
 use chrono::{DateTime, Utc};
@@ -102,7 +100,7 @@ async fn deep_check_passes_when_audit_log_facts_and_entries_agree() {
 #[tokio::test(flavor = "multi_thread")]
 async fn deep_check_passes_when_audit_event_carries_publisher_envelope() {
     // Regression guard for the fact-payload divergence class. The
-    // publisher (`DomainPublisher::emit_with_actor_at`) stamps `_actor`
+    // publisher envelope (`EventStamp`) stamps `_actor`
     // (always) and `_simulated` (sim runs) onto EVERY event payload; the
     // live in-tx fact never carries them. `rebuild_facts` must strip those
     // envelope keys (see `rebuild_facts::strip_envelope`) so the rebuilt

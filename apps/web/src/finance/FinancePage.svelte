@@ -23,7 +23,7 @@
     loadCommerceSummary,
     type CommerceSummary,
   } from './api';
-  import type { Paged } from '../data/paginated';
+  import type { PagedResult } from '../data/paginated';
   import { href } from '../router';
   import { session } from '@boss/web-kit/session/session.svelte';
 
@@ -50,16 +50,19 @@
 
   let tab = $state<Tab>('overview');
 
-  let invoicesPage = $state<Paged<Invoice>>({
-    data: [],
-    total: 0,
-    limit: 0,
-    offset: 0,
-  });
+  /// The invoice list as loaded — failed is its own state, rendered
+  /// by InvoicesTab, so an outage never reads as "no invoices"
+  /// (packet 3fba9c35).
+  let invoicesResult = $state<PagedResult<Invoice> | null>(null);
   let summary = $state<CommerceSummary | null>(null);
   let summaryLoading = $state(true);
 
-  let invoices = $derived(invoicesPage.data);
+  let invoices = $derived(
+    invoicesResult?.kind === 'ready' ? invoicesResult.page.data : [],
+  );
+  let invoicesError = $derived(
+    invoicesResult?.kind === 'failed' ? invoicesResult.error : null,
+  );
 
   let readOnly = $derived(
     session.value.kind === 'ready' && session.value.user.role === 'auditor',
@@ -71,7 +74,7 @@
     const load = async () => {
       const [inv, s] = await Promise.all([loadInvoices(), loadCommerceSummary()]);
       if (!cancelled) {
-        invoicesPage = inv;
+        invoicesResult = inv;
         summary = s;
         summaryLoading = false;
       }
@@ -144,6 +147,7 @@
     {:else if tab === 'invoices'}
       <InvoicesTab
         {invoices}
+        loadError={invoicesError}
         totalCount={summary?.total_invoice_count ?? invoices.length}
       />
     {:else if tab === 'approvals'}

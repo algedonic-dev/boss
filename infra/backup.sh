@@ -26,6 +26,25 @@ for f in /etc/boss-*.toml; do
   [ -f "$f" ] && cp "$f" "${DEST}/"
 done
 
+# Packet attachment bytes. The `file_refs` ROWS ride the pg_dump
+# below, so backing up the database without this directory restores a
+# system whose every attachment reference resolves to nothing —
+# metadata insisting bytes exist where they do not. That is a
+# conservation failure the restore would report as success, which is
+# the worst shape for one.
+#
+# Content-addressed under `sha256/<hex>`, so this copy can never
+# contain two names for the same bytes. The path comes from
+# infra/files-root.sh, the single definition deploy-services.sh also
+# reads — it cannot drift from the store the service actually writes.
+# shellcheck source=infra/files-root.sh
+. "$(dirname "$0")/files-root.sh"
+if [ -d "$BOSS_FILES_ROOT" ]; then
+  echo "  copying packet attachments..."
+  cp -a "$BOSS_FILES_ROOT/" "${DEST}/boss-files/" 2>/dev/null \
+    || echo "  (attachment store present but could not be copied)"
+fi
+
 # Kanidm IdP state (idm-kanidm.md Q4): the online-backup dir joins
 # the set — losing it loses every person's credentials and passkeys.
 if [ -d /var/lib/kanidm ]; then

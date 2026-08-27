@@ -15,6 +15,14 @@ pub enum JobsError {
     StepNotFound(StepId),
     #[error("storage failure: {0}")]
     Storage(String),
+    /// A claim lost its race (or targeted an unclaimable step). The
+    /// loser learns the current holder and status so the queue lens
+    /// can say "taken by X" instead of failing blankly.
+    #[error("step not claimable: held by {holder:?}, status {status}")]
+    ClaimConflict {
+        holder: Option<String>,
+        status: String,
+    },
 }
 
 /// Optional filters for listing jobs.
@@ -26,6 +34,24 @@ pub struct JobFilter {
     /// both match `kind_prefix = "refurb"`).
     pub kind_prefix: Option<String>,
     pub status: Option<JobStatus>,
+    /// A retention window on TERMINAL packets: keep everything still
+    /// live, plus anything closed on or after this date. Drop
+    /// everything closed before it.
+    ///
+    /// A board renders a card in the column of its current step, so
+    /// terminal packets have to be fetched to appear in terminal
+    /// columns — and the feedback board was fetching all 173
+    /// user-feedback packets to show 14 live ones, 92% of it finished
+    /// work, 27 packets away from silently truncating at its
+    /// `limit=200`. Filtering after the fetch does not fix that; the
+    /// window has to be in the query.
+    ///
+    /// Same idea as `stations.md`'s `terminal_window_days`, which
+    /// `my-watchlist` sets to 14 so a filer can still see an outcome.
+    /// Combines with `status` as OR, not AND: `status = open` plus a
+    /// window means "live OR recently closed", which is the useful
+    /// question and the only one a board asks.
+    pub closed_since: Option<chrono::NaiveDate>,
     pub priority: Option<Priority>,
     pub owner_id: Option<String>,
     /// Filter by subject reference (e.g., device serial, account id).
@@ -35,12 +61,42 @@ pub struct JobFilter {
     /// prefix of it — the same resolution contract as
     /// `job_edge_resolves`. The clear-on-close handler's query.
     pub waiting_on: Option<String>,
+    /// Jobs whose `metadata` CONTAINS this document — the JSONB
+    /// containment shape (`metadata @> $1`), so a station predicate's
+    /// `metadata_equals` clause narrows in SQL instead of after the
+    /// page is drawn. A per-actor station is the case that needs it: a
+    /// watchlist filtered only in memory would page through the whole
+    /// company's newest packets to find one person's.
+    ///
+    /// Flat string-valued objects only — that is the whole of what
+    /// `metadata_equals` expresses.
+    pub metadata_contains: Option<serde_json::Value>,
     /// Row-level policy scope — translated from `boss_policy_client::Predicate`
     /// by the HTTP handler before calling the adapter. Pushing it down
     /// into SQL here means scoped roles get accurate `total` counts
     /// and pages that only contain jobs they can see (no wasted page
     /// space on rows the post-fetch filter would discard).
     pub scope: JobScope,
+    /// Keep only real packets (`Some(false)`) or only simulated ones
+    /// (`Some(true)`). `None` — the default — is every packet, which
+    /// is what every existing caller already gets.
+    ///
+    /// WHY IT IS A QUERY FILTER AND NOT A CLIENT-SIDE `.filter()`, for
+    /// exactly the reason `closed_since` above is: measured
+    /// 2026-08-17, **5,201 of 5,964 packets (87%) are simulated**, and
+    /// a page of 200 drawn from that population holds roughly 26 real
+    /// ones. A surface that fetches a page and then discards the
+    /// simulated rows shows a nearly empty list, a wrong `total`, and
+    /// silently truncates — the same failure the retention window was
+    /// added to fix, one order of magnitude worse.
+    ///
+    /// `simulated` is set at admission and immutable afterwards
+    /// (`update_job` restores it from the existing row), so this is a
+    /// stable partition rather than a mutable label. Measured on the
+    /// same population: of 39 kinds, **zero are mixed** — a kind is
+    /// either entirely simulated or entirely real — so filtering here
+    /// never splits a kind's packets across two answers.
+    pub simulated: Option<bool>,
 }
 
 /// The policy-scope slice applied to a listing. Mirrors the shapes
@@ -87,6 +143,150 @@ pub struct LaunchCalendarRow {
     pub launch_channel: Option<String>,
 }
 
+/// One version's block in the per-kind terminal report — Tier 1 of
+/// the experiments program (docs/design/network-experiments.md):
+/// measure what version pinning already records. The version
+/// dimension is the packet's PINNED `workflow_version`, so the report
+/// compares protocol variants by what actually ran each packet.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VersionTerminalReport {
+    pub version: i32,
+    /// Every packet pinned to this version (any status).
+    pub total: i64,
+    /// Packet count per status — the six job statuses, zero-count
+    /// statuses omitted.
+    pub by_status: std::collections::BTreeMap<String, i64>,
+    /// Outcome distribution over CLOSED packets: `metadata.outcome`
+    /// value → count. Cancelled packets are terminal but not closed,
+    /// so they stay out of the measurement.
+    pub outcomes: std::collections::BTreeMap<String, i64>,
+    /// Closed packets that declared no outcome (the catch-all close).
+    /// Counted separately rather than under a sentinel key so a
+    /// machine reading `outcomes` only ever sees real outcome values.
+    pub closed_without_outcome: i64,
+    /// Open→close cycle time over closed packets, in days, from the
+    /// dates the jobs row itself carries (`opened_on` / `closed_on` —
+    /// both reproduced by the rebuilder).
+    pub cycle_time_days: CycleTimeDays,
+}
+
+/// Median + p90 with the sample count they were computed over. A
+/// closed packet without a `closed_on` date is not a sample, which is
+/// why `samples` can undercut `by_status["closed"]`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CycleTimeDays {
+    pub samples: i64,
+    pub median: Option<f64>,
+    pub p90: Option<f64>,
+}
+
+/// `percentile_cont` over an already-sorted slice — the same
+/// continuous-percentile arithmetic Postgres runs, mirrored here so
+/// the default (in-memory) report and the SQL override agree to the
+/// bit-level formula, not just approximately.
+fn percentile_cont(sorted: &[f64], p: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let rn = p * (sorted.len() - 1) as f64;
+    let frn = rn.floor();
+    let crn = rn.ceil();
+    let lo = sorted[frn as usize];
+    if frn == crn {
+        return Some(lo);
+    }
+    let hi = sorted[crn as usize];
+    Some((crn - rn) * lo + (rn - frn) * hi)
+}
+
+/// The status's public wire string — derived from the one serde
+/// definition on [`JobStatus`] rather than a third hand-written
+/// match (postgres.rs and http/jobs.rs already carry two).
+fn job_status_key(status: JobStatus) -> String {
+    match serde_json::to_value(status) {
+        Ok(serde_json::Value::String(s)) => s,
+        _ => format!("{status:?}"),
+    }
+}
+
+/// The outcome as `metadata->>'outcome'` would read it: absent or
+/// JSON null is no outcome; a string is itself; any other JSON value
+/// is its text.
+fn outcome_key(metadata: &serde_json::Value) -> Option<String> {
+    match metadata.get("outcome") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(other) => Some(other.to_string()),
+    }
+}
+
+/// Pure aggregation behind [`JobsRepository::workflow_terminal_report`]
+/// — a function of the packets, so any adapter's answer is checkable
+/// against it. Versions sort newest first.
+pub fn terminal_report_from_jobs(
+    jobs: &[Job],
+    since: Option<chrono::NaiveDate>,
+) -> Vec<VersionTerminalReport> {
+    use std::collections::BTreeMap;
+
+    struct Acc {
+        total: i64,
+        by_status: BTreeMap<String, i64>,
+        outcomes: BTreeMap<String, i64>,
+        closed_without_outcome: i64,
+        cycle_days: Vec<f64>,
+    }
+
+    let mut per_version: BTreeMap<i32, Acc> = BTreeMap::new();
+    for job in jobs {
+        if let Some(since) = since
+            && job.opened_on < since
+        {
+            continue;
+        }
+        let acc = per_version.entry(job.workflow_version).or_insert(Acc {
+            total: 0,
+            by_status: BTreeMap::new(),
+            outcomes: BTreeMap::new(),
+            closed_without_outcome: 0,
+            cycle_days: Vec::new(),
+        });
+        acc.total += 1;
+        *acc.by_status.entry(job_status_key(job.status)).or_insert(0) += 1;
+        if job.status == JobStatus::Closed {
+            match outcome_key(&job.metadata) {
+                Some(outcome) => *acc.outcomes.entry(outcome).or_insert(0) += 1,
+                None => acc.closed_without_outcome += 1,
+            }
+            if let Some(closed_on) = job.closed_on {
+                acc.cycle_days
+                    .push((closed_on - job.opened_on).num_days() as f64);
+            }
+        }
+    }
+
+    per_version
+        .into_iter()
+        .rev()
+        .map(|(version, mut acc)| {
+            acc.cycle_days
+                .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            VersionTerminalReport {
+                version,
+                total: acc.total,
+                by_status: acc.by_status,
+                outcomes: acc.outcomes,
+                closed_without_outcome: acc.closed_without_outcome,
+                cycle_time_days: CycleTimeDays {
+                    samples: acc.cycle_days.len() as i64,
+                    median: percentile_cont(&acc.cycle_days, 0.5),
+                    p90: percentile_cont(&acc.cycle_days, 0.9),
+                },
+            }
+        })
+        .collect()
+}
+
 /// One open, workable step surfaced to an executor's "My Day" pull
 /// query — the step plus the minimum Job context the caller needs to
 /// act on it without a second fetch. Returned by
@@ -95,10 +295,29 @@ pub struct LaunchCalendarRow {
 #[derive(Debug, Clone, Serialize)]
 pub struct AssignmentRow {
     pub job_id: JobId,
+    /// The envelope's identity, so a queue lens can name the packet
+    /// without a second fetch.
+    pub job_title: String,
+    pub due_on: Option<chrono::NaiveDate>,
     pub workflow: String,
+    /// The protocol version this packet was admitted under. Rides on
+    /// the row so an executor can resolve the step's spec (its
+    /// spec-authored `duration_hours`, for one) against the exact
+    /// Workflow row the Job is pinned to, without a second fetch.
+    pub workflow_version: i32,
     pub subject_kind: String,
     pub subject_id: String,
     pub priority: Priority,
+    /// The Job's admission-fixed sim-vs-real flag, and its tags. A
+    /// projection, not the Job — but a queue lens renders a packet
+    /// card from the row alone, and a simulated packet has to look
+    /// simulated in a personal queue exactly as it does in the yard.
+    /// `tags` rides along for the same reason: the shared card
+    /// predicate falls back to a `sim` / `simulated` / `synthetic` tag
+    /// for packets that predate the column (there was no backfill), so
+    /// without it the two lenses would disagree on the same packet.
+    pub simulated: bool,
+    pub tags: Vec<String>,
     pub step: Step,
 }
 
@@ -155,6 +374,34 @@ pub trait JobsRepository: Send + Sync {
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError>;
 
+    /// Merge `patch`'s top-level keys into the Job's `metadata`,
+    /// atomically, touching no envelope field. A `null` value REMOVES
+    /// the key (the conductor's `overlay_metadata` convention); any
+    /// other value replaces that key wholesale. Returns the post-merge
+    /// Job.
+    ///
+    /// This is the server-side home of the read-modify-write every
+    /// metadata-merging caller used to run client-side through the
+    /// full-replacement job PUT — a race over the ENVELOPE: a packet
+    /// closed (status + `metadata.outcome` stamped) between the GET
+    /// and the PUT came back open with its outcome erased, on the
+    /// system of record.
+    ///
+    /// Unlike the other `_at` mutations this takes the
+    /// [`boss_core::publisher::EventStamp`] rather than pre-built
+    /// events: the JOB_UPDATED payload is full
+    /// row state (what the rebuild consumes), so it must be built from
+    /// the POST-merge row, which only the adapter's transaction knows.
+    /// Same precedent as the workflow registry's `publish_authored`
+    /// recording WORKFLOW_PUBLISHED beside the row it describes. The
+    /// stamp's `timestamp` is the write's timestamp.
+    async fn merge_job_metadata_at(
+        &self,
+        id: &JobId,
+        patch: &serde_json::Map<String, serde_json::Value>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<Job, JobsError>;
+
     async fn list_jobs(
         &self,
         filter: &JobFilter,
@@ -187,6 +434,21 @@ pub trait JobsRepository: Send + Sync {
         now: DateTime<Utc>,
         events: &[boss_core::event::Event],
     ) -> Result<(), JobsError>;
+
+    /// Claim a ready step for an actor — the Ready→Active
+    /// compare-and-set (queue-visibility Q2). Succeeds only while
+    /// the step is `ready` and unassigned; a re-claim by the current
+    /// holder (ready or active) is an idempotent success. Everything
+    /// else is `ClaimConflict` naming the holder. Like
+    /// `append_sign_off`, this write path owns its fields — the
+    /// generic step UPDATE racing a claim cannot un-decide it.
+    async fn claim_step_at(
+        &self,
+        step_id: &StepId,
+        actor: &str,
+        now: DateTime<Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<Step, JobsError>;
 
     /// Append one sign-off stamp atomically. Stamps are
     /// append-only and owned by this path — the generic step UPDATE
@@ -262,11 +524,16 @@ pub trait JobsRepository: Send + Sync {
                 if assignee_match || role_match {
                     out.push(AssignmentRow {
                         job_id: job.id,
+                        job_title: job.title.clone(),
+                        due_on: job.due_on,
                         workflow: job.kind.clone(),
+                        workflow_version: job.workflow_version,
                         subject_kind: boss_core::primitives::Subject::kind(&job.subject)
                             .to_string(),
                         subject_id: boss_core::primitives::Subject::id(&job.subject).to_string(),
                         priority: job.priority,
+                        simulated: job.simulated,
+                        tags: job.tags.clone(),
                         step,
                     });
                     if out.len() >= limit as usize {
@@ -312,10 +579,15 @@ pub trait JobsRepository: Send + Sync {
                 }
                 out.push(AssignmentRow {
                     job_id: job.id,
+                    job_title: job.title.clone(),
+                    due_on: job.due_on,
                     workflow: job.kind.clone(),
+                    workflow_version: job.workflow_version,
                     subject_kind: boss_core::primitives::Subject::kind(&job.subject).to_string(),
                     subject_id: boss_core::primitives::Subject::id(&job.subject).to_string(),
                     priority: job.priority,
+                    simulated: job.simulated,
+                    tags: job.tags.clone(),
                     step,
                 });
                 if out.len() >= limit as usize {
@@ -326,10 +598,55 @@ pub trait JobsRepository: Send + Sync {
         Ok(out)
     }
 
+    /// Per-version terminal report for one workflow kind — Tier 1 of
+    /// the experiments program (docs/design/network-experiments.md):
+    /// the read surface that replaces the ad-hoc SQL the brewery
+    /// protocol iterations were measured with. Groups every packet of
+    /// `kind` by its PINNED `workflow_version` and reports counts,
+    /// closed-outcome distribution, and open→close cycle-time stats.
+    ///
+    /// `since` keeps packets opened on/after that date; `simulated`
+    /// partitions like [`JobFilter::simulated`] (`None` is every
+    /// packet). A kind with no packets reports an empty Vec — absence
+    /// is a fact, not an error.
+    ///
+    /// The default impl is the pure [`terminal_report_from_jobs`]
+    /// over `list_jobs` — honest but O(packets of the kind) in Rust;
+    /// the Postgres adapter overrides it with one SQL statement.
+    async fn workflow_terminal_report(
+        &self,
+        kind: &str,
+        since: Option<chrono::NaiveDate>,
+        simulated: Option<bool>,
+    ) -> Result<Vec<VersionTerminalReport>, JobsError> {
+        let filter = JobFilter {
+            kind: Some(kind.to_string()),
+            simulated,
+            ..Default::default()
+        };
+        let (jobs, _total) = self.list_jobs(&filter, i64::MAX, 0).await?;
+        Ok(terminal_report_from_jobs(&jobs, since))
+    }
+
     /// Count steps whose kind matches `step_kind` and whose status is
     /// still non-terminal (pending, ready, active). Used by the Step
     /// UX plugin retire path to surface a blast-radius preview.
     async fn count_in_flight_steps_by_kind(&self, step_kind: &str) -> Result<i64, JobsError>;
+
+    /// Count Jobs pinned to one Workflow ROW — `(kind, version)`,
+    /// the pair a Job records at open — whose status is still
+    /// non-terminal (anything but closed / cancelled).
+    ///
+    /// A Job stays pinned to the version it opened under, so this is
+    /// the live-work blast radius of retiring that exact row. Boot's
+    /// quarantine pass asks before it auto-retires an unviable
+    /// Workflow: retiring a row with open Jobs on it would strand
+    /// them.
+    async fn count_open_jobs_for_workflow(
+        &self,
+        kind: &str,
+        version: i32,
+    ) -> Result<i64, JobsError>;
 
     /// Group Jobs by kind and return `(kind, count)` pairs, optionally
     /// scoped to a specific status. Used by the operating-model view

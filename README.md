@@ -30,8 +30,10 @@ enterprise stack.** Beer Open Source Software for System
 Modeling, named in tribute to **Stafford Beer**, the British
 cybernetician whose work on the Viable System Model and Project
 Cybersyn shaped how I thought about modeling organizations while
-designing BOSS. Event-sourced, state-machine-shaped, built around
-describing real-world organizations directly.
+designing BOSS. Event-sourced and network-shaped: **the network is
+the substrate, the fat protocols dictate the current operating
+model, the actors run it** — built around describing real-world
+organizations directly.
 
 **The thesis: a reasonably-sized business — a brewery, a
 device-refurb shop, a dental practice, a 200-tech field-service
@@ -78,10 +80,16 @@ tools, buys three things the patchwork can't:
 Underneath, the model is event-sourced and third-party-verifiable
 (above) — replay rebuilds every projection from t=0 — so
 durability, auditability, and a one-policy-gate security posture
-come from the foundation, not from operator discipline. The
-executor model is humans plus agents: agents execute Steps inside
-the same schema and sign-off rules as humans, never in the
-request path.
+come from the foundation, not from operator discipline. It reads
+in three layers, each replaceable without disturbing the others:
+the **network** is the substrate — packets, the queues that hold
+them, routes, the log, one admission edge — and has no opinion
+about what the work means; the **protocols** are fat and carry the
+meaning, which is why changing how the company works is publishing
+a versioned registry row rather than shipping code; and the
+**actors** — humans plus agents — are the CPUs that run it,
+executing Steps inside the same schema, policy gate, and sign-off
+rules, never in the request path.
 
 The codebase is structured to be conducive to rapid customization
 with AI coding agents — with a bit of care to preserve the audit-
@@ -93,16 +101,14 @@ malleable.
 Install it locally and open it in a browser: the demo tenant,
 Algedonic Ales, **builds itself live**. A fresh install starts
 with an empty audit log (schema + reference data only); the
-brewery simulator then ticks forward from the demo epoch (~1
-sim-day per ~43 wall-seconds at the warp-2000 demo default) and
-generates the operation as it
+brewery simulator then ticks sim-days forward from the demo
+epoch and generates the operation as it
 goes — jobs, orders, invoices, ledger entries, projections. So
 the SPA is **sparse on first load and fills in as the sim runs**,
 and the audit log grows while you click around. The install (see
-[Quick start](#quick-start) below — `docker compose up`, ~20-25
-min cold) builds from source and seeds the tenant through the
-public API; the bootstrap-admin email you set in `.env` becomes
-your login.
+[Quick start](#quick-start) below) builds from source and seeds
+the tenant through the public API; the bootstrap-admin email you
+set in `.env` becomes your login.
 
 A few specific places that land the design quickly (all served
 by the local install on `:4443`):
@@ -116,15 +122,17 @@ by the local install on `:4443`):
 | The brewery's people, with role-based scoped views | <http://localhost:4443/ux/people> |
 | A workflow's anatomy (Workflow authoring surface) | <http://localhost:4443/system/workflows> |
 
-Both install paths land on `:4443` (gateway in demo mode +
-local-auth). What you see is the head of `main` plus the data
-the simulator has generated since you started the stack.
+The install lands on `:4443` behind local-auth: log in as the
+bootstrap-admin for write access, or use the **Browse as a
+guest** button for read-only. What you see is the head of `main`
+plus the data the simulator has generated since you started the
+stack.
 
 ## Where to start
 
 | If you want to … | Read |
 |---|---|
-| See it in a browser | [Quick start](#quick-start) below — `docker compose up`, ~20-25 min cold |
+| See it in a browser | [Quick start](#quick-start) below — `docker compose up` |
 | Understand the architecture | [docs/architecture-diagram.md](docs/architecture-diagram.md) — four diagrams, conceptual to concrete |
 | Read the BOSS core domain | [CLAUDE.md §Primitives + §Supporting concepts](CLAUDE.md#primitives) |
 | See the public demo tenant | [examples/brewery/DOMAIN.md](examples/brewery/DOMAIN.md) — Algedonic Ales |
@@ -172,9 +180,7 @@ Port assignments are the canonical
 
 ## Quick start
 
-Two paths — pick whichever matches your environment.
-
-**Docker compose** (fastest, ~20-25 min cold):
+One supported install path — Docker compose:
 
 ```sh
 git clone https://github.com/algedonic-dev/boss.git
@@ -184,24 +190,12 @@ cp .env.example .env
 docker compose up
 ```
 
-Open `http://localhost:4443`.
-
-**Bare-metal local** (with Postgres 16+, NATS, Rust stable,
-Bun 1.1+ installed):
-
-```sh
-git clone https://github.com/algedonic-dev/boss.git
-cd boss
-./infra/oss-quickstart/quickstart.sh
-```
-
-Open `http://127.0.0.1:4443`.
-
-Either way, the bootstrap-admin email you provide becomes the
-seed `platform-admin` Employee, the install seeds the brewery
-tenant (Workflows, accounts, vendors, reference data), and the live
-brewery sim ticks ~1 sim-day per ~43 wall-seconds (warp-2000 demo
-default), building the demo from there. Full runbook + troubleshooting at
+Open `http://localhost:4443` and log in with the bootstrap-admin
+email you set. The install seeds the brewery tenant through the
+public API and starts the live sim, which builds the demo from an
+empty log. Expected timings, the init-chain log checkpoints, the
+guest button, troubleshooting, and the host-native source-tree
+dev path (`quickstart.sh`) all live in the one install runbook:
 [`infra/oss-quickstart/README.md`](infra/oss-quickstart/README.md).
 
 > **The demo builds itself live.** The install starts the brewery sim
@@ -212,12 +206,13 @@ default), building the demo from there. Full runbook + troubleshooting at
 > asserts a clean rebuild + conservation/integrity.
 
 > ⚠  **Not production-ready.** The quickstart runs the whole
-> platform on one machine with no real authentication. Anyone
-> with network access to the host has full operator privileges.
-> Adding an integrated IAM (Authelia or any OIDC IDP via
-> forward-auth) and a hardened production-infrastructure
-> template are queued under "Post-release" in
-> [`TODO.md`](TODO.md).
+> platform on one machine behind file-backed local-auth — no
+> SSO, no MFA, no account lockout, no rate limiting, no
+> edge-tier hardening (see the quickstart README's
+> Authentication section). An integrated IAM (Authelia or any
+> OIDC IDP via forward-auth) and a hardened
+> production-infrastructure template are queued under
+> "Post-release" in [`TODO.md`](TODO.md).
 
 ## Production posture
 

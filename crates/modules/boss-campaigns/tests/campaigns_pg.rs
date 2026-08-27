@@ -6,8 +6,6 @@
 //! no event, so a campaign with no Job about it yet existed live but
 //! not in any rebuild.
 
-#![cfg(feature = "postgres")]
-
 use boss_campaigns::PgCampaigns;
 use boss_campaigns::port::CampaignsRepository;
 use boss_campaigns::types::Campaign;

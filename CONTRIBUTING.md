@@ -109,24 +109,26 @@ change:
 
 ## Getting set up
 
-The repo's [`README.md`](README.md) walks through the prereqs
-(Rust, Bun, Postgres 16, NATS) and the first-run flow. Two
-install paths:
+The one install runbook is
+[`infra/oss-quickstart/README.md`](infra/oss-quickstart/README.md)
+— prereqs, expected timings, the init-chain log checkpoints, and
+troubleshooting all live there. Two ways in:
 
-**Docker compose** — fastest path; four containers (Postgres,
-NATS, a one-shot init, and `boss-services` running every service
-plus the brewery sim).
+**Docker compose** — the supported install; no local toolchain
+needed.
 
 ```sh
 cd infra/oss-quickstart && docker compose up
 # open http://localhost:4443
 ```
 
-**Bare-metal** — what you want if you're actually changing
-code; runs each service as a plain background process so you can
-iterate on a single crate without rebuilding the whole stack.
-Logs land in `~/.boss-logs/`, PIDs in `~/.boss-pids`, and the
-whole stack stops with `kill $(cat ~/.boss-pids)`.
+**Source-tree dev mode** — what you want if you're actually
+changing code; runs each service as a plain background process so
+you can iterate on a single crate without rebuilding the whole
+stack. Logs land in `~/.boss-logs/`, PIDs in `~/.boss-pids`, and
+the whole stack stops with `kill $(cat ~/.boss-pids)`. Prereqs
+(including the `CREATE ROLE boss` step) are in the runbook's
+"Developing against the source tree" section.
 
 ```sh
 ./infra/oss-quickstart/quickstart.sh

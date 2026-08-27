@@ -5,8 +5,6 @@
 //! with the right shape. Idempotency check: a second run produces no
 //! new rows.
 
-#![cfg(feature = "postgres")]
-
 use boss_ledger::rebuild_facts;
 use boss_testing::TestDb;
 use chrono::{DateTime, Utc};

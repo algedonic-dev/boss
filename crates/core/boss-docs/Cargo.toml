@@ -46,3 +46,11 @@ sqlx = { version = "0.8", default-features = false, features = ["macros", "runti
 
 [lints]
 workspace = true
+
+[[test]]
+name = "docs_events_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "schema_status_agreement_pg"
+required-features = ["postgres"]

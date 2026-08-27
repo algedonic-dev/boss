@@ -55,3 +55,51 @@ proptest = "1"
 
 [lints]
 workspace = true
+
+[[test]]
+name = "audit_log_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "consume_idempotency_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "financial_facts_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "opening_je_event_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "outbox_inventory_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "po_batch_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "primary_vendor_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "procurement_audit_chain"
+required-features = ["postgres"]
+
+[[test]]
+name = "procurement_crm_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "rebuild_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "receive_idempotency_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "value_conservation_pg"
+required-features = ["postgres"]

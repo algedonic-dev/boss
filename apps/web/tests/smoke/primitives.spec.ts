@@ -4,7 +4,8 @@
 // assets list, asset detail, job detail), run against the Svelte
 // bundle on port 5174 via the standalone dev server.
 //
-// The abort criterion for the migration (svelte-migration.md Q7)
+// The abort criterion for the migration (ADRs 0078-0084; Q7 was
+// cited from a migration doc that was never written)
 // includes "no worse DOM stability than React" — these tests are
 // how we verify that claim.
 

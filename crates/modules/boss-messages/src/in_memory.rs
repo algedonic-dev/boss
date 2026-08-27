@@ -46,11 +46,16 @@ impl MessageRepository for InMemoryMessages {
         Ok(msgs)
     }
 
-    async fn unread_count(&self, recipient_id: &str) -> Result<u32, MessageError> {
+    async fn unread_count(
+        &self,
+        recipient_id: &str,
+        kind: Option<&str>,
+    ) -> Result<u32, MessageError> {
         let guard = self.messages.read().await;
         let count = guard
             .iter()
             .filter(|m| m.recipient_id == recipient_id && m.read_at.is_none())
+            .filter(|m| kind.is_none_or(|k| m.kind.0 == k))
             .count();
         Ok(count as u32)
     }
@@ -132,6 +137,40 @@ impl MessageRepository for InMemoryMessages {
         Ok(())
     }
 
+    async fn expire_signals_under(
+        &self,
+        path_prefix: &str,
+        now: DateTime<Utc>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<u32, MessageError> {
+        let ids: Vec<String> = {
+            let mut guard = self.messages.write().await;
+            let mut hit = Vec::new();
+            for m in guard.iter_mut() {
+                let matches = m.entity_ref.as_ref().is_some_and(|e| {
+                    e.entity_path
+                        .as_deref()
+                        .is_some_and(|p| p.starts_with(path_prefix))
+                });
+                if matches && m.kind.0 == MessageKind::SIGNAL && m.read_at.is_none() {
+                    m.kind = MessageKind::ARCHIVED.into();
+                    hit.push(m.id.clone());
+                }
+            }
+            hit
+        };
+        // One event per row, mirroring the Pg adapter — a summary
+        // event would leave the rebuilder knowing how many moved but
+        // not which.
+        for id in &ids {
+            self.record(stamp.event(
+                crate::events::MESSAGE_ARCHIVED,
+                serde_json::json!({ "id": id, "archived_at": now, "reason": "entity-past-relevancy" }),
+            ));
+        }
+        Ok(ids.len() as u32)
+    }
+
     async fn archive_message(
         &self,
         id: &str,
@@ -189,7 +228,6 @@ mod tests {
         boss_core::publisher::EventStamp::new(
             "messages",
             boss_core::actor::ActorId::Automation("test".into()),
-            Utc::now(),
         )
     }
 
@@ -229,7 +267,7 @@ mod tests {
     #[tokio::test]
     async fn unread_count_correct() {
         let repo = test_repo();
-        let count = repo.unread_count("emp-001").await.unwrap();
+        let count = repo.unread_count("emp-001", None).await.unwrap();
         assert_eq!(count, 2);
     }
 
@@ -268,11 +306,11 @@ mod tests {
     #[tokio::test]
     async fn mark_read_reduces_unread_count() {
         let repo = test_repo();
-        let before = repo.unread_count("emp-001").await.unwrap();
+        let before = repo.unread_count("emp-001", None).await.unwrap();
         repo.mark_read("msg-001", Utc::now(), &test_stamp())
             .await
             .unwrap();
-        let after = repo.unread_count("emp-001").await.unwrap();
+        let after = repo.unread_count("emp-001", None).await.unwrap();
         assert_eq!(after, before - 1);
     }
 
@@ -314,5 +352,128 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, MessageError::NotFound(_)));
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+    use crate::types::*;
+
+    fn msg(id: &str, kind: &str, path: Option<&str>, read: bool) -> Message {
+        Message {
+            id: id.to_string(),
+            sender_id: "automation:dispatcher".to_string(),
+            recipient_id: "emp-001".to_string(),
+            subject: format!("S {id}"),
+            body: "b".to_string(),
+            entity_ref: path.map(|p| EntityRef {
+                entity_type: "job".to_string(),
+                entity_id: "job-1".to_string(),
+                entity_path: Some(p.to_string()),
+            }),
+            kind: kind.into(),
+            sent_at: Utc::now(),
+            read_at: if read { Some(Utc::now()) } else { None },
+            reply_to: None,
+        }
+    }
+
+    fn stamp() -> boss_core::publisher::EventStamp {
+        boss_core::publisher::EventStamp::new(
+            "messages",
+            boss_core::actor::ActorId::Automation("test".into()),
+        )
+    }
+
+    /// The three narrowings the port doc promises, asserted together
+    /// because the value of this expiry is entirely in what it does
+    /// NOT touch. A version that cleared directs would delete the one
+    /// category the inbox's needs-you filter is built on.
+    #[tokio::test]
+    async fn expires_only_unread_signals_under_the_prefix() {
+        let repo = InMemoryMessages::new(vec![
+            msg("stale-job", MessageKind::SIGNAL, Some("/jobs/job-1"), false),
+            msg(
+                "stale-step",
+                MessageKind::SIGNAL,
+                Some("/jobs/job-1/steps/s1"),
+                false,
+            ),
+            msg("a-direct", MessageKind::DIRECT, Some("/jobs/job-1"), false),
+            msg(
+                "already-read",
+                MessageKind::SIGNAL,
+                Some("/jobs/job-1"),
+                true,
+            ),
+            msg("other-job", MessageKind::SIGNAL, Some("/jobs/job-2"), false),
+            msg("no-entity", MessageKind::SIGNAL, None, false),
+        ]);
+
+        let n = repo
+            .expire_signals_under("/jobs/job-1", Utc::now(), &stamp())
+            .await
+            .unwrap();
+        assert_eq!(n, 2, "both shapes under the prefix, and nothing else");
+
+        async fn kind_of(repo: &InMemoryMessages, id: &str) -> String {
+            repo.message_by_id(id).await.unwrap().unwrap().kind.0
+        }
+        assert_eq!(kind_of(&repo, "stale-job").await, MessageKind::ARCHIVED);
+        assert_eq!(kind_of(&repo, "stale-step").await, MessageKind::ARCHIVED);
+        assert_eq!(
+            kind_of(&repo, "a-direct").await,
+            MessageKind::DIRECT,
+            "a direct is addressed to a person and does not expire with the job"
+        );
+        assert_eq!(
+            kind_of(&repo, "already-read").await,
+            MessageKind::SIGNAL,
+            "a read message already did its job"
+        );
+        assert_eq!(
+            kind_of(&repo, "other-job").await,
+            MessageKind::SIGNAL,
+            "the prefix must not leak across jobs"
+        );
+        assert_eq!(
+            kind_of(&repo, "no-entity").await,
+            MessageKind::SIGNAL,
+            "a message about nothing cannot be past relevancy"
+        );
+    }
+
+    /// `/jobs/job-1` must not match `/jobs/job-10`.
+    #[tokio::test]
+    async fn the_prefix_does_not_match_a_longer_id() {
+        let repo = InMemoryMessages::new(vec![msg(
+            "sibling",
+            MessageKind::SIGNAL,
+            Some("/jobs/job-10"),
+            false,
+        )]);
+        let n = repo
+            .expire_signals_under("/jobs/job-1/", Utc::now(), &stamp())
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn records_one_event_per_archived_row() {
+        let repo = InMemoryMessages::new(vec![
+            msg("a", MessageKind::SIGNAL, Some("/jobs/job-1"), false),
+            msg("b", MessageKind::SIGNAL, Some("/jobs/job-1"), false),
+        ]);
+        repo.expire_signals_under("/jobs/job-1", Utc::now(), &stamp())
+            .await
+            .unwrap();
+        let events = repo.recorded_events();
+        assert_eq!(
+            events.len(),
+            2,
+            "the rebuilder needs to know WHICH rows moved"
+        );
     }
 }

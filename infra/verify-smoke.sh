@@ -43,14 +43,7 @@ expect_at_least_one() {
         fail "$label: query failed ($url)"
         return
     fi
-    actual=$(printf '%s' "$body" | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    print($jq_expr)
-except Exception:
-    print('')
-" 2>/dev/null)
+    actual=$(printf '%s' "$body" | jq -r "$jq_expr" 2>/dev/null)
     if [[ -z "$actual" ]]; then
         fail "$label: parse failed ($url)"
         return
@@ -63,25 +56,25 @@ except Exception:
 }
 
 section "Reference data (seeded at first boot)"
-expect_at_least_one "kb models"   "http://127.0.0.1:7750/api/catalog/models"           "len(d)"
-expect_at_least_one "employees"   "http://127.0.0.1:7500/api/people"                   "len(d) if isinstance(d, list) else d.get('total', 0)"
-expect_at_least_one "accounts"    "http://127.0.0.1:7500/api/people/accounts"          "len(d) if isinstance(d, list) else d.get('total', 0)"
-expect_at_least_one "vendors"     "http://127.0.0.1:7300/api/inventory/vendors"        "len(d)"
+expect_at_least_one "kb models"   "http://127.0.0.1:7750/api/catalog/models"           "length"
+expect_at_least_one "employees"   "http://127.0.0.1:7500/api/people"                   'if type == "array" then length else (.total // 0) end'
+expect_at_least_one "accounts"    "http://127.0.0.1:7500/api/people/accounts"          'if type == "array" then length else (.total // 0) end'
+expect_at_least_one "vendors"     "http://127.0.0.1:7300/api/inventory/vendors"        "length"
 
 section "Coordination primitives (every brewery sim emits these)"
-expect_at_least_one "Workflows"    "http://127.0.0.1:7900/api/workflows"               "len(d)"
-expect_at_least_one "jobs"        "http://127.0.0.1:7900/api/jobs?limit=1"             "d.get('total', 0)"
-expect_at_least_one "assets" "http://127.0.0.1:7600/api/assets?limit=1"  "d.get('total', 0)"
+expect_at_least_one "Workflows"    "http://127.0.0.1:7900/api/workflows"               "length"
+expect_at_least_one "jobs"        "http://127.0.0.1:7900/api/jobs?limit=1"             ".total // 0"
+expect_at_least_one "assets" "http://127.0.0.1:7600/api/assets?limit=1"  ".total // 0"
 
 section "Operational motions (sales + finance + shipping)"
-expect_at_least_one "invoices"            "http://127.0.0.1:7400/api/commerce/invoices?limit=1"      "d.get('total', 0)"
-expect_at_least_one "shipments"           "http://127.0.0.1:7100/api/shipping/shipments?limit=1"     "d.get('total', 0)"
-expect_at_least_one "purchase orders"     "http://127.0.0.1:7300/api/inventory/purchase-orders?limit=1" "d.get('total', 0)"
+expect_at_least_one "invoices"            "http://127.0.0.1:7400/api/commerce/invoices?limit=1"      ".total // 0"
+expect_at_least_one "shipments"           "http://127.0.0.1:7100/api/shipping/shipments?limit=1"     ".total // 0"
+expect_at_least_one "purchase orders"     "http://127.0.0.1:7300/api/inventory/purchase-orders?limit=1" ".total // 0"
 
 section "Audit + ledger backbone"
-expect_at_least_one "policy rules"    "http://127.0.0.1:7250/api/policy/rules"                  "len(d)"
-expect_at_least_one "ledger summary"  "http://127.0.0.1:7080/api/ledger/summary"                "1 if d else 0"
-expect_at_least_one "messages"        "http://127.0.0.1:7200/api/messages?limit=1"              "d.get('total', 0)"
+expect_at_least_one "policy rules"    "http://127.0.0.1:7250/api/policy/rules"                  "length"
+expect_at_least_one "ledger summary"  "http://127.0.0.1:7080/api/ledger/summary"                'if . == null or . == false or . == 0 or . == "" or . == {} or . == [] then 0 else 1 end'
+expect_at_least_one "messages"        "http://127.0.0.1:7200/api/messages?limit=1"              ".total // 0"
 
 section "Summary"
 

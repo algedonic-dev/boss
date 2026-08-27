@@ -5,8 +5,6 @@
 //! drain; zero on_hand forces zero value. The 2026-07-06 365d regen
 //! measured the old averaged scheme leaking +$6,597.77/yr here.
 
-#![cfg(feature = "postgres")]
-
 use boss_products::PgProducts;
 use boss_products::port::ProductsRepository;
 use boss_testing::TestDb;
@@ -16,8 +14,8 @@ fn stamp() -> boss_core::publisher::EventStamp {
     boss_core::publisher::EventStamp::new(
         "products",
         boss_core::actor::ActorId::Automation("test".into()),
-        chrono::Utc::now(),
     )
+    .with_timestamp(chrono::Utc::now())
 }
 
 async fn seed_product(db: &TestDb, sku: &str) {

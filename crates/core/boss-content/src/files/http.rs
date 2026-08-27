@@ -264,7 +264,11 @@ async fn upload(
         return err(e);
     }
 
-    let now = boss_clock_client::now_from(&state.clock).await;
+    // OUTBOX (phase 2) below records content.file.attached in the
+    // same transaction as the row; `uploaded_at` takes the stamp's
+    // wall instant so row, payload, and record stamp agree.
+    let stamp = crate::events::event_stamp(&state.publisher).await;
+    let now = stamp.timestamp;
     let id = Uuid::new_v4();
     let draft = FileRefDraft {
         id,
@@ -279,9 +283,6 @@ async fn upload(
         uploaded_at: now,
     };
 
-    // OUTBOX (phase 2): the adapter records content.file.attached in
-    // the same transaction as the row.
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
     match state.repo.insert(draft.clone(), &stamp).await {
         Ok(row) => (StatusCode::CREATED, Json(row)).into_response(),
         Err(e) => {
@@ -522,7 +523,9 @@ async fn finalize_upload(
         Err(e) => return err(e),
     }
 
-    let now = boss_clock_client::now_from(&state.clock).await;
+    // Same shape as the upload path: the stamp is the one instant.
+    let stamp = crate::events::event_stamp(&state.publisher).await;
+    let now = stamp.timestamp;
     let draft = FileRefDraft {
         id: req.file_id,
         target: target.clone(),
@@ -535,9 +538,6 @@ async fn finalize_upload(
         uploaded_by: user.id.clone(),
         uploaded_at: now,
     };
-    // OUTBOX (phase 2): the adapter records content.file.attached in
-    // the same transaction as the row.
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
     match state.repo.insert(draft, &stamp).await {
         Ok(row) => (StatusCode::CREATED, Json(row)).into_response(),
         Err(e) => err(e),
@@ -606,12 +606,15 @@ async fn soft_delete(
     if let Err(resp) = check_policy(&state, &user, Action::Update, &row.target).await {
         return resp;
     }
-    let now = boss_clock_client::now_from(&state.clock).await;
     // OUTBOX (phase 2): the adapter records content.file.detached in
     // the same transaction as the flip — and only on an actual flip,
     // so a repeat delete no longer publishes a duplicate event.
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
-    if let Err(e) = state.repo.soft_delete(id, now, &user.id, &stamp).await {
+    let stamp = crate::events::event_stamp(&state.publisher).await;
+    if let Err(e) = state
+        .repo
+        .soft_delete(id, stamp.timestamp, &user.id, &stamp)
+        .await
+    {
         return err(e);
     }
     StatusCode::NO_CONTENT.into_response()

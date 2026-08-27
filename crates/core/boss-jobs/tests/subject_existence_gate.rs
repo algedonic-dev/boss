@@ -99,6 +99,7 @@ fn build_app(existence: Option<Arc<dyn SubjectExistenceCheck>>) -> (Router, Arc<
     );
     let state = JobsApiState {
         job_edges: None,
+        stations: None,
         jobs: jobs.clone(),
         bus,
         publisher,
@@ -142,6 +143,7 @@ fn job_with_subject(subject: Subject) -> Job {
         closed_on: None,
         metadata: serde_json::Value::Null,
         tags: vec![],
+        simulated: false,
     }
 }
 

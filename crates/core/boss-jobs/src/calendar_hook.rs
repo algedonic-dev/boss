@@ -191,6 +191,7 @@ mod tests {
             blocked_by: vec![],
             sort_order: 0,
             sign_offs_required: Vec::new(),
+            assurance_required: None,
             sign_offs: Vec::new(),
             fields: Vec::new(),
             metadata: serde_json::Value::Object(metadata),

@@ -4,8 +4,6 @@
 //! writes a matching `financial_facts` row in the same transaction. Backed
 //! by a real Postgres via `TestDb`.
 
-#![cfg(feature = "postgres")]
-
 use boss_commerce::PgCommerce;
 use boss_commerce::port::CommerceRepository;
 use boss_commerce::types::*;

@@ -192,6 +192,10 @@ kind = "task"
 ready_when = "steps.whirlpool.done"
 authority_role = "brewer"
 title_template = "Fermentation start (pitch yeast)"
+# Honest fermentation time: a pale ale ferments ~7 days, not one
+# 8h kind-default workday. Spec-authored duration wins over the
+# StepType's typical_duration_hours.
+duration_hours = 168.0
 metadata_defaults = { ferm_temp_c = 19, yeast_strain = "", vessel = "" }
 
 # QC checkpoint between fermentation and packaging. Kept as a normal
@@ -1566,7 +1570,9 @@ metadata_defaults = { kind = "income", jurisdiction = "US-FEDERAL" }
 # `[periodic.quarterly-excise]`. Same three-step shape as the other
 # tax filings; metadata kind="excise" routes to the 2320 Excise Tax
 # Payable liability account at remit time. The liability is accrued
-# per brew batch (DR 6550 / CR 2320 = excise_bbl × $3.50/bbl) by the
+# per brew batch (DR 6550 / CR 2320, rate graduated over the year's
+# taxed barrels via the excise_rate_schedules registry — see
+# seeds/excise_rates.toml for the TTB curve) by the
 # `excise-accrue-on-production-produce-step-done` dispatcher rule, so
 # this filing's `period-excise` derive_basis sums the 2320 credit
 # balance for the quarter and the terminal step drains it to Cash.
@@ -1842,6 +1848,8 @@ kind = "task"
 ready_when = "steps.whirlpool.done"
 authority_role = "brewer"
 title_template = "Fermentation start (pitch yeast + dry hop schedule)"
+# Honest fermentation time: ~7 days for an IPA (primary + dry hop).
+duration_hours = 168.0
 metadata_defaults = { ferm_temp_c = 19, yeast_strain = "California Ale", vessel = "" }
 
 # PACKAGING ALLOCATION — one tank of fungible wort, split across formats by
@@ -2038,6 +2046,8 @@ kind = "task"
 ready_when = "steps.whirlpool.done"
 authority_role = "brewer"
 title_template = "Fermentation start (pitch yeast)"
+# Honest fermentation time: a stout conditions ~10 days.
+duration_hours = 240.0
 metadata_defaults = { ferm_temp_c = 18, yeast_strain = "English Ale", vessel = "" }
 
 # PACKAGING ALLOCATION — one tank of fungible wort, split across formats by
@@ -2229,6 +2239,8 @@ kind = "task"
 ready_when = "steps.whirlpool.done"
 authority_role = "brewer"
 title_template = "Fermentation start (pitch lager yeast)"
+# Honest fermentation time: cold lagering runs ~14 days.
+duration_hours = 336.0
 metadata_defaults = { ferm_temp_c = 11, yeast_strain = "German Lager", vessel = "" }
 
 # PACKAGING ALLOCATION — one tank of fungible wort, split across formats by
@@ -2423,6 +2435,8 @@ kind = "task"
 ready_when = "steps.whirlpool.done"
 authority_role = "brewer"
 title_template = "Fermentation start (pitch yeast + biotransformation dry hop)"
+# Honest fermentation time: a hazy turns around in ~6 days.
+duration_hours = 144.0
 metadata_defaults = { ferm_temp_c = 20, yeast_strain = "English Ale", vessel = "" }
 
 # PACKAGING ALLOCATION — one tank of fungible wort, split across formats by

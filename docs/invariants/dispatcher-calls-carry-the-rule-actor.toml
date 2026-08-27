@@ -1,0 +1,8 @@
+[[invariant]]
+id = "dispatcher-calls-carry-the-rule-actor"
+claim = "Every downstream call a dispatcher handler makes must carry the rule-as-actor `x-boss-user` header."
+source = "infra/lint/dispatcher-actor-stamp.sh"
+enforcement = "enforced"
+mechanism = "infra/lint/dispatcher-actor-stamp.sh"
+last_verified = ""
+note = "Structural rather than a test, because an unauthenticated internal call is a latent outage that fires when somebody else adds a gate, possibly months later — handler tests mock the downstream service and pass whether or not the call is authenticated."

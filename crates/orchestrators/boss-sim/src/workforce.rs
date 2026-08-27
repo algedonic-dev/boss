@@ -16,7 +16,10 @@
 //! `now ≥ started_at + duration` — so a 5-day fermentation is genuinely
 //! held for five sim-days of clock time while a 15-minute QC finishes
 //! almost immediately. Durations are real, paced by the clock, not a
-//! per-tick completion-probability roll.
+//! per-tick completion-probability roll. The duration itself resolves
+//! spec-first: a step whose Workflow spec authors `duration_hours`
+//! (read via the Job's pinned workflow version) is paced by that; the
+//! StepType kind's typical duration is only the fallback.
 //!
 //! ## Pull the whole assigned backlog in one query
 //!
@@ -55,6 +58,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use crate::actor_coverage::ActorCoverage;
 use crate::api_activity::{self, ActorKind, ApiActivity};
 
 /// Default duration for step kinds with no `typical_duration_hours`
@@ -107,6 +111,10 @@ pub struct WorkforceStats {
     pub checkins: u64,
     pub claimed: u64,
     pub completed: u64,
+    /// Real (non-simulated) assignments the boundary refused to touch.
+    /// Nonzero is normal - humans and agents have queues too - but this
+    /// number existing is what makes the boundary observable.
+    pub real_skipped: u64,
     /// Steps left Ready because real inventory was short (the
     /// auto-reorder catches up).
     pub deferred: u64,
@@ -158,8 +166,19 @@ pub struct Workforce {
     client: reqwest::blocking::Client,
     api_base: String,
     /// StepType kind → typical duration hours, sourced from the
-    /// StepRegistry. Drives the duration-gated completion.
+    /// StepRegistry. Drives the duration-gated completion — as the
+    /// FALLBACK: a step whose Workflow spec authors its own
+    /// `duration_hours` is paced by that instead (see
+    /// `step_duration_hours`).
     durations: HashMap<String, f64>,
+    /// (workflow kind, pinned version) → spec slug → spec-authored
+    /// `duration_hours`. Lazily fetched from the registry's versioned
+    /// read surface on first sight of a (workflow, version) pair and
+    /// cached — Workflow versions are append-only, so a cached row
+    /// can never go stale. Mutex, not RwLock: the critical sections
+    /// are a lookup or an insert, and the worker threads spend their
+    /// time in HTTP round-trips, not here.
+    spec_durations: std::sync::Mutex<HashMap<(String, i32), HashMap<String, f64>>>,
     /// StepType kind → its required-at-done fields, sourced from the
     /// StepRegistry. On completion the workforce supplies any the Workflow
     /// didn't default — the executor filling the step's form.
@@ -177,6 +196,11 @@ pub struct Workforce {
     /// the dispatcher routes to them stay Ready for the human; see
     /// `workable_assignee`.
     excluded_assignees: std::collections::HashSet<String>,
+    /// Employee id → steps completed this process lifetime. The input
+    /// to [`Self::actor_coverage`] — WHO acts, where `WorkforceStats`
+    /// only counts HOW MUCH. Mutex (not a plain field): `complete`
+    /// takes `&self` from the parallel step workers.
+    completions_by_actor: std::sync::Mutex<HashMap<String, u64>>,
     pub stats: WorkforceStats,
 }
 
@@ -221,10 +245,12 @@ impl Workforce {
             client,
             api_base: api_base.to_string(),
             durations,
+            spec_durations: std::sync::Mutex::new(HashMap::new()),
             required_fields,
             api_activity: api_activity::new_handle(),
             emp_roles: HashMap::new(),
             excluded_assignees: Default::default(),
+            completions_by_actor: std::sync::Mutex::new(HashMap::new()),
             stats: WorkforceStats::default(),
         }
     }
@@ -249,6 +275,29 @@ impl Workforce {
     pub fn with_excluded_assignees(mut self, ids: impl IntoIterator<Item = String>) -> Self {
         self.excluded_assignees.extend(ids);
         self
+    }
+
+    /// Count one completed step against `emp` — the actor-coverage
+    /// tally ([`Self::actor_coverage`]). A poisoned lock drops the
+    /// sample rather than panicking: telemetry never wedges the sim.
+    fn note_completion(&self, emp: &str) {
+        if let Ok(mut m) = self.completions_by_actor.lock() {
+            *m.entry(emp.to_string()).or_default() += 1;
+        }
+    }
+
+    /// Snapshot actor coverage: who on the roster this executor is
+    /// actually driving, per role, vs who has never completed a step.
+    /// Pure function of the emp→role map, the per-employee completion
+    /// tally, and the operator-exclusion set (operators are labeled,
+    /// never counted dormant). The daemon serves this in `/telemetry`.
+    pub fn actor_coverage(&self) -> ActorCoverage {
+        let completions = self
+            .completions_by_actor
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        crate::actor_coverage::compute(&self.emp_roles, &completions, &self.excluded_assignees)
     }
 
     /// The role to attribute an employee's API calls to (cockpit display).
@@ -279,6 +328,91 @@ impl Workforce {
             .get(kind)
             .copied()
             .unwrap_or(DEFAULT_STEP_HOURS)
+    }
+
+    /// A step's pacing duration. Resolution order: the step's own
+    /// spec `duration_hours` — read from the Job's PINNED workflow
+    /// version — wins; the StepType kind's typical duration is the
+    /// fallback. This is what lets a `task`-kind fermentation hold
+    /// for the 168h its Workflow says instead of "completing" in the
+    /// kind's one-workday default.
+    fn step_duration_hours(&self, row: &Value, step: &Value, kind: &str) -> f64 {
+        self.spec_duration_hours(row, step)
+            .unwrap_or_else(|| self.duration_hours(kind))
+    }
+
+    /// The spec-authored duration for this row's step, if its pinned
+    /// Workflow version authors one. First sight of a (workflow,
+    /// version) pair fetches the version row and caches its slug →
+    /// hours map. A failed fetch resolves to `None` (kind-default
+    /// pacing for this pass) and is NOT cached, so a transient
+    /// registry error heals on the next check-in.
+    fn spec_duration_hours(&self, row: &Value, step: &Value) -> Option<f64> {
+        let workflow = row.get("workflow")?.as_str()?;
+        let version = i32::try_from(row.get("workflow_version")?.as_i64()?).ok()?;
+        let slug = step.get("spec_slug")?.as_str()?;
+        let key = (workflow.to_string(), version);
+        if let Ok(cache) = self.spec_durations.lock()
+            && let Some(by_slug) = cache.get(&key)
+        {
+            return by_slug.get(slug).copied();
+        }
+        match self.fetch_spec_durations(workflow, version) {
+            Ok(by_slug) => {
+                let hours = by_slug.get(slug).copied();
+                if let Ok(mut cache) = self.spec_durations.lock() {
+                    cache.insert(key, by_slug);
+                }
+                hours
+            }
+            Err(e) => {
+                warn!(
+                    workflow, version, error = %e,
+                    "spec-duration fetch failed; kind default paces this pass"
+                );
+                None
+            }
+        }
+    }
+
+    /// GET the pinned Workflow version row and index each step's
+    /// spec-authored `duration_hours` by its slug (`title`). 404 is
+    /// definitive — no such version row — and comes back as an empty
+    /// map so it caches; transport / 5xx errors bubble up so the
+    /// caller retries next pass.
+    fn fetch_spec_durations(&self, workflow: &str, version: i32) -> Result<HashMap<String, f64>> {
+        let url = service_url(
+            &self.api_base,
+            &format!("/api/workflows/{workflow}/versions/{version}"),
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .with_context(|| format!("GET {url}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(HashMap::new());
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            anyhow::bail!("GET {url} -> {status}");
+        }
+        let spec: Value = resp.json().with_context(|| format!("decode {url}"))?;
+        Ok(spec
+            .get("steps")
+            .and_then(|v| v.as_array())
+            .map(|steps| {
+                steps
+                    .iter()
+                    .filter_map(|s| {
+                        Some((
+                            s.get("title")?.as_str()?.to_string(),
+                            s.get("duration_hours")?.as_f64()?,
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// Read the freely-advancing sim clock. Returns `(now, epoch_end)`.
@@ -343,11 +477,35 @@ impl Workforce {
             .send()
             .with_context(|| format!("GET {url}"))?;
         let body: Value = resp.json().context("decode /api/jobs/assignments")?;
-        let rows = body
+        let all_rows = body
             .get("data")
             .and_then(|d| d.as_array())
             .cloned()
             .unwrap_or_default();
+        // THE SIM BOUNDARY, enforced where selection happens. This
+        // query returns every assigned workable step in the SYSTEM -
+        // real packets included - and on 2026-08-20/21 this executor
+        // "completed" two real cars' proven steps and all six daily
+        // maintenance sweeps under their assignees' identities, filling
+        // required fields with capitalized field-name echoes
+        // (verified='Verified'), and left the sweeps fork-unfireable
+        // (defect 88798c96). A simulated worker works simulated
+        // packets, full stop. FAIL CLOSED: a row that does not say
+        // simulated=true is not the sim's to touch - absent means real
+        // (rows predating the column carry sim tags the envelope
+        // already folds into `simulated`).
+        let mut real_skipped = 0u64;
+        let rows: Vec<Value> = all_rows
+            .into_iter()
+            .filter(|row| {
+                let sim = row_is_simulated(row);
+                if !sim {
+                    real_skipped += 1;
+                }
+                sim
+            })
+            .collect();
+        self.stats.real_skipped += real_skipped;
 
         // Drive steps with bounded parallelism (see WORKFORCE_WORKERS). The
         // blocking client is Clone+Send+Sync and each step claims/completes
@@ -454,6 +612,10 @@ impl Workforce {
             }
         };
 
+        // Spec-authored duration (via the Job's pinned workflow
+        // version) wins; StepType kind default is the fallback.
+        let step_hours = self.step_duration_hours(row, step, kind);
+
         match status {
             "ready" => {
                 // Don't start a brew's consume without the ingredients —
@@ -470,7 +632,7 @@ impl Workforce {
                 // elsewhere: triggers are resolved at materialization, and
                 // outcome / milestone are completed by the dispatcher's
                 // marker handler — none are ever assigned to a worker.)
-                if self.duration_hours(kind) <= 0.0 {
+                if step_hours <= 0.0 {
                     self.complete(
                         job_id,
                         step_id,
@@ -491,7 +653,7 @@ impl Workforce {
                     .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                     .map(|d| d.with_timezone(&Utc));
                 let elapsed_enough = match started {
-                    Some(start) => now >= start + duration_from_hours(self.duration_hours(kind)),
+                    Some(start) => now >= start + duration_from_hours(step_hours),
                     // No stamp (claimed before this model / orphan) — let
                     // it complete rather than wedge forever.
                     None => true,
@@ -565,12 +727,15 @@ impl Workforce {
         // existing keys, then fill any required field the Workflow didn't
         // already default.
         let mut md = metadata.as_object().cloned().unwrap_or_default();
-        self.fill_required_fields(kind, &mut md, now);
+        self.fill_required_fields(kind, &mut md, step_id, now);
         // Inline authoring: the step's own required fields
         // are part of the completion contract too.
         for (name, field_type) in authored_fields {
             if !md.contains_key(name) {
-                md.insert(name.clone(), synth_field_value(field_type, name, now));
+                md.insert(
+                    name.clone(),
+                    synth_field_value(field_type, name, step_id, now),
+                );
             }
         }
         // Gates (demand-gate / availability-gate) are agent-executed: the
@@ -581,7 +746,9 @@ impl Workforce {
         // only labor; see docs/architecture-decisions.md).
         obj.insert("metadata".to_string(), Value::Object(md.clone()));
         if sign_offs_required.is_empty() {
-            return self.put_step(job_id, step_id, &body, emp);
+            self.put_step(job_id, step_id, &body, emp)?;
+            self.note_completion(emp);
+            return Ok(());
         }
         // Sign-off contract: stamps attest the step's FINAL shape, so the
         // metadata the executor fills lands first, then the stamps,
@@ -602,18 +769,22 @@ impl Workforce {
             step_id,
             &json!({ "status": "completed", "completed_by": emp }),
             emp,
-        )
+        )?;
+        self.note_completion(emp);
+        Ok(())
     }
 
     /// Fill the kind's required-at-done fields the Workflow didn't default,
     /// with type-appropriate values — the simulated executor supplying the
     /// inputs a human would type before marking the step done. Existing
     /// keys (Workflow defaults, values set on an earlier transition) are
-    /// never overwritten.
+    /// never overwritten. `step_id` is the spread key for enum-typed
+    /// fields: stable per step, varied across the population.
     fn fill_required_fields(
         &self,
         kind: &str,
         md: &mut serde_json::Map<String, Value>,
+        step_id: &str,
         now: DateTime<Utc>,
     ) {
         let Some(fields) = self.required_fields.get(kind) else {
@@ -625,7 +796,7 @@ impl Workforce {
             }
             md.insert(
                 f.name.clone(),
-                synth_field_value(&f.field_type, &f.name, now),
+                synth_field_value(&f.field_type, &f.name, step_id, now),
             );
         }
     }
@@ -756,10 +927,10 @@ fn workable_assignee<'a>(
 /// A reasonable value for a required field, by its StepType `field_type` —
 /// what a human executor would put in the box. Type-valid against
 /// `boss_jobs::step_registry::validate_field_type`: dates/times get a real
-/// instant, enums (pipe-joined) pick the leading variant (the happy-path
-/// outcome for most: `pass`, `completed`, …), and free text gets a
-/// readable label derived from the field name.
-fn synth_field_value(field_type: &str, name: &str, now: DateTime<Utc>) -> Value {
+/// instant, enums (pipe-joined) spread deterministically over ALL their
+/// variants (see `enum_variant`), and free text gets a readable label
+/// derived from the field name.
+fn synth_field_value(field_type: &str, name: &str, step_id: &str, now: DateTime<Utc>) -> Value {
     match field_type {
         "number" | "integer" => json!(1),
         "boolean" => json!(true),
@@ -768,12 +939,48 @@ fn synth_field_value(field_type: &str, name: &str, now: DateTime<Utc>) -> Value 
         "date" => json!(now.date_naive().to_string()), // YYYY-MM-DD (len 10)
         "date-time" => json!(now.to_rfc3339()),        // len ≥ 19
         "uri" => json!("https://docs.example.internal/sop"),
-        // Enum types are pipe-joined; the first variant is the conventional
-        // happy-path value.
-        s if s.contains('|') => json!(s.split('|').next().unwrap_or("")),
+        // Enum types are pipe-joined.
+        s if s.contains('|') => json!(enum_variant(s, name, step_id)),
         // "string" / "id-ref" / anything else accepts any string.
         _ => json!(humanize(name)),
     }
+}
+
+/// Pick one variant of a pipe-joined enum by hash-spreading over the
+/// step's identity.
+///
+/// Always taking the leading variant made every synthesized outcome a
+/// constant — all ten closed `tasting-panel` packets carried
+/// `verdict: "release"`, so the hold rate read 0% by construction and
+/// any outcome-distribution measured over sim traffic measured nothing.
+/// Spreading over `(step_id, field)` gives the same step the same answer
+/// on every replay while the population visits every variant. The field
+/// name is in the key so two enums on one step draw independently.
+/// Unweighted and uniform: the sim has no ground truth about how often a
+/// real panel holds a batch, and inventing weights would dress a guess
+/// up as data.
+fn enum_variant<'a>(field_type: &'a str, name: &str, step_id: &str) -> &'a str {
+    let variants: Vec<&str> = field_type.split('|').collect();
+    let h = fxhash(&format!("{step_id}\u{1f}{name}"));
+    // Fold the high half down before the modulus. FNV-1a's low bits are
+    // weak — bit 0 is just the parity of the input bytes — so a two-value
+    // enum keyed on the raw hash makes every field on a step agree.
+    // `split` always yields at least one item, so the modulus is safe.
+    let idx = ((h ^ (h >> 32)) as usize) % variants.len();
+    variants[idx]
+}
+
+/// Small stable string hash (FNV-1a) — NOT `DefaultHasher`, whose seed
+/// varies per process and would make a replayed run pick different
+/// values than the run it replays. Same shape as the owner-resolution
+/// spread in `boss-jobs`.
+fn fxhash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 /// `"document_title"` → `"Document title"`: a readable label for a synthetic
@@ -787,8 +994,86 @@ fn humanize(name: &str) -> String {
     }
 }
 
+/// The sim boundary as one checkable question. `true` only when the
+/// assignment row SAYS simulated=true; absent, null, or false all read
+/// as REAL and are not the sim's to touch (fail closed - defect
+/// 88798c96 is what the open version of this predicate did).
+fn row_is_simulated(row: &Value) -> bool {
+    row.get("simulated").and_then(Value::as_bool) == Some(true)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    /// A Workforce whose kind-default map says `task` takes 8h, with a
+    /// primed spec-duration cache (no HTTP in tests — a cached
+    /// (workflow, version) entry short-circuits the registry fetch).
+    fn workforce_with_cache(cache: HashMap<String, f64>) -> super::Workforce {
+        let wf = super::Workforce::new(
+            "http://127.0.0.1:9", // never dialed: the cache is primed
+            HashMap::from([("task".to_string(), 8.0)]),
+            HashMap::new(),
+        );
+        wf.spec_durations
+            .lock()
+            .unwrap()
+            .insert(("morning-brew".to_string(), 3), cache);
+        wf
+    }
+
+    fn row_and_step() -> (serde_json::Value, serde_json::Value) {
+        let step = json!({ "kind": "task", "spec_slug": "fermentation-start" });
+        let row = json!({
+            "workflow": "morning-brew",
+            "workflow_version": 3,
+            "step": step,
+        });
+        (row.clone(), row["step"].clone())
+    }
+
+    #[test]
+    fn spec_duration_hours_beats_kind_default() {
+        // The step's own spec (via the Job's pinned workflow version)
+        // says fermentation takes 168h; the `task` kind default is 8h.
+        // The spec wins — this is the fidelity fix that stops a 7-day
+        // fermentation "completing" in one workday.
+        let wf = workforce_with_cache(HashMap::from([("fermentation-start".to_string(), 168.0)]));
+        let (row, step) = row_and_step();
+        assert_eq!(wf.step_duration_hours(&row, &step, "task"), 168.0);
+    }
+
+    #[test]
+    fn kind_default_when_spec_is_silent() {
+        // Known workflow version, but the spec authors no duration for
+        // this slug → the StepType kind default paces it, exactly as
+        // before this field existed.
+        let wf = workforce_with_cache(HashMap::new());
+        let (row, step) = row_and_step();
+        assert_eq!(wf.step_duration_hours(&row, &step, "task"), 8.0);
+        // And a kind the durations map doesn't know falls to the
+        // DEFAULT_STEP_HOURS floor.
+        assert_eq!(
+            wf.step_duration_hours(&row, &step, "some-unknown-kind"),
+            super::DEFAULT_STEP_HOURS
+        );
+    }
+
+    #[test]
+    fn the_boundary_fails_closed() {
+        use serde_json::json;
+        assert!(super::row_is_simulated(&json!({"simulated": true})));
+        assert!(!super::row_is_simulated(&json!({"simulated": false})));
+        assert!(!super::row_is_simulated(&json!({})), "absent means real");
+        assert!(!super::row_is_simulated(&json!({"simulated": null})));
+        assert!(
+            !super::row_is_simulated(&json!({"simulated": "true"})),
+            "a string is not a claim - fail closed on shape too"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -860,6 +1145,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn completion_tally_feeds_actor_coverage() {
+        use crate::actor_coverage::RoleStatus;
+        let emp_roles: HashMap<String, String> = HashMap::from([
+            ("emp-1".to_string(), "brewer".to_string()),
+            ("emp-2".to_string(), "brewer".to_string()),
+            ("emp-3".to_string(), "shipping-clerk".to_string()),
+            ("emp-admin".to_string(), "platform-admin".to_string()),
+        ]);
+        let wf = Workforce::new("http://127.0.0.1:9", HashMap::new(), HashMap::new())
+            .with_actor_telemetry(crate::api_activity::new_handle(), emp_roles)
+            .with_excluded_assignees(["emp-admin".to_string()]);
+
+        // Before any completion: both simulatable roles are dormant and
+        // platform-admin reads operator — never dormant.
+        let cov = wf.actor_coverage();
+        assert_eq!(cov.roles_acting, 0);
+        assert_eq!(cov.roles_dormant, 2);
+        assert_eq!(cov.roles_operator, 1);
+        assert_eq!(cov.employees_total, 4);
+        assert_eq!(cov.employees_operator, 1);
+
+        // Two completions by emp-1 + one by emp-2 → brewer acts:
+        // 2 distinct people, 3 steps.
+        wf.note_completion("emp-1");
+        wf.note_completion("emp-1");
+        wf.note_completion("emp-2");
+        let cov = wf.actor_coverage();
+        assert_eq!(cov.employees_acting, 2);
+        let brewer = cov.roles.iter().find(|r| r.role == "brewer").unwrap();
+        assert_eq!(brewer.acting, 2);
+        assert_eq!(brewer.completions, 3);
+        assert_eq!(brewer.status, RoleStatus::Acting);
+        // The clerk roster still hasn't acted — visible dormant.
+        let clerk = cov
+            .roles
+            .iter()
+            .find(|r| r.role == "shipping-clerk")
+            .unwrap();
+        assert_eq!(clerk.status, RoleStatus::Dormant);
+    }
+
     fn fixed_now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2025-04-03T12:00:00Z")
             .unwrap()
@@ -869,14 +1196,15 @@ mod tests {
     #[test]
     fn synth_field_value_is_type_valid_per_kind() {
         let now = fixed_now();
+        let step = "step-1";
         // Free text -> a readable label derived from the field name.
         assert_eq!(
-            synth_field_value("string", "document_title", now),
+            synth_field_value("string", "document_title", step, now),
             json!("Document title")
         );
         // date-time -> RFC3339 (the validator requires len >= 19).
         assert!(
-            synth_field_value("date-time", "scheduled_at", now)
+            synth_field_value("date-time", "scheduled_at", step, now)
                 .as_str()
                 .unwrap()
                 .len()
@@ -884,23 +1212,103 @@ mod tests {
         );
         // date -> YYYY-MM-DD (the validator requires len == 10).
         assert_eq!(
-            synth_field_value("date", "due", now)
+            synth_field_value("date", "due", step, now)
                 .as_str()
                 .unwrap()
                 .len(),
             10
         );
-        // enum -> leading variant.
-        assert_eq!(
-            synth_field_value("pass|fail|conditional", "result", now),
-            json!("pass")
-        );
+        // enum -> one of the declared variants (which one is the step's
+        // own deterministic draw; see enum_choice_* below).
+        let picked = synth_field_value("pass|fail|conditional", "result", step, now);
+        assert!(matches!(
+            picked.as_str(),
+            Some("pass" | "fail" | "conditional")
+        ));
         // scalars are the right JSON shape.
-        assert!(synth_field_value("integer", "n", now).is_i64());
-        assert!(synth_field_value("boolean", "b", now).is_boolean());
-        assert!(synth_field_value("array", "xs", now).is_array());
-        assert!(synth_field_value("object", "o", now).is_object());
-        assert!(synth_field_value("uri", "u", now).is_string());
+        assert!(synth_field_value("integer", "n", step, now).is_i64());
+        assert!(synth_field_value("boolean", "b", step, now).is_boolean());
+        assert!(synth_field_value("array", "xs", step, now).is_array());
+        assert!(synth_field_value("object", "o", step, now).is_object());
+        assert!(synth_field_value("uri", "u", step, now).is_string());
+    }
+
+    /// Replay determinism: the same step always synthesizes the same
+    /// enum value, on any process and at any clock reading. The choice
+    /// is a function of the step's identity, nothing else.
+    #[test]
+    fn enum_choice_is_stable_for_a_step_id() {
+        let now = fixed_now();
+        let first = synth_field_value("release|hold", "verdict", "step-7f3a2b", now);
+        assert!(matches!(first.as_str(), Some("release" | "hold")));
+        for _ in 0..64 {
+            assert_eq!(
+                synth_field_value("release|hold", "verdict", "step-7f3a2b", now),
+                first,
+                "same step id must always yield the same choice"
+            );
+        }
+        // The clock is not part of the key — a replay that lands on a
+        // different sim instant must still make the same choice.
+        assert_eq!(
+            synth_field_value(
+                "release|hold",
+                "verdict",
+                "step-7f3a2b",
+                now + Duration::hours(37)
+            ),
+            first
+        );
+    }
+
+    /// The defect this fixes: ten closed `tasting-panel` packets all
+    /// carried `verdict: "release"`, so the hold rate read 0% by
+    /// construction. A spread that never leaves the first variant is
+    /// the same constant with extra steps.
+    #[test]
+    fn enum_choice_visits_every_variant_across_step_ids() {
+        let now = fixed_now();
+        for field_type in ["release|hold", "pass|fail|conditional", "a|b|c|d"] {
+            let variants: Vec<&str> = field_type.split('|').collect();
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for i in 0..400 {
+                let step_id = format!("01994a7f-{i:04}-7c1e-9d2b-6f0a1c3d5e7{}", i % 10);
+                let v = synth_field_value(field_type, "verdict", &step_id, now);
+                let s = v.as_str().expect("enum synthesizes a string").to_string();
+                assert!(
+                    variants.contains(&s.as_str()),
+                    "{s} is not a declared variant"
+                );
+                *counts.entry(s).or_default() += 1;
+            }
+            assert_eq!(
+                counts.len(),
+                variants.len(),
+                "{field_type}: only visited {:?}",
+                counts.keys().collect::<Vec<_>>()
+            );
+            // Not merely surjective — a variant that shows up twice in
+            // 400 draws still makes a rate measurement noise. Each must
+            // carry at least half its uniform share.
+            let floor = 400 / (variants.len() * 2);
+            for (value, n) in &counts {
+                assert!(*n >= floor, "{field_type}: {value} drew {n} of 400");
+            }
+        }
+    }
+
+    /// Two enum fields on one step must not move in lockstep — the field
+    /// name is part of the key, so a step's `verdict` and its `route`
+    /// are independent draws.
+    #[test]
+    fn enum_choice_is_per_field_not_only_per_step() {
+        let now = fixed_now();
+        let differ = (0..64).any(|i| {
+            let step_id = format!("step-{i:03}");
+            synth_field_value("release|hold", "verdict", &step_id, now)
+                != synth_field_value("release|hold", "route", &step_id, now)
+        });
+        assert!(differ, "every step drew the same value for both fields");
     }
 
     #[test]
@@ -924,7 +1332,7 @@ mod tests {
 
         let mut md = serde_json::Map::new();
         md.insert("document_title".to_string(), json!("Q2 Safety Policy"));
-        wf.fill_required_fields("acknowledgment", &mut md, now);
+        wf.fill_required_fields("acknowledgment", &mut md, "step-1", now);
         // Pre-set key is preserved (the Workflow's default wins).
         assert_eq!(
             md.get("document_title").unwrap(),
@@ -935,7 +1343,7 @@ mod tests {
 
         // Unknown kind -> no-op.
         let mut empty = serde_json::Map::new();
-        wf.fill_required_fields("not-a-kind", &mut empty, now);
+        wf.fill_required_fields("not-a-kind", &mut empty, "step-2", now);
         assert!(empty.is_empty());
     }
 }

@@ -73,7 +73,6 @@ describe('nav catalog — app assignment', () => {
     // The Operating System map — the executor network. Sits beside
     // the dispatcher cascade: same IT audience, different question
     // (job traffic, not rule wiring).
-    'system-os-map',
     // Flow — the team's own throughput, in wall-clock time. Distinct
     // from System Monitoring on purpose: monitoring answers what the
     // machine is doing, Flow answers what the people got through.
@@ -82,6 +81,19 @@ describe('nav catalog — app assignment', () => {
     // Beside Flow deliberately: Flow is throughput, Fleet is where
     // the work is piling up (queue-visibility Q4's depth signal).
     'system-fleet',
+    // The train yard — the departure board over the pipeline's queues
+    // and the IT app's guest-visible landing (departure-board.md Q1).
+    // Its car landed without this line; added when the map arrived.
+    'system-yard',
+    // The network map — every registry station as a node
+    // (stations.md: priority queues, stations, and network nodes are
+    // one concept). No edges until motion is evented.
+    'system-map',
+    // Incidents — active incident-post-mortem packets to respond to,
+    // plus the closed ones rendered as a durable archive (David:
+    // "both where we respond to active incidents and document post
+    // mortems for posterity").
+    'system-incidents',
   ];
 
   it('the IT app contains the System Model set plus what we added deliberately', () => {

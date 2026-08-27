@@ -33,6 +33,10 @@
   // device-asset shape (collectParts) for tenants that DO use
   // satellite linkage.
   let catalogParts = $state<CatalogPart[]>([]);
+  /// Non-null when a row-source load failed — rendered instead of the
+  /// empty state, so an outage never reads as "no parts" (packet
+  /// 3fba9c35, the false-empty sweep).
+  let loadFailed = $state<string | null>(null);
   let loading = $state(true);
   // Defaults to "all" so the playground shows the SKUs on first
   // load. Operators rebrowsing for stockouts click "Needs
@@ -52,6 +56,10 @@
           fetch('/api/inventory/orders'),
           fetch('/api/catalog/parts'),
         ]);
+        // The row sources (models, inventory, catalog parts) are the
+        // page's primary data — any of them failing fails the list.
+        // The PO list only feeds "on order" counts and degrades.
+        const primaryDown = [mResp, iResp, cpResp].find((r) => !r.ok);
         const mBody = mResp.ok ? await mResp.json() : [];
         const iBody = iResp.ok ? await iResp.json() : [];
         const pBody = pResp.ok ? await pResp.json() : [];
@@ -61,10 +69,14 @@
           inventory = Array.isArray(iBody) ? iBody : (iBody.data ?? []);
           pos = Array.isArray(pBody) ? pBody : (pBody.data ?? []);
           catalogParts = Array.isArray(cpBody) ? cpBody : (cpBody.data ?? []);
+          loadFailed = primaryDown ? `HTTP ${primaryDown.status}` : null;
           loading = false;
         }
-      } catch {
-        if (!cancelled) loading = false;
+      } catch (e) {
+        if (!cancelled) {
+          loadFailed = e instanceof Error ? e.message : String(e);
+          loading = false;
+        }
       }
     })();
     return () => {
@@ -224,6 +236,10 @@
     <section class="list-section">
       {#if loading}
         <p class="empty">Loading…</p>
+      {:else if loadFailed}
+        <p class="empty load-failed" role="alert">
+          Couldn't load parts — {loadFailed}
+        </p>
       {:else if visible.length === 0}
         <p class="empty">No parts match those filters.</p>
       {:else}

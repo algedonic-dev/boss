@@ -63,7 +63,7 @@ impl std::str::FromStr for WorkflowStatus {
 /// recovered from which titles each `ready_when` mentions. The
 /// human-facing label comes from `title_template` (or a humanized
 /// `title` when that's blank).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StepSpec {
     /// Stable slug + predicate identifier, unique within the
     /// Workflow. Kebab-case (`mash-in`, `cfo-approval`).
@@ -93,6 +93,20 @@ pub struct StepSpec {
     /// at materialization.
     #[serde(default)]
     pub sign_offs_required: Vec<String>,
+    /// The weakest stamp this step accepts. Protocol data: raising a
+    /// step to `presence` is a Workflow edit, not a deploy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assurance_required: Option<boss_core::job::Assurance>,
+    /// How long this step's work actually takes, in hours. Executors
+    /// pacing a step (the sim workforce's duration-gated completion)
+    /// prefer this over the StepType kind's `typical_duration_hours` —
+    /// a `task`-kind fermentation ferments for the 168h its Workflow
+    /// says, not the kind's one-workday default. `None` means "the
+    /// kind's typical duration", so every existing spec is unchanged.
+    /// Protocol data, not a code path (§9): correcting a duration is a
+    /// Workflow edit, not a deploy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_hours: Option<f64>,
     /// Step-authored completion-contract fields (inline
     /// authoring) — validated in union with the kind bundle's fields,
     /// so vocabulary that isn't shared needs no registry row.
@@ -100,6 +114,30 @@ pub struct StepSpec {
     pub fields: Vec<boss_core::job::StepField>,
     #[serde(default)]
     pub authority_role: Option<String>,
+    /// Leave this step UNASSIGNED for whoever holds `authority_role`
+    /// to claim, instead of the dispatcher handing it to one person.
+    ///
+    /// The dispatcher's role-assignment loop resolves a role-gated
+    /// step to a single eligible employee and assigns it. Where a role
+    /// has one holder that is not routing, it is a permanent
+    /// nomination: every `platform-admin` step in the system is
+    /// assigned to the same person, and nobody else — human or agent —
+    /// can pick one up even when they hold the role. Measured
+    /// 2026-08-18: all six open design reviews assigned to `emp-david`,
+    /// none claimable, which is why answered reviews still read as his
+    /// queue.
+    ///
+    /// CLAIMABILITY IS NOT AUTHORITY, which is what makes this safe.
+    /// `authority_role` still decides who MAY claim and complete; this
+    /// only decides whether the packet arrives pre-nominated or waits
+    /// in a role queue. Nothing here widens what an actor is permitted
+    /// to do, and policy is still enforced at the claim.
+    ///
+    /// Protocol data, not a code path (§9): making a step claimable is
+    /// a Workflow edit, not a deploy. `None` means today's behaviour,
+    /// so every existing spec is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimable: Option<bool>,
     #[serde(default)]
     pub metadata_defaults: serde_json::Value,
 }
@@ -152,7 +190,7 @@ fn default_subject_source() -> String {
 
 /// A full registry row. All fields serialize directly to the
 /// `workflows` JSONB columns with the same names.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowSpec {
     pub kind: String,
     pub version: i32,
@@ -240,6 +278,8 @@ impl WorkflowSpec {
 /// "workflow"` per Q3 of the design doc — reuses the existing
 /// CustomSubject support without forcing a new Subject variant
 /// in `boss-core`.
+#[cfg(test)]
+#[cfg(test)]
 fn workflow_design_spec() -> WorkflowSpec {
     let steps = vec![
         StepSpec {
@@ -268,6 +308,7 @@ fn workflow_design_spec() -> WorkflowSpec {
             // platform-admin alone: authoring a work-type is the
             // operational leaders' job, not solely the deploy operator's.
             sign_offs_required: vec!["workflow-approver".into()],
+            assurance_required: None,
             authority_role: Some("workflow-approver".into()),
             metadata_defaults: serde_json::json!({ "authority_role": "workflow-approver" }),
             ..Default::default()
@@ -342,6 +383,12 @@ fn workflow_design_spec() -> WorkflowSpec {
 ///   2. `gate`    — everything green, and observed working
 ///   3. `review`  — opened for review, url recorded
 ///   999. `merged`/`abandoned` — outcomes
+// Kept only as the fidelity test's expected value — see
+// `the_platform_bundle_matches_the_specs_it_replaced`. Out of
+// `platform_workflows()`, so the lib build has no caller: the kind
+// now lives in infra/platform/workflows.toml and an operator edit
+// to it survives a boot, which is the whole point of the move.
+#[cfg(test)]
 fn ship_a_change_spec() -> WorkflowSpec {
     let steps = vec![
         StepSpec {
@@ -427,6 +474,62 @@ fn ship_a_change_spec() -> WorkflowSpec {
                     field_type: "string".into(),
                     required: true,
                 },
+                // The gate's OWN account of the run, not the author's.
+                //
+                // `gates` and `verified` are prose, so "the gate was
+                // green" has always been something the protocol takes
+                // on trust. On 2026-08-17 a car asserted
+                // `infra/gate.sh --auto green` while its crate did not
+                // compile, and the train it boarded reddened twice
+                // (742d1faa). Two more reds the same day were the
+                // subtler version: the gate really did pass, on a
+                // laptop, in a shape CI does not run — one suite that
+                // had never seen `FORGEJO_ACTIONS`, one that had never
+                // run against a clean tree whose HEAD is its own trunk.
+                // Neither prose field would have shown that, because
+                // the author did not know it either.
+                //
+                // `infra/gate.sh` now writes a receipt (see
+                // `write_receipt`) recording the mode, the commit,
+                // whether the tree was dirty, the host, whether any CI
+                // marker was set, the free space, and every check with
+                // its result. Paste it here.
+                //
+                // This is EVIDENCE, NOT ENFORCEMENT — nothing stops
+                // someone typing a fiction into a string field, and
+                // pretending otherwise would be the same trust the
+                // prose fields already misplace. What it changes is
+                // that the honest answer is now the easy one, and that
+                // the fact which keeps catching us — WHERE the gate ran
+                // — is written down by something other than the person
+                // making the claim.
+                boss_core::job::StepField {
+                    name: "receipt".into(),
+                    field_type: "string".into(),
+                    required: true,
+                },
+                // What the change LOOKS like, for a car that changes a
+                // rendered surface — a screenshot path, or what was
+                // rendered and looked at.
+                //
+                // Optional, because most cars change no surface and a
+                // required field would be answered "n/a" into
+                // meaninglessness. It exists because the protocol is a
+                // better place to carry this than any one actor's
+                // notes: on 2026-08-15 a UI change was "fixed" twice in
+                // the wrong file and both diffs compiled, typechecked
+                // and read plausibly. The tooling to render it was
+                // already in the repo — `apps/web/playwright.mocked
+                // .config.ts`, chromium installed — and one screenshot
+                // named the mistake in a minute. Asking the question on
+                // the step is what makes that habit belong to whoever
+                // holds the car rather than to whoever happened to
+                // learn it.
+                boss_core::job::StepField {
+                    name: "rendered".into(),
+                    field_type: "string".into(),
+                    required: false,
+                },
             ],
             ..Default::default()
         },
@@ -443,16 +546,52 @@ fn ship_a_change_spec() -> WorkflowSpec {
             }],
             ..Default::default()
         },
+        // Merged is not done. David, 2026-08-19, after a day of
+        // "changes are done that are not visible in my UI experience":
+        // *"Since I am using 'prod', I should have the definitive view
+        // and proof that the change is fully deployed, which should be
+        // the happy path terminal outcome."* The step's contract is
+        // proof AT THE CONSUMING LAYER of the deployed system — a
+        // browser check (infra/uxprobe) for anything with a surface,
+        // endpoint/log evidence for anything without one. `verified`
+        // is required at done so the proof is on the record, and
+        // `method` names which kind of proof it was.
+        //
+        // Same trigger the terminal used to fire on: the conductor (or
+        // a person) observed the merge. The terminal below now waits
+        // for the proof instead.
+        StepSpec {
+            title: "proven".into(),
+            kind: "task".into(),
+            ready_when: "steps.review.done AND job.metadata.merged = \"true\"".into(),
+            title_template: "Proven in prod".into(),
+            authority_role: Some("platform-admin".into()),
+            fields: vec![
+                boss_core::job::StepField {
+                    name: "verified".into(),
+                    field_type: "string".into(),
+                    required: true,
+                },
+                boss_core::job::StepField {
+                    name: "method".into(),
+                    field_type: "browser|api|log".into(),
+                    required: false,
+                },
+            ],
+            ..Default::default()
+        },
         StepSpec {
             title: "merged".into(),
             kind: "outcome".into(),
-            // BOTH halves, same shape as `abandoned` below and for the
-            // same reason: the dispatcher completes any ready
-            // terminal, so gated on `review.done` alone this fired the
-            // moment review completed — Jobs read "merged" while their
-            // PR was still open. The marker is set by whatever
-            // OBSERVED the merge: the train conductor, or a person.
-            ready_when: "steps.review.done AND job.metadata.merged = \"true\"".into(),
+            // The happy terminal fires on the PROOF, not the merge —
+            // the outcome value stays "merged" so every consumer of
+            // the close marker (the feedback obligation above all)
+            // keeps matching, and now fires only once the change is
+            // verified where the operator actually lives. The
+            // conductor's own bookkeeping is untouched: it still
+            // completes `review` and sets the merge marker, and the
+            // packet then waits at `proven` instead of closing.
+            ready_when: "steps.proven.done".into(),
             title_template: "Merged".into(),
             metadata_defaults: serde_json::json!({ "outcome_kind": "completed" }),
             terminal: Some(Terminal {
@@ -510,7 +649,12 @@ fn ship_a_change_spec() -> WorkflowSpec {
          question. The `scope` step is the point of the kind: it asks a person what the \
          change contains and what it deliberately excludes BEFORE the work, which is the \
          only moment that decision keeps a PR small. Counted on /system/flow, so a cadence \
-         target needs no second mechanism."
+         target needs no second mechanism. Name the feedback packet this change answers in \
+         `metadata.backlog_item` — a declared job edge, ref-checked at the write, and the \
+         link the dispatcher follows on merge to complete that packet's open branch and \
+         tell its filer. Use `metadata.backlog_text` only when the referent is not a Job \
+         on this instance (legacy, or a request that arrived as prose); it is free text \
+         and nothing follows it."
             .to_string(),
     );
     spec
@@ -560,6 +704,11 @@ fn ship_a_change_spec() -> WorkflowSpec {
 ///   5. `backfill`  — synthetic past, then the go-live transition
 ///   6. `verify`    — schema, registry, invariants
 ///   999. `complete` / `abandoned`
+// Kept only as the fidelity test's expected value — see
+// `the_platform_bundle_matches_the_specs_it_replaced`. Out of
+// `platform_workflows()`, so the lib build has no caller.
+#[cfg(test)]
+#[cfg(test)]
 fn regenerate_deployment_spec() -> WorkflowSpec {
     /// A step in the chain, gated on its predecessor, carrying one
     /// required record of what was done.
@@ -751,6 +900,8 @@ fn regenerate_deployment_spec() -> WorkflowSpec {
 ///   0. `triage`  — measure the claim, choose a route (human-gated)
 ///   1..n         — one branch per route
 ///   999. `closed`
+#[cfg(test)]
+#[cfg(test)]
 fn backlog_item_spec() -> WorkflowSpec {
     const DISPOSITIONS: &str = "verify|design|build|duplicate|stale|decline";
 
@@ -904,6 +1055,35 @@ fn backlog_item_spec() -> WorkflowSpec {
 /// `policy-rule-design` one) land here as additional entries —
 /// never as TOML-loader exceptions, never as direct
 /// `INSERT INTO workflows` SQL.
+/// The path to the platform Workflow bundle, resolved from this crate.
+pub fn platform_bundle_path() -> &'static str {
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../infra/platform/workflows.toml"
+    )
+}
+
+/// EVERY kind a deployment has: the Rust roster PLUS the bundle.
+///
+/// `platform_workflows()` alone stopped being that answer the moment
+/// kinds began moving to infra/platform/workflows.toml, and the gap is
+/// silent in exactly the wrong way — a test that seeds only the roster
+/// still compiles, still runs, and gets `unknown or inactive job kind`
+/// at the first create, so the assertion it was written for never
+/// executes. Four suites failed that way the day `ship-a-change`
+/// converted; each had been passing while testing nothing.
+///
+/// Anything standing up a registry that is meant to resemble a
+/// deployment wants this, not the roster.
+pub fn seedable_platform_workflows() -> Vec<WorkflowSpec> {
+    let mut all = platform_workflows();
+    all.extend(
+        crate::seed_loader::load_workflows(platform_bundle_path())
+            .expect("the platform Workflow bundle parses"),
+    );
+    all
+}
+
 pub fn platform_workflows() -> Vec<WorkflowSpec> {
     vec![
         maintenance_spec(
@@ -921,13 +1101,37 @@ pub fn platform_workflows() -> Vec<WorkflowSpec> {
             "Ledger replay check",
             "The 03:30 rooted-at-audit-log replay comparison.",
         ),
-        workflow_design_spec(),
         design_doc_review_spec(),
         user_feedback_spec(),
-        ship_a_change_spec(),
-        regenerate_deployment_spec(),
-        backlog_item_spec(),
         pr_train_spec(),
+        // `workflow-design`, `regenerate-deployment` and `backlog-item`
+        // are NOT missing — they moved to infra/platform/workflows.toml
+        // and are supplied by `boss-platform-workflow-seed`
+        // (protocols-as-data, step 1: the kinds with no traffic first,
+        // so a wrong loader can hurt nothing).
+        //
+        // Leaving this list is the point of the exercise. A kind here
+        // is a protocol that cannot be changed without a deploy, and
+        // one bootstrap_reconcile will rewrite if an operator edits it.
+        // A kind in the bundle is data: the seed inserts it once and
+        // nothing ever overwrites it.
+        //
+        // THE BUNDLE IS WHAT SAYS WHICH, and it has to be read on the
+        // main this lands on rather than the one the branch was cut
+        // from. This car spent a round narrowed to `regenerate-deployment`
+        // alone, because at its base commit the bundle held one
+        // workflow. Train #45 added the other two an hour later, so
+        // measuring against the branch point would have left
+        // `workflow-design` and `backlog-item` in BOTH places — and a
+        // kind in both places is the worse failure, not the safe one:
+        // bootstrap_reconcile republishes the code version over the
+        // bundle's on every boot, which is precisely what moving them
+        // out was for.
+        //
+        // The three builders survive below under #[cfg(test)] as the
+        // fidelity test's expected value — the proof the bundle says
+        // exactly what the code used to. They are deleted for real
+        // once that test has watched a release go by.
     ]
 }
 
@@ -1120,13 +1324,34 @@ fn pr_train_spec() -> WorkflowSpec {
             ..Default::default()
         },
         StepSpec {
+            title: "converged".into(),
+            kind: "task".into(),
+            ready_when: "steps.deployed.done".into(),
+            title_template: "Cluster converged".into(),
+            authority_role: admin.clone(),
+            // Merging installs nothing (fdff316c), and the cluster
+            // converge was fire-and-forget with no packet and no alarm
+            // (7e5ee013) — measured at six silent hours on 2026-08-19,
+            // which armed a dedup guard late and minted a duplicate
+            // packet. David, 2026-08-19: fix it at the TRAIN layer.
+            // The conductor completes this step only when the RUNNING
+            // cluster binary self-reports the merge commit (the health
+            // endpoint's build commit — proof the pod restarted onto
+            // it, where an image tag would only prove a push), and
+            // files a loud packet when convergence lags past the
+            // threshold instead of waiting silently.
+            fields: vec![req("cluster_commit"), req("verified")],
+            ..Default::default()
+        },
+        StepSpec {
             title: "arrived".into(),
             kind: "outcome".into(),
-            // Both evidence trails must be on the record: the deploys
-            // that carried it out AND the CI verdict — without the ci
-            // edge the verdict step is a leaf no terminal depends on,
-            // which the viability lint rightly rejects.
-            ready_when: "steps.deployed.done AND steps.ci.done".into(),
+            // Three evidence trails must be on the record: the deploys
+            // that carried it out, the CLUSTER actually serving the
+            // merge, AND the CI verdict — without the ci edge the
+            // verdict step is a leaf no terminal depends on, which the
+            // viability lint rightly rejects.
+            ready_when: "steps.converged.done AND steps.ci.done".into(),
             title_template: "Train arrived".into(),
             metadata_defaults: serde_json::json!({ "outcome_kind": "completed" }),
             terminal: Some(Terminal {
@@ -1208,6 +1433,46 @@ fn user_feedback_spec() -> WorkflowSpec {
     // of stranding a Job at runtime.
     const DISPOSITIONS: &str = "reproduce|design|build|duplicate|needs-info|decline";
 
+    // ROUTING IS NOT A ONE-SHOT GUESS (a001c78a, found by exercising
+    // the protocol rather than reading it).
+    //
+    // Every branch predicate used to read `steps.triage.metadata
+    // .disposition` and nothing else, so the packet was routed exactly
+    // once — before the investigation that produces the evidence. An
+    // investigator who discovered the item needed a design decision had
+    // no move: recording that on the investigate step was decorative,
+    // and `closed` fired on `steps.investigate.done`, so FINISHING the
+    // investigation ended the packet whatever it concluded. Observed
+    // live on 3f5f7f63, whose recommendation is stranded on a closed
+    // packet.
+    //
+    // So `investigate` carries the same vocabulary triage does, minus
+    // `reproduce` (it IS the reproduction) and plus `resolved` (the
+    // investigation settled it, which is v9's only behaviour). A branch
+    // is reachable from whichever step reached that conclusion.
+    //
+    // This is what the network framing predicts: routing decided once,
+    // by the actor with the least information, is exactly the property
+    // stations-as-queues exists to replace.
+    const INVESTIGATION_OUTCOMES: &str = "resolved|design|build|needs-info|duplicate|decline";
+
+    /// Reachable from triage's decision OR from the investigation's.
+    ///
+    /// Both halves must be evaluable at once: `boss-expr` errors on a
+    /// missing identifier and OR does not short-circuit past the error,
+    /// so ONE unreadable clause takes down a predicate that is
+    /// otherwise true. That is why `investigate` declares a
+    /// `metadata_defaults` disposition below — materialization stamps
+    /// it, so the key exists from the moment the step does. Registered
+    /// as `a-predicate-reading-another-steps-field-needs-that-key-to-exist`.
+    fn routed_to(disposition: &str) -> String {
+        format!(
+            "(steps.triage.done AND steps.triage.metadata.disposition = \"{disposition}\") \
+             OR (steps.investigate.done \
+             AND steps.investigate.metadata.disposition = \"{disposition}\")"
+        )
+    }
+
     /// A branch that leaves the Job open for someone to do the work.
     /// Authority-gated for the same reason triage is: `task` has no
     /// required roles, so without a gate the simulated workforce
@@ -1216,9 +1481,7 @@ fn user_feedback_spec() -> WorkflowSpec {
         StepSpec {
             title: title.into(),
             kind: "task".into(),
-            ready_when: format!(
-                "steps.triage.done AND steps.triage.metadata.disposition = \"{disposition}\""
-            ),
+            ready_when: routed_to(disposition),
             title_template: label.into(),
             authority_role: Some("platform-admin".into()),
             ..Default::default()
@@ -1240,9 +1503,7 @@ fn user_feedback_spec() -> WorkflowSpec {
         StepSpec {
             title: title.into(),
             kind: "outcome".into(),
-            ready_when: format!(
-                "steps.triage.done AND steps.triage.metadata.disposition = \"{disposition}\""
-            ),
+            ready_when: routed_to(disposition),
             title_template: label.into(),
             metadata_defaults: serde_json::json!({ "outcome_kind": outcome_kind }),
             terminal: Some(Terminal {
@@ -1324,8 +1585,60 @@ fn user_feedback_spec() -> WorkflowSpec {
             ],
             ..Default::default()
         },
-        branch("investigate", "Reproduce and investigate", "reproduce"),
-        branch("design-review", "Decide the design", "design"),
+        StepSpec {
+            // Reached from triage only — an investigation cannot route
+            // to another investigation, and `reproduce` is not in
+            // INVESTIGATION_OUTCOMES for that reason.
+            ready_when: "steps.triage.done AND steps.triage.metadata.disposition = \"reproduce\""
+                .into(),
+            fields: vec![
+                boss_core::job::StepField {
+                    name: "disposition".into(),
+                    field_type: INVESTIGATION_OUTCOMES.into(),
+                    // Required at done, like triage's: an investigation
+                    // that does not say where the item goes next is the
+                    // v9 behaviour this replaces.
+                    required: true,
+                },
+                boss_core::job::StepField {
+                    name: "finding".into(),
+                    field_type: "string".into(),
+                    required: false,
+                },
+            ],
+            // `resolved` — the investigation settled it — is v9's only
+            // outcome, so an investigator who says nothing gets exactly
+            // the old behaviour.
+            //
+            // The default is LOAD-BEARING twice over, and neither
+            // reason is cosmetic. (1) Materialization stamps it, so
+            // every branch predicate above can read
+            // `steps.investigate.metadata.disposition` from the moment
+            // the packet exists — without it the key is absent, the
+            // clause errors, and OR takes the whole predicate down with
+            // it. (2) The `complete-feedback-branch-on-car-merged`
+            // obligation completes `investigate` when a car names the
+            // packet; a required field with no default would 422 that
+            // write and break the feedback loop.
+            metadata_defaults: serde_json::json!({ "disposition": "resolved" }),
+            ..branch("investigate", "Reproduce and investigate", "reproduce")
+        },
+        // v11 (David, 0ab5fa3a, accepted 2026-08-19): the design
+        // decision is kind `answer-question`, not `task`. Browser-
+        // measured on v10: a task with no declared fields renders the
+        // generic surface, whose whole decision affordance was one
+        // Start button — no verdict, no response, nowhere to record
+        // WHAT was decided. `answer-question` is the platform's
+        // question-and-response contract (verdict + answer required at
+        // done), it lands in My Day's "Yours to decide" queue, and its
+        // plugin renders the brief + buttons + proposed answer. The
+        // slug stays `design-review`, so the `closed` terminal and the
+        // car-merge obligation keep matching; that obligation carries
+        // the required fields via its rule row's `done_metadata` arg.
+        StepSpec {
+            kind: "answer-question".into(),
+            ..branch("design-review", "Decide the design", "design")
+        },
         branch("build", "Build the change", "build"),
         branch("needs-info", "Waiting on the reporter", "needs-info"),
         closing_branch(
@@ -1348,7 +1661,17 @@ fn user_feedback_spec() -> WorkflowSpec {
             // Any branch that did real work lands here. The two
             // closing branches terminate on their own and never reach
             // this one.
-            ready_when: "steps.investigate.done OR steps.design-review.done \
+            //
+            // `investigate` is the exception, and the narrowing is the
+            // other half of the re-routing fix: finishing an
+            // investigation ends the packet ONLY when the investigation
+            // said there was nothing further. An investigation that
+            // routed onward leaves this predicate false and the packet
+            // open, waiting at the branch it named — which is the
+            // behaviour a001c78a reported missing.
+            ready_when: "(steps.investigate.done \
+                         AND steps.investigate.metadata.disposition = \"resolved\") \
+                         OR steps.design-review.done \
                          OR steps.build.done OR steps.needs-info.done"
                 .into(),
             title_template: "Feedback closed".into(),
@@ -1383,6 +1706,46 @@ fn user_feedback_spec() -> WorkflowSpec {
             .to_string(),
     );
     spec
+}
+
+/// Which `user-feedback` step a triage disposition opens, and whether
+/// reaching it ends the Job on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedbackBranch {
+    /// The step's `spec_slug` — the stable machine-facing identifier
+    /// (`investigate`, `design-review`, …), which is what a caller
+    /// addressing the step across the HTTP surface matches on.
+    pub slug: String,
+    /// `true` for `duplicate` / `declined`: the branch IS a declared
+    /// terminal, so triage closes the Job outright and there is no
+    /// open step for anything downstream to complete.
+    pub terminal: bool,
+}
+
+/// Which branch step the `user-feedback` triage disposition
+/// `disposition` opened — the fork's routing table, answered from the
+/// shipped spec rather than from a second list.
+///
+/// Every branch's eligibility is `steps.triage.done AND
+/// steps.triage.metadata.disposition = "<value>"`, so the mapping
+/// disposition → step already exists in the Workflow; this reads it
+/// back out instead of restating it. A branch renamed in
+/// `user_feedback_spec` moves this answer with it, which is the point
+/// (CLAUDE.md §9a — the fact stays in one place instead of drifting
+/// against a hardcoded table).
+///
+/// `None` for a disposition no branch claims — an unknown value, or
+/// one the viability lint has yet to catch.
+pub fn feedback_branch_for_disposition(disposition: &str) -> Option<FeedbackBranch> {
+    let needle = format!("steps.triage.metadata.disposition = \"{disposition}\"");
+    user_feedback_spec()
+        .steps
+        .into_iter()
+        .find(|s| s.ready_when.contains(&needle))
+        .map(|s| FeedbackBranch {
+            slug: s.title,
+            terminal: s.terminal.is_some(),
+        })
 }
 
 /// Build the canonical `design-doc-review` WorkflowSpec.
@@ -1488,11 +1851,36 @@ fn subject_fields(subject: &Subject) -> Vec<(&'static str, &str)> {
     vec![("id", subject.id.as_str()), ("kind", subject.kind.as_str())]
 }
 
-fn expand_title(template: &str, subject: &Subject) -> String {
+/// Substitute the step-title token alphabet: `{subject.<field>}` and
+/// `{metadata.<field>}`, the same two namespaces `expand_metadata`
+/// exposes to `metadata_defaults`. A title is the sentence telling a
+/// human what this step is asking of them, so it gets the same per-Job
+/// context the step's metadata already had.
+///
+/// Scalar metadata only (string/number/bool), matching
+/// `expand_metadata`: an object or array has no sensible rendering in
+/// a title, and stringifying one would produce a worse label than
+/// leaving the token alone.
+///
+/// An unknown token is left LITERAL rather than blanked, which is the
+/// same choice `{day…}` makes without a date anchor: a visible
+/// `{metadata.typo}` in the UI is a bug report, whereas silently
+/// emitting "Inspect: " reads as finished work.
+fn expand_title(template: &str, subject: &Subject, job_metadata: &serde_json::Value) -> String {
     let mut out = template.to_string();
     for (field, value) in subject_fields(subject) {
-        let token = format!("{{subject.{field}}}");
-        out = out.replace(&token, value);
+        out = out.replace(&format!("{{subject.{field}}}"), value);
+    }
+    if let Some(map) = job_metadata.as_object() {
+        for (key, value) in map {
+            let rendered = match value {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => continue,
+            };
+            out = out.replace(&format!("{{metadata.{key}}}"), &rendered);
+        }
     }
     out
 }
@@ -1577,14 +1965,54 @@ fn expand_metadata(
             }
         }
     }
+    /// A default written as EXACTLY `{metadata.<key>}` whose Job value
+    /// is an array or an object is substituted whole, not stringified.
+    ///
+    /// Without this, structured Job metadata cannot reach a step at
+    /// all: `meta_fields` above keeps only String/Number/Bool, so an
+    /// array is not in the substitution table, the token matches
+    /// nothing, and the step is materialized carrying the literal text
+    /// `{metadata.questions}`. Silent, and it looks like the spawn rule
+    /// failed to bind.
+    ///
+    /// That is why a design review opens blank (defect 6f40b23f). The
+    /// review plugin renders `step.metadata.questions` when the packet
+    /// carries its own work, and falls back to fetching the doc from a
+    /// service the cluster does not route. The questions could not ride
+    /// into the step even when the spawn bound them onto the Job.
+    ///
+    /// SCALARS ARE DELIBERATELY UNTOUCHED. They already substitute
+    /// correctly, and whole-value substitution would change their TYPE
+    /// — `{metadata.count}` returns String("5") today and would start
+    /// returning Number(5), which `check_metadata_defaults_values`
+    /// type-checks against the StepType's declared field. Narrowing
+    /// this to the case that is currently broken keeps every existing
+    /// template byte-identical.
+    fn whole_value<'a>(s: &str, job_meta: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+        let key = s.strip_prefix("{metadata.")?.strip_suffix('}')?;
+        // One token and nothing else — `"{metadata.a}{metadata.b}"` is
+        // string concatenation and has no whole-value reading.
+        if key.contains('{') || key.contains('}') {
+            return None;
+        }
+        match job_meta.get(key) {
+            Some(v @ (Value::Array(_) | Value::Object(_))) => Some(v),
+            _ => None,
+        }
+    }
+
     fn walk(
         v: &serde_json::Value,
         fields: &[(&'static str, &str)],
         meta_fields: &[(String, String)],
+        job_meta: &serde_json::Value,
         date_anchor: Option<chrono::NaiveDate>,
     ) -> serde_json::Value {
         match v {
             Value::String(s) => {
+                if let Some(whole) = whole_value(s, job_meta) {
+                    return whole.clone();
+                }
                 let mut out = s.clone();
                 for (field, value) in fields {
                     let token = format!("{{subject.{field}}}");
@@ -1602,20 +2030,23 @@ fn expand_metadata(
             Value::Array(items) => Value::Array(
                 items
                     .iter()
-                    .map(|x| walk(x, fields, meta_fields, date_anchor))
+                    .map(|x| walk(x, fields, meta_fields, job_meta, date_anchor))
                     .collect(),
             ),
             Value::Object(map) => {
                 let mut out = serde_json::Map::with_capacity(map.len());
                 for (k, v) in map {
-                    out.insert(k.clone(), walk(v, fields, meta_fields, date_anchor));
+                    out.insert(
+                        k.clone(),
+                        walk(v, fields, meta_fields, job_meta, date_anchor),
+                    );
                 }
                 Value::Object(out)
             }
             other => other.clone(),
         }
     }
-    walk(template, &fields, &meta_fields, date_anchor)
+    walk(template, &fields, &meta_fields, job_metadata, date_anchor)
 }
 
 /// Turn a `WorkflowSpec` + concrete `Subject` + fresh `JobId` into
@@ -1682,7 +2113,7 @@ where
         let title = if spec_step.title_template.is_empty() {
             humanize_slug(&spec_step.title)
         } else {
-            expand_title(&spec_step.title_template, subject)
+            expand_title(&spec_step.title_template, subject, job_metadata)
         };
         let merged = merge_metadata(&spec_step.metadata_defaults, spec_step);
         // Per-Job context flows through `{subject.<field>}` + `{day…}`
@@ -1699,6 +2130,11 @@ where
             kind: spec_step.kind.clone(),
             title,
             spec_slug: Some(spec_step.title.clone()),
+            // The protocol's requirement travels onto the packet at
+            // materialisation, like every other step property — so an
+            // in-flight step keeps the assurance its Workflow version
+            // declared even if the protocol is later edited.
+            assurance_required: spec_step.assurance_required,
             assignee_id: None,
             status: StepStatus::Pending,
             sort_order: idx as i32,
@@ -1939,6 +2375,14 @@ fn refs_all_terminal(spec: &WorkflowSpec, steps: &[Step], idx: usize) -> bool {
 /// settles in a single call. A spec/steps length mismatch (only
 /// possible if a Workflow was republished mid-flight with a different
 /// step count) is treated as "leave everything as-is."
+/// Has this job's step list diverged from the spec it was admitted
+/// under? A `true` here means [`reevaluate`] cannot run and the job is
+/// frozen — no step will ever advance again. Exposed so a caller with
+/// the job id in hand can report WHICH job, which `reevaluate` cannot.
+pub fn steps_diverged_from_spec(spec: &WorkflowSpec, steps: &[Step]) -> bool {
+    spec.steps.len() != steps.len()
+}
+
 pub fn reevaluate(
     spec: &WorkflowSpec,
     steps: &mut [Step],
@@ -1947,6 +2391,31 @@ pub fn reevaluate(
 ) -> Vec<usize> {
     let mut changed = Vec::new();
     if spec.steps.len() != steps.len() {
+        // A JOB WHOSE STEP COUNT DIVERGED FROM ITS SPEC CAN NEVER
+        // ADVANCE AGAIN. Predicates are not stored on steps (the table
+        // has no ready_when column) — advancement is recomputed by
+        // pairing spec steps with job steps POSITIONALLY, so one
+        // inserted step misaligns every pair after it and the honest
+        // move is to evaluate nothing.
+        //
+        // Bailing was always right. Bailing SILENTLY was not: on
+        // 2026-08-14 design review 32a4e70d sat in David's queue with
+        // its review step completed and its terminal pending, and the
+        // only symptom was "I finished it and it is still there". The
+        // job could not notice it was finished, and nothing said so.
+        //
+        // `POST /api/jobs/{id}/steps` is a public route, so any
+        // protocol that adds a step to a live job freezes it this way.
+        // Until steps carry their spec slug (the durable fix — then
+        // pairing is by name and extra steps are simply ignored), this
+        // log is what turns an invisible dead job into a visible one.
+        tracing::error!(
+            spec_steps = spec.steps.len(),
+            job_steps = steps.len(),
+            "job steps diverged from its workflow spec — this job is FROZEN \
+             and no step will advance again; a step was almost certainly \
+             added to a live job"
+        );
         return changed;
     }
     loop {
@@ -1988,6 +2457,12 @@ fn merge_metadata(defaults: &serde_json::Value, step: &StepSpec) -> serde_json::
             serde_json::Value::String(role.clone()),
         );
     }
+    // Surfaced the same way `authority_role` is, because the
+    // dispatcher reads the materialized STEP, never the spec — it is
+    // reacting to an event and has no workflow row in hand.
+    if let (Some(claimable), serde_json::Value::Object(m)) = (step.claimable, &mut merged) {
+        m.insert("claimable".to_string(), serde_json::Value::Bool(claimable));
+    }
     merged
 }
 
@@ -2003,6 +2478,14 @@ pub enum WorkflowError {
     Conflict(String),
     #[error("invalid spec: {0}")]
     Invalid(String),
+    /// The spec failed the viability lint and so may not occupy the
+    /// ACTIVE slot. Carries every problem so the HTTP surface can
+    /// hand the editor the same `{step, reason, message}` list
+    /// `POST /api/workflows/_validate` returns. Distinct from
+    /// `Invalid` because it maps to 422 (semantically well-formed,
+    /// operationally unrunnable), not 400.
+    #[error("workflow is not viable: {}", .0.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "))]
+    Unviable(Vec<crate::workflow_lint::WorkflowLintError>),
     #[error("storage error: {0}")]
     Storage(String),
 }
@@ -2032,15 +2515,42 @@ pub trait WorkflowRegistry: Send + Sync {
     /// Append a new version with `status = Draft`. If no prior rows
     /// exist, the new row is version 1; otherwise it's max(version)+1.
     /// Returns the stored spec (with its assigned version + created_at).
-    async fn create_draft(&self, spec: WorkflowSpec) -> Result<WorkflowSpec, WorkflowError>;
+    ///
+    /// Every write method takes `actor` + `now` because under 3P a
+    /// registry write IS a network configuration change
+    /// (protocol-policy-publish.md, Constraints): the adapter builds
+    /// the corresponding event via `events::workflow_registry_event`
+    /// and records it atomically with the row — the caller supplies
+    /// the who (session actor, or a named automation) and the when
+    /// (clock-routed, never wallclock in production paths).
+    async fn create_draft(
+        &self,
+        spec: WorkflowSpec,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<WorkflowSpec, WorkflowError>;
 
     /// Flip the latest draft row of this kind to active and any
-    /// previous active row to retired. Transactional.
-    async fn publish(&self, kind: &str) -> Result<WorkflowSpec, WorkflowError>;
+    /// previous active row to retired. Transactional; records
+    /// `jobs.kind.published` (payload = the promoted spec) with the
+    /// row flips.
+    async fn publish(
+        &self,
+        kind: &str,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<WorkflowSpec, WorkflowError>;
 
     /// Flip the active row of this kind to retired. Idempotent if
-    /// already retired.
-    async fn retire(&self, kind: &str) -> Result<(), WorkflowError>;
+    /// already retired — and silent then too: only a write that
+    /// touched a row records `jobs.kind.retired` (payload = the
+    /// retired spec).
+    async fn retire(
+        &self,
+        kind: &str,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<(), WorkflowError>;
 
     /// Look up the active spec and materialize its step DAG against
     /// the given subject. Default impl fetches + delegates to the
@@ -2085,12 +2595,17 @@ pub trait WorkflowRegistry: Send + Sync {
     ///   `status='retired'`.
     ///
     /// Returns the published spec with `version` + `created_at`
-    /// reflecting the durable row. See
-    /// `docs/architecture-decisions.md` §Jobs, Workflows, Steps.
+    /// reflecting the durable row. Records `jobs.kind.published`
+    /// (payload = the promoted spec) in the same transaction — the
+    /// step-update path that dispatches here no longer emits its own
+    /// copy. See `docs/architecture-decisions.md` §Jobs, Workflows,
+    /// Steps.
     async fn publish_authored(
         &self,
         spec: WorkflowSpec,
         authoring_job_id: JobId,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
     ) -> Result<WorkflowSpec, WorkflowError>;
 
     /// Reconcile the active rows in the registry against a set of
@@ -2116,9 +2631,15 @@ pub trait WorkflowRegistry: Send + Sync {
     /// — including `workflow-design`, the meta-kind that owns the
     /// design / review / publish workflow for every other kind in
     /// the registry.
+    ///
+    /// Records `jobs.kind.published` per inserted/republished row;
+    /// preserved and unchanged rows write nothing and record
+    /// nothing (rows_affected > 0 means event).
     async fn bootstrap_reconcile(
         &self,
         defaults: &[WorkflowSpec],
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
     ) -> Result<KindReconcileStats, WorkflowError>;
 }
 
@@ -2141,6 +2662,12 @@ pub struct KindReconcileStats {
     /// Bootstrap-owned rows already matching the default — no
     /// write.
     pub unchanged: usize,
+    /// Defaults refused by the viability lint — never written, never
+    /// activated. A shipped seed landing here is a code bug (the
+    /// `every_shipped_platform_seed_is_viable` test exists to keep
+    /// this at zero); the reconcile still completes for the rest so
+    /// one bad default can't strand the whole platform set.
+    pub rejected: usize,
 }
 
 /// Helper: returns true iff every body field that bootstrap
@@ -2176,6 +2703,11 @@ pub struct InMemoryWorkflows {
     /// adapter uses, so reconcile semantics match across adapters
     /// in tests.
     bootstrap_owned: Arc<Mutex<std::collections::HashSet<(String, i32)>>>,
+    /// What the Pg adapter records into `event_outbox` inside the
+    /// row transaction, this adapter collects here — same events at
+    /// the same write points, so tests assert the event contract
+    /// through the port without a database.
+    recorded: Arc<Mutex<Vec<boss_core::event::Event>>>,
 }
 
 impl Default for InMemoryWorkflows {
@@ -2189,7 +2721,18 @@ impl InMemoryWorkflows {
         Self {
             rows: Arc::new(Mutex::new(HashMap::new())),
             bootstrap_owned: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            recorded: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Every event a write method recorded, in write order — the
+    /// in-memory stand-in for `SELECT ... FROM event_outbox`.
+    pub fn recorded_events(&self) -> Vec<boss_core::event::Event> {
+        self.recorded.lock().unwrap().clone()
+    }
+
+    fn record(&self, event: boss_core::event::Event) {
+        self.recorded.lock().unwrap().push(event);
     }
 
     /// Seed helper for tests + bootstrap. Inserts a row as-is without
@@ -2262,17 +2805,33 @@ impl WorkflowRegistry for InMemoryWorkflows {
         Ok(rows)
     }
 
-    async fn create_draft(&self, mut spec: WorkflowSpec) -> Result<WorkflowSpec, WorkflowError> {
+    async fn create_draft(
+        &self,
+        mut spec: WorkflowSpec,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
+    ) -> Result<WorkflowSpec, WorkflowError> {
         let next = self.max_version(&spec.kind).unwrap_or(0) + 1;
         spec.version = next;
         spec.status = WorkflowStatus::Draft;
-        spec.created_at = Utc::now();
+        spec.created_at = now;
         let mut rows = self.rows.lock().unwrap();
         rows.insert((spec.kind.clone(), spec.version), spec.clone());
+        drop(rows);
+        self.record(crate::events::workflow_registry_event(
+            crate::events::WORKFLOW_DRAFT_SAVED,
+            actor,
+            &spec,
+        ));
         Ok(spec)
     }
 
-    async fn publish(&self, kind: &str) -> Result<WorkflowSpec, WorkflowError> {
+    async fn publish(
+        &self,
+        kind: &str,
+        actor: &boss_core::actor::ActorId,
+        _now: DateTime<Utc>,
+    ) -> Result<WorkflowSpec, WorkflowError> {
         let mut rows = self.rows.lock().unwrap();
 
         // Find the latest draft for this kind.
@@ -2285,6 +2844,9 @@ impl WorkflowRegistry for InMemoryWorkflows {
                 WorkflowError::NotFound(format!("no draft to publish for kind: {kind}"))
             })?;
 
+        // The publish gate — refuse before any row flips.
+        crate::workflow_lint::gate_active(&latest_draft).map_err(WorkflowError::Unviable)?;
+
         // Demote any currently-active row for this kind.
         for ((k, _), row) in rows.iter_mut() {
             if k == kind && row.status == WorkflowStatus::Active {
@@ -2296,22 +2858,44 @@ impl WorkflowRegistry for InMemoryWorkflows {
         let key = (latest_draft.kind.clone(), latest_draft.version);
         let row = rows.get_mut(&key).unwrap();
         row.status = WorkflowStatus::Active;
-        Ok(row.clone())
+        let promoted = row.clone();
+        drop(rows);
+        self.record(crate::events::workflow_registry_event(
+            crate::events::WORKFLOW_PUBLISHED,
+            actor,
+            &promoted,
+        ));
+        Ok(promoted)
     }
 
-    async fn retire(&self, kind: &str) -> Result<(), WorkflowError> {
+    async fn retire(
+        &self,
+        kind: &str,
+        actor: &boss_core::actor::ActorId,
+        _now: DateTime<Utc>,
+    ) -> Result<(), WorkflowError> {
         let mut rows = self.rows.lock().unwrap();
         let any_active = rows
             .values()
             .any(|r| r.kind == kind && r.status == WorkflowStatus::Active);
         if !any_active {
-            // Idempotent — nothing to do.
+            // Idempotent — nothing to do, so nothing to record.
             return Ok(());
         }
+        let mut retired: Option<WorkflowSpec> = None;
         for ((k, _), row) in rows.iter_mut() {
             if k == kind && row.status == WorkflowStatus::Active {
                 row.status = WorkflowStatus::Retired;
+                retired = Some(row.clone());
             }
+        }
+        drop(rows);
+        if let Some(spec) = retired {
+            self.record(crate::events::workflow_registry_event(
+                crate::events::WORKFLOW_RETIRED,
+                actor,
+                &spec,
+            ));
         }
         Ok(())
     }
@@ -2320,11 +2904,17 @@ impl WorkflowRegistry for InMemoryWorkflows {
         &self,
         mut spec: WorkflowSpec,
         authoring_job_id: JobId,
+        actor: &boss_core::actor::ActorId,
+        now: DateTime<Utc>,
     ) -> Result<WorkflowSpec, WorkflowError> {
+        // Same gate as `publish` — this path writes an active row
+        // with no draft ever existing, so it needs its own check.
+        crate::workflow_lint::gate_active(&spec).map_err(WorkflowError::Unviable)?;
+
         let next = self.max_version(&spec.kind).unwrap_or(0) + 1;
         spec.version = next;
         spec.status = WorkflowStatus::Active;
-        spec.created_at = Utc::now();
+        spec.created_at = now;
         spec.authoring_job_id = Some(*authoring_job_id.inner().as_uuid());
 
         let key = (spec.kind.clone(), spec.version);
@@ -2336,25 +2926,52 @@ impl WorkflowRegistry for InMemoryWorkflows {
             }
         }
         rows.insert(key.clone(), spec.clone());
+        drop(rows);
 
         // The new row was published via a Job — operator-owned, NOT
         // bootstrap. Make sure the discriminator reflects that so
         // future reconciles preserve it.
         let mut owned = self.bootstrap_owned.lock().unwrap();
         owned.remove(&key);
+        drop(owned);
 
+        self.record(crate::events::workflow_registry_event(
+            crate::events::WORKFLOW_PUBLISHED,
+            actor,
+            &spec,
+        ));
         Ok(spec)
     }
 
     async fn bootstrap_reconcile(
         &self,
         defaults: &[WorkflowSpec],
+        actor: &boss_core::actor::ActorId,
+        _now: DateTime<Utc>,
     ) -> Result<KindReconcileStats, WorkflowError> {
         let mut stats = KindReconcileStats::default();
+        // Inserted/republished rows record `jobs.kind.published`;
+        // preserved/unchanged rows touched nothing and record
+        // nothing. Collected here and pushed after the row locks
+        // drop.
+        let mut events: Vec<boss_core::event::Event> = Vec::new();
+        let step_types = crate::step_registry::StepRegistry::v1();
         let mut rows = self.rows.lock().unwrap();
         let mut owned = self.bootstrap_owned.lock().unwrap();
 
         for default in defaults {
+            // Platform seeding sets rows ACTIVE, so it answers to the
+            // publish gate too. An unviable default is refused here
+            // rather than seeded and quarantined at the next boot.
+            if let Err(problems) = crate::workflow_lint::gate_active_with(default, &step_types) {
+                tracing::error!(
+                    kind = %default.kind,
+                    problems = %problems.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("; "),
+                    "platform Workflow default fails the viability lint — refusing to seed it"
+                );
+                stats.rejected += 1;
+                continue;
+            }
             // Find the active row for this kind, if any.
             let active_key: Option<(String, i32)> = rows
                 .iter()
@@ -2372,8 +2989,13 @@ impl WorkflowRegistry for InMemoryWorkflows {
                     spec.version = 1;
                     spec.status = WorkflowStatus::Active;
                     let key = (spec.kind.clone(), spec.version);
-                    rows.insert(key.clone(), spec);
+                    rows.insert(key.clone(), spec.clone());
                     owned.insert(key);
+                    events.push(crate::events::workflow_registry_event(
+                        crate::events::WORKFLOW_PUBLISHED,
+                        actor,
+                        &spec,
+                    ));
                     stats.inserted += 1;
                 }
                 Some(key) => {
@@ -2407,8 +3029,13 @@ impl WorkflowRegistry for InMemoryWorkflows {
                             published.version = next;
                             published.status = WorkflowStatus::Active;
                             let new_key = (published.kind.clone(), next);
-                            rows.insert(new_key.clone(), published);
+                            rows.insert(new_key.clone(), published.clone());
                             owned.insert(new_key);
+                            events.push(crate::events::workflow_registry_event(
+                                crate::events::WORKFLOW_PUBLISHED,
+                                actor,
+                                &published,
+                            ));
                             stats.republished += 1;
                         } else {
                             stats.unchanged += 1;
@@ -2419,6 +3046,11 @@ impl WorkflowRegistry for InMemoryWorkflows {
                     }
                 }
             }
+        }
+        drop(rows);
+        drop(owned);
+        for event in events {
+            self.record(event);
         }
 
         Ok(stats)
@@ -2588,6 +3220,8 @@ mod pg {
         async fn create_draft(
             &self,
             mut spec: WorkflowSpec,
+            actor: &boss_core::actor::ActorId,
+            now: DateTime<Utc>,
         ) -> Result<WorkflowSpec, WorkflowError> {
             let mut tx = self
                 .pool
@@ -2608,7 +3242,7 @@ mod pg {
 
             spec.version = next;
             spec.status = WorkflowStatus::Draft;
-            spec.created_at = Utc::now();
+            spec.created_at = now;
 
             let subject_kinds_json = serde_json::to_value(&spec.subject_kinds)
                 .map_err(|e| WorkflowError::Invalid(e.to_string()))?;
@@ -2617,12 +3251,35 @@ mod pg {
             let on_complete_create_json = serde_json::to_value(&spec.on_complete_create)
                 .map_err(|e| WorkflowError::Invalid(e.to_string()))?;
 
+            // `created_by` is the discriminator bootstrap_reconcile uses:
+            // it republishes the code default over any row that reads
+            // 'bootstrap', and preserves anything else. The column
+            // defaults to 'bootstrap', and this INSERT used to omit it —
+            // so a workflow published through the API was stamped as if
+            // the platform seed had written it, and the next boot
+            // silently republished the code default over the operator's
+            // edit.
+            //
+            // That is not hypothetical. Two protocol edits on 2026-08-14
+            // — a `satisfied` terminal added to `user-feedback` v8 and to
+            // `ship-a-change` v4 — were gone by the next day, both kinds
+            // bumped one version with the terminal absent, and nobody
+            // noticed for a day. `approval`, edited the same way but
+            // absent from platform_workflows(), kept its edits, which is
+            // what isolated the cause (68331085).
+            //
+            // Stamping the ACTOR makes the write mean what it says: a
+            // person or agent published this, so reconcile preserves it.
+            // Same posture `publish_authored` already had with
+            // `job-<id>`; this closes the gap for the plain path.
+            let created_by = actor.to_string();
             sqlx::query(
                 "INSERT INTO workflows
                     (kind, version, status, label, description, category,
                      subject_kinds, steps, metadata_schema, entitlements, metadata,
-                     on_complete_create, owning_team, authoring_job_id, created_at)
-                 VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                     on_complete_create, owning_team, authoring_job_id, created_by,
+                     created_at)
+                 VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
             )
             .bind(&spec.kind)
             .bind(spec.version)
@@ -2637,10 +3294,20 @@ mod pg {
             .bind(&on_complete_create_json)
             .bind(&spec.owning_team)
             .bind(spec.authoring_job_id)
+            .bind(&created_by)
             .bind(spec.created_at)
             .execute(&mut *tx)
             .await
             .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+
+            let event = crate::events::workflow_registry_event(
+                crate::events::WORKFLOW_DRAFT_SAVED,
+                actor,
+                &spec,
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(WorkflowError::Storage)?;
 
             tx.commit()
                 .await
@@ -2648,16 +3315,28 @@ mod pg {
             Ok(spec)
         }
 
-        async fn publish(&self, kind: &str) -> Result<WorkflowSpec, WorkflowError> {
+        async fn publish(
+            &self,
+            kind: &str,
+            actor: &boss_core::actor::ActorId,
+            _now: DateTime<Utc>,
+        ) -> Result<WorkflowSpec, WorkflowError> {
             let mut tx = self
                 .pool
                 .begin()
                 .await
                 .map_err(|e| WorkflowError::Storage(e.to_string()))?;
 
-            // Pick the latest draft.
-            let draft_version: Option<(i32,)> = sqlx::query_as(
-                "SELECT version FROM workflows
+            // Pick the latest draft — the full row, not just the
+            // version: the event payload is the promoted spec, and
+            // it must come from data read INSIDE this transaction
+            // (a post-commit re-fetch could observe a concurrent
+            // writer and record a spec the flip never produced).
+            let draft: Option<Row> = sqlx::query_as(
+                "SELECT kind, version, status, label, description, category,
+                        subject_kinds, steps, metadata_schema, entitlements, metadata,
+                        on_complete_create, owning_team, authoring_job_id, created_at
+                 FROM workflows
                  WHERE kind = $1 AND status = 'draft'
                  ORDER BY version DESC LIMIT 1",
             )
@@ -2666,9 +3345,15 @@ mod pg {
             .await
             .map_err(|e| WorkflowError::Storage(e.to_string()))?;
 
-            let draft_version = draft_version
-                .map(|(v,)| v)
+            let mut promoted = draft
+                .map(row_to_spec)
+                .transpose()?
                 .ok_or_else(|| WorkflowError::NotFound(format!("no draft to publish: {kind}")))?;
+
+            // The publish gate, inside the transaction and against
+            // the row we are about to promote — not against whatever
+            // a caller happened to hand us.
+            crate::workflow_lint::gate_active(&promoted).map_err(WorkflowError::Unviable)?;
 
             // Retire any currently-active row.
             sqlx::query(
@@ -2686,27 +3371,84 @@ mod pg {
                  WHERE kind = $1 AND version = $2",
             )
             .bind(kind)
-            .bind(draft_version)
+            .bind(promoted.version)
             .execute(&mut *tx)
             .await
             .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            promoted.status = WorkflowStatus::Active;
+
+            let event = crate::events::workflow_registry_event(
+                crate::events::WORKFLOW_PUBLISHED,
+                actor,
+                &promoted,
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(WorkflowError::Storage)?;
 
             tx.commit()
                 .await
                 .map_err(|e| WorkflowError::Storage(e.to_string()))?;
 
-            self.get_version(kind, draft_version).await
+            Ok(promoted)
         }
 
-        async fn retire(&self, kind: &str) -> Result<(), WorkflowError> {
+        async fn retire(
+            &self,
+            kind: &str,
+            actor: &boss_core::actor::ActorId,
+            _now: DateTime<Utc>,
+        ) -> Result<(), WorkflowError> {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+
+            // Read the active row first — the event payload is the
+            // retired spec, and the idempotent no-op path (nothing
+            // active) must record nothing. At most one row can be
+            // active per kind (partial unique index).
+            let active: Option<Row> = sqlx::query_as(
+                "SELECT kind, version, status, label, description, category,
+                        subject_kinds, steps, metadata_schema, entitlements, metadata,
+                        on_complete_create, owning_team, authoring_job_id, created_at
+                 FROM workflows
+                 WHERE kind = $1 AND status = 'active'",
+            )
+            .bind(kind)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+
+            let Some(row) = active else {
+                // Idempotent — nothing to do, so nothing to record.
+                return Ok(());
+            };
+            let mut spec = row_to_spec(row)?;
+
             sqlx::query(
                 "UPDATE workflows SET status = 'retired'
                  WHERE kind = $1 AND status = 'active'",
             )
             .bind(kind)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+            spec.status = WorkflowStatus::Retired;
+
+            let event = crate::events::workflow_registry_event(
+                crate::events::WORKFLOW_RETIRED,
+                actor,
+                &spec,
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(WorkflowError::Storage)?;
+
+            tx.commit()
+                .await
+                .map_err(|e| WorkflowError::Storage(e.to_string()))?;
             Ok(())
         }
 
@@ -2714,7 +3456,14 @@ mod pg {
             &self,
             mut spec: WorkflowSpec,
             authoring_job_id: JobId,
+            actor: &boss_core::actor::ActorId,
+            now: DateTime<Utc>,
         ) -> Result<WorkflowSpec, WorkflowError> {
+            // Same gate as `publish` — refuse before opening the
+            // transaction, since nothing here can rescue an unviable
+            // spec.
+            crate::workflow_lint::gate_active(&spec).map_err(WorkflowError::Unviable)?;
+
             let mut tx = self
                 .pool
                 .begin()
@@ -2733,7 +3482,7 @@ mod pg {
 
             spec.version = next;
             spec.status = WorkflowStatus::Active;
-            spec.created_at = Utc::now();
+            spec.created_at = now;
             spec.authoring_job_id = Some(*authoring_job_id.inner().as_uuid());
 
             // Retire any existing active row of this kind first —
@@ -2787,6 +3536,15 @@ mod pg {
             .await
             .map_err(|e| WorkflowError::Storage(e.to_string()))?;
 
+            let event = crate::events::workflow_registry_event(
+                crate::events::WORKFLOW_PUBLISHED,
+                actor,
+                &spec,
+            );
+            boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                .await
+                .map_err(WorkflowError::Storage)?;
+
             tx.commit()
                 .await
                 .map_err(|e| WorkflowError::Storage(e.to_string()))?;
@@ -2797,6 +3555,8 @@ mod pg {
         async fn bootstrap_reconcile(
             &self,
             defaults: &[WorkflowSpec],
+            actor: &boss_core::actor::ActorId,
+            now: DateTime<Utc>,
         ) -> Result<KindReconcileStats, WorkflowError> {
             // Dedicated row shape that includes the bootstrap
             // discriminator alongside the body. The non-reconcile
@@ -2824,8 +3584,24 @@ mod pg {
             }
 
             let mut stats = KindReconcileStats::default();
+            let step_types = crate::step_registry::StepRegistry::v1();
 
             for default in defaults {
+                // Platform seeding sets rows ACTIVE, so it answers to
+                // the publish gate too. An unviable default is refused
+                // here rather than seeded and quarantined at the next
+                // boot.
+                if let Err(problems) = crate::workflow_lint::gate_active_with(default, &step_types)
+                {
+                    tracing::error!(
+                        kind = %default.kind,
+                        problems = %problems.iter().map(|p| p.to_string()).collect::<Vec<_>>().join("; "),
+                        "platform Workflow default fails the viability lint — refusing to seed it"
+                    );
+                    stats.rejected += 1;
+                    continue;
+                }
+
                 let row: Option<ReconcileRow> = sqlx::query_as(
                     "SELECT kind, version, status, label, description, category,
                             subject_kinds, steps, metadata_schema, entitlements, metadata,
@@ -2841,7 +3617,9 @@ mod pg {
 
                 match row {
                     None => {
-                        // Insert as v1, active, bootstrap-owned.
+                        // Insert as v1, active, bootstrap-owned —
+                        // in a transaction so the published event
+                        // records with the row it describes.
                         let subject_kinds_json = serde_json::to_value(&default.subject_kinds)
                             .map_err(|e| WorkflowError::Invalid(e.to_string()))?;
                         let steps_json = serde_json::to_value(&default.steps)
@@ -2850,6 +3628,17 @@ mod pg {
                             serde_json::to_value(&default.on_complete_create)
                                 .map_err(|e| WorkflowError::Invalid(e.to_string()))?;
 
+                        let mut inserted = default.clone();
+                        inserted.version = 1;
+                        inserted.status = WorkflowStatus::Active;
+                        inserted.created_at = now;
+
+                        let mut tx = self
+                            .pool
+                            .begin()
+                            .await
+                            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+
                         sqlx::query(
                             "INSERT INTO workflows
                                 (kind, version, status, label, description, category,
@@ -2857,7 +3646,7 @@ mod pg {
                                  on_complete_create, owning_team, authoring_job_id,
                                  created_by, created_at)
                              VALUES ($1, 1, 'active', $2, $3, $4, $5, $6, $7, $8, $9,
-                                     $10, $11, $12, 'bootstrap', NOW())",
+                                     $10, $11, $12, 'bootstrap', $13)",
                         )
                         .bind(&default.kind)
                         .bind(&default.label)
@@ -2871,9 +3660,23 @@ mod pg {
                         .bind(&on_complete_create_json)
                         .bind(&default.owning_team)
                         .bind(default.authoring_job_id)
-                        .execute(&self.pool)
+                        .bind(now)
+                        .execute(&mut *tx)
                         .await
                         .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+
+                        let event = crate::events::workflow_registry_event(
+                            crate::events::WORKFLOW_PUBLISHED,
+                            actor,
+                            &inserted,
+                        );
+                        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                            .await
+                            .map_err(WorkflowError::Storage)?;
+
+                        tx.commit()
+                            .await
+                            .map_err(|e| WorkflowError::Storage(e.to_string()))?;
 
                         stats.inserted += 1;
                     }
@@ -2952,7 +3755,7 @@ mod pg {
                                          metadata, on_complete_create, owning_team,
                                          authoring_job_id, created_by, created_at)
                                      VALUES ($1, $2, 'active', $3, $4, $5, $6, $7, $8, $9,
-                                             $10, $11, $12, NULL, 'bootstrap', NOW())",
+                                             $10, $11, $12, NULL, 'bootstrap', $13)",
                                 )
                                 .bind(&default.kind)
                                 .bind(next)
@@ -2966,9 +3769,24 @@ mod pg {
                                 .bind(&default.metadata)
                                 .bind(&on_complete_create_json)
                                 .bind(&default.owning_team)
+                                .bind(now)
                                 .execute(&mut *tx)
                                 .await
                                 .map_err(|e| WorkflowError::Storage(e.to_string()))?;
+
+                                let mut published = default.clone();
+                                published.version = next;
+                                published.status = WorkflowStatus::Active;
+                                published.created_at = now;
+                                published.authoring_job_id = None;
+                                let event = crate::events::workflow_registry_event(
+                                    crate::events::WORKFLOW_PUBLISHED,
+                                    actor,
+                                    &published,
+                                );
+                                boss_events::outbox::record_event_in_tx(&mut tx, &event)
+                                    .await
+                                    .map_err(WorkflowError::Storage)?;
 
                                 tx.commit()
                                     .await
@@ -2999,6 +3817,157 @@ pub use pg::PgWorkflows;
 
 #[cfg(test)]
 mod tests {
+
+    /// The platform bundle says exactly what the code used to say.
+    ///
+    /// This is protocols-as-data Q4 made mechanical. David's answer:
+    /// "moving `user-feedback` v10 from code to bundle must produce a
+    /// row identical to the live v10 — not v11. If the loader publishes
+    /// a new version instead of recognising the existing one, every
+    /// in-flight packet keeps its old spec and the board grows a second
+    /// lineage."
+    ///
+    /// It lives here rather than in tests/ because the builder it
+    /// compares against is private and no longer reachable from
+    /// `platform_workflows()` — it was removed from that list when the
+    /// kind moved to the bundle, and it survives only as this test's
+    /// expected value. Deleting it is safe once a release has gone by
+    /// with this green; until then it is the proof.
+    ///
+    /// The length assertion is the load-bearing half, and it has
+    /// already earned its keep: it went red the first time three kinds
+    /// were removed from `platform_workflows()` against a bundle
+    /// holding one. A kind that leaves the code without arriving in
+    /// the bundle exists in neither place on a fresh deployment, and
+    /// nothing else in the tree would have said so.
+    /// The bundle's own kinds pass the same viability lint the code
+    /// kinds do.
+    ///
+    /// `validate_all` is what proves a protocol can FINISH — that
+    /// every terminal is reachable and no step is orphaned. Rust
+    /// kinds get it via `platform_workflows_passes_validate_all`;
+    /// until now nothing pointed it at the bundle, so a protocol
+    /// authored as data had strictly less checking than one authored
+    /// as a literal. That gap is the wrong incentive to leave in
+    /// place while the whole direction of travel is protocols
+    /// becoming data.
+    #[test]
+    fn the_bundle_is_as_viable_as_the_code() {
+        use crate::step_registry::StepRegistry;
+        use crate::workflow_lint::validate_all;
+        let bundled = crate::seed_loader::load_workflows(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../infra/platform/workflows.toml"
+        ))
+        .expect("the platform bundle parses");
+        let registry = StepRegistry::v1();
+        let findings = validate_all(&bundled, &registry);
+        assert!(
+            findings.is_empty(),
+            "the platform bundle has viability findings: {findings:#?}"
+        );
+    }
+
+    #[test]
+    fn the_platform_bundle_matches_the_specs_it_replaced() {
+        let bundle_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../infra/platform/workflows.toml"
+        );
+        let bundled =
+            crate::seed_loader::load_workflows(bundle_path).expect("the platform bundle parses");
+        let expected = [
+            workflow_design_spec(),
+            regenerate_deployment_spec(),
+            backlog_item_spec(),
+            ship_a_change_spec(),
+        ];
+        // Every CONVERTED kind must still be here. This is the
+        // load-bearing half and it has earned its keep: it went red
+        // the first time three kinds were removed from
+        // `platform_workflows()` against a bundle holding one. A kind
+        // that leaves the code without arriving in the bundle exists
+        // in neither place on a fresh deployment.
+        //
+        // Not a length equality any more, because the bundle is now
+        // also where NEW platform kinds are authored — `design-doc` was
+        // never a Rust literal and has no spec to be faithful to.
+        // Requiring len() to match would mean every new protocol
+        // authored as data had to be added to a list of things
+        // converted FROM code, which is backwards: the whole direction
+        // of travel is that a new protocol never touches Rust at all.
+        for want in &expected {
+            assert!(
+                bundled.iter().any(|b| b.kind == want.kind),
+                "`{}` was converted to the bundle and has gone missing from it",
+                want.kind
+            );
+        }
+        // …and nothing in the bundle may SHADOW a kind the code still
+        // seeds. That is the other direction of the same guarantee: a
+        // kind in both places gets its bundle row republished from
+        // code by bootstrap_reconcile on every boot.
+        for b in &bundled {
+            assert!(
+                !platform_workflows().iter().any(|p| p.kind == b.kind),
+                "`{}` is in BOTH the bundle and platform_workflows() — bootstrap_reconcile \
+                 will republish the code version over the bundle's on every boot",
+                b.kind
+            );
+        }
+        for want in &expected {
+            let got = bundled
+                .iter()
+                .find(|b| b.kind == want.kind)
+                .unwrap_or_else(|| {
+                    panic!("`{}` left the code but is not in the bundle", want.kind)
+                });
+            assert_eq!(got.label, want.label, "{}: label", want.kind);
+            assert_eq!(got.category, want.category, "{}: category", want.kind);
+            assert_eq!(
+                got.subject_kinds, want.subject_kinds,
+                "{}: subject_kinds",
+                want.kind
+            );
+            assert_eq!(
+                got.owning_team, want.owning_team,
+                "{}: owning_team",
+                want.kind
+            );
+
+            // THE STEPS ARE THE PROTOCOL, AND THEY WERE NOT CHECKED.
+            //
+            // Until 2026-08-26 this test compared four scalars and
+            // stopped. The bundle's own header claimed it "asserts each
+            // row equals the spec it replaces, field for field", and
+            // that was simply not true: step titles, `ready_when`
+            // predicates, fields, sign-offs, terminals and metadata
+            // defaults were all unchecked. A conversion could rewrite
+            // the entire flow and still pass, because label and
+            // category matched.
+            //
+            // That gap matters most exactly where the conversion order
+            // says the risk is highest. `ship-a-change` carries 255
+            // packets; a mistranscribed predicate there — `steps.gate
+            // .done` where the spec says something stricter — would
+            // survive this test AND the viability lint, which only asks
+            // whether the flow is reachable, not whether it is the same
+            // flow. Every future car would then run a protocol nobody
+            // chose.
+            //
+            // Compared as JSON rather than by PartialEq so the failure
+            // names the offending step and shows both sides, which is
+            // what a transcription error needs in order to be fixable.
+            let got_steps = serde_json::to_value(&got.steps).expect("bundle steps serialize");
+            let want_steps = serde_json::to_value(&want.steps).expect("spec steps serialize");
+            assert_eq!(
+                got_steps, want_steps,
+                "{}: the bundle's steps differ from the spec they replaced. A conversion must \
+                 change WHERE a protocol lives, never WHAT it says.",
+                want.kind
+            );
+        }
+    }
     use super::*;
 
     #[test]
@@ -3052,6 +4021,118 @@ mod tests {
         assert_eq!(
             expanded.get("po_id").and_then(|v| v.as_str()),
             Some("PO-vnd-malt-001")
+        );
+    }
+
+    #[test]
+    fn expand_metadata_carries_a_structured_job_value_whole_into_a_step() {
+        // Defect 6f40b23f: a design review opened blank because the
+        // question set could not reach the step. The plugin renders
+        // `step.metadata.questions` when a packet carries its own
+        // work; the spawn bound the questions onto the JOB, and this
+        // expansion dropped them, because only scalars were in the
+        // substitution table.
+        let subject = Subject::new("custom", "docs/design/packet-loss.md");
+        let job_meta = serde_json::json!({
+            "questions": [
+                {"anchor": "Q1", "title": "How do we detect a dropped packet?"},
+                {"anchor": "Q2", "title": "Who is told, and how fast?"},
+            ],
+        });
+        let template = serde_json::json!({ "questions": "{metadata.questions}" });
+        let expanded = expand_metadata(&template, &subject, &job_meta, None);
+        let got = expanded.get("questions").expect("questions present");
+        assert!(
+            got.is_array(),
+            "the step must receive the ARRAY, not the literal token — it was {got:?}"
+        );
+        assert_eq!(got.as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            got[1].get("anchor").and_then(|v| v.as_str()),
+            Some("Q2"),
+            "carried whole, not flattened or re-ordered"
+        );
+    }
+
+    #[test]
+    fn expand_metadata_carries_a_structured_value_that_is_an_object_too() {
+        let subject = Subject::new("custom", "x");
+        let job_meta = serde_json::json!({ "doc": {"title": "Packet loss", "words": 900} });
+        let expanded = expand_metadata(
+            &serde_json::json!({ "doc": "{metadata.doc}" }),
+            &subject,
+            &job_meta,
+            None,
+        );
+        assert_eq!(
+            expanded
+                .get("doc")
+                .and_then(|d| d.get("title"))
+                .and_then(|v| v.as_str()),
+            Some("Packet loss")
+        );
+    }
+
+    #[test]
+    fn expand_metadata_still_stringifies_scalars_exactly_as_before() {
+        // The narrowing that keeps this change safe. A scalar token
+        // must keep returning a STRING: `check_metadata_defaults_values`
+        // type-checks the result against the StepType's declared field,
+        // and every existing template was authored against this
+        // behaviour.
+        let subject = Subject::new("custom", "x");
+        let job_meta = serde_json::json!({ "part_sku": "malt-2row", "count": 5 });
+        let expanded = expand_metadata(
+            &serde_json::json!({ "sku": "{metadata.part_sku}", "n": "{metadata.count}" }),
+            &subject,
+            &job_meta,
+            None,
+        );
+        assert_eq!(
+            expanded.get("sku").and_then(|v| v.as_str()),
+            Some("malt-2row")
+        );
+        assert_eq!(
+            expanded.get("n").and_then(|v| v.as_str()),
+            Some("5"),
+            "a number token stays a string — changing this would retype every existing default"
+        );
+    }
+
+    #[test]
+    fn expand_metadata_does_not_take_a_whole_value_for_a_concatenation() {
+        // Two tokens in one string is string-building; there is no
+        // whole-value reading of it, so it must fall through to
+        // substitution (and an array, absent from the scalar table,
+        // simply leaves its token alone rather than corrupting it).
+        let subject = Subject::new("custom", "x");
+        let job_meta = serde_json::json!({ "a": [1, 2], "b": "tail" });
+        let expanded = expand_metadata(
+            &serde_json::json!({ "joined": "{metadata.a}{metadata.b}" }),
+            &subject,
+            &job_meta,
+            None,
+        );
+        assert_eq!(
+            expanded.get("joined").and_then(|v| v.as_str()),
+            Some("{metadata.a}tail"),
+            "concatenation stays a string"
+        );
+    }
+
+    #[test]
+    fn expand_metadata_leaves_a_structured_token_alone_when_the_job_has_no_such_key() {
+        let subject = Subject::new("custom", "x");
+        let expanded = expand_metadata(
+            &serde_json::json!({ "questions": "{metadata.questions}" }),
+            &subject,
+            &serde_json::json!({}),
+            None,
+        );
+        assert_eq!(
+            expanded.get("questions").and_then(|v| v.as_str()),
+            Some("{metadata.questions}"),
+            "an unbound token passes through verbatim, as every other unknown token does"
         );
     }
 
@@ -3143,24 +4224,57 @@ mod tests {
         assert_eq!(trigger.subject_source, "same");
     }
 
+    /// A minimal VIABLE spec — one trigger flowing into one terminal.
+    /// Every write path that sets a row ACTIVE runs the viability
+    /// gate, so a step-less fixture would be refused (and described
+    /// work no Job could ever finish, which is why the gate exists).
     fn seed_spec(kind: &str) -> WorkflowSpec {
         WorkflowSpec::platform_seed(
             kind,
             format!("Test {kind}"),
             "test",
             vec!["asset".into()],
-            Vec::new(),
+            vec![
+                StepSpec {
+                    title: "start".into(),
+                    kind: "task".into(),
+                    ready_when: "true".into(),
+                    ..Default::default()
+                },
+                StepSpec {
+                    title: "finish".into(),
+                    kind: "task".into(),
+                    ready_when: "steps.start.done".into(),
+                    terminal: Some(Terminal {
+                        outcome: "done".into(),
+                    }),
+                    ..Default::default()
+                },
+            ],
         )
+    }
+
+    /// Shared write-path actor: every registry write records an
+    /// event, and the event needs a who. Tests are exempt from the
+    /// no-wallclock lint, so `Utc::now()` rides along at call sites.
+    fn test_actor() -> boss_core::actor::ActorId {
+        boss_core::actor::ActorId::Human("emp-test".into())
     }
 
     #[tokio::test]
     async fn create_draft_assigns_next_version() {
         let reg = InMemoryWorkflows::new();
-        let v1 = reg.create_draft(seed_spec("repair")).await.unwrap();
+        let v1 = reg
+            .create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
         assert_eq!(v1.version, 1);
         assert_eq!(v1.status, WorkflowStatus::Draft);
 
-        let v2 = reg.create_draft(seed_spec("repair")).await.unwrap();
+        let v2 = reg
+            .create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
         assert_eq!(v2.version, 2);
         assert_eq!(v2.status, WorkflowStatus::Draft);
     }
@@ -3170,14 +4284,24 @@ mod tests {
         let reg = InMemoryWorkflows::new();
 
         // v1 drafted and published.
-        reg.create_draft(seed_spec("repair")).await.unwrap();
-        let active_v1 = reg.publish("repair").await.unwrap();
+        reg.create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        let active_v1 = reg
+            .publish("repair", &test_actor(), Utc::now())
+            .await
+            .unwrap();
         assert_eq!(active_v1.version, 1);
         assert_eq!(active_v1.status, WorkflowStatus::Active);
 
         // v2 drafted and published.
-        reg.create_draft(seed_spec("repair")).await.unwrap();
-        let active_v2 = reg.publish("repair").await.unwrap();
+        reg.create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        let active_v2 = reg
+            .publish("repair", &test_actor(), Utc::now())
+            .await
+            .unwrap();
         assert_eq!(active_v2.version, 2);
         assert_eq!(active_v2.status, WorkflowStatus::Active);
 
@@ -3191,10 +4315,16 @@ mod tests {
     #[tokio::test]
     async fn retire_flips_active_to_retired() {
         let reg = InMemoryWorkflows::new();
-        reg.create_draft(seed_spec("repair")).await.unwrap();
-        reg.publish("repair").await.unwrap();
+        reg.create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        reg.publish("repair", &test_actor(), Utc::now())
+            .await
+            .unwrap();
 
-        reg.retire("repair").await.unwrap();
+        reg.retire("repair", &test_actor(), Utc::now())
+            .await
+            .unwrap();
         let err = reg.get_active("repair").await.unwrap_err();
         match err {
             WorkflowError::NotFound(_) => {}
@@ -3206,14 +4336,21 @@ mod tests {
     async fn retire_is_idempotent() {
         let reg = InMemoryWorkflows::new();
         // Retiring a kind with no active row is a no-op, not an error.
-        reg.retire("never-existed").await.unwrap();
-        reg.retire("never-existed").await.unwrap();
+        reg.retire("never-existed", &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        reg.retire("never-existed", &test_actor(), Utc::now())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn publish_without_draft_returns_not_found() {
         let reg = InMemoryWorkflows::new();
-        let err = reg.publish("repair").await.unwrap_err();
+        let err = reg
+            .publish("repair", &test_actor(), Utc::now())
+            .await
+            .unwrap_err();
         match err {
             WorkflowError::NotFound(_) => {}
             other => panic!("expected NotFound, got {other:?}"),
@@ -3321,9 +4458,15 @@ mod tests {
         }
     }
 
-    /// The feedback flow collects exactly ONE thing from an operator —
-    /// the triage disposition — so every step must close on its own
-    /// defaults plus that.
+    /// The feedback flow collects exactly one thing per DECIDING step
+    /// — a disposition — so every step must close on its own defaults
+    /// plus that.
+    ///
+    /// There are two deciding steps since v10: triage routes on what
+    /// the report says, and `investigate` re-routes on what the
+    /// investigation found. Both are human-gated `task` steps whose
+    /// declared fields the generic step surface renders, so both are
+    /// collectable. A required field on any OTHER step would not be.
     ///
     /// Both halves matter. A required field anywhere else is a step
     /// nothing in this flow can satisfy, because no surface asks for
@@ -3368,6 +4511,27 @@ mod tests {
                     );
                 }
             }
+            // …and what the KIND's own surface collects. A StepType's
+            // required fields are the kind's completion contract, and
+            // the kind's surface (plugin or platform) is what asks for
+            // them — v11's `answer-question` design-review collects
+            // verdict + answer through its own form, exactly like the
+            // approval Workflow's decide step. Only spec-declared
+            // fields were simulated before, which made any kind with
+            // its own required fields read as "can never complete".
+            if let Some(st) = registry.get(&s.kind) {
+                for f in st.fields.iter().filter(|f| f.required) {
+                    let sample = f.field_type.split('|').next().unwrap_or("x");
+                    if let serde_json::Value::Object(m) = &mut metadata
+                        && !m.contains_key(f.name)
+                    {
+                        m.insert(
+                            f.name.to_string(),
+                            serde_json::Value::String(sample.to_string()),
+                        );
+                    }
+                }
+            }
 
             let result = registry
                 .validate_metadata(&s.kind, &metadata)
@@ -3392,9 +4556,162 @@ mod tests {
 
         assert_eq!(
             operator_supplied,
-            vec!["Triage feedback.disposition".to_string()],
-            "the feedback flow has exactly one field an operator fills in; anything \
-             else here is a step no surface can complete"
+            vec![
+                "Triage feedback.disposition".to_string(),
+                "Reproduce and investigate.disposition".to_string(),
+            ],
+            "the feedback flow collects a disposition at each deciding step and nothing \
+             else; anything else here is a step no surface can complete"
+        );
+    }
+
+    /// The routing table triage actually implements. A shipped change
+    /// answers a feedback packet by completing the step its
+    /// disposition opened, so "which step did `build` open" has to be
+    /// an answerable question rather than something a caller guesses
+    /// from the label.
+    #[test]
+    fn each_disposition_names_the_branch_it_opened() {
+        for (disposition, slug, terminal) in [
+            ("reproduce", "investigate", false),
+            ("design", "design-review", false),
+            ("build", "build", false),
+            ("needs-info", "needs-info", false),
+            ("duplicate", "duplicate", true),
+            ("decline", "declined", true),
+        ] {
+            let branch = feedback_branch_for_disposition(disposition)
+                .unwrap_or_else(|| panic!("`{disposition}` opens no branch"));
+            assert_eq!(
+                branch.slug, slug,
+                "`{disposition}` routed to the wrong step"
+            );
+            assert_eq!(
+                branch.terminal, terminal,
+                "`{disposition}` disagrees about whether its branch ends the Job"
+            );
+        }
+    }
+
+    /// EVERY value of the disposition enum resolves — the same
+    /// property the viability lint proves about successors, asserted
+    /// against the lookup callers use. A disposition with no branch
+    /// here is an item that routes nowhere.
+    #[test]
+    fn every_declared_disposition_resolves_to_a_branch() {
+        let spec = user_feedback_spec();
+        let triage = spec
+            .steps
+            .iter()
+            .find(|s| s.title == "triage")
+            .expect("triage step present");
+        let field = triage
+            .fields
+            .iter()
+            .find(|f| f.name == "disposition")
+            .expect("triage collects a disposition");
+        for value in field.field_type.split('|') {
+            assert!(
+                feedback_branch_for_disposition(value).is_some(),
+                "disposition `{value}` is offered to triagers but opens no branch"
+            );
+        }
+    }
+
+    /// An unknown disposition is `None`, not a wrong answer. A caller
+    /// completing "whatever branch this opened" must be able to tell
+    /// "nothing" from "something".
+    #[test]
+    fn an_unknown_disposition_opens_no_branch() {
+        assert_eq!(feedback_branch_for_disposition("wontfix"), None);
+        assert_eq!(feedback_branch_for_disposition(""), None);
+    }
+
+    #[test]
+    fn materialize_surfaces_claimable_and_leaves_authority_intact() {
+        // The dispatcher reads the materialized STEP, never the spec —
+        // it reacts to an event with no workflow row in hand. So
+        // `claimable` has to ride into step metadata the same way
+        // `authority_role` does, or the flag is invisible where it is
+        // consulted.
+        //
+        // The second assertion is the one that matters for security:
+        // making a step claimable must not disturb its authority.
+        // Claimability decides who the packet WAITS for; authority
+        // decides who may act. Widening the first while silently
+        // clearing the second would turn a queue into an open door.
+        let spec = WorkflowSpec::platform_seed(
+            "review",
+            "Review",
+            "governance",
+            vec!["custom".into()],
+            vec![StepSpec {
+                title: "decide".into(),
+                kind: "sign-off".into(),
+                ready_when: "true".into(),
+                authority_role: Some("platform-admin".into()),
+                claimable: Some(true),
+                terminal: Some(Terminal {
+                    outcome: "decided".into(),
+                }),
+                ..Default::default()
+            }],
+        );
+        let subject = Subject::new("custom", "docs/design/x.md");
+        let job_metadata = serde_json::Value::Object(Default::default());
+        let mut i = 0u32;
+        let steps = materialize_steps(&spec, &subject, JobId::new(), &job_metadata, || {
+            i += 1;
+            StepId::from_uuid(Uuid::from_u128(i as u128))
+        });
+        let md = &steps[0].metadata;
+        assert_eq!(
+            md.get("claimable").and_then(|v| v.as_bool()),
+            Some(true),
+            "the dispatcher cannot honour a flag it cannot see"
+        );
+        assert_eq!(
+            md.get("authority_role").and_then(|v| v.as_str()),
+            Some("platform-admin"),
+            "claimable must not disturb authority — a role queue is \
+             still gated on the role"
+        );
+    }
+
+    #[test]
+    fn a_step_says_nothing_about_claimability_by_default() {
+        // Absent means today's behaviour. Every existing Workflow row
+        // deserialises with `claimable: None` and must materialize
+        // exactly as it does now, or this change silently unassigns
+        // the whole system.
+        let spec = WorkflowSpec::platform_seed(
+            "review",
+            "Review",
+            "governance",
+            vec!["custom".into()],
+            vec![StepSpec {
+                title: "decide".into(),
+                kind: "sign-off".into(),
+                ready_when: "true".into(),
+                authority_role: Some("platform-admin".into()),
+                terminal: Some(Terminal {
+                    outcome: "decided".into(),
+                }),
+                ..Default::default()
+            }],
+        );
+        let subject = Subject::new("custom", "x");
+        let job_metadata = serde_json::Value::Object(Default::default());
+        let mut i = 0u32;
+        let steps = materialize_steps(&spec, &subject, JobId::new(), &job_metadata, || {
+            i += 1;
+            StepId::from_uuid(Uuid::from_u128(i as u128))
+        });
+        assert!(
+            steps[0].metadata.get("claimable").is_none(),
+            "an unset flag must not appear in step metadata at all — the \
+             dispatcher defaults it to false, and writing it explicitly \
+             would make every step look deliberately non-claimable"
         );
     }
 
@@ -3414,6 +4731,7 @@ mod tests {
                 ready_when: "true".into(),
                 title_template: "Annual".into(),
                 sign_offs_required: vec!["platform-admin".into()],
+                assurance_required: None,
                 authority_role: Some("qa-lead".into()),
                 terminal: Some(Terminal {
                     outcome: "certified".into(),
@@ -3445,11 +4763,21 @@ mod tests {
     #[tokio::test]
     async fn list_versions_returns_oldest_first() {
         let reg = InMemoryWorkflows::new();
-        reg.create_draft(seed_spec("repair")).await.unwrap();
-        reg.publish("repair").await.unwrap();
-        reg.create_draft(seed_spec("repair")).await.unwrap();
-        reg.publish("repair").await.unwrap();
-        reg.create_draft(seed_spec("repair")).await.unwrap();
+        reg.create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        reg.publish("repair", &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        reg.create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        reg.publish("repair", &test_actor(), Utc::now())
+            .await
+            .unwrap();
+        reg.create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
 
         let versions = reg.list_versions("repair").await.unwrap();
         assert_eq!(versions.len(), 3);
@@ -3855,15 +5183,24 @@ mod tests {
     // bootstrap_reconcile — InMemoryWorkflows
     // -----------------------------------------------------------
 
+    /// Viable by construction — reconcile activates rows, so it runs
+    /// the same gate publish does.
     fn reconcile_spec(kind: &str, label: &str) -> WorkflowSpec {
-        WorkflowSpec::platform_seed(kind, label, "platform", vec!["account".into()], Vec::new())
+        let mut spec = seed_spec(kind);
+        spec.label = label.to_string();
+        spec.category = "platform".into();
+        spec.subject_kinds = vec!["account".into()];
+        spec
     }
 
     #[tokio::test]
     async fn bootstrap_reconcile_inserts_missing_kinds() {
         let registry = InMemoryWorkflows::new();
         let defaults = vec![reconcile_spec("workflow-design", "Design a Workflow")];
-        let stats = registry.bootstrap_reconcile(&defaults).await.unwrap();
+        let stats = registry
+            .bootstrap_reconcile(&defaults, &test_actor(), Utc::now())
+            .await
+            .unwrap();
         assert_eq!(stats.inserted, 1);
         assert_eq!(stats.republished, 0);
         assert_eq!(stats.preserved, 0);
@@ -3880,13 +5217,13 @@ mod tests {
         // Seed a stale bootstrap row.
         let stale = reconcile_spec("workflow-design", "Old Label");
         registry
-            .bootstrap_reconcile(&[stale])
+            .bootstrap_reconcile(&[stale], &test_actor(), Utc::now())
             .await
             .expect("seed bootstrap");
         // Defaults now carry the corrected label.
         let updated = reconcile_spec("workflow-design", "Design a Workflow");
         let stats = registry
-            .bootstrap_reconcile(&[updated])
+            .bootstrap_reconcile(&[updated], &test_actor(), Utc::now())
             .await
             .expect("republish");
         assert_eq!(stats.inserted, 0);
@@ -3919,12 +5256,12 @@ mod tests {
         let registry = InMemoryWorkflows::new();
         let spec = reconcile_spec("workflow-design", "Design a Workflow");
         registry
-            .bootstrap_reconcile(std::slice::from_ref(&spec))
+            .bootstrap_reconcile(std::slice::from_ref(&spec), &test_actor(), Utc::now())
             .await
             .expect("seed");
         for _ in 0..3 {
             let stats = registry
-                .bootstrap_reconcile(std::slice::from_ref(&spec))
+                .bootstrap_reconcile(std::slice::from_ref(&spec), &test_actor(), Utc::now())
                 .await
                 .expect("reboot");
             assert_eq!(stats.republished, 0);
@@ -3952,7 +5289,10 @@ mod tests {
         registry.seed(operator_spec).expect("seed operator row");
 
         let updated = reconcile_spec("workflow-design", "Default Label");
-        let stats = registry.bootstrap_reconcile(&[updated]).await.unwrap();
+        let stats = registry
+            .bootstrap_reconcile(&[updated], &test_actor(), Utc::now())
+            .await
+            .unwrap();
         assert_eq!(stats.inserted, 0);
         assert_eq!(stats.republished, 0);
         assert_eq!(stats.preserved, 1);
@@ -3969,10 +5309,13 @@ mod tests {
         let registry = InMemoryWorkflows::new();
         let spec = reconcile_spec("workflow-design", "Design a Workflow");
         registry
-            .bootstrap_reconcile(std::slice::from_ref(&spec))
+            .bootstrap_reconcile(std::slice::from_ref(&spec), &test_actor(), Utc::now())
             .await
             .expect("seed");
-        let stats = registry.bootstrap_reconcile(&[spec]).await.unwrap();
+        let stats = registry
+            .bootstrap_reconcile(&[spec], &test_actor(), Utc::now())
+            .await
+            .unwrap();
         assert_eq!(stats.inserted, 0);
         assert_eq!(stats.republished, 0);
         assert_eq!(stats.preserved, 0);
@@ -3990,7 +5333,7 @@ mod tests {
         let job_id = JobId::new();
 
         let published = registry
-            .publish_authored(spec, job_id)
+            .publish_authored(spec, job_id, &test_actor(), Utc::now())
             .await
             .expect("publish");
 
@@ -4014,11 +5357,21 @@ mod tests {
         let job_b = JobId::new();
 
         registry
-            .publish_authored(reconcile_spec("morning-brew", "v1 label"), job_a)
+            .publish_authored(
+                reconcile_spec("morning-brew", "v1 label"),
+                job_a,
+                &test_actor(),
+                Utc::now(),
+            )
             .await
             .expect("first publish");
         let updated = registry
-            .publish_authored(reconcile_spec("morning-brew", "v2 label"), job_b)
+            .publish_authored(
+                reconcile_spec("morning-brew", "v2 label"),
+                job_b,
+                &test_actor(),
+                Utc::now(),
+            )
             .await
             .expect("supersede");
 
@@ -4114,45 +5467,149 @@ mod tests {
         // The dispatcher completes any ready terminal, so an outcome
         // gated on `steps.review.done` alone fires when review
         // completes — Job 606b40fb read "merged" while its PR was
-        // still open. The marker is what the conductor (or a person)
-        // sets when the merge has actually happened.
-        let kinds = platform_workflows();
+        // still open. The merge-evidence gate now lives on `proven`
+        // (the terminal fires on the PROOF, David 2026-08-19:
+        // "merged" must mean visible in prod, not landed on main),
+        // so this guard follows it: the chain terminal ← proven ←
+        // merge marker must be unbroken, or the dispatcher closes
+        // Jobs on review completion again.
+        // READ FROM THE BUNDLE, because that is where the protocol
+        // lives now. Repointed rather than deleted when ship-a-change
+        // converted to data: the guarantee is about the PROTOCOL, not
+        // about which file holds it, and a conversion that quietly
+        // dropped this assertion would have removed the guard while
+        // the flow it guards kept running.
+        let kinds = crate::seed_loader::load_workflows(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../infra/platform/workflows.toml"
+        ))
+        .expect("the platform bundle parses");
         let ship = kinds
             .iter()
             .find(|k| k.kind == "ship-a-change")
-            .expect("ship-a-change present");
+            .expect("ship-a-change present in the bundle");
+        let proven = ship
+            .steps
+            .iter()
+            .find(|s| s.title == "proven")
+            .expect("proven step present");
+        assert!(
+            proven.ready_when.contains("job.metadata.merged"),
+            "proven must wait for merge evidence; ready_when = {:?}",
+            proven.ready_when
+        );
         let merged = ship
             .steps
             .iter()
             .find(|s| s.title == "merged")
             .expect("merged outcome present");
         assert!(
-            merged.ready_when.contains("job.metadata.merged"),
-            "merged must wait for merge evidence; ready_when = {:?}",
+            merged.ready_when.contains("steps.proven.done"),
+            "the terminal must wait for the prod proof; ready_when = {:?}",
             merged.ready_when
+        );
+        // The proof itself cannot evaporate into a completed step.
+        assert!(
+            proven
+                .fields
+                .iter()
+                .any(|f| f.name == "verified" && f.required),
+            "proven must require the `verified` evidence at done"
         );
     }
 
     #[test]
     fn platform_workflows_carries_the_shipped_meta_kinds() {
         let kinds = platform_workflows();
+        // The roster and the seed change together — that is
+        // `a-registry-seed-and-its-roster-test-change-together` in the
+        // register, and this assertion is the half that enforces it.
+        // The count only ever goes DOWN now: protocols-as-data.md's
+        // direction of travel is that a kind leaves this roster for
+        // infra/platform/workflows.toml and never comes back, and a
+        // new protocol never touches Rust at all.
         assert_eq!(
             kinds.len(),
-            10,
-            "ships workflow-design + design-doc-review + user-feedback + ship-a-change \
-             + regenerate-deployment + backlog-item + pr-train + the three maintenance \
-             kinds (backup / audit-integrity / ledger-replay — internal-forge Q6)"
+            6,
+            "ships design-doc-review + user-feedback + pr-train + the three \
+             maintenance kinds (backup / audit-integrity / ledger-replay — \
+             internal-forge Q6). workflow-design, regenerate-deployment, \
+             backlog-item and ship-a-change are in the bundle, not here."
         );
+        // NO TENANT NOUNS IN CORE. David, 2026-08-16: "We don't want
+        // brewery nouns in core no matter what. But most nouns should
+        // be data anyway, so that was its own class of problem."
+        //
+        // Two problems were tangled in protocols-as-data Q5 and this
+        // asserts the one that survives. The FORM problem — protocols
+        // as Rust literals — is what the bundle fixes. The LAYER
+        // problem — a tenant's vocabulary living in Tier 1 — is never
+        // acceptable and was held only by vigilance: the roster count
+        // above says "seven", not "seven PLATFORM kinds", so swapping
+        // one for `morning-brew` would keep it green.
+        //
+        // `tier-import-audit.sh` cannot see this. It checks crate
+        // DEPENDENCIES, and a brewery noun hardcoded in a core crate
+        // adds no dependency at all — which is exactly how this class
+        // hides.
+        //
+        // The list is the brewery and used-device-shop vocabularies
+        // that have historically appeared here. Deliberately a
+        // denylist rather than a shape rule: "is this noun
+        // tenant-specific" is a judgement, and encoding a bad guess as
+        // a lint would block legitimate platform kinds. A tenant kind
+        // that is not on this list still gets caught by the count
+        // assertion above, which cannot be satisfied without a
+        // deliberate edit.
+        for tenant_noun in [
+            "sale",
+            "morning-brew",
+            "morning-brew-ipa",
+            "morning-brew-stout",
+            "wholesale-keg-order",
+            "direct-shop-order",
+            "ingredient-restock",
+            "refurb-used",
+            "refurb-device",
+        ] {
+            assert!(
+                !kinds.iter().any(|k| k.kind == tenant_noun),
+                "`{tenant_noun}` is a TENANT noun and must not ship in \
+                 platform_workflows() — tenant kinds seed from examples/<tenant>/, \
+                 and a brewery vocabulary in Tier 1 is the leak CLAUDE.md §10 names. \
+                 tier-import-audit.sh cannot catch this: a hardcoded noun adds no \
+                 crate dependency."
+            );
+        }
+
+        for bundled_kind in ["workflow-design", "regenerate-deployment", "backlog-item"] {
+            assert!(
+                !kinds.iter().any(|k| k.kind == bundled_kind),
+                "`{bundled_kind}` is supplied by the bundle; a kind in BOTH places is \
+                 worse than a kind in neither — bootstrap_reconcile republishes the \
+                 code version over the bundle's on every boot"
+            );
+        }
 
         // The boundary declaration is the whole point of the kind, so
         // it gets pinned rather than left to the generic viability
         // lint. `excludes` optional would make the step completable
         // without saying what the change leaves out, which is the one
         // sentence that keeps a change small.
-        let ship = kinds
+        // ship-a-change moved to the bundle, so the assertions follow
+        // it there rather than lapsing — the same treatment
+        // regenerate-deployment got below. A guarantee that stops being
+        // checked because its subject changed file is a guarantee that
+        // was never really held.
+        let bundled_kinds = crate::seed_loader::load_workflows(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../infra/platform/workflows.toml"
+        ))
+        .expect("the platform bundle parses");
+        let ship = bundled_kinds
             .iter()
             .find(|k| k.kind == "ship-a-change")
-            .expect("ship-a-change present");
+            .expect("ship-a-change present in the bundle");
         let scope = ship
             .steps
             .iter()
@@ -4177,10 +5634,20 @@ mod tests {
         // incidents in one day is what "verify the artifacts" is
         // guarding, and an optional field would be skipped under
         // exactly the conditions that produce them.
-        let regen = kinds
+        //
+        // `regenerate-deployment` moved to the bundle, so the
+        // assertions follow it there rather than lapsing. A guarantee
+        // that stops being checked because its subject moved house is
+        // a guarantee that was deleted quietly.
+        let bundled = crate::seed_loader::load_workflows(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../infra/platform/workflows.toml"
+        ))
+        .expect("the platform bundle parses");
+        let regen = bundled
             .iter()
             .find(|k| k.kind == "regenerate-deployment")
-            .expect("regenerate-deployment present");
+            .expect("regenerate-deployment present in the bundle");
         let artifacts = regen
             .steps
             .iter()
@@ -4252,10 +5719,13 @@ mod tests {
         // world moved (`stale`), another had a stale rationale but a
         // live defect (`verify`). Drop either and a backlog rots into
         // fiction with nowhere to record why.
-        let backlog = kinds
+        // Follows the kind into the bundle, like the regenerate-deployment
+        // assertions above. A guarantee that lapses because its subject
+        // moved house is a guarantee that was deleted quietly.
+        let backlog = bundled
             .iter()
             .find(|k| k.kind == "backlog-item")
-            .expect("backlog-item present");
+            .expect("backlog-item present in the bundle");
         let triage = backlog
             .steps
             .iter()
@@ -4283,10 +5753,10 @@ mod tests {
             "`evidence` must be required at done"
         );
 
-        let design = kinds
+        let design = bundled
             .iter()
             .find(|k| k.kind == "workflow-design")
-            .expect("workflow-design present");
+            .expect("workflow-design present in the bundle");
         assert_eq!(design.version, 1);
         assert_eq!(design.status, WorkflowStatus::Active);
         assert_eq!(design.subject_kinds, vec!["custom".to_string()]);
@@ -4395,11 +5865,19 @@ mod tests {
 
     #[test]
     fn platform_workflows_steps_run_design_to_publish_in_four_steps() {
-        let kinds = platform_workflows();
+        // `workflow-design` is bundle-supplied now, so the lifecycle is
+        // asserted where the lifecycle lives. The alternative — dropping
+        // the test with the kind — is how a four-step contract quietly
+        // becomes whatever the TOML happens to say.
+        let kinds = crate::seed_loader::load_workflows(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../infra/platform/workflows.toml"
+        ))
+        .expect("the platform bundle parses");
         let design = kinds
             .iter()
             .find(|k| k.kind == "workflow-design")
-            .expect("workflow-design present");
+            .expect("workflow-design present in the bundle");
         // v2: flat steps, DAG implicit in ready_when. The lifecycle is
         // author → validate → approve(sign-off) → publish(terminal).
         let steps = &design.steps;
@@ -4420,11 +5898,13 @@ mod tests {
         assert_eq!(steps[3].kind, "workflow-publish"); // publish
         assert!(steps[3].terminal.is_some(), "publish is the terminal step");
 
-        // design-doc-review carries 3 steps: open → review → reviewed.
-        let review = kinds
-            .iter()
+        // design-doc-review is still code-supplied, so it is asserted
+        // against the code — this test now reads both registries, which
+        // is what the split actually looks like.
+        let review = platform_workflows()
+            .into_iter()
             .find(|k| k.kind == "design-doc-review")
-            .expect("design-doc-review present");
+            .expect("design-doc-review present in platform_workflows");
         assert_eq!(review.steps.len(), 3, "review lifecycle has 3 steps");
     }
 
@@ -4464,7 +5944,11 @@ mod tests {
         // next reconcile must preserve the operator-published row.
         let registry = InMemoryWorkflows::new();
         registry
-            .bootstrap_reconcile(&[reconcile_spec("morning-brew", "Bootstrap Label")])
+            .bootstrap_reconcile(
+                &[reconcile_spec("morning-brew", "Bootstrap Label")],
+                &test_actor(),
+                Utc::now(),
+            )
             .await
             .expect("seed bootstrap");
 
@@ -4472,12 +5956,18 @@ mod tests {
             .publish_authored(
                 reconcile_spec("morning-brew", "Job-Authored Label"),
                 JobId::new(),
+                &test_actor(),
+                Utc::now(),
             )
             .await
             .expect("publish via Job");
 
         let stats = registry
-            .bootstrap_reconcile(&[reconcile_spec("morning-brew", "Default Label")])
+            .bootstrap_reconcile(
+                &[reconcile_spec("morning-brew", "Default Label")],
+                &test_actor(),
+                Utc::now(),
+            )
             .await
             .expect("reconcile after publish");
         assert_eq!(
@@ -4486,5 +5976,265 @@ mod tests {
         );
         let live = registry.get_active("morning-brew").await.unwrap();
         assert_eq!(live.label, "Job-Authored Label");
+    }
+
+    // -----------------------------------------------------------
+    // Registry events — every write records an outbox event with
+    // the row (protocol-policy-publish.md, Constraints). The
+    // InMemory adapter collects what the Pg adapter records inside
+    // the row transaction; `recorded_events()` is the test window.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn publish_records_exactly_one_published_event() {
+        let reg = InMemoryWorkflows::new();
+        let actor = test_actor();
+        reg.create_draft(seed_spec("repair"), &actor, Utc::now())
+            .await
+            .unwrap();
+        let published = reg.publish("repair", &actor, Utc::now()).await.unwrap();
+
+        let events: Vec<_> = reg
+            .recorded_events()
+            .into_iter()
+            .filter(|e| e.kind == crate::events::WORKFLOW_PUBLISHED)
+            .collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "publish must record exactly one jobs.kind.published"
+        );
+        let payload = &events[0].payload;
+        // The actor rides as `_actor` in EventStamp's exact shape —
+        // a Human serializes as the bare employee id.
+        assert_eq!(payload["_actor"], "emp-test");
+        // The payload IS the promoted spec.
+        assert_eq!(payload["kind"], "repair");
+        assert_eq!(payload["version"], published.version);
+        assert_eq!(payload["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn create_draft_records_draft_saved() {
+        let reg = InMemoryWorkflows::new();
+        let draft = reg
+            .create_draft(seed_spec("repair"), &test_actor(), Utc::now())
+            .await
+            .unwrap();
+
+        let events = reg.recorded_events();
+        assert_eq!(events.len(), 1, "one write, one event");
+        assert_eq!(events[0].kind, crate::events::WORKFLOW_DRAFT_SAVED);
+        assert_eq!(events[0].payload["kind"], "repair");
+        assert_eq!(events[0].payload["version"], draft.version);
+        assert_eq!(events[0].payload["status"], "draft");
+    }
+
+    #[tokio::test]
+    async fn retire_records_once_and_stays_silent_when_already_retired() {
+        let reg = InMemoryWorkflows::new();
+        let actor = test_actor();
+        reg.create_draft(seed_spec("repair"), &actor, Utc::now())
+            .await
+            .unwrap();
+        reg.publish("repair", &actor, Utc::now()).await.unwrap();
+
+        reg.retire("repair", &actor, Utc::now()).await.unwrap();
+        // Second retire is the idempotent no-op path: rows_affected
+        // is 0, so no event — the log records what happened, and
+        // nothing happened (transactional-audit-log.md discipline).
+        reg.retire("repair", &actor, Utc::now()).await.unwrap();
+
+        let retired: Vec<_> = reg
+            .recorded_events()
+            .into_iter()
+            .filter(|e| e.kind == crate::events::WORKFLOW_RETIRED)
+            .collect();
+        assert_eq!(
+            retired.len(),
+            1,
+            "idempotent retire must not record a second event"
+        );
+        assert_eq!(retired[0].payload["kind"], "repair");
+        assert_eq!(retired[0].payload["status"], "retired");
+    }
+
+    #[tokio::test]
+    async fn reconcile_records_published_per_touched_row_only() {
+        let registry = InMemoryWorkflows::new();
+        let actor = boss_core::actor::ActorId::Automation("bootstrap-reconciler".into());
+
+        // Fresh insert → one event.
+        registry
+            .bootstrap_reconcile(
+                &[reconcile_spec("workflow-design", "Design a Workflow")],
+                &actor,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registry.recorded_events().len(), 1);
+
+        // No drift → untouched row, no event.
+        registry
+            .bootstrap_reconcile(
+                &[reconcile_spec("workflow-design", "Design a Workflow")],
+                &actor,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.recorded_events().len(),
+            1,
+            "an unchanged reconcile row writes nothing and must record nothing"
+        );
+
+        // Drift → republish, one more event carrying the new version.
+        registry
+            .bootstrap_reconcile(
+                &[reconcile_spec("workflow-design", "Renamed")],
+                &actor,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let events = registry.recorded_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, crate::events::WORKFLOW_PUBLISHED);
+        assert_eq!(events[1].payload["version"], 2);
+        assert_eq!(
+            events[1].payload["_actor"],
+            "automation:bootstrap-reconciler"
+        );
+    }
+}
+
+#[cfg(test)]
+mod title_expansion_tests {
+    use super::*;
+
+    fn subject() -> Subject {
+        Subject::new("custom", "disk-headroom")
+    }
+
+    #[test]
+    fn metadata_tokens_resolve_in_step_titles() {
+        // The bug this exists for: `maintenance-sweep` v1 shipped
+        // `Inspect: {{ job.metadata.target }}` and rendered the mustache
+        // verbatim, because the token alphabet is single-brace
+        // `{metadata.<field>}` and nothing ever spoke mustache. A step
+        // title reading like broken markup is worse than no
+        // interpolation, since it is the sentence telling a human what
+        // is being asked of them.
+        let meta = serde_json::json!({ "target": "disk-headroom" });
+        assert_eq!(
+            expand_title("Inspect: {metadata.target}", &subject(), &meta),
+            "Inspect: disk-headroom"
+        );
+    }
+
+    #[test]
+    fn subject_and_metadata_tokens_compose() {
+        let meta = serde_json::json!({ "area": "infra" });
+        assert_eq!(
+            expand_title(
+                "{subject.kind}/{subject.id} — {metadata.area}",
+                &subject(),
+                &meta
+            ),
+            "custom/disk-headroom — infra"
+        );
+    }
+
+    #[test]
+    fn numbers_and_bools_render_as_scalars() {
+        let meta = serde_json::json!({ "commits_ahead": 34, "urgent": true });
+        assert_eq!(
+            expand_title(
+                "Publish {metadata.commits_ahead} ({metadata.urgent})",
+                &subject(),
+                &meta
+            ),
+            "Publish 34 (true)"
+        );
+    }
+
+    #[test]
+    fn unknown_and_non_scalar_tokens_are_left_literal() {
+        // Left visible on purpose, matching `{day…}` without an anchor:
+        // a `{metadata.typo}` on screen is a bug report, whereas
+        // blanking it renders "Inspect: " and reads as finished work.
+        let meta = serde_json::json!({ "nested": { "a": 1 } });
+        assert_eq!(
+            expand_title("A {metadata.typo} B {metadata.nested}", &subject(), &meta),
+            "A {metadata.typo} B {metadata.nested}"
+        );
+    }
+
+    #[test]
+    fn a_mustache_is_not_the_token_syntax_and_stays_literal() {
+        // Guards the misreading directly: if someone reintroduces
+        // `{{ job.metadata.x }}` in a registry row, this is what they
+        // will get, and the test says so out loud rather than leaving
+        // the next author to discover it in David's queue.
+        let meta = serde_json::json!({ "target": "disk-headroom" });
+        assert_eq!(
+            expand_title("Inspect: {{ job.metadata.target }}", &subject(), &meta),
+            "Inspect: {{ job.metadata.target }}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod frozen_job_tests {
+    use super::*;
+
+    /// The 32a4e70d shape: a live job gains a step (a per-question task
+    /// the design-review protocol adds), its count no longer matches
+    /// the spec, and from that moment no step can advance — including
+    /// the terminal, so the job never closes and never leaves the
+    /// reviewer's queue.
+    #[test]
+    fn an_added_step_freezes_the_job_and_is_detectable() {
+        let spec = ship_a_change_spec();
+        let subject = Subject::new("custom", "x");
+        let mut n = 0u32;
+        let mut steps = materialize_steps(
+            &spec,
+            &subject,
+            JobId::new(),
+            &serde_json::json!({}),
+            || {
+                n += 1;
+                StepId::new()
+            },
+        );
+        assert!(
+            !steps_diverged_from_spec(&spec, &steps),
+            "a freshly materialized job matches its spec"
+        );
+
+        // Complete every spec step, then confirm evaluation still runs.
+        let before = reevaluate(&spec, &mut steps, &subject, &serde_json::json!({}));
+        let _ = before;
+
+        // Now the protocol adds a step to the live job.
+        let mut extra = steps[0].clone();
+        extra.id = StepId::new();
+        extra.title = "Q: a question captured as a step".into();
+        extra.status = StepStatus::Completed;
+        steps.push(extra);
+
+        assert!(
+            steps_diverged_from_spec(&spec, &steps),
+            "an added step must be detectable — this is the frozen state"
+        );
+        let changed = reevaluate(&spec, &mut steps, &subject, &serde_json::json!({}));
+        assert!(
+            changed.is_empty(),
+            "a diverged job advances nothing: reevaluate must refuse rather \
+             than pair spec steps against misaligned job steps"
+        );
     }
 }

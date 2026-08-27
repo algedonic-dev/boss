@@ -1,0 +1,8 @@
+[[invariant]]
+id = "drift-a-queue-is-a-lens-not-a-structure"
+claim = "A queue is a lens … never a reified structure."
+source = "docs/design/queue-visibility.md; docs/design/views-as-queue-lenses.md"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "DOES NOT HOLD TODAY. The station registry ships as rows: infra/postgres/schema/116-stations.sql creates a `stations` table with a primary key, a versioning discipline and a partial unique index. The lens half survives inside each row — membership is derived by evaluating `predicate` over open Jobs at read time, with no mutable current-station field on the packet — so the accurate statement is that queue MEMBERSHIP is a lens while the queue's IDENTITY is reified. Judgement call pending: the doc's absolute is what drifted, not the schema."

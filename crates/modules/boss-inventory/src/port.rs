@@ -45,13 +45,11 @@ pub trait InventoryRepository: Send + Sync {
     /// the Warehouse workbench when a new part SKU is stocked for the
     /// first time.
     async fn upsert_item(&self, item: &InventoryItem) -> Result<(), InventoryError> {
-        let now = Utc::now();
         let stamp = EventStamp::new(
             "inventory",
             boss_core::actor::ActorId::Automation("platform".into()),
-            now,
         );
-        self.upsert_item_at(item, now, &stamp).await
+        self.upsert_item_at(item, stamp.timestamp, &stamp).await
     }
     /// Records `inventory.item.upserted` (the upserted row — the
     /// last-write-wins rebuild source) in the same transaction as the
@@ -71,13 +69,11 @@ pub trait InventoryRepository: Send + Sync {
         qty: u32,
     ) -> Result<ConsumeApplied, InventoryError> {
         let source_id = format!("{}@{}", part_sku, uuid::Uuid::new_v4());
-        let now = Utc::now();
         let stamp = EventStamp::new(
             "inventory",
             boss_core::actor::ActorId::Automation("platform".into()),
-            now,
         );
-        self.consume_part_at(part_sku, qty, now, &source_id, &stamp)
+        self.consume_part_at(part_sku, qty, stamp.timestamp, &source_id, &stamp)
             .await
     }
     /// `source_id` must be unique per consume call — it's the
@@ -211,14 +207,19 @@ pub trait InventoryRepository: Send + Sync {
         unit_cost_cents: Option<i64>,
         source_id: &str,
     ) -> Result<ReceiveApplied, InventoryError> {
-        let now = Utc::now();
         let stamp = EventStamp::new(
             "inventory",
             boss_core::actor::ActorId::Automation("platform".into()),
-            now,
         );
-        self.receive_part_at(part_sku, qty, unit_cost_cents, now, source_id, &stamp)
-            .await
+        self.receive_part_at(
+            part_sku,
+            qty,
+            unit_cost_cents,
+            stamp.timestamp,
+            source_id,
+            &stamp,
+        )
+        .await
     }
     /// OUTBOX (phase 2): records `inventory.item.upserted` (post-
     /// receive row state) + `inventory.item.received` (the exact
@@ -235,13 +236,12 @@ pub trait InventoryRepository: Send + Sync {
         stamp: &EventStamp,
     ) -> Result<ReceiveApplied, InventoryError>;
     async fn create_purchase_order(&self, po: &PurchaseOrder) -> Result<(), InventoryError> {
-        let now = Utc::now();
         let stamp = EventStamp::new(
             "inventory",
             boss_core::actor::ActorId::Automation("platform".into()),
-            now,
         );
-        self.create_purchase_order_at(po, now, &stamp).await
+        self.create_purchase_order_at(po, stamp.timestamp, &stamp)
+            .await
     }
     /// OUTBOX (phase 2): header + lines + subject identity +
     /// `inventory.purchase_order.upserted` (the caller-intended PO
@@ -266,13 +266,11 @@ pub trait InventoryRepository: Send + Sync {
     /// Convenience overload: stamps `Utc::now()` + a platform-
     /// automation event stamp. Handlers use `create_vendor_at`.
     async fn create_vendor(&self, vendor: &Vendor) -> Result<String, InventoryError> {
-        let now = Utc::now();
         let stamp = EventStamp::new(
             "inventory",
             boss_core::actor::ActorId::Automation("platform".into()),
-            now,
         );
-        self.create_vendor_at(vendor, now, &stamp).await
+        self.create_vendor_at(vendor, stamp.timestamp, &stamp).await
     }
     /// OUTBOX (transactional-audit-log phase 2): records
     /// `inventory.vendor.created` (full row state) — enriched via
@@ -307,13 +305,12 @@ pub trait InventoryRepository: Send + Sync {
     /// discrepancy_cents, and discrepancy_kind. Otherwise the invoice
     /// lands as `status=received` for later reconciliation.
     async fn upsert_vendor_invoice(&self, invoice: &VendorInvoice) -> Result<(), InventoryError> {
-        let now = Utc::now();
         let stamp = EventStamp::new(
             "inventory",
             boss_core::actor::ActorId::Automation("platform".into()),
-            now,
         );
-        self.upsert_vendor_invoice_at(invoice, now, &stamp).await
+        self.upsert_vendor_invoice_at(invoice, stamp.timestamp, &stamp)
+            .await
     }
     /// OUTBOX (phase 2): records `inventory.vendor_invoice.upserted`
     /// (the full row — the last-write-wins rebuild source) plus the

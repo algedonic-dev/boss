@@ -2,16 +2,14 @@
 //! PgAuditWriter, snapshot bulletins + bulletin_dismissals, drop,
 //! rebuild from `audit_log`, assert match.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 fn test_stamp(now: chrono::DateTime<Utc>) -> boss_core::publisher::EventStamp {
     boss_core::publisher::EventStamp::new(
         "content",
         boss_core::actor::ActorId::Automation("test".into()),
-        now,
     )
+    .with_timestamp(now)
 }
 
 /// Drain the outbox through the relay pipeline into audit_log.

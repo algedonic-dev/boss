@@ -12,8 +12,6 @@
 //! trigger lineage). The endpoint rejecting that shape hard-failed the
 //! first post-#100 year run at sim-day 37.
 
-#![cfg(feature = "postgres")]
-
 use axum::body::Body;
 use axum::http::Request;
 use boss_testing::TestDb;

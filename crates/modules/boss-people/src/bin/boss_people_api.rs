@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
     info!(%clock_url, "clock client wired");
 
     // Wire the sim-mode probe into the publisher so every
-    // emit_at automatically injects `_simulated: bool` into
+    // every stamp automatically injects `_simulated: bool` into
     // the audit_log payload without per-handler changes.
     let publisher = publisher.map(|p| {
         p.with_sim_probe(Arc::new(boss_clock_client::ClockSimProbe::new(
@@ -153,7 +153,11 @@ async fn main() -> Result<()> {
         publisher.clone(),
         clock.clone(),
     ))
-    .merge(boss_people::scope::scope_router(pool.clone()));
+    .merge(boss_people::scope::scope_router(pool.clone()))
+    .merge(boss_people::webauthn::webauthn_router(
+        pool.clone(),
+        clock.clone(),
+    ));
     // people-api owns only the employee-side routers. The
     // accounts-side routers (accounts, account_team_members,
     // account_notes, account_next_actions, account_risk_scores,

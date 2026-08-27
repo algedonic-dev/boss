@@ -335,7 +335,7 @@ async fn create_note(
     // DO NOTHING guard doubles as the event gate, so a replayed
     // create records nothing).
     if inserted {
-        let stamp = crate::events::event_stamp(&state.publisher, now).await;
+        let stamp = crate::events::event_stamp(&state.publisher).await;
         let event = stamp.event(
             ACCOUNT_NOTE_POSTED,
             serde_json::to_value(&evt).unwrap_or_default(),
@@ -380,7 +380,7 @@ async fn delete_note(
     // OUTBOX (phase 2): the deleted event records with the flip (the
     // NotFound above returns pre-recording; an already-deleted note
     // matches 0 rows and records nothing).
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let stamp = crate::events::event_stamp(&state.publisher).await;
     let event = stamp.event(
         ACCOUNT_NOTE_DELETED,
         serde_json::to_value(&evt).unwrap_or_default(),

@@ -43,7 +43,15 @@ export type Route =
   /// whole viewport instead of a panel inside the job page — review
   /// and authoring steps are reading tasks, and reading competes
   /// badly with a sidebar and a step list.
-  | { kind: 'stepFocus'; jobId: string; stepId: string }
+  | {
+      kind: 'stepFocus';
+      jobId: string;
+      stepId: string;
+      /// In-app path the lens that opened this step wants Back to
+      /// return to, with a label for it. Absent for a deep link.
+      from?: string;
+      fromLabel?: string;
+    }
   | { kind: 'service' }
   | { kind: 'sales' }
   | { kind: 'refurb' }
@@ -82,9 +90,14 @@ export type Route =
   | { kind: 'systemStepPlugins' }
   | { kind: 'systemStepPluginDetail'; pluginSlug: string }
   | { kind: 'systemDesign' }
-  | { kind: 'systemOsMap' }
+  | { kind: 'systemYard' }
+  /// The network map — every registry station as a node (stations.md).
+  | { kind: 'systemMap' }
   | { kind: 'systemFlow' }
   | { kind: 'systemFleet' }
+  /// The IT incidents surface — active incident-post-mortem packets +
+  /// the closed ones rendered as a durable archive.
+  | { kind: 'incidents' }
   | { kind: 'systemSubjects' }
   | { kind: 'systemModel' }
   | { kind: 'experiments' }
@@ -111,8 +124,25 @@ export type Route =
   | { kind: 'shopProduct'; sku: string };
 
 export function parseRoute(pathname: string): Route {
-  const raw = pathname.replace(/^\/dashboard/, '').replace(/\/$/, '') || '/';
+  let raw = pathname.replace(/^\/dashboard/, '').replace(/\/$/, '') || '/';
   if (raw === '/login') return { kind: 'login' };
+
+  // IT surfaces answer on /it/* as well as /system/*.
+  //
+  // Feedback 0fc8b216: "We should not be under /system route because I
+  // am working on a Job in the context of the IT department. So I
+  // should be in the /it route IT app." He is right — nav-catalog
+  // already assigns every one of these to `app: 'it'`, so the URL was
+  // the last place still calling them System surfaces.
+  //
+  // /system/* is kept, permanently and deliberately. Those paths are in
+  // bookmarks, in the station registry's `upstream` hrefs, and in docs;
+  // an alias costs one line and a redirect that breaks a saved link
+  // costs an operator their place. Canonical moves, old paths keep
+  // answering.
+  if (raw === '/it' || raw.startsWith('/it/')) {
+    raw = `/system${raw.slice('/it'.length)}`;
+  }
 
   // ===== System Model perspective — /system/* =====
   if (raw === '/system' || raw.startsWith('/system/')) {
@@ -124,9 +154,11 @@ export function parseRoute(pathname: string): Route {
     if (p === '/monitoring/atlas') return { kind: 'systemMonitoringAtlas' };
     if (p === '/kb') return { kind: 'systemKb' };
     if (p === '/design') return { kind: 'systemDesign' };
-    if (p === '/os-map') return { kind: 'systemOsMap' };
+    if (p === '/yard') return { kind: 'systemYard' };
+    if (p === '/map') return { kind: 'systemMap' };
     if (p === '/flow') return { kind: 'systemFlow' };
     if (p === '/fleet') return { kind: 'systemFleet' };
+    if (p === '/incidents') return { kind: 'incidents' };
     if (p === '/feedback') return { kind: 'systemFeedback' };
     if (p === '/experiments') return { kind: 'experiments' };
     if (p === '/subjects') return { kind: 'systemSubjects' };
@@ -271,7 +303,23 @@ export function parseRoute(pathname: string): Route {
   // Before the greedy /jobs/(.+) below, which would otherwise swallow
   // the whole `{id}/steps/{stepId}` tail as a job id.
   const sfm = p.match(/^\/jobs\/([^/]+)\/steps\/([^/]+)$/);
-  if (sfm) return { kind: 'stepFocus', jobId: sfm[1]!, stepId: sfm[2]! };
+  if (sfm) {
+    const sp = new URLSearchParams(window.location.search);
+    const r: Route = { kind: 'stepFocus', jobId: sfm[1]!, stepId: sfm[2]! };
+    // Where "back" goes, and what to call it. Only the lens that sent
+    // the operator here knows — the step surface cannot infer it, and
+    // guessing from the Job's kind would put a per-workflow branch in
+    // core routing (CLAUDE.md 9). Leading-slash check keeps this an
+    // in-app path: a `from` naming another origin would turn a Back
+    // button into an open redirect.
+    const from = sp.get('from');
+    const fromLabel = sp.get('from_label');
+    if (from?.startsWith('/') && !from.startsWith('//')) {
+      (r as { from?: string }).from = from;
+      if (fromLabel) (r as { fromLabel?: string }).fromLabel = fromLabel;
+    }
+    return r;
+  }
 
   const jm = p.match(/^\/jobs\/(.+)$/);
   if (jm) return { kind: 'jobDetail', jobId: jm[1]! };

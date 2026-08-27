@@ -63,3 +63,27 @@ tower = { workspace = true, features = ["util"] }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "audit_immutability"
+required-features = ["postgres"]
+
+[[test]]
+name = "audit_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "event_kinds_registry_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "outbox_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "subject_edges_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "tail_http"
+required-features = ["postgres"]

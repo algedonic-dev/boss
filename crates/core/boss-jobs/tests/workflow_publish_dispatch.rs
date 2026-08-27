@@ -4,10 +4,12 @@
 //! When a step of kind `workflow-publish` flips to Done via PUT
 //! /api/jobs/{id}/steps/{step_id}, the handler must:
 //! 1. Pull `workflow_spec` from the step metadata.
-//! 2. Validate it via `validate_all`.
-//! 3. Call `WorkflowRegistry::publish_authored(spec, job_id)`.
-//! 4. Emit `jobs.kind.published` with the full published spec.
-//! 5. Persist STEP_UPDATED only AFTER the registry write succeeds.
+//! 2. Hand it to the registry, which gates it on viability.
+//! 3. Call `WorkflowRegistry::publish_authored(spec, job_id, actor, now)`
+//!    — the registry records `jobs.kind.published` (full published
+//!    spec) atomically with the workflows row; the step path no
+//!    longer emits its own copy.
+//! 4. Persist STEP_UPDATED only AFTER the registry write succeeds.
 //!
 //! Decision record: `docs/architecture-decisions.md` §Jobs,
 //! Workflows, Steps (Workflows bootstrap through Jobs).
@@ -66,6 +68,7 @@ fn build_app(
     );
     let state = JobsApiState {
         job_edges: None,
+        stations: None,
         jobs: jobs.clone(),
         bus: bus.clone(),
         publisher,
@@ -111,6 +114,7 @@ async fn seed_publish_step(
         sort_order: 0,
         blocked_by: vec![],
         sign_offs_required: Vec::new(),
+        assurance_required: None,
         sign_offs: Vec::new(),
         fields: Vec::new(),
         completed_on: None,
@@ -125,8 +129,8 @@ async fn seed_publish_step(
 }
 
 fn valid_spec(kind: &str) -> WorkflowSpec {
-    // Must pass validate_all (the dispatch path lints before
-    // publishing): a viable trigger → terminal pair.
+    // Must pass the viability gate `publish_authored` enforces:
+    // a viable trigger → terminal pair.
     WorkflowSpec::platform_seed(
         kind,
         "Morning Brew",
@@ -174,7 +178,9 @@ async fn put_step_done(
 
 #[tokio::test]
 async fn done_dispatches_publish_authored_and_emits_kind_published_event() {
-    let kinds: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
+    // Concrete handle: `recorded_events()` is the InMemory window
+    // onto what the Pg adapter records in the row transaction.
+    let kinds = Arc::new(InMemoryWorkflows::new());
     let (app, jobs, _bus) = build_app(kinds.clone());
 
     let spec = valid_spec("morning-brew");
@@ -201,11 +207,12 @@ async fn done_dispatches_publish_authored_and_emits_kind_published_event() {
         *job_id.inner().as_uuid(),
     );
 
-    // The audit-bearing event landed — OUTBOX (phase 2): recorded by
-    // the repository in the step-update write, not published on the
-    // bus (the in-memory repo collects what the Pg adapter would
-    // record in-tx).
-    let events = jobs.recorded_events();
+    // The audit-bearing event landed — recorded by the REGISTRY
+    // adapter atomically with the workflows row (registry-events
+    // car), no longer pushed into the step-update write. The
+    // in-memory registry collects what the Pg adapter records
+    // in-tx.
+    let events = kinds.recorded_events();
     let published: Vec<_> = events
         .iter()
         .filter(|e| e.kind == WORKFLOW_PUBLISHED)
@@ -219,11 +226,21 @@ async fn done_dispatches_publish_authored_and_emits_kind_published_event() {
     assert_eq!(payload["kind"], "morning-brew");
     assert_eq!(payload["version"], 1);
     assert_eq!(payload["status"], "active");
+    // The actor is the session user who flipped the step.
+    assert_eq!(payload["_actor"], "emp-cto");
+
+    // The step path must NOT duplicate it — one write, one event.
+    assert!(
+        jobs.recorded_events()
+            .iter()
+            .all(|e| e.kind != WORKFLOW_PUBLISHED),
+        "the step-update write no longer carries jobs.kind.published"
+    );
 }
 
 #[tokio::test]
 async fn missing_workflow_spec_metadata_returns_400_no_publish() {
-    let kinds: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::new());
     let (app, jobs, _bus) = build_app(kinds.clone());
 
     let (job_id, step_id) =
@@ -236,8 +253,12 @@ async fn missing_workflow_spec_metadata_returns_400_no_publish() {
         "missing workflow_spec must abort the step write"
     );
 
-    // No publish event should have recorded — OUTBOX (phase 2): the
-    // repo collects what the Pg adapter would record in-tx.
+    // No publish event should have recorded — neither by the
+    // registry (the write never happened) nor by the step path.
+    assert!(
+        kinds.recorded_events().is_empty(),
+        "the registry must record nothing when dispatch fails"
+    );
     let events = jobs.recorded_events();
     assert!(
         events.iter().all(|e| e.kind != WORKFLOW_PUBLISHED),
@@ -264,7 +285,7 @@ async fn missing_workflow_spec_metadata_returns_400_no_publish() {
 
 #[tokio::test]
 async fn malformed_workflow_spec_returns_400() {
-    let kinds: Arc<dyn WorkflowRegistry> = Arc::new(InMemoryWorkflows::new());
+    let kinds = Arc::new(InMemoryWorkflows::new());
     let (app, jobs, _bus) = build_app(kinds.clone());
 
     let (job_id, step_id) = seed_publish_step(
@@ -276,8 +297,39 @@ async fn malformed_workflow_spec_returns_400() {
     let resp = put_step_done(&app, job_id, step_id, &user_header(&cto())).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
+    assert!(kinds.recorded_events().is_empty());
     let events = jobs.recorded_events();
     assert!(events.iter().all(|e| e.kind != WORKFLOW_PUBLISHED));
+}
+
+#[tokio::test]
+async fn unviable_workflow_spec_returns_422_and_publishes_nothing() {
+    // The Step dispatch path sets a registry row ACTIVE without a
+    // draft ever existing, so it answers to the publish gate too
+    // (2026-08-13). The refusal is 422 with the lint problems, and
+    // the step must NOT flip to done behind a failed registry write.
+    let kinds = Arc::new(InMemoryWorkflows::new());
+    let (app, jobs, _bus) = build_app(kinds.clone());
+
+    // Viable shape minus the outcome — the incident's exact defect.
+    let mut spec = valid_spec("morning-brew");
+    spec.steps[1].terminal = None;
+    let metadata = json!({ "workflow_spec": serde_json::to_value(&spec).unwrap() });
+    let (job_id, step_id) = seed_publish_step(jobs.as_ref(), metadata).await;
+
+    let resp = put_step_done(&app, job_id, step_id, &user_header(&cto())).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    assert!(
+        kinds.get_active("morning-brew").await.is_err(),
+        "an unviable spec must not reach the active slot by any path"
+    );
+    assert!(kinds.recorded_events().is_empty());
+    assert!(
+        jobs.recorded_events()
+            .iter()
+            .all(|e| e.kind != WORKFLOW_PUBLISHED)
+    );
 }
 
 #[tokio::test]
@@ -298,6 +350,7 @@ async fn publish_step_without_kind_registry_returns_503() {
     );
     let state = JobsApiState {
         job_edges: None,
+        stations: None,
         jobs: jobs.clone(),
         bus: bus.clone(),
         publisher,

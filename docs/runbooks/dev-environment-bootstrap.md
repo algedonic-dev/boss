@@ -106,9 +106,10 @@ pg_isready` should all succeed.
 
 ## 1. Postgres role + databases
 
-`bootstrap-db.sh` assumes a `boss` role already exists with
-password `boss` and connects via `127.0.0.1`. Create it first
-or every subsequent step fails on auth.
+`bootstrap-boss.sh` and `bootstrap-scratch.sh` (thin wrappers
+over the shared engine, `bootstrap-db.sh`) assume a `boss` role
+already exists with password `boss` and connect via `127.0.0.1`.
+Create it first or every subsequent step fails on auth.
 
 ```sh
 sudo -u postgres psql -d postgres -c \
@@ -124,11 +125,17 @@ sudo /opt/boss/infra/postgres/bootstrap-boss.sh
 sudo /opt/boss/infra/postgres/bootstrap-scratch.sh
 ```
 
-Expect a WARN line about `boss-operator-baseline-seed` not being
-on PATH. That's fine — the binary doesn't exist yet; we'll re-run
-after the build. (There is no separate Workflow-seed binary:
-platform Workflows auto-reconcile on `boss-jobs-api` startup, and
-tenant Workflows load via the per-tenant prepare step —
+Expect WARN lines about `boss-operator-baseline-seed` and
+`boss-platform-workflow-seed` not being on PATH. That's fine —
+the binaries don't exist yet; we'll re-run after the build.
+(Workflow seeding is split three ways:
+`boss-platform-workflow-seed` — a real, load-bearing binary that
+`bootstrap-db.sh` invokes here, and that the compose install's
+init runs as its `[2/4]` step — loads the platform Workflow
+bundle shipped as data in `infra/platform/workflows.toml`,
+insert-if-missing; `boss-jobs-api` additionally reconciles its
+code-defined platform meta-kinds on every startup; and tenant
+Workflows load via the per-tenant prepare step —
 `boss-brewery-sim prepare`. See
 `docs/design/platform-vs-tenant-jobkinds.md`.)
 
@@ -275,8 +282,11 @@ sudo systemctl enable --now boss-gateway
 sudo boss-auth add admin@example.com
 ```
 
-To put the SSH-CA flow (short-lived issued SSH certs + central
-revocation) back, see `infra/blueprints/ssh-ca/README.md`.
+An SSH-CA flow (short-lived issued SSH certs + central
+revocation) is future work — `infra/blueprints/` does not exist
+in this tree. Cloud-provider blueprint recipes (an ssh-ca one
+among them) are queued post-release; see the **Cloud-provider
+blueprints** entry in `TODO.md`.
 
 ## 7. Seed the brewery tenant via the live API
 
@@ -291,8 +301,11 @@ The converged prepare step seeds the whole tenant through the public
 API, in order: the Class registry, the brewery Workflows (real
 `workflow-design` Jobs), tenant policy grants, then the data — the
 brewery exec team (CTO/COO/CEO/owner, from
-`examples/brewery/seeds/operator_hires.toml`), the ~700-employee
-roster (`seed_employees`, deterministic seed=42), 50 wholesale
+`examples/brewery/seeds/operator_hires.toml`), the generated
+employee roster (`seed_employees`, deterministic seed=42 — 405
+rows in `examples/brewery/seeds/employees.json`; with the exec
+team and operator baseline the prepared roster lands at 411
+people), 50 wholesale
 accounts + 30 prospects + the `acc-direct-shop` catch-all, 13
 vendors, 6 calendar reservations, 3 bulletins, and finished-product +
 raw + asset opening balances. Thousands of rows land in `audit_log`.
@@ -352,8 +365,13 @@ the TODO board:
   `/api/<name>/health`. Today's output is misleading.
 - `bootstrap-db.sh` could `CREATE ROLE boss` itself rather than
   failing on missing role.
-- A top-level `infra/dev-bootstrap.sh` that chains §0–§5 in
-  order would replace this whole runbook with a single command.
+- A single command that chains §0–§7 exists:
+  `infra/bootstrap-vm.sh` (fresh Ubuntu 24.04 VM; apt →
+  toolchains → Postgres role + DBs → NATS → build → install →
+  re-seed → deploy → tenant seed → health probes). Two known
+  flaws, each with a packet filed: it does not deploy the SPA
+  (§6 stays manual), and it carries a hardcoded binary list
+  that can drift from the port registry.
 - `infra/verify-smoke.sh` probes the prod-stack ports (7100–7900)
   over HTTP, so after a `scratch://` replay it FAILs every motion
   even though the data is in scratch. It should take the env (or

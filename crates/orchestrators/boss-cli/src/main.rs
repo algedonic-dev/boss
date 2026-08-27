@@ -2,13 +2,18 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod cadence;
+mod census;
+mod delivery_policy;
 mod deploy;
 mod docs;
 mod docs_flush;
 mod doctor;
 mod inspect;
 mod ops;
+mod queue;
 mod script;
+mod train;
 mod upgrade;
 
 #[derive(Parser)]
@@ -106,6 +111,29 @@ enum Commands {
         #[command(subcommand)]
         action: InspectAction,
     },
+    /// PR-train conductor — drive the pr-train Workflow: reconcile
+    /// open trains against reality, board this window's train. The
+    /// systemd timers enter through `boss train run` (via
+    /// infra/train/conductor.sh).
+    Train {
+        #[command(subcommand)]
+        action: TrainAction,
+    },
+    /// Read the feedback triage board from a terminal. Read-only on
+    /// purpose: taking an item, annotating it, or closing it goes
+    /// through the board or the step API, so every state change
+    /// carries an actor.
+    Queue {
+        /// Column to show: all | waiting | with-agent |
+        /// routed[:disposition] | done
+        #[arg(default_value = "all")]
+        column: String,
+    },
+    /// Job-packet network diagnostics (docs/design/packet-loss.md).
+    Packet {
+        #[command(subcommand)]
+        action: PacketAction,
+    },
     /// Query the audit log for domain events
     Audit {
         /// Filter by event kind prefix (e.g., "catalog.model")
@@ -120,6 +148,107 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrainAction {
+    /// Prove the locomotive fit — clone owned by the running user,
+    /// both remotes reachable — and exit. A sick locomotive exits 3,
+    /// loud in the unit's status, instead of surfacing at departure.
+    Preflight {
+        /// Say what would happen without writing anywhere
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Record evidence on open trains — the CI verdict, the merge
+    /// (observed, never assumed), the deploys that carried it out.
+    /// No boarding. This is the 10-minute early-warning cadence.
+    Reconcile {
+        /// Say what would happen without writing anywhere
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Board this window's train without reconciling first: collect
+    /// ready ship-a-change Jobs, assemble the train branch, open the
+    /// one batched PR.
+    Board {
+        /// Say what would happen without writing anywhere
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Reconcile open trains, then board this window's train (what
+    /// the retired timers used to enter; now fired by the
+    /// `train-window` cadence rule).
+    Run {
+        /// Say what would happen without writing anywhere
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Cancel an open train that will not arrive: close its PR
+    /// unmerged, release the boarded cars back to the dock (each one
+    /// re-enters the next boarding, with the reason on its record),
+    /// complete the train's `cancelled` terminal, and delete the
+    /// train's own branch — never a car's.
+    Cancel {
+        /// The train's Job id (or a unique prefix), or its PR url
+        train: String,
+        /// Why — recorded on the cancelled step and every released car
+        #[arg(long)]
+        reason: String,
+        /// Say what would happen without writing anywhere
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// The cadence loop: evaluate the `cadence_rules` registry
+    /// against boss-clock time and fire the verbs the rules name,
+    /// recording every firing in `cadence_firings`. The supervised
+    /// entry (infra/train/boss-train.service) — the schedule itself
+    /// is protocol data (docs/design/protocol-cadence.md).
+    Cadence {
+        /// Evaluate one tick and exit (operator / test entry)
+        #[arg(long)]
+        once: bool,
+        /// Say what would fire without claiming or running anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PacketAction {
+    /// Measure packet conservation across the whole instance and
+    /// print what it found: open vs terminal counts by kind, the age
+    /// and stall profile of open packets, how many stations would
+    /// present each one (zero = ORPHANED — structurally unworkable),
+    /// and whether declared `job_edges` still point at Jobs that
+    /// exist.
+    ///
+    /// Read-only and non-raising by design: it files no job, sends no
+    /// message, repairs nothing, and exits 0 whatever it finds —
+    /// packet-loss.md Q2 defers raising until the base rate this
+    /// measures is known.
+    Census {
+        /// Days without step motion before a packet counts stalled.
+        #[arg(long, default_value = "7", value_parser = clap::value_parser!(i64).range(1..))]
+        stale_days: i64,
+        /// Output as JSON (for jq / a cadence rule recording a series).
+        #[arg(long)]
+        json: bool,
+        /// Cap on open packets evaluated. The default covers today's
+        /// volume with room to spare; a truncating run says so in the
+        /// output rather than sampling silently.
+        #[arg(long, default_value = "2000")]
+        max_open: usize,
+        /// Cap on Jobs read when resolving edge references that are id
+        /// PREFIXES (those need the full id universe — see the module
+        /// docs). 0 skips the scan and reports those refs unknown.
+        #[arg(long, default_value = "20000")]
+        max_scan: usize,
+        /// Override the jobs-api URL. Defaults to BOSS_JOBS_URL or
+        /// http://127.0.0.1:7900.
+        #[arg(long)]
+        jobs_url: Option<String>,
     },
 }
 
@@ -418,6 +547,61 @@ async fn main() -> Result<()> {
                 inspect::employees(role.as_deref(), limit, json, &gw).await
             }
         },
+        Commands::Train { action } => {
+            // The cadence loop reads boss-clock time itself (via
+            // ClockClient) — it never takes a wallclock argument.
+            if let TrainAction::Cadence { once, dry_run } = action {
+                return cadence::run(once, dry_run).await;
+            }
+            let (phase, dry) = match action {
+                TrainAction::Preflight { dry_run } => (train::Phase::Preflight, dry_run),
+                TrainAction::Reconcile { dry_run } => (train::Phase::Reconcile, dry_run),
+                TrainAction::Board { dry_run } => (train::Phase::Board, dry_run),
+                TrainAction::Run { dry_run } => (train::Phase::Run, dry_run),
+                TrainAction::Cancel {
+                    train,
+                    reason,
+                    dry_run,
+                } => (
+                    train::Phase::Cancel {
+                        handle: train,
+                        reason,
+                    },
+                    dry_run,
+                ),
+                TrainAction::Cadence { .. } => unreachable!("handled above"),
+            };
+            // Wall-clock at the CLI boundary: the train window IS the
+            // operator's now (the verb entry a person or the cadence
+            // loop fires), and nothing here stamps audit_log directly
+            // — jobs-api does that on the far side of the HTTP calls.
+            train::run(phase, dry, chrono::Utc::now()).await
+        }
+        Commands::Queue { column } => queue::run(&column).await,
+        Commands::Packet { action } => match action {
+            PacketAction::Census {
+                stale_days,
+                json,
+                max_open,
+                max_scan,
+                jobs_url,
+            } => {
+                // Wall-clock at the CLI boundary: the census's `now`
+                // IS the operator's now, and it stamps nothing — every
+                // call it makes is a GET.
+                census::run(
+                    census::Options {
+                        stale_days,
+                        json,
+                        max_open,
+                        max_scan,
+                        jobs_url,
+                    },
+                    chrono::Utc::now(),
+                )
+                .await
+            }
+        },
         Commands::Audit {
             kind,
             source,
@@ -569,7 +753,6 @@ async fn cmd_ledger_lock(postgres_url: &str, starts_on: &str, locked_by: &str) -
     let stamp = boss_core::publisher::EventStamp::new(
         "ledger",
         boss_core::actor::ActorId::Automation("operator-cli".into()),
-        chrono::Utc::now(),
     );
     let checksum = boss_ledger::periods::lock_period(&pool, id, locked_by, &stamp, locked_by)
         .await
@@ -596,7 +779,6 @@ async fn cmd_ledger_unlock(postgres_url: &str, starts_on: &str) -> Result<()> {
     let stamp = boss_core::publisher::EventStamp::new(
         "ledger",
         boss_core::actor::ActorId::Automation("operator-cli".into()),
-        chrono::Utc::now(),
     );
     boss_ledger::periods::unlock_period(&pool, id, &stamp, "operator-cli")
         .await

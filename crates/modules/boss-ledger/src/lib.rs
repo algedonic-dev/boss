@@ -15,6 +15,7 @@
 //!   write transactions
 
 pub mod error;
+pub mod excise;
 pub mod recognize;
 pub mod rules;
 pub mod types;

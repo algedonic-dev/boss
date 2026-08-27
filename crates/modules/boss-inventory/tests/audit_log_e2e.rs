@@ -3,8 +3,6 @@
 //! the transactional outbox inside the domain tx; the relay drain
 //! moves it to audit_log (chained) + the bus.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::http::StatusCode;

@@ -5,8 +5,6 @@
 //! deterministic `source_id`: replaying the same consume is a no-op on
 //! `on_hand` (and dodges a spurious InsufficientStock once stock falls).
 
-#![cfg(feature = "postgres")]
-
 use boss_inventory::PgInventory;
 use boss_inventory::port::InventoryRepository;
 use boss_inventory::types::InventoryItem;
@@ -17,8 +15,8 @@ fn stamp() -> boss_core::publisher::EventStamp {
     boss_core::publisher::EventStamp::new(
         "inventory-test",
         boss_core::actor::ActorId::Automation("test".into()),
-        chrono::Utc::now(),
     )
+    .with_timestamp(chrono::Utc::now())
 }
 
 fn item(sku: &str, on_hand: u32, unit_cost_cents: i64) -> InventoryItem {

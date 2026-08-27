@@ -9,7 +9,9 @@
 //! Hexagonal: the domain defines a `JobsRepository` port (trait).
 //! Postgres, in-memory, and other adapters implement the same trait.
 
+pub mod cadence;
 pub mod calendar_hook;
+pub mod delivery;
 pub mod escalation;
 pub mod events;
 pub mod http;
@@ -20,11 +22,18 @@ pub mod policy_glue;
 pub mod port;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod protocol_conversion;
 #[cfg(feature = "postgres")]
 pub mod rebuild;
 pub mod registry;
 pub mod scheduling;
+pub mod station_lint;
+pub mod station_projection;
+pub mod station_quarantine;
+pub mod station_queue;
+pub mod stations;
 pub mod workflow_lint;
+pub mod workflow_quarantine;
 // Platform Workflows live in `registry::platform_workflows()` (currently
 // just `workflow-design`); tenant Workflows live in
 // `examples/<tenant>/seeds/workflows.toml` and load via `seed_loader`.
@@ -46,6 +55,13 @@ pub use registry::PgWorkflows;
 pub use registry::{
     InMemoryWorkflows, StepSpec, Terminal, WorkflowError, WorkflowRegistry, WorkflowSpec,
     WorkflowStatus, materialize_steps, reevaluate,
+};
+pub use station_queue::{DisciplineKey, StationPredicate, StationQueue, evaluate_station};
+#[cfg(feature = "postgres")]
+pub use stations::PgStations;
+pub use stations::{
+    InMemoryStations, StationCapability, StationError, StationKind, StationLens, StationRegistry,
+    StationSpec, StationUpstream,
 };
 #[cfg(feature = "postgres")]
 pub use step_plugins::PgStepPlugins;

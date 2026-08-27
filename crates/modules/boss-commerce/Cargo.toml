@@ -53,3 +53,27 @@ sqlx = { version = "0.8", default-features = false, features = ["macros", "runti
 
 [lints]
 workspace = true
+
+[[test]]
+name = "agreements_audit_chain"
+required-features = ["postgres"]
+
+[[test]]
+name = "financial_facts_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "gl_drift"
+required-features = ["postgres"]
+
+[[test]]
+name = "outbox_invoice_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "rebuild_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "write_off_convergence_pg"
+required-features = ["postgres"]

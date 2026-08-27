@@ -44,3 +44,7 @@ sqlx = { version = "0.8", default-features = false, features = ["macros", "runti
 
 [lints]
 workspace = true
+
+[[test]]
+name = "classes_pg"
+required-features = ["postgres"]

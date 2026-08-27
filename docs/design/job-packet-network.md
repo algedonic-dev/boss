@@ -18,8 +18,8 @@ understand where this is going" (`955ba4e5`).
 **Related**: [requirements-based-addressing.md](./requirements-based-addressing.md) —
 the addressing half of this model: queues as predicates, pools as
 their actor face ·
-[it-activity-network.md](./it-activity-network.md) — the rendering:
-stations/rails/traffic/packets ·
+[stations.md](./stations.md) — the network's nodes, and the
+registry contract for them ·
 [queue-visibility.md](./queue-visibility.md) ·
 [transactional-audit-log.md](./transactional-audit-log.md) ·
 [human-powered-state-machine.md](./human-powered-state-machine.md)
@@ -148,7 +148,7 @@ The system diagram redraws on the network stack (`955ba4e5`): the
 audit log is the wire; projections are interface counters; services
 are hosts; the dispatcher is a router running data-defined rules;
 workflows are the protocol suite; queues are ports; policy is the
-firewall; the canvas (it-activity-network) is the NOC wall. One
+firewall; the activity canvas is the NOC wall. One
 picture, one vocabulary, from architecture doc to UI labels — the
 presentation payoff item `75a66b01` asks for: a protocol has a name, a
 version, a page, and usage stats, the way a workflow today has only a
@@ -156,88 +156,75 @@ DAG.
 
 ## Open questions
 
-### Q1: What happens to `owner_id`?
+All 7 open questions were resolved 2026-08-12 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-Proposed: two stages. Stage 1 (cheap, honest): `owner_id` stays as
-"accountable human of record" but stops pretending to be routing —
-surfaces label it accountability, and queue lenses take over "whose
-work is this now". Stage 2 (the real move): Self/Team policy scopes
-re-key onto queue/requirement ownership + packet authorship, and
-`owner_id` becomes a derived lens over the log. Q7's rejection rule
-survives as "every packet's *protocol* must name an accountable
-requirement owner".
+---
 
-### Q2: Does `Job.status` remain a stored column?
 
-Proposed: keep the column as a materialized cache of the derived
-value (the indexes and every `status=open` predicate keep working),
-but the writers invert: step writes recompute it always; the manual
-status PUT dies except for the two imperative facts, which become
-explicit packet writes — `released` (draft → open) and a `cancelled`
-verdict step — so even they are payload, not out-of-band column
-flips.
+## Decisions
 
-### Q3: What is the v1 protocol set on the envelope?
+### Q1: What happens to `owner_id`? (resolved)
 
-Proposed (revised 2026-08-12, David's simplification): **a fixed set
-of compatible protocols declared at creation, with translation as the
-only protocol change.** The pin generalizes to `protocols[]`, written
-once; admission composes the set at creation — requirements conjoin
-(narrowing-only composition stays commutative, per
-requirements-based-addressing Q6), obligations union, and
-`workflow_lint`'s viability proof runs over the whole composed set at
-the one moment it can be complete. Mid-flight change is **packet
-translation**: a new packet under the new set, created through the
-same admission edge, carrying a declared mapping (headers per the
-registry, subject identity, a translation summary) and a
-`translated_from` edge (`job_edges` already speaks this); the source
-packet closes with a `translated` terminal so cadence views tell it
-apart from abandonment. This keeps the envelope genuinely immutable,
-makes every protocol change visible traffic (a gateway hop on the
-canvas, with an actor), and deletes the mid-flight machinery whole:
-no layering-time lint, no lane namespacing, no subtract semantics.
-Dynamic layering — conjoining a protocol onto a live packet — is the
-rejected-for-v1 alternative; revisit only if translation volume shows
-in-place layering earning its complexity. The hold/compliance case
-that motivated layering routes through policy (a hold is an access
-restriction, boss-policy's job) or an explicit translation.
+Resolved 2026-08-12 — accept.
 
-### Q4: Which metadata keys become declared headers?
+Two stages as proposed: owner_id stays as accountable-human-of-record but stops pretending to be routing (stage 1); Self/Team policy scopes re-key onto queue/requirement ownership and owner_id becomes a derived lens (stage 2). Q7 rejection survives as protocol-names-an-accountable-requirement-owner.
 
-Proposed: generalize `job_edges` into a header registry: a header row
-declares name, value shape, whether it is an edge (resolution +
-on_missing), and **which protocol reads it**. Seed it from the
-folklore set (`waiting_on`, the conductor's train contract, and
-`authority_role` — whose triple duty as routing key, board heuristic,
-and sim-defense gets named and split). Undeclared metadata stays
-free-form payload.
+**Rationale:** David reviewed and accepted 2026-08-12; recorded by claude:fable.
 
-### Q5: What makes a priority queue?
 
-Proposed: priority moves to the Class registry (retiring the CHECK +
-enum + union), and a queue definition (requirements-based-addressing
-Q1's registry, when it earns itself) may declare a discipline:
-`fifo` (today's `(opened_on, sort_order)`) or `by_class(priority)`.
-Escalation stays a hop, not a discipline — the escalation router is
-already the only consumer of priority and it routes rather than
-reorders.
+### Q2: Does `Job.status` remain a stored column? (resolved)
 
-### Q6: What does protocol presentation look like?
+Resolved 2026-08-12 — accept.
 
-The `75a66b01` question: protocols need semantics people can talk
-about — name, version, purpose ("financial transaction compliance"),
-what it demands of a packet (headers read, steps added, requirements
-conjoined), and usage (packets in flight per version — the unread
-`jobs_kind_version` index; per-protocol latency once `784d26c9`
-lands). Proposed: a protocol page per workflow kind at
-`/system/workflows/<kind>` grows the network vocabulary, and the
-canvas's route-ghost layer becomes per-protocol tint — but the
-naming/semantics conventions deserve their own sitting once this
-doc's model is agreed.
+Status column stays as a materialized cache of the derived value; step writes always recompute; the manual status PUT dies except released and cancelled, which become explicit packet writes.
 
-### Q7: Where does the system diagram live?
+**Rationale:** David reviewed and accepted 2026-08-12; recorded by claude:fable.
 
-Proposed: `docs/architecture-diagram.md` redraws on the network
-vocabulary above and becomes the one diagram both the README and the
-canvas legend cite — one picture, kept honest by naming the same
-layers the canvas renders live.
+
+### Q3: What is the v1 protocol set on the envelope? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+As revised: a fixed set of compatible protocols declared at creation, composed once at admission (requirements conjoin, obligations union, lint over the composed set). Mid-flight change is packet translation through admission - new packet, translated_from edge, translated terminal on the source. Layering rejected for v1; holds route through policy. Translation is also how packets cross fabrics (instances) - one mechanism for both.
+
+**Rationale:** David reviewed and accepted 2026-08-12; recorded by claude:fable.
+
+
+### Q4: Which metadata keys become declared headers? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+Generalize job_edges into the header registry: name, value shape, edge-ness (resolution + on_missing), and which protocol reads it. Seed from the folklore set; authority_role triple duty gets named and split. Undeclared metadata stays free-form payload.
+
+**Rationale:** David reviewed and accepted 2026-08-12; recorded by claude:fable.
+
+
+### Q5: What makes a priority queue? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+Priority moves to the Class registry, retiring the CHECK + Rust enum + TS union; queue definitions may declare a discipline (fifo or by_class(priority)). Escalation stays a hop, not a discipline.
+
+**Rationale:** David reviewed and accepted 2026-08-12; recorded by claude:fable.
+
+
+### Q6: What does protocol presentation look like? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+Protocol pages per workflow kind grow the network vocabulary (name, version, purpose, demands, usage via the jobs_kind_version index once 784d26c9 lands); canvas route-ghost becomes per-protocol tint. Naming conventions get their own sitting.
+
+**Rationale:** David reviewed and accepted 2026-08-12; recorded by claude:fable.
+
+
+### Q7: Where does the system diagram live? (resolved)
+
+Resolved 2026-08-12 — accept.
+
+docs/architecture-diagram.md redraws on the network vocabulary and becomes the one diagram the README and the canvas legend both cite.
+
+**Rationale:** David reviewed and accepted 2026-08-12; recorded by claude:fable.

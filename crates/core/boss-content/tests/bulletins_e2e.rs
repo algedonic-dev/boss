@@ -2,8 +2,6 @@
 //! Postgres adapters. Keeps the port invariants honest regardless of
 //! which implementation is in play.
 
-#![cfg(feature = "postgres")]
-
 use boss_content::types::{Audience, BulletinDraft, BulletinPatch, BulletinPriority, UserContext};
 use boss_content::{ContentError, ContentRepository, InMemoryContent, PgContent};
 use boss_testing::TestDb;

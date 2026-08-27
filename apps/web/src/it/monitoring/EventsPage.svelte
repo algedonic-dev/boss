@@ -44,6 +44,12 @@
   let sourceFilter = $state('');
   let kindFilter = $state('');
   let limit = $state<(typeof LIMIT_CHOICES)[number]>(100);
+  // Provenance filter. Defaults to `real`: the audit log was 89%
+  // simulated when this landed (328,255 of 370,033 rows), so an
+  // unfiltered page is nine-tenths brewery traffic and the operator
+  // events it buries are the reason anyone opens this page. `all`
+  // stays one click away — the default is a lens, not a lie.
+  let provenance = $state<'real' | 'sim' | 'all'>('real');
   let autoRefresh = $state(true);
   let expanded = $state<string | null>(null);
   let lastFetched = $state<Date | null>(null);
@@ -76,6 +82,10 @@
     const knd = kindFilter.trim();
     if (src) params.set('source', src);
     if (knd) params.set('kind', knd);
+    // The export honours the same lens as the view. A download that
+    // silently disagreed with the table above it would be worse than
+    // no export.
+    if (provenance !== 'all') params.set('simulated', provenance);
     // Convert dates to half-open RFC-3339 window. `until` is
     // exclusive on the backend, so we pass to-date+1day to include
     // the entire to-date.
@@ -101,6 +111,7 @@
     const src = sourceFilter.trim();
     const knd = kindFilter.trim();
     const lim = limit;
+    const prov = provenance;
     const auto = autoRefresh;
 
     let cancelled = false;
@@ -109,6 +120,7 @@
       const params = new URLSearchParams();
       if (src) params.set('source', src);
       if (knd) params.set('kind', knd);
+      if (prov !== 'all') params.set('simulated', prov);
       params.set('limit', String(lim));
       try {
         const r = await fetch(`/api/events/tail?${params.toString()}`, {
@@ -256,6 +268,14 @@
             bind:value={kindFilter}
             placeholder="e.g. step, invoice"
           />
+        </label>
+        <label class="events-filter">
+          <span>Provenance</span>
+          <select bind:value={provenance}>
+            <option value="real">Real only</option>
+            <option value="sim">Simulated only</option>
+            <option value="all">All</option>
+          </select>
         </label>
         <label class="events-filter">
           <span>Limit</span>

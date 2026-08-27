@@ -4,8 +4,6 @@
 //! snapshot the four projection tables, drop them, rebuild from
 //! `audit_log`, assert exact match.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::Router;

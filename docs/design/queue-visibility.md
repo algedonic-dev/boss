@@ -1,6 +1,8 @@
 # Design: queue visibility — every actor's lens on the one queue
 
-**Status**: in-review — open questions tracked at `/system/design`.
+**Status**: approved — in-review — open questions tracked at `/system/design` (2026-08-18).
+**Superseded in part** by [stations.md](./stations.md), which describes
+what shipped. Where the two disagree, stations.md wins.
 **Source**: feedback `207236cc` — raised by David in the audit-log Q6
 review (2026-08-08): "Every actor needs visibility into their
 personal queue and there are lots of abstract groups, like anyone
@@ -118,8 +120,24 @@ this the hard way.
 
 ## The shape of the answer
 
-**A queue is a lens — a WHERE clause over the one steps
-projection — never a reified structure.** Personal queue: the
+**A station is registry data; its *membership* is a predicate, not
+a stored roster.** The station row is real (name, discipline,
+capability gate, `wip_limit`); what is derived is who is in its
+queue right now — evaluated over packet state at read time, so
+there is no second source of truth to drift from `steps` and
+nothing to rebuild. A *view* over a station is a lens; the station
+itself is a node in the network.
+
+*(Amended 2026-08-13. This paragraph read "a queue is a lens …
+never a reified structure", written before the station registry
+shipped. `infra/postgres/schema/116-stations.sql` reified the node
+and `stations.md` Q1–Q4 ratified it, so the original sentence had
+become an argument against the substrate's own nodes. The
+distinction it was reaching for — no per-actor roster to drift —
+survives intact, one level down.)*
+
+The lenses over those stations are what each actor sees.
+Personal queue: the
 assignee branch. Group queue: the role branch. Agent queue: the
 same lens through the same API (agents are actors; the MCP
 `list_my_work` tool wraps this endpoint). Reified per-actor queues
@@ -146,9 +164,10 @@ engineering team is free to change what serves it.
 
 ## What this deliberately is not
 
-- **Not per-actor queue storage.** No queue tables, no broker
-  state per actor. Measurement says the derived lens stays cheap
-  far past any visible horizon.
+- **Not per-actor queue *storage* — a station row declares the
+  queue; membership is still derived.** No per-actor queue tables,
+  no broker state per actor. Measurement says the derived
+  membership stays cheap far past any visible horizon.
 - **Not a workload-balancing scheduler.** Assignment stays
   deterministic (replay depends on it). Whether it should weigh
   load or shift patterns is a separate decision for a separate
@@ -159,52 +178,154 @@ engineering team is free to change what serves it.
 
 ## Open questions
 
-### Q1: Does My Day move onto the assignments lens?
+All 2 open questions were resolved 2026-08-18 via the in-app
+decision tracker and flushed to git. See the Decisions
+section below. This section is kept empty as the landing
+place for any new questions that surface during
+implementation.
 
-The page reimplements a weaker client-side version of the lens
-over `/api/jobs?limit=200`, with a self-documented cap bug. Moving
-it to `GET /api/jobs/assignments?assignee_id=me&roles=…` fixes the
-bug, makes the group queue visible to humans for the first time,
-and deletes code. This is close to a defect fix; the open part is
-UX — does My Day show the two branches as one list or as "mine"
-vs "up for grabs"?
+---
 
-### Q2: What are the claim semantics for group-visible steps?
+## Decisions
 
-Before any surface serves the group lens, Ready→Active needs
-compare-and-set: claim succeeds only if `assignee_id` is still
-NULL (`rows_affected > 0` gates the event, the same
-idempotency-guard shape every other write path uses). A failed
-claim is a normal outcome, not an error. Without this, two actors
-will eventually complete the same step twice.
+### Q1: Does My Day move onto the assignments lens? (resolved)
 
-### Q3: Roles only — or do skills join the routing vocabulary, or get deleted?
+Resolved 2026-08-16 — override.
 
-`authority_role` gates everything today. The `employee_skills`
-data exists but nothing reads it — and the repo rule is that dead
-code gets deleted. Either skills become a real routing term
-(people-api filter + dispatcher candidate filter + a `skills=`
-lens param) or the table and column go. Keeping unread data
-"just in case" is the one option the coding guidelines rule out.
+**The question was:**
 
-### Q4: Is per-lens queue depth an algedonic signal, and where does it surface?
+> The page reimplements a weaker client-side version of the lens
+> over `/api/jobs?limit=200`, with a self-documented cap bug. Moving
+> it to `GET /api/jobs/assignments?assignee_id=me&roles=…` fixes the
+> bug, makes the group queue visible to humans for the first time,
+> and deletes code. This is close to a defect fix; the open part is
+> UX — does My Day show the two branches as one list or as "mine"
+> vs "up for grabs"?
 
-Depth and oldest-wait per role lens (computed on wall-clock
-`created_at`) are cheap aggregates over the in-flight set. Are
-they cybernetics telemetry with thresholds (S4 sees "ar-clerk
-queue depth 3× baseline"), a Flow-view panel, or both? And does a
-breach open a Job (the system's native way to make someone own a
-fact)?
+Yes — and it already moved. MePage reads GET /api/jobs/assignments (apps/web/src/me/assignments.ts:92); the page's own comment records that this replaced the capped `jobs?status=open` scan filtered client-side. Recording it because the question was answered by building it, and nothing marks a question resolved when the thing that answers it ships.
 
-### Q5: Does assignment strategy become per-step-kind rule data?
 
-Today the strategy is code: hash-spread when a role matches,
-leave-unassigned when none does. Whether a step kind is
-push-assigned or pooled for pull is a policy choice that differs
-by workflow (sign-offs want a named person; generic tasks want a
-pool). Registries-over-code says this belongs in the dispatcher
-rules registry next to the other routing rules — one `strategy`
-field per rule, not new `match` arms.
+### Q2: What are the claim semantics for group-visible steps? (resolved)
+
+Resolved 2026-08-16 — override.
+
+**The question was:**
+
+> Before any surface serves the group lens, Ready→Active needs
+> compare-and-set: claim succeeds only if `assignee_id` is still
+> NULL (`rows_affected > 0` gates the event, the same
+> idempotency-guard shape every other write path uses). A failed
+> claim is a normal outcome, not an error. Without this, two actors
+> will eventually complete the same step twice.
+
+Settled by the claim CAS, shipped as car a4c8f910: POST /api/jobs/{id}/steps/{step_id}/claim does a compare-and-set on Ready->Active, so two actors cannot claim one step. A claim that names its station additionally checks membership (409) and capability (403) BEFORE the CAS, which is where the group-visible half of this question lands.
+
+
+### Q4: Is per-lens queue depth an algedonic signal, and where does it surface? (resolved)
+
+Resolved 2026-08-16 — override.
+
+**The question was:**
+
+> Depth and oldest-wait per role lens (computed on wall-clock
+> `created_at`) are cheap aggregates over the in-flight set. Are
+> they cybernetics telemetry with thresholds (S4 sees "ar-clerk
+> queue depth 3× baseline"), a Flow-view panel, or both? And does a
+> breach open a Job (the system's native way to make someone own a
+> fact)?
+
+Yes, and advisory rather than enforced. A station declares `wip_limit`; the queue envelope reports `over_limit`; lenses warn and telemetry reads it, and nothing blocks on it — the posture stations.md Q3 ratified. It surfaces wherever a lens renders the station, the dock being the first.
+
+### Q3: Roles only — or do skills join the routing vocabulary, or get deleted? (resolved)
+
+Resolved 2026-08-18 — accept.
+
+**The question was:**
+
+> `authority_role` gates everything today. The `employee_skills`
+> data exists but nothing reads it — and the repo rule is that dead
+> code gets deleted. Either skills become a real routing term
+> (people-api filter + dispatcher candidate filter + a `skills=`
+> lens param) or the table and column go. Keeping unread data
+> "just in case" is the one option the coding guidelines rule out.
+>
+>
+> Proposed: **delete the table and the column.** Checked before
+> proposing: `employee_skills` is written by the people rebuilder and by
+> the projection that repopulates it, and read by nothing. The single
+> `.skills` access in the tree is the write path putting them back. So
+> this is unread data, and the guidelines rule out keeping it.
+>
+> The reason to delete rather than wire it up is that skills as a
+> separate table is the WEAKER of two mechanisms we already have for the
+> same job. Roles are Classes of `employee` Subjects — one `classes`
+> table keyed `(subject_kind, code)`, tenant-extensible without a fork.
+> A skill is the same kind of noun. If routing ever needs "can operate
+> the canning line", that is a Class and a capability term, not a
+> bespoke table with its own rebuild path and its own TRUNCATE.
+>
+> Stations sharpen this further since the question was written: a
+> station already carries `capability: {"roles": [...]}`, checked at the
+> claim CAS. That is where a skills term would land if it were needed —
+> one more key in an object that already exists, on a row an operator can
+> edit. Nothing in the routing done to date has wanted it.
+>
+> So: drop `employee_skills`, drop `Employee.skills`, and if the need
+> appears, add `capability.skills` reading Class codes. Deleting is
+> reversible in an afternoon; carrying an unread table is the thing that
+> quietly costs.
+
+**delete the table and the column.** Checked before proposing: `employee_skills` is written by the people rebuilder and by the projection that repopulates it, and read by nothing. The single `.skills` access in the tree is the write path putting them back. So this is unread data, and the guidelines rule out keeping it.
+
+
+### Q5: Does assignment strategy become per-step-kind rule data? (resolved)
+
+Resolved 2026-08-18 — accept.
+
+**The question was:**
+
+> Today the strategy is code: hash-spread when a role matches,
+> leave-unassigned when none does. Whether a step kind is
+> push-assigned or pooled for pull is a policy choice that differs
+> by workflow (sign-offs want a named person; generic tasks want a
+> pool). Registries-over-code says this belongs in the dispatcher
+> rules registry next to the other routing rules — one `strategy`
+> field per rule, not new `match` arms.
+>
+>
+>
+> Proposed: **yes, as rule data — but the vocabulary the question assumed
+> has been overtaken, and the new one is better.**
+>
+> When this was written the choice was "push-assigned or pooled for
+> pull", and pull had no mechanism. It does now. A station is a
+> data-defined queue that HOLDS packets, and the claim CAS
+> (`POST /api/jobs/{id}/steps/{step_id}/claim`) makes an actor taking one
+> safe against a second actor taking the same one — with membership
+> checked 409 and capability 403 before the compare-and-set. So "pooled
+> for pull" is no longer a strategy to build; it is what happens when
+> nothing assigns the step.
+>
+> That makes the field smaller and more honest than a `strategy` enum.
+> The real question per rule is only whether to PUSH — name a holder now
+> — and the existing behaviours are the two values: `assign` (resolve the
+> authority_role to a holder, hash-spread over the job id, as the code
+> does today) and `leave` (write no assignee; the step is claimed from
+> whatever station's predicate matches it).
+>
+> Put it on the dispatcher rule row beside the other routing terms, so a
+> sign-off can be push-assigned and a generic task pooled without a
+> `match` arm, which is registries-over-code applied where it belongs.
+>
+> One thing to carry into the build rather than discover: a step left
+> unassigned is only pullable if some station's predicate actually
+> matches it. Today two do — the dock and the watchlist — so `leave` on
+> an arbitrary step kind can produce a packet in nobody's queue. The rule
+> row should be refused at publish time if it says `leave` for a step no
+> station holds, the same way the fork lint refuses an orphan outcome.
+
+**yes, as rule data — but the vocabulary the question assumed has been overtaken, and the new one is better.**
+
 
 ## Decision history
 

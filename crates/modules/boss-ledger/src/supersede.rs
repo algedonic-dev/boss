@@ -161,10 +161,15 @@ pub async fn apply_supersede_in_tx(
 pub async fn replay_supersede_events_in_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
 ) -> Result<u64, LedgerError> {
+    // `ORDER BY id` = commit order, so last-write-wins replays in the
+    // order operators actually superseded. Timestamp order is
+    // incoherent across the sim-to-wall stamp transition (sim time
+    // retired from the record, David 2026-08-22, packet a7a4cae5),
+    // and its `event_id` tiebreak was a random UUID.
     let events: Vec<(serde_json::Value,)> = sqlx::query_as(
         "SELECT payload FROM audit_log \
          WHERE kind = 'ledger.fact.superseded' \
-         ORDER BY timestamp, event_id",
+         ORDER BY id",
     )
     .fetch_all(&mut **tx)
     .await

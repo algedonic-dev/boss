@@ -752,9 +752,10 @@ pub fn match_event(
     topic: &str,
     payload: &serde_json::Value,
     helpers: &dyn HelperResolver,
-) -> Result<Vec<MatchedRule>, MatchError> {
+) -> MatchOutcome {
     let ctx = expr::Context { payload, helpers };
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     for rule in registry.rules() {
         // Schedule-triggered rules never match an incoming event; the
         // clock-stream task fires them. Skip them here.
@@ -765,44 +766,109 @@ pub fn match_event(
             continue;
         }
         if let Some(when) = &rule.when {
-            let v = expr::eval(when, &ctx).map_err(|err| MatchError::PredicateFailed {
-                rule: rule.name.clone(),
-                err,
-            })?;
+            let v = match expr::eval(when, &ctx) {
+                Ok(v) => v,
+                Err(err) => {
+                    skipped.push(SkippedRule {
+                        rule: rule.name.clone(),
+                        err: MatchError::PredicateFailed {
+                            rule: rule.name.clone(),
+                            err,
+                        },
+                    });
+                    continue;
+                }
+            };
             match v.as_bool() {
                 Some(true) => {}
                 Some(false) => continue,
                 None => {
-                    return Err(MatchError::PredicateNotBool {
+                    skipped.push(SkippedRule {
                         rule: rule.name.clone(),
-                        kind: v.kind(),
+                        err: MatchError::PredicateNotBool {
+                            rule: rule.name.clone(),
+                            kind: v.kind(),
+                        },
                     });
+                    continue;
                 }
             }
         }
         let mut invocations = Vec::with_capacity(rule.do_steps.len());
+        let mut arg_failure = None;
         for ds in &rule.do_steps {
             let mut args = Vec::with_capacity(ds.args.len());
             for (k, expr) in &ds.args {
-                let val = expr::eval(expr, &ctx).map_err(|err| MatchError::ArgFailed {
-                    rule: rule.name.clone(),
-                    handler: ds.handler.clone(),
-                    arg: k.clone(),
-                    err,
-                })?;
-                args.push((k.clone(), val));
+                match expr::eval(expr, &ctx) {
+                    Ok(val) => args.push((k.clone(), val)),
+                    Err(err) => {
+                        arg_failure = Some(MatchError::ArgFailed {
+                            rule: rule.name.clone(),
+                            handler: ds.handler.clone(),
+                            arg: k.clone(),
+                            err,
+                        });
+                        break;
+                    }
+                }
+            }
+            if arg_failure.is_some() {
+                break;
             }
             invocations.push(MatchedInvocation {
                 handler: ds.handler.clone(),
                 args,
             });
         }
+        if let Some(err) = arg_failure {
+            skipped.push(SkippedRule {
+                rule: rule.name.clone(),
+                err,
+            });
+            continue;
+        }
         out.push(MatchedRule {
             rule_name: rule.name.clone(),
             invocations,
         });
     }
-    Ok(out)
+    MatchOutcome {
+        matched: out,
+        skipped,
+    }
+}
+
+/// A rule that could not be evaluated for this event, and why.
+///
+/// Kept rather than discarded: the whole point of isolating these is
+/// that they must still be LOUD. A rule that silently stops firing is
+/// the silent-orphaning this layer exists to prevent - the isolation
+/// changes who pays for the defect, not whether anyone hears about it.
+#[derive(Debug)]
+pub struct SkippedRule {
+    pub rule: String,
+    pub err: MatchError,
+}
+
+/// The result of matching one event against the registry.
+///
+/// WHY THIS IS NOT A `Result`. It used to be, and a single malformed
+/// rule therefore aborted matching for the ENTIRE topic: `?` on one
+/// rule's arg-resolution failure returned before any rule ran, so the
+/// caller NAK'd, and every redelivery failed identically until the
+/// event dead-lettered. Observed 2026-08-24: rule
+/// `spawn-keg-return-on-delivery` referenced `job_id`, which is not in
+/// the `jobs.job.closed` payload (the field is `id`), and
+/// `expire-signals-on-job-closed`, `jobs-clear-waiting-on` and
+/// `resolve-subjob-on-child-job-closed` all stopped processing that
+/// event as collateral.
+///
+/// A malformed rule is a defect in THAT RULE. Its neighbours on the
+/// topic did nothing wrong and must still fire.
+#[derive(Debug, Default)]
+pub struct MatchOutcome {
+    pub matched: Vec<MatchedRule>,
+    pub skipped: Vec<SkippedRule>,
 }
 
 #[derive(Debug, Error)]
@@ -1011,8 +1077,7 @@ args = { zebra = "\"z\"", alpha = "\"a\"", mango = "\"m\"" }
             "on_hand": 10,
             "reorder_point": 20,
         });
-        let matched =
-            match_event(&reg, "inventory.parts.consumed", &payload, &MockHelpers).unwrap();
+        let matched = match_event(&reg, "inventory.parts.consumed", &payload, &MockHelpers).matched;
         assert_eq!(matched.len(), 1);
         let m = &matched[0];
         assert_eq!(m.rule_name, "spawn-restock-on-low-inventory");
@@ -1038,8 +1103,7 @@ args = { zebra = "\"z\"", alpha = "\"a\"", mango = "\"m\"" }
             "on_hand": 10,
             "reorder_point": 20,
         });
-        let matched =
-            match_event(&reg, "inventory.parts.consumed", &payload, &MockHelpers).unwrap();
+        let matched = match_event(&reg, "inventory.parts.consumed", &payload, &MockHelpers).matched;
         assert!(matched.is_empty());
     }
 
@@ -1051,7 +1115,7 @@ args = { zebra = "\"z\"", alpha = "\"a\"", mango = "\"m\"" }
             "on_hand": 10,
             "reorder_point": 20,
         });
-        let matched = match_event(&reg, "step.done.procurement", &payload, &MockHelpers).unwrap();
+        let matched = match_event(&reg, "step.done.procurement", &payload, &MockHelpers).matched;
         assert!(matched.is_empty());
     }
 
@@ -1068,19 +1132,19 @@ handler = "audit.log"
         let payload = json!({});
         assert_eq!(
             match_event(&reg, "step.done.procurement", &payload, &NoHelpers)
-                .unwrap()
+                .matched
                 .len(),
             1
         );
         assert_eq!(
             match_event(&reg, "step.done.billing", &payload, &NoHelpers)
-                .unwrap()
+                .matched
                 .len(),
             1
         );
         assert_eq!(
             match_event(&reg, "step.opened", &payload, &NoHelpers)
-                .unwrap()
+                .matched
                 .len(),
             0
         );
@@ -1102,7 +1166,7 @@ handler = "h2"
 "#;
         let reg = Registry::from_toml(toml).unwrap();
         let payload = json!({});
-        let matched = match_event(&reg, "step.done.procurement", &payload, &NoHelpers).unwrap();
+        let matched = match_event(&reg, "step.done.procurement", &payload, &NoHelpers).matched;
         assert_eq!(matched.len(), 2);
         assert_eq!(matched[0].rule_name, "r1");
         assert_eq!(matched[1].rule_name, "r2");
@@ -1123,7 +1187,7 @@ on_event = "x"
 handler = "h"
 "#;
         let reg = Registry::from_toml(toml).unwrap();
-        let matched = match_event(&reg, "x", &json!({}), &NoHelpers).unwrap();
+        let matched = match_event(&reg, "x", &json!({}), &NoHelpers).matched;
         // Declaration order: "second" then "first".
         assert_eq!(matched[0].rule_name, "second");
         assert_eq!(matched[1].rule_name, "first");
@@ -1140,9 +1204,57 @@ when = "42"
 handler = "h"
 "#;
         let reg = Registry::from_toml(toml).unwrap();
+        // A non-boolean predicate no longer aborts the topic: the rule
+        // is skipped and reported, and matching continues.
+        let outcome = match_event(&reg, "x", &json!({}), &NoHelpers);
+        assert!(outcome.matched.is_empty());
         assert!(matches!(
-            match_event(&reg, "x", &json!({}), &NoHelpers),
-            Err(MatchError::PredicateNotBool { .. })
+            outcome.skipped.as_slice(),
+            [SkippedRule {
+                err: MatchError::PredicateNotBool { .. },
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn a_rule_with_an_unresolvable_arg_does_not_take_the_topic_with_it() {
+        // The 2026-08-24 incident, as a test. `spawn-keg-return` names
+        // `job_id`, which the payload does not carry - the field is
+        // `id`. Before isolation this returned Err from match_event, so
+        // NOTHING on the topic fired and the event dead-lettered after
+        // eight redeliveries that could never have succeeded.
+        let toml = r#"
+[[rule]]
+name = "spawn-keg-return"
+on_event = "jobs.job.closed"
+[[rule.do]]
+handler = "jobs.spawn"
+args = { subject = "job_id" }
+
+[[rule]]
+name = "expire-signals"
+on_event = "jobs.job.closed"
+[[rule.do]]
+handler = "audit.log"
+args = { subject = "id" }
+"#;
+        let reg = Registry::from_toml(toml).unwrap();
+        let payload = json!({"id": "job-1", "kind": "wholesale-keg-order"});
+        let outcome = match_event(&reg, "jobs.job.closed", &payload, &NoHelpers);
+
+        // The innocent neighbour still fires.
+        assert_eq!(outcome.matched.len(), 1);
+        assert_eq!(outcome.matched[0].rule_name, "expire-signals");
+
+        // The broken rule is skipped and NAMED - isolation must not
+        // mean silence, or a rule that quietly stops firing becomes the
+        // silent orphaning this layer exists to prevent.
+        assert_eq!(outcome.skipped.len(), 1);
+        assert_eq!(outcome.skipped[0].rule, "spawn-keg-return");
+        assert!(matches!(
+            outcome.skipped[0].err,
+            MatchError::ArgFailed { .. }
         ));
     }
 
@@ -1274,7 +1386,7 @@ handler = "h"
         // match_event ignores it entirely.
         assert!(
             match_event(&reg, "anything.at.all", &json!({}), &NoHelpers)
-                .unwrap()
+                .matched
                 .is_empty()
         );
     }

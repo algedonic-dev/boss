@@ -48,6 +48,7 @@ fn job_owned_by(id: &str, owner: &str) -> Job {
         closed_on: None,
         metadata: serde_json::Value::Null,
         tags: vec![],
+        simulated: false,
     }
 }
 
@@ -59,6 +60,7 @@ fn build_app(policy: Arc<dyn PolicyClient>) -> (Router, Arc<InMemoryJobs>) {
     let step_registry = Arc::new(StepRegistry::v1());
     let state = JobsApiState {
         job_edges: None,
+        stations: None,
         jobs: jobs.clone(),
         bus,
         publisher,
@@ -770,5 +772,221 @@ async fn put_step_active_allowed_with_open_blockers() {
         resp.status(),
         StatusCode::NO_CONTENT,
         "active transition must be allowed even with open blockers"
+    );
+}
+
+// --- Assurance: how strong a stamp had to be ------------------------------
+//
+// A stamp already recorded WHO attested and WHAT they attested
+// (`shape_hash`). It never recorded how hard it was to produce, so
+// "David clicked approve" and "David logged in this morning and
+// something clicked approve" were the same fact.
+//
+// David, 2026-08-16, on the bypass question: "an assurance level with
+// a bypass is a comment, not a control." So a stamp's assurance is
+// what the server VERIFIED, never what the caller asked for — and
+// until the WebAuthn ceremony exists, a step demanding presence simply
+// cannot be stamped. These tests pin both halves: the default path is
+// unchanged, and the raised path refuses rather than pretending.
+
+fn qa_policy() -> Arc<dyn PolicyClient> {
+    Arc::new(
+        FakePolicyClient::builder()
+            .allow("qa-lead", Action::Update, Resource::step(), Scope::All)
+            .allow(
+                "qa-lead",
+                Action::SignOff,
+                Resource::new("step-signoff:qa-lead"),
+                Scope::All,
+            )
+            .build(),
+    )
+}
+
+fn qa_lead(id: &str) -> User {
+    let mut u = service_tech(id);
+    u.role = "qa-lead".to_string();
+    u
+}
+
+/// The default is unchanged, which is what makes this safe to ship.
+///
+/// Every existing step leaves `assurance_required` unset and every
+/// StepType floors at `Session`, so the gate is inert until a protocol
+/// raises it. A stamp records `session` — the truth about how it was
+/// produced — rather than leaving the field meaningless.
+#[tokio::test]
+async fn an_ordinary_step_still_stamps_and_records_session_assurance() {
+    let (app, jobs) = build_app(qa_policy());
+    let user = qa_lead("emp-90");
+    let job = job_owned_by("00000000-0000-0000-0000-000000000090", &user.id);
+    jobs.create_job(&job).await.unwrap();
+    let step = sign_off_step(job.id, "qa-lead");
+    jobs.add_step(&step).await.unwrap();
+
+    let resp = post_sign_off(app, &user, &step, "qa-lead").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the default path must not change"
+    );
+
+    let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+    let stamp = stored.sign_offs.first().expect("a stamp was appended");
+    assert_eq!(
+        stamp.assurance,
+        boss_core::job::Assurance::Session,
+        "a session-authenticated stamp must say so, not claim more"
+    );
+}
+
+/// A step that demands presence REFUSES a plain session request.
+///
+/// This is the test that would catch a bypass being added later: if
+/// someone makes the endpoint honour a caller-supplied assurance (the
+/// body, a query param — anything other than the gateway-vouched
+/// `x-boss-presence` header), this starts returning 200 and the
+/// control becomes decoration.
+#[tokio::test]
+async fn a_step_requiring_presence_refuses_without_a_ceremony_ticket() {
+    let (app, jobs) = build_app(qa_policy());
+    let user = qa_lead("emp-91");
+    let job = job_owned_by("00000000-0000-0000-0000-000000000091", &user.id);
+    jobs.create_job(&job).await.unwrap();
+    let mut step = sign_off_step(job.id, "qa-lead");
+    step.assurance_required = Some(boss_core::job::Assurance::Presence);
+    jobs.add_step(&step).await.unwrap();
+
+    let resp = post_sign_off(app, &user, &step, "qa-lead").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a session request cannot satisfy presence, so the stamp must be refused"
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["required"], "presence");
+    assert_eq!(body["produced"], "session");
+
+    let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert!(
+        stored.sign_offs.is_empty(),
+        "a refused stamp must leave no trace on the step"
+    );
+}
+
+/// The sign-off request with the gateway's presence header attached.
+/// In production the edge strips every inbound `x-boss-*` header and
+/// re-injects this one only after verifying a passkey ticket, so its
+/// presence at this service means the gateway vouched. See
+/// role_headers.rs; the machine token guards the service port itself.
+async fn post_sign_off_with_presence(
+    app: Router,
+    user: &User,
+    step: &Step,
+    role: &str,
+    presence: &serde_json::Value,
+) -> axum::http::Response<Body> {
+    app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/api/jobs/{}/steps/{}/sign-offs",
+                step.job_id, step.id,
+            ))
+            .header("content-type", "application/json")
+            .header("x-boss-user", user_header(user))
+            .header("x-boss-presence", presence.to_string())
+            .body(Body::from(format!("{{\"role\":\"{role}\"}}")))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+/// The ceremony's happy path: a gateway-vouched presence header whose
+/// binding matches the step's CURRENT shape produces a Presence stamp
+/// carrying the challenge nonce — the audit trail from stamp back to
+/// the exact single-use ceremony that produced it.
+#[tokio::test]
+async fn a_matching_presence_header_produces_a_presence_stamp_with_its_nonce() {
+    let (app, jobs) = build_app(qa_policy());
+    let user = qa_lead("emp-92");
+    let job = job_owned_by("00000000-0000-0000-0000-000000000092", &user.id);
+    jobs.create_job(&job).await.unwrap();
+    let mut step = sign_off_step(job.id, "qa-lead");
+    step.assurance_required = Some(boss_core::job::Assurance::Presence);
+    jobs.add_step(&step).await.unwrap();
+
+    let shape = boss_core::job::step_shape_hash(&step.title, &step.metadata);
+    let presence = serde_json::json!({
+        "employee_id": user.id,
+        "step_id": step.id.to_string(),
+        "shape_hash": shape,
+        "nonce": "ceremony-nonce-1",
+    });
+    let resp = post_sign_off_with_presence(app, &user, &step, "qa-lead", &presence).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+    let stamp = stored.sign_offs.first().expect("a stamp was appended");
+    assert_eq!(stamp.assurance, boss_core::job::Assurance::Presence);
+    assert_eq!(
+        stamp.presence_nonce.as_deref(),
+        Some("ceremony-nonce-1"),
+        "the stamp names the exact challenge that produced it"
+    );
+}
+
+/// The binding is to CONTENT, not to the step id: a ticket minted
+/// before an edit carries the old shape hash, and the stamp must not
+/// survive an edit it never saw. The refusal names the staleness so
+/// the actor knows to re-run the ceremony, not to hunt a bug.
+#[tokio::test]
+async fn a_stale_presence_header_downgrades_to_session_and_refuses() {
+    let (app, jobs) = build_app(qa_policy());
+    let user = qa_lead("emp-93");
+    let job = job_owned_by("00000000-0000-0000-0000-000000000093", &user.id);
+    jobs.create_job(&job).await.unwrap();
+    let mut step = sign_off_step(job.id, "qa-lead");
+    step.assurance_required = Some(boss_core::job::Assurance::Presence);
+    jobs.add_step(&step).await.unwrap();
+
+    let presence = serde_json::json!({
+        "employee_id": user.id,
+        "step_id": step.id.to_string(),
+        "shape_hash": "a-hash-from-before-the-step-was-edited",
+        "nonce": "ceremony-nonce-2",
+    });
+    let resp = post_sign_off_with_presence(app, &user, &step, "qa-lead", &presence).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["produced"], "session");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stale"),
+        "the refusal must name staleness: {}",
+        body["detail"]
+    );
+
+    let stored = jobs.get_step(&step.id).await.unwrap().unwrap();
+    assert!(stored.sign_offs.is_empty());
+}
+
+/// Ordering is the contract: a step may raise, and `Presence` is
+/// strictly stronger than `Session`.
+#[test]
+fn assurance_orders_presence_above_session() {
+    use boss_core::job::Assurance;
+    assert!(Assurance::Presence > Assurance::Session);
+    assert_eq!(Assurance::default(), Assurance::Session);
+    // max() is how a step's requirement combines with its kind's
+    // floor; a Workflow may raise but never lower.
+    assert_eq!(
+        Assurance::Session.max(Assurance::Presence),
+        Assurance::Presence
     );
 }

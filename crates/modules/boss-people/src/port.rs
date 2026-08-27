@@ -42,9 +42,8 @@ pub trait PeopleRepository: Send + Sync {
     /// OUTBOX (phase 2): records `people.employee.created` (full row
     /// state) in the same transaction as the row.
     async fn create_employee(&self, emp: &Employee) -> Result<String, PeopleError> {
-        let now = Utc::now();
-        let stamp = EventStamp::new("people", ActorId::Automation("platform".into()), now);
-        self.create_employee_at(emp, now, &stamp).await
+        let stamp = EventStamp::new("people", ActorId::Automation("platform".into()));
+        self.create_employee_at(emp, stamp.timestamp, &stamp).await
     }
     async fn create_employee_at(
         &self,
@@ -56,9 +55,9 @@ pub trait PeopleRepository: Send + Sync {
     /// Replace an employee by ID. Errors if ID doesn't exist.
     /// Records `people.employee.updated` (full row state) in-tx.
     async fn update_employee(&self, id: &str, emp: &Employee) -> Result<(), PeopleError> {
-        let now = Utc::now();
-        let stamp = EventStamp::new("people", ActorId::Automation("platform".into()), now);
-        self.update_employee_at(id, emp, now, &stamp).await
+        let stamp = EventStamp::new("people", ActorId::Automation("platform".into()));
+        self.update_employee_at(id, emp, stamp.timestamp, &stamp)
+            .await
     }
     async fn update_employee_at(
         &self,
@@ -71,9 +70,8 @@ pub trait PeopleRepository: Send + Sync {
     /// Delete an employee and satellite data. Errors if ID doesn't exist.
     /// Records `people.employee.deleted` (`{id, deleted_at}`) in-tx.
     async fn delete_employee(&self, id: &str) -> Result<(), PeopleError> {
-        let now = Utc::now();
-        let stamp = EventStamp::new("people", ActorId::Automation("platform".into()), now);
-        self.delete_employee_at(id, now, &stamp).await
+        let stamp = EventStamp::new("people", ActorId::Automation("platform".into()));
+        self.delete_employee_at(id, stamp.timestamp, &stamp).await
     }
     async fn delete_employee_at(
         &self,

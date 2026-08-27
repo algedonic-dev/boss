@@ -7,8 +7,6 @@
 //! (what this test simulates) would be invisible if the query ever
 //! walked back to the invoice table.
 
-#![cfg(feature = "postgres")]
-
 mod common;
 
 use std::sync::Arc;

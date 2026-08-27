@@ -3,8 +3,6 @@
 //! transactional outbox inside the adapter's tx; the relay drain
 //! moves it to audit_log. Deliberately NO direct audit writer.
 
-#![cfg(feature = "postgres")]
-
 mod common;
 
 use std::sync::Arc;

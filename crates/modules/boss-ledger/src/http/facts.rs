@@ -118,12 +118,7 @@ pub(super) async fn create_manual_entry(
         "lines": lines_json,
     });
 
-    let stamp = super::event_stamp(
-        &state,
-        &user,
-        boss_clock_client::now_from(&state.clock).await,
-    )
-    .await;
+    let stamp = super::event_stamp(&state, &user).await;
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
         Err(e) => return storage_err(e),
@@ -516,8 +511,7 @@ async fn post_inventory_movement(
     // in). The old post-commit-crash window (fact committed, emit
     // lost) is closed structurally.
     if recorded.inserted {
-        let now = boss_clock_client::now_from(&state.clock).await;
-        let stamp = super::event_stamp(&state, &user, now).await;
+        let stamp = super::event_stamp(&state, &user).await;
         if let Err(e) =
             crate::events::record_ledger_event_in_tx(&mut tx, &stamp, event_kind, payload.clone())
                 .await
@@ -674,8 +668,7 @@ pub(super) async fn supersede_fact_handler(
         "superseded_by": body.superseded_by,
     });
     {
-        let now = boss_clock_client::now_from(&state.clock).await;
-        let stamp = super::event_stamp(&state, &user, now).await;
+        let stamp = super::event_stamp(&state, &user).await;
         if let Err(e) = crate::events::record_ledger_event_in_tx(
             &mut tx,
             &stamp,

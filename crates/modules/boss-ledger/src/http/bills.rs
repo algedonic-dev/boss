@@ -106,7 +106,7 @@ pub(super) async fn create_bill(
     }
 
     // Outbox phase 2: `ledger.bill.approved` records inside this tx.
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     let mut tx = match state.pool.begin().await {
         Ok(t) => t,
         Err(e) => return storage_err(e),
@@ -236,7 +236,7 @@ pub(super) async fn pay_bill(
         return Json(existing).into_response(); // idempotent
     }
 
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     match pay_one_bill(&state, &existing, paid_on, &stamp).await {
         Ok(bill) => Json(bill).into_response(),
         Err(e) => e,
@@ -280,7 +280,7 @@ pub(super) async fn batch_pay_bills(
         Err(e) => return ledger_err(e),
     };
 
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     let mut total: i64 = 0;
     let mut ids = Vec::with_capacity(approved.len());
     for bill in &approved {

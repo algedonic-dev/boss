@@ -148,6 +148,10 @@ pub fn advance_cursor(cursor: Option<NaiveDate>, now: &ClockNow, cap: u64) -> Cu
 pub struct ScheduleRunner {
     pub registry: Registry,
     pub handlers: HandlerRegistry,
+    /// Helper resolver for `when` guards and args — the SAME resolver
+    /// the event runner uses, so a predicate means one thing regardless
+    /// of what triggered its rule.
+    pub helpers: Arc<dyn super::expr::HelperResolver + Send + Sync>,
     /// Clock SSE base URL (e.g. `http://127.0.0.1:7060`).
     pub clock_url: String,
     /// Postgres pool — the single-row `dispatcher_clock_cursor` lives here.
@@ -250,17 +254,37 @@ impl ScheduleRunner {
     }
 
     /// Build the [`MatchedRule`] set for one sim-day: every schedule rule
-    /// that fires on `day` (using the cached calendar), with its
-    /// `do_steps` args evaluated against the synthetic clock-day payload.
+    /// that fires on `day` (using the cached calendar), with its `when`
+    /// guard evaluated and its `do_steps` args evaluated against the
+    /// synthetic clock-day payload.
     ///
-    /// Pure given `(registry, calendars, day)` — no I/O. The synthetic
-    /// payload is `{"_day": "YYYY-MM-DD"}` so a `jobs.spawn` arg like
+    /// Pure given `(registry, calendars, day, helpers)` — no I/O of its
+    /// own, though a helper may do some. The synthetic payload is
+    /// `{"_day": "YYYY-MM-DD"}` so a `jobs.spawn` arg like
     /// `subject = "_day"` (or a `metadata.x` field) can reference the
     /// firing day. (Mirrors the sim PeriodicEngine's `inject_day`.)
+    ///
+    /// `when` on a schedule rule is the same predicate language the
+    /// event runner evaluates, helpers included — this is what lets a
+    /// daily spawner carry a dedup guard like
+    /// `NOT open_publish_exists("github-mirror")` (defect 9f0c566a: the
+    /// daily publish packet was minted every day its predecessor sat at
+    /// an approval, because scheduled rules had no way to ask). Until
+    /// this landed, `when` on a schedule rule was silently IGNORED —
+    /// parsed, stored, never consulted — which is worse than either
+    /// honoring or rejecting it.
+    ///
+    /// Error posture: a guard that fails to evaluate SKIPS the rule for
+    /// the day, with a warning — the same posture as the arg-eval
+    /// failure directly below, one rule per function. The event runner
+    /// instead NAKs toward a dead-letter, but it has redelivery to lean
+    /// on; a clock day fires once. The cost is a quiet day when the
+    /// helper's backing API is down, which the warn line makes findable.
     pub fn matched_for_day(
         registry: &Registry,
         calendars: &HashMap<String, BusinessCalendar>,
         day: NaiveDate,
+        helpers: &dyn super::expr::HelperResolver,
     ) -> (Vec<MatchedRule>, serde_json::Value) {
         let payload = json!({ "_day": day.format("%Y-%m-%d").to_string() });
         let mut matched = Vec::new();
@@ -275,14 +299,30 @@ impl ScheduleRunner {
             if !sched.fires_on(cal, day) {
                 continue;
             }
-            // Schedule rules carry literal args only (no event payload to
-            // bind against), so the expr context's payload is the
-            // synthetic day object and there are no helpers to resolve.
-            // Evaluate each do-step's args against it.
             let ctx = super::expr::Context {
                 payload: &payload,
-                helpers: &super::expr::NoHelpers,
+                helpers,
             };
+            if let Some(when) = &rule.when {
+                match super::expr::eval(when, &ctx).map(|v| v.as_bool()) {
+                    Ok(Some(true)) => {}
+                    Ok(Some(false)) => continue,
+                    Ok(None) => {
+                        warn!(
+                            rule = %rule.name, day = %day,
+                            "schedule runner: when guard is not a boolean; skipping rule for this day"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            rule = %rule.name, day = %day, error = %e,
+                            "schedule runner: when guard failed to evaluate; skipping rule for this day"
+                        );
+                        continue;
+                    }
+                }
+            }
             let mut invocations = Vec::with_capacity(rule.do_steps.len());
             let mut arg_error = false;
             for ds in &rule.do_steps {
@@ -361,7 +401,8 @@ impl ScheduleRunner {
             // run ahead of what's durably recorded (we retry next tick).
             let mut persist_failed = false;
             for day in &advance.days_to_fire {
-                let (matched, payload) = Self::matched_for_day(&self.registry, &calendars, *day);
+                let (matched, payload) =
+                    Self::matched_for_day(&self.registry, &calendars, *day, self.helpers.as_ref());
                 if !matched.is_empty() {
                     // Synthesize a clock-day dispatch context: the topic is
                     // `clock.day` and the "triggering event id" is the day
@@ -644,7 +685,8 @@ handler = "h"
         let reg = sched_registry();
         let cals = HashMap::new();
         // 2026-01-15: both daily AND monthly fire; event rule never.
-        let (matched, payload) = ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 1, 15));
+        let (matched, payload) =
+            ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 1, 15), &NoHelpers);
         let names: Vec<&str> = matched.iter().map(|m| m.rule_name.as_str()).collect();
         assert!(names.contains(&"daily-sweep"));
         assert!(names.contains(&"monthly-close"));
@@ -655,7 +697,7 @@ handler = "h"
         assert_eq!(payload["_day"], "2026-01-15");
 
         // 2026-01-16: only daily fires.
-        let (matched, _) = ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 1, 16));
+        let (matched, _) = ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 1, 16), &NoHelpers);
         let names: Vec<&str> = matched.iter().map(|m| m.rule_name.as_str()).collect();
         assert_eq!(names, vec!["daily-sweep"]);
     }
@@ -666,7 +708,7 @@ handler = "h"
         // firing day from the synthetic payload.
         let reg = sched_registry();
         let cals = HashMap::new();
-        let (matched, _) = ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 3, 9));
+        let (matched, _) = ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 3, 9), &NoHelpers);
         let daily = matched
             .iter()
             .find(|m| m.rule_name == "daily-sweep")
@@ -706,19 +748,19 @@ handler = "h"
         );
         // 15th (Sat): does NOT fire.
         assert!(
-            ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 8, 15))
+            ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 8, 15), &NoHelpers)
                 .0
                 .is_empty()
         );
         // 16th (Sun): does NOT fire.
         assert!(
-            ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 8, 16))
+            ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 8, 16), &NoHelpers)
                 .0
                 .is_empty()
         );
         // 17th (Mon): postponed fire.
         assert_eq!(
-            ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 8, 17))
+            ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 8, 17), &NoHelpers)
                 .0
                 .len(),
             1
@@ -744,7 +786,7 @@ handler = "h"
         // Fires on the nominal 15th even though it's a weekend, because
         // a missing calendar means "every day is a business day".
         assert_eq!(
-            ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 8, 15))
+            ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 8, 15), &NoHelpers)
                 .0
                 .len(),
             1,
@@ -853,6 +895,7 @@ handler = "h"
         let r = ScheduleRunner {
             registry: reg,
             handlers: HandlerRegistry::new(),
+            helpers: Arc::new(NoHelpers),
             clock_url: "http://127.0.0.1:7060".into(),
             pool: sqlx::postgres::PgPoolOptions::new()
                 .connect_lazy("postgres://boss:boss@127.0.0.1/boss")
@@ -862,7 +905,111 @@ handler = "h"
         };
         let cals = r.load_calendars().await;
         assert!(cals.is_empty(), "absent calendar is skipped, not faked");
-        // Sanity: NoHelpers is the resolver matched_for_day uses.
-        let _ = &NoHelpers;
+    }
+
+    // ----- when guards on schedule rules -----------------------------
+    //
+    // Until 2026-08-18 a `when` on a schedule-triggered rule was parsed,
+    // stored, and never consulted — matched_for_day built its context
+    // over NoHelpers and skipped straight to args. These pin the guard
+    // actually gating the firing, and the skip-with-warning posture for
+    // a guard that cannot evaluate.
+
+    /// Answers one helper with a fixed bool and RECORDS what it was
+    /// asked, so a test can assert the dedup key, not just the verdict.
+    struct StubOpen {
+        answer: bool,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+    impl StubOpen {
+        fn new(answer: bool) -> Self {
+            Self {
+                answer,
+                asked: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+    impl super::super::expr::HelperResolver for StubOpen {
+        fn call(
+            &self,
+            name: &str,
+            args: &[super::super::expr::Value],
+        ) -> std::result::Result<super::super::expr::Value, super::super::expr::EvalError> {
+            match name {
+                "open_publish_exists" => {
+                    if let Some(super::super::expr::Value::String(s)) = args.first() {
+                        self.asked.lock().expect("stub lock").push(s.clone());
+                    }
+                    Ok(super::super::expr::Value::Bool(self.answer))
+                }
+                other => Err(super::super::expr::EvalError::UnknownHelper(
+                    other.to_string(),
+                )),
+            }
+        }
+    }
+
+    const GUARDED: &str = r#"
+[[rule]]
+name = "guarded-daily"
+when = 'NOT open_publish_exists("github-mirror")'
+[rule.schedule]
+cadence = "daily"
+anchor_date = "2026-01-01"
+[[rule.do]]
+handler = "jobs.spawn"
+"#;
+
+    #[test]
+    fn a_guarded_schedule_rule_fires_when_the_guard_clears() {
+        let reg = Registry::from_toml(GUARDED).unwrap();
+        let cals = HashMap::new();
+        let stub = StubOpen::new(false);
+        let (matched, _) = ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 1, 15), &stub);
+        assert_eq!(matched.len(), 1, "no open packet → the day fires");
+        assert_eq!(
+            stub.asked.lock().unwrap().as_slice(),
+            ["github-mirror"],
+            "the guard asks about the SUBJECT, the only stable identity"
+        );
+    }
+
+    #[test]
+    fn a_guarded_schedule_rule_skips_while_a_packet_is_open() {
+        let reg = Registry::from_toml(GUARDED).unwrap();
+        let cals = HashMap::new();
+        let stub = StubOpen::new(true);
+        let (matched, _) = ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 1, 15), &stub);
+        assert!(
+            matched.is_empty(),
+            "an open packet suppresses the day's spawn: {matched:?}"
+        );
+    }
+
+    #[test]
+    fn a_guard_that_cannot_evaluate_skips_only_its_own_rule() {
+        // GUARDED plus an unguarded sibling: the broken guard must not
+        // take the sibling's firing down with it.
+        let toml = format!(
+            "{GUARDED}
+[[rule]]
+name = \"unguarded-daily\"
+[rule.schedule]
+cadence = \"daily\"
+anchor_date = \"2026-01-01\"
+[[rule.do]]
+handler = \"jobs.spawn\"
+"
+        );
+        let reg = Registry::from_toml(&toml).unwrap();
+        let cals = HashMap::new();
+        // NoHelpers cannot resolve open_publish_exists → eval error.
+        let (matched, _) = ScheduleRunner::matched_for_day(&reg, &cals, d(2026, 1, 15), &NoHelpers);
+        let names: Vec<_> = matched.iter().map(|m| m.rule_name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["unguarded-daily"],
+            "the erroring guard skips its rule for the day, nothing else"
+        );
     }
 }

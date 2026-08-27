@@ -132,11 +132,14 @@ pub(super) async fn create_vendor<R: InventoryRepository + 'static>(
         behavior: body.behavior,
     };
 
-    let now = boss_clock_client::now_from(&state.clock).await;
     // Outbox phase 2: `inventory.vendor.created` records inside the
     // repository transaction via the stamp; no post-commit emit.
-    let stamp = super::event_stamp(&state, &user, now).await;
-    match state.inventory.create_vendor_at(&vendor, now, &stamp).await {
+    let stamp = super::event_stamp(&state, &user).await;
+    match state
+        .inventory
+        .create_vendor_at(&vendor, stamp.timestamp, &stamp)
+        .await
+    {
         Ok(created_id) => (
             StatusCode::CREATED,
             Json(serde_json::json!({"ok": true, "id": created_id})),
@@ -180,8 +183,7 @@ pub(super) async fn update_vendor<R: InventoryRepository + 'static>(
         behavior: body.behavior,
     };
 
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     match state.inventory.update_vendor(&id, &vendor, &stamp).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(InventoryError::NotFound(msg)) => (StatusCode::NOT_FOUND, msg).into_response(),
@@ -194,8 +196,7 @@ pub(super) async fn delete_vendor<R: InventoryRepository + 'static>(
     Path(id): Path<String>,
     CurrentUser(user): CurrentUser,
 ) -> Response {
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     match state.inventory.delete_vendor(&id, &stamp).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(InventoryError::NotFound(msg)) => (StatusCode::NOT_FOUND, msg).into_response(),

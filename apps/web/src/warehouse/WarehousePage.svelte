@@ -32,6 +32,11 @@
   let inventory = $state<InventoryItem[]>([]);
   let purchaseOrders = $state<PurchaseOrder[]>([]);
   let status = $state<WarehouseStatus | null>(null);
+  /// Non-null when the inventory/PO reads failed — rendered instead
+  /// of "0 tracked SKUs" and empty tables, which an outage is not
+  /// (packet 3fba9c35, the false-empty sweep). The status tile keeps
+  /// its own honest "unavailable" render.
+  let loadFailed = $state<string | null>(null);
   let statusLoading = $state(true);
   let tab = $state<Tab>('overview');
 
@@ -51,8 +56,10 @@
         purchaseOrders = Array.isArray(body) ? body : (body.data ?? []);
       }
       if (sResp.ok) status = (await sResp.json()) as WarehouseStatus;
-    } catch {
-      // ignore
+      const down = [iResp, pResp].find((x) => !x.ok);
+      loadFailed = down ? `HTTP ${down.status}` : null;
+    } catch (e) {
+      loadFailed = e instanceof Error ? e.message : String(e);
     }
     statusLoading = false;
   }
@@ -349,7 +356,11 @@
       </aside>
 
       <section class="list-section">
-        {#if invVisible.length === 0}
+        {#if loadFailed}
+          <p class="empty load-failed" role="alert">
+            Couldn't load inventory — {loadFailed}
+          </p>
+        {:else if invVisible.length === 0}
           <p class="empty">No items match that filter.</p>
         {:else}
           <table class="data-table data-table-striped">
@@ -477,7 +488,11 @@
           </div>
         {/if}
 
-        {#if poVisible.length === 0}
+        {#if loadFailed}
+          <p class="empty load-failed" role="alert">
+            Couldn't load purchase orders — {loadFailed}
+          </p>
+        {:else if poVisible.length === 0}
           <p class="empty">No POs match that filter.</p>
         {:else}
           <table class="data-table data-table-striped">

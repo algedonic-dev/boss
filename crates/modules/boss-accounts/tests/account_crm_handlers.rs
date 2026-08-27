@@ -9,8 +9,6 @@
 //!   - soft-deleted notes hide from default list
 //!   - missing actor_id returns 4xx (type-layer rejection)
 
-#![cfg(feature = "postgres")]
-
 use axum::http::StatusCode;
 use boss_accounts::account_notes::account_notes_router;
 use boss_accounts::account_team_members::account_team_router;

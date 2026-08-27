@@ -305,10 +305,15 @@ mod tests {
         // human-powered-state-machine.md is a stable framing doc —
         // approved status, no open questions, won't be purged or
         // migrated. Reliable fixture as design docs come and go.
+        // (Retitled 2026-08-13 when it became the execution lens over
+        // the-three-layers.md; still the same stable fixture.)
         let target = "docs/design/human-powered-state-machine.md";
         assert!(docs.iter().any(|d| d.path == target));
         let doc = repo.doc_by_path(target).await.unwrap().unwrap();
-        assert_eq!(doc.title, "Design: BOSS as a Human-Powered State Machine");
+        assert_eq!(
+            doc.title,
+            "Design: the human-powered state machine — the execution lens"
+        );
         // Git metadata should have a real commit sha (7+ chars).
         assert!(doc.last_commit_sha.len() >= 7);
         let questions = repo.questions_for_doc(target).await.unwrap();

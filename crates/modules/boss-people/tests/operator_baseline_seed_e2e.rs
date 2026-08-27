@@ -22,8 +22,6 @@
 //!      than silently dropping the field on the next quickstart
 //!      run).
 
-#![cfg(feature = "postgres")]
-
 use boss_people::rebuild_people;
 use boss_people::types::*;
 use boss_testing::TestDb;

@@ -4,8 +4,6 @@ description = "ML platform — models + predictions infrastructure (Phase 1 scaf
 version.workspace = true
 edition.workspace = true
 
-required-features = ["postgres"]
-
 [features]
 default = []
 postgres = ["dep:sqlx"]
@@ -36,3 +34,7 @@ sqlx = { version = "0.8", default-features = false, features = ["macros", "runti
 
 [lints]
 workspace = true
+
+[[test]]
+name = "phase_two_seed_queries_pg"
+required-features = ["postgres"]

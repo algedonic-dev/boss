@@ -11,8 +11,6 @@
 //! projection, runs rebuild_accounts, and asserts both rows
 //! reappear with the post-PUT field values intact.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 /// Drain the outbox through the relay pipeline into audit_log.

@@ -1,0 +1,8 @@
+[[invariant]]
+id = "drift-every-executor-has-an-actor-station"
+claim = "Every executor has an `actor` station; `group` stations are served by a set of actors; `constraint` stations gate membership by capability predicates."
+source = "docs/design/stations.md; restated in infra/postgres/schema/116-stations.sql"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "DOES NOT HOLD TODAY. The stations table ships exactly two seeded rows, both kind='batch' (loading-dock, design-review). There are no actor, group or constraint rows anywhere in the tree, and no authoring API to create them — crates/core/boss-jobs/src/http/mod.rs routes only GET /api/stations and GET /api/stations/{name}/queue, so the registry is read-only in both adapters. The schema comment defends the gap ('actor and group stations are TENANT data'), but no tenant seed creates one either. Judgement call pending: ship the authoring surface, or narrow the doc to the batch stations that exist."

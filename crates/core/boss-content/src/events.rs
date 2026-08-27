@@ -35,14 +35,12 @@ pub const FILE_DETACHED: &str = "content.file.detached";
 /// phase 2).
 pub(crate) async fn event_stamp(
     publisher: &Option<boss_core::publisher::DomainPublisher>,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> boss_core::publisher::EventStamp {
     match publisher {
-        Some(p) => p.stamp_with_actor_at(p.default_actor(), now).await,
+        Some(p) => p.stamp_with_actor(p.default_actor()).await,
         None => boss_core::publisher::EventStamp::new(
             "content",
             boss_core::actor::ActorId::Automation("content".into()),
-            now,
         ),
     }
 }

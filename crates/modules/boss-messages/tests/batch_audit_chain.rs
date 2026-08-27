@@ -5,8 +5,6 @@
 //! batch path used by the sim and bulk imports is a silent bypass
 //! and every batch-imported row vanishes on `boss-rebuild-all`.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::Router;

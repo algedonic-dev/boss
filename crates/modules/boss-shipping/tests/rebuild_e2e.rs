@@ -4,8 +4,6 @@
 //! `shipment_assets`, drop, rebuild from `audit_log`, assert exact
 //! match.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::Router;

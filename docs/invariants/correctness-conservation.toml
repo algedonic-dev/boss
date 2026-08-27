@@ -1,0 +1,8 @@
+[[invariant]]
+id = "correctness-conservation"
+claim = "For every conserved quantity, `in − out = stock` to the unit."
+source = "docs/design/correctness-protocol.md §The five properties.2"
+enforcement = "checked"
+mechanism = "infra/lint/conservation-invariants.sh — 22 SQL invariants (trial balance, inventory non-negative, GL control accounts 1300/1320/cash, accrual >= remittance for sales tax / payroll / deferred revenue, FG GL balance identical to sum of value_cents, period close reflects net P&L), run hourly in prod and inside infra/postgres/validate-brewery-sim.sh"
+last_verified = "2026-08-13"
+note = "The best-held of the five, and still `checked` rather than `enforced`: it needs a live populated DB and settles only over a full regen, so it cannot gate a PR. Scope is the brewery tenant's chart of accounts — the invariants are written against specific account numbers, so a second tenant inherits no coverage."

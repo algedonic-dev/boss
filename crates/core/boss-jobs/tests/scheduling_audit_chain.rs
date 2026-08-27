@@ -5,8 +5,6 @@
 //! reappears from audit_log alone — i.e. every write is audited and
 //! the projections are fully rebuildable.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::Router;

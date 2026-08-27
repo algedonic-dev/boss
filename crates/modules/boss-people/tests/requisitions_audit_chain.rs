@@ -10,8 +10,6 @@
 //! drops the projection and asserts the row reappears with the
 //! latest status intact.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::Router;

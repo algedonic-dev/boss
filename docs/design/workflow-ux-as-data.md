@@ -1,6 +1,6 @@
 # Design: workflow UX as data — when vanilla is the exception
 
-**Status**: in-review — open questions tracked at `/system/design`.
+**Status**: decided — all questions answered by David in review `b4cc0406`, 2026-08-19.
 **Source**: David, 2026-08-09: "having vanilla UX for a workflow or
 step is going to become the exception rather than the norm… my
 department app will want to build custom views for the workflows we
@@ -108,49 +108,33 @@ ship views.
 
 ## Open questions
 
-### Q1: One UI-plugin registry, or a sibling table per slot?
-
-`step_plugins` could generalize to a `ui_plugins` registry with a
-`slot` column (`step:<kind>` | `workflow:<kind>:<surface>`), or a
-sibling `workflow_views` table keeps the two lifecycles apart. One
-registry means one authoring surface, one version discipline, one
-serving path; the split means simpler rows. Precedent (the Class
-registry: one table, kind-keyed) leans single-registry.
-
-### Q2: What exactly does the host hand a view?
-
-Proposal: the step-plugin props shape, plus a provided client —
-`readJob`, merge-safe `patchStep`, `route(edge)`, `listAtNode` — and
-optional kit components (StepDag, the schema renderer). Decides
-consideration 2. Sub-question: does the existing step-plugin host
-retrofit the same client, so the trap closes everywhere at once?
-
-### Q3: Is drag-and-drop a kit interaction or per-view freedom?
-
-One curated dnd-routing component (drop targets = the routing edges
-of the current node, exactly TriageFlow's semantics) keeps the
-decision-graph reading consistent everywhere and is testable once.
-Per-view freedom lets a department invent interactions the kit
-never imagined. These compose — kit component first, freedom
-allowed — unless we decide consistency matters more.
-
-### Q4: How do plugin surfaces get gated in CI?
-
-Options: a plugin smoke harness (mount each registered bundle
-against the adversarial mock, fail on pageerror — the route-smoke
-contract extended to bundles); publish-time validation only
-(schema-checked row, untested mount); or deferred-with-reason per
-plugin. The step-plugin fleet is small today; the decision sets the
-bar before the fleet grows.
-
-### Q5: Who may publish a view, and as whom?
-
-Same question as design-docs-as-data Q4 and MCP Q2, arriving at a
-third door: department apps will be authored substantially by
-agents. Policy rule on `(publish, ui-plugin)`, a `publish-a-view`
-Workflow, or role-scoped authoring at `/system/step-plugins`'s
-successor. Should resolve consistently with those two.
+None — every question was answered in review `b4cc0406` on 2026-08-19; see Decision history.
 
 ## Decision history
 
-_None yet._
+**Q2 — What exactly does the host hand a view (decided by David in review `b4cc0406`, 2026-08-19).**
+the step-plugin props shape, plus a provided client — `readJob`, merge-safe `patchStep`, `route(edge)`, `listAtNode` — and optional kit components (StepDag, the schema renderer). Decides consideration 2. Sub-question: does the existing step-plugin host retrofit the same client, so the trap closes everywhere at once?
+
+**Q3 — Is drag-and-drop a kit interaction or per-view freedom (decided by David in review `b4cc0406`, 2026-08-19).**
+**kit component first, per-view freedom allowed** — the compose option the paragraph above already names, chosen deliberately rather than by default.
+
+**Q4 — How do plugin surfaces get gated in CI (decided by David in review `b4cc0406`, 2026-08-19).**
+**the plugin smoke harness, in the CI-gated mocked suite** — and the measurement says this is not a close call.
+
+**Q5 — Who may publish a view, and as whom (decided by David in review `b4cc0406`, 2026-08-19).**
+**a policy rule on `(publish, ui-plugin)`, and nothing else** — the same answer David gave to the same question one door along.
+
+**Q1 — One UI-plugin registry, or a sibling table per slot? (resolved before this review; carried from Open questions).**
+Resolved 2026-08-16 — override.
+
+**The question was:**
+
+> `step_plugins` could generalize to a `ui_plugins` registry with a
+> `slot` column (`step:<kind>` | `workflow:<kind>:<surface>`), or a
+> sibling `workflow_views` table keeps the two lifecycles apart. One
+> registry means one authoring surface, one version discipline, one
+> serving path; the split means simpler rows. Precedent (the Class
+> registry: one table, kind-keyed) leans single-registry.
+
+One registry. `step_plugins` (03-jobs.sql) is the single table and carries nine active rows today. The sibling-table-per-slot alternative was never built and nothing has needed it since.
+

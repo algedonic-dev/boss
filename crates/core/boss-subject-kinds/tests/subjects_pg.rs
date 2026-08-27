@@ -12,8 +12,6 @@
 //! - `subject_exists` is the uniform existence probe the jobs gate
 //!   uses for every kind.
 
-#![cfg(feature = "postgres")]
-
 use boss_subject_kinds::subjects::{record_subject_in_tx, subject_exists, upsert_subject};
 use boss_testing::TestDb;
 

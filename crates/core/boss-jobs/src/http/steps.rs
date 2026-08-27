@@ -5,6 +5,20 @@ use super::*;
 
 use axum::extract::Path;
 
+/// The wire spelling of a step status, for messages the caller reads.
+/// Local rather than borrowed from the postgres adapter: an HTTP error
+/// string has no business depending on the storage layer, and the two
+/// are free to diverge without either noticing.
+fn status_word(s: StepStatus) -> &'static str {
+    match s {
+        StepStatus::Pending => "pending",
+        StepStatus::Ready => "ready",
+        StepStatus::Active => "active",
+        StepStatus::Completed => "completed",
+        StepStatus::Skipped => "skipped",
+    }
+}
+
 pub(super) async fn list_steps<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     Path(id): Path<String>,
@@ -30,6 +44,54 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
         Some(id) => id,
         None => return (StatusCode::BAD_REQUEST, "invalid job id").into_response(),
     };
+
+    // A JOB'S STEP SET IS FIXED AT ADMISSION. Step predicates are not
+    // stored on steps (the table has no ready_when column) — readiness
+    // is recomputed by pairing spec steps with job steps positionally,
+    // so one appended step misaligns every pair after it and
+    // `registry::reevaluate` refuses to advance anything. The job is
+    // then frozen: no step moves again, including its terminal, so it
+    // never closes and never leaves its owner's queue.
+    //
+    // That is not hypothetical. Design review 32a4e70d gained a
+    // per-question step on 2026-08-13, sat in David's queue with its
+    // review COMPLETED and its terminal pending, and produced feedback
+    // 55c92985: "I finished the top design review and it still shows
+    // the same metadata and is in the same queue." The divergence was
+    // logged at warn by `reevaluate_and_persist` the whole time; a warn
+    // in a log nobody is reading is not a signal, so the job looked
+    // exactly like one waiting on its owner.
+    //
+    // Refusing here is the honest boundary: a new step is a change to
+    // the WORKFLOW, and the registry is where that belongs — publish a
+    // new version and admit new packets under it. In-flight packets
+    // stay pinned to the version they were admitted under, which is the
+    // whole point of the versioning.
+    //
+    // The route stays for the case it is safe in: a job whose kind has
+    // no spec to diverge from.
+    if let Some(reg) = &state.kind_registry
+        && let Ok(Some(job)) = state.jobs.get_job(&job_id).await
+        && let Ok(spec) = reg.get_version(&job.kind, job.workflow_version).await
+        && let Ok(existing) = state.jobs.list_steps(&job_id).await
+        && existing.len() >= spec.steps.len()
+    {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "refusing to add a step to job {job_id}: it already has {} step(s), \
+                 matching workflow {} v{}. Appending would diverge the job from its \
+                 spec, and readiness is computed by pairing the two positionally — \
+                 the job would freeze and never reach a terminal. Add the step to the \
+                 workflow and publish a new version instead; in-flight jobs stay \
+                 pinned to the version they were admitted under.",
+                existing.len(),
+                job.kind,
+                job.workflow_version
+            ),
+        )
+            .into_response();
+    }
 
     // Ensure the step belongs to this job.
     step.job_id = job_id;
@@ -65,7 +127,6 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
             .into_response();
     }
 
-    let now = boss_clock_client::now_from(&state.clock).await;
     // OUTBOX (phase 2): STEP_CREATED (full row state, what the
     // rebuild consumes) records in the SAME transaction as the row.
     // The actor is stamped from the authenticated session per the
@@ -75,8 +136,15 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
     // Employee taking on the work; we honor that as the audit actor
     // so step.created rows attribute to a person, not a process.
     // Otherwise the actor is the session's own identity — a human
-    // operator, or the named automation (`automation:<authority>`);
-    // never anonymous.
+    // operator, a named automation (`automation:<authority>`), or an
+    // agent session (`<mode>:<model>`); never anonymous.
+    //
+    // Agents deliberately do NOT belong in `is_automation`. This flag
+    // means "the caller is a proxy standing in for a person, so honor
+    // the person it names" — the sim's whole purpose. An agent is not
+    // a proxy: it IS the CPU that did the work, and redirecting its
+    // attribution to `assignee_id` would erase exactly the agent
+    // attribution the `<mode>:<model>` actor id exists to record.
     let is_automation = user.id == "anonymous"
         || user.id.starts_with("automation:")
         || user.id.starts_with("rule:")
@@ -92,12 +160,21 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
             .ambient_actor()
             .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into())),
     };
-    let stamp = state.publisher.stamp_with_actor_at(actor, now).await;
-    let step_event = stamp.event(
-        events::STEP_CREATED,
-        serde_json::to_value(&step).unwrap_or_default(),
-    );
-    if let Err(e) = state.jobs.add_step_at(&step, now, &[step_event]).await {
+    let mut stamp = state.publisher.stamp_with_actor(actor).await;
+    // Step events inherit the parent packet's admission-fixed
+    // `simulated` flag (the packet, not the request's transport
+    // context, is the source of truth). A step posted against a
+    // missing Job keeps the chain default — Pg rejects it on the FK
+    // anyway.
+    if let Ok(Some(job)) = state.jobs.get_job(&job_id).await {
+        stamp = stamp.with_simulated(job.simulated);
+    }
+    let step_event = stamp.event(events::STEP_CREATED, events::step_state_payload(&step));
+    if let Err(e) = state
+        .jobs
+        .add_step_at(&step, stamp.timestamp, &[step_event])
+        .await
+    {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
@@ -115,17 +192,23 @@ pub(super) async fn add_step<R: JobsRepository + 'static, B: EventBus + 'static>
 /// published spec on success or a (status, message) pair the
 /// caller can short-circuit with.
 ///
-/// Validation = `boss_jobs::workflow_lint::validate_all` —
-/// catches required-field mismatches, unknown step kinds, and the
-/// other static guarantees a published spec needs. The lint
-/// failure is surfaced as 400 so the SPA can render the offender.
+/// The stamp's `actor` + `now` ride into `publish_authored` so the
+/// registry adapter records `jobs.kind.published` atomically with
+/// the workflows row — the step path no longer emits its own copy.
+///
+/// Viability is NOT re-linted here: `publish_authored` runs
+/// `workflow_lint::gate_active` itself, because it is one of the
+/// paths that can set a row ACTIVE and every such path must refuse
+/// on its own (a pre-check in one caller protects only that caller).
+/// A refusal arrives as `WorkflowError::Unviable` and leaves as 422
+/// with the problem list, matching `POST /api/workflows/{kind}/publish`.
 async fn dispatch_workflow_publish(
     registry: &dyn crate::registry::WorkflowRegistry,
     step: &boss_core::job::Step,
     job_id: boss_core::job::JobId,
+    actor: &boss_core::actor::ActorId,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<crate::registry::WorkflowSpec, (StatusCode, String)> {
-    use crate::workflow_lint::validate_all;
-
     let spec_value = step.metadata.get("workflow_spec").ok_or((
         StatusCode::BAD_REQUEST,
         "workflow-publish step missing required metadata field `workflow_spec`".to_string(),
@@ -139,22 +222,22 @@ async fn dispatch_workflow_publish(
             )
         })?;
 
-    let registry_v1 = crate::step_registry::StepRegistry::v1();
-    let lint_errs = validate_all(std::slice::from_ref(&spec), &registry_v1);
-    if !lint_errs.is_empty() {
-        let mut msg = String::from("workflow-publish: spec failed validate_all:");
-        for e in &lint_errs {
-            msg.push_str(&format!("\n  {e}"));
-        }
-        return Err((StatusCode::BAD_REQUEST, msg));
-    }
-
-    registry.publish_authored(spec, job_id).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("publish_authored failed: {e}"),
-        )
-    })
+    registry
+        .publish_authored(spec, job_id, actor, now)
+        .await
+        .map_err(|e| match e {
+            crate::registry::WorkflowError::Unviable(problems) => {
+                let mut msg = String::from("workflow-publish: spec is not viable:");
+                for p in &problems {
+                    msg.push_str(&format!("\n  {p}"));
+                }
+                (StatusCode::UNPROCESSABLE_ENTITY, msg)
+            }
+            other => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("publish_authored failed: {other}"),
+            ),
+        })
 }
 
 pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'static>(
@@ -209,6 +292,15 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
+    // The parent packet, fetched ONCE: the event stamp inherits its
+    // `simulated` flag, the step.done / step.assigned markers read
+    // its Subject identity, and the re-evaluator runs against it.
+    // The step write below never touches the jobs row, so this read
+    // stays current through all of those. (The auto-close pass at
+    // the bottom re-fetches — close_job_on_terminal may have closed
+    // the Job in between.)
+    let parent_job = state.jobs.get_job(&job_id).await.ok().flatten();
+
     let mut merged = match serde_json::to_value(&old) {
         Ok(v) => v,
         Err(e) => {
@@ -262,6 +354,66 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         && let Some(obj) = step.metadata.as_object_mut()
     {
         obj.insert("authority_role".into(), auth);
+    }
+
+    // A TERMINAL ROW IS FROZEN, AND SAYING SO IS THE POINT.
+    //
+    // Both adapters refuse to write `status`, `completed_on` and
+    // `metadata` on a completed or skipped step — deliberately, so a
+    // write merged against a stale pre-completion fetch cannot demote a
+    // finished step. What they did NOT do was tell anyone: the row was
+    // left untouched and the handler still answered 204, so a caller
+    // could not distinguish a write that landed from one that vanished.
+    //
+    // That cost real work. Three cars' stale gate receipts were
+    // "repaired", the API said 204 three times, nothing was written,
+    // and the cars were reported fixed while staying unboardable
+    // (09576fab). It bit again on 2026-08-27: an accepted correction
+    // could not be applied to the sentence it corrected, because the
+    // sentence lives in a completed step's metadata.
+    //
+    // SCOPED TO A REAL CHANGE, not to every write. The freeze exists to
+    // make racing writers harmless — dispatcher assign retries and
+    // JetStream redeliveries re-PUT content that is already stored, and
+    // those are no-ops that must keep succeeding. Refusing them would
+    // trade a silent bug for a noisy one. So the refusal fires only
+    // when the write would actually alter a frozen field.
+    //
+    // Nothing on a terminal step is legitimately mutable through here:
+    // the conductor's `boarded_head` stamp, the one path that visibly
+    // works against finished cars, writes JOB metadata via
+    // `merge_job_metadata`, never step metadata.
+    //
+    // `status` IS DELIBERATELY NOT CHECKED HERE. The demotion case
+    // already has its own refusal further down, added for this same
+    // defect (job 903e6b90), and it says something better than this
+    // could: which status the step is, and which one the caller tried
+    // to set. Repeating the check here would preempt that message with
+    // a vaguer one. This block covers only the two fields that were
+    // still being dropped in silence.
+    if matches!(old.status, StepStatus::Completed | StepStatus::Skipped) {
+        let mut frozen: Vec<&str> = Vec::new();
+        if step.completed_on != old.completed_on {
+            frozen.push("completed_on");
+        }
+        if step.metadata != old.metadata {
+            frozen.push("metadata");
+        }
+        if !frozen.is_empty() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "step is terminal — these fields are immutable",
+                    "step_id": step_id.to_string(),
+                    "step_status": status_word(old.status),
+                    "refused_fields": frozen,
+                    "hint": "a completed step is a record of what happened. To correct or \
+                             annotate it, write to the parent job's metadata \
+                             (PATCH /api/jobs/{id}/metadata) instead.",
+                })),
+            )
+                .into_response();
+        }
     }
 
     // Auto-stamp completed_on on the done-transition if the caller
@@ -432,31 +584,6 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         }
     }
 
-    // In-process dispatch for the `workflow-publish` StepType. When a
-    // step of this kind flips to Done, read `workflow_spec` from
-    // metadata, lint it via `validate_all`, and call
-    // `WorkflowRegistry::publish_authored` so the meta-Job's authoring
-    // closes by writing a real registry row.
-    //
-    // Registry-write-first: if publish_authored fails, `update_step_at`
-    // is never called and no STEP_UPDATED accumulates in audit_log for
-    // a step whose side effect couldn't fire — keeping audit_log
-    // integrity on partial failure.
-    let mut published_kind: Option<crate::registry::WorkflowSpec> = None;
-    if is_flipping_to_done && step.kind == "workflow-publish" {
-        let Some(reg) = &state.kind_registry else {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Workflow registry unavailable for workflow-publish dispatch",
-            )
-                .into_response();
-        };
-        match dispatch_workflow_publish(reg.as_ref(), &step, job_id).await {
-            Ok(spec) => published_kind = Some(spec),
-            Err((status, msg)) => return (status, msg).into_response(),
-        }
-    }
-
     let now = boss_clock_client::now_from(&state.clock).await;
 
     // OUTBOX (phase 2): the state event + every marker this
@@ -469,7 +596,12 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // field in the body that names the real Employee whose work the
     // step represents; we honor that override when the calling
     // identity is an automation slug so the audit_log row attributes
-    // work to a person, not a process.
+    // work to a person, not a process. Agent sessions
+    // (`<mode>:<model>`) are excluded from that override on purpose —
+    // see the note on the same flag in `create_step`: an agent is the
+    // CPU, not a stand-in for one. Computed BEFORE the
+    // workflow-publish dispatch below — the registry write records
+    // its event under this same actor + now.
     let body_completed_by = body
         .get("completed_by")
         .and_then(|v| v.as_str())
@@ -488,24 +620,52 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
             .ambient_actor()
             .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into())),
     };
-    let stamp = state
-        .publisher
-        .stamp_with_actor_at(actor.clone(), now)
-        .await;
-    let mut step_events = vec![stamp.event(
-        events::STEP_UPDATED,
-        serde_json::to_value(&step).unwrap_or_default(),
-    )];
 
-    // The `workflow-publish` dispatch produces an audit-bearing
-    // event with the full published spec — what `rebuild_workflows`
-    // reads to reconstruct the registry from audit_log.
-    if let Some(spec) = &published_kind {
-        step_events.push(stamp.event(
-            events::WORKFLOW_PUBLISHED,
-            serde_json::to_value(spec).unwrap_or_default(),
-        ));
+    // In-process dispatch for the `workflow-publish` StepType. When a
+    // step of this kind flips to Done, read `workflow_spec` from
+    // metadata and call `WorkflowRegistry::publish_authored` so the
+    // meta-Job's authoring closes by writing a real registry row.
+    // `publish_authored` runs the viability gate itself — an unviable
+    // spec comes back as 422 and the step does not flip.
+    //
+    // Registry-write-first: if publish_authored fails, `update_step_at`
+    // is never called and no STEP_UPDATED accumulates in audit_log for
+    // a step whose side effect couldn't fire — keeping audit_log
+    // integrity on partial failure.
+    if is_flipping_to_done && step.kind == "workflow-publish" {
+        let Some(reg) = &state.kind_registry else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Workflow registry unavailable for workflow-publish dispatch",
+            )
+                .into_response();
+        };
+        if let Err((status, msg)) =
+            dispatch_workflow_publish(reg.as_ref(), &step, job_id, &actor, now).await
+        {
+            return (status, msg).into_response();
+        }
     }
+
+    let mut stamp = state.publisher.stamp_with_actor(actor.clone()).await;
+    // Step events inherit the packet's admission-fixed flag — a real
+    // operator completing a step on a simulated Job records a
+    // simulated event, and a sim-chain write to a real Job stays
+    // real.
+    if let Some(j) = &parent_job {
+        stamp = stamp.with_simulated(j.simulated);
+    }
+    let stamp = stamp;
+    let mut step_events =
+        vec![stamp.event(events::STEP_UPDATED, events::step_state_payload(&step))];
+
+    // The `workflow-publish` dispatch's WORKFLOW_PUBLISHED event —
+    // the full published spec `rebuild_workflows` reads to
+    // reconstruct the registry — used to be pushed into
+    // `step_events` here. It moved into the registry adapter
+    // (`publish_authored` records it atomically with the workflows
+    // ROW), so the step path no longer duplicates it. The rebuild
+    // reads the same kind either way.
 
     // Marker events for downstream consumers — informational
     // duplicates of state already in STEP_UPDATED. Rebuild ignores.
@@ -528,15 +688,14 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         // extra fetch. (Read before the write; the step update
         // doesn't touch the job row.)
         if !step.kind.is_empty() {
-            let (subject_kind, subject_id) =
-                if let Ok(Some(job)) = state.jobs.get_job(&job_id).await {
-                    (
-                        boss_core::primitives::Subject::kind(&job.subject).to_string(),
-                        boss_core::primitives::Subject::id(&job.subject).to_string(),
-                    )
-                } else {
-                    (String::new(), String::new())
-                };
+            let (subject_kind, subject_id) = if let Some(job) = &parent_job {
+                (
+                    boss_core::primitives::Subject::kind(&job.subject).to_string(),
+                    boss_core::primitives::Subject::id(&job.subject).to_string(),
+                )
+            } else {
+                (String::new(), String::new())
+            };
             step_events.push(stamp.event(
                 &format!("step.done.{}", step.kind),
                 serde_json::json!({
@@ -572,7 +731,7 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // forking; the handler's deterministic message id dedupes when the
     // ready path already told the same person.
     if step.assignee_id.is_some() && old.assignee_id != step.assignee_id && !step.kind.is_empty() {
-        let (subject_kind, subject_id) = if let Ok(Some(job)) = state.jobs.get_job(&job_id).await {
+        let (subject_kind, subject_id) = if let Some(job) = &parent_job {
             (
                 boss_core::primitives::Subject::kind(&job.subject).to_string(),
                 boss_core::primitives::Subject::id(&job.subject).to_string(),
@@ -607,7 +766,45 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         ));
     }
 
-    if let Err(e) = state.jobs.update_step_at(&step, now, &step_events).await {
+    // Refuse, out loud, what the row would silently drop.
+    //
+    // `update_step_at`'s UPDATE freezes status, completed_on and
+    // metadata on a terminal step — deliberately, so a write computed
+    // against a pre-completion fetch (dispatcher assign retries,
+    // JetStream redeliveries, any racing read-modify-write) cannot
+    // demote it. That invariant is right and stays.
+    //
+    // What was wrong is that the caller was never told. The handler
+    // returned 204 and the columns simply did not move, so an actor
+    // that believed it had recorded something had not. Job 903e6b90
+    // found it by probe; the same silence ate a correction to a car's
+    // build step earlier the same day, and nobody noticed until the
+    // record was read back.
+    //
+    // Idempotent re-sends still pass: this compares VALUES, so a
+    // redelivery that re-completes an already-completed step with the
+    // same status is unchanged and proceeds. Only a real conflict —
+    // a different status against a terminal row — is refused.
+    if matches!(old.status, StepStatus::Completed | StepStatus::Skipped)
+        && step.status != old.status
+    {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "step is {} and does not move backwards: refusing to set it to {}. \
+                 Terminal steps are immutable; add a new step or record the change elsewhere.",
+                status_word(old.status),
+                status_word(step.status)
+            ),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = state
+        .jobs
+        .update_step_at(&step, stamp.timestamp, &step_events)
+        .await
+    {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
@@ -616,32 +813,28 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
     // Ready) or rule a branch out (Pending → Skipped). The re-evaluator
     // is the single readiness engine, driven off the active
     // WorkflowSpec's predicates rather than denormalized edges.
-    if let Some(reg) = &state.kind_registry {
-        let job_for_reeval = match state.jobs.get_job(&job_id).await {
-            Ok(Some(j)) => Some(j),
-            _ => None,
-        };
-        if let Some(job) = job_for_reeval {
-            reevaluate_and_persist(&state, &job, &actor, now).await;
+    if let Some(reg) = &state.kind_registry
+        && let Some(job) = parent_job
+    {
+        reevaluate_and_persist(&state, &job, &actor).await;
 
-            // If the step we just completed is a declared terminal,
-            // close the Job with that outcome and skip every
-            // still-non-terminal step. Pair the live Step back to its
-            // StepSpec by index (== sort_order, the materializer's
-            // contract). Resolve the pinned version — same rule as the
-            // re-evaluator.
-            let just_completed =
-                old.status != StepStatus::Completed && step.status == StepStatus::Completed;
-            if just_completed
-                && let Ok(spec) = reg.get_version(&job.kind, job.workflow_version).await
-                && let Some(outcome) = spec
-                    .steps
-                    .get(step.sort_order as usize)
-                    .and_then(|spec_step| spec_step.terminal.as_ref())
-                    .map(|t| t.outcome.clone())
-            {
-                close_job_on_terminal(&state, &job_id, &outcome, &actor, now).await;
-            }
+        // If the step we just completed is a declared terminal,
+        // close the Job with that outcome and skip every
+        // still-non-terminal step. Pair the live Step back to its
+        // StepSpec by index (== sort_order, the materializer's
+        // contract). Resolve the pinned version — same rule as the
+        // re-evaluator.
+        let just_completed =
+            old.status != StepStatus::Completed && step.status == StepStatus::Completed;
+        if just_completed
+            && let Ok(spec) = reg.get_version(&job.kind, job.workflow_version).await
+            && let Some(outcome) = spec
+                .steps
+                .get(step.sort_order as usize)
+                .and_then(|spec_step| spec_step.terminal.as_ref())
+                .map(|t| t.outcome.clone())
+        {
+            close_job_on_terminal(&state, &job_id, &outcome, &actor, now).await;
         }
     }
 
@@ -664,17 +857,15 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
             let old_status = job.status;
             job.status = new_status;
             if new_status == JobStatus::Closed {
-                // Same sim-day-vs-wall-clock contract as step.completed_on:
-                // the closing transition is the step we just wrote, so its
-                // completed_on (sim-day when the LiveApiOutput sent it,
-                // wall-clock-NOW filled in above otherwise) is the right
-                // anchor for the Job's closed_on too. Falls through to
-                // wall-clock only if the step somehow lacks a date.
+                // Same business-date contract as step.completed_on:
+                // the closing transition is the step we just wrote, so
+                // its completed_on (a date on the authoritative — sim-
+                // aware — calendar) is the right anchor for the Job's
+                // closed_on too. Falls through to the authoritative
+                // clock's date only if the step somehow lacks one.
                 let job_now = boss_clock_client::now_from(&state.clock).await;
                 job.closed_on = step.completed_on.or(Some(job_now.date_naive()));
-                let _ = (job_now,); // keep job_now hoisted for the update_job_at call below
             }
-            let job_now = boss_clock_client::now_from(&state.clock).await;
             // OUTBOX (phase 2): the state event (full row state for
             // the rebuild) + status markers record in the SAME
             // transaction as the auto-transition. The actor is
@@ -684,8 +875,9 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
             // state change too.
             let close_stamp = state
                 .publisher
-                .stamp_with_actor_at(actor.clone(), job_now)
-                .await;
+                .stamp_with_actor(actor.clone())
+                .await
+                .with_simulated(job.simulated);
             let mut close_events = vec![
                 close_stamp.event(
                     events::JOB_UPDATED,
@@ -706,6 +898,41 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                     serde_json::json!({
                         "id": job.id.to_string(),
                         "closed_on": job.closed_on,
+                        // ALWAYS present, on all three emit sites,
+                        // defaulting null — the dispatcher's expr
+                        // binder makes an ABSENT identifier a
+                        // PredicateFailed → Retry → dead-letter storm
+                        // rather than a quiet false, so a rule gating
+                        // on `kind` / `outcome` needs the keys on every
+                        // close, not just the ones that have an answer.
+                        // (The `notify_on_done` field on step.done,
+                        // migration 106, is the same contract.) A
+                        // catch-all close carries no declared outcome,
+                        // so `outcome` is null here unless a terminal
+                        // already stamped one.
+                        "kind": job.kind,
+                        "outcome": job.metadata.get("outcome"),
+                        // What closed, in words. A rule that SPAWNS off
+                        // a close has to title the new packet, and the
+                        // only titles available to it are a literal or
+                        // an identifier from this payload — the arg
+                        // language has no concatenation. Without this
+                        // key, `title = "title"` binds nothing and the
+                        // whole event dead-letters (see below); with a
+                        // literal instead, every spawned packet is
+                        // named identically and the board cannot tell
+                        // them apart.
+                        "title": job.title,
+                        // WHAT the closed packet was about. A recurring
+                        // sweep names its target here
+                        // (`stale-build-caches`), and that is the only
+                        // stable identity a spawning rule can dedupe
+                        // on: the sweep's `id` differs every firing and
+                        // its `title` is templated per target, so two
+                        // days of the same finding are indistinguishable
+                        // without this. Present on all three sites for
+                        // the same reason `kind` and `title` are.
+                        "subject_id": boss_core::primitives::Subject::id(&job.subject),
                         // D7: same delegate-subjob back-link as the
                         // terminal-close path, so a child Job that
                         // closes via the all-steps-terminal catch-all
@@ -715,7 +942,10 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
                     }),
                 ));
             }
-            let _ = state.jobs.update_job_at(&job, job_now, &close_events).await;
+            let _ = state
+                .jobs
+                .update_job_at(&job, close_stamp.timestamp, &close_events)
+                .await;
         }
     }
 
@@ -733,10 +963,206 @@ pub(super) struct SignOffBody {
 /// the role-scoped resource `step-signoff:<role>`.
 /// Idempotent per (role, current shape): re-stamping unchanged
 /// content returns the step unchanged.
+/// `POST /api/jobs/{id}/steps/{step_id}/claim` — the claim hop
+/// (queue-visibility Q2). Ready→Active as a compare-and-set owned by
+/// the adapter: exactly one claimant wins; the loser gets 409 with
+/// the holder. Idempotent for the holder. The generic PUT keeps its
+/// PATCH semantics and never adjudicates claims.
+#[derive(Deserialize, Default)]
+pub(super) struct ClaimQuery {
+    /// The station the claimant is pulling FROM. A packet has no
+    /// single derivable station — membership is a predicate, and
+    /// several stations can hold the same packet — so the capability
+    /// gate (stations.md Q3: enforced at the claim CAS) applies to
+    /// the station the claim names, not to some inferred one. Claims
+    /// without a station keep today's behavior: the CAS plus the
+    /// policy check above, no station capability consulted.
+    station: Option<String>,
+}
+
+pub(super) async fn claim_step<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    Path((id, step_id_str)): Path<(String, String)>,
+    CurrentUser(user): CurrentUser,
+    axum::extract::Query(q): axum::extract::Query<ClaimQuery>,
+) -> Response {
+    let job_id = match parse_job_id(&id) {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, "invalid job id").into_response(),
+    };
+    let step_id = match parse_step_id(&step_id_str) {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, "invalid step id").into_response(),
+    };
+    match state
+        .policy
+        .check(&user, Action::Update, Resource::step())
+        .await
+    {
+        Ok(Decision::Deny { reason }) => {
+            return (StatusCode::FORBIDDEN, reason).into_response();
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("policy check failed: {e}"),
+            )
+                .into_response();
+        }
+    }
+    let old = match state.jobs.get_step(&step_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return (StatusCode::NOT_FOUND, "step not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    if old.job_id != job_id {
+        return (StatusCode::NOT_FOUND, "step not on this job").into_response();
+    }
+
+    let actor = user
+        .ambient_actor()
+        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+    // The parent packet: the claim's events inherit its
+    // admission-fixed `simulated` flag, and the assignment marker
+    // reads its Subject identity.
+    let parent_job = state.jobs.get_job(&job_id).await.ok().flatten();
+
+    // Station capability gate (stations.md Q3): when the claim names
+    // the station it pulls from, the packet must actually be a
+    // member of that station's queue, and the station's capability
+    // (Class-registry role vocabulary) must admit the claimant.
+    // Checked BEFORE the CAS so a gated claim never decides the
+    // race it wasn't allowed to enter.
+    if let Some(station_name) = q.station.as_deref() {
+        let Some(reg) = &state.stations else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "station registry not configured",
+            )
+                .into_response();
+        };
+        let row = match reg.get_active(station_name).await {
+            Ok(s) => s,
+            Err(crate::stations::StationError::NotFound(msg)) => {
+                return (StatusCode::NOT_FOUND, msg).into_response();
+            }
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        };
+        // Same binding as the queue read: "is this packet at MY
+        // station" is the question a per-actor station asks, and an
+        // unbindable placeholder means the claimant has no queue here
+        // — so the packet is not at it.
+        let bound = row.bind_self(self_id(&user));
+        let Some(job) = &parent_job else {
+            return (StatusCode::NOT_FOUND, "job not found").into_response();
+        };
+        let needs_steps = bound.as_ref().is_some_and(|s| s.predicate.needs_steps());
+        let steps = if needs_steps {
+            state.jobs.list_steps(&job_id).await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !bound
+            .as_ref()
+            .is_some_and(|s| s.predicate.matches(job, &steps))
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "packet is not at this station",
+                    "station": station_name,
+                })),
+            )
+                .into_response();
+        }
+        if let Some(capability) = &row.capability
+            && !capability.allows_role(&user.role)
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "role not admitted by station capability",
+                    "station": station_name,
+                    "role": user.role,
+                    "allowed_roles": capability.roles,
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let mut stamp = state.publisher.stamp_with_actor(actor).await;
+    if let Some(j) = &parent_job {
+        stamp = stamp.with_simulated(j.simulated);
+    }
+    let stamp = stamp;
+
+    // Optimistic post-state for the events; the CAS makes it the
+    // real post-state on success, and on conflict nothing records.
+    let mut claimed = old.clone();
+    claimed.assignee_id = Some(user.id.clone());
+    claimed.status = StepStatus::Active;
+
+    let mut claim_events = vec![stamp.event(
+        events::STEP_UPDATED,
+        serde_json::to_value(&claimed).unwrap_or_default(),
+    )];
+    // Same grammar as the PUT path: an assignment marker only when
+    // the assignee genuinely changed (a re-claim is not an
+    // assignment), payload mirroring step.ready for messages.notify.
+    if old.assignee_id.as_deref() != Some(user.id.as_str()) && !claimed.kind.is_empty() {
+        let (subject_kind, subject_id) = if let Some(job) = &parent_job {
+            (
+                boss_core::primitives::Subject::kind(&job.subject).to_string(),
+                boss_core::primitives::Subject::id(&job.subject).to_string(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        claim_events.push(stamp.event(
+            &format!("step.assigned.{}", claimed.kind),
+            serde_json::json!({
+                "job_id": job_id.to_string(),
+                "step_id": step_id.to_string(),
+                "kind": claimed.kind,
+                "subject_kind": subject_kind,
+                "subject_id": subject_id,
+                "assignee_id": claimed.assignee_id,
+                "metadata": claimed.metadata,
+            }),
+        ));
+    }
+
+    match state
+        .jobs
+        .claim_step_at(&step_id, &user.id, stamp.timestamp, &claim_events)
+        .await
+    {
+        Ok(step) => Json(step).into_response(),
+        Err(crate::port::JobsError::ClaimConflict { holder, status }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "step already claimed or not claimable",
+                "holder": holder,
+                "status": status,
+            })),
+        )
+            .into_response(),
+        Err(crate::port::JobsError::StepNotFound(_)) => {
+            (StatusCode::NOT_FOUND, "step not found").into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus + 'static>(
     State(state): State<Arc<JobsApiState<R, B>>>,
     Path((id, step_id_str)): Path<(String, String)>,
     CurrentUser(user): CurrentUser,
+    headers: axum::http::HeaderMap,
     Json(body): Json<SignOffBody>,
 ) -> Response {
     let job_id = match parse_job_id(&id) {
@@ -782,7 +1208,75 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
         return (StatusCode::FORBIDDEN, reason).into_response();
     }
 
+    // ASSURANCE: what this step demands, and what we can actually
+    // produce. The step's own requirement wins when it is stronger
+    // than the kind's floor; a Workflow may raise, never lower.
+    let floor = state
+        .step_registry
+        .get(&step.kind)
+        .map(|t| t.assurance_floor)
+        .unwrap_or_default();
+    let required = step.assurance_required.unwrap_or_default().max(floor);
+
+    // NO BYPASS, which is the point David settled in Q3: "an assurance
+    // level with a bypass is a comment, not a control." A stamp's
+    // assurance is what the server VERIFIED, never what the caller
+    // asked for. `Presence` is producible exactly one way: the
+    // gateway's passkey ceremony verified a WebAuthn assertion over
+    // sha256(shape_hash || ":" || nonce) and swapped the resulting
+    // ticket for an `x-boss-presence` header — a header the edge
+    // strips from every inbound request, so its presence here means
+    // the gateway itself vouched. We still re-check the binding
+    // against the step's CURRENT shape: a stale hash means the
+    // content moved after the ceremony, and the stamp must not
+    // survive an edit it never saw.
     let shape = boss_core::job::step_shape_hash(&step.title, &step.metadata);
+    let presence_claim = headers
+        .get("x-boss-presence")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    let (produced, presence_nonce, presence_detail) = match &presence_claim {
+        Some(p)
+            if p["step_id"] == step_id_str.as_str()
+                && p["shape_hash"] == shape.as_str()
+                && p["employee_id"] == user.id.as_str() =>
+        {
+            (
+                boss_core::job::Assurance::Presence,
+                p["nonce"].as_str().map(String::from),
+                "",
+            )
+        }
+        Some(_) => (
+            boss_core::job::Assurance::Session,
+            None,
+            " A presence ticket WAS presented but did not match: either the step's \
+             content changed after the ceremony (stale shape hash — re-run it against \
+             the current content) or it was minted for a different step or actor.",
+        ),
+        None => (
+            boss_core::job::Assurance::Session,
+            None,
+            " Complete the passkey ceremony for this step \
+             (POST /api/auth/passkey/assert/begin, then .../finish) and retry with \
+             the issued ticket.",
+        ),
+    };
+    if required > produced {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "step requires stronger assurance than this request carries",
+                "required": required,
+                "produced": produced,
+                "detail": format!(
+                    "this step requires proof of presence — a passkey assertion bound \
+                     to the step's shape hash.{presence_detail}"
+                ),
+            })),
+        )
+            .into_response();
+    }
     if step
         .sign_offs
         .iter()
@@ -796,11 +1290,18 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
         role: role.clone(),
         stamped_at: now,
         shape_hash: shape.clone(),
+        assurance: produced,
+        presence_nonce: presence_nonce.clone(),
     };
     // OUTBOX (phase 2): the signed-off marker records in the SAME
     // transaction as the stamp append.
     let actor = boss_core::actor::ActorId::human(&user.id);
-    let event_stamp = state.publisher.stamp_with_actor_at(actor, now).await;
+    let mut event_stamp = state.publisher.stamp_with_actor(actor).await;
+    // The signed-off marker inherits the packet's admission-fixed
+    // flag, like every other event about the Job.
+    if let Ok(Some(job)) = state.jobs.get_job(&job_id).await {
+        event_stamp = event_stamp.with_simulated(job.simulated);
+    }
     let signed_off_event = event_stamp.event(
         events::STEP_SIGNED_OFF,
         serde_json::json!({
@@ -809,11 +1310,13 @@ pub(super) async fn post_step_sign_off<R: JobsRepository + 'static, B: EventBus 
             "role": role,
             "authority_id": user.id,
             "shape_hash": shape,
+            "assurance": produced,
+            "presence_nonce": presence_nonce,
         }),
     );
     if let Err(e) = state
         .jobs
-        .append_sign_off(&step_id, &stamp, now, &[signed_off_event])
+        .append_sign_off(&step_id, &stamp, event_stamp.timestamp, &[signed_off_event])
         .await
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -850,8 +1353,9 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
 
     let terminal_stamp = state
         .publisher
-        .stamp_with_actor_at(actor.clone(), now)
-        .await;
+        .stamp_with_actor(actor.clone())
+        .await
+        .with_simulated(job.simulated);
 
     // Skip every still-non-terminal step. The Job is closing on its
     // terminal outcome; any Pending/Ready/Active step is now moot.
@@ -864,11 +1368,13 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
                 s.status = StepStatus::Skipped;
                 // OUTBOX (phase 2): the skip's state event records in
                 // the SAME transaction as the row.
-                let skip_event = terminal_stamp.event(
-                    events::STEP_UPDATED,
-                    serde_json::to_value(&s).unwrap_or_default(),
-                );
-                if let Err(e) = state.jobs.update_step_at(&s, now, &[skip_event]).await {
+                let skip_event =
+                    terminal_stamp.event(events::STEP_UPDATED, events::step_state_payload(&s));
+                if let Err(e) = state
+                    .jobs
+                    .update_step_at(&s, terminal_stamp.timestamp, &[skip_event])
+                    .await
+                {
                     tracing::warn!(
                         job_id = %job_id,
                         step_id = %s.id,
@@ -916,6 +1422,20 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
                 "id": job.id.to_string(),
                 "closed_on": job.closed_on,
                 "outcome": outcome,
+                // Which protocol closed. Present on all three emit
+                // sites so a rule can select the Workflow it cares
+                // about as data: the close marker otherwise names no
+                // kind, and every consumer had to fetch the Job to
+                // find out whether the event was even about them.
+                "kind": job.kind,
+                // Present on all three sites for the same reason `kind`
+                // is: a spawning rule can only name the packet it
+                // creates from a literal or from this payload.
+                "title": job.title,
+                // See the status-transition site above: the subject is
+                // the recurring packet's stable identity, and the only
+                // key a spawn rule can dedupe a repeating finding on.
+                "subject_id": boss_core::primitives::Subject::id(&job.subject),
                 // D7: surface the delegate-subjob back-link (if any) on
                 // the close marker so the jobs.subjob_resolve rule can
                 // gate `when` on it without fetching the Job. Null for
@@ -924,7 +1444,11 @@ async fn close_job_on_terminal<R: JobsRepository + 'static, B: EventBus + 'stati
             }),
         ),
     ];
-    if let Err(e) = state.jobs.update_job_at(&job, now, &close_events).await {
+    if let Err(e) = state
+        .jobs
+        .update_job_at(&job, terminal_stamp.timestamp, &close_events)
+        .await
+    {
         tracing::warn!(job_id = %job_id, error = %e, "terminal close: failed to persist closed Job");
     }
 }
@@ -963,7 +1487,6 @@ pub(super) async fn reevaluate_and_persist<R: JobsRepository + 'static, B: Event
     state: &Arc<JobsApiState<R, B>>,
     job: &Job,
     actor: &boss_core::actor::ActorId,
-    now: chrono::DateTime<chrono::Utc>,
 ) {
     let Some(reg) = &state.kind_registry else {
         return;
@@ -997,8 +1520,9 @@ pub(super) async fn reevaluate_and_persist<R: JobsRepository + 'static, B: Event
                 crate::registry::reevaluate(&spec, &mut steps, &job.subject, &job.metadata);
             let stamp = state
                 .publisher
-                .stamp_with_actor_at(actor.clone(), now)
-                .await;
+                .stamp_with_actor(actor.clone())
+                .await
+                .with_simulated(job.simulated);
             for idx in changed {
                 let changed_step = &steps[idx];
                 // OUTBOX (phase 2): the promoted step's state event +
@@ -1008,15 +1532,15 @@ pub(super) async fn reevaluate_and_persist<R: JobsRepository + 'static, B: Event
                 // in the SAME transaction as the promotion.
                 let mut reeval_events = vec![stamp.event(
                     events::STEP_UPDATED,
-                    serde_json::to_value(changed_step).unwrap_or_default(),
+                    events::step_state_payload(changed_step),
                 )];
                 if changed_step.status == StepStatus::Ready && !changed_step.kind.is_empty() {
                     reeval_events
-                        .push(build_step_ready_event(state, job, changed_step, actor, now).await);
+                        .push(build_step_ready_event(state, job, changed_step, actor).await);
                 }
                 if let Err(e) = state
                     .jobs
-                    .update_step_at(changed_step, now, &reeval_events)
+                    .update_step_at(changed_step, stamp.timestamp, &reeval_events)
                     .await
                 {
                     tracing::warn!(
@@ -1045,14 +1569,14 @@ pub(super) async fn build_step_ready_event<R: JobsRepository + 'static, B: Event
     job: &Job,
     step: &Step,
     actor: &boss_core::actor::ActorId,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> boss_core::event::Event {
     let subject_kind = boss_core::primitives::Subject::kind(&job.subject).to_string();
     let subject_id = boss_core::primitives::Subject::id(&job.subject).to_string();
     let stamp = state
         .publisher
-        .stamp_with_actor_at(actor.clone(), now)
-        .await;
+        .stamp_with_actor(actor.clone())
+        .await
+        .with_simulated(job.simulated);
     stamp.event(
         &format!("step.ready.{}", step.kind),
         serde_json::json!({

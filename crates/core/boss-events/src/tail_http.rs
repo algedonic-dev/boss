@@ -90,6 +90,21 @@ pub struct TailQuery {
     pub until: Option<DateTime<Utc>>,
     /// Max rows to return. Clamped to [1, 500]; default 100.
     pub limit: Option<i64>,
+    /// Provenance filter: `real` hides simulated traffic, `sim` shows
+    /// only it, absent shows everything.
+    ///
+    /// This exists because the audit log is overwhelmingly synthetic —
+    /// 328,255 of 370,033 rows carried `_simulated: true` when this
+    /// was written, 89%. Filtering client-side would have meant
+    /// fetching a page and discarding nine rows in ten, so a
+    /// 100-row page showed about eleven real events. The filter has to
+    /// be where the LIMIT is applied or it does not really filter.
+    ///
+    /// The flag lives in the payload rather than a column
+    /// (`payload->>'_simulated'`), so this reads it there. `real`
+    /// COALESCEs: a row predating the flag is real, because the
+    /// simulator did not exist to have written it.
+    pub simulated: Option<String>,
 }
 
 async fn tail(
@@ -131,6 +146,16 @@ async fn tail(
     if let Some(until) = q.until {
         binds.push(Bind::Ts(until));
         sql.push_str(&format!(" AND timestamp < ${}", binds.len()));
+    }
+    // No bind: the two spellings are a closed set decided here, never
+    // caller text reaching SQL. An unrecognised value filters nothing,
+    // which keeps a typo in a URL from silently hiding the log.
+    match q.simulated.as_deref() {
+        Some("real") => {
+            sql.push_str(" AND COALESCE(payload->>'_simulated', 'false') <> 'true'");
+        }
+        Some("sim") => sql.push_str(" AND payload->>'_simulated' = 'true'"),
+        _ => {}
     }
     binds.push(Bind::Int(limit));
     sql.push_str(&format!(" ORDER BY timestamp DESC LIMIT ${}", binds.len()));

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use boss_core::job::{Job, JobStatus, Step, StepStatus};
 use boss_core::port::EventBus;
@@ -27,17 +27,25 @@ use crate::registry::{WorkflowError, WorkflowRegistry, WorkflowSpec};
 use crate::step_plugins::{StepPluginError, StepPluginRegistry, StepPluginSpec};
 use crate::step_registry::StepRegistry;
 
+pub mod machine_gate;
+
+mod census;
 mod jobs;
 mod kinds;
 mod plugins;
 mod sim_clock;
+mod stations;
 mod steps;
+mod terminal_report;
 
+use census::*;
 use jobs::*;
 use kinds::*;
 use plugins::*;
 use sim_clock::*;
+use stations::*;
 use steps::*;
+use terminal_report::*;
 
 const DEFAULT_LIMIT: i64 = 100;
 const MAX_LIMIT: i64 = 1000;
@@ -65,6 +73,11 @@ pub struct JobsApiState<R: JobsRepository, B: EventBus> {
     /// The job_edges registry (read-only; edges are declared in
     /// migrations). None → 503 on the read route.
     pub job_edges: Option<Arc<dyn crate::job_edges::JobEdgesRegistry>>,
+    /// Station registry (stations.md) — the data-defined priority
+    /// queues over packets. Same optionality semantics as
+    /// `kind_registry`: None → 503 on the /api/stations routes and
+    /// the claim path's station gate.
+    pub stations: Option<Arc<dyn crate::stations::StationRegistry>>,
     /// Cross-service client for the global calendar primitive
     /// (`docs/architecture-decisions.md` §Calendar). When set, scheduling
     /// steps that transition `ready → active` with full
@@ -137,11 +150,51 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         .route("/api/jobs", post(create_job::<R, B>))
         .route("/api/jobs/{id}", get(get_job::<R, B>))
         .route("/api/jobs/{id}", put(update_job::<R, B>))
+        // Top-level metadata merge — the atomic alternative to the
+        // GET → spread → full PUT read-modify-write. `null` removes.
+        .route("/api/jobs/{id}/metadata", patch(patch_job_metadata::<R, B>))
         .route("/api/jobs/{id}/stream", get(job_stream::<R, B>))
         .route("/api/jobs/step-types", get(list_step_types::<R, B>))
+        // Station registry — data-defined priority queues over
+        // packets (docs/design/stations.md). Append-only and
+        // versioned like the Workflow registry, and editable at run
+        // time: a queue is redrawn by publishing a new version, never
+        // by a deploy.
+        .route(
+            "/api/stations",
+            get(list_stations::<R, B>).post(create_station::<R, B>),
+        )
+        // The packet-loss census door (packet-loss.md Q3): the
+        // dispatcher's `network.census` handler measures over the
+        // read surfaces above and lands its counts here, one
+        // `jobs.network.census` event per firing.
+        .route("/api/network/census", post(record_network_census::<R, B>))
+        .route("/api/stations/load", get(stations_load::<R, B>))
+        // Author-time dry run: lint a spec without persisting, so the
+        // editor surfaces the same `station_lint::gate_active` the
+        // publish path enforces.
+        .route("/api/stations/_validate", post(validate_station::<R, B>))
+        .route("/api/stations/{name}/queue", get(station_queue::<R, B>))
+        .route(
+            "/api/stations/{name}/versions",
+            get(list_station_versions::<R, B>),
+        )
+        .route(
+            "/api/stations/{name}/versions/{version}",
+            get(get_station_version::<R, B>),
+        )
+        .route(
+            "/api/stations/{name}/publish",
+            post(publish_station::<R, B>),
+        )
+        .route("/api/stations/{name}/retire", post(retire_station::<R, B>))
         .route("/api/jobs/{id}/steps", get(list_steps::<R, B>))
         .route("/api/jobs/{id}/steps", post(add_step::<R, B>))
         .route("/api/jobs/{id}/steps/{step_id}", put(update_step::<R, B>))
+        .route(
+            "/api/jobs/{id}/steps/{step_id}/claim",
+            post(claim_step::<R, B>),
+        )
         .route(
             "/api/jobs/{id}/steps/{step_id}/sign-offs",
             post(post_step_sign_off::<R, B>),
@@ -152,10 +205,10 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
             "/api/workflows",
             get(list_kinds::<R, B>).post(create_kind::<R, B>),
         )
-        // Author-time dry run: lint a draft spec without persisting, so
-        // the editor surfaces the same validate_all the publish path
-        // enforces (live, on the graph). See architecture-decisions.md
-        // §Jobs, Workflows, Steps.
+        // Author-time dry run: lint a draft spec without persisting,
+        // so the editor surfaces the same `workflow_lint::gate_active`
+        // the publish path enforces (live, on the graph). See
+        // architecture-decisions.md §Jobs, Workflows, Steps.
         .route("/api/workflows/_validate", post(validate_kind::<R, B>))
         .route(
             "/api/workflows/{kind}",
@@ -168,6 +221,13 @@ pub fn router<R: JobsRepository + 'static, B: EventBus + 'static>(
         .route(
             "/api/workflows/{kind}/versions/{version}",
             get(get_kind_version::<R, B>),
+        )
+        // Experiments Tier 1 (docs/design/network-experiments.md):
+        // the per-version terminal report — measurement of what
+        // version pinning already records.
+        .route(
+            "/api/workflows/{kind}/terminal-report",
+            get(workflow_terminal_report::<R, B>),
         )
         .route("/api/workflows/{kind}/publish", post(publish_kind::<R, B>))
         .route("/api/workflows/{kind}/retire", post(retire_kind::<R, B>))
@@ -277,6 +337,55 @@ pub(super) async fn validate_custom_subject<R: JobsRepository, B: EventBus>(
     subject: &boss_core::job::Subject,
 ) -> Result<(), Response> {
     check_custom_subject(state.subject_kinds.as_ref(), subject).await
+}
+
+// ---------------------------------------------------------------------------
+// Shared policy-scope translation
+// ---------------------------------------------------------------------------
+
+/// Translate the caller's read-scope `Predicate` into the `JobScope`
+/// the adapter can push into SQL. `DepartmentIs` is the odd one out:
+/// Jobs don't carry a department column, so it's either "all"
+/// (caller's department matches) or "none" (it doesn't). Shared by
+/// the /api/jobs list and the station queue lens so every packet
+/// read surface passes through ONE policy path.
+pub(super) fn job_scope_from_predicate(
+    user: &boss_policy_client::User,
+    predicate: &boss_policy_client::Predicate,
+) -> JobScope {
+    match predicate {
+        boss_policy_client::Predicate::Unrestricted => JobScope::All,
+        boss_policy_client::Predicate::None => JobScope::None,
+        boss_policy_client::Predicate::OwnerIs { user_id } => JobScope::OwnerIs(user_id.clone()),
+        boss_policy_client::Predicate::OwnerIn { user_ids } => JobScope::OwnerIn(user_ids.clone()),
+        boss_policy_client::Predicate::AccountIn { account_ids } => {
+            JobScope::AccountIn(account_ids.clone())
+        }
+        boss_policy_client::Predicate::DepartmentIs { department } => {
+            if user.department.as_deref() == Some(department.as_str()) {
+                JobScope::All
+            } else {
+                JobScope::None
+            }
+        }
+    }
+}
+
+/// The id a station predicate's [`crate::station_queue::SELF`]
+/// placeholder binds to for this request, or `None` when the caller is
+/// not an identified actor.
+///
+/// `ambient_actor()` is already the platform's answer to "is there
+/// somebody behind this request" — it returns `None` for an anonymous
+/// caller — so the guest case is settled by the existing identity rule
+/// rather than by a second hardcoded sentinel here. The id itself is
+/// `user.id`, because that is what a packet records when it names who
+/// filed it.
+///
+/// Shared by the station queue read and the claim gate: both ask a
+/// per-actor station the same question, so both must bind the same id.
+pub(super) fn self_id(user: &boss_policy_client::User) -> Option<&str> {
+    user.ambient_actor().is_some().then_some(user.id.as_str())
 }
 
 // ---------------------------------------------------------------------------

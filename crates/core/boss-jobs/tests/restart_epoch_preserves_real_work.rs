@@ -19,8 +19,6 @@
 //! failed and nothing was logged; the Jobs were simply gone the next
 //! time the board was read.
 
-#![cfg(feature = "postgres")]
-
 use boss_jobs::postgres::trim_epoch_audit_log;
 use boss_testing::TestDb;
 

@@ -1,7 +1,5 @@
 //! Manual — in-memory + Postgres port-conformance tests.
 
-#![cfg(feature = "postgres")]
-
 use boss_content::types::{Audience, ManualPatch, ManualSectionDraft, UserContext};
 use boss_content::{ContentError, ContentRepository, InMemoryContent, PgContent};
 use boss_testing::TestDb;

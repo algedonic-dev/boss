@@ -48,3 +48,7 @@ workspace = true
 name = "boss-subjects-rebuild"
 path = "src/bin/boss_subjects_rebuild.rs"
 required-features = ["rebuild-bin"]
+
+[[test]]
+name = "subjects_pg"
+required-features = ["postgres"]

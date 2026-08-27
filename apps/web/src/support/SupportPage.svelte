@@ -36,6 +36,10 @@
   let jobsPage = $state<Paged<Job> | null>(null);
   let accounts = $state<Account[]>([]);
   let devicesPage = $state<Paged<Asset> | null>(null);
+  /// Non-null when the case-list load failed — rendered instead of
+  /// the empty states, so an outage never reads as "no open cases"
+  /// (packet 3fba9c35, the false-empty sweep).
+  let loadFailed = $state<string | null>(null);
   let loading = $state(true);
   let tab = $state<Tab>('overview');
 
@@ -54,13 +58,25 @@
         ]);
         const pBody = pResp.ok ? await pResp.json() : [];
         if (!cancelled) {
-          jobsPage = jPaged;
+          // The jobs list is the page's primary dataset — its failure
+          // is the page's failure. Devices/accounts enrich the rows
+          // and degrade to dashes as before.
+          if (jPaged.kind === 'ready') {
+            jobsPage = jPaged.page;
+            loadFailed = null;
+          } else {
+            jobsPage = null;
+            loadFailed = jPaged.error;
+          }
           accounts = Array.isArray(pBody) ? pBody : (pBody.data ?? []);
-          devicesPage = dPaged;
+          devicesPage = dPaged.kind === 'ready' ? dPaged.page : null;
           loading = false;
         }
-      } catch {
-        if (!cancelled) loading = false;
+      } catch (e) {
+        if (!cancelled) {
+          loadFailed = e instanceof Error ? e.message : String(e);
+          loading = false;
+        }
       }
     })();
     return () => {
@@ -187,6 +203,10 @@
 
   {#if loading}
     <p class="empty">Loading…</p>
+  {:else if loadFailed && tab === 'overview'}
+    <p class="empty load-failed" role="alert">
+      Couldn't load cases — {loadFailed}
+    </p>
   {:else if tab === 'overview'}
     <div class="tab-content" style="display:flex; flex-wrap:wrap; gap:16px; padding:16px 0">
       <Section title="Case volume">
@@ -206,7 +226,11 @@
     </div>
   {:else if tab === 'active'}
     <section class="list-section" style="padding:16px 0">
-      {#if activeRows.length === 0}
+      {#if loadFailed}
+        <p class="empty load-failed" role="alert">
+          Couldn't load cases — {loadFailed}
+        </p>
+      {:else if activeRows.length === 0}
         <p class="empty">No open cases.</p>
       {:else}
         <table class="data-table data-table-striped">
@@ -265,7 +289,11 @@
     </section>
   {:else if tab === 'account-health'}
     <section class="list-section" style="padding:16px 0">
-      {#if accountHealthRows.length === 0}
+      {#if loadFailed}
+        <p class="empty load-failed" role="alert">
+          Couldn't load cases — {loadFailed}
+        </p>
+      {:else if accountHealthRows.length === 0}
         <p class="empty">No account data.</p>
       {:else}
         <table class="data-table data-table-striped">

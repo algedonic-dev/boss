@@ -45,3 +45,19 @@ sqlx = { version = "0.8", default-features = false, features = ["macros", "runti
 
 [lints]
 workspace = true
+
+[[test]]
+name = "all_sources_pushdown_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "fleet_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "steps_source_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "subject_linkage_pg"
+required-features = ["postgres"]

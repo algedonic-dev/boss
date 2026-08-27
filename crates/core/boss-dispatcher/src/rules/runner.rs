@@ -15,7 +15,7 @@ use futures::StreamExt;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Max events processed in parallel. A strictly-serial loop awaits each
 /// event's handlers (1-2 HTTP round-trips) before pulling the next, which
@@ -198,11 +198,30 @@ impl RulesRunner {
         payload: &Value,
     ) -> boss_nats::durable::Settle {
         use boss_nats::durable::Settle;
-        let matched =
-            match registry::match_event(&self.registry, topic, payload, self.helpers.as_ref()) {
-                Ok(m) => m,
-                Err(e) => return Settle::Retry(format!("matching event on {topic}: {e}")),
-            };
+        let registry::MatchOutcome { matched, skipped } =
+            registry::match_event(&self.registry, topic, payload, self.helpers.as_ref());
+        // A rule that cannot be evaluated is skipped, LOUDLY, and its
+        // neighbours still fire. It used to abort matching for the whole
+        // topic, so one bad arg reference silenced every rule bound to
+        // that subject until the event dead-lettered.
+        //
+        // These never retry. A predicate that will not evaluate or an
+        // arg that names a field the payload does not carry fails
+        // identically on every redelivery - it is a defect in the rule
+        // text, not a transient. Burning the redelivery budget on it
+        // only delays the same outcome, which is what the eight NAKs
+        // before the 2026-08-24 dead-letter bought us.
+        for s in &skipped {
+            error!(
+                rule = %s.rule,
+                topic = %topic,
+                triggering_event = %event_id,
+                class = "permanent",
+                error = %s.err,
+                "RULE-SKIPPED: rule could not be evaluated and did not fire; \
+                 other rules on this topic were unaffected (fix the rule and republish)"
+            );
+        }
         if matched.is_empty() {
             return Settle::Ack;
         }

@@ -1,0 +1,56 @@
+# file_refs garbage collection — in-cluster chore (migration packet 68744407).
+#
+# Mirrors the boss-gcp timer's cadence and contract; the rule it obeys
+# is the one the search/views chores established: a chore runs against
+# the database of the instance whose packet it completes. Config files
+# come from boss-generate-configs — the same generator the pod's own
+# services use at start, pointed at the same secret.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: boss-files-gc
+  namespace: boss
+  labels:
+    boss-chore: "true"
+spec:
+  schedule: "15 4 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: chore
+              image: 10.20.0.15:3000/david/boss:latest
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  /usr/local/bin/boss-generate-configs
+                  /usr/local/bin/boss-maintenance-wrap.sh maintenance-files-gc "file_refs garbage collection"
+                  # file_refs has never been configured on (no [files] block), so
+                  # this no-ops today — which is the honest result: the SoR's
+                  # files are off, and the packet records a run that had
+                  # nothing to collect.
+                  /usr/local/bin/boss-files-gc --config /etc/boss-content-api.toml
+                  /usr/local/bin/boss-step.sh maintenance-files-gc run result=ok
+              env:
+                - name: RUST_LOG
+                  value: info
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: boss-secrets
+                      key: database-url
+                - name: BOSS_JOBS_URL
+                  value: http://boss-jobs-internal.boss.svc.cluster.local:7900
+                - name: BOSS_MACHINE_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: boss-secrets
+                      key: machine-token
+                      optional: true

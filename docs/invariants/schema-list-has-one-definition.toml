@@ -1,0 +1,8 @@
+[[invariant]]
+id = "schema-list-has-one-definition"
+claim = "The schema list has one definition."
+source = "CLAUDE.md §9a; crates/core/boss-testing/build.rs"
+enforcement = "enforced"
+mechanism = "crates/core/boss-testing/build.rs"
+last_verified = ""
+note = "Collapsed twice. First build.rs generated SCHEMA_FILES from manifest.txt, which removed the second hand-maintained list but left the manifest itself as a contended tail line — any two cars carrying a migration conflicted there, four re-rails on 2026-08-13 and two stranded cars on 2026-08-14. So on 2026-08-15 the manifest was deleted and the DIRECTORY became the definition: build.rs and migrate.sh each sort infra/postgres/schema/*.sql by the numeric NNN- prefix, and test_db.rs re-reads the directory at run time as the backstop against a stale OUT_DIR artifact. Three readers, one definition, and nothing to append."

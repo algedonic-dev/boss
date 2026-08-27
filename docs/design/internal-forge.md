@@ -8,7 +8,8 @@ trains, deployed periodically … I think we also have maintenance
 missing here."
 **Related**: [dev-cluster.md](./dev-cluster.md) (declared this as
 the after-runners direction) · [idm-kanidm.md](./idm-kanidm.md) ·
-[it-activity-network.md](./it-activity-network.md)
+[stations.md](./stations.md) — the forge and its runners become
+instrumented stations
 
 ## What internalizing buys
 
@@ -71,7 +72,7 @@ implementation.
 
 Resolved 2026-08-12 — accept.
 
-Forgejo — decided de facto and running (10.20.0.15:3000: git, the OCI registry the CI image pulls from, and a registered Actions runner; fa7191b is the adoption act). Placement in two stages: the interim LAN box is legitimate for CI-shadowing, and its Forgejo data dir enters the backup set now — until then the GitHub mirror is its only off-host copy. Cluster placement lands per dev-cluster topology, now schedulable: the cluster is up and running BOSS, Kanidm, and Longhorn.
+Forgejo — decided de facto and running (<forge-host>:3000: git, the OCI registry the CI image pulls from, and a registered Actions runner; fa7191b is the adoption act). Placement in two stages: the interim LAN box is legitimate for CI-shadowing, and its Forgejo data dir enters the backup set now — until then the GitHub mirror is its only off-host copy. Cluster placement lands per dev-cluster topology, now schedulable: the cluster is up and running BOSS, Kanidm, and Longhorn.
 
 **Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
 
@@ -98,7 +99,7 @@ The ship-a-change review step gains sign_offs_required: [operator] — a version
 
 Resolved 2026-08-12 — accept.
 
-Forgejo-to-GitHub push-mirror on every main update, superseding dev-cluster's 'daily'. The mirror is a disaster-recovery artifact of the system of record — a day-stale copy is a day of lost commits — and the GitHub-native checks (CodeQL, Scorecard, install-smoke) only audit what the mirror shows them. Inbound stays deliberate-pull via GitHub PRs; the fork model keeps external code off internal runners.
+Forgejo-to-GitHub push-mirror on every main update, superseding dev-cluster's 'daily'. The mirror is a disaster-recovery artifact of the system of record — a day-stale copy is a day of lost commits — and the GitHub-native checks (CodeQL, Scorecard) only audit what the mirror shows them. (install-smoke was in that list, but it is not currently a live automated check: the forge copy has been workflow_dispatch-only since 2026-08-18 — its compose run took the CI runner's network down — and the mirror copy's guardianship is not current, since the mirror only advances when a publish is pushed.) Inbound stays deliberate-pull via GitHub PRs; the fork model keeps external code off internal runners.
 
 **Rationale:** David approved the worked recommendations 2026-08-11 (evidence-grounded decision sheet); recorded by claude:fable.
 

@@ -844,28 +844,7 @@ async fn main() -> Result<()> {
             let guard = engine.lock().expect("engine mutex poisoned");
             guard.tenant.meta.ticks_per_day()
         };
-        // Backfill runs at DAY granularity; live runs at the tenant's
-        // own (hourly). Warp is the phase marker again — the same one
-        // the go-live guard reads — so there is no second knob and no
-        // way for the two to disagree about which phase we are in.
-        //
-        // This is not a speed-up by itself: `per_tick_sleep_ms`
-        // divides one wall budget N ways, so 24 ticks and 1 tick cost
-        // the same per sim-day. What it buys is HEADROOM — one batch
-        // of work per sim-day instead of 24 — and headroom is what
-        // makes a shorter budget (higher warp) sustainable. Warp past
-        // ~2000 was previously "chase dead" at hourly granularity for
-        // exactly this reason: the day's work stopped fitting in the
-        // day's budget and the sim fell behind its own clock.
-        //
-        // Intra-day detail in fabricated history is the thing being
-        // traded away, and nothing evaluates it. The live segment —
-        // where the real measurement happens — keeps full resolution.
-        let ticks_per_day = if clock.warp_factor.unwrap_or(1.0) > 1.0 {
-            1
-        } else {
-            ticks_per_day
-        };
+        let ticks_per_day = effective_ticks_per_day(clock.warp_factor, ticks_per_day);
         assert!(ticks_per_day > 0);
         // Run only sim-days the daemon hasn't run yet — (cursor,
         // current_sim_date], each exactly once. While the warp clock sits
@@ -929,6 +908,7 @@ async fn main() -> Result<()> {
                 callbacks.clone(),
                 day,
                 tick_idx,
+                ticks_per_day,
             )
             .await
             {
@@ -975,9 +955,9 @@ async fn main() -> Result<()> {
             // writes) + cadence. Cheap post-tick snapshot copy.
             global_tick += 1;
             {
-                let wf = workforce
+                let (wf, coverage) = workforce
                     .lock()
-                    .map(|w| w.stats.clone())
+                    .map(|w| (w.stats.clone(), w.actor_coverage()))
                     .unwrap_or_default();
                 let api = output.lock().map(|o| o.stats.clone()).unwrap_or_default();
                 let actors = boss_sim::api_activity::snapshot(&api_activity);
@@ -988,6 +968,7 @@ async fn main() -> Result<()> {
                         &wf,
                         &api,
                         actors,
+                        coverage,
                     );
                 }
             }
@@ -1004,11 +985,38 @@ async fn main() -> Result<()> {
             // daemon only drives + logs. We never write sim_clock from here
             // — a late write could regress it behind clock-api and show the
             // SPA a date older than the events being written.
+            //
+            // jobs_created_* are the engine's cumulative-since-boot
+            // counters — the self-diagnosis for the tick-strength
+            // class of defect. A year of warp that shows
+            // jobs_created_total in the tens instead of the
+            // thousands, or a rate-driven kind missing from the top
+            // entries it should dominate, is visible here without a
+            // DB query. INFO carries a total + the top few kinds so
+            // the once-per-sim-day line stays one line; the full
+            // per-kind map is a RUST_LOG=debug flip away for
+            // forensics on a specific starved kind.
+            let (jobs_created_total, top_kinds, all_kinds) = {
+                let guard = engine.lock().expect("engine mutex poisoned");
+                let by_kind = &guard.state.counters.jobs_created_by_kind;
+                (
+                    guard.state.counters.jobs_created,
+                    jobs_by_kind_summary(by_kind, 5),
+                    jobs_by_kind_summary(by_kind, usize::MAX),
+                )
+            };
             info!(
                 ran_through = %ran_through,
                 slices_this_pass,
                 ticks_per_day,
+                jobs_created_total,
+                jobs_created_top_kinds = %top_kinds,
                 "sim-day complete"
+            );
+            tracing::debug!(
+                ran_through = %ran_through,
+                jobs_created_by_kind = %all_kinds,
+                "sim-day job totals by kind"
             );
         }
     }
@@ -1055,6 +1063,56 @@ fn clock_from_now(now: &boss_clock_client::ClockNow) -> Clock {
         warp_factor: now.warp_factor,
         restart_in_progress: now.restart_in_progress,
     }
+}
+
+/// How many slices this daemon runs per sim-day — THE clock.
+///
+/// Backfill runs at DAY granularity; live runs at the tenant's
+/// own (`tick_duration = "1m"` → 1440). Warp is the phase marker
+/// again — the same one the go-live guard reads — so there is no
+/// second knob and no way for the two to disagree about which
+/// phase we are in.
+///
+/// This is not a speed-up by itself: `per_tick_sleep_ms` divides
+/// one wall budget N ways, so N ticks and 1 tick cost the same
+/// per sim-day. What it buys is HEADROOM — one batch of work per
+/// sim-day instead of N — and headroom is what makes a shorter
+/// budget (higher warp) sustainable. Warp past ~2000 was
+/// previously "chase dead" at sub-day granularity for exactly
+/// this reason: the day's work stopped fitting in the day's
+/// budget and the sim fell behind its own clock.
+///
+/// Intra-day detail in fabricated history is the thing being
+/// traded away, and nothing evaluates it. The live segment —
+/// where the real measurement happens — keeps full resolution.
+///
+/// The value returned here is threaded through `advance_one_tick`
+/// into `run_brewery_one_tick`: the engine sizes ticks from THIS
+/// number, never from the tenant's own `ticks_per_day()`. When the
+/// engine re-derived it, warp days ran ONE slice sized `1/1440` of
+/// a day and every Poisson rate in the fabricated year ran at
+/// 1/1440 strength (seasonal-release fired 3 times ever, intended
+/// ~30/yr).
+fn effective_ticks_per_day(warp_factor: Option<f64>, tenant_ticks_per_day: u32) -> u32 {
+    if warp_factor.unwrap_or(1.0) > 1.0 {
+        1
+    } else {
+        tenant_ticks_per_day
+    }
+}
+
+/// Render `jobs_created_by_kind` as `kind:count` pairs, highest
+/// count first (ties alphabetical), truncated to `limit` entries.
+/// Feeds the "sim-day complete" log line's self-diagnosis fields.
+fn jobs_by_kind_summary(by_kind: &HashMap<String, u64>, limit: usize) -> String {
+    let mut pairs: Vec<(&str, u64)> = by_kind.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    pairs.truncate(limit);
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{k}:{v}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// One unit of simulated work: a sim-day and which slice of it.
@@ -1175,6 +1233,58 @@ mod day_cursor_tests {
 
     fn t(y: i32, m: u32, day: u32, h: u32, min: u32) -> chrono::DateTime<chrono::Utc> {
         d(y, m, day).and_hms_opt(h, min, 0).unwrap().and_utc()
+    }
+
+    #[test]
+    fn warp_collapses_to_one_slice_and_live_keeps_the_tenants() {
+        assert_eq!(effective_ticks_per_day(Some(8760.0), 1440), 1);
+        assert_eq!(effective_ticks_per_day(Some(1.5), 1440), 1);
+        assert_eq!(effective_ticks_per_day(Some(1.0), 1440), 1440);
+        assert_eq!(effective_ticks_per_day(None, 1440), 1440);
+        assert_eq!(effective_ticks_per_day(None, 24), 24);
+    }
+
+    /// The daemon/engine boundary invariant, phase by phase: for
+    /// whatever N this daemon slices a sim-day into, the ticks the
+    /// engine builds from that same N (it is a parameter now — the
+    /// engine cannot re-derive its own) sum to 24.0 hours. Under
+    /// warp N=1 used to meet an engine-derived 1440 and a "day" was
+    /// one minute of rate strength.
+    #[test]
+    fn a_sim_days_slices_sum_to_24_hours_in_both_phases() {
+        let tenant_tpd = 1440; // brewery tenant.toml: tick_duration = "1m"
+        for warp in [Some(8760.0), None] {
+            let n = effective_ticks_per_day(warp, tenant_tpd);
+            let total: f64 = (0..n)
+                .map(|i| boss_sim::engines::tick_for(i, n).duration_hours)
+                .sum();
+            assert!(
+                (total - 24.0).abs() < 1e-9,
+                "warp={warp:?}: {n} slices sum to {total}h, want 24.0"
+            );
+        }
+    }
+
+    #[test]
+    fn jobs_by_kind_summary_sorts_truncates_and_breaks_ties_by_name() {
+        let by_kind: HashMap<String, u64> = [
+            ("tap-launch".to_string(), 2),
+            ("seasonal-release".to_string(), 3),
+            ("wholesale-order".to_string(), 4100),
+            ("equipment-pm".to_string(), 13),
+            ("retail-restock".to_string(), 13),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            jobs_by_kind_summary(&by_kind, 3),
+            "wholesale-order:4100,equipment-pm:13,retail-restock:13"
+        );
+        assert_eq!(
+            jobs_by_kind_summary(&by_kind, usize::MAX),
+            "wholesale-order:4100,equipment-pm:13,retail-restock:13,seasonal-release:3,tap-launch:2"
+        );
+        assert_eq!(jobs_by_kind_summary(&HashMap::new(), 5), "");
     }
 
     #[test]
@@ -1563,6 +1673,7 @@ async fn advance_one_tick(
     callbacks: Arc<Mutex<VecDeque<SimBusEvent>>>,
     day: NaiveDate,
     tick_idx: u32,
+    ticks_per_day: u32,
 ) -> Result<()> {
     tokio::task::spawn_blocking(move || -> Result<_> {
         let mut engine_guard = engine.lock().expect("engine mutex poisoned");
@@ -1583,7 +1694,13 @@ async fn advance_one_tick(
                 engine_guard.bus.emit(ev);
             }
         }
-        run_brewery_one_tick(&mut engine_guard, day, tick_idx, &mut *output_guard)
+        run_brewery_one_tick(
+            &mut engine_guard,
+            day,
+            tick_idx,
+            ticks_per_day,
+            &mut *output_guard,
+        )
     })
     .await
     .context("spawn_blocking advance_one_tick")??;

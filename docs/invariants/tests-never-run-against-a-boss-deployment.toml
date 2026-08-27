@@ -1,0 +1,8 @@
+[[invariant]]
+id = "tests-never-run-against-a-boss-deployment"
+claim = "`TestDb` refuses to create a scratch database on any Postgres server that hosts a database named `boss`."
+source = "crates/core/boss-testing/src/test_db.rs (production_refusal); infra/cluster/manifests/boss-dev.yaml"
+enforcement = "enforced"
+mechanism = "crates/core/boss-testing/src/test_db.rs"
+last_verified = "2026-08-15"
+note = "`production_refusal` runs on the admin connection before any CREATE DATABASE and panics with the way out; three unit tests cover refuse/allow/override. Exercised against a real server rather than only in unit tests: a decoy `boss` database was planted on the scratch instance, the suite refused on every test, passed 7/7 with BOSS_TEST_ALLOW_PRODUCTION_SERVER=1, and passed 7/7 again once the decoy was dropped. On 2026-08-14 a `cargo test --workspace` created 582 scratch databases on the production cluster through a forgotten `kubectl port-forward`, filled the Longhorn PVC and put Postgres into recovery. Nothing was lost, by luck. Host and port cannot distinguish the cases — a laptop's own Postgres and a port-forwarded production one are both 127.0.0.1, and the admin database is `postgres` in both. What separates them is that a scratch instance has no reason to hold a database called `boss`. The boss-dev pod is the other half: it moves the DEFAULT onto a sidecar that cannot be production, so the guard is the backstop rather than the only line."

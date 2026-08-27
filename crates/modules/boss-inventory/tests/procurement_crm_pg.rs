@@ -2,8 +2,6 @@
 //! 1). Round-trips contacts / interactions / account-team / contracts
 //! through a real Postgres DB to validate schema + adapter + HTTP.
 
-#![cfg(feature = "postgres")]
-
 use axum::http::StatusCode;
 use boss_inventory::procurement::http::{ProcurementApiState, router};
 use boss_testing::{TestDb, TestRequest};

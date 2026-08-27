@@ -53,7 +53,7 @@ fn a_doc_with_open_questions_and_no_review_spawns_one() {
         &indexed_payload(5),
         &StubReviews(false),
     )
-    .expect("eval");
+    .matched;
     assert_eq!(hits.len(), 1, "open questions + no review → spawn");
     let args = &hits[0].invocations[0].args;
     let get = |k: &str| {
@@ -89,7 +89,7 @@ fn an_existing_open_review_suppresses_the_spawn() {
         &indexed_payload(5),
         &StubReviews(true),
     )
-    .expect("eval");
+    .matched;
     assert!(
         hits.is_empty(),
         "indexed re-fires on every question-count change; the dedup must hold"
@@ -105,7 +105,7 @@ fn a_doc_with_no_open_questions_stays_silent() {
         &indexed_payload(0),
         &StubReviews(false),
     )
-    .expect("eval");
+    .matched;
     assert!(
         hits.is_empty(),
         "a fully-resolved doc needs no review — nothing to answer"

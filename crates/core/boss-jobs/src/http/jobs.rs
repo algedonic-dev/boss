@@ -38,6 +38,19 @@ pub(super) struct ListJobsQuery {
     /// here; the stored value may be a >= 8-char prefix). The
     /// clear-on-close handler's query.
     waiting_on: Option<String>,
+    /// Terminal retention window, in days. `closed_within=14` returns
+    /// live packets plus anything closed in the last fortnight, and
+    /// drops the rest — what a BOARD wants, since it must fetch
+    /// terminal packets to place them in terminal columns but has no
+    /// use for a year of them. The feedback board was pulling all 173
+    /// user-feedback packets to show 14 live ones and was 27 short of
+    /// silently truncating at its own limit.
+    closed_within: Option<i64>,
+    /// `simulated=false` drops the demo tenant's packets; `true` keeps
+    /// only those; absent is everything, so no existing caller moves.
+    /// 87% of packets are simulated, so a surface that wants real work
+    /// has to say so in the query rather than filter the page it got.
+    simulated: Option<bool>,
 }
 
 pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static>(
@@ -61,26 +74,10 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
     };
 
     // Translate the Predicate into a JobScope the adapter can push
-    // into SQL. `DepartmentIs` is the odd one out: Jobs don't carry
-    // a department column, so it's either "all" (caller's department
-    // matches) or "none" (it doesn't). The handler short-circuits
-    // before hitting the adapter in the mismatch case.
-    let scope = match &predicate {
-        boss_policy_client::Predicate::Unrestricted => JobScope::All,
-        boss_policy_client::Predicate::None => JobScope::None,
-        boss_policy_client::Predicate::OwnerIs { user_id } => JobScope::OwnerIs(user_id.clone()),
-        boss_policy_client::Predicate::OwnerIn { user_ids } => JobScope::OwnerIn(user_ids.clone()),
-        boss_policy_client::Predicate::AccountIn { account_ids } => {
-            JobScope::AccountIn(account_ids.clone())
-        }
-        boss_policy_client::Predicate::DepartmentIs { department } => {
-            if user.department.as_deref() == Some(department.as_str()) {
-                JobScope::All
-            } else {
-                JobScope::None
-            }
-        }
-    };
+    // into SQL — shared with the station queue lens
+    // (`job_scope_from_predicate`), so every packet read surface
+    // passes through one policy path.
+    let scope = job_scope_from_predicate(&user, &predicate);
 
     let filter = JobFilter {
         kind: q.kind,
@@ -89,7 +86,9 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
         owner_id: q.owner_id,
         subject_id: q.subject_id,
         waiting_on: q.waiting_on,
+        closed_since: closed_since_from(q.closed_within, &state).await,
         scope,
+        simulated: q.simulated,
         ..Default::default()
     };
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
@@ -121,6 +120,22 @@ pub(super) async fn list_jobs<R: JobsRepository + 'static, B: EventBus + 'static
         "offset": offset,
     }))
     .into_response()
+}
+
+/// Resolve `closed_within=<days>` to a date on the authoritative
+/// clock, not the process's wall time — the sim runs on boss-clock and
+/// a board asking for "the last 14 days" must mean the same fortnight
+/// the packets were closed in.
+async fn closed_since_from<R: JobsRepository, B: EventBus>(
+    days: Option<i64>,
+    state: &JobsApiState<R, B>,
+) -> Option<chrono::NaiveDate> {
+    let days = days?;
+    // Negative or absurd values are a caller mistake, not a filter:
+    // clamp rather than return an empty board with no explanation.
+    let days = days.clamp(0, 3650);
+    let today = boss_clock_client::now_from(&state.clock).await.date_naive();
+    Some(today - chrono::Duration::days(days))
 }
 
 #[derive(Deserialize)]
@@ -182,10 +197,54 @@ pub(super) async fn list_assignments<R: JobsRepository + 'static, B: EventBus + 
     {
         Ok(rows) => {
             let total = rows.len();
-            Json(serde_json::json!({ "data": rows, "total": total })).into_response()
+            let data: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| assignment_row_json(r, &state.step_registry))
+                .collect();
+            Json(serde_json::json!({ "data": data, "total": total })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// One assignment row, plus the completion contract of its step kind.
+///
+/// WHY THE SERVER ANSWERS THIS. David, 2026-08-16: *"it probably makes
+/// sense to have a special separation between jobs that are in a queue
+/// with a human-only policy with jobs that agents are also eligible
+/// for as a practical consideration"* — and, on why the distinction
+/// matters at all: *"We intentionally do not want many protocols where
+/// policy requires a human because that is slow."*
+///
+/// That separation is already data. `StepType::completion` is the
+/// closed axis of the step alphabet: `human` means an operator holding
+/// the `authority_role` completes it, `agent` means the dispatcher
+/// executes it on `step.ready` and the human workforce never pulls it.
+/// So the queue split needs no new field, no new policy concept, and
+/// no list of kinds in the frontend — just the registry fact the
+/// server already holds, carried on the row.
+///
+/// `null` when the StepType registry does not know the kind. That is
+/// a real condition (a tenant protocol naming a kind this deployment
+/// has not registered) and it is reported rather than smoothed over;
+/// the reader's job is to treat an unknown contract as needing a
+/// person, which is the safe direction — it puts the packet in front
+/// of somebody instead of filing it under "an agent will get it".
+fn assignment_row_json(
+    row: &crate::port::AssignmentRow,
+    steps: &crate::step_registry::StepRegistry,
+) -> serde_json::Value {
+    let mut v = serde_json::to_value(row).unwrap_or_default();
+    v["step"]["completion"] = serde_json::to_value(steps.get(&row.step.kind).map(|t| t.completion))
+        .unwrap_or(serde_json::Value::Null);
+    // The second registry fact the queues split on (291a73a7, option
+    // c): is completing this step a DECISION? Same null-when-unknown
+    // contract as `completion`, and the same safe direction for the
+    // reader — an unknown kind is treated as a decision for a person.
+    v["step"]["decision_shaped"] =
+        serde_json::to_value(steps.get(&row.step.kind).map(|t| t.decision_shaped))
+            .unwrap_or(serde_json::Value::Null);
+    v
 }
 
 #[derive(Deserialize)]
@@ -253,11 +312,19 @@ pub(super) async fn jobs_live<R: JobsRepository + 'static, B: EventBus + 'static
         kind: None,
         kind_prefix: None,
         status: Some(boss_core::job::JobStatus::Open),
+        closed_since: None,
         priority: None,
         owner_id: None,
         subject_id: None,
         waiting_on: None,
+        metadata_contains: None,
         scope: JobScope::All,
+        // Unchanged on purpose. This feed currently shows every
+        // packet, 87% of which are the demo tenant's; narrowing it is
+        // a decision about what this surface is FOR, not part of
+        // adding the capability, so it is left to the caller that
+        // owns the surface.
+        simulated: None,
     };
     let jobs = match state.jobs.list_jobs(&filter, 12, 0).await {
         Ok((jobs, _total)) => jobs,
@@ -414,9 +481,40 @@ fn default_materialize_steps() -> bool {
 fn persist_error_response(e: impl std::fmt::Display) -> Response {
     let msg = e.to_string();
     if msg.contains("job edge") && msg.contains("unresolvable") {
-        (StatusCode::BAD_REQUEST, msg).into_response()
+        (StatusCode::BAD_REQUEST, edge_guidance(msg)).into_response()
     } else {
         (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+    }
+}
+
+/// A rejected edge tells the author WHAT was refused; this adds what
+/// to do instead.
+///
+/// `backlog_item` is the declared, ref-checked link from a change to
+/// the feedback packet it answers, and the dispatcher's
+/// `complete-feedback-branch-on-car-merged` rule follows it to close
+/// that packet when the change merges. So it is worth preferring, and
+/// worth refusing when it does not resolve — a link to nothing closes
+/// nothing.
+///
+/// But not every motivating item IS a Job on this instance. Some
+/// predate the packet model, some arrived as a sentence in chat. The
+/// free-text field `backlog_text` carries those: it is not a declared
+/// edge, so nothing ref-checks it and nothing follows it. Without
+/// this sentence an author who hit the guard had two moves and no way
+/// to tell which was intended — the observed response was to drop the
+/// reference entirely, which is how sixteen packets ended up
+/// unlinked.
+fn edge_guidance(msg: String) -> String {
+    if msg.contains("backlog_item") {
+        format!(
+            "{msg} — `backlog_item` is a declared job edge and must name a Job on this \
+             instance (it is what closes that packet when this change merges). For a \
+             legacy or free-text referent, put it in `backlog_text` instead, which is \
+             prose and is not ref-checked."
+        )
+    } else {
+        msg
     }
 }
 
@@ -447,6 +545,15 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
                 .into_response();
         }
     };
+
+    // Admission decides sim-vs-real ONCE, here, and the flag never
+    // moves again (03-jobs.sql: the epoch trim leans on a Job's rows
+    // all sharing one fate). Two admissible sources, OR-ed: an
+    // explicit `simulated: true` on the body (demo seeding, tests),
+    // or the request arriving on a sim chain (`x-sim-origin` — how
+    // every sim-engine create presents). The OR means a sim chain can
+    // never mint real work, even with a body that claims otherwise.
+    job.simulated = job.simulated || boss_core::sim_origin::is_in_sim_chain();
 
     // Validate the kind against the Workflow registry. When no registry
     // is plumbed (older tests) we accept any kind string. We capture
@@ -562,12 +669,27 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
     let actor = user
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-    let job_stamp = state.publisher.stamp_with_actor_at(actor, now).await;
+    // Every event about the Job inherits its admission-fixed flag as
+    // the `_simulated` marker — the packet, not the transport context
+    // of the write, is the source of truth for sim-vs-real.
+    let job_stamp = state
+        .publisher
+        .stamp_with_actor(actor)
+        .await
+        .with_simulated(job.simulated);
     let job_event = job_stamp.event(
         events::JOB_CREATED,
         serde_json::to_value(&job).unwrap_or_default(),
     );
-    if let Err(e) = state.jobs.create_job_at(&job, now, &[job_event]).await {
+    // Row-touch columns bind the stamp's wall time — the rebuilder
+    // reproduces them from audit_log.timestamp, so live and replay
+    // must read the same instant. Business dates (opened_on, `{day}`
+    // tokens below) keep the authoritative clock's `now`.
+    if let Err(e) = state
+        .jobs
+        .create_job_at(&job, job_stamp.timestamp, &[job_event])
+        .await
+    {
         return persist_error_response(e);
     }
 
@@ -616,12 +738,18 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
             let step_actor = user
                 .ambient_actor()
                 .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-            let step_stamp = state.publisher.stamp_with_actor_at(step_actor, now).await;
-            let step_event = step_stamp.event(
-                events::STEP_CREATED,
-                serde_json::to_value(step).unwrap_or_default(),
-            );
-            if let Err(e) = state.jobs.add_step_at(step, now, &[step_event]).await {
+            let step_stamp = state
+                .publisher
+                .stamp_with_actor(step_actor)
+                .await
+                .with_simulated(job.simulated);
+            let step_event =
+                step_stamp.event(events::STEP_CREATED, events::step_state_payload(step));
+            if let Err(e) = state
+                .jobs
+                .add_step_at(step, step_stamp.timestamp, &[step_event])
+                .await
+            {
                 tracing::warn!(
                     job_id = %job_id,
                     step_id = %step.id,
@@ -643,8 +771,7 @@ pub(super) async fn create_job<R: JobsRepository + 'static, B: EventBus + 'stati
                 let ready_actor = user
                     .ambient_actor()
                     .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-                ready_events
-                    .push(build_step_ready_event(&state, &job, step, &ready_actor, now).await);
+                ready_events.push(build_step_ready_event(&state, &job, step, &ready_actor).await);
             }
         }
         if !ready_events.is_empty()
@@ -833,6 +960,17 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
     };
     let old_status = existing.status;
 
+    // `simulated` is IMMUTABLE after admission. Ignore-not-reject,
+    // matching how the other server-owned field on this route is
+    // treated (the path-authoritative `id` above): the stored value
+    // wins over anything on the wire, so a client round-tripping a
+    // full Job body never has to strip the field, and a client trying
+    // to flip it simply doesn't. The Pg adapter's UPDATE never
+    // touches the column; carrying the stored value forward here
+    // keeps the JOB_UPDATED event payload (and the in-memory
+    // adapter) agreeing with the row.
+    job.simulated = existing.simulated;
+
     // Pick the right policy action: transitioning to Closed is a Close
     // action (more restricted than Update); everything else is Update.
     let action = if job.status == JobStatus::Closed && old_status != JobStatus::Closed {
@@ -871,7 +1009,6 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
         return resp;
     }
 
-    let now = boss_clock_client::now_from(&state.clock).await;
     // OUTBOX (phase 2): the state event (full row state, what the
     // rebuild consumes) + the status-transition markers (topic-only
     // duplicates for downstream consumers; rebuild ignores them)
@@ -879,7 +1016,11 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
     let actor = user
         .ambient_actor()
         .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-    let stamp = state.publisher.stamp_with_actor_at(actor, now).await;
+    let stamp = state
+        .publisher
+        .stamp_with_actor(actor)
+        .await
+        .with_simulated(job.simulated);
     let mut job_events = vec![stamp.event(
         events::JOB_UPDATED,
         serde_json::to_value(&job).unwrap_or_default(),
@@ -894,16 +1035,40 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
             }),
         ));
         if job.status == JobStatus::Closed {
+            // Same four keys as the two step-driven close paths
+            // (`close_job_on_terminal` and the all-steps-terminal
+            // catch-all, both in http/steps.rs). The close marker is
+            // ONE contract with three emit sites, and a rule's `when`
+            // binds identifiers off whichever one fired: an absent key
+            // is a PredicateFailed → Retry → dead-letter, not a quiet
+            // false. This site used to carry only `id` / `closed_on`,
+            // so a Job closed by a direct status PUT dead-lettered the
+            // `parent_step_id != null` subjob rule instead of skipping
+            // it.
             job_events.push(stamp.event(
                 events::JOB_CLOSED,
                 serde_json::json!({
                     "id": job.id.to_string(),
                     "closed_on": job.closed_on,
+                    "kind": job.kind,
+                    "outcome": job.metadata.get("outcome"),
+                    // Same contract as `kind` above: always present, so
+                    // a rule that spawns off a close can name the new
+                    // packet after the one that caused it.
+                    "title": job.title,
+                    // Third of the three close sites. Same contract:
+                    // the subject is what a spawning rule dedupes on.
+                    "subject_id": boss_core::primitives::Subject::id(&job.subject),
+                    "parent_step_id": job.metadata.get("parent_step_id"),
                 }),
             ));
         }
     }
-    if let Err(e) = state.jobs.update_job_at(&job, now, &job_events).await {
+    if let Err(e) = state
+        .jobs
+        .update_job_at(&job, stamp.timestamp, &job_events)
+        .await
+    {
         return persist_error_response(e);
     }
 
@@ -916,8 +1081,150 @@ pub(super) async fn update_job<R: JobsRepository + 'static, B: EventBus + 'stati
         let actor = user
             .ambient_actor()
             .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
-        super::steps::reevaluate_and_persist(&state, &job, &actor, now).await;
+        super::steps::reevaluate_and_persist(&state, &job, &actor).await;
     }
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// `PATCH /api/jobs/{id}/metadata` — merge top-level metadata keys
+/// into the Job, atomically, server-side.
+///
+/// Body: a JSON object of top-level metadata keys. A `null` value
+/// REMOVES the key — the conductor's `overlay_metadata` convention —
+/// and every other value replaces that key wholesale. Status, steps,
+/// and every other envelope field are untouchable through this route.
+///
+/// WHY IT EXISTS: with only the full-replacement PUT, every caller
+/// that wanted to set one metadata key ran GET → spread → PUT client-
+/// side. The 2026-08-21 UX audit caught what that costs: the board
+/// closes the packet (status closed + `metadata.outcome` stamped)
+/// between a dismisser's GET and PUT, and the dismiss resurrects it
+/// open with the outcome erased — on the system of record. The merge
+/// now happens inside one adapter transaction against the row as it
+/// stands, so the envelope a concurrent writer produced survives.
+///
+/// Policy: the same `Action::Update` gate + scope check as the job
+/// PUT. A metadata patch cannot transition status, so the PUT's
+/// stricter `Close` action never applies here.
+pub(super) async fn patch_job_metadata<R: JobsRepository + 'static, B: EventBus + 'static>(
+    State(state): State<Arc<JobsApiState<R, B>>>,
+    Path(id): Path<String>,
+    CurrentUser(user): CurrentUser,
+    Json(patch): Json<serde_json::Value>,
+) -> Response {
+    let job_id = match parse_job_id(&id) {
+        Some(id) => id,
+        None => return (StatusCode::BAD_REQUEST, "invalid job id").into_response(),
+    };
+    let serde_json::Value::Object(patch) = patch else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "metadata patch must be a JSON object of top-level keys",
+        )
+            .into_response();
+    };
+
+    let existing = match state.jobs.get_job(&job_id).await {
+        Ok(Some(existing)) => existing,
+        Ok(None) => return (StatusCode::NOT_FOUND, "job not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    // Policy gate mirrors update_job's Update arm exactly.
+    let decision = match state
+        .policy
+        .check(&user, Action::Update, Resource::job())
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("policy check failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let scope = match decision {
+        Decision::Deny { reason } => {
+            return (StatusCode::FORBIDDEN, reason).into_response();
+        }
+        Decision::Allow { scope } => scope,
+    };
+    if !scope_matches(&user, &scope, &existing) {
+        return (StatusCode::FORBIDDEN, "job is outside your scope").into_response();
+    }
+
+    let actor = user
+        .ambient_actor()
+        .unwrap_or_else(|| boss_core::actor::ActorId::Automation("platform".into()));
+    // Same enrichment as the PUT path: the packet's admission-fixed
+    // flag — not the transport context — marks the event. The adapter
+    // builds JOB_UPDATED from the post-merge row with this stamp and
+    // records it in the same transaction as the write.
+    let stamp = state
+        .publisher
+        .stamp_with_actor(actor.clone())
+        .await
+        .with_simulated(existing.simulated);
+    let merged = match state
+        .jobs
+        .merge_job_metadata_at(&job_id, &patch, &stamp)
+        .await
+    {
+        Ok(job) => job,
+        Err(crate::port::JobsError::NotFound(_)) => {
+            return (StatusCode::NOT_FOUND, "job not found").into_response();
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    // Same wake as the PUT: a metadata write can flip a metadata-gated
+    // `ready_when` (ship-a-change's Merged outcome waits on
+    // `job.metadata.merged`). Closed/cancelled Jobs stay untouched.
+    if merged.status == JobStatus::Open {
+        super::steps::reevaluate_and_persist(&state, &merged, &actor).await;
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::edge_guidance;
+
+    /// The guard's own text is the valuable part and must survive
+    /// verbatim — an author reads WHICH edge and WHICH id was refused
+    /// off this string.
+    #[test]
+    fn edge_guidance_keeps_the_guards_message_first() {
+        let raw = "job edge ship-a-change.backlog_item references unresolvable Job 2c4ae549";
+        let out = edge_guidance(raw.to_string());
+        assert!(
+            out.starts_with(raw),
+            "the guard's own text must lead: {out}"
+        );
+    }
+
+    /// …and a refused `backlog_item` names the free-text escape
+    /// hatch. Without it the observed move was to drop the reference
+    /// entirely, which is how packets ended up unlinked.
+    #[test]
+    fn a_refused_backlog_item_names_backlog_text_as_the_alternative() {
+        let out = edge_guidance(
+            "job edge ship-a-change.backlog_item references unresolvable Job 2c4ae549".to_string(),
+        );
+        assert!(
+            out.contains("backlog_text"),
+            "an author who hit the guard needs the alternative named: {out}"
+        );
+    }
+
+    /// Other edges get no feedback-specific advice bolted on.
+    #[test]
+    fn an_unrelated_edge_failure_is_passed_through_untouched() {
+        let raw = "job edge pr-train.boarded_jobs references unresolvable Job abc";
+        assert_eq!(edge_guidance(raw.to_string()), raw);
+    }
 }

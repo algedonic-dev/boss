@@ -49,17 +49,14 @@ export type CommerceSummary = {
   currency: string;
 };
 
-import { fetchPaged, type Paged } from '../data/paginated';
+import { fetchPaged, type PagedResult } from '../data/paginated';
 
-export async function loadInvoices(): Promise<Paged<Invoice>> {
-  return (
-    (await fetchPaged<Invoice>(`${API_BASE}/invoices?limit=1000`)) ?? {
-      data: [],
-      total: 0,
-      limit: 0,
-      offset: 0,
-    }
-  );
+/// The invoice list, failure included. The old signature swallowed a
+/// failed fetch into an empty page, so an outage rendered "No
+/// invoices match those filters" with every count at 0 (packet
+/// 3fba9c35, the false-empty sweep).
+export function loadInvoices(): Promise<PagedResult<Invoice>> {
+  return fetchPaged<Invoice>(`${API_BASE}/invoices?limit=1000`);
 }
 
 export async function loadCommerceSummary(): Promise<CommerceSummary | null> {

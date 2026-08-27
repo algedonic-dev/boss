@@ -3,8 +3,6 @@
 //! Verifies that AP domain state transitions emit the right fact, in the
 //! same transaction as the domain write, idempotently.
 
-#![cfg(feature = "postgres")]
-
 use boss_inventory::PgInventory;
 use boss_inventory::port::InventoryRepository;
 use boss_inventory::types::*;

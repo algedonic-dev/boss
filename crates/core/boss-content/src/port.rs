@@ -40,9 +40,9 @@ pub trait ContentRepository: Send + Sync {
         draft: BulletinDraft,
         actor_id: &str,
     ) -> Result<Bulletin, ContentError> {
-        let now = Utc::now();
-        let stamp = EventStamp::new("content", ActorId::Automation("platform".into()), now);
-        self.create_bulletin_at(draft, actor_id, now, &stamp).await
+        let stamp = EventStamp::new("content", ActorId::Automation("platform".into()));
+        self.create_bulletin_at(draft, actor_id, stamp.timestamp, &stamp)
+            .await
     }
     async fn create_bulletin_at(
         &self,
@@ -58,9 +58,9 @@ pub trait ContentRepository: Send + Sync {
         id: Uuid,
         patch: BulletinPatch,
     ) -> Result<Bulletin, ContentError> {
-        let now = Utc::now();
-        let stamp = EventStamp::new("content", ActorId::Automation("platform".into()), now);
-        self.update_bulletin_at(id, patch, now, &stamp).await
+        let stamp = EventStamp::new("content", ActorId::Automation("platform".into()));
+        self.update_bulletin_at(id, patch, stamp.timestamp, &stamp)
+            .await
     }
     async fn update_bulletin_at(
         &self,
@@ -73,9 +73,8 @@ pub trait ContentRepository: Send + Sync {
     /// Records `content.bulletin.deleted` (`{id, deleted_at}`) in-tx
     /// after the row actually deleted.
     async fn delete_bulletin(&self, id: Uuid) -> Result<(), ContentError> {
-        let now = Utc::now();
-        let stamp = EventStamp::new("content", ActorId::Automation("platform".into()), now);
-        self.delete_bulletin_at(id, now, &stamp).await
+        let stamp = EventStamp::new("content", ActorId::Automation("platform".into()));
+        self.delete_bulletin_at(id, stamp.timestamp, &stamp).await
     }
     async fn delete_bulletin_at(
         &self,
@@ -89,9 +88,9 @@ pub trait ContentRepository: Send + Sync {
     /// only when the dismissal row actually inserted (a repeat
     /// dismissal records nothing).
     async fn dismiss_bulletin(&self, id: Uuid, employee_id: &str) -> Result<(), ContentError> {
-        let now = Utc::now();
-        let stamp = EventStamp::new("content", ActorId::Automation("platform".into()), now);
-        self.dismiss_bulletin_at(id, employee_id, now, &stamp).await
+        let stamp = EventStamp::new("content", ActorId::Automation("platform".into()));
+        self.dismiss_bulletin_at(id, employee_id, stamp.timestamp, &stamp)
+            .await
     }
     async fn dismiss_bulletin_at(
         &self,

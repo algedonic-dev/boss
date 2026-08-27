@@ -21,6 +21,12 @@ use boss_testing::RecordingEventBus;
 use chrono::NaiveDate;
 use tower::ServiceExt;
 
+/// The reconcile write-path actor — every registry write records an
+/// event now, and reconcile attributes to the named automation.
+fn reconciler() -> boss_core::actor::ActorId {
+    boss_core::actor::ActorId::Automation("bootstrap-reconciler".into())
+}
+
 fn ceo_header() -> String {
     serde_json::json!({
         "id": "emp-ceo",
@@ -71,6 +77,7 @@ async fn new_job_pins_to_active_version_not_default_one() {
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let state = JobsApiState {
         job_edges: None,
+        stations: None,
         jobs: jobs.clone(),
         bus,
         publisher: DomainPublisher::new(bus_dyn, "jobs"),
@@ -202,7 +209,10 @@ async fn a_republish_does_not_strand_a_job_opened_under_the_old_version() {
     }
 
     let kinds = Arc::new(InMemoryWorkflows::new());
-    kinds.bootstrap_reconcile(&[v1()]).await.expect("seed v1");
+    kinds
+        .bootstrap_reconcile(&[v1()], &reconciler(), chrono::Utc::now())
+        .await
+        .expect("seed v1");
 
     let jobs = Arc::new(InMemoryJobs::new());
     let kind_registry: Arc<dyn WorkflowRegistry> = kinds.clone();
@@ -217,6 +227,7 @@ async fn a_republish_does_not_strand_a_job_opened_under_the_old_version() {
     let bus_dyn: Arc<dyn EventBus> = bus.clone();
     let app = router(JobsApiState {
         job_edges: None,
+        stations: None,
         jobs: jobs.clone(),
         bus,
         publisher: DomainPublisher::new(bus_dyn, "jobs"),
@@ -262,7 +273,10 @@ async fn a_republish_does_not_strand_a_job_opened_under_the_old_version() {
     assert_eq!(opened.workflow_version, 1);
 
     // The registry moves on WHILE the Job is in flight.
-    let stats = kinds.bootstrap_reconcile(&[v2()]).await.expect("republish");
+    let stats = kinds
+        .bootstrap_reconcile(&[v2()], &reconciler(), chrono::Utc::now())
+        .await
+        .expect("republish");
     assert_eq!(stats.republished, 1);
     assert_eq!(
         kinds.get_active("versioned").await.unwrap().version,

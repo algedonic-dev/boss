@@ -10,6 +10,7 @@
 
   import { isPending, isTerminal as _isTerminal, type StepStatus } from '../jobs/types';
   import type { Employee } from '../people/types';
+  import { putStep } from './stepWrite';
 
   type StepData = {
     id: string;
@@ -45,6 +46,13 @@
   let toConfirmed = $state(pickBool('to_confirmed'));
   let notes = $state(step.notes ?? '');
   let saving = $state(false);
+  let writeError = $state<string | null>(null);
+  $effect(() => {
+    // The surface instance is reused when the rail switches steps —
+    // an error from step A must not render under step B.
+    void step.id;
+    writeError = null;
+  });
   let terminal = $derived(_isTerminal(step.status));
 
   let employees = $state<Employee[]>([]);
@@ -73,6 +81,7 @@
 
   async function persist(status?: string): Promise<void> {
     saving = true;
+    writeError = null;
     try {
       const body = {
         ...step,
@@ -87,11 +96,17 @@
           to_confirmed: toConfirmed,
         },
       };
-      await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+      const res = await putStep(jobId, step.id, body);
+      if (res.kind === 'failed') {
+        writeError = res.error;
+        // The checkmarks read as recorded facts, not as a form in
+        // progress — a rejected write must not leave them rendering
+        // confirmations the server never accepted. Fall back to the
+        // confirmed state (packet cc9d7fc6, "phantom statuses").
+        fromConfirmed = pickBool('from_confirmed');
+        toConfirmed = pickBool('to_confirmed');
+        return;
+      }
       onUpdate();
     } finally {
       saving = false;
@@ -160,6 +175,10 @@
       disabled={terminal}
     ></textarea>
   </div>
+
+  {#if writeError}
+    <p class="step-write-error" role="alert">{writeError}</p>
+  {/if}
 
   <div class="step-actions">
     {#if !terminal}

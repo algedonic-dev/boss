@@ -81,15 +81,42 @@ pub fn handler_emits() -> BTreeMap<&'static str, Vec<&'static str>> {
         ("people.terminate", vec!["people.employee.updated"]),
         ("shipping.create", vec!["shipping.shipment.created"]),
         ("jobs.spawn", vec!["jobs.job.created"]),
+        // Delegates to jobs.spawn per orphaned doc, so it emits
+        // whatever that emits — and nothing of its own.
+        ("docs.design.sweep", vec!["jobs.job.created"]),
         ("jobs.complete_step", vec!["jobs.step.completed"]),
         // Clears waiting_on via PUT /api/jobs — the update emits
         // jobs.job.updated (and wakes metadata-gated steps in the
         // same write, aa9980c8).
         ("jobs.clear_waiting", vec!["jobs.job.updated"]),
         ("jobs.subjob_resolve", vec!["jobs.step.completed"]),
+        // Completes the open branch on the Job a declared edge names
+        // (a merged car answering its feedback packet). The completion
+        // is what closes the loop: jobs.step.completed → step.done.* →
+        // the packet's own `closed` terminal → jobs.job.closed, which
+        // re-enters the rule set at notify-filer-on-feedback-terminal.
+        ("jobs.complete_linked_step", vec!["jobs.step.completed"]),
         ("gate.resolve", vec!["jobs.step.completed"]),
         ("packaging.allocate", vec!["jobs.step.completed"]),
+        // The packet-loss census (migration 152): reads the whole
+        // board through the jobs API and lands one
+        // `jobs.network.census` event per firing via the census door.
+        // No rule listens on that topic — the series is for lenses,
+        // not for the cascade — so the loop terminates here by design
+        // (packet-loss.md Q2: report first, raise later).
+        ("network.census", vec!["jobs.network.census"]),
         ("messages.notify", vec![]),
+        // Tells the filer how their packet ended. A sink, like every
+        // other notifier — the message is the end of the cascade, not
+        // a new branch of it.
+        ("messages.notify_job_terminal", vec![]),
+        // Archives the unread SIGNALS about a job when it closes
+        // (rule expire-signals-on-job-closed, migration 128). A sink:
+        // it records messages.message.archived per row it touches, and
+        // no dispatcher rule listens on that topic — archiving a stale
+        // notification must not wake anything up, which is the whole
+        // point of archiving it.
+        ("messages.expire_for_job", vec![]),
         // Queues a docs flush job (rule 109) — a docs-api write, no
         // event emitted back into the cascade (the flush WORKER's
         // eventual commit is outside the dispatcher's loop).

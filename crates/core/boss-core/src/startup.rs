@@ -87,6 +87,14 @@ pub struct Capabilities {
     pub storage: &'static str,
     /// Crate version (`CARGO_PKG_VERSION`).
     pub version: &'static str,
+    /// The git commit this binary was BUILT from — `BOSS_BUILD_COMMIT`
+    /// at compile time, which the image build passes as a build arg.
+    /// `None` in dev builds. This is what lets the train's `converged`
+    /// step prove the RUNNING cluster binary serves the merge commit:
+    /// an image tag proves a push happened; a self-reported build
+    /// commit proves the pod restarted onto it (fdff316c / 7e5ee013,
+    /// decided 2026-08-19).
+    pub commit: Option<&'static str>,
 }
 
 impl Capabilities {
@@ -96,12 +104,14 @@ impl Capabilities {
     /// `storage` arg is the storage backend the caller actually
     /// wired up — typically `"postgres"` from a
     /// `#[cfg(feature = "postgres")]` arm, `"in-memory"` from the
-    /// fallback arm.
+    /// fallback arm. The build commit is read here rather than at
+    /// call sites so every service reports it identically for free.
     pub fn new(service: &'static str, version: &'static str, storage: &'static str) -> Self {
         Self {
             service,
             storage,
             version,
+            commit: option_env!("BOSS_BUILD_COMMIT"),
         }
     }
 }

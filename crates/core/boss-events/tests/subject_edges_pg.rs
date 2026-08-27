@@ -7,8 +7,6 @@
 //! 2026-07-13 phantom-account incident class, now closed for every
 //! subject-referential edge, not just the hand-picked ones).
 
-#![cfg(feature = "postgres")]
-
 use boss_core::event::Event;
 use boss_events::outbox::record_event_in_tx;
 use boss_testing::TestDb;

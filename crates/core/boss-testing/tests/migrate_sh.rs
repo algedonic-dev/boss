@@ -2,7 +2,7 @@
 //! into a database.
 //!
 //! The runner's contract, pinned here:
-//! - manifest.txt is the ordered migration list; entries not yet recorded
+//! - schema/*.sql sorted by NNN- prefix is the migration order; files not yet recorded
 //!   in `schema_migrations` apply in order, each atomically with its
 //!   record, so a re-run never re-applies and a failure records nothing.
 //! - `--baseline` records without running, for databases that predate the
@@ -14,7 +14,7 @@
 //!
 //! Each test creates its own scratch database (dropped at the end; a
 //! panic can leak one — the `test_boss_mig_` prefix makes orphans easy to
-//! find, same tradeoff as TestDb). The synthetic-manifest tests copy the
+//! find, same tradeoff as TestDb). The synthetic-schema tests copy the
 //! script into a temp dir beside a tiny schema/ so they can grow, break,
 //! and edit migrations without touching the repo's real schema files.
 
@@ -113,7 +113,8 @@ fn assert_ok(out: &Output, what: &str) {
 }
 
 /// A temp copy of the runner beside a synthetic schema/ dir the test can
-/// mutate freely. `files` are `(manifest entry, sql)` in manifest order.
+/// mutate freely. `files` are `(filename, sql)`; the runner derives the
+/// order from the `NNN-` prefixes, so there is no list to write.
 struct Synthetic {
     dir: PathBuf,
 }
@@ -129,7 +130,6 @@ impl Synthetic {
         for (name, sql) in files {
             s.write(name, sql);
         }
-        s.write_manifest(&files.iter().map(|(n, _)| *n).collect::<Vec<_>>());
         s
     }
 
@@ -139,14 +139,6 @@ impl Synthetic {
 
     fn write(&self, name: &str, sql: &str) {
         fs::write(self.dir.join("schema").join(name), sql).expect("writing schema file");
-    }
-
-    fn write_manifest(&self, names: &[&str]) {
-        fs::write(
-            self.dir.join("schema/manifest.txt"),
-            names.join("\n") + "\n",
-        )
-        .expect("writing manifest");
     }
 }
 
@@ -194,30 +186,43 @@ async fn table_exists(conn: &mut PgConnection, table: &str) -> bool {
         .get("present")
 }
 
-fn manifest_entries(dir: &Path) -> Vec<String> {
-    fs::read_to_string(dir.join("manifest.txt"))
-        .expect("reading manifest.txt")
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(str::to_string)
-        .collect()
+/// The migration order as the runner computes it: every `*.sql` in the
+/// schema dir, sorted by its `NNN-` prefix. Mirrors migrate.sh's
+/// `sort -t- -k1,1n` and build.rs's sort key — if those three ever
+/// disagree, the tests below apply a different schema than production.
+fn migration_order(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .expect("reading the schema dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sql"))
+        .collect();
+    names.sort_by_key(|n| {
+        let num: u32 = n
+            .split('-')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(u32::MAX);
+        (num, n.clone())
+    });
+    names
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn real_manifest_applies_to_a_fresh_db_and_a_rerun_is_a_noop() {
+async fn the_real_schema_applies_to_a_fresh_db_and_a_rerun_is_a_noop() {
     let (name, url) = scratch_db().await;
 
     let out = run(&real_script(), &[], &url);
     assert_ok(&out, "first run against a fresh db");
 
     let mut conn = connect(&url).await;
-    let expected = manifest_entries(&real_schema_dir());
+    let expected = migration_order(&real_schema_dir());
     let mut got = recorded(&mut conn).await;
     let mut want = expected.clone();
     got.sort();
     want.sort();
-    assert_eq!(got, want, "every manifest entry is recorded, nothing else");
+    assert_eq!(got, want, "every migration is recorded, nothing else");
     assert!(table_exists(&mut conn, "jobs").await, "03-jobs applied");
     assert!(
         table_exists(&mut conn, "audit_log").await,
@@ -243,11 +248,12 @@ async fn only_unrecorded_entries_apply() {
     let mut conn = connect(&url).await;
     let first = recorded_row(&mut conn, "01-first.sql").await;
 
+    // Dropping the file in IS the whole act of adding a migration —
+    // there is no list to update, which is the point of the collapse.
     syn.write("02-second.sql", "CREATE TABLE t2 (id int);");
-    syn.write_manifest(&["01-first.sql", "02-second.sql"]);
     assert_ok(
         &run(&syn.script(), &[], &url),
-        "applying the appended entry",
+        "applying the newly-added migration",
     );
 
     assert!(table_exists(&mut conn, "t2").await, "02-second ran");

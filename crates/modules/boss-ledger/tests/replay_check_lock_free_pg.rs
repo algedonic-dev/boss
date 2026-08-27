@@ -17,8 +17,6 @@
 //!    has no open periods, so the diff scope here is empty by
 //!    construction.)
 
-#![cfg(feature = "postgres")]
-
 use boss_ledger::{FactWrite, record_fact_in_tx};
 use boss_testing::TestDb;
 

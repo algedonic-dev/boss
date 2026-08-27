@@ -40,8 +40,7 @@ pub(super) async fn lock_handler(
         .unwrap_or_else(|| "ledger".to_string());
     // Outbox phase 2: the who-locked-what audit event records inside
     // lock_period's own transaction.
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     match crate::periods::lock_period(&state.pool, id, &locked_by, &stamp, &user.id).await {
         Ok(checksum) => {
             Json(serde_json::json!({"status": "locked", "checksum": checksum})).into_response()
@@ -58,8 +57,7 @@ pub(super) async fn unlock_handler(
     if let Some(r) = reject_if_auditor(&user) {
         return r;
     }
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     match crate::periods::unlock_period(&state.pool, id, &stamp, &user.id).await {
         Ok(()) => Json(serde_json::json!({"status": "open"})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -112,7 +110,7 @@ pub(super) async fn create_period_handler(
 
     let id = Uuid::new_v4();
     let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     let mut tx = match state.pool.begin().await {
         Ok(t) => t,
         Err(e) => return storage_err(e),
@@ -471,8 +469,7 @@ pub(super) async fn close_period_handler(
     // Outbox phase 2: the close event commits with the closing
     // entry + the lock, atomically.
     {
-        let now = boss_clock_client::now_from(&state.clock).await;
-        let stamp = super::event_stamp(&state, &user, now).await;
+        let stamp = super::event_stamp(&state, &user).await;
         if let Err(e) = crate::events::record_ledger_event_in_tx(
             &mut tx,
             &stamp,

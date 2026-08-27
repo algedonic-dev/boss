@@ -1,0 +1,8 @@
+[[invariant]]
+id = "no-tenant-nouns-in-the-platform-roster"
+claim = "A tenant's vocabulary never ships in Tier 1: platform_workflows() carries platform kinds only, and tenant kinds seed from examples/<tenant>/."
+source = "CLAUDE.md §10; David 2026-08-16 (\"We don't want brewery nouns in core no matter what\"); protocols-as-data.md Q5"
+enforcement = "enforced"
+mechanism = "crates/core/boss-jobs/src/registry.rs"
+last_verified = ""
+note = "Asserted by `platform_workflows_carries_the_shipped_meta_kinds`, which denies a list of brewery and used-device-shop nouns. The roster's count assertion alone does NOT hold this: it says seven, not seven PLATFORM kinds, so swapping one for `morning-brew` keeps it green — verified by planting exactly that and watching the noun guard fire where the count did not. `tier-import-audit.sh` cannot see this class either, because a hardcoded noun in a core crate adds no crate dependency. Deliberately a denylist rather than a shape rule: whether a noun is tenant-specific is a judgement, and a bad guess encoded as a lint would block legitimate platform kinds; an unlisted tenant kind still has to get past the count assertion, which needs a deliberate edit. Separate from the FORM problem the same question raised — nouns hardcoded as Rust literals at all — which the platform bundle addresses and which shrinks this without removing it."

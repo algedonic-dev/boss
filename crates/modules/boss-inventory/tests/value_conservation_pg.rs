@@ -18,8 +18,6 @@
 //! docs/architecture-decisions.md §Finance & ledger (Q1–Q3 resolved
 //! 2026-07-07).
 
-#![cfg(feature = "postgres")]
-
 use boss_inventory::PgInventory;
 use boss_inventory::port::InventoryRepository;
 use boss_inventory::types::InventoryItem;
@@ -30,8 +28,8 @@ fn stamp() -> boss_core::publisher::EventStamp {
     boss_core::publisher::EventStamp::new(
         "inventory-test",
         boss_core::actor::ActorId::Automation("test".into()),
-        chrono::Utc::now(),
     )
+    .with_timestamp(chrono::Utc::now())
 }
 
 fn item(sku: &str, on_hand: u32, value_cents: i64) -> InventoryItem {

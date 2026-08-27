@@ -12,8 +12,6 @@
 //! shape-resolution for the two drive payloads is pinned in
 //! `http_writes.rs`.
 
-#![cfg(feature = "postgres")]
-
 use boss_commerce::PgCommerce;
 use boss_commerce::port::{CommerceError, CommerceRepository};
 use boss_commerce::types::*;
@@ -25,8 +23,8 @@ fn stamp() -> EventStamp {
     EventStamp::new(
         "commerce",
         boss_core::actor::ActorId::Automation("test".into()),
-        chrono::Utc::now(),
     )
+    .with_timestamp(chrono::Utc::now())
 }
 
 fn invoice(id: &str, status: &str) -> Invoice {

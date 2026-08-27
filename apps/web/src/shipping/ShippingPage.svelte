@@ -34,6 +34,10 @@
   ];
 
   let shipmentsPage = $state<Paged<Shipment> | null>(null);
+  /// Non-null when the load failed — rendered instead of the empty
+  /// state, so an outage never reads as "no shipments" (packet
+  /// 3fba9c35, the false-empty sweep).
+  let loadFailed = $state<string | null>(null);
   let loading = $state(true);
   let tab = $state<Tab>('all');
   // Default to undelivered — the working queue (label-created,
@@ -49,9 +53,15 @@
     let cancelled = false;
     loading = true;
     (async () => {
-      const paged = await fetchPaged<Shipment>('/api/shipping/shipments?limit=1000');
+      const result = await fetchPaged<Shipment>('/api/shipping/shipments?limit=1000');
       if (!cancelled) {
-        shipmentsPage = paged;
+        if (result.kind === 'ready') {
+          shipmentsPage = result.page;
+          loadFailed = null;
+        } else {
+          shipmentsPage = null;
+          loadFailed = result.error;
+        }
         loading = false;
       }
     })();
@@ -160,6 +170,10 @@
     <section class="list-section">
       {#if loading}
         <p class="empty">Loading…</p>
+      {:else if loadFailed}
+        <p class="empty load-failed" role="alert">
+          Couldn't load shipments — {loadFailed}
+        </p>
       {:else if visible.length === 0}
         <p class="empty">No shipments match those filters.</p>
       {:else}

@@ -50,9 +50,8 @@ pub trait KbRepository: Send + Sync {
     /// Create a new device model. Returns the SKU. Errors if SKU already exists.
     /// Records `kb.model.created` (full row state) in-tx.
     async fn create_model(&self, model: &AssetModel) -> Result<String, KbError> {
-        let now = Utc::now();
-        let stamp = EventStamp::new("kb", ActorId::Automation("platform".into()), now);
-        self.create_model_at(model, now, &stamp).await
+        let stamp = EventStamp::new("kb", ActorId::Automation("platform".into()));
+        self.create_model_at(model, stamp.timestamp, &stamp).await
     }
     async fn create_model_at(
         &self,
@@ -64,9 +63,9 @@ pub trait KbRepository: Send + Sync {
     /// Replace a device model by SKU. Errors if SKU doesn't exist.
     /// Records `kb.model.updated` (full row state) in-tx.
     async fn update_model(&self, sku: &str, model: &AssetModel) -> Result<(), KbError> {
-        let now = Utc::now();
-        let stamp = EventStamp::new("kb", ActorId::Automation("platform".into()), now);
-        self.update_model_at(sku, model, now, &stamp).await
+        let stamp = EventStamp::new("kb", ActorId::Automation("platform".into()));
+        self.update_model_at(sku, model, stamp.timestamp, &stamp)
+            .await
     }
     async fn update_model_at(
         &self,
@@ -79,9 +78,8 @@ pub trait KbRepository: Send + Sync {
     /// Delete a device model and all satellite data. Errors if SKU doesn't exist.
     /// Records `kb.model.deleted` (`{sku, deleted_at}`) in-tx.
     async fn delete_model(&self, sku: &str) -> Result<(), KbError> {
-        let now = Utc::now();
-        let stamp = EventStamp::new("kb", ActorId::Automation("platform".into()), now);
-        self.delete_model_at(sku, now, &stamp).await
+        let stamp = EventStamp::new("kb", ActorId::Automation("platform".into()));
+        self.delete_model_at(sku, stamp.timestamp, &stamp).await
     }
     async fn delete_model_at(
         &self,

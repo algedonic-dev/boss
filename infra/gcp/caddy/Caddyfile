@@ -1,0 +1,92 @@
+# Caddy front door for boss-dev-1.
+#
+# playground.algedonic.dev arrives via Cloudflare Tunnel only —
+# cloudflared dials this listener over loopback with SNI =
+# playground.algedonic.dev. No public DNS points at this VM, so
+# there is no Let's-Encrypt path / nip.io block.
+
+playground.algedonic.dev {
+    tls /etc/caddy/certs/algedonic.crt /etc/caddy/certs/algedonic.key
+
+    encode gzip
+
+    reverse_proxy 10.20.0.30:80 {
+        flush_interval -1
+    }
+
+    # When the gateway (127.0.0.1:4443) is unreachable — e.g. a seed
+    # regen has the demo DB offline — the reverse_proxy errors. Serve a
+    # "demo regenerating" page with HTTP 200 (NOT the upstream's 5xx):
+    # Cloudflare Access replaces an origin 5xx with its own error page,
+    # so the body only reaches visitors when we respond 200. The body is
+    # a backtick raw string so the HTML's quotes/braces aren't parsed as
+    # Caddyfile tokens, and 200 trails the string as the explicit status.
+    handle_errors {
+        header Content-Type "text/html; charset=utf-8"
+        header Cache-Control "no-store, must-revalidate"
+        respond `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="30">
+<title>BOSS — service interrupted</title>
+<style>
+:root{color-scheme:dark;--void:#0D1014;--ink:#12161C;--fog:#E8ECEF;--signal:#5FD4A8;--static:#7A838C;--hairline:#2A3138}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--void);color:var(--fog);font:16px/1.65 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:2rem}
+.card{max-width:36rem;background:var(--ink);border:1px solid var(--hairline);padding:2rem 2.25rem}
+.eyebrow{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;letter-spacing:.3em;text-transform:uppercase;color:var(--signal);display:flex;align-items:center;gap:.65rem;margin-bottom:1.5rem}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--signal);animation:pulse 1.4s ease-in-out infinite;flex:none}
+@keyframes pulse{50%{opacity:.3}}
+@media (prefers-reduced-motion:reduce){.dot{animation:none}}
+h1{font-size:1.4rem;font-weight:600;margin:0 0 .9rem;letter-spacing:-.01em}
+p{margin:0 0 .9rem;color:var(--static)}
+.small{font-size:.85rem;color:var(--static);border-top:1px solid var(--hairline);margin-top:1.6rem;padding-top:1rem}
+</style>
+</head>
+<body>
+<div class="card">
+<div class="eyebrow"><span class="dot"></span>BOSS · service interrupted</div>
+<h1>The system is briefly unavailable</h1>
+<p>A deploy is rolling or a component is restarting. This page returns to the app automatically as soon as the system answers again — usually within a couple of minutes.</p>
+<p>Nothing you submitted is lost: BOSS records every state change in an append-only log, so work in flight resumes where it stopped.</p>
+<p class="small">This page refreshes itself every 30 seconds. If it persists for more than a few minutes, something is genuinely stuck rather than restarting. BOSS — Beer Open Source Software for system modeling.</p>
+</div>
+</body>
+</html>` 200
+    }
+
+    log {
+        output stdout
+        format console
+    }
+}
+
+# Kanidm — identity provider, running in the home cluster and reached
+# over the WireGuard tunnel. Added 2026-08-10.
+#
+# Host is preserved deliberately: Kanidm binds WebAuthn to `origin`
+# (https://id.algedonic.dev). If Caddy rewrote Host to the backend
+# address, passkey registration would fail with an origin mismatch.
+#
+# tls_insecure_skip_verify: the backend presents the Cloudflare Origin
+# CA certificate, which is valid for id.algedonic.dev but issued by a CA
+# that is not in Caddy's trust store. The hop is private — WireGuard to
+# an isolated VLAN — so this is a trust-store gap, not an exposure.
+id.algedonic.dev {
+    tls /etc/caddy/certs/algedonic.crt /etc/caddy/certs/algedonic.key
+
+    encode gzip
+
+    reverse_proxy https://10.20.0.31 {
+        transport http {
+            tls
+            tls_insecure_skip_verify
+        }
+        header_up Host {host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto https
+        flush_interval -1
+    }
+}

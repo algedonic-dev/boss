@@ -1,0 +1,8 @@
+[[invariant]]
+id = "sim-speaks-only-the-public-api"
+claim = "Code that runs OUTSIDE the system (the simulator, tenant engine drivers, seed loaders) must interact with the system only through its public HTTP API."
+source = "infra/lint/sim-boundary-audit.sh"
+enforcement = "enforced"
+mechanism = "infra/lint/sim-boundary-audit.sh"
+last_verified = ""
+note = "Allowlist grandfathers the six violators found at the v1.0.10 audit; migrating each off the allowlist is the open work. The lint fails on any NEW path dep from a sim-side crate onto a module implementation crate. CAVEAT — it is enforced in CI only: the dep-extraction awk uses `\\s`, a GNU extension, so on BSD awk (macOS) it matches nothing and the run reports '0 dep declarations scanned' while still exiting 0. A local infra/gate.sh on a Mac gets no coverage from this lint."

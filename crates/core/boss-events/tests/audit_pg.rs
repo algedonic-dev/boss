@@ -9,8 +9,6 @@
 //! `audit_log` — the other five services emitted to NATS but never
 //! persisted, and there were no tests covering the behavior at all.
 
-#![cfg(feature = "postgres")]
-
 use boss_core::audit::AuditWriter;
 use boss_core::event::Event;
 use boss_events::PgAuditWriter;

@@ -162,14 +162,14 @@
   }
   .fb-more {
     font-size: 11px;
-    color: var(--text-dim, #a8a29e);
+    color: var(--text-dim, var(--static, #7A838C));
     margin-left: auto;
   }
   .fb-route {
     font: inherit;
     font-size: 11px;
-    background: var(--bg, #f5f5f4);
-    border: 1px solid var(--border, #e7e5e4);
+    background: var(--bg, var(--void, #0D1014));
+    border: 1px solid var(--border, var(--hairline, #2A3138));
     border-radius: 3px;
     padding: 1px 6px;
     cursor: pointer;
@@ -185,14 +185,14 @@
     font-size: 12px;
     font-weight: 600;
     padding: 3px 12px;
-    border: 1px solid var(--border, #e7e5e4);
+    border: 1px solid var(--border, var(--hairline, #2A3138));
     border-radius: 999px;
     background: transparent;
     cursor: pointer;
     color: inherit;
   }
   .fb-view.active {
-    border-color: var(--color-accent, #7a3f1f);
-    color: var(--color-accent, #7a3f1f);
+    border-color: var(--signal, #5FD4A8);
+    color: var(--signal, #5FD4A8);
   }
 </style>

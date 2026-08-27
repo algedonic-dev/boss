@@ -5,17 +5,48 @@
 //! drift, the bootstrap loop in boss-jobs-api would silently apply
 //! one branch in dev tests and a different branch in production.
 
-#![cfg(feature = "postgres")]
-
 use boss_core::job::JobId;
 use boss_jobs::registry::{
-    KindReconcileStats, PgWorkflows, WorkflowRegistry, WorkflowSpec, WorkflowStatus,
+    KindReconcileStats, PgWorkflows, StepSpec, Terminal, WorkflowRegistry, WorkflowSpec,
+    WorkflowStatus,
 };
 use boss_testing::TestDb;
 use sqlx::Row;
 
+/// A minimal VIABLE spec — trigger → terminal. Reconcile sets rows
+/// active, so it runs the same viability gate publish does; a
+/// step-less fixture would be refused (and would never have run in
+/// production either).
 fn spec(kind: &str, label: &str) -> WorkflowSpec {
-    WorkflowSpec::platform_seed(kind, label, "platform", vec!["account".into()], Vec::new())
+    WorkflowSpec::platform_seed(
+        kind,
+        label,
+        "platform",
+        vec!["account".into()],
+        vec![
+            StepSpec {
+                title: "start".into(),
+                kind: "task".into(),
+                ready_when: "true".into(),
+                ..Default::default()
+            },
+            StepSpec {
+                title: "finish".into(),
+                kind: "task".into(),
+                ready_when: "steps.start.done".into(),
+                terminal: Some(Terminal {
+                    outcome: "done".into(),
+                }),
+                ..Default::default()
+            },
+        ],
+    )
+}
+
+/// Shared write-path actor + now: every registry write records an
+/// event with a who and a when (tests are wallclock-exempt).
+fn reconciler() -> boss_core::actor::ActorId {
+    boss_core::actor::ActorId::Automation("bootstrap-reconciler".into())
 }
 
 async fn created_by(db: &TestDb, kind: &str) -> Option<String> {
@@ -33,7 +64,11 @@ async fn pg_inserts_missing_kinds_as_bootstrap_owned() {
     let registry = PgWorkflows::new(db.pool.clone());
 
     let stats = registry
-        .bootstrap_reconcile(&[spec("workflow-design", "Design a Workflow")])
+        .bootstrap_reconcile(
+            &[spec("workflow-design", "Design a Workflow")],
+            &reconciler(),
+            chrono::Utc::now(),
+        )
         .await
         .expect("reconcile");
 
@@ -44,6 +79,7 @@ async fn pg_inserts_missing_kinds_as_bootstrap_owned() {
             republished: 0,
             preserved: 0,
             unchanged: 0,
+            rejected: 0,
         }
     );
 
@@ -67,12 +103,20 @@ async fn pg_republishes_drifted_bootstrap_rows_as_a_new_version() {
     let registry = PgWorkflows::new(db.pool.clone());
 
     registry
-        .bootstrap_reconcile(&[spec("workflow-design", "Old Label")])
+        .bootstrap_reconcile(
+            &[spec("workflow-design", "Old Label")],
+            &reconciler(),
+            chrono::Utc::now(),
+        )
         .await
         .expect("seed bootstrap");
 
     let stats = registry
-        .bootstrap_reconcile(&[spec("workflow-design", "New Label")])
+        .bootstrap_reconcile(
+            &[spec("workflow-design", "New Label")],
+            &reconciler(),
+            chrono::Utc::now(),
+        )
         .await
         .expect("republish");
 
@@ -135,7 +179,11 @@ async fn pg_preserves_operator_edits() {
     .expect("seed operator row");
 
     let stats = registry
-        .bootstrap_reconcile(&[spec("workflow-design", "Default Label")])
+        .bootstrap_reconcile(
+            &[spec("workflow-design", "Default Label")],
+            &reconciler(),
+            chrono::Utc::now(),
+        )
         .await
         .expect("reconcile");
 
@@ -156,6 +204,74 @@ async fn pg_preserves_operator_edits() {
     );
 }
 
+/// A workflow published through the ORDINARY API path is operator-owned
+/// and survives reconcile.
+///
+/// This is the gap that let two protocol edits vanish. `pg_preserves_
+/// operator_edits` above seeds its operator row with direct SQL, so it
+/// proved reconcile PRESERVES such a row while nothing proved the API
+/// ever produced one — and it did not: `create_draft` omitted
+/// `created_by`, the column defaults to 'bootstrap', and the next boot
+/// republished the code default over the edit.
+///
+/// Measured cost: a `satisfied` terminal added to `user-feedback` v8 and
+/// `ship-a-change` v4 on 2026-08-14 was gone by the next day, both kinds
+/// one version higher with the terminal absent. `approval`, edited the
+/// same way but absent from platform_workflows(), kept its edits — which
+/// is what isolated the cause (68331085).
+///
+/// So this drives the real path end to end rather than asserting the
+/// stamp: draft, publish, reconcile against a DIFFERENT code default,
+/// and check the edit is still there afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_preserves_a_workflow_published_through_the_api() {
+    let db = TestDb::new().await;
+    let registry = PgWorkflows::new(db.pool.clone());
+    let editor = boss_core::actor::ActorId::Human("emp-david".into());
+    let now = chrono::Utc::now();
+
+    let mut edited = spec("workflow-design", "David's Label");
+    edited.status = WorkflowStatus::Draft;
+    registry
+        .create_draft(edited, &editor, now)
+        .await
+        .expect("draft through the ordinary API path");
+    registry
+        .publish("workflow-design", &editor, now)
+        .await
+        .expect("publish");
+
+    assert_eq!(
+        created_by(&db, "workflow-design").await.as_deref(),
+        Some("emp-david"),
+        "an API publish must record WHO published it — 'bootstrap' here is the bug"
+    );
+
+    let stats = registry
+        .bootstrap_reconcile(
+            &[spec("workflow-design", "Default Label")],
+            &reconciler(),
+            now,
+        )
+        .await
+        .expect("reconcile");
+
+    assert_eq!(
+        stats.preserved, 1,
+        "the edit is operator-owned, so reconcile must leave it alone"
+    );
+    assert_eq!(
+        stats.republished, 0,
+        "republishing here is the silent revert"
+    );
+
+    let live = registry.get_active("workflow-design").await.unwrap();
+    assert_eq!(
+        live.label, "David's Label",
+        "the edit survived the boot that used to undo it"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_no_op_when_already_matching() {
     let db = TestDb::new().await;
@@ -163,11 +279,15 @@ async fn pg_no_op_when_already_matching() {
 
     let body = spec("workflow-design", "Design a Workflow");
     registry
-        .bootstrap_reconcile(std::slice::from_ref(&body))
+        .bootstrap_reconcile(
+            std::slice::from_ref(&body),
+            &reconciler(),
+            chrono::Utc::now(),
+        )
         .await
         .expect("seed");
     let stats = registry
-        .bootstrap_reconcile(&[body])
+        .bootstrap_reconcile(&[body], &reconciler(), chrono::Utc::now())
         .await
         .expect("reconcile");
 
@@ -185,13 +305,22 @@ async fn pg_publish_authored_supersedes_active_and_stamps_provenance() {
     // Seed a bootstrap row first, so the publish path actually
     // exercises the supersede branch (not just an insert).
     registry
-        .bootstrap_reconcile(&[spec("morning-brew", "Bootstrap Label")])
+        .bootstrap_reconcile(
+            &[spec("morning-brew", "Bootstrap Label")],
+            &reconciler(),
+            chrono::Utc::now(),
+        )
         .await
         .expect("seed bootstrap");
 
     let job_id = JobId::new();
     let published = registry
-        .publish_authored(spec("morning-brew", "Job-Authored Label"), job_id)
+        .publish_authored(
+            spec("morning-brew", "Job-Authored Label"),
+            job_id,
+            &boss_core::actor::ActorId::Human("emp-cto".into()),
+            chrono::Utc::now(),
+        )
         .await
         .expect("publish");
 
@@ -230,7 +359,11 @@ async fn pg_publish_authored_supersedes_active_and_stamps_provenance() {
     // Sanity check: the next bootstrap_reconcile against an updated
     // default does NOT touch the operator-published row.
     let stats = registry
-        .bootstrap_reconcile(&[spec("morning-brew", "Updated Bootstrap Default")])
+        .bootstrap_reconcile(
+            &[spec("morning-brew", "Updated Bootstrap Default")],
+            &reconciler(),
+            chrono::Utc::now(),
+        )
         .await
         .expect("reconcile post-publish");
     assert_eq!(

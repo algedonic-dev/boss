@@ -63,9 +63,24 @@
 }
 .step-review-design .srd-meter.is-complete > i { background: #16a34a; }
 
-/* Two panes: the document to read, the decisions to record. */
+/* Two panes: the document to read, the decisions to record.
+
+   The rail may grow to half (David, 6d4fa80a: "give the question bar
+   up to half if it doesn't require scrolling the doc panel
+   horizontally"). It was capped at 420px while the doc took every
+   remaining pixel — but the doc CANNOT use them: .srd-doc-inner is
+   capped at 68ch, so past that width the left pane was growing its
+   own margins while the rail, which holds the textareas you actually
+   type in, stayed narrow.
+
+   Both columns are 1fr, so on a wide viewport they split evenly. The
+   left floor is what honours "without scrolling the doc panel": 46ch
+   is narrower than the 68ch measure but still comfortably wider than
+   the point at which prose starts to break up, and the elements that
+   genuinely cannot reflow — pre blocks and tables — already scroll
+   inside their own box rather than widening the panel. */
 .step-review-design .srd-panes {
-  display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, 420px);
+  display: grid; grid-template-columns: minmax(46ch, 1fr) minmax(320px, 1fr);
   gap: var(--srd-gap); align-items: start;
 }
 @media (max-width: 1100px) {
@@ -109,7 +124,13 @@
 .step-review-design .srd-doc-inner td {
   border: 1px solid var(--border, #e7e5e4); padding: 6px 10px; text-align: left;
 }
-.step-review-design .srd-docmeta {
+.step-review-design .srd-rawmd {
+      white-space: pre-wrap;
+      word-break: break-word;
+      font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+      margin: 12px 0 0;
+    }
+    .srd-docmeta {
   font-size: 12px; color: var(--text-dim, #78716c);
   margin-bottom: 18px; padding-bottom: 10px;
   border-bottom: 1px solid var(--border, #e7e5e4);
@@ -157,6 +178,38 @@
   outline: 2px solid var(--accent, #2563eb); outline-offset: -1px; background: var(--card, #fff);
 }
 .step-review-design .srd-q textarea:disabled { opacity: .7; }
+
+/* The proposal is an offer, so it is visibly NOT the resolution box:
+   its own tinted card, above the label, with the button that copies it
+   down. Reading line-height — this is prose the reviewer has to weigh,
+   not a UI string. */
+.step-review-design .srd-proposal {
+  margin: 12px 0 0; padding: 8px 10px; border-radius: 5px;
+  border: 1px solid var(--border, #e7e5e4);
+  border-left: 3px solid var(--accent, #2563eb);
+  background: var(--bg, #fafaf9);
+}
+.step-review-design .srd-proposal-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+}
+.step-review-design .srd-proposal-label {
+  font-size: 11px; font-weight: 600; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--text-dim, #78716c);
+}
+.step-review-design .srd-proposal-text {
+  margin-top: 6px; font-size: 13px; line-height: 1.55; color: var(--text, #1c1917);
+  white-space: pre-wrap;
+}
+.step-review-design .srd-use {
+  flex: none; font: inherit; font-size: 12px; cursor: pointer;
+  padding: 3px 10px; border-radius: 4px;
+  border: 1px solid var(--accent, #2563eb);
+  background: transparent; color: var(--accent, #2563eb);
+}
+.step-review-design .srd-use:hover:not(:disabled) {
+  background: var(--accent, #2563eb); color: #fff;
+}
+.step-review-design .srd-use:disabled { opacity: .5; cursor: default; }
 
 .step-review-design .srd-empty,
 .step-review-design .srd-loading {
@@ -215,6 +268,12 @@
 
     let doc = null;
     let questions = [];
+    // True when the questions came from the packet rather than the
+    // docs API. Decides whether answers are mirrored to
+    // pending-decisions: a self-carried packet's answers live in step
+    // metadata, which IS the record, so mirroring them into the flush
+    // pipeline would create a second copy that can disagree.
+    let selfCarried = false;
     let loadError = null;
     let saving = false;
     let saveError = null;
@@ -245,6 +304,38 @@
     }
     function allAnswered() {
       return questions.length > 0 && answeredCount() === questions.length;
+    }
+
+    /// The doc's own proposed answer, with a button that copies it into
+    /// the resolution box. Returns null when the question proposes
+    /// nothing, which is most of the corpus' older questions and every
+    /// question whose author left the answer open on purpose.
+    ///
+    /// `q.proposal` is parsed by boss-docs from a `Proposed:` line.
+    /// That extractor recognised only `**Proposal**:` until 2026-08-14
+    /// — a spelling no doc uses — so this field was null on every
+    /// question in the corpus and the rail below carries a comment
+    /// concluding there was no proposal to accept.
+    function proposalBlock(q, onUse) {
+      const proposal = typeof q.proposal === 'string' ? q.proposal.trim() : '';
+      if (!proposal) return null;
+      const btn = h(
+        'button',
+        { className: 'srd-use', type: 'button', disabled: isDone },
+        'Use this',
+      );
+      btn.addEventListener('click', () => onUse(proposal));
+      return h(
+        'div',
+        { className: 'srd-proposal' },
+        h(
+          'div',
+          { className: 'srd-proposal-head' },
+          h('span', { className: 'srd-proposal-label' }, 'Proposed in the doc'),
+          btn,
+        ),
+        h('div', { className: 'srd-proposal-text' }, proposal),
+      );
     }
 
     const progressSpan = h('span', { className: 'srd-progress' });
@@ -310,11 +401,16 @@
       // thing they are reviewing.
       const docPane = h('div', { className: 'srd-doc' });
       const inner = h('div', { className: 'srd-doc-inner' });
+      // A self-carried packet has no path/status/word_count — it is not
+      // a file yet, which is the point. Say what it IS instead of
+      // rendering three `undefined`s.
       inner.appendChild(
         h(
           'div',
           { className: 'srd-docmeta' },
-          `${doc.path} · ${doc.status} · ${doc.word_count || '—'} words`,
+          doc.path
+            ? `${doc.path} · ${doc.status} · ${doc.word_count || '—'} words`
+            : 'carried by this packet · not yet a file',
         ),
       );
       if (doc.content_html) {
@@ -324,6 +420,26 @@
         // trust domain as this bundle.
         prose.innerHTML = doc.content_html;
         inner.appendChild(prose);
+      } else if (doc.markdown) {
+        // A SELF-CARRIED packet's prose is NOT server-rendered and NOT
+        // in the same trust domain — it is whatever the author put in
+        // step metadata. The host's escape-first renderer
+        // (window.__boss_markdown, web-kit's renderMarkdown) makes it
+        // READABLE without trusting it: every character is escaped
+        // before any tag the renderer emits, and hrefs admit only
+        // http(s)/relative (2244db9e — "showed special markdown
+        // characters"). Absent the host renderer (older SPA, tests),
+        // the preserved-text fallback stands.
+        const render = window.__boss_markdown;
+        if (typeof render === 'function') {
+          const prose = h('div', { className: 'srd-doc-inner-md' });
+          prose.innerHTML = render(doc.markdown);
+          inner.appendChild(prose);
+        } else {
+          const prose = h('pre', { className: 'srd-rawmd' });
+          prose.textContent = doc.markdown;
+          inner.appendChild(prose);
+        }
       }
       docPane.appendChild(inner);
       bodyDiv.appendChild(docPane);
@@ -369,6 +485,26 @@
             }
             return q.body_md ? h('div', { className: 'srd-q-body' }, q.body_md) : null;
           })(),
+          // The proposal, offered rather than applied (David,
+          // 2026-08-14): "give you the ability to populate the
+          // resolution but I have to still click the button ...
+          // basically just authorizing you to copy and paste on my
+          // behalf." So the draft sits here with a button, and the
+          // resolution box stays empty until he presses it. Filling
+          // the box directly would make every question count as
+          // answered on page load, and Complete is gated on that
+          // count — one stray click would then record decisions
+          // nobody read.
+          //
+          // Nothing about this is recorded on the packet: the
+          // proposal is the doc's own text, and what gets stored is
+          // the resolution he committed.
+          proposalBlock(q, (text) => {
+            ta.value = text;
+            setResolution(q.anchor, text);
+            card.classList.add('is-addressed');
+            ta.focus();
+          }),
           h('label', { className: 'srd-label' }, 'Resolution'),
           ta,
         );
@@ -394,6 +530,11 @@
           ),
         );
       }
+      // A doc that failed to LOAD must not offer completion: with
+      // `questions` still empty the gate below reads as "no questions"
+      // and renders "Mark reviewed" on top of the error — reviewing a
+      // doc nobody has seen (found by the 6f40b23f harness).
+      if (loadError) return;
       if (isDone) return;
       const saveBtn = h(
         'button',
@@ -428,10 +569,22 @@
       // so the existing flush-jobs path can extract them to ADRs. We
       // POST one at a time — the endpoint is upsert-style.
       // PendingDecisionInput wants {doc_path, anchor, kind, resolution}.
-      // The reviewer types free-text decisions here (there's no parsed
-      // proposal being accepted), so every row is an Override. The old
-      // body sent `proposal` with no kind — a 422 this catch swallowed,
-      // so flush-jobs always saw zero pending decisions.
+      // The old body sent `proposal` with no kind — a 422 this catch
+      // swallowed, so flush-jobs always saw zero pending decisions.
+      //
+      // `kind` is now a fact rather than a constant. It used to be
+      // hardcoded to override because no question ever carried a
+      // proposal to accept (the parser looked for a spelling the corpus
+      // does not use), which made the accept/override split carry no
+      // information at all. It is derived from what the reviewer
+      // submitted: identical to the doc's proposal means he took it,
+      // anything else means he wrote his own. That is a claim about his
+      // text, not about who drafted it — nothing here records that a
+      // proposal was pre-filled.
+      const proposalFor = (anchor) => {
+        const q = questions.find((x) => x.anchor === anchor);
+        return q && typeof q.proposal === 'string' ? q.proposal.trim() : '';
+      };
       const writes = resolutions
         .filter((r) => r.decision.trim().length > 0)
         .map((r) =>
@@ -441,7 +594,7 @@
             body: JSON.stringify({
               doc_path: docPath,
               anchor: r.anchor,
-              kind: 'override',
+              kind: r.decision.trim() === proposalFor(r.anchor) ? 'accept' : 'override',
               resolution: r.decision,
             }),
           }),
@@ -469,7 +622,7 @@
       saveError = null;
       renderActions();
       try {
-        await persistPendingDecisions();
+        if (!selfCarried) await persistPendingDecisions();
         const completing = autoComplete && (allAnswered() || questions.length === 0);
         const workingStatus = step.status === 'pending' ? 'active' : step.status;
         const finalMeta = { ...step.metadata, doc_path: docPath, resolutions };
@@ -514,8 +667,79 @@
     }
 
     async function load() {
+      // SELF-CARRIED FIRST. When the step brings its own questions,
+      // this plugin needs no docs-api and no file on deployed main —
+      // the packet IS the doc.
+      //
+      // That is the whole point. The fetch below carries a 404 message
+      // apologising that "review Jobs are instant data but docs ride
+      // trains, so a review can exist before its doc reaches deployed
+      // main" — which is a fair description of a review protocol that
+      // cannot start until the thing being reviewed has already
+      // shipped. David, 2026-08-16: "our lack of good protocol around
+      // design docs, and the plumbing being broken too, is causing
+      // major slowdowns in my design review handling speed."
+      //
+      // Backward compatible on purpose: every existing
+      // design-doc-review Job has no `questions` key and takes the
+      // fetch path exactly as before. Nothing in flight changes.
+      const carried = step.metadata && step.metadata.questions;
+      if (Array.isArray(carried) && carried.length > 0) {
+        selfCarried = true;
+        questions = carried.map((q, i) => ({
+          anchor: String(q.anchor || `Q${i + 1}`),
+          title: String(q.title || q.question || ''),
+          proposal: typeof q.proposal === 'string' ? q.proposal : '',
+          body: typeof q.body === 'string' ? q.body : '',
+        }));
+        // THE PROSE MAY BE ON EITHER BAG, and this reads both.
+        //
+        // The questions must live on the STEP — that is what makes the
+        // packet self-carried. The prose has no such requirement, and
+        // an author who puts `markdown` in the Job's metadata (the
+        // natural place for "the document this packet is about") got a
+        // review surface with questions and an EMPTY doc pane. That
+        // shipped: David reviewed a design on 2026-08-16 seeing only
+        // the questions, and answered four of them blind before asking
+        // whether the content side was supposed to be empty.
+        //
+        // Falling back is the right shape rather than a workaround.
+        // "Which metadata bag" is exactly the kind of detail that will
+        // keep being got wrong, and the cost of guessing wrong should
+        // be nothing rather than a silently unreadable review.
+        const sm = step.metadata || {};
+        doc = {
+          title: String(sm.title || docPath || 'Design doc'),
+          content_html: null,
+          markdown: String(sm.markdown || ''),
+        };
+        if (!doc.markdown) {
+          try {
+            const jr = await fetch(`/api/jobs/${jobId}`, {
+              headers: { accept: 'application/json' },
+            });
+            if (jr.ok) {
+              const job = await jr.json();
+              const jm = (job && job.metadata) || {};
+              doc.markdown = String(jm.markdown || '');
+              if (!sm.title && jm.title) doc.title = String(jm.title);
+            }
+          } catch (_) {
+            // A packet with questions and no readable prose is still
+            // reviewable; leave the doc pane empty rather than fail
+            // the whole surface.
+          }
+        }
+        renderHeader();
+        renderBody();
+        renderProgress();
+        renderActions();
+        return;
+      }
       if (!docPath) {
-        loadError = 'step.metadata.doc_path is empty';
+        loadError =
+          'this step carries neither metadata.questions nor metadata.doc_path — ' +
+          'nothing to review';
         renderBody();
         renderProgress();
         renderActions();
@@ -543,7 +767,27 @@
           return;
         }
         if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
-        const detail = await r.json();
+        // The other honest miss (6f40b23f): a front that does not
+        // route /api/design/* answers 200 with a ZERO-BYTE body — the
+        // docs service runs on the operator instance only. Left to
+        // r.json() this rendered as a JSON parse error, which reads
+        // like a broken doc rather than an absent service.
+        const raw = await r.text();
+        if (!raw.trim()) {
+          loadError =
+            `this instance does not serve the docs API (an empty reply ` +
+            `for ${docPath}) — the docs service runs on the operator ` +
+            `instance only. Reviews spawned since 2026-08-18 carry ` +
+            `their questions in the packet and never need this fetch; ` +
+            `this older packet carries only a pointer. Open it on the ` +
+            `operator instance, or re-spawn the review to get a ` +
+            `self-carried packet.`;
+          renderBody();
+          renderProgress();
+          renderActions();
+          return;
+        }
+        const detail = JSON.parse(raw);
         doc = detail;
         questions = Array.isArray(detail.questions) ? detail.questions : [];
       } catch (e) {

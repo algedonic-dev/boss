@@ -31,6 +31,7 @@
 //! terminal = { outcome = "brewed" }    # optional; marks a terminal
 //! sign_offs_required = []          # role codes; "@authority_role" resolves
 //! authority_role = "head-brewer"
+//! claimable = true              # role queue, not a nomination
 //! metadata_defaults = { mash_temp_f = 152 }
 //! ```
 //!
@@ -117,10 +118,24 @@ struct StepToml {
     title_template: String,
     #[serde(default)]
     sign_offs_required: Vec<String>,
+    /// A bundle may raise a step's assurance; omitted means "the
+    /// StepType's floor", which is Session unless the kind says
+    /// otherwise. Protocol data, so raising it is a Workflow edit.
+    #[serde(default)]
+    assurance_required: Option<boss_core::job::Assurance>,
+    /// Spec-authored duration in hours — preferred by executors over
+    /// the StepType kind's `typical_duration_hours`. Omitted means
+    /// "the kind's typical duration". See `StepSpec::duration_hours`.
+    #[serde(default)]
+    duration_hours: Option<f64>,
     #[serde(default)]
     fields: Vec<boss_core::job::StepField>,
     #[serde(default)]
     authority_role: Option<String>,
+    /// Leave the step for its role to claim rather than
+    /// nominating one holder. See `StepSpec::claimable`.
+    #[serde(default)]
+    claimable: Option<bool>,
     #[serde(default)]
     metadata_defaults: serde_json::Value,
 }
@@ -193,12 +208,15 @@ fn workflow_toml_to_spec(toml: WorkflowToml, default_owner: &str) -> WorkflowSpe
         .map(|s| StepSpec {
             title: s.title,
             kind: s.kind,
+            assurance_required: s.assurance_required,
+            duration_hours: s.duration_hours,
             ready_when: s.ready_when,
             terminal: s.terminal.map(|t| Terminal { outcome: t.outcome }),
             title_template: s.title_template,
             sign_offs_required: s.sign_offs_required,
             fields: s.fields,
             authority_role: s.authority_role,
+            claimable: s.claimable,
             metadata_defaults: s.metadata_defaults,
         })
         .collect();
@@ -342,6 +360,40 @@ terminal = { outcome = "brewed" }
         assert_eq!(step.metadata_defaults["mash_temp_f"], 152);
         assert_eq!(step.metadata_defaults["mash_minutes"], 60);
         assert_eq!(specs[0].owning_team, "brewery");
+    }
+
+    #[test]
+    fn carries_step_duration_hours_through() {
+        // A step may author its own duration (`duration_hours`) —
+        // preferred by executors over the StepType kind's
+        // `typical_duration_hours`. The key must flow from seed TOML
+        // into `StepSpec.duration_hours`; a step without it stays
+        // `None` (kind-default pacing).
+        let text = r#"
+[[workflow]]
+kind = "with-duration"
+label = "With Duration"
+category = "production"
+subject_kinds = ["location"]
+
+[[workflow.step]]
+title = "trigger"
+kind = "task"
+ready_when = "true"
+title_template = "Open"
+
+[[workflow.step]]
+title = "fermentation-start"
+kind = "task"
+ready_when = "steps.trigger.done"
+title_template = "Ferment"
+duration_hours = 168.0
+terminal = { outcome = "brewed" }
+"#;
+        let specs = parse_workflows(text, "brewery", "<test>").unwrap();
+        let steps = &specs[0].steps;
+        assert_eq!(steps[0].duration_hours, None, "unset key stays None");
+        assert_eq!(steps[1].duration_hours, Some(168.0));
     }
 
     #[test]
@@ -541,6 +593,31 @@ title_template = "Open"
         }
         // Every spec carries the brewery owning_team stamp.
         assert!(specs.iter().all(|s| s.owning_team == "brewery"));
+        // Fermentation is the headline fidelity case for spec-authored
+        // durations: each morning-brew family ferments for days, not
+        // one 8h kind-default workday. Pin the seed values here so the
+        // seed bundle and the loader cannot drift apart.
+        for (kind, hours) in [
+            ("morning-brew", 168.0),
+            ("morning-brew-ipa", 168.0),
+            ("morning-brew-hazy", 144.0),
+            ("morning-brew-stout", 240.0),
+            ("morning-brew-lager", 336.0),
+        ] {
+            let spec = specs.iter().find(|s| s.kind == kind).unwrap_or_else(|| {
+                panic!("expected `{kind}` in brewery Workflows");
+            });
+            let ferment = spec
+                .steps
+                .iter()
+                .find(|s| s.title == "fermentation-start")
+                .unwrap_or_else(|| panic!("`{kind}` should have a fermentation-start step"));
+            assert_eq!(
+                ferment.duration_hours,
+                Some(hours),
+                "`{kind}` fermentation-start should carry an honest duration"
+            );
+        }
     }
 
     #[test]

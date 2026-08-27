@@ -24,7 +24,27 @@
   import { navigate } from '../router';
   import { session } from '@boss/web-kit/session/session.svelte';
 
-  let { jobId, stepId } = $props<{ jobId: string; stepId: string }>();
+  let { jobId, stepId, from, fromLabel } = $props<{
+    jobId: string;
+    stepId: string;
+    /// Where the operator came from. David, feedback 40fe7291, filed
+    /// while working the design queue: "The 'Back' functionality from
+    /// a design review went to the job. What I expected: gone back to
+    /// the Design Review queue."
+    ///
+    /// Back used to be hardcoded to the job page, which is the one
+    /// place you were deliberately NOT sent — a review opens the
+    /// full-page step surface precisely because the job page buries
+    /// the document beside a sidebar and a step list. So Back undid
+    /// the routing choice and dropped you one queue further away.
+    ///
+    /// The lens that opened the step says where back goes, because it
+    /// is the only thing that knows. Absent (a deep link, or a
+    /// surface that has not adopted it) the job page remains the
+    /// fallback, so nothing regresses.
+    from?: string;
+    fromLabel?: string;
+  }>();
 
   // Reuse the plugin contract's own step shape rather than
   // redeclaring it — a local copy drifts, and the drift only shows up
@@ -37,6 +57,13 @@
   let step = $state<Step | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
+
+  // Declared after `job` because the label falls back to it. Kept as
+  // one pair so the destination and its name can never disagree — a
+  // Back reading "Design Review" that lands on the job page is worse
+  // than the bug this fixes.
+  const backTo = $derived(from ?? `/ux/jobs/${jobId}`);
+  const backText = $derived(fromLabel ?? (from ? 'Back' : (job?.title ?? 'Back to job')));
 
   // The plugin contract takes `PluginCurrentUser | undefined`, not
   // null — undefined means "no user known", which is what a
@@ -107,8 +134,8 @@
 
 <div class="step-focus">
   <div class="step-focus-bar">
-    <button class="step-focus-back" onclick={() => navigate(`/ux/jobs/${jobId}`)}>
-      ← {job?.title ?? 'Back to job'}
+    <button class="step-focus-back" onclick={() => navigate(backTo)}>
+      ← {backText}
     </button>
     {#if step}
       <span class="step-focus-title">{step.title}</span>
@@ -154,16 +181,16 @@
 <style>
   .step-focus-brief {
     margin: 10px 0 14px;
-    border: 1px solid var(--color-border, #e7e0d2);
+    border: 1px solid var(--hairline, #2A3138);
     border-radius: 8px;
     padding: 10px 14px;
-    background: var(--color-bg-raised, #fff);
+    background: var(--card, var(--ink, #12161C));
   }
   .step-focus-brief summary {
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    color: var(--color-fg-muted, #8a7a5f);
+    color: var(--static, #7A838C);
     font-weight: 600;
     cursor: pointer;
   }
@@ -180,7 +207,7 @@
     inset: 44px 0 0 0;
     display: flex;
     flex-direction: column;
-    background: var(--bg, #fafaf9);
+    background: var(--bg, var(--void, #0D1014));
   }
   .step-focus-bar {
     flex: none;
@@ -188,8 +215,8 @@
     align-items: center;
     gap: 12px;
     padding: 10px 24px;
-    border-bottom: 1px solid var(--border, #e7e5e4);
-    background: var(--card, #fff);
+    border-bottom: 1px solid var(--border, var(--hairline, #2A3138));
+    background: var(--card, var(--ink, #12161C));
   }
   .step-focus-back {
     background: none;
@@ -200,11 +227,11 @@
     cursor: pointer;
     font: inherit;
     font-size: 13px;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim, var(--static, #7A838C));
   }
   .step-focus-back:hover {
-    background: var(--bg, #f5f5f4);
-    color: var(--text, #1c1917);
+    background: var(--wash, rgba(232, 236, 239, 0.04));
+    color: var(--text, var(--fog, #E8ECEF));
   }
   .step-focus-title {
     font-size: 14px;
@@ -215,7 +242,7 @@
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim, var(--static, #7A838C));
   }
   /* The plugin owns everything from here down. */
   .step-focus-body {
@@ -233,10 +260,10 @@
     max-height: calc(100vh - 190px);
   }
   .step-focus-msg {
-    color: var(--text-dim, #78716c);
+    color: var(--text-dim, var(--static, #7A838C));
     font-size: 14px;
   }
   .step-focus-err {
-    color: #b91c1c;
+    color: var(--err, #e2685c);
   }
 </style>

@@ -2,8 +2,6 @@
 //! the projections, drop them, rebuild from `audit_log`, and assert
 //! the rebuilt projections match the snapshots exactly.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::Router;
@@ -55,6 +53,7 @@ struct StepSnapshot {
     sort_order: i32,
     blocked_by: Vec<Uuid>,
     sign_offs_required: serde_json::Value,
+    assurance_required: Option<String>,
     sign_offs: serde_json::Value,
     completed_on: Option<NaiveDate>,
     metadata: serde_json::Value,
@@ -79,7 +78,7 @@ async fn snapshot_jobs(pool: &PgPool) -> Vec<JobSnapshot> {
 async fn snapshot_steps(pool: &PgPool) -> Vec<StepSnapshot> {
     sqlx::query_as::<_, StepSnapshot>(
         "SELECT id, job_id, kind, title, assignee_id, status, sort_order, blocked_by, \
-                sign_offs_required, sign_offs, completed_on, metadata, notes, \
+                sign_offs_required, assurance_required, sign_offs, completed_on, metadata, notes, \
                 step_plugin_version, embedded_job, created_at, updated_at \
          FROM steps ORDER BY id",
     )
@@ -133,6 +132,7 @@ fn build_app(pool: PgPool) -> Router {
 
     let state = JobsApiState {
         job_edges: None,
+        stations: None,
         jobs,
         bus,
         publisher,
@@ -164,6 +164,7 @@ fn fixture_job(id: &str, title: &str) -> Job {
         closed_on: None,
         metadata: serde_json::json!({"site": "main"}),
         tags: vec!["urgent".into(), "vip".into()],
+        simulated: false,
     }
 }
 
@@ -187,6 +188,7 @@ fn fixture_step(step_id: &str, job_id: &str, sort_order: i32, title: &str) -> St
         sort_order,
         blocked_by: vec![],
         sign_offs_required: Vec::new(),
+        assurance_required: None,
         sign_offs: Vec::new(),
         fields: Vec::new(),
         completed_on: None,

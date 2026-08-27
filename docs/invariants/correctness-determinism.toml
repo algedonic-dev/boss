@@ -1,0 +1,8 @@
+[[invariant]]
+id = "correctness-determinism"
+claim = "Same inputs produce same outputs across runs — no wall-clock-derived random numbers in side effects, no nondeterministic ordering of within-step writes."
+source = "docs/design/correctness-protocol.md §The five properties.5"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "Half the claim has a mechanism and half has none. no-wallclock.sh holds the wall-clock clause statically. NOTHING checks the ordering clause: no lint, test or sweep asserts that within-step writes land in a deterministic order, and the nightly ledger replay would only surface it after the fact, in one domain, as an unexplained divergence. Recorded here as unenforced rather than enforced-by-no-wallclock because a register entry that cites a mechanism for half a claim is the exact ambiguity this file exists to remove."

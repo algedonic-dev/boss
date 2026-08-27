@@ -87,6 +87,23 @@ pub async fn now_from(clock: &Arc<dyn ClockClient>) -> chrono::DateTime<Utc> {
     clock.now().await.now
 }
 
+/// Wall-clock now — the sanctioned source for a **record stamp**
+/// built outside [`boss_core::publisher::EventStamp`] (which mints
+/// its own): the gateway audit drain, the boss-jobs registry event
+/// builders, adapters that construct `Event`s directly.
+///
+/// Sim time is retired from the record (David, 2026-08-22, packet
+/// a7a4cae5). `audit_log.timestamp` says when a fact was recorded on
+/// the one real clock; the deploy-mode clock ([`ClockClient::now`])
+/// keeps answering the *business* question ("what day is it in this
+/// company's timeline") for payload fields and domain logic. Reach
+/// for this function only when the value lands on a record's
+/// `timestamp`; everything else still routes through the clock port
+/// — the `no-wallclock` lint holds that line.
+pub fn wall_now() -> chrono::DateTime<Utc> {
+    Utc::now()
+}
+
 /// Subscribe to the clock's streaming tick feed (`GET /api/clock/ticks`,
 /// Server-Sent Events) and yield each [`ClockNow`] as it arrives — the
 /// low-latency, always-connected clock feed the dispatcher's timing

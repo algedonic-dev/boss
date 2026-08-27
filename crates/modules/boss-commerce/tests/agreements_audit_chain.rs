@@ -4,8 +4,6 @@
 //! audit_log, and `rebuild_commerce` must replay it — otherwise every
 //! agreement disappears on rebuild.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::Router;

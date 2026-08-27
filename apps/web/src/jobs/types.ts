@@ -93,6 +93,13 @@ export type Step = {
   job_id: string;
   kind: string;
   title: string;
+  /// The step's stable identity within its Workflow — the authored
+  /// step name, not the rendered `title` (which interpolates packet
+  /// metadata and therefore differs per packet). Anything keying off
+  /// "which step is this" wants this field; `title` is for humans.
+  /// Present on the wire and previously undeclared here, so callers
+  /// that needed it type-errored despite the data being there.
+  spec_slug?: string;
   assignee_id: string | null;
   status: StepStatus;
   sort_order: number;

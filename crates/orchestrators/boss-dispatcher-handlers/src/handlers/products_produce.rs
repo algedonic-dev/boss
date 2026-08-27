@@ -90,7 +90,7 @@ impl ProductsProduce {
         ledger_base: impl Into<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            client: reqwest::Client::new(),
+            client: crate::handlers::common::api_client(),
             products_base: products_base.into(),
             jobs_base: jobs_base.into(),
             inventory_base: inventory_base.into(),

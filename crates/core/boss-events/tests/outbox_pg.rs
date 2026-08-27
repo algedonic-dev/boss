@@ -12,8 +12,6 @@
 //!   crash point retries idempotently (no duplicate audit rows, no
 //!   lost notifications).
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

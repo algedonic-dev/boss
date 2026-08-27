@@ -5,6 +5,9 @@
 //! each one to its markdown file via `docs_flush::apply_decisions`,
 //! commits the result, and marks the job succeeded. Failures mark
 //! the job as failed with the error message.
+//!
+//! It commits and stops there. Getting the commit anywhere is a car's
+//! job — see `resolve_push_remote` for why, and for the opt-in.
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -182,28 +185,19 @@ async fn process_job(
 
     run_git(root, &["add", &job.payload.doc_path])?;
     run_git(root, &["commit", "-m", &commit_msg])?;
-    // Where to push is deployment-shaped: the playground works on a
-    // fork (pushes to `origin` = the protected upstream are denied),
-    // and a review box may want commit-only with a human carrying the
-    // branch. BOSS_DOCS_FLUSH_REMOTE overrides the remote;
-    // BOSS_DOCS_FLUSH_NO_PUSH=1 skips the push entirely (the commit —
-    // the durable half — still lands and the job succeeds with its
-    // sha). A failed push still fails the job, with the sha in the
-    // error so the human can push by hand.
-    let no_push = std::env::var("BOSS_DOCS_FLUSH_NO_PUSH").is_ok_and(|v| v == "1");
-    if no_push {
-        eprintln!("  (BOSS_DOCS_FLUSH_NO_PUSH=1 — commit made, push skipped)");
-    } else {
-        let remote =
-            std::env::var("BOSS_DOCS_FLUSH_REMOTE").unwrap_or_else(|_| "origin".to_string());
-        if let Err(e) = run_git(root, &["push", &remote, "HEAD"]) {
-            let sha = run_git_capture(root, &["rev-parse", "HEAD"])
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|_| "unknown".into());
-            return Err(anyhow!(
-                "commit {sha} succeeded but push to `{remote}` failed \
-                 (set BOSS_DOCS_FLUSH_REMOTE or BOSS_DOCS_FLUSH_NO_PUSH=1): {e}"
-            ));
+    match resolve_push_remote(|k| std::env::var(k).ok()) {
+        None => {
+            eprintln!("  (committed only — set BOSS_DOCS_FLUSH_REMOTE to push)");
+        }
+        Some(remote) => {
+            if let Err(e) = run_git(root, &["push", &remote, "HEAD"]) {
+                let sha = run_git_capture(root, &["rev-parse", "HEAD"])
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| "unknown".into());
+                return Err(anyhow!(
+                    "commit {sha} succeeded but push to `{remote}` failed: {e}"
+                ));
+            }
         }
     }
 
@@ -260,6 +254,36 @@ async fn mark_failed(client: &reqwest::Client, base: &str, job_id: &str, err: &s
     Ok(())
 }
 
+/// Where — if anywhere — a flushed commit gets pushed.
+///
+/// The flusher's job ends at the commit. That is David's answer to
+/// design-docs-as-data Q4, which says twice that the reviewable unit
+/// is "the docs car that carries the flush through a train": the
+/// commit is the flush's output, and a car is what moves it.
+///
+/// It used to default to `origin`, and `origin` on a BOSS deployment
+/// is the public GitHub mirror — the one remote whose protocol says
+/// nothing reaches it without a human sign-off. So the default
+/// guessed, guessed the most dangerous remote of the four, and 403'd:
+/// five decisions landed in idm-kanidm on 2026-08-16 and the run
+/// still exited non-zero, reporting failure for work that was safely
+/// committed (f89348b5).
+///
+/// Pushing is therefore opt-in and named explicitly. The conductor's
+/// `BOSS_TRAIN_DEPLOY_REMOTE` is deliberately NOT consulted as a
+/// fallback, though the triage suggested it: that variable answers
+/// "where does the conductor deploy from", the flusher usually sits
+/// on `main`, and inheriting it would push design commits straight
+/// past the train that Q4 says should carry them.
+fn resolve_push_remote<F>(env: F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env("BOSS_DOCS_FLUSH_REMOTE")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Result<()> {
     let output = Command::new("git")
         .args(args)
@@ -284,4 +308,55 @@ fn run_git_capture(cwd: &Path, args: &[&str]) -> Result<String> {
         anyhow::bail!("git {} failed: {}", args.join(" "), stderr.trim());
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_push_remote;
+
+    fn env_of(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    // The regression. An unconfigured flusher used to push `origin`,
+    // and on this deployment `origin` is https://github.com/algedonic-dev/boss
+    // — the public mirror, which needs a sign-off no automated run has.
+    #[test]
+    fn an_unconfigured_flush_pushes_nowhere() {
+        assert_eq!(resolve_push_remote(env_of(&[])), None);
+    }
+
+    // The conductor's remote is the conductor's. Reading it here would
+    // put design commits on the deploy remote's default branch without
+    // the train that design-docs-as-data Q4 says carries them.
+    #[test]
+    fn the_conductors_deploy_remote_is_not_inherited() {
+        assert_eq!(
+            resolve_push_remote(env_of(&[("BOSS_TRAIN_DEPLOY_REMOTE", "forge")])),
+            None
+        );
+    }
+
+    #[test]
+    fn pushing_happens_when_a_remote_is_named() {
+        assert_eq!(
+            resolve_push_remote(env_of(&[("BOSS_DOCS_FLUSH_REMOTE", "forge")])),
+            Some("forge".to_string())
+        );
+    }
+
+    // A variable set to nothing is a half-finished config, not a
+    // request to push to a remote called "".
+    #[test]
+    fn a_blank_remote_is_not_a_remote() {
+        assert_eq!(
+            resolve_push_remote(env_of(&[("BOSS_DOCS_FLUSH_REMOTE", "   ")])),
+            None
+        );
+    }
 }

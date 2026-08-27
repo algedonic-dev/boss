@@ -1,0 +1,8 @@
+[[invariant]]
+id = "dispatcher-rules-only-shrink"
+claim = "The roster is a ratchet: the count may fall, and any rise fails CI."
+source = "infra/lint/dispatcher-rules-ratchet.sh; docs/design/protocol-policy-publish.md"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "STATED AS A RATCHET, IMPLEMENTED AS A STATIC CEILING. The lint compares the rule count against a hardcoded BASELINE=38 and fails only above it; falling below is advisory and prints a reminder to lower BASELINE by hand. So once a migration removes rules, nothing stops the same number being re-added silently — a true ratchet cannot be un-clicked by inaction. Count and baseline are both 38 today, so the ceiling binds at the moment; the gap opens the first time a migration lands without the follow-up edit. What would enforce it: have the lint write the observed count back, or fail on any drift from BASELINE in either direction."

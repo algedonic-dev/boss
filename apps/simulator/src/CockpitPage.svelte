@@ -13,6 +13,7 @@
   import { onMount } from 'svelte';
   import PageHeader from '@boss/web-kit/ui/PageHeader.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
+  import ActorCoveragePanel from './ActorCoveragePanel.svelte';
   import type { SimTelemetry, ActorActivity, AuditEntry, ClockNow } from './types';
 
   const TELEMETRY_POLL_MS = 2_000;
@@ -277,6 +278,10 @@
     </div>
 
     <div class="cockpit-col">
+      <!-- Roster coverage first: whether the sim is driving the whole
+           brewery is the panel an operator must not have to dig for. -->
+      <ActorCoveragePanel coverage={tele.actor_coverage} />
+
       <Section title="API engagement by actor" wide>
         <p class="point-sub">
           Calls the sim makes to the public API, by who's acting — cumulative count, distinct people

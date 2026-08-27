@@ -13,8 +13,6 @@
 //!   - `rebuild_projection` recovers a stale or empty projection table
 //!     from the event log alone.
 
-#![cfg(feature = "postgres")]
-
 use boss_assets::PgAssets;
 use boss_assets::port::AssetsRepository;
 use boss_assets::types::{

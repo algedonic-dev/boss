@@ -1,0 +1,48 @@
+# The gate's toolchain, pinned so CI and a dev box agree by
+# construction rather than by luck.
+#
+# Why this exists. On 2026-08-13 a car could not be gated locally at
+# all: `cargo clippy --all-features --tests` failed with `duplicated
+# attribute` on two postgres adapters, while the same commit passed
+# the same gate in forge CI. The divergence was the toolchain — a dev
+# box on 1.93.1 against a CI image on 1.96 — and it cost a
+# diagnosis before anyone thought to compare versions, because
+# nothing in the tree stated what version the gate expected.
+#
+# 1.96.1 matches infra/forge/boss-ci/Dockerfile (`FROM
+# rust:1.96.1-slim-bookworm`). Those two facts now live twice, which
+# CLAUDE.md §9a says to collapse or pin; they are pinned rather than
+# collapsed because the Dockerfile's FROM line and a rustup channel
+# are different vocabularies with no shared source. Moving one means
+# moving the other in the same car — and the version appearing in a
+# diff is the point, since a silent toolchain bump is exactly the
+# change that produces phantom failures on one machine and not
+# another.
+#
+# THE PATCH DIGIT IS LOAD-BEARING, and leaving it off cost a CI job on
+# every single run. This said `1.96` while the image ships `1.96.1`,
+# and to rustup those are two different toolchain names: it could not
+# resolve `1.96` locally, so it went to static.rust-lang.org for the
+# channel manifest before running anything. Proven by running the CI
+# image with `--network none`:
+#
+#   channel = "1.96"    -> syncing channel updates for 1.96 ...
+#                          error: could not download file from
+#                          'https://static.rust-lang.org/dist/channel-rust-1.96.toml.sha256'
+#   channel = "1.96.1"  -> rustc 1.96.1 (31fca3adb 2026-06-26)
+#
+# That download is why `fast` died in 12s on train 1597b4a4 with the
+# network wobbling, and it made static.rust-lang.org a hard dependency
+# of every job and every gate for no benefit — the toolchain was
+# already installed, with both components, in the image. A floating
+# `1.96` in the Dockerfile would reintroduce it the moment the base
+# image moves to 1.96.2, so both sides now name the patch.
+#
+# The components are the gate's, not a preference: infra/gate.sh runs
+# clippy and `cargo fmt -- --check`, so a toolchain without them
+# cannot run the gate. They are already installed in the image, so
+# naming them here costs nothing at run time once the channel resolves
+# locally.
+[toolchain]
+channel = "1.96.1"
+components = ["rustfmt", "clippy"]

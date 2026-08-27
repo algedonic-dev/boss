@@ -52,33 +52,39 @@ implementation. Every domain rebuilder follows the same shape:
 6. **Commit + return a report** with counters
    (`events_processed`, `rows_inserted`, etc.).
 
-### Critical correctness rule: timestamps in events, not `NOW()`
+### Critical correctness rule: one instant per write — the stamp's
 
-Every projection write that previously used SQL `NOW()` has to
-read the timestamp **once in the request handler** from the clock
-service (`state.clock.now().await.now`, wrapped as
-`req_now(&state.clock)` in each module), then pass it to both the
-storage layer and the event payload. Otherwise, the DB stamps `T1`
-and the event payload carries `T2 ≈ T1 + 2ms`, and a rebuild
-reproduces a different value than the original projection — failing
-exact equality. Reading from the clock service rather than
-`Utc::now()` also keeps the timestamp on the sim clock when the
-deploy is replaying simulated activity.
+**The record stamp is wall-clock time, minted once by `EventStamp`**
+(sim time is fully retired from the record — David, 2026-08-22,
+packet a7a4cae5). What survives unchanged is the T1/T2 rule: a
+projection write must not read time twice. The DB stamping `T1` while
+the event carries `T2 ≈ T1 + 2ms` makes a rebuild reproduce a
+different value than the original projection — failing exact
+equality.
+
+So the shape is: build the stamp, and let **`stamp.timestamp`** feed
+every row column the rebuilder reproduces from `audit_log.timestamp`
+(`created_at` / `updated_at`). Business dates — `happened_on`,
+`issued_on`, `completed_on` defaults, `{day}` tokens — are a
+different question ("what day is it in this company's timeline") and
+still read the clock service (`state.clock.now().await.now`),
+sim-aware by design; they ride in the payload, and rebuilders read
+them back from the payload, never from the stamp.
 
 Two ergonomics enforce this across services:
 
-**`EventStamp` carries the timestamp into the write**
+**`EventStamp` mints and carries the timestamp into the write**
 (`boss-core/src/publisher.rs`). Events record on the transactional
 outbox INSIDE the domain transaction (the write-path contract:
 [transactional-audit-log.md](transactional-audit-log.md)); the
-stamp the handler builds — `publisher.stamp_with_actor_at(actor,
-now)` — bakes the caller-supplied `now` into every event it mints,
-and there is no defaulted-`Utc::now()` variant, because a wallclock
-default would leak wall-time rows into a sim regen instead of
-stamping the sim clock. The handler reads `now` once from the clock
-service and passes it to the `_at` mutation, which binds it into
-the row's `created_at` / `updated_at` AND records the stamped
-event(s) in the same transaction — so the audit_log row's
+stamp the handler builds — `publisher.stamp_with_actor(actor)` —
+mints wall-clock now at construction and bakes it into every event
+it builds. There is no caller-supplied-timestamp variant on the
+live path: that argument was how sim time reached the record, and
+retiring the argument is what retires the mixed-clock log. The
+handler passes `stamp.timestamp` to the `_at` mutation, which binds
+it into the row's `created_at` / `updated_at` AND records the
+stamped event(s) in the same transaction — so the audit_log row's
 `timestamp` matches what the projection got bound to, structurally.
 
 **Repository trait `_at` overloads** — every mutation method gets
@@ -109,12 +115,13 @@ per-kind-stamp crates pass `&stamp` and let the adapter build the
 payload):
 
 ```rust
-let now = boss_clock_client::now_from(&state.clock).await;
-let stamp = state.publisher.stamp_with_actor_at(actor, now).await;
+let stamp = state.publisher.stamp_with_actor(actor).await; // mints wall now
 let event = stamp.event(JOB_CREATED, serde_json::to_value(&job)?);
-state.jobs.create_job_at(&job, now, &[event]).await?;
+state.jobs.create_job_at(&job, stamp.timestamp, &[event]).await?;
 // The adapter recorded JOB_CREATED in the same transaction as the
-// row; boss-event-relay delivers it to audit_log + NATS.
+// row; boss-event-relay delivers it to audit_log + NATS. A handler
+// that ALSO needs a business date still reads the clock port:
+// let today = boss_clock_client::now_from(&state.clock).await.date_naive();
 ```
 
 Rebuilders that don't follow this can't reproduce timestamps

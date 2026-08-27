@@ -77,6 +77,43 @@ pub async fn inject_role_headers(
         if let Ok(val) = axum::http::HeaderValue::from_str(&session.access_tier) {
             req.headers_mut().insert("x-boss-access-tier", val);
         }
+        // Machine token (7fcd78fa phase 1): the gateway vouches for
+        // session-authenticated browser traffic at the machine door.
+        // Stamped INSIDE the session branch on purpose — the token
+        // asserts "this write came through an authenticated front
+        // door", and stamping it on sessionless traffic would turn the
+        // door's one credential into a blanket pass. The edge strip
+        // above already removed any client-forged copy (x-boss-*).
+        if let Some(token) = boss_core::machine_token::from_env()
+            && let Ok(val) = axum::http::HeaderValue::from_str(&token)
+        {
+            req.headers_mut()
+                .insert(boss_core::machine_token::HEADER, val);
+        }
+        // Presence ticket swap (docs/design/presence.md): a verified
+        // assertion travels as `x-presence-ticket` — a name outside
+        // the x-boss-* prefix so the edge strip above doesn't eat it,
+        // because the strip is exactly what makes the SWAPPED header
+        // unforgeable. A valid ticket (HMAC over the session key,
+        // unexpired) becomes `x-boss-presence`, which boss-jobs reads
+        // as produced-assurance; an invalid one is dropped silently —
+        // the sign-off then fails 422 as a Session stamp would.
+        let ticket = req
+            .headers()
+            .get(boss_gateway::passkey::TICKET_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        if let Some(ticket) = ticket {
+            req.headers_mut()
+                .remove(boss_gateway::passkey::TICKET_HEADER);
+            if let Some(hdr) =
+                boss_gateway::passkey::presence_header_from_ticket(&ticket, &state.session_key)
+                && let Ok(val) = axum::http::HeaderValue::from_str(&hdr)
+            {
+                req.headers_mut()
+                    .insert(boss_gateway::passkey::PRESENCE_HEADER, val);
+            }
+        }
     }
 
     next.run(req).await

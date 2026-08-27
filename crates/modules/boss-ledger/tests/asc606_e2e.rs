@@ -18,8 +18,6 @@
 //! env-var mutation here doesn't leak into rules_v1 / periods_e2e /
 //! http_api which all want v1.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Mutex;
 
 use boss_ledger::{BossRuleSet, FactRef, evaluate, post_fact_in_tx, recognize};
@@ -307,8 +305,8 @@ async fn locked_period_skip_advances_cursor_without_posting() {
     let stamp = boss_core::publisher::EventStamp::new(
         "ledger",
         boss_core::actor::ActorId::Automation("test".into()),
-        chrono::Utc::now(),
-    );
+    )
+    .with_timestamp(chrono::Utc::now());
     boss_ledger::periods::lock_period(&db.pool, feb_period_id, "test", &stamp, "test")
         .await
         .unwrap();

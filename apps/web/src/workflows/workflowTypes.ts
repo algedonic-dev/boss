@@ -36,6 +36,11 @@ export type StepSpec = {
   title_template: string;
   sign_offs_required?: string[];
   authority_role: string | null;
+  /// Assurance the stamp must be produced with. Absent/null = the
+  /// kind's floor (today: session). "presence" demands a passkey
+  /// assertion bound to the step's shape hash — a Workflow may raise
+  /// but never lower the floor (docs/design/presence.md Q1).
+  assurance_required?: 'session' | 'presence' | null;
   metadata_defaults: Record<string, unknown>;
 };
 

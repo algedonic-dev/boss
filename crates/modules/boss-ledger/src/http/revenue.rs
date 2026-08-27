@@ -62,7 +62,7 @@ pub(super) async fn create_revenue_schedule(
     }
 
     let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = super::event_stamp(&state, &user, now).await;
+    let stamp = super::event_stamp(&state, &user).await;
     let mut tx = match state.pool.begin().await {
         Ok(t) => t,
         Err(e) => return storage_err(e),

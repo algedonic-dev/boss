@@ -64,3 +64,19 @@ sqlx = { version = "0.8", default-features = false, features = ["macros", "runti
 
 [lints]
 workspace = true
+
+[[test]]
+name = "bulletins_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "files_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "manual_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "rebuild_e2e"
+required-features = ["postgres"]

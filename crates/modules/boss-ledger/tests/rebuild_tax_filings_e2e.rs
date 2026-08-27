@@ -20,8 +20,6 @@
 //! source facts) posts no journal entry, so it has no fact to rebuild
 //! from. `ledger.tax.filing.created` carries the row shape instead.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::Router;

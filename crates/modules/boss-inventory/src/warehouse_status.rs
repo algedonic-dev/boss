@@ -522,8 +522,8 @@ mod tests {
     // ---------------------------------------------------------------------
     // Property-based tests
     //
-    // Proptest on the pure aggregators per
-    // docs/formal-methods.md step 1: each asserts a structural
+    // Proptest on the pure aggregators. (A formal-methods doc was
+    // cited here and never written.) Each asserts a structural
     // invariant that has to hold regardless of the shape of the input.
     // Strategies build worst-case inputs (empty, zero, overflow,
     // duplicates, monotonic growth) automatically.

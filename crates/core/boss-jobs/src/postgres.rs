@@ -66,6 +66,7 @@ struct JobRow {
     closed_on: Option<chrono::NaiveDate>,
     metadata: serde_json::Value,
     tags: Vec<String>,
+    simulated: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -80,6 +81,7 @@ struct StepRow {
     sort_order: i32,
     blocked_by: Vec<uuid::Uuid>,
     sign_offs_required: serde_json::Value,
+    assurance_required: Option<String>,
     sign_offs: serde_json::Value,
     fields: serde_json::Value,
     completed_on: Option<chrono::NaiveDate>,
@@ -97,10 +99,15 @@ struct StepRow {
 struct AssignmentRowSql {
     #[sqlx(flatten)]
     step: StepRow,
+    job_title: String,
+    due_on: Option<chrono::NaiveDate>,
     workflow: String,
+    workflow_version: i32,
     subject_kind: String,
     subject_id: String,
     priority: String,
+    simulated: bool,
+    tags: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +129,7 @@ fn row_to_job(r: JobRow) -> Job {
         closed_on: r.closed_on,
         metadata: r.metadata,
         tags: r.tags,
+        simulated: r.simulated,
     }
 }
 
@@ -137,6 +145,13 @@ fn row_to_step(r: StepRow) -> Result<Step, JobsError> {
         sort_order: r.sort_order,
         blocked_by: r.blocked_by.into_iter().map(StepId::from_uuid).collect(),
         sign_offs_required: serde_json::from_value(r.sign_offs_required).unwrap_or_default(),
+        // An unrecognised value reads as None — "the kind's floor" —
+        // rather than failing the whole row. A step whose requirement
+        // cannot be parsed is still a step someone needs to see.
+        assurance_required: r
+            .assurance_required
+            .as_deref()
+            .and_then(|v| serde_json::from_value(serde_json::Value::String(v.to_string())).ok()),
         sign_offs: serde_json::from_value(r.sign_offs).unwrap_or_default(),
         fields: serde_json::from_value(r.fields).unwrap_or_default(),
         completed_on: r.completed_on,
@@ -335,11 +350,14 @@ impl JobsRepository for PgJobs {
         .bind(&job.tags)
         .bind(job.workflow_version)
         .bind(now)
-        // Decided once, here, from the origin of the request that
-        // opened the Job — and never revisited. Everything downstream
-        // (steps, side effects, an operator poking at it later) is
-        // simulated iff the Job is.
-        .bind(boss_core::sim_origin::is_in_sim_chain())
+        // Decided once, at ADMISSION (create_job in http/jobs.rs:
+        // explicit body flag OR sim-chain origin) — and never
+        // revisited. The adapter persists the Job it was handed so
+        // the row can never disagree with the JOB_CREATED payload
+        // recorded beside it; everything downstream (steps, side
+        // effects, an operator poking at it later) is simulated iff
+        // the Job is.
+        .bind(job.simulated)
         .execute(&mut *tx)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -362,7 +380,7 @@ impl JobsRepository for PgJobs {
 
     async fn get_job(&self, id: &JobId) -> Result<Option<Job>, JobsError> {
         let row = sqlx::query_as::<_, JobRow>(
-            "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, due_on, closed_on, metadata, tags FROM jobs WHERE id = $1",
+            "SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status, priority, opened_on, due_on, closed_on, metadata, tags, simulated FROM jobs WHERE id = $1",
         )
         .bind(*id.inner().as_uuid())
         .fetch_optional(&self.pool)
@@ -383,6 +401,10 @@ impl JobsRepository for PgJobs {
             .begin()
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // `simulated` is deliberately absent from the SET list: a
+        // Job's origin is decided at admission and never revisited.
+        // The storage enforces the immutability rather than trusting
+        // every caller to (same rule as rebuild.rs's upsert).
         let result = sqlx::query(
             r#"
             UPDATE jobs SET kind = $2, subject_kind = $3, subject_id = $4,
@@ -427,6 +449,75 @@ impl JobsRepository for PgJobs {
         Ok(())
     }
 
+    async fn merge_job_metadata_at(
+        &self,
+        id: &JobId,
+        patch: &serde_json::Map<String, serde_json::Value>,
+        stamp: &boss_core::publisher::EventStamp,
+    ) -> Result<Job, JobsError> {
+        // Split the overlay once: null values are removals, everything
+        // else upserts. Top-level only — that is the whole of the
+        // contract, matching the conductor's `overlay_metadata`.
+        let removals: Vec<String> = patch
+            .iter()
+            .filter(|(_, v)| v.is_null())
+            .map(|(k, _)| k.clone())
+            .collect();
+        let upserts: serde_json::Map<String, serde_json::Value> = patch
+            .iter()
+            .filter(|(_, v)| !v.is_null())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // ONE statement is the atomicity: the merge happens against
+        // the row as it stands at write time, never against a copy a
+        // caller fetched earlier. The CASE folds a non-object metadata
+        // (jsonb null, or a fresh row) to `{}` so `||` concatenates
+        // instead of erroring; `- text[]` is the null-removes half.
+        let row = sqlx::query_as::<_, JobRow>(
+            r#"
+            UPDATE jobs SET
+                metadata = (CASE WHEN jsonb_typeof(metadata) = 'object'
+                                 THEN metadata ELSE '{}'::jsonb END
+                            || $2::jsonb) - $3::text[],
+                updated_at = $4
+            WHERE id = $1
+            RETURNING id, kind, workflow_version, subject_kind, subject_id, title, owner_id,
+                      status, priority, opened_on, due_on, closed_on, metadata, tags, simulated
+            "#,
+        )
+        .bind(*id.inner().as_uuid())
+        .bind(serde_json::Value::Object(upserts))
+        .bind(&removals)
+        .bind(stamp.timestamp)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        let Some(row) = row else {
+            return Err(JobsError::NotFound(*id));
+        };
+        let job = row_to_job(row);
+        // OUTBOX (phase 2): the JOB_UPDATED state event is built from
+        // the POST-merge row this transaction just produced — the
+        // rebuild consumes it as full row state, so it must be the
+        // row, not an optimistic copy — and records with it.
+        let event = stamp.event(
+            crate::events::JOB_UPDATED,
+            serde_json::to_value(&job).unwrap_or_default(),
+        );
+        boss_events::outbox::record_event_in_tx(&mut tx, &event)
+            .await
+            .map_err(JobsError::Storage)?;
+        tx.commit()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        Ok(job)
+    }
+
     async fn list_jobs(
         &self,
         filter: &JobFilter,
@@ -469,10 +560,21 @@ impl JobsRepository for PgJobs {
         // /api/jobs?account_id=foo looked empty on every detail page.
         let list_sql = r#"
             SELECT id, kind, workflow_version, subject_kind, subject_id, title, owner_id, status,
-                   priority, opened_on, due_on, closed_on, metadata, tags
+                   priority, opened_on, due_on, closed_on, metadata, tags, simulated
             FROM jobs
             WHERE ($1::text IS NULL OR kind = $1)
-              AND ($2::text IS NULL OR status = $2)
+              -- $13 is the terminal retention window. With it, $2 is
+              -- no longer a plain equality: a board wants live packets
+              -- OR recently-closed ones, which is an OR across two
+              -- different columns and cannot be expressed by status
+              -- alone.
+              AND (
+                CASE WHEN $13::date IS NULL
+                     THEN ($2::text IS NULL OR status = $2)
+                     ELSE (status NOT IN ('closed', 'cancelled')
+                           OR closed_on >= $13::date)
+                END
+              )
               AND ($3::text IS NULL OR owner_id = $3)
               AND ($4::text IS NULL OR kind LIKE $4)
               AND ($7::text IS NULL OR owner_id = $7)
@@ -492,6 +594,15 @@ impl JobsRepository for PgJobs {
                 OR (length(metadata->>'waiting_on') >= 8
                     AND $11 LIKE (metadata->>'waiting_on') || '%')
               )
+              -- $12 is a JSONB containment document (a station
+              -- predicate's bound `metadata_equals`): every key/value
+              -- in it must be present on the packet.
+              AND ($12::jsonb IS NULL OR metadata @> $12::jsonb)
+              -- $14 partitions real work from the demo tenant's.
+              -- Pushed into SQL, not applied to the page: 87% of
+              -- packets are simulated, so a post-fetch filter returns
+              -- a nearly empty page and a wrong total.
+              AND ($14::bool IS NULL OR simulated = $14)
             ORDER BY opened_on DESC
             LIMIT $5 OFFSET $6
         "#;
@@ -508,6 +619,9 @@ impl JobsRepository for PgJobs {
             .bind(scope_accounts.as_deref())
             .bind(filter.subject_id.as_deref())
             .bind(filter.waiting_on.as_deref())
+            .bind(filter.metadata_contains.as_ref())
+            .bind(filter.closed_since)
+            .bind(filter.simulated)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -516,7 +630,13 @@ impl JobsRepository for PgJobs {
             r#"
             SELECT COUNT(*) FROM jobs
             WHERE ($1::text IS NULL OR kind = $1)
-              AND ($2::text IS NULL OR status = $2)
+              AND (
+                CASE WHEN $11::date IS NULL
+                     THEN ($2::text IS NULL OR status = $2)
+                     ELSE (status NOT IN ('closed', 'cancelled')
+                           OR closed_on >= $11::date)
+                END
+              )
               AND ($3::text IS NULL OR owner_id = $3)
               AND ($4::text IS NULL OR kind LIKE $4)
               AND ($5::text IS NULL OR owner_id = $5)
@@ -533,6 +653,10 @@ impl JobsRepository for PgJobs {
                 OR (length(metadata->>'waiting_on') >= 8
                     AND $9 LIKE (metadata->>'waiting_on') || '%')
               )
+              AND ($10::jsonb IS NULL OR metadata @> $10::jsonb)
+              -- Same partition as the list query, so `total` agrees
+              -- with the rows actually returned.
+              AND ($12::bool IS NULL OR simulated = $12)
             "#,
         )
         .bind(filter.kind.as_deref())
@@ -544,6 +668,9 @@ impl JobsRepository for PgJobs {
         .bind(scope_accounts.as_deref())
         .bind(filter.subject_id.as_deref())
         .bind(filter.waiting_on.as_deref())
+        .bind(filter.metadata_contains.as_ref())
+        .bind(filter.closed_since)
+        .bind(filter.simulated)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
@@ -580,10 +707,10 @@ impl JobsRepository for PgJobs {
         let result = sqlx::query(
             r#"
             INSERT INTO steps (id, job_id, kind, title, spec_slug, assignee_id, status, sort_order,
-                               blocked_by, sign_offs_required, sign_offs, fields,
+                               blocked_by, sign_offs_required, assurance_required, sign_offs, fields,
                                completed_on, metadata, notes, step_plugin_version,
                                embedded_job, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $18)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $19)
             ON CONFLICT (id) DO NOTHING
             "#,
         )
@@ -597,6 +724,11 @@ impl JobsRepository for PgJobs {
         .bind(step.sort_order)
         .bind(blocked_by_uuids(&step.blocked_by))
         .bind(serde_json::to_value(&step.sign_offs_required).unwrap_or_default())
+        .bind(
+            step.assurance_required
+                .and_then(|a| serde_json::to_value(a).ok())
+                .and_then(|v| v.as_str().map(str::to_string)),
+        )
         .bind(serde_json::to_value(&step.sign_offs).unwrap_or_default())
         .bind(serde_json::to_value(&step.fields).unwrap_or_default())
         .bind(step.completed_on)
@@ -626,7 +758,7 @@ impl JobsRepository for PgJobs {
 
     async fn get_step(&self, id: &StepId) -> Result<Option<Step>, JobsError> {
         let row = sqlx::query_as::<_, StepRow>(
-            "SELECT id, job_id, kind, title, spec_slug, assignee_id, status, sort_order, blocked_by, sign_offs_required, sign_offs, fields, completed_on, metadata, notes, step_plugin_version, embedded_job FROM steps WHERE id = $1",
+            "SELECT id, job_id, kind, title, spec_slug, assignee_id, status, sort_order, blocked_by, sign_offs_required, assurance_required, sign_offs, fields, completed_on, metadata, notes, step_plugin_version, embedded_job FROM steps WHERE id = $1",
         )
         .bind(*id.inner().as_uuid())
         .fetch_optional(&self.pool)
@@ -704,6 +836,69 @@ impl JobsRepository for PgJobs {
         Ok(())
     }
 
+    async fn claim_step_at(
+        &self,
+        step_id: &StepId,
+        actor: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        events: &[boss_core::event::Event],
+    ) -> Result<Step, JobsError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        // The compare half of the CAS lives in the WHERE clause, so
+        // two racing claims serialize on the row lock and exactly one
+        // sees a matching predicate. Idempotent re-claim by the
+        // holder matches too (ready or already active).
+        let row = sqlx::query(
+            r#"
+            UPDATE steps SET assignee_id = $2, status = 'active', updated_at = $3
+            WHERE id = $1
+              AND (
+                    (status = 'ready' AND (assignee_id IS NULL OR assignee_id = $2))
+                 OR (status = 'active' AND assignee_id = $2)
+              )
+            RETURNING id
+            "#,
+        )
+        .bind(*step_id.inner().as_uuid())
+        .bind(actor)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+
+        if row.is_none() {
+            // Lost the race (or the step was never claimable). Read
+            // the row in the same tx so the conflict names the truth
+            // the claimant collided with.
+            let cur: Option<(Option<String>, String)> =
+                sqlx::query_as("SELECT assignee_id, status FROM steps WHERE id = $1")
+                    .bind(*step_id.inner().as_uuid())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| JobsError::Storage(e.to_string()))?;
+            return match cur {
+                None => Err(JobsError::StepNotFound(*step_id)),
+                Some((holder, status)) => Err(JobsError::ClaimConflict { holder, status }),
+            };
+        }
+
+        for event in events {
+            boss_events::outbox::record_event_in_tx(&mut tx, event)
+                .await
+                .map_err(JobsError::Storage)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| JobsError::Storage(e.to_string()))?;
+        self.get_step(step_id)
+            .await?
+            .ok_or(JobsError::StepNotFound(*step_id))
+    }
+
     async fn append_sign_off(
         &self,
         step_id: &StepId,
@@ -764,7 +959,7 @@ impl JobsRepository for PgJobs {
 
     async fn list_steps(&self, job_id: &JobId) -> Result<Vec<Step>, JobsError> {
         let rows = sqlx::query_as::<_, StepRow>(
-            "SELECT id, job_id, kind, title, spec_slug, assignee_id, status, sort_order, blocked_by, sign_offs_required, sign_offs, fields, completed_on, metadata, notes, step_plugin_version, embedded_job FROM steps WHERE job_id = $1 ORDER BY sort_order",
+            "SELECT id, job_id, kind, title, spec_slug, assignee_id, status, sort_order, blocked_by, sign_offs_required, assurance_required, sign_offs, fields, completed_on, metadata, notes, step_plugin_version, embedded_job FROM steps WHERE job_id = $1 ORDER BY sort_order",
         )
         .bind(*job_id.inner().as_uuid())
         .fetch_all(&self.pool)
@@ -785,10 +980,12 @@ impl JobsRepository for PgJobs {
         // (opened_on, sort_order) for a stable executor queue.
         let rows = sqlx::query_as::<_, AssignmentRowSql>(
             "SELECT s.id, s.job_id, s.kind, s.title, s.spec_slug, s.assignee_id, s.status, \
-                    s.sort_order, s.blocked_by, s.sign_offs_required, s.sign_offs, \
+                    s.sort_order, s.blocked_by, s.sign_offs_required, s.assurance_required, s.sign_offs, \
                     s.fields, s.completed_on, s.metadata, s.notes, \
                     s.step_plugin_version, s.embedded_job, \
-                    j.kind AS workflow, j.subject_kind, j.subject_id, j.priority \
+                    j.title AS job_title, j.due_on, j.kind AS workflow, j.workflow_version, \
+                    j.subject_kind, j.subject_id, j.priority, \
+                    j.simulated, j.tags \
              FROM steps s \
              JOIN jobs j ON s.job_id = j.id \
              WHERE j.status = 'open' \
@@ -811,10 +1008,15 @@ impl JobsRepository for PgJobs {
             .map(|r| {
                 Ok(AssignmentRow {
                     job_id: JobId::from_uuid(r.step.job_id),
+                    job_title: r.job_title,
+                    due_on: r.due_on,
                     workflow: r.workflow,
+                    workflow_version: r.workflow_version,
                     subject_kind: r.subject_kind,
                     subject_id: r.subject_id,
                     priority: parse_priority(&r.priority),
+                    simulated: r.simulated,
+                    tags: r.tags,
                     step: row_to_step(r.step)?,
                 })
             })
@@ -828,10 +1030,12 @@ impl JobsRepository for PgJobs {
         // every assigned step, decoupled from who assigned it.
         let rows = sqlx::query_as::<_, AssignmentRowSql>(
             "SELECT s.id, s.job_id, s.kind, s.title, s.spec_slug, s.assignee_id, s.status, \
-                    s.sort_order, s.blocked_by, s.sign_offs_required, s.sign_offs, \
+                    s.sort_order, s.blocked_by, s.sign_offs_required, s.assurance_required, s.sign_offs, \
                     s.fields, s.completed_on, s.metadata, s.notes, \
                     s.step_plugin_version, s.embedded_job, \
-                    j.kind AS workflow, j.subject_kind, j.subject_id, j.priority \
+                    j.title AS job_title, j.due_on, j.kind AS workflow, j.workflow_version, \
+                    j.subject_kind, j.subject_id, j.priority, \
+                    j.simulated, j.tags \
              FROM steps s \
              JOIN jobs j ON s.job_id = j.id \
              WHERE j.status = 'open' \
@@ -848,10 +1052,15 @@ impl JobsRepository for PgJobs {
             .map(|r| {
                 Ok(AssignmentRow {
                     job_id: JobId::from_uuid(r.step.job_id),
+                    job_title: r.job_title,
+                    due_on: r.due_on,
                     workflow: r.workflow,
+                    workflow_version: r.workflow_version,
                     subject_kind: r.subject_kind,
                     subject_id: r.subject_id,
                     priority: parse_priority(&r.priority),
+                    simulated: r.simulated,
+                    tags: r.tags,
                     step: row_to_step(r.step)?,
                 })
             })
@@ -868,6 +1077,162 @@ impl JobsRepository for PgJobs {
         .await
         .map_err(|e| JobsError::Storage(e.to_string()))?;
         Ok(n)
+    }
+
+    async fn count_open_jobs_for_workflow(
+        &self,
+        kind: &str,
+        version: i32,
+    ) -> Result<i64, JobsError> {
+        // Served by the `jobs_kind_version` index (03-jobs.sql).
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM jobs \
+             WHERE kind = $1 AND workflow_version = $2 \
+               AND status NOT IN ('closed', 'cancelled')",
+        )
+        .bind(kind)
+        .bind(version)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+        Ok(n)
+    }
+
+    async fn workflow_terminal_report(
+        &self,
+        kind: &str,
+        since: Option<chrono::NaiveDate>,
+        simulated: Option<bool>,
+    ) -> Result<Vec<crate::port::VersionTerminalReport>, JobsError> {
+        // One statement for the whole report — the version dimension
+        // is the PINNED `workflow_version`, served by the
+        // `jobs_kind_version` index, so there is no per-version
+        // fan-out. Contract pinned against the port's pure
+        // `terminal_report_from_jobs` by tests/terminal_report_pg.rs:
+        // outcomes read `metadata->>'outcome'` over closed rows only,
+        // cycle days are `(closed_on - opened_on)` — the dates the
+        // row carries and the rebuilder reproduces — and the
+        // percentiles are `percentile_cont`, which the port helper
+        // mirrors formula-for-formula.
+        let rows: Vec<(
+            i32,
+            i64,
+            serde_json::Value,
+            serde_json::Value,
+            i64,
+            i64,
+            Option<f64>,
+            Option<f64>,
+        )> = sqlx::query_as(
+            r#"
+            WITH base AS (
+              SELECT workflow_version,
+                     status,
+                     metadata->>'outcome' AS outcome,
+                     (closed_on - opened_on)::float8 AS cycle_days
+              FROM jobs
+              WHERE kind = $1
+                AND ($2::date IS NULL OR opened_on >= $2)
+                AND ($3::bool IS NULL OR simulated = $3)
+            ),
+            statuses AS (
+              SELECT workflow_version,
+                     jsonb_object_agg(status, n) AS by_status,
+                     SUM(n)::BIGINT AS total
+              FROM (
+                SELECT workflow_version, status, COUNT(*) AS n
+                FROM base GROUP BY workflow_version, status
+              ) t
+              GROUP BY workflow_version
+            ),
+            outcomes AS (
+              SELECT workflow_version,
+                     jsonb_object_agg(outcome, n)
+                       FILTER (WHERE outcome IS NOT NULL) AS outcomes,
+                     COALESCE(SUM(n) FILTER (WHERE outcome IS NULL), 0)::BIGINT
+                       AS closed_without_outcome
+              FROM (
+                SELECT workflow_version, outcome, COUNT(*) AS n
+                FROM base WHERE status = 'closed'
+                GROUP BY workflow_version, outcome
+              ) t
+              GROUP BY workflow_version
+            ),
+            cycles AS (
+              SELECT workflow_version,
+                     COUNT(*)::BIGINT AS samples,
+                     percentile_cont(0.5) WITHIN GROUP (ORDER BY cycle_days) AS median,
+                     percentile_cont(0.9) WITHIN GROUP (ORDER BY cycle_days) AS p90
+              FROM base
+              WHERE status = 'closed' AND cycle_days IS NOT NULL
+              GROUP BY workflow_version
+            )
+            SELECT s.workflow_version,
+                   s.total,
+                   s.by_status,
+                   COALESCE(o.outcomes, '{}'::jsonb) AS outcomes,
+                   COALESCE(o.closed_without_outcome, 0) AS closed_without_outcome,
+                   COALESCE(c.samples, 0) AS samples,
+                   c.median,
+                   c.p90
+            FROM statuses s
+            LEFT JOIN outcomes o USING (workflow_version)
+            LEFT JOIN cycles c USING (workflow_version)
+            ORDER BY s.workflow_version DESC
+            "#,
+        )
+        .bind(kind)
+        .bind(since)
+        .bind(simulated)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| JobsError::Storage(e.to_string()))?;
+
+        fn counts_map(
+            v: serde_json::Value,
+        ) -> Result<std::collections::BTreeMap<String, i64>, JobsError> {
+            match v {
+                serde_json::Value::Object(map) => map
+                    .into_iter()
+                    .map(|(k, n)| {
+                        n.as_i64().map(|n| (k, n)).ok_or_else(|| {
+                            JobsError::Storage(format!("non-integer count in report: {n}"))
+                        })
+                    })
+                    .collect(),
+                other => Err(JobsError::Storage(format!(
+                    "report expected a JSON object of counts, got: {other}"
+                ))),
+            }
+        }
+
+        rows.into_iter()
+            .map(
+                |(
+                    version,
+                    total,
+                    by_status,
+                    outcomes,
+                    closed_without_outcome,
+                    samples,
+                    median,
+                    p90,
+                )| {
+                    Ok(crate::port::VersionTerminalReport {
+                        version,
+                        total,
+                        by_status: counts_map(by_status)?,
+                        outcomes: counts_map(outcomes)?,
+                        closed_without_outcome,
+                        cycle_time_days: crate::port::CycleTimeDays {
+                            samples,
+                            median,
+                            p90,
+                        },
+                    })
+                },
+            )
+            .collect()
     }
 
     async fn count_jobs_by_kind(

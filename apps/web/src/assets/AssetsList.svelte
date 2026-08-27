@@ -48,11 +48,11 @@
           fetchPaged<Asset>('/api/assets?limit=500'),
           fetch('/api/assets/summary'),
         ]);
-        if (devPaged === null) throw new Error('systems fetch failed');
+        if (devPaged.kind === 'failed') throw new Error(devPaged.error);
         if (!sumResp.ok) throw new Error(`summary HTTP ${sumResp.status}`);
         const sumBody = (await sumResp.json()) as AssetsSummary;
         if (!cancelled) {
-          devicesPage = devPaged;
+          devicesPage = devPaged.page;
           summary = sumBody;
           loading = false;
         }

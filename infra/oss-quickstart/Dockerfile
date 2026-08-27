@@ -1,5 +1,5 @@
 # OSS quickstart — single image carrying every BOSS service binary
-# + the built SPA. Ships from `docker compose up` in
+# + both built SPAs. Ships from `docker compose up` in
 # `infra/oss-quickstart/docker-compose.yml`.
 #
 # Multi-stage:
@@ -7,8 +7,9 @@
 #   2. planner     — cargo-chef recipe (the dependency build plan).
 #   3. rust-build  — cook the dep tree (a cacheable layer), then
 #                    compile the workspace in release mode.
-#   4. spa-build   — bun install + bun run build for apps/web.
-#   5. runtime     — debian:slim with the binaries + SPA copied in.
+#   4. spa-build   — bun install + bun run build for BOTH SPAs
+#                    (apps/web and apps/simulator).
+#   5. runtime     — debian:slim with the binaries + SPAs copied in.
 #
 # Image size: ~250 MB (binaries are stripped via `-C strip=symbols`
 # in the workspace Cargo.toml; SPA dist is gzipped by Caddy).
@@ -83,6 +84,16 @@ COPY crates ./crates
 COPY examples ./examples
 COPY infra/postgres ./infra/postgres
 
+# The commit this image is built from, exported to the cargo build so
+# `Capabilities` self-reports it from every service's health endpoint
+# (option_env! in boss-core). Declared AFTER the chef cook layer on
+# purpose: the arg changes every build, and placing it above would
+# invalidate the cached dependency tree each time. The train's
+# `converged` step reads this back from the RUNNING pod — the proof of
+# installation the arrival report now requires (fdff316c / 7e5ee013).
+ARG BOSS_BUILD_COMMIT=
+ENV BOSS_BUILD_COMMIT=$BOSS_BUILD_COMMIT
+
 # Build every binary the runtime needs. --features postgres pulls in
 # the sqlx-backed adapters; the workspace builds in one cargo
 # invocation so dep compilation is shared across crates. The cooked
@@ -143,12 +154,13 @@ COPY apps/simulator/package.json ./apps/simulator/package.json
 COPY libs/web-kit/package.json ./libs/web-kit/package.json
 RUN bun install --frozen-lockfile
 
-# Source for the members the SPA build needs — apps/web + its
-# @boss/web-kit workspace dependency.
+# Source for the members the SPA build needs — apps/web, apps/simulator,
+# and the @boss/web-kit workspace dependency they share.
 COPY apps/web ./apps/web
+COPY apps/simulator ./apps/simulator
 COPY libs/web-kit ./libs/web-kit
 
-# `apps/web/src/build.ts` shells out to `boss-ports-list` for the
+# Both `src/build.ts` scripts shell out to `boss-ports-list` for the
 # canonical service-port table (single-source-of-truth shared with
 # the Rust binaries). The binary comes from stage 1; copy it onto
 # PATH so the SPA build resolves it. Bare-metal `quickstart.sh`
@@ -158,6 +170,16 @@ COPY libs/web-kit ./libs/web-kit
 # stage the binary explicitly.
 COPY --from=rust-build /out/boss-ports-list /usr/local/bin/boss-ports-list
 RUN cd apps/web && bun run build
+# The Simulator UX is a SECOND SPA — its own bundle, served by
+# boss-simulator (not the gateway) under /simulator. It was never
+# built here, so every image shipped without it: the service logged
+# "no SPA bundle found — serving stub page" and the visitor got
+# whatever the gateway's fallback handed back instead of the
+# simulator. Build it in the same stage; the runtime stage below
+# copies it to the dir the service reads.
+RUN cd apps/simulator && bun run build && \
+    test -f dist/index.html || \
+    (echo "FATAL: apps/simulator built no dist/index.html" >&2; exit 1)
 
 # ---------------------------------------------------------------------------
 # Stage 5 — runtime.
@@ -175,6 +197,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
     wget \
     curl \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
 # BOSS runs as a non-root user. UID 1500 matches the systemd-deploy
@@ -200,6 +223,17 @@ COPY --from=rust-build /out/ /usr/local/bin/
 # container in compose mounts /opt/boss/spa as a read-only volume.
 COPY --from=spa-build /spa/apps/web/dist /opt/boss/spa
 
+# Simulator UX bundle. Lands on boss-simulator's OWN default static
+# dir rather than under /opt/boss like the web SPA: nothing mounts or
+# re-serves this one, and the default is the only path the service
+# reads when BOSS_SIM_STATIC_DIR is unset — which it is here, since
+# services-launcher.sh execs the binary with the container's
+# environment and compose sets no override. Putting it anywhere else
+# would mean a second copy of the path in docker-compose.yml, free to
+# drift from the binary (CLAUDE.md §9a). Read-only for the service,
+# so root-owned is correct.
+COPY --from=spa-build /spa/apps/simulator/dist /var/lib/boss-simulator/dist
+
 # Brewery seeds + reference data — the `init.sh` first-run path
 # applies these against the freshly-bootstrapped DB.
 COPY infra/postgres /opt/boss/infra/postgres
@@ -207,12 +241,29 @@ COPY infra/postgres /opt/boss/infra/postgres
 # MUST be available — seed-operator-baseline.sh reads this dir to POST
 # them to /api/people once the stack is up.
 COPY infra/operator-baseline /opt/boss/infra/operator-baseline
+# The platform Workflow bundle — protocols shipped as DATA
+# (protocols-as-data step 1). bootstrap-db.sh seeds it insert-if-
+# missing at ../platform/workflows.toml relative to itself, and until
+# this COPY existed that path was absent from the image, so the seed
+# SILENTLY SKIPPED on every cluster boot: ten bundle kinds (the eight
+# timer-maintenance protocols among them) never reached the SoR, and
+# every boss-gcp maintenance unit died on a 400 posting a packet of an
+# unknown kind — deploy-confirm and the conservation checks included,
+# red on every tick since the cutover, invisible because a failed
+# oneshot notifies nobody (found 2026-08-19).
+COPY infra/platform /opt/boss/infra/platform
 # Dispatcher rule registry — boss-dispatcher's side-effect runner reads
 # BOSS_DISPATCHER_RULES (set in docker-compose.yml) which points at
 # /opt/boss/infra/dispatcher/rules.toml. Without this dir the rules runner
 # can't start and Jobs get assigned + worked but never close.
 COPY infra/dispatcher /opt/boss/infra/dispatcher
 COPY examples /opt/boss/examples
+# The design decision tracker (boss-docs-api, repo_root=/opt/boss)
+# reads docs/design/*.md from the image. Without this COPY the
+# tracker serves only DB-cached content, reindex finds zero docs,
+# and design reviews never spawn on a container deploy - exactly
+# how the cluster SoR went review-blind on 2026-08-12.
+COPY docs /opt/boss/docs
 
 # Post-API seed scripts boss-launch (services-launcher) runs once the
 # API stack is up: the platform operator-baseline, then the brewery
@@ -226,6 +277,11 @@ COPY infra/seed-brewery-tenant.sh /opt/boss/infra/seed-brewery-tenant.sh
 # Quickstart launcher + init scripts.
 COPY infra/oss-quickstart/init.sh /usr/local/bin/boss-init
 COPY infra/oss-quickstart/services-launcher.sh /usr/local/bin/boss-launch
+# The maintenance-packet wrap scripts, so in-cluster CronJob chores
+# (boss-search-reindex first) open and complete their packets the same
+# way the boss-gcp timers do — one script pair, both hosts (jq above
+# is theirs).
+COPY infra/boss-maintenance-wrap.sh infra/boss-step.sh /usr/local/bin/
 COPY infra/oss-quickstart/generate-configs.sh /usr/local/bin/boss-generate-configs
 RUN chmod +x /usr/local/bin/boss-init /usr/local/bin/boss-launch \
     /usr/local/bin/boss-generate-configs \

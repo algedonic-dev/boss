@@ -14,6 +14,7 @@
   import EntityLink from '@boss/web-kit/ui/EntityLink.svelte';
   import Section from '@boss/web-kit/ui/Section.svelte';
   import { formatMoney } from '@boss/web-kit/ui/money';
+  import { putStep } from './stepWrite';
 
   type StepData = {
     id: string;
@@ -62,6 +63,13 @@
   let failureCode = $state<string>(String(step.metadata.failure_mode_code ?? ''));
   let workNotes = $state<string>(String(step.metadata.work_notes ?? ''));
   let saving = $state(false);
+  let writeError = $state<string | null>(null);
+  $effect(() => {
+    // The surface instance is reused when the rail switches steps —
+    // an error from step A must not render under step B.
+    void step.id;
+    writeError = null;
+  });
 
   let systemInfo = $state<SystemInfo | null>(null);
   let model = $state<CatalogModel | null>(null);
@@ -121,6 +129,7 @@
 
   async function save(newStatus?: string): Promise<void> {
     saving = true;
+    writeError = null;
     try {
       const body: Record<string, unknown> = {
         ...step,
@@ -133,11 +142,11 @@
         },
       };
       if (newStatus) body.status = newStatus;
-      await fetch(`/api/jobs/${jobId}/steps/${step.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+      const res = await putStep(jobId, step.id, body);
+      if (res.kind === 'failed') {
+        writeError = res.error;
+        return;
+      }
       onUpdate();
     } finally {
       saving = false;
@@ -206,6 +215,10 @@
             ></textarea>
           </div>
       </Section>
+
+      {#if writeError}
+        <p class="step-write-error" role="alert">{writeError}</p>
+      {/if}
 
       <div class="step-actions">
         {#if isPending(step.status)}

@@ -49,7 +49,8 @@ pub(crate) struct AppState {
     pub perf: Arc<PerfCollector>,
 }
 
-/// Auth-event staging (gateway-audit-events.md Q1). The URL is its
+/// Auth-event staging (docs/architecture-decisions.md §Policy &
+/// auth). The URL is its
 /// own variable — not BOSS_POSTGRES_URL — because it is expected to
 /// carry the INSERT-only `boss_gateway_audit` role
 /// (111-gateway-audit-events.sql), not the service superuser. Absent
@@ -68,16 +69,13 @@ fn build_auth_audit() -> boss_gateway::audit::AuthAudit {
             .connect_lazy(&url)
         {
             Ok(pool) => {
-                // Clock-as-service: the drain task stamps each event
-                // via the clock so the log's timeline stays coherent
-                // under sim warp; ReqwestClockClient already falls
-                // back to wall time on transport error.
-                let clock_url =
-                    std::env::var("BOSS_CLOCK_URL").unwrap_or_else(|_| boss_ports::url("clock"));
-                boss_gateway::audit::AuthAudit::spawn(
-                    Arc::new(boss_events::outbox::PgOutboxRecorder::new(pool)),
-                    Arc::new(boss_clock_client::ReqwestClockClient::new(clock_url)),
-                )
+                // The drain task stamps each event with wall time —
+                // sim time is retired from the record (David,
+                // 2026-08-22, packet a7a4cae5); an auth decision is
+                // real-world activity in any clock mode.
+                boss_gateway::audit::AuthAudit::spawn(Arc::new(
+                    boss_events::outbox::PgOutboxRecorder::new(pool),
+                ))
             }
             Err(e) => {
                 tracing::warn!(error = %e, "audit DB URL unusable — auth events degrade to warn lines");
@@ -336,6 +334,22 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
             "/api/jobs/{*rest}",
             axum::routing::any(|s, r| proxy::handle(s, r, &proxy::JOBS)),
         )
+        // Stations — the network's nodes (stations.md). Registry rows
+        // and their evaluated queues live on the jobs upstream beside
+        // workflows, so they proxy there. Auth-gated like `/api/jobs`:
+        // the handlers apply the same job-read policy scope inside, so
+        // a guest session reads the yard's dock through here. Without
+        // these two lines the endpoints exist on the service and 404 at
+        // the human door — which is how they shipped in train #10, with
+        // the yard silently falling back to its derived dock.
+        .route(
+            "/api/stations",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
+        .route(
+            "/api/stations/{*rest}",
+            axum::routing::any(|s, r| proxy::handle(s, r, &proxy::JOBS)),
+        )
         // Scheduling routes live alongside jobs on the same upstream.
         // Auth-gated like the rest of /api/*.
         .route(
@@ -573,8 +587,21 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
         // demo session + persona flow apply (the service's own operator
         // gate refuses control writes for audit-readonly). These specific
         // routes win over the /{*rest} SPA fallback below.
+        //
+        // All THREE spellings are needed. `{*rest}` needs at least one
+        // segment, so `/simulator/` — what a browser sends for a
+        // trailing-slash link, a bookmark, or the SPA's own base URL —
+        // matched neither of the other two and fell through to the root
+        // SPA route, which answered a /simulator URL with the MAIN
+        // app's index.html. Same missing-bare-matcher shape as the
+        // `/api` catch-all below, and the reason this one is pinned by
+        // a test (`the_simulator_prefix_never_resolves_to_the_main_spa`).
         .route(
             "/simulator",
+            axum::routing::any(|s, r| proxy::handle_app(s, r, &proxy::SIMULATOR)),
+        )
+        .route(
+            "/simulator/",
             axum::routing::any(|s, r| proxy::handle_app(s, r, &proxy::SIMULATOR)),
         )
         .route(
@@ -599,6 +626,41 @@ fn build_router(local_auth_state: Option<Arc<LocalAuthState>>) -> axum::Router<A
     // CredentialStore + the session_key + an http client for
     // bootstrap_email lookups against boss-people-api).
     if let Some(la) = local_auth_state {
+        // Passkey ceremony (docs/design/presence.md, packet 7218c3f1):
+        // best-effort mount — a malformed BOSS_PUBLIC_URL must degrade
+        // to "no passkey routes", never crash the front door.
+        let app = match boss_gateway::passkey::PasskeyState::from_env(la.session_key.clone()) {
+            Ok(pk) => {
+                let pk = std::sync::Arc::new(pk);
+                app.route(
+                    "/api/auth/passkey/register/begin",
+                    axum::routing::post(boss_gateway::passkey::register_begin)
+                        .with_state(pk.clone()),
+                )
+                .route(
+                    "/api/auth/passkey/register/finish",
+                    axum::routing::post(boss_gateway::passkey::register_finish)
+                        .with_state(pk.clone()),
+                )
+                .route(
+                    "/api/auth/passkey/assert/begin",
+                    axum::routing::post(boss_gateway::passkey::assert_begin).with_state(pk.clone()),
+                )
+                .route(
+                    "/api/auth/passkey/assert/finish",
+                    axum::routing::post(boss_gateway::passkey::assert_finish)
+                        .with_state(pk.clone()),
+                )
+                .route(
+                    "/api/auth/passkey/credentials",
+                    axum::routing::get(boss_gateway::passkey::credentials_list).with_state(pk),
+                )
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "passkey ceremony not mounted");
+                app
+            }
+        };
         app.route(
             "/api/auth/login",
             axum::routing::post(local_auth::login).with_state(la.clone()),
@@ -901,6 +963,10 @@ mod routing_tests {
             "/api/events/tail",
             "/api/design/docs",
             "/api/it/health",
+            // Shipped on the service in train #10 and unreachable at
+            // the door until train #12 — the reason this list exists.
+            "/api/stations",
+            "/api/stations/loading-dock/queue",
         ];
         for path in REAL {
             let (_, body) = get(app(), path).await;
@@ -957,5 +1023,83 @@ mod routing_tests {
             !body.contains(MISS),
             "a page route must not be treated as an API miss: {body}"
         );
+    }
+
+    /// Same request a browser makes when someone clicks a link: GET
+    /// with an Accept that asks for HTML.
+    async fn navigate(app: axum::Router, path: &str) -> (StatusCode, String, String) {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(axum::http::header::ACCEPT, "text/html,*/*;q=0.8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+        let status = resp.status();
+        let location = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        (
+            status,
+            location,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
+    }
+
+    /// The simulator is a DIFFERENT app behind the same door, and
+    /// `/simulator/` — the spelling a browser produces from a trailing
+    /// slash, a redirect, or a relative link — matched neither
+    /// `/simulator` nor `/simulator/{*rest}`: matchit's `{*rest}` needs
+    /// at least one segment, exactly the shape that motivated the bare
+    /// `/api` matcher above. So it fell through to the root `/{*rest}`
+    /// SPA route and the visitor was served the MAIN app's index.html —
+    /// "Algedonic Ales", the dashboard shell — under a /simulator URL.
+    ///
+    /// That is worse than an error. boss-simulator's own "bundle not
+    /// installed" stub says what is wrong; another app's shell just
+    /// looks broken, and got reported as "the simulator didn't load"
+    /// (69a0421d) while the real fault was one missing route.
+    ///
+    /// The discriminator is which handler answers an unauthenticated
+    /// document navigation: the simulator proxy (`proxy::handle_app`)
+    /// sends a browser to `/login?next=…`, the root SPA handler
+    /// (`static_files::handle`) returns a bare 401. No upstream, no
+    /// session, no files on disk — so this pins routing and nothing
+    /// else.
+    #[tokio::test]
+    async fn the_simulator_prefix_never_resolves_to_the_main_spa() {
+        for path in [
+            "/simulator",
+            // The regression. Every other spelling already worked.
+            "/simulator/",
+            "/simulator/config",
+            "/simulator/api/status",
+        ] {
+            let (status, location, body) = navigate(app(), path).await;
+            assert_eq!(
+                status,
+                StatusCode::SEE_OTHER,
+                "`{path}` was not routed to boss-simulator — it fell through to the \
+                 root SPA handler, which serves the MAIN app's index.html to anyone \
+                 with a session. body: {body}"
+            );
+            assert_eq!(
+                location,
+                format!("/login?next={path}"),
+                "`{path}` should come back from the simulator proxy's login redirect"
+            );
+            assert!(
+                !body.to_lowercase().contains("<!doctype html"),
+                "a /simulator path must never be answered with another app's HTML \
+                 shell: {body}"
+            );
+        }
     }
 }

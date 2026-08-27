@@ -189,8 +189,7 @@ async fn create_case(
     // replayed create collapses and records nothing (before, every
     // replay published a duplicate opened event).
     if inserted {
-        let now = boss_clock_client::now_from(&state.clock).await;
-        let stamp = crate::events::event_stamp(&state.publisher, now).await;
+        let stamp = crate::events::event_stamp(&state.publisher).await;
         let event = stamp.event(
             SUPPORT_CASE_OPENED,
             serde_json::to_value(&req).unwrap_or_default(),
@@ -263,8 +262,7 @@ async fn update_case(
     }
     // OUTBOX (phase 2): the updated event records with the update
     // (the NotFound above returns pre-recording).
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let stamp = crate::events::event_stamp(&state.publisher).await;
     let event = stamp.event(
         SUPPORT_CASE_UPDATED,
         serde_json::to_value(&evt).unwrap_or_default(),

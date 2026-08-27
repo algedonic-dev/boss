@@ -53,3 +53,31 @@ sqlx = { version = "0.8", default-features = false, features = ["macros", "runti
 
 [lints]
 workspace = true
+
+[[test]]
+name = "account_crm_handlers"
+required-features = ["postgres"]
+
+[[test]]
+name = "account_delete_guard"
+required-features = ["postgres"]
+
+[[test]]
+name = "account_notes_audit_chain"
+required-features = ["postgres"]
+
+[[test]]
+name = "next_actions"
+required-features = ["postgres"]
+
+[[test]]
+name = "rebuild_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "support_cases_audit_chain"
+required-features = ["postgres"]
+
+[[test]]
+name = "team_members_audit_chain"
+required-features = ["postgres"]

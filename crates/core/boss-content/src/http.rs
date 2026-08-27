@@ -124,13 +124,12 @@ async fn create(
         Ok(u) => u,
         Err(e) => return e.into_response(),
     };
-    let now = boss_clock_client::now_from(&state.clock).await;
     // OUTBOX (phase 2): the adapter records the bulletin events
     // inside the domain transaction; nothing publishes post-commit.
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let stamp = crate::events::event_stamp(&state.publisher).await;
     match state
         .repo
-        .create_bulletin_at(draft, &user.id, now, &stamp)
+        .create_bulletin_at(draft, &user.id, stamp.timestamp, &stamp)
         .await
     {
         Ok(b) => (StatusCode::CREATED, Json(b)).into_response(),
@@ -144,9 +143,12 @@ async fn update(
     _headers: HeaderMap,
     Json(patch): Json<BulletinPatch>,
 ) -> Response {
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
-    match state.repo.update_bulletin_at(id, patch, now, &stamp).await {
+    let stamp = crate::events::event_stamp(&state.publisher).await;
+    match state
+        .repo
+        .update_bulletin_at(id, patch, stamp.timestamp, &stamp)
+        .await
+    {
         Ok(b) => Json(b).into_response(),
         Err(e) => err(e),
     }
@@ -157,9 +159,12 @@ async fn remove(
     Path(id): Path<Uuid>,
     _headers: HeaderMap,
 ) -> Response {
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
-    match state.repo.delete_bulletin_at(id, now, &stamp).await {
+    let stamp = crate::events::event_stamp(&state.publisher).await;
+    match state
+        .repo
+        .delete_bulletin_at(id, stamp.timestamp, &stamp)
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => err(e),
     }
@@ -174,11 +179,10 @@ async fn dismiss(
         Ok(u) => u,
         Err(e) => return e.into_response(),
     };
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = crate::events::event_stamp(&state.publisher, now).await;
+    let stamp = crate::events::event_stamp(&state.publisher).await;
     match state
         .repo
-        .dismiss_bulletin_at(id, &user.id, now, &stamp)
+        .dismiss_bulletin_at(id, &user.id, stamp.timestamp, &stamp)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),

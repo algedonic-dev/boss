@@ -2,8 +2,6 @@
 //! `subjects` identity table (R1). Every kind is checked the same
 //! way; there are no fall-through kinds anymore.
 
-#![cfg(feature = "postgres")]
-
 use boss_core::job::{Job, JobId, JobStatus, Priority, Subject};
 use boss_jobs::port::JobsRepository;
 use boss_jobs::subject_existence::{
@@ -61,6 +59,7 @@ fn job_about(id: &str, kind: &str, subject: Subject) -> Job {
         closed_on: None,
         metadata: serde_json::Value::Null,
         tags: vec![],
+        simulated: false,
     }
 }
 

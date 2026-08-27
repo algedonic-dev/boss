@@ -54,9 +54,9 @@ pub trait ShippingRepository: Send + Sync {
     /// Create a new shipment. Returns the ID. Errors if ID already exists.
     /// Records `shipping.shipment.created` (full row state) in-tx.
     async fn create_shipment(&self, shipment: &Shipment) -> Result<String, ShippingError> {
-        let now = Utc::now();
-        let stamp = EventStamp::new("shipping", ActorId::Automation("platform".into()), now);
-        self.create_shipment_at(shipment, now, &stamp).await
+        let stamp = EventStamp::new("shipping", ActorId::Automation("platform".into()));
+        self.create_shipment_at(shipment, stamp.timestamp, &stamp)
+            .await
     }
     async fn create_shipment_at(
         &self,
@@ -68,9 +68,9 @@ pub trait ShippingRepository: Send + Sync {
     /// Replace a shipment by ID. Errors if ID doesn't exist.
     /// Records `shipping.shipment.updated` (full row state) in-tx.
     async fn update_shipment(&self, id: &str, shipment: &Shipment) -> Result<(), ShippingError> {
-        let now = Utc::now();
-        let stamp = EventStamp::new("shipping", ActorId::Automation("platform".into()), now);
-        self.update_shipment_at(id, shipment, now, &stamp).await
+        let stamp = EventStamp::new("shipping", ActorId::Automation("platform".into()));
+        self.update_shipment_at(id, shipment, stamp.timestamp, &stamp)
+            .await
     }
     async fn update_shipment_at(
         &self,
@@ -83,9 +83,8 @@ pub trait ShippingRepository: Send + Sync {
     /// Delete a shipment and satellite data. Errors if ID doesn't exist.
     /// Records `shipping.shipment.deleted` (`{id, deleted_at}`) in-tx.
     async fn delete_shipment(&self, id: &str) -> Result<(), ShippingError> {
-        let now = Utc::now();
-        let stamp = EventStamp::new("shipping", ActorId::Automation("platform".into()), now);
-        self.delete_shipment_at(id, now, &stamp).await
+        let stamp = EventStamp::new("shipping", ActorId::Automation("platform".into()));
+        self.delete_shipment_at(id, stamp.timestamp, &stamp).await
     }
     async fn delete_shipment_at(
         &self,

@@ -1,6 +1,6 @@
 # Design: payload encryption — confidentiality in a log that proves plaintext
 
-**Status**: in-review — open questions tracked at `/system/design`.
+**Status**: decided — all questions answered by David in review `07c40d86`, 2026-08-19.
 **Source**: feedback `a32ea8c0` (David, 2026-08-09): "We should think
 about encrypting job payloads given they are the atomic unit of
 information in the system. We will need a sophisticated system to
@@ -91,52 +91,22 @@ with sealed fields marked as sealed rather than silently absent
 
 ## Open questions
 
-### Q1: Which layer is the target, and which is the first stage?
-
-Proposal: stage 2 (read-path redaction) ships first — it delivers
-the operator-visible half of the ask with zero crypto risk and
-forces the classification work that every deeper layer needs
-anyway. Layer 3 follows for the fields whose classification proves
-stable. Layer 4 only if a tenant's threat model demands it.
-
-### Q2: Where does field sensitivity live in the ontology?
-
-A `sensitivity` attribute on `metadata_schema` fields and on the
-event-kind registry's payload schemas — or a standalone
-classification registry keyed `(kind, field_path)` like
-`job_edges`. The registry shape keeps classification independent of
-the many schema owners; the inline shape keeps one source of truth
-per field. Both must answer: who may *author* a classification
-change (it is a disclosure decision).
-
-### Q3: What does the chain prove once fields seal?
-
-Sealed-before-insert means the chain honestly proves what was
-written (ciphertext + clear fields). Verification stays mechanical.
-But the *determinism* property — rebuild reproduces projections —
-now requires rebuild-time decryption for sealed fields. Does the
-integrity checker learn to verify sealed payloads structurally, and
-does replay carry a decryption principal?
-
-### Q4: What happens to the existing plaintext history?
-
-The log cannot be rewritten. Options: accept plaintext history with
-a classification cutover date (honest, cheap, leaves salaries
-readable in old rows); epoch-reset the demo tenant post-cutover
-(viable here, not for a real tenant); or a sealed re-log migration
-(new epoch whose baseline is a sealed transform of the old log —
-heavy machinery, the only full answer). A real tenant decides this
-before their first sensitive write, which is the strongest argument
-for deciding classification early.
-
-### Q5: How do sealed fields read in the UI?
-
-Sealed-and-marked (the field exists, shows as sealed, requests
-elevation) versus policy-filtered (absent for the unauthorized).
-Sealed-and-marked is the honest surface and matches the
-"decrypt and view only the policy-approved elements" framing —
-you can see that there is something you cannot see.
+None — every question was answered in review `07c40d86` on 2026-08-19; see Decision history.
 
 ## Decision history
 
-_None yet._
+**Q1 — Which layer is the target, and which is the first stage (decided by David in review `07c40d86`, 2026-08-19).**
+stage 2 (read-path redaction) ships first — it delivers the operator-visible half of the ask with zero crypto risk and forces the classification work that every deeper layer needs anyway. Layer 3 follows for the fields whose classification proves stable. Layer 4 only if a tenant's threat model demands it.
+
+**Q2 — Where does field sensitivity live in the ontology (decided by David in review `07c40d86`, 2026-08-19).**
+**inline, as a `sensitivity` key on `event_kinds.payload_fields` entries — because the column already exists and this question is the reason it was created.** Migration 108's own comment on it reads "flat field inventory `[{name, type, note}]`; starts empty, filled as consumers (encryption classification, rule authoring) need it". The standalone registry was considered and built against, twice over, by someone who then chose the inline shape.
+
+**Q3 — What does the chain prove once fields seal (decided by David in review `07c40d86`, 2026-08-19).**
+**the integrity checker learns nothing, and replay carries a rebuild principal.** The two halves of this question have very different answers and the doc treats them as one.
+
+**Q4 — What happens to the existing plaintext history (decided by David in review `07c40d86`, 2026-08-19).**
+Agreed with the accept part of the proposal, but let's not worry about the epoch reset or baseline time. That isn't needed anymore that the network is 'live'. There is only real-time / wall clock now.
+
+**Q5 — How do sealed fields read in the UI (decided by David in review `07c40d86`, 2026-08-19).**
+**sealed-and-marked, and the question the doc has not asked is what the marker says.** The choice itself is not close and the doc argues it correctly: absence lies. Two things worth adding before this is buildable.
+

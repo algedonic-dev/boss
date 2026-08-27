@@ -146,6 +146,11 @@
 
   let agentCosts = $state<VmCosts[]>([]);
   let counts = $state({ devices: 0, serviceJobs: 0, accounts: 0, models: 0, employees: 0 });
+  /// Non-null when the snapshot / pipeline reads failed — rendered in
+  /// the affected panels instead of zeros and "no activity", which an
+  /// outage is not (packet 3fba9c35, the false-empty sweep).
+  let costsFailed = $state<string | null>(null);
+  let countsFailed = $state<string | null>(null);
 
   // Risk-score panel data
   type RiskScore = {
@@ -168,9 +173,12 @@
         if (r.ok) {
           const data = (await r.json()) as { costs?: VmCosts[] };
           if (!cancelled && data.costs) agentCosts = data.costs;
+          if (!cancelled) costsFailed = null;
+        } else {
+          if (!cancelled) costsFailed = `HTTP ${r.status}`;
         }
-      } catch {
-        // ignore
+      } catch (e) {
+        if (!cancelled) costsFailed = e instanceof Error ? e.message : String(e);
       }
       try {
         const [pResp, mResp, eResp, dResp, jResp] = await Promise.all([
@@ -204,9 +212,11 @@
             const body = (await jResp.json()) as { total: number };
             counts.serviceJobs = body.total ?? 0;
           }
+          const down = [pResp, mResp, eResp, dResp, jResp].find((x) => !x.ok);
+          countsFailed = down ? `HTTP ${down.status}` : null;
         }
-      } catch {
-        // ignore
+      } catch (e) {
+        if (!cancelled) countsFailed = e instanceof Error ? e.message : String(e);
       }
       try {
         const r = await fetch('/api/people/accounts/risk-scores?limit=10');
@@ -293,13 +303,19 @@
     </Section>
 
     <Section title="Data Pipeline">
-        <dl class="kv cto-kv">
-          <dt>Service requests</dt><dd class="num">{counts.serviceJobs}</dd>
-          <dt>Tracked devices</dt><dd class="num">{counts.devices}</dd>
-          <dt>Active accounts</dt><dd class="num">{counts.accounts}</dd>
-          <dt>Catalog models</dt><dd class="num">{counts.models}</dd>
-          <dt>Employees</dt><dd class="num">{counts.employees}</dd>
-        </dl>
+        {#if countsFailed}
+          <p class="empty load-failed" role="alert">
+            Couldn't load pipeline counts — {countsFailed}
+          </p>
+        {:else}
+          <dl class="kv cto-kv">
+            <dt>Service requests</dt><dd class="num">{counts.serviceJobs}</dd>
+            <dt>Tracked devices</dt><dd class="num">{counts.devices}</dd>
+            <dt>Active accounts</dt><dd class="num">{counts.accounts}</dd>
+            <dt>Catalog models</dt><dd class="num">{counts.models}</dd>
+            <dt>Employees</dt><dd class="num">{counts.employees}</dd>
+          </dl>
+        {/if}
     </Section>
 
     <Section title="Churn watchlist">
@@ -344,7 +360,11 @@
     <MlModelsPanel />
 
     <Section title="Agent Spend">
-        {#if costRows.length === 0}
+        {#if costsFailed}
+          <div class="cto-svc-desc load-failed" role="alert">
+            Couldn't load agent spend — {costsFailed}
+          </div>
+        {:else if costRows.length === 0}
           <div class="cto-svc-desc">No agent activity in this window</div>
         {:else}
           <dl class="kv cto-kv">

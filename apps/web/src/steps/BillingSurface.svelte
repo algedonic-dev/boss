@@ -63,7 +63,7 @@
   // shaped like an actual invoice id (UUID, or the `inv-step-…`
   // / `INV-…` prefix the SPA + sim emit). The simulator's faker
   // can put short English words ("scheduled", "queued", …) into
-  // string fields with no faker_hint; rendering those as
+  // plain `string` fields; rendering those as
   // `/finance/<word>` links produces a console 404 and a broken
   // "not found" view. Defensively reject anything that doesn't
   // look like an id shape.

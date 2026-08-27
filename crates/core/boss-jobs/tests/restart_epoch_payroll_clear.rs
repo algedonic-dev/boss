@@ -13,8 +13,6 @@
 //! Driven against Postgres directly: the in-memory adapter has no
 //! payroll_runs table, so this gap is Postgres-only.
 
-#![cfg(feature = "postgres")]
-
 use boss_jobs::postgres::clear_epoch_payroll_state;
 use boss_testing::TestDb;
 

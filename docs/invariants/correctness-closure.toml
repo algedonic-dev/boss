@@ -1,0 +1,8 @@
+[[invariant]]
+id = "correctness-closure"
+claim = "Every Job that opens reaches a terminal state."
+source = "docs/design/correctness-protocol.md §The five properties.3"
+enforcement = "unenforced"
+mechanism = ""
+last_verified = ""
+note = "The doc says stranded mid-flight Jobs 'are loose ends, and a periodic sweep surfaces them as Bulletins on Operations'. That sweep does not exist: no timer, script or handler looks for open Jobs that can no longer progress, and conservation-invariants.sh's C/D/F check only that ALREADY-closed jobs and paid invoices carry their closed_on / paid_on. The viability lint proves a protocol CAN finish, which is strictly weaker than every Job DOES. What would enforce it: a sweep over open Jobs with no ready step and no live assignee, emitting Bulletins — the conservation sweep's own header still carries the 'TODO: bulletin emission once the bus is wired' that blocks it."

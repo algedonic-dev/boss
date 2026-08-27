@@ -12,8 +12,6 @@
 //! audit_log. So an auditor has a record of who locked period FY26
 //! and when — not just that the row currently shows status='locked'.
 
-#![cfg(feature = "postgres")]
-
 use std::sync::Arc;
 
 use axum::Router;

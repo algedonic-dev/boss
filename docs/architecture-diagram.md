@@ -146,7 +146,7 @@ The colour groups above are operational ("which subsystem") but
 the audit-bar split is orthogonal. Four tiers in the workspace
 today:
 
-- **Tier 1 — core state-machine OS** (`crates/core/`, 27 crates).
+- **Tier 1 — core state-machine OS** (`crates/core/`, 29 crates).
   `boss-gateway`, `boss-jobs-api`, `boss-dispatcher`, `boss-policy-api`,
   `boss-classes-api`, `boss-locations-api`,
   `boss-subject-kinds-api`, `boss-calendar-api`,
@@ -157,14 +157,14 @@ today:
   most of the rails. **Tightest review bar; correctness protocol
   non-negotiable.**
 - **Tier 2 — company-modeling layer** (`crates/modules/`,
-  16 crates). `boss-people-api`, `boss-commerce-api`,
+  18 crates). `boss-people-api`, `boss-commerce-api`,
   `boss-inventory-api`, `boss-shipping-api`, `boss-ledger-api`,
   `boss-messages-api`, `boss-catalog-api`, `boss-assets-api`,
   `boss-products-api`, `boss-accounts`, plus matching `*-client`
   crates. Most of the blue + green clusters.
   Inherits the core's correctness contracts but the domain
   surface evolves at business speed.
-- **Orchestrators** (`crates/orchestrators/`, 5 crates). Cross-
+- **Orchestrators** (`crates/orchestrators/`, 6 crates). Cross-
   tier binaries that fan out across both: `boss-rebuild`,
   `boss-cli`, `boss-sim`,
   `boss-ml-api` (wires the Tier-1 ML framework + Tier-2 plugins),

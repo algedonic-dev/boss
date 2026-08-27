@@ -112,12 +112,22 @@ handler = "ledger.tax.remit"
 args = { remit = "true", provider = "\"in-house\"" }
 
 # Federal beer excise tax accrual. Each brew batch's package step
-# accrues `excise_bbl × $3.50/bbl` (TTB small-brewer rate) as
+# accrues its `excise_bbl` (step metadata, seeded per beer) as
 # DR 6550 Excise Tax Expense / CR 2320 Excise Tax Payable, exactly
 # the way sales tax accrues per invoice line. The quarterly
-# excise-tax-filing Workflow drains 2320 → 1000 Cash. `excise_bbl`
-# rides in the package step's metadata (seeded per beer); a batch with
+# excise-tax-filing Workflow drains 2320 → 1000 Cash. A batch with
 # no taxable barrels is a no-op.
+#
+# THE RATE IS REGISTRY DATA (brewery-fidelity Q4): the handler sends
+# barrels, and the ledger resolves the jurisdiction's graduated tier
+# schedule from `excise_rate_schedules` against year-to-date taxed
+# barrels — the real TTB curve ($3.50/bbl for the first 60,000 bbl of
+# the calendar year, $16.00/bbl above; the brewery seeds it via
+# examples/brewery/seeds/excise_rates.toml). `rate_cents_per_bbl`
+# here is only the flat FALLBACK for a jurisdiction with no registry
+# row — applied loudly, kept so pre-registry deployments accrue
+# exactly as before. It understates real TTB liability ~3.7× at the
+# demo tenant's volume; the registry row is the fix, not this arg.
 [[rule]]
 name = "excise-accrue-on-production-produce-step-done"
 on_event = "step.done.production-produce"
@@ -453,3 +463,331 @@ name = "jobs-clear-waiting-on"
 on_event = "jobs.job.closed"
 [[rule.do]]
 handler = "jobs.clear_waiting"
+
+# A shipped change answers the packet that authorized it (job
+# 2c4ae549). `ship-a-change` has declared a `backlog_item` job edge at
+# its Job metadata since migration 104 — dialed to `abort` by 105, so
+# an unresolvable referent is refused at the write — and until now
+# nothing READ it. Measured 2026-08-11: sixteen feedback packets sat at
+# `submitted` while the work they authorized was shipped, tested and
+# live; the loop closed only because an agent remembered.
+#
+# David ratified the rule: "Once the user feedback results in either a
+# shipped change or some other terminal state, it can be closed without
+# the filer approving." So the merge completes the branch step triage
+# opened, and the `user-feedback` Workflow's own `ready_when` fires its
+# `closed` terminal — nothing here knows the packet closes.
+#
+# `steps` lists the branches a SHIPPED change satisfies. `needs-info`
+# is deliberately absent: a change landing does not answer a question
+# asked of the reporter. The list is pinned against the live Workflow
+# by boss-dispatcher's tests/feedback_obligation_rules.rs, so renaming
+# a branch fails CI instead of silently completing nothing.
+#
+# `when` binds `kind` / `outcome` off the close marker — both present
+# on every emit site, null when unanswered (the same always-present
+# contract `notify_on_done` has on step.done: an ABSENT identifier is a
+# PredicateFailed → Retry → dead-letter, not a quiet false). Seeded
+# live by 117-feedback-obligation.sql.
+[[rule]]
+name = "complete-feedback-branch-on-car-merged"
+# Bumped by migration 150: v2 adds `done_metadata`, the rule row's own
+# translation of "this car merged" into the completed step kind's
+# vocabulary. user-feedback v11's design-review is `answer-question`
+# (verdict + answer required at done), and an evidence-only completion
+# would 400 there. String values substitute {branch}/{car}/{title};
+# absent keys only — a person's own written metadata always wins.
+version = 2
+on_event = "jobs.job.closed"
+when = "kind = \"ship-a-change\" AND outcome = \"merged\""
+[[rule.do]]
+handler = "jobs.complete_linked_step"
+args = { link = "\"backlog_item\"", steps = "\"investigate,design-review,build\"", done_metadata = '"{\"verdict\": \"approved\", \"answer\": \"shipped: {branch} — {title}\"}"' }
+
+# …and the filer always hears how it ended (same ratification: "But, we
+# should always notify the filer with the terminal state"). ANY
+# terminal, not only the shipped one — `duplicate` and `declined` are
+# answers a filer is owed for the same reason. The message names the
+# packet, the terminal, and what satisfied it, and goes through
+# boss-messages with a deterministic id so a redelivered close
+# collapses on that surface's existing ON CONFLICT (id) insert rather
+# than stacking an inbox row. Seeded live by
+# 117-feedback-obligation.sql.
+[[rule]]
+name = "notify-filer-on-feedback-terminal"
+on_event = "jobs.job.closed"
+when = "kind = \"user-feedback\""
+[[rule.do]]
+handler = "messages.notify_job_terminal"
+args = { recipient_key = "\"submitted_by\"" }
+
+# ---------------------------------------------------------------------
+# The maintenance protocol (migration 121). David, 2026-08-14: "We
+# probably need protocol around maintenance of the IT systems."
+#
+# These two are the dispatcher's SANCTIONED shape under its narrowed
+# charter — initiate on a schedule, and initiate on threshold. Neither
+# routes anything: routing belongs in the protocol row.
+# ---------------------------------------------------------------------
+
+# 1. ADMISSION, on the clock. The first clock-triggered rule in the
+# system — the schedule machinery existed and had never been used.
+# Daily per maintenance AREA; more areas are more rows, and intraday is
+# a `schedule` edit rather than a deploy. Starting with disk headroom,
+# which has already cost real time twice wearing two disguises on train
+# #22 (once as `ld terminated with signal 7 [Bus error]`, because the
+# linker mmaps its output and ENOSPC surfaces as a bus error, not as
+# "disk full") and put three machines at 100% on 2026-08-13.
+[[rule]]
+name = "maintenance-sweep-disk-daily"
+schedule = { cadence = "daily", anchor_date = "2026-08-14" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"maintenance-sweep\"", subject_kind = "\"custom\"", subject = "\"disk-headroom\"", title = "\"Disk headroom sweep\"", "metadata.target" = "\"disk-headroom\"", "metadata.area" = "\"infra\"" }
+
+# 2. WHAT A SWEEP PRODUCES. A sweep that concluded it needed work spawns
+# a ship-a-change car carrying a `backlog_item` edge back to the sweep,
+# so the car closes its own sweep on merge through the existing
+# feedback-obligation machinery. That is what makes the dock
+# self-filling rather than hand-loaded.
+#
+# Fires on the sweep's TERMINAL OUTCOME, not on the `remediate` step
+# completing: the step-done topic is `step.done.<step kind>` and
+# `remediate` is a plain `task`, so subscribing there would wake this on
+# every task step in every workflow and lean on a `when` to discard
+# almost all of them. The outcome is the more honest trigger anyway.
+[[rule]]
+name = "spawn-car-on-sweep-remediated"
+# Bumped by migration 148, which retired v1 (the unguarded spawn) and
+# inserted this row as v2. Absent, version defaults to 1 and the
+# seed-matches-toml pin reads the two as drifted.
+version = 2
+on_event = "jobs.job.closed"
+when = "kind = \"maintenance-sweep\" AND outcome = \"remediated\" AND NOT open_car_exists(subject_id)"
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"ship-a-change\"", subject_kind = "\"custom\"", subject = "id", title = "title", "metadata.backlog_item" = "id", "metadata.sweep_target" = "subject_id" }
+
+# ---------------------------------------------------------------------
+# Three more maintenance areas (migration 122). 121 seeded the protocol
+# and one area and noted that David expects several; this is the
+# follow-through, filed as d0092947.
+#
+# Seeded together on purpose. David, 2026-08-14: "introducing and
+# changing protocol is cheap, so we can create as many as we need and
+# edit them to find the right operating cadence." The `clear` vs
+# `remediated` counts are what say which cadence is wrong — that is a
+# query, not an opinion, and it needs rows to run against.
+#
+# All three are invisible-until-expensive, and each was found by paying
+# for it once. Cadence `daily` per David's standing instruction; if the
+# dock floods, the fix is a `schedule` edit on these rows, not a deploy.
+# ---------------------------------------------------------------------
+
+# 1. STALE BUILD CACHES. The disk problem 121 was written about had a
+# cause a disk sweep would not have found: 69GB of cargo target dirs
+# under .claude/worktrees for branches that shipped days earlier, 48GB
+# in one worktree. The main tree gave back 9GB, the worktrees 67GB — so
+# an inspection pointed at the repo reports the small number and moves
+# on. Deliberately its own area rather than a bigger disk check: the two
+# look in different places, and collapsing them is how the 67GB stayed
+# invisible the first time.
+[[rule]]
+name = "maintenance-sweep-build-caches-daily"
+schedule = { cadence = "daily", anchor_date = "2026-08-14" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"maintenance-sweep\"", subject_kind = "\"custom\"", subject = "\"stale-build-caches\"", title = "\"Stale build cache sweep\"", "metadata.target" = "\"stale-build-caches\"", "metadata.area" = "\"infra\"" }
+
+# 2. IMAGE FRESHNESS. The CI runner's rootful docker held a 31-hour-old
+# boss-ci image while the registry served a newer one. build.sh's header
+# already warns that a registry retag does not refresh a runner's local
+# tag — the warning existed and the drift happened anyway, which is the
+# signal that a comment is not a mechanism (CLAUDE.md 9a). Cost a
+# 25-minute mystery once, and fails in the worst direction: CI goes
+# green or red against an image nobody is looking at.
+[[rule]]
+name = "maintenance-sweep-image-freshness-daily"
+schedule = { cadence = "daily", anchor_date = "2026-08-14" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"maintenance-sweep\"", subject_kind = "\"custom\"", subject = "\"image-freshness\"", title = "\"CI image freshness sweep\"", "metadata.target" = "\"image-freshness\"", "metadata.area" = "\"ci\"" }
+
+# 3. DEPLOY CONVERGENCE LAG. The converge runner failed silently for
+# hours on a missing `-i` in a docker invocation and the cluster sat on
+# a stale image while forge main moved on. A failed systemd oneshot
+# notifies nobody. This is the one that most directly undermines "the
+# cluster is the system of record": an unconverged cluster is a system
+# of record telling you about a commit that is no longer true.
+[[rule]]
+name = "maintenance-sweep-converge-lag-daily"
+schedule = { cadence = "daily", anchor_date = "2026-08-14" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"maintenance-sweep\"", subject_kind = "\"custom\"", subject = "\"deploy-convergence\"", title = "\"Deploy convergence sweep\"", "metadata.target" = "\"deploy-convergence\"", "metadata.area" = "\"deploy\"" }
+
+# 5. TREE-vs-CLUSTER CONFORMANCE. infra/cluster/manifests/ describes
+# what should be running; nothing checked that any of it was. boss-dev.yaml
+# was merged on 2026-08-15, applied by hand, and a day later a design doc
+# asserted in review that the pod had never run — while it had 25 hours of
+# uptime. The tree could not answer the question either way.
+#
+# check-manifests-applied.sh answers it. This rule is what makes somebody
+# ask: a sweep packet lands daily with a target, an actor runs the check
+# and records what it found, and the fork is the protocol's own —
+# remediate when a manifest is missing from the cluster, clear when the
+# two agree. The script stops being a file nobody runs and becomes the
+# instrument of a step.
+#
+# Deliberately a sweep and not a systemd timer. A timer that finds drift
+# has nowhere to put the finding; David, 2026-08-16: "let's try and get as
+# much maintenance and management into job protocols rather than floating
+# around scripts or system timers elsewhere."
+[[rule]]
+name = "maintenance-sweep-cluster-conformance-daily"
+schedule = { cadence = "daily", anchor_date = "2026-08-17" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"maintenance-sweep\"", subject_kind = "\"custom\"", subject = "\"cluster-conformance\"", title = "\"Cluster conformance sweep\"", "metadata.target" = "\"cluster-conformance\"", "metadata.area" = "\"cluster\"" }
+
+# 6. DOC STATUS DRIFT. A design doc's `**Status**:` line is
+# hand-written and nothing ever updates it. Answering a question is a
+# flush, and the flush rewrites the Decision-history section without
+# touching the header — so status is stale BY DEFAULT, as fresh as the
+# last time a human happened to edit that line (feedback 0b8ae875,
+# filed as the mechanism behind bedda461).
+#
+# The detector already exists: `GET /api/design/stale-statuses` reports
+# docs whose status claims live discussion (`draft`, `in-review`,
+# `reopened`) while the tracker holds zero open questions for them. It
+# has existed and reported to nobody, which is the same defect as the
+# conformance script — a check with no caller is not a mechanism.
+#
+# Deliberately a REPORT feeding a sweep, not a rejection at index time.
+# `crates-and-layers.md` reads "in-review (agent draft; the re-tiering
+# call is David's)" — legitimately waiting on a person with no
+# questions registered. Refusing to index that would be wrong, and a
+# rule that has to be right about intent is a rule that will be wrong.
+# A sweep puts it in front of someone who can tell the difference.
+[[rule]]
+name = "maintenance-sweep-doc-status-daily"
+schedule = { cadence = "daily", anchor_date = "2026-08-17" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"maintenance-sweep\"", subject_kind = "\"custom\"", subject = "\"doc-status\"", title = "\"Design doc status sweep\"", "metadata.target" = "\"doc-status\"", "metadata.area" = "\"docs\"" }
+
+# ---------------------------------------------------------------------
+# Expire the notifications about a job that has finished (David,
+# 2026-08-14: "we still need a way to automatically expire inbox
+# messages for jobs that have moved past relevancy"). Migration 128.
+#
+# A ready-step notification is true when it is sent and stops being
+# true the moment the work behind it is done. Nothing retracted them,
+# so the admin inbox reached 2,058 unread — overwhelmingly signals
+# about steps closed days ago. That count was not a backlog, it was
+# sediment, and an inbox nobody can read is a channel that does not
+# exist.
+#
+# A cross-protocol reactor, which is the exemption the ratchet names:
+# no single Workflow definition can express "when a job of any kind
+# closes, retire the messages about it", because the messages are not
+# part of the job's protocol.
+#
+# Only unread `signal` rows move, and never a `direct` — the messages
+# port carries that reasoning. A person asking another person something
+# does not stop asking because a job closed.
+# ---------------------------------------------------------------------
+[[rule]]
+name = "expire-signals-on-job-closed"
+on_event = "jobs.job.closed"
+[[rule.do]]
+handler = "messages.expire_for_job"
+
+# ---------------------------------------------------------------------
+# Publish to the public GitHub mirror, on the clock.
+#
+# The mirror is fed by PULL REQUEST, never by pushing main (the mirror
+# protocol's own rule), so the daily packet is what carries a batch of
+# forge commits over and puts David's sign-off in front of the push.
+#
+# Seeded by 129-publish-to-github-rule.sql. It is here because
+# `dispatcher_rules_seed_matches_toml` compares the seeded registry
+# against this file in BOTH directions: a migration that seeds a rule
+# without adding it here fails the same way an unseeded rule does, and
+# that is exactly how it reddened the 13-car train 20260815-0621. The
+# table is the runtime registry; this file is the human-authored source;
+# neither is allowed to be the only one that knows.
+[[rule]]
+name = "publish-to-github-daily"
+# Bumped by migration 149: v1 minted a packet every day regardless of
+# whether yesterday's still sat at its approval sign-off — measured
+# 2026-08-18, two identical open packets one day apart (9f0c566a).
+# One mirror, one open publish packet: the guard keys on the packet's
+# declared subject. Schedule rules evaluate `when` with the same
+# helper resolver as event rules since the same migration's car; a
+# guard that cannot evaluate skips ONLY that rule for the day, loudly.
+version = 2
+when = 'NOT open_publish_exists("github-mirror")'
+schedule = { cadence = "daily", anchor_date = "2026-08-15" }
+[[rule.do]]
+handler = "jobs.spawn"
+args = { kind = "\"publish-to-github\"", subject_kind = "\"custom\"", subject = "\"github-mirror\"", title = "\"Publish to the public GitHub mirror\"", "metadata.target" = "\"origin/main\"", "metadata.area" = "\"platform\"" }
+
+# ---------------------------------------------------------------------
+# Ask the level question on a clock (packet ae8a14f7).
+#
+# `design-review-spawn` asks a LEVEL question — "this doc has open
+# questions and no open review" — but only ever gets asked on an EDGE,
+# `docs.design.indexed`, which by design fires only when a doc's review
+# surface CHANGES. Close a review while its questions are still open
+# and the doc can never get another one, because nothing about it will
+# change again on its own. The 2026-08-13 audit did exactly that to
+# five docs and roughly twenty-three questions became unreachable, with
+# no mechanism that could ever surface them.
+#
+# A TIMER, which is this ratchet's standing exemption: no Workflow
+# definition can declare "sweep the corpus for docs nobody is
+# reviewing", because no packet causes it. The condition is a standing
+# state of the corpus, not a reaction to a transition — which is the
+# whole bug.
+#
+# `docs.design.sweep` decides only WHICH docs are orphaned and then
+# hands each to `jobs.spawn` as the payload the edge rule would have
+# delivered, so these args are `design-review-spawn`'s verbatim and
+# must change with them.
+#
+# Seeded by 141-design-review-level-sweep.sql; present here because
+# `dispatcher_rules_seed_matches_toml` compares in BOTH directions.
+[[rule]]
+name = "design-review-level-sweep"
+schedule = { cadence = "daily", anchor_date = "2026-08-16" }
+[[rule.do]]
+handler = "docs.design.sweep"
+args = { kind = "\"design-doc-review\"", subject_kind = "\"custom\"", subject = "path", title = "title", "metadata.doc_path" = "path", "metadata.doc_title" = "title" }
+
+# ---------------------------------------------------------------------
+# The packet-loss census (packet-loss.md, all questions decided in
+# review 9fb9904f). Q1's invariant: every admitted packet reaches a
+# terminal, and every non-terminal packet is visible at >= 1 station.
+# Q3 puts the census on a cadence writing its counts to the log, so
+# loss becomes a MEASURED SERIES rather than a spot check; lenses read
+# the series instead of recomputing it.
+#
+# A TIMER, the ratchet's standing exemption, and it adds no routing:
+# the handler spawns nothing and moves nothing — one firing lands
+# exactly one `jobs.network.census` event (via the jobs service's
+# census door) carrying the counts. Report first (Q2): no raiser, no
+# threshold, no catch-all orphan station; the raiser comes later,
+# calibrated against the base rate this series accumulates. The
+# condition it watches is a standing STATE of the network — what is
+# NOT moving — which no Workflow definition can declare, because no
+# packet causes it. Field meanings live in the handler's module doc
+# (boss-dispatcher-handlers handlers/network_census.rs).
+#
+# Seeded by 152-network-census.sql; present here because
+# `dispatcher_rules_seed_matches_toml` compares in BOTH directions.
+[[rule]]
+name = "network-census-daily"
+schedule = { cadence = "daily", anchor_date = "2026-08-21" }
+[[rule.do]]
+handler = "network.census"

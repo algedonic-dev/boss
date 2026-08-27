@@ -154,6 +154,92 @@ BUILD_URL="postgres://$DB_USER:$DB_USER@127.0.0.1/$DB_NAME"
 # `examples/brewery/seeds/operator_hires.toml` for the source of
 # truth and `crates/modules/boss-people/src/bin/boss_operator_baseline_seed.rs`
 # for the loader.
+# Platform Workflow rows that live as DATA rather than as Rust
+# literals (docs/design/protocols-as-data.md). INSERT-ONLY: a kind
+# already present is left exactly as it is, including an operator's
+# edits to it. Deliberately NOT bootstrap_reconcile, which republishes
+# the code default over a drifted row and is how two protocol edits
+# were silently undone on 2026-08-14 (68331085).
+#
+# Runs before the reconcile in boss-jobs-api's boot: a kind supplied
+# here is absent from platform_workflows(), so reconcile never
+# considers it.
+if PLATFORM_WF_BIN="$(find_boss_bin boss-platform-workflow-seed)"; then
+    PLATFORM_WF_TOML="$(dirname "$0")/../platform/workflows.toml"
+    if [ -f "$PLATFORM_WF_TOML" ]; then
+        echo "  seeding platform Workflow bundle"
+        # Filter the happy path's noise but NEVER the failure: the old
+        # `| grep ... || true` swallowed a failing seed's error text AND
+        # its exit code — the third silence in this one code path (after
+        # the missing file and the missing binary), each found the hard
+        # way. On failure everything the seed said is shown.
+        if SEED_OUT="$("$PLATFORM_WF_BIN" \
+            --database-url "$BUILD_URL" \
+            --seed-path "$PLATFORM_WF_TOML" 2>&1)"; then
+            printf '%s\n' "$SEED_OUT" | grep -E "inserted|already present|seed:" || true
+        else
+            echo "  WARNING: platform Workflow bundle seed FAILED — full output follows" >&2
+            printf '%s\n' "$SEED_OUT" >&2
+        fi
+    else
+        # LOUD, deliberately. This exact silence cost two days: the
+        # image lacked infra/platform/, the [ -f ] guard skipped the
+        # seed without a word on every cluster boot, ten bundle kinds
+        # never reached the registry, and every timer unit posting one
+        # of them died on a 400 nobody saw (2026-08-19). A missing
+        # bundle is a packaging fault and must read like one.
+        echo "  WARNING: platform Workflow bundle NOT FOUND at $PLATFORM_WF_TOML — the seed" >&2
+        echo "  is being SKIPPED; bundle-supplied kinds will be missing from this deployment" >&2
+    fi
+else
+    # The OTHER half of the same invariant, which the warning above
+    # missed: the 2026-08-19 fix made a missing BUNDLE loud but left a
+    # missing BINARY silent, and that is exactly how every fresh
+    # install shipped broken — the seed bin is feature-gated and the
+    # image's workspace build skipped it, so this outer guard fell
+    # through without a word (packet c93e115a, caught by the public
+    # mirror's install smoke). A boot-read binary is packaging, and
+    # absent packaging must read like a fault, not like silence.
+    echo "  WARNING: boss-platform-workflow-seed binary NOT FOUND on PATH or in" >&2
+    echo "  target/release — the platform Workflow seed is being SKIPPED;" >&2
+    echo "  bundle-supplied kinds will be missing from this deployment" >&2
+fi
+
+# THE THREE SILENCES, CLOSED BY ASKING ABOUT THE OUTCOME INSTEAD.
+#
+# Above there are three ways the platform bundle can fail to arrive —
+# missing binary, missing file, failing seed — and each was found the
+# hard way and made loud in turn. All three still only WARN, which was
+# survivable while the bundle carried three idle kinds.
+#
+# It no longer is. `ship-a-change` is in the bundle now, so a skipped
+# seed is a deployment where NO CHANGE CAN SHIP, and the symptom is a
+# 400 on the first car rather than anything resembling a packaging
+# fault — precisely the 2026-08-19 shape, where ten bundle kinds were
+# missing and every timer posting one died on a 400 nobody saw.
+#
+# So this asks the only question that matters, once, in terms of the
+# outcome rather than the mechanism: is the delivery protocol actually
+# in the registry? It catches all three failure paths and any future
+# fourth, and it fails the bootstrap rather than warning into a log
+# nobody reads.
+REQUIRED_KINDS="ship-a-change"
+for kind in $REQUIRED_KINDS; do
+    present=$(psql "$BUILD_URL" -tAc \
+        "SELECT COUNT(*) FROM workflows WHERE kind = '$kind' AND status = 'active'" \
+        2>/dev/null || echo 0)
+    if [ "${present:-0}" -lt 1 ]; then
+        echo "  FATAL: workflow kind '$kind' is not active in the registry after seeding." >&2
+        echo "  It lives in infra/platform/workflows.toml, so one of these is true:" >&2
+        echo "    - boss-platform-workflow-seed was not found (see the warning above)" >&2
+        echo "    - infra/platform/ is missing from the image" >&2
+        echo "    - the seed ran and failed" >&2
+        echo "  A deployment without this kind cannot ship a change, including the fix." >&2
+        exit 1
+    fi
+    echo "  verified: workflow kind '$kind' is active"
+done
+
 if OPERATOR_SEED_BIN="$(find_boss_bin boss-operator-baseline-seed)"; then
     OPERATOR_HIRES_TOML="$(dirname "$0")/../operator-baseline/operator_hires.toml"
     if [ -f "$OPERATOR_HIRES_TOML" ]; then

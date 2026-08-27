@@ -13,10 +13,17 @@ boss-core = { path = "../../core/boss-core" }
 boss-ports = { path = "../../core/boss-ports" }
 boss-events = { path = "../../core/boss-events" }
 boss-nats = { path = "../../core/boss-nats" }
+# The station registry + its predicate evaluator. `boss packet
+# census` answers "which stations would present this packet?" by
+# calling the SAME `StationPredicate::matches` the /queue endpoint
+# calls — a census that disagrees with the queue is worse than none.
+boss-jobs = { path = "../../core/boss-jobs" }
 boss-assets = { path = "../../modules/boss-assets", features = ["postgres"] }
+boss-clock-client = { path = "../../core/boss-clock-client" }
 boss-ledger = { path = "../../modules/boss-ledger", features = ["postgres"] }
-sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "runtime-tokio", "postgres", "json", "chrono"] }
 clap = { workspace = true }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -27,6 +34,17 @@ dirs = "6"
 chrono = { workspace = true }
 uuid = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+[dev-dependencies]
+# DB-backed cadence tests (the firing claim's exactly-once contract
+# rides the cadence_firings primary key, which only Postgres can pin).
+boss-testing = { path = "../../core/boss-testing", features = ["postgres"] }
+# The delivery-policy seed pin reads the seeded row through the same Pg
+# adapter the jobs API serves it from, so "seed equals the conductor's
+# compiled fallback" is checked end to end rather than against a
+# hand-copied column list. Test-only: the shipped `boss` binary reads
+# the policy over HTTP and needs no database.
+boss-jobs = { path = "../../core/boss-jobs", features = ["postgres"] }
 
 [lints]
 workspace = true

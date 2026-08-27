@@ -77,16 +77,12 @@ pub fn router(state: ProcurementApiState) -> Router {
 /// actor is the publisher's default (mirrors the boss-products
 /// handler helper); `_simulated` resolves via the publisher's clock
 /// probe when one is wired.
-async fn event_stamp(
-    state: &ProcurementApiState,
-    now: chrono::DateTime<chrono::Utc>,
-) -> boss_core::publisher::EventStamp {
+async fn event_stamp(state: &ProcurementApiState) -> boss_core::publisher::EventStamp {
     match &state.publisher {
-        Some(p) => p.stamp_with_actor_at(p.default_actor(), now).await,
+        Some(p) => p.stamp_with_actor(p.default_actor()).await,
         None => boss_core::publisher::EventStamp::new(
             "inventory",
             boss_core::actor::ActorId::Automation("platform".into()),
-            now,
         ),
     }
 }
@@ -120,8 +116,7 @@ async fn upsert_contact(
         )
             .into_response();
     }
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match PgProcurement::new(state.pool.clone())
         .upsert_contact(body, &stamp)
         .await
@@ -135,8 +130,7 @@ async fn delete_contact(
     State(state): State<Arc<ProcurementApiState>>,
     Path((vendor_id, id)): Path<(String, String)>,
 ) -> Response {
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match PgProcurement::new(state.pool.clone())
         .delete_contact(&vendor_id, &id, &stamp)
         .await
@@ -186,8 +180,7 @@ async fn insert_interaction(
         )
             .into_response();
     }
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match PgProcurement::new(state.pool.clone())
         .insert_interaction(body, &stamp)
         .await
@@ -207,8 +200,7 @@ async fn soft_delete_interaction(
     Path((_vendor_id, id)): Path<(String, String)>,
     Json(body): Json<SoftDeleteBody>,
 ) -> Response {
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match PgProcurement::new(state.pool.clone())
         .soft_delete_interaction(&id, &body.deleted_by, &stamp)
         .await
@@ -247,8 +239,7 @@ async fn upsert_account_team_member(
         )
             .into_response();
     }
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match PgProcurement::new(state.pool.clone())
         .upsert_account_team_member(body, &stamp)
         .await
@@ -265,8 +256,7 @@ async fn remove_account_team_member(
     // The prior assignment (who was unassigned) is captured by the
     // adapter INSIDE the delete tx, so the event payload can't race a
     // concurrent reassignment.
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match PgProcurement::new(state.pool.clone())
         .remove_account_team_member(&vendor_id, &role, &stamp)
         .await
@@ -312,8 +302,7 @@ async fn upsert_contract(
         )
             .into_response();
     }
-    let now = boss_clock_client::now_from(&state.clock).await;
-    let stamp = event_stamp(&state, now).await;
+    let stamp = event_stamp(&state).await;
     match PgProcurement::new(state.pool.clone())
         .upsert_contract(body, &stamp)
         .await

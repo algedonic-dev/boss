@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# infra/oss-quickstart/quickstart.sh — five-minute clone-to-SPA path
-# for evaluators kicking the OSS tires.
+# infra/oss-quickstart/quickstart.sh — source-tree dev path (cold
+# build ~60-80 min on 2 vCPUs; the supported install is compose).
 #
 # What this does, in order:
 #   1. Check the four hard prerequisites (Rust, Bun, Postgres, NATS).
@@ -15,10 +15,10 @@
 #   5. Start every service as a background process (PIDs in ~/.boss-pids)
 #      including boss-gateway with BOSS_GUEST_ACCESS=1 +
 #      BOSS_AUTH_PROVIDER=local-auth. Operator opens
-#      http://127.0.0.1:4443 and is in — anonymous visitors get
-#      `audit-readonly` (everything renders, no writes); log in
-#      at /login with the bootstrap-admin email + 'change-me' to
-#      upgrade to platform-admin.
+#      http://127.0.0.1:4443 and signs in at /login — bootstrap-
+#      admin email + 'change-me' for platform-admin, or the
+#      "Browse as a guest" button for a read-only audit-readonly
+#      session (nothing is minted for anonymous requests).
 #
 # What this is NOT: a production setup. The gateway runs the
 # file-backed local-auth provider (Argon2id-hashed credentials,
@@ -27,7 +27,7 @@
 # gates reads. No SSO, no MFA, no account lockout, no rate
 # limiting, no edge-tier hardening. This is the OSS evaluation
 # path; production-grade deployments are tracked under the
-# "Production Infrastructure Default" + "IAM Integration" TODO
+# "Production infrastructure template" + "Integrated IAM" TODO
 # entries.
 #
 # Re-run safe: idempotent against an existing DB. Drops the live
@@ -119,11 +119,11 @@ if [[ -z "$EMAIL" ]]; then
     echo "    - start the live brewery sim — it builds the 12-month demo from empty"
     echo "    - start the stack on http://127.0.0.1:4443"
     echo ""
-    echo "  ⚠  Not production-ready. Demo mode is on: anonymous visitors"
-    echo "     get audit-readonly (everything renders, no writes). The"
-    echo "     'first user' below becomes the seed admin Employee — log"
-    echo "     in at /login with their email + 'change-me' to get write"
-    echo "     access. Rotate the password right after."
+    echo "  ⚠  Not production-ready. Every visitor signs in at /login:"
+    echo "     the 'first user' below becomes the seed admin Employee —"
+    echo "     their email + 'change-me' gets write access — and the"
+    echo "     'Browse as a guest' button gives a read-only session"
+    echo "     (BOSS_GUEST_ACCESS=1). Rotate the password right after."
     echo ""
     read -r -p "  Bootstrap-admin email: " EMAIL
 fi
@@ -210,14 +210,14 @@ echo "===================================================================="
 echo "  Quickstart complete."
 echo "===================================================================="
 echo ""
-echo "  SPA:        http://127.0.0.1:4443  (anonymous = audit-readonly demo)"
-echo "  Login:      http://127.0.0.1:4443/login  → upgrades to platform-admin"
+echo "  SPA:        http://127.0.0.1:4443  (sign in, or guest button = read-only)"
+echo "  Login:      http://127.0.0.1:4443/login  → platform-admin session"
 echo "  Bootstrap:  $EMAIL  (role=platform-admin)"
 echo ""
 echo "  Stop:    kill \$(cat ~/.boss-pids)"
 echo "  Re-run:  ./infra/oss-quickstart/quickstart.sh --email=$EMAIL"
 echo ""
-echo "  ⚠  Not production-ready. Real auth, HA topology, and email-OTP"
-echo "     reset land under the Production Infrastructure + IAM"
-echo "     Integration TODOs (see TODO.md)."
+echo "  ⚠  Not production-ready. SSO, HA topology, and email-OTP"
+echo "     reset land under the 'Production infrastructure template'"
+echo "     + 'Integrated IAM' TODO entries (see TODO.md)."
 echo ""

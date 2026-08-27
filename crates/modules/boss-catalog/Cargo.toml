@@ -52,3 +52,19 @@ sqlx = { version = "0.8", default-features = false, features = ["macros", "runti
 
 [lints]
 workspace = true
+
+[[test]]
+name = "audit_log_e2e"
+required-features = ["postgres"]
+
+[[test]]
+name = "catalog_delete_guard"
+required-features = ["postgres"]
+
+[[test]]
+name = "marketing_assets_pg"
+required-features = ["postgres"]
+
+[[test]]
+name = "rebuild_e2e"
+required-features = ["postgres"]
