@@ -289,8 +289,29 @@ spec:
             # login, and the write path is what's under scrutiny.
             - {name: BOSS_GUEST_ACCESS, value: "1"}
             - {name: BOSS_TENANT_MANIFEST_TOML, value: /opt/boss/examples/brewery/seeds/tenant.toml}
-            - name: BOSS_SESSION_KEY
-              valueFrom: {secretKeyRef: {name: boss-secrets, key: session-key}}
+            # A PATH, NOT A KEY — the name is a trap and this comment is
+            # the guard rail. boss-gateway reads this variable as a
+            # filename and loads the key from it, generating one if the
+            # file is absent.
+            #
+            # This used to be `valueFrom: secretKeyRef` pointing at
+            # boss-secrets/session-key. The 64 hex characters in that
+            # secret were taken as a RELATIVE PATH, resolved against the
+            # container's working directory, found to be missing, and a
+            # fresh random key was minted and written to a file named
+            # after the secret on the ephemeral overlay filesystem.
+            # Nothing errored. Every deploy silently issued a new signing
+            # key, so every session cookie stopped verifying and every
+            # operator was signed out — three times on 2026-08-26 alone,
+            # reported as the site being down when it was up throughout.
+            #
+            # /var/lib/boss/auth is the boss-auth PVC, mounted below and
+            # kept for exactly this class of reason: the volume comment
+            # already argues that a credential which does not survive a
+            # restart makes the break-glass path a fiction. A session key
+            # that does not survive a restart is the same fiction with a
+            # shorter fuse.
+            - {name: BOSS_SESSION_KEY, value: /var/lib/boss/auth/session.key}
             # Collections loop: dispatcher pushes step.done.<kind> to the
             # sim's webhook on the same loopback host:port. Both must agree
             # or zero collections fire and AR balloons.

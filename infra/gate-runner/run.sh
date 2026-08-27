@@ -118,7 +118,53 @@ except Exception as e:
                       "error": str(e)}))
 PY
 )
-report "$VERDICT" "$SUMMARY" || echo "WARN: verdict not reported — packet will go overdue (the alarm still works)"
+# THE VERDICT GOES IN THE LOG BEFORE IT GOES ANYWHERE ELSE.
+#
+# It used to live in exactly two places, and on 2026-08-25 both were
+# lost at once (cf0021ae): the gate passed 30/30 on
+# chore/the-build-leaves-the-control-plane, w-1 rebooted before the
+# pod finished, and the receipt survived only on the PVC — it had to
+# be recovered by mounting the disk in a throwaway pod. The pod log
+# is the third copy, it costs one line, and `kubectl logs` reaches
+# it without mounting anything.
+echo "gate-runner: receipt $SUMMARY"
+
+if ! report "$VERDICT" "$SUMMARY"; then
+    # THE OLD FALLBACK CLAIMED AN ALARM THAT CANNOT ALWAYS FIRE.
+    #
+    # It said "packet will go overdue (the alarm still works)". That
+    # holds only while the packet is OPEN. The case that actually
+    # burned us is the other one: a gate-run packet reused across
+    # relaunches was already TERMINAL, so the step write was refused
+    # AND no overdue can ever be raised against a closed packet. Both
+    # channels went quiet together and the run looked like it never
+    # happened.
+    #
+    # So the two cases are told apart and only one of them is
+    # reassuring. Neither changes the exit status: this is a failure
+    # to RECORD the result, not a failure of the gate, and reporting
+    # a green gate as red is the confusion cf0021ae exists about.
+    state=$(curl -sf -H "x-boss-user: $ACTOR" \
+        "$JOBS_API/api/jobs/$GATE_RUN_JOB_ID" \
+        | python3 -c 'import sys,json; print(json.load(sys.stdin).get("status","unknown"))' \
+        2>/dev/null || echo unreachable)
+    echo "WARN: verdict not recorded on packet $GATE_RUN_JOB_ID (packet status: $state)"
+    case "$state" in
+        open)
+            echo "  The packet is still open, so it will go overdue and the alarm will fire."
+            ;;
+        unreachable)
+            echo "  The jobs API could not be reached, so the packet state is unknown."
+            echo "  If it was open it will go overdue; if it was not, this log is the only record."
+            ;;
+        *)
+            echo "  THE PACKET IS ALREADY $state, SO NOTHING WILL GO OVERDUE AND NO ALARM"
+            echo "  WILL FIRE. The verdict above is the only surviving record of this run."
+            echo "  A terminal packet cannot accept a verdict — file a fresh gate-run packet"
+            echo "  rather than reusing one across relaunches (see 64cae7e9)."
+            ;;
+    esac
+fi
 tail -5 /gate-target/gate.log || true
 echo "gate-runner: $GATE_BRANCH@${HEAD_SHA:0:10} -> $VERDICT"
 [ "$VERDICT" = green ]
