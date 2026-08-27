@@ -32,7 +32,7 @@
 # layer serves both: local rebuilds hit the local layer cache, CI
 # restores the same layer from the Actions cache.
 # ---------------------------------------------------------------------------
-FROM rust:1.96-slim-bookworm@sha256:c8a94a78f67ec8c4d474ec7f71e0720f21eb7e584e158daec0874cafa7c30e4d AS rust-base
+FROM rust:1.97-slim-bookworm@sha256:2775a09d208ff0d7c1f50490c45b62db929e87ba1dcbc3f2132ac71a704bcdd3 AS rust-base
 
 # sqlx + reqwest need pkg-config + libssl-dev for the rustls-native
 # bridge; the rest of the workspace is pure Rust.
@@ -131,7 +131,7 @@ RUN set -eu && \
 # ---------------------------------------------------------------------------
 # Stage 4 — SPA build.
 # ---------------------------------------------------------------------------
-FROM oven/bun:1.3-debian@sha256:9dba1a1b43ce28c9d7931bfc4eb00feb63b0114720a0277a8f939ae4dfc9db6f AS spa-build
+FROM oven/bun:1.4-debian@sha256:5bb0f9be3a1a36a03e27c9a9dd894a3b1ad26657155c7df4dda771e17bf872ef AS spa-build
 
 # Skip puppeteer's Chrome download in this build stage — puppeteer
 # is a devDependency for browser-based smoke tests, not needed by
@@ -184,7 +184,7 @@ RUN cd apps/simulator && bun run build && \
 # ---------------------------------------------------------------------------
 # Stage 5 — runtime.
 # ---------------------------------------------------------------------------
-FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716 AS runtime
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
 
 # Runtime deps: ca-certs for outbound HTTPS (the gateway), libssl
 # for rustls's native bridge, postgresql-client for the init
