@@ -356,6 +356,66 @@ pub(super) async fn update_step<R: JobsRepository + 'static, B: EventBus + 'stat
         obj.insert("authority_role".into(), auth);
     }
 
+    // A TERMINAL ROW IS FROZEN, AND SAYING SO IS THE POINT.
+    //
+    // Both adapters refuse to write `status`, `completed_on` and
+    // `metadata` on a completed or skipped step — deliberately, so a
+    // write merged against a stale pre-completion fetch cannot demote a
+    // finished step. What they did NOT do was tell anyone: the row was
+    // left untouched and the handler still answered 204, so a caller
+    // could not distinguish a write that landed from one that vanished.
+    //
+    // That cost real work. Three cars' stale gate receipts were
+    // "repaired", the API said 204 three times, nothing was written,
+    // and the cars were reported fixed while staying unboardable
+    // (09576fab). It bit again on 2026-08-27: an accepted correction
+    // could not be applied to the sentence it corrected, because the
+    // sentence lives in a completed step's metadata.
+    //
+    // SCOPED TO A REAL CHANGE, not to every write. The freeze exists to
+    // make racing writers harmless — dispatcher assign retries and
+    // JetStream redeliveries re-PUT content that is already stored, and
+    // those are no-ops that must keep succeeding. Refusing them would
+    // trade a silent bug for a noisy one. So the refusal fires only
+    // when the write would actually alter a frozen field.
+    //
+    // Nothing on a terminal step is legitimately mutable through here:
+    // the conductor's `boarded_head` stamp, the one path that visibly
+    // works against finished cars, writes JOB metadata via
+    // `merge_job_metadata`, never step metadata.
+    //
+    // `status` IS DELIBERATELY NOT CHECKED HERE. The demotion case
+    // already has its own refusal further down, added for this same
+    // defect (job 903e6b90), and it says something better than this
+    // could: which status the step is, and which one the caller tried
+    // to set. Repeating the check here would preempt that message with
+    // a vaguer one. This block covers only the two fields that were
+    // still being dropped in silence.
+    if matches!(old.status, StepStatus::Completed | StepStatus::Skipped) {
+        let mut frozen: Vec<&str> = Vec::new();
+        if step.completed_on != old.completed_on {
+            frozen.push("completed_on");
+        }
+        if step.metadata != old.metadata {
+            frozen.push("metadata");
+        }
+        if !frozen.is_empty() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "step is terminal — these fields are immutable",
+                    "step_id": step_id.to_string(),
+                    "step_status": status_word(old.status),
+                    "refused_fields": frozen,
+                    "hint": "a completed step is a record of what happened. To correct or \
+                             annotate it, write to the parent job's metadata \
+                             (PATCH /api/jobs/{id}/metadata) instead.",
+                })),
+            )
+                .into_response();
+        }
+    }
+
     // Auto-stamp completed_on on the done-transition if the caller
     // didn't send one. The simulator's LiveApiOutput sends the
     // sim-day explicitly; SPA-driven step completion ("Mark done"
